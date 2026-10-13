@@ -45,7 +45,8 @@ typedef struct ArisFrameStats {
     uint32_t srgb;         /* 1 when the surface texture format is sRGB */
     uint32_t center_bgra;  /* centre pixel read back as 0xAARRGGBB (0 if unavailable) */
     uint32_t elapsed_us;   /* CPU time spent producing the frame, microseconds */
-    uint64_t frame_index;  /* frames rendered since process start */
+    uint64_t frame_index;  /* frames rendered since process start (all surfaces) */
+    uint64_t surface_frame_index; /* frames rendered by this surface */
 } ArisFrameStats;
 
 /* ABI version; checked by the host at startup. */
@@ -87,6 +88,31 @@ int32_t aris_reader_surface_detach(uint64_t surface_id);
  * (size*size*4 bytes, RGBA8). Useful for CI and for "is the GPU path alive?".
  */
 int32_t aris_reader_gpu_offscreen_probe(uint32_t size, uint8_t *out_rgba, size_t len);
+
+/*
+ * Uploads a page bitmap (BGRA, sRGB, tightly packed) as a GPU texture and returns its
+ * handle. The buffer must hold width*height*4 bytes.
+ */
+int32_t aris_reader_gpu_upload_texture(uint32_t width,
+                                       uint32_t height,
+                                       const uint8_t *pixels,
+                                       size_t len,
+                                       uint64_t *out_texture_id);
+
+/* Releases a texture uploaded by aris_reader_gpu_upload_texture(). */
+int32_t aris_reader_gpu_release_texture(uint64_t texture_id);
+
+/*
+ * Draws an uploaded texture into the surface at (x, y, width, height) in physical
+ * pixels and presents the frame. `stats` may be NULL.
+ */
+int32_t aris_reader_surface_draw_page(uint64_t surface_id,
+                                      uint64_t texture_id,
+                                      float x,
+                                      float y,
+                                      float width,
+                                      float height,
+                                      ArisFrameStats *stats);
 
 /* Releases the device and every surface. */
 int32_t aris_reader_gpu_shutdown(void);

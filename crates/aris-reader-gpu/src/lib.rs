@@ -20,8 +20,10 @@
 //! | C. Offscreen + IOSurface fallback | Kept as a documented fallback; not needed. |
 
 pub mod context;
+pub mod page;
 
 pub use context::{FrameReport, GpuContext, SPIKE_TRIANGLE_RGBA};
+pub use page::TextureId;
 
 use aris_reader_core::{DocId, PageIndex, Rect, Size};
 use std::ffi::c_void;

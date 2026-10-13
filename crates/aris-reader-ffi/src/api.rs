@@ -10,7 +10,9 @@
 //! The full object graph (long-lived documents, sessions, viewports, event streams)
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
-use aris_reader_core::{DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex};
+use aris_reader_core::{
+    DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, RasterRequest,
+};
 use aris_reader_pdfium::{PdfiumBackend, backend_description};
 use std::sync::Arc;
 
@@ -127,6 +129,101 @@ impl ArisEngine {
             is_encrypted: backend.is_encrypted(),
             backend: backend_description().to_string(),
         })
+    }
+}
+
+/// Size of a page in points, already accounting for `/Rotate`.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct PageSize {
+    pub width_pt: f64,
+    pub height_pt: f64,
+    pub rotation_degrees: i32,
+}
+
+/// A rasterized page, ready to be uploaded to the GPU.
+///
+/// `pixels` is BGRA (sRGB), exactly what the GPU layer expects — see
+/// `docs/03-rendering.md` §5. The shell uploads it and draws a quad; until the tile
+/// pipeline lands (T1.5–T1.7) a whole page is one texture.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PageBitmap {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub stride: u32,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    pub pixels: Vec<u8>,
+}
+
+/// An open document.
+///
+/// Long-lived by design: the shell opens once and then asks for pages as the reader
+/// navigates. Threading follows `docs/02-architecture.md` §3 — the backend is
+/// `Send + Sync`, and rasterization happens on the caller's thread for now (the raster
+/// pool arrives with T1.3).
+#[derive(uniffi::Object)]
+pub struct ArisDocument {
+    backend: PdfiumBackend,
+    path: String,
+}
+
+#[uniffi::export]
+impl ArisDocument {
+    /// The path this document was opened from.
+    pub fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    pub fn page_count(&self) -> u32 {
+        self.backend.page_count()
+    }
+
+    /// Page size in points (`/Rotate` applied).
+    pub fn page_size_pt(&self, page: u32) -> Result<PageSize, ArisFfiError> {
+        let info = self.backend.page_info(PageIndex(page))?;
+        let view = info.geometry.view_size(1.0);
+        Ok(PageSize {
+            width_pt: view.width,
+            height_pt: view.height,
+            rotation_degrees: info.geometry.rotation.degrees(),
+        })
+    }
+
+    /// Rasterizes `page` at `scale` (1.0 = 72 dpi) into a BGRA buffer.
+    pub fn rasterize_page(&self, page: u32, scale: f64) -> Result<PageBitmap, ArisFfiError> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("scale must be positive and finite, got {scale}"),
+            });
+        }
+
+        let request = RasterRequest::full_page(PageIndex(page), scale);
+        let tile = self.backend.rasterize(&request)?;
+        let info = self.backend.page_info(PageIndex(page))?;
+        let view = info.geometry.view_size(1.0);
+
+        Ok(PageBitmap {
+            width_px: tile.size.width.round() as u32,
+            height_px: tile.size.height.round() as u32,
+            stride: tile.stride as u32,
+            width_pt: view.width,
+            height_pt: view.height,
+            pixels: tile.pixels,
+        })
+    }
+}
+
+#[uniffi::export]
+impl ArisEngine {
+    /// Opens a document and keeps it open (contrast with [`ArisEngine::probe_document`],
+    /// which is a one-shot summary).
+    pub fn open_document(
+        &self,
+        path: String,
+        password: Option<String>,
+    ) -> Result<Arc<ArisDocument>, ArisFfiError> {
+        let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
+        Ok(Arc::new(ArisDocument { backend, path }))
     }
 }
 

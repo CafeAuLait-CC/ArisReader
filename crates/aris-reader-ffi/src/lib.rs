@@ -70,7 +70,10 @@ pub struct ArisFrameStats {
     /// Centre pixel read back as 0xAARRGGBB (BGRA byte order), 0 when unavailable.
     pub center_bgra: u32,
     pub elapsed_us: u32,
+    /// Frames rendered since the context was created (all surfaces).
     pub frame_index: u64,
+    /// Frames rendered by this surface.
+    pub surface_frame_index: u64,
 }
 
 /// The process-wide GPU context, created by [`aris_reader_gpu_init`].
@@ -226,32 +229,144 @@ pub unsafe extern "C" fn aris_reader_surface_render(
         Ok(())
     });
 
-    if let (Some(frame), false) = (report, stats.is_null()) {
-        let [blue, green, red, alpha] = frame.center_pixel_bgra.unwrap_or([0, 0, 0, 0]);
-        // Packed as 0xAARRGGBB, which is what the Swift side decodes.
-        let center_argb =
-            u32::from(alpha) << 24 | u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue);
-        // SAFETY: the caller guarantees `stats` is null or writable (documented above).
-        unsafe {
-            stats.write(ArisFrameStats {
-                presented: u32::from(frame.presented),
-                width: frame.width,
-                height: frame.height,
-                srgb: u32::from(frame.format_is_srgb),
-                center_bgra: center_argb,
-                elapsed_us: frame.elapsed_us.min(u64::from(u32::MAX)) as u32,
-                frame_index: frame.frame_index,
-            });
-        }
+    // SAFETY: the contract of the exported function requires a writable `stats`.
+    unsafe { write_stats(result, report, stats) };
+    result
+}
+
+/// Copies a frame report into the caller's struct (a no-op for null pointers).
+///
+/// # Safety
+///
+/// `stats` must be null or writable.
+unsafe fn write_stats(
+    result: i32,
+    report: Option<aris_reader_gpu::FrameReport>,
+    stats: *mut ArisFrameStats,
+) {
+    if result != code::OK {
+        return;
+    }
+    let Some(frame) = report else { return };
+    if stats.is_null() {
+        return;
     }
 
-    result
+    let [blue, green, red, alpha] = frame.center_pixel_bgra.unwrap_or([0, 0, 0, 0]);
+    // Packed as 0xAARRGGBB, which is what the Swift side decodes.
+    let center_argb =
+        u32::from(alpha) << 24 | u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue);
+
+    // SAFETY: the caller guarantees `stats` is null or writable (documented above).
+    unsafe {
+        stats.write(ArisFrameStats {
+            presented: u32::from(frame.presented),
+            width: frame.width,
+            height: frame.height,
+            srgb: u32::from(frame.format_is_srgb),
+            center_bgra: center_argb,
+            elapsed_us: frame.elapsed_us.min(u64::from(u32::MAX)) as u32,
+            frame_index: frame.frame_index,
+            surface_frame_index: frame.surface_frame_index,
+        });
+    }
 }
 
 /// Unregisters a surface (only after this may Swift release the corresponding `CAMetalLayer`).
 #[unsafe(no_mangle)]
 pub extern "C" fn aris_reader_surface_detach(surface_id: u64) -> i32 {
     with_context(|context| context.detach_surface(SurfaceId(surface_id)))
+}
+
+/// Uploads a page bitmap (BGRA, sRGB, tightly packed) as a GPU texture.
+///
+/// # Safety
+///
+/// `pixels` must point to at least `width * height * 4` readable bytes and
+/// `out_texture_id` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aris_reader_gpu_upload_texture(
+    width: u32,
+    height: u32,
+    pixels: *const u8,
+    len: usize,
+    out_texture_id: *mut u64,
+) -> i32 {
+    if pixels.is_null() || out_texture_id.is_null() {
+        return code::ERR_INVALID_ARGUMENT;
+    }
+    let expected = (width as usize) * (height as usize) * 4;
+    if len < expected {
+        return code::ERR_INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller guarantees `pixels` covers `expected` bytes (documented above).
+    let bytes = unsafe { std::slice::from_raw_parts(pixels, expected) };
+
+    let mut texture_id = 0u64;
+    let result = with_context(|context| {
+        let id = context.upload_page_texture(width, height, bytes)?;
+        texture_id = id.0;
+        Ok(())
+    });
+    if result == code::OK {
+        // SAFETY: the caller guarantees `out_texture_id` is writable (documented above).
+        unsafe { out_texture_id.write(texture_id) };
+    }
+    result
+}
+
+/// Releases a texture uploaded by [`aris_reader_gpu_upload_texture`].
+#[unsafe(no_mangle)]
+pub extern "C" fn aris_reader_gpu_release_texture(texture_id: u64) -> i32 {
+    with_context(|context| context.release_texture(aris_reader_gpu::TextureId(texture_id)))
+}
+
+/// Draws an uploaded texture into the surface at `[x, y, width, height]` in physical
+/// pixels and presents the frame. `stats` may be null.
+///
+/// # Safety
+///
+/// `stats` must be null or point to a writable [`ArisFrameStats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aris_reader_surface_draw_page(
+    surface_id: u64,
+    texture_id: u64,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    stats: *mut ArisFrameStats,
+) -> i32 {
+    let mut report = None;
+    let result = with_context(|context| {
+        let frame = context.render_page(
+            SurfaceId(surface_id),
+            aris_reader_gpu::TextureId(texture_id),
+            [x, y, width, height],
+            // Neutral reading background; pages are drawn on top of it.
+            [0.13, 0.13, 0.15, 1.0],
+        )?;
+        if frame.surface_frame_index <= 2 || frame.surface_frame_index % 600 == 0 {
+            println!(
+                "aris-gpu: surface {} page frame {} — {}×{} px, presented={}, quad=({:.0},{:.0} {:.0}×{:.0})",
+                surface_id,
+                frame.surface_frame_index,
+                frame.width,
+                frame.height,
+                frame.presented,
+                x,
+                y,
+                width,
+                height
+            );
+        }
+        report = Some(frame);
+        Ok(())
+    });
+
+    // SAFETY: the contract of the exported function requires a writable `stats`.
+    unsafe { write_stats(result, report, stats) };
+    result
 }
 
 /// Renders the spike content offscreen and copies it into `out_rgba`.

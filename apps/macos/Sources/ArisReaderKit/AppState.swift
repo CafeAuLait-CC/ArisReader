@@ -62,6 +62,11 @@ public final class AppState: ObservableObject {
     @Published public var lastError: String?
     @Published public var showFileImporter: Bool = false
 
+    /// The page bitmap currently on screen (nil until a document is open).
+    @Published public private(set) var pageImage: PageImage?
+    /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
+    private var deviceScale: CGFloat = 2.0
+
     /// Human-readable GPU/frame status shown in the toolbar (updated a few times
     /// per second by the canvas, so it must stay cheap).
     @Published public var gpuStatus: String = "GPU: starting…"
@@ -77,16 +82,19 @@ public final class AppState: ObservableObject {
         let green = (color >> 8) & 0xFF
         let blue = color & 0xFF
         let format = stats.srgb == 1 ? "sRGB" : "linear"
+        // The centre pixel is only meaningful on the paths that opt into readback
+        // (the M0 spike did; the page path does not), so omit it rather than lie.
+        let center = stats.center_bgra == 0
+            ? ""
+            : String(format: " · centre #%02X%02X%02X", red, green, blue)
         gpuStatus = String(
-            format: "%@: %llu frames · %ux%u px · %@ · centre #%02X%02X%02X · %.1f ms",
+            format: "%@: %llu frames · %ux%u px · %@%@ · %.1f ms",
             label,
             stats.frame_index,
             stats.width,
             stats.height,
             format,
-            red,
-            green,
-            blue,
+            center,
             Double(stats.elapsed_us) / 1000.0
         )
     }
@@ -115,6 +123,16 @@ public final class AppState: ObservableObject {
         // exercise the whole Swift → UniFFI → PDFium path.
         if let path = ProcessInfo.processInfo.environment["ARIS_READER_OPEN"], !path.isEmpty {
             open(url: URL(fileURLWithPath: path))
+            // Optional 1-based page for headless checks: ARIS_READER_OPEN_PAGE=3
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_OPEN_PAGE"],
+               let page = Int(raw), page > 0 {
+                currentPage = page
+            }
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_ZOOM"],
+               let zoom = Int(raw), zoom > 0 {
+                zoomPercent = zoom
+            }
+            reloadPage()
         }
     }
 
@@ -143,6 +161,7 @@ public final class AppState: ObservableObject {
             } else {
                 statusMessage = "Opened \(loaded.title) (no pages reported)"
             }
+            reloadPage()
         } catch {
             lastError = String(describing: error)
             statusMessage = "Couldn't open the document"
@@ -151,22 +170,55 @@ public final class AppState: ObservableObject {
 
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
+        reloadPage()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
+        reloadPage()
     }
 
     public func zoomActual() {
         zoomPercent = 100
+        reloadPage()
     }
 
     public func nextPage() {
         guard let document, document.pageCount > 0 else { return }
         currentPage = min(document.pageCount, currentPage + 1)
+        reloadPage()
     }
 
     public func previousPage() {
+        guard currentPage > 1 else { return }
         currentPage = max(1, currentPage - 1)
+        reloadPage()
+    }
+
+    /// Called by the canvas once it knows the display's backing scale.
+    public func setDeviceScale(_ scale: CGFloat) {
+        guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
+        deviceScale = scale
+        reloadPage()
+    }
+
+    /// Rasterizes the current page at the current zoom and hands it to the canvas.
+    ///
+    /// Synchronous on purpose for this slice: a full A4 page takes single-digit
+    /// milliseconds with PDFium. Moving it to the raster pool (T1.3) is what makes
+    /// scrolling stay smooth once tiles arrive.
+    public func reloadPage() {
+        guard document != nil else {
+            pageImage = nil
+            return
+        }
+        let scale = CGFloat(zoomPercent) / 100.0 * deviceScale
+        do {
+            pageImage = try engine.renderPage(currentPage - 1, scale: scale)
+        } catch {
+            pageImage = nil
+            lastError = String(describing: error)
+            statusMessage = "Couldn't render page \(currentPage)"
+        }
     }
 }

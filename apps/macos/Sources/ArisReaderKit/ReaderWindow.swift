@@ -50,8 +50,11 @@ public struct ReaderWindow: View {
     private var canvas: some View {
         ZStack {
             PDFCanvasView(
+                pageImage: state.pageImage,
+                zoom: CGFloat(state.zoomPercent) / 100.0,
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
-                onFailure: { message in state.reportGpuFailure(message) }
+                onFailure: { message in state.reportGpuFailure(message) },
+                onDeviceScale: { scale in state.setDeviceScale(scale) }
             )
             secondSurface
 

@@ -66,11 +66,11 @@ pub struct FrameReport {
     pub surface_frame_index: u64,
 }
 
-struct SurfaceEntry {
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    settings: SurfaceConfig,
-    frame_index: u64,
+pub(crate) struct SurfaceEntry {
+    pub(crate) surface: wgpu::Surface<'static>,
+    pub(crate) config: wgpu::SurfaceConfiguration,
+    pub(crate) settings: SurfaceConfig,
+    pub(crate) frame_index: u64,
 }
 
 /// GPU context: process-wide device plus a table of attached surfaces.
@@ -80,14 +80,18 @@ struct SurfaceEntry {
 pub struct GpuContext {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surfaces: HashMap<SurfaceId, SurfaceEntry>,
-    /// One pipeline per target format; surfaces and the offscreen probe differ.
+    /// `pub(crate)` so the page pipeline in [`crate::page`] can share the one GPU
+    /// device without a second abstraction layer (all of it runs on the GPU thread).
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) surfaces: HashMap<SurfaceId, SurfaceEntry>,
+    /// One spike pipeline per target format; surfaces and the offscreen probe differ.
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     shader: wgpu::ShaderModule,
     next_surface_id: u64,
-    frames_rendered: u64,
+    pub(crate) frames_rendered: u64,
+    /// Textured-quad pipeline and the uploaded page textures (the tile compositor's start).
+    pub(crate) page: crate::page::PageState,
 }
 
 impl GpuContext {
@@ -134,6 +138,9 @@ impl GpuContext {
             source: wgpu::ShaderSource::Wgsl(SPIKE_SHADER.into()),
         });
 
+        // Built before the struct literal: the literal moves `device`.
+        let page = crate::page::PageState::new(&device);
+
         Ok(Self {
             instance,
             adapter,
@@ -144,6 +151,7 @@ impl GpuContext {
             shader,
             next_surface_id: 1,
             frames_rendered: 0,
+            page,
         })
     }
 

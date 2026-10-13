@@ -34,6 +34,34 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
     }
 }
 
+/// A rasterized page on its way to the GPU.
+///
+/// `bgra` is exactly what PDFium produced and exactly what the GPU layer expects, so
+/// nothing converts it on the way (`docs/03-rendering.md` §5).
+public struct PageImage: Sendable {
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    /// Page size in points (already rotated); the canvas scales it by the zoom factor.
+    public let pointSize: CGSize
+    public let bgra: Data
+    /// Monotonic id, so the canvas can tell a new rasterization from a repeated one.
+    public let generation: UInt64
+
+    public init(
+        pixelWidth: Int,
+        pixelHeight: Int,
+        pointSize: CGSize,
+        bgra: Data,
+        generation: UInt64
+    ) {
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.pointSize = pointSize
+        self.bgra = bgra
+        self.generation = generation
+    }
+}
+
 /// Engine interface.
 ///
 /// The UI depends only on this protocol, so the real engine (`RustEngine`, backed by the
@@ -41,17 +69,20 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
 @MainActor
 public protocol PDFEngine: AnyObject {
     func openDocument(at url: URL) throws -> LoadedDocument
+    /// Rasterizes a page at `scale` (1.0 = 72 dpi, so pass zoom × backing scale).
+    func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage
     /// Engine version plus backend description (About panel, diagnostics).
     var version: String { get }
 }
 
 /// The real engine: the UniFFI control plane described in `docs/05-ffi.md`.
-///
-/// Currently the control plane exposes a single `probeDocument` call (task T0.8 proved the
-/// pipeline); long-lived document handles, sessions and event streams arrive with M1.
 @MainActor
 public final class RustEngine: PDFEngine {
     private let engine: ArisEngine
+    /// The open document. One document per engine for now; the full document/session
+    /// graph (several windows, shared documents, event streams) is M1 work.
+    private var document: ArisDocument?
+    private var generation: UInt64 = 0
 
     public init() throws {
         self.engine = try ArisEngine()
@@ -62,16 +93,41 @@ public final class RustEngine: PDFEngine {
     }
 
     public func openDocument(at url: URL) throws -> LoadedDocument {
-        let summary = try engine.probeDocument(path: url.path, password: nil)
+        let opened = try engine.openDocument(path: url.path, password: nil)
+        document = opened
+
+        let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
+
         return LoadedDocument(
             title: url.deletingPathExtension().lastPathComponent,
-            pageCount: Int(summary.pageCount),
+            pageCount: Int(opened.pageCount()),
             url: url,
             firstPageSize: CGSize(
-                width: summary.firstPageWidthPt,
-                height: summary.firstPageHeightPt
+                width: firstPage?.widthPt ?? 0,
+                height: firstPage?.heightPt ?? 0
             ),
-            backend: summary.backend
+            backend: engine.backend()
+        )
+    }
+
+    public func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage {
+        guard let document else {
+            throw NSError(
+                domain: "ArisReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+
+        let bitmap = try document.rasterizePage(page: UInt32(page), scale: Double(scale))
+        generation += 1
+
+        return PageImage(
+            pixelWidth: Int(bitmap.widthPx),
+            pixelHeight: Int(bitmap.heightPx),
+            pointSize: CGSize(width: bitmap.widthPt, height: bitmap.heightPt),
+            bgra: bitmap.pixels,
+            generation: generation
         )
     }
 }
@@ -89,6 +145,14 @@ public final class MockEngine: PDFEngine {
             title: url.deletingPathExtension().lastPathComponent,
             pageCount: 0,
             url: url
+        )
+    }
+
+    public func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage {
+        throw NSError(
+            domain: "ArisReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize pages"]
         )
     }
 }
