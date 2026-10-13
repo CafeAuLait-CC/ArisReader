@@ -317,6 +317,50 @@ impl ArisDocument {
         })
     }
 
+    /// Rasterizes an arbitrary rectangle of `page`.
+    ///
+    /// The tile path proves PDFium's matrix rendering is exact; this exposes the same
+    /// capability for a rectangle the caller chooses, which is what a figure or table preview
+    /// needs (a citation points at a region, not at a whole page).
+    pub fn rasterize_region(
+        &self,
+        page: u32,
+        scale: f64,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<PageBitmap, ArisFfiError> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("scale must be positive and finite, got {scale}"),
+            });
+        }
+        if !(width_pt > 0.0 && height_pt > 0.0) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("region {width_pt}×{height_pt} must be positive"),
+            });
+        }
+
+        // A region is rasterized at its own budget: it is small by construction, so the
+        // whole-page clamp does not apply.
+        let request =
+            RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+        let tile = self.backend.rasterize(&request)?;
+        let info = self.backend.page_info(PageIndex(page))?;
+        let view = info.geometry.view_size(1.0);
+
+        Ok(PageBitmap {
+            width_px: tile.size.width.round() as u32,
+            height_px: tile.size.height.round() as u32,
+            stride: tile.stride as u32,
+            width_pt: view.width,
+            height_pt: view.height,
+            scale_used: scale,
+            pixels: tile.pixels,
+        })
+    }
+
     /// Extracts the text layer of `page`.
     ///
     /// Character boxes come back in **view space** (points, top-left origin), which is what

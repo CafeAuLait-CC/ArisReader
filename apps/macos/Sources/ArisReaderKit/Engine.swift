@@ -194,6 +194,15 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Rasterizes one rectangle of a page, in view-space points.
+    func rasterizeRegion(
+        page: Int,
+        scale: CGFloat,
+        xPt: CGFloat,
+        yPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat
+    ) async throws -> PageImage
     /// Links on a page, in view space (empty when the page has none).
     func links(_ page: Int) async throws -> [DocumentLink]
     /// Document outline (empty when the PDF has no bookmarks).
@@ -391,6 +400,52 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func rasterizeRegion(
+        page: Int,
+        scale: CGFloat,
+        xPt: CGFloat,
+        yPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat
+    ) async throws -> PageImage {
+        guard let document else {
+            throw NSError(
+                domain: "ArisReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+
+        generation += 1
+        let generation = self.generation
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let bitmap = try document.rasterizeRegion(
+                        page: UInt32(page),
+                        scale: Double(scale),
+                        xPt: Double(xPt),
+                        yPt: Double(yPt),
+                        widthPt: Double(widthPt),
+                        heightPt: Double(heightPt)
+                    )
+                    continuation.resume(
+                        returning: PageImage(
+                            pixelWidth: Int(bitmap.widthPx),
+                            pixelHeight: Int(bitmap.heightPx),
+                            pointSize: CGSize(width: widthPt, height: heightPt),
+                            bgra: bitmap.pixels,
+                            generation: generation
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func links(_ page: Int) async throws -> [DocumentLink] {
         guard let document else { return [] }
 
@@ -554,6 +609,21 @@ public final class MockEngine: PDFEngine {
             domain: "ArisReader",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
+        )
+    }
+
+    public func rasterizeRegion(
+        page: Int,
+        scale: CGFloat,
+        xPt: CGFloat,
+        yPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat
+    ) async throws -> PageImage {
+        throw NSError(
+            domain: "ArisReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize regions"]
         )
     }
 

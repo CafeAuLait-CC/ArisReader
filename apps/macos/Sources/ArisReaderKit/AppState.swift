@@ -156,6 +156,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         public let title: String
         /// Where the link was found, shown in the panel for context.
         public let source: String
+        /// Region of the target page to show, when the citation points at a figure or table
+        /// rather than at the top of a page (view space, points).
+        public let region: CGRect?
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -167,16 +170,39 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private let referencePreviewWidthPt: CGFloat = 300
 
     /// Opens a floating preview of `page`.
-    public func openReferencePreview(page: Int, title: String, from source: String) {
+    public func openReferencePreview(
+        page: Int,
+        title: String,
+        from source: String,
+        region: CGRect? = nil
+    ) {
         guard document != nil, page >= 0 else { return }
-        referencePreview = ReferencePreview(page: page, title: title, source: source)
+        referencePreview = ReferencePreview(
+            page: page,
+            title: title,
+            source: source,
+            region: region
+        )
 
-        let widthPt = max(engine.contentWidthPt(gapPt: pageGapPt), 1)
+        let widthPt = max(region?.width ?? engine.contentWidthPt(gapPt: pageGapPt), 1)
         let scale = referencePreviewWidthPt / widthPt * deviceScale
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard let image = try? await self.engine.renderPage(page, scale: scale) else { return }
+            let rasterized: PageImage?
+            if let region {
+                rasterized = try? await self.engine.rasterizeRegion(
+                    page: page,
+                    scale: scale,
+                    xPt: region.minX,
+                    yPt: region.minY,
+                    widthPt: region.width,
+                    heightPt: region.height
+                )
+            } else {
+                rasterized = try? await self.engine.renderPage(page, scale: scale)
+            }
+            guard let image = rasterized else { return }
 
             self.referencePreviewPages = [
                 CanvasPage(
@@ -406,13 +432,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
 
             // Development aid: ARIS_READER_PREVIEW=<page> opens the reference panel, so M4
-            // is verifiable without clicking a link.
+            // is verifiable without clicking a link. ARIS_READER_PREVIEW_REGION="x,y,w,h"
+            // (view-space points) shows just that rectangle — the figure/table case.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_PREVIEW"],
                let page = Int(raw), page > 0 {
+                var region: CGRect?
+                if let spec = ProcessInfo.processInfo.environment["ARIS_READER_PREVIEW_REGION"] {
+                    let parts = spec.split(separator: ",").compactMap { Double($0) }
+                    if parts.count == 4 {
+                        region = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+                    }
+                }
                 openReferencePreview(
                     page: page - 1,
-                    title: "Page \(page)",
-                    from: "ARIS_READER_PREVIEW"
+                    title: region == nil ? "Page \(page)" : "Figure on page \(page)",
+                    from: "ARIS_READER_PREVIEW",
+                    region: region
                 )
             }
 
