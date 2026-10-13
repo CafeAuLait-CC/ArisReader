@@ -5,7 +5,8 @@
 
 use aris_reader_core::{
     ArisError, DocumentBackend, ErrorCode, LinkInfo, OutlineNode, PageGeometry, PageIndex,
-    PageInfo, RasterFormat, RasterRequest, RasterTile, RawTextPage, Rect, Result, Rotation, Size,
+    PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawCharBox, RawTextPage, Rect,
+    Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -306,10 +307,59 @@ impl DocumentBackend for PdfiumBackend {
         Err(ArisError::not_implemented("PdfiumBackend::links (T4.1)"))
     }
 
-    fn raw_text_page(&self, _page: PageIndex) -> Result<RawTextPage> {
-        Err(ArisError::not_implemented(
-            "PdfiumBackend::raw_text_page (T2.1)",
-        ))
+    fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage> {
+        // Text extraction walks the same document state as rendering, so it takes the same
+        // lock (`docs/03-rendering.md`).
+        let _guard = self
+            .raster_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let pdf_page = self.page(page)?;
+        let text = pdf_page.text().map_err(|error| {
+            ArisError::new(
+                ErrorCode::RenderFailed,
+                "PDFium failed to read the text layer",
+            )
+            .with_detail(format!("page {} → {error}", page.get()))
+        })?;
+
+        let mut chars = Vec::new();
+        for character in text.chars().iter() {
+            let bounds = character.loose_bounds().map_err(|error| {
+                ArisError::new(ErrorCode::RenderFailed, "PDFium reported no character box")
+                    .with_detail(format!("page {} → {error}", page.get()))
+            })?;
+            let unicode = character
+                .unicode_char()
+                .map(u32::from)
+                .unwrap_or(u32::from(char::REPLACEMENT_CHARACTER));
+
+            chars.push(RawCharBox {
+                rect: rect_from_pdf(bounds),
+                origin: Point::new(
+                    f64::from(bounds.left().value),
+                    f64::from(bounds.bottom().value),
+                ),
+                unicode,
+                // `PdfPageTextChar::font_size` is not usable here (its trait bounds are
+                // not satisfied); the loose box height is a good stand-in for selection UI.
+                font_size: f64::from(bounds.height().value),
+                // TODO(T2.1): derive the glyph angle from the text matrix; PDFium's
+                // character API does not expose it directly.
+                angle: 0.0,
+            });
+        }
+
+        Ok(RawTextPage {
+            page,
+            chars,
+            text: text.all(),
+            // TODO(T2.1): `FPDFText_IsGenerated` / `FPDFText_HasUnicodeMapError` are not
+            // exposed by pdfium-render yet; both matter for search reliability.
+            is_generated: false,
+            has_unicode_map_error: false,
+        })
     }
 
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {

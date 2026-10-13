@@ -67,6 +67,14 @@ public final class MetalCanvasView: NSView {
 
     /// Scroll gestures, reported as deltas in screen points.
     public var onScroll: ((CGFloat) -> Void)?
+    /// Pointer events, reported in **content points** (the shell's layout space).
+    public var onPointerDown: ((CGPoint) -> Void)?
+    public var onPointerDragged: ((CGPoint) -> Void)?
+    public var onPointerUp: (() -> Void)?
+    /// ⌘C.
+    public var onCopy: (() -> Void)?
+    /// Horizontal offset of the content inside the viewport, in screen points.
+    private var contentOffsetX: CGFloat = 0
     /// Viewport size in screen points, so the shell can compute what is visible.
     public var onViewportSize: ((CGSize) -> Void)?
     /// Width of the widest page in points; used to centre narrow documents.
@@ -146,6 +154,42 @@ public final class MetalCanvasView: NSView {
     }
 
     public override var acceptsFirstResponder: Bool { true }
+
+    // MARK: - Pointer
+
+    /// Converts an event location into content points (origin at the first page's top-left,
+    /// one unit per PDF point at 100% zoom), which is the space the shell thinks in.
+    private func contentPoint(for event: NSEvent) -> CGPoint {
+        let view = convert(event.locationInWindow, from: nil)
+        let fromTop = CGPoint(x: view.x, y: bounds.height - view.y)
+        return CGPoint(
+            x: (fromTop.x - contentOffsetX) / max(zoom, 0.01),
+            y: fromTop.y / max(zoom, 0.01) + scrollYPt
+        )
+    }
+
+    public override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        onPointerDown?(contentPoint(for: event))
+    }
+
+    public override func mouseDragged(with event: NSEvent) {
+        onPointerDragged?(contentPoint(for: event))
+    }
+
+    public override func mouseUp(with event: NSEvent) {
+        onPointerUp?()
+    }
+
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // ⌘C without a menu item: the canvas is the first responder while reading.
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "c" {
+            onCopy?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     public override func keyDown(with event: NSEvent) {
         let page = bounds.height * 0.9
@@ -338,6 +382,7 @@ public final class MetalCanvasView: NSView {
         // is the normal case for a maximised window.
         let contentWidthPx = contentWidthPt * zoom * scale
         let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
+        contentOffsetX = offsetX / scale
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
@@ -421,6 +466,10 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onDeviceScale: (CGFloat) -> Void
     private let onViewportSize: (CGSize) -> Void
     private let onScroll: (CGFloat) -> Void
+    private let onPointerDown: (CGPoint) -> Void
+    private let onPointerDragged: (CGPoint) -> Void
+    private let onPointerUp: () -> Void
+    private let onCopy: () -> Void
 
     public init(
         pages: [CanvasPage] = [],
@@ -431,7 +480,11 @@ public struct PDFCanvasView: NSViewRepresentable {
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
-        onScroll: @escaping (CGFloat) -> Void = { _ in }
+        onScroll: @escaping (CGFloat) -> Void = { _ in },
+        onPointerDown: @escaping (CGPoint) -> Void = { _ in },
+        onPointerDragged: @escaping (CGPoint) -> Void = { _ in },
+        onPointerUp: @escaping () -> Void = {},
+        onCopy: @escaping () -> Void = {}
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -442,6 +495,10 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onDeviceScale = onDeviceScale
         self.onViewportSize = onViewportSize
         self.onScroll = onScroll
+        self.onPointerDown = onPointerDown
+        self.onPointerDragged = onPointerDragged
+        self.onPointerUp = onPointerUp
+        self.onCopy = onCopy
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -460,6 +517,10 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onDeviceScale = onDeviceScale
         view.onViewportSize = onViewportSize
         view.onScroll = onScroll
+        view.onPointerDown = onPointerDown
+        view.onPointerDragged = onPointerDragged
+        view.onPointerUp = onPointerUp
+        view.onCopy = onCopy
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt

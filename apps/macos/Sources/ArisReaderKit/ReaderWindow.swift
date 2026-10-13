@@ -58,7 +58,11 @@ public struct ReaderWindow: View {
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
                 onViewportSize: { size in state.setViewportSize(size) },
-                onScroll: { delta in state.scroll(byScreenPoints: delta) }
+                onScroll: { delta in state.scroll(byScreenPoints: delta) },
+                onPointerDown: { point in state.beginSelection(at: point) },
+                onPointerDragged: { point in state.extendSelection(to: point) },
+                onPointerUp: { state.clearSelection() },
+                onCopy: { state.copySelection() }
             )
             secondSurface
 

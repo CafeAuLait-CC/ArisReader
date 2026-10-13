@@ -83,6 +83,23 @@ public struct PagePlacement: Equatable, Sendable {
     }
 }
 
+/// One character of a page's text layer, boxed in view space (points, top-left origin).
+public struct TextChar: Sendable {
+    public let unicode: UInt32
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+}
+
+/// A page's text layer.
+public struct TextPage: Sendable {
+    public let page: Int
+    public let chars: [TextChar]
+    public let text: String
+    public let hasUnicodeMapError: Bool
+}
+
 /// One rasterized tile: what `rasterizeTile` hands back.
 ///
 /// Tiles are the unit the shell thinks in once zoom passes what a single page texture can
@@ -147,6 +164,8 @@ public protocol PDFEngine: AnyObject {
         tileY: Int,
         tileSize: Int
     ) async throws -> TileImage
+    /// Extracts the text layer of a page (character boxes in view space).
+    func textPage(_ page: Int) async throws -> TextPage
     /// Total height of the scrolling content, in points.
     func contentHeightPt(gapPt: CGFloat) -> CGFloat
     /// Width of the widest page, in points (the canvas centres the content with it).
@@ -302,6 +321,42 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func textPage(_ page: Int) async throws -> TextPage {
+        guard let document else {
+            throw NSError(
+                domain: "ArisReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let extracted = try document.textPage(page: UInt32(page))
+                    continuation.resume(
+                        returning: TextPage(
+                            page: page,
+                            chars: extracted.chars.map { character in
+                                TextChar(
+                                    unicode: character.unicode,
+                                    xPt: CGFloat(character.xPt),
+                                    yPt: CGFloat(character.yPt),
+                                    widthPt: CGFloat(character.widthPt),
+                                    heightPt: CGFloat(character.heightPt)
+                                )
+                            },
+                            text: extracted.text,
+                            hasUnicodeMapError: extracted.hasUnicodeMapError
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
         guard let document else { return 0 }
         return CGFloat(document.contentHeightPt(gapPt: Double(gapPt)))
@@ -384,6 +439,14 @@ public final class MockEngine: PDFEngine {
             domain: "ArisReader",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize tiles"]
+        )
+    }
+
+    public func textPage(_ page: Int) async throws -> TextPage {
+        throw NSError(
+            domain: "ArisReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
         )
     }
 

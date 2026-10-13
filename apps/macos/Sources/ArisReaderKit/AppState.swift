@@ -1,5 +1,6 @@
 import ArisReaderFFI
 import Combine
+import AppKit
 import Foundation
 
 /// Sidebar tabs (see `docs/04-ui-ux.md` §2.2).
@@ -103,6 +104,31 @@ public final class AppState: ObservableObject {
     /// arrive afterwards are stale and get dropped.
     private var renderEpoch: UInt64 = 0
 
+    /// Text layers, fetched once per page.
+    private var textPages: [Int: TextPage] = [:]
+    private var textPagesInFlight: Set<Int> = []
+    /// Page placements from the last layout pass (hit-testing needs them).
+    private var visiblePagePlacements: [PagePlacement] = []
+
+    /// A selection: a page and an inclusive character range in its text layer.
+    public struct Selection: Equatable, Sendable {
+        public let page: Int
+        public let range: ClosedRange<Int>
+    }
+
+    @Published public private(set) var selection: Selection?
+    /// Character the drag started on, so extending the selection stays anchored.
+    private var selectionAnchor: Int?
+    /// 1×1 texture drawn as a translucent quad over selected characters — the same
+    /// textured-quad pipeline the pages use, so selection needs no new GPU path.
+    private lazy var highlightImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x40, 0xC0, 0xFF, 0x55]),
+        generation: 1
+    )
+
     /// Raster scale as a discrete pyramid level: the smallest LOD whose scale covers the
     /// zoom. Zooming therefore stops re-rasterizing anything — the GPU scales the quad from
     /// the nearest LOD, and only the tile *set* changes.
@@ -197,6 +223,12 @@ public final class AppState: ObservableObject {
                 beginScrollActivity()
             }
             reloadVisiblePages()
+
+            // Development aid: ARIS_READER_SELECT="x1,y1;x2,y2" (content points) selects
+            // between two points and copies, so the text path can be verified headlessly.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SELECT"], !raw.isEmpty {
+                selectForVerification(raw)
+            }
         }
     }
 
@@ -287,6 +319,33 @@ public final class AppState: ObservableObject {
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
         reloadVisiblePages()
+    }
+
+    /// Selects between two content-space points and copies the result (development aid).
+    private func selectForVerification(_ specification: String) {
+        let points = specification.split(separator: ";").compactMap { pair -> CGPoint? in
+            let parts = pair.split(separator: ",").compactMap { Double($0) }
+            guard parts.count == 2 else { return nil }
+            return CGPoint(x: parts[0], y: parts[1])
+        }
+        guard let first = points.first else { return }
+
+        Task { @MainActor [weak self] in
+            // Text layers arrive asynchronously; give them a moment before hit-testing.
+            try? await Task.sleep(for: .milliseconds(700))
+            self?.beginSelection(at: first)
+            if points.count > 1 {
+                self?.extendSelection(to: points[1])
+            }
+            // Clear first: otherwise a failed selection would leave the *previous* run's
+            // text on the pasteboard and the check would pass for the wrong reason.
+            NSPasteboard.general.clearContents()
+            self?.copySelection()
+
+            let selected = NSPasteboard.general.string(forType: .string) ?? ""
+            let line = "aris-select: \(selected.count) characters: \"\(selected)\"\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
     }
 
     /// 0…1 position of the viewport inside the content (drives the scroll indicator).
@@ -382,6 +441,8 @@ public final class AppState: ObservableObject {
         let top = scrollYPt - margin
         let bottom = scrollYPt + viewportHeight + margin
 
+        visiblePagePlacements = Array(visible)
+
         var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
 
@@ -414,9 +475,146 @@ public final class AppState: ObservableObject {
             }
         }
 
+        appendSelectionHighlights(to: &pages)
+        prefetchTextLayers(for: visible)
         evictTiles(keeping: wanted)
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
+    }
+
+    /// Adds one translucent quad per selected character.
+    private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
+        guard let selection,
+              let textPage = textPages[selection.page],
+              let placement = visiblePagePlacements.first(where: { $0.index == selection.page })
+        else { return }
+
+        for index in selection.range where index < textPage.chars.count {
+            let character = textPage.chars[index]
+            pages.append(
+                CanvasPage(
+                    placement: PagePlacement(
+                        index: 900_000_000 + index,
+                        topPt: placement.topPt + character.yPt,
+                        leftPt: placement.leftPt + character.xPt,
+                        widthPt: character.widthPt,
+                        heightPt: character.heightPt
+                    ),
+                    image: highlightImage
+                )
+            )
+        }
+    }
+
+    /// Fetches the text layer of every visible page (once), so hit-testing is instant.
+    private func prefetchTextLayers(for placements: [PagePlacement]) {
+        for placement in placements where textPages[placement.index] == nil {
+            guard !textPagesInFlight.contains(placement.index) else { continue }
+            textPagesInFlight.insert(placement.index)
+
+            let page = placement.index
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.textPagesInFlight.remove(page) }
+                if let extracted = try? await self.engine.textPage(page) {
+                    self.textPages[page] = extracted
+                    self.reloadVisiblePages()
+                }
+            }
+        }
+    }
+
+    // MARK: - Selection
+
+    /// Starts a selection at a point in content space.
+    public func beginSelection(at point: CGPoint) {
+        guard let hit = characterIndex(at: point) else {
+            clearSelection()
+            return
+        }
+        selectionAnchor = hit.index
+        selection = Selection(page: hit.page, range: hit.index...hit.index)
+        reloadVisiblePages()
+    }
+
+    /// Extends the selection to a point in content space.
+    public func extendSelection(to point: CGPoint) {
+        guard let anchor = selectionAnchor,
+              let current = selection,
+              let hit = characterIndex(at: point),
+              hit.page == current.page
+        else { return }
+
+        selection = Selection(
+            page: current.page,
+            range: min(anchor, hit.index)...max(anchor, hit.index)
+        )
+        reloadVisiblePages()
+    }
+
+    public func clearSelection() {
+        guard selection != nil || selectionAnchor != nil else { return }
+        selection = nil
+        selectionAnchor = nil
+        reloadVisiblePages()
+    }
+
+    /// Copies the selected characters (⌘C from the canvas).
+    public func copySelection() {
+        guard let selection, let textPage = textPages[selection.page] else { return }
+        let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
+        guard !range.isEmpty else { return }
+
+        let scalars = textPage.chars[range].compactMap { Unicode.Scalar($0.unicode) }
+        let string = String(String.UnicodeScalarView(scalars))
+        guard !string.isEmpty else { return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+        statusMessage = "Copied \(string.count) characters"
+    }
+
+    /// Character under a content-space point: containment first, then the nearest box on
+    /// the same line, so clicking just past the end of a word still lands somewhere useful.
+    private func characterIndex(at point: CGPoint) -> (page: Int, index: Int)? {
+        for placement in visiblePagePlacements {
+            let pageRect = CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            )
+            guard pageRect.contains(point), let textPage = textPages[placement.index] else {
+                continue
+            }
+
+            let local = CGPoint(
+                x: point.x - placement.leftPt,
+                y: point.y - placement.topPt
+            )
+            var best: (index: Int, distance: CGFloat)?
+
+            for (index, character) in textPage.chars.enumerated() {
+                let box = CGRect(
+                    x: character.xPt,
+                    y: character.yPt,
+                    width: character.widthPt,
+                    height: character.heightPt
+                )
+                if box.contains(local) {
+                    return (placement.index, index)
+                }
+                guard abs(box.midY - local.y) < max(box.height * 1.5, 14) else { continue }
+                let distance = abs(box.midX - local.x)
+                if best == nil || distance < best!.distance {
+                    best = (index, distance)
+                }
+            }
+
+            if let best { return (placement.index, best.index) }
+            return nil
+        }
+        return nil
     }
 
     /// Rasterizes one tile in the background and folds it into the cache.

@@ -11,7 +11,7 @@
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
 use aris_reader_core::{
-    DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, RasterRequest,
+    DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, Point, RasterRequest,
 };
 use aris_reader_pdfium::{PdfiumBackend, backend_description};
 use aris_reader_session::DocumentLayout;
@@ -317,6 +317,46 @@ impl ArisDocument {
         })
     }
 
+    /// Extracts the text layer of `page`.
+    ///
+    /// Character boxes come back in **view space** (points, top-left origin), which is what
+    /// hit-testing needs, so the shell never touches page space. The order is the engine's
+    /// character order, not necessarily visual reading order (see `docs/03-rendering.md`).
+    pub fn text_page(&self, page: u32) -> Result<TextPage, ArisFfiError> {
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+
+        let chars = raw
+            .chars
+            .iter()
+            .map(|character| {
+                // Page boxes use a bottom-left origin, so the glyph's *top* edge is what
+                // maps to the view-space y after the single Y-flip.
+                let top_left = Point::new(
+                    character.rect.origin.x,
+                    character.rect.origin.y + character.rect.size.height,
+                );
+                // `page_to_view(1.0)` is the page→view transform at 100%: character boxes are
+                // reported in content points, and the canvas applies the zoom itself.
+                let view = geometry.page_to_view(1.0).apply(top_left);
+                TextChar {
+                    unicode: character.unicode,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: character.rect.size.width,
+                    height_pt: character.rect.size.height,
+                }
+            })
+            .collect();
+
+        Ok(TextPage {
+            page,
+            chars,
+            text: raw.text,
+            has_unicode_map_error: raw.has_unicode_map_error,
+        })
+    }
+
     /// Total height of the scrolling content for the given page gap.
     pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
         self.layout(gap_pt).content_height_pt()
@@ -440,6 +480,27 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     scale
 }
 
+/// One character of a page's text layer, boxed in **view space** (points, top-left origin).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TextChar {
+    pub unicode: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// A page's text layer plus the whole-page string.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TextPage {
+    pub page: u32,
+    pub chars: Vec<TextChar>,
+    /// Whole-page text, aligned with `chars` (line breaks as `\n`).
+    pub text: String,
+    /// The Unicode mapping has errors, which makes search unreliable.
+    pub has_unicode_map_error: bool,
+}
+
 /// One rasterized tile of a page.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TileBitmap {
@@ -503,6 +564,54 @@ mod tests {
             Err(ArisFfiError::Document { message }) => assert!(!message.is_empty()),
             other => panic!("expected a document error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn text_page_returns_boxes_inside_the_page() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        let text = document.text_page(0).expect("text page");
+        assert!(!text.text.is_empty(), "the fixture has a text layer");
+        assert!(
+            text.chars.len() > 50,
+            "only {} characters",
+            text.chars.len()
+        );
+
+        let size = document.page_size_pt(0).expect("page size");
+        for character in &text.chars {
+            assert!(
+                character.x_pt >= -1.0 && character.x_pt <= size.width_pt + 1.0,
+                "character x {} outside the page width {}",
+                character.x_pt,
+                size.width_pt
+            );
+            // View space: y grows downwards from the top edge.
+            assert!(
+                character.y_pt >= -1.0 && character.y_pt <= size.height_pt + 1.0,
+                "character y {} outside the page height {}",
+                character.y_pt,
+                size.height_pt
+            );
+        }
+
+        // The whole-page string is what search will run on, so it must be the same text.
+        assert!(
+            text.text.chars().count() >= text.chars.len() / 2,
+            "the page string looks truncated: {} chars of text for {} boxes",
+            text.text.chars().count(),
+            text.chars.len()
+        );
     }
 
     #[test]
