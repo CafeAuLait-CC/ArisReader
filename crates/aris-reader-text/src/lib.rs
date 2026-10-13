@@ -649,6 +649,11 @@ pub fn find_references_with_landings(
     landings: &std::collections::BTreeMap<u32, Vec<f64>>,
     max_entries: usize,
 ) -> Vec<ReferenceEntry> {
+    // Region gating was tried and reverted: `locate_reference_region` is accurate for most of the
+    // sample corpus but mis-locates a few papers (one put the list at pages 19..21 while it sits
+    // near page 10), and gating on a wrong region costs far more than the gains elsewhere -- one
+    // paper lost 50 points of matched citations. The locator stays as a diagnostic (`region` in the
+    // CLI prints per-page scores) until the region decision itself is made self-consistent.
     let parsed = find_references(pages.iter().map(|(page, text)| (*page, text)), max_entries);
     if landings.is_empty() {
         return parsed;
@@ -1665,5 +1670,222 @@ mod block_tests {
         let blocks = blocks_from(&lines_from(&page), 0.8);
         assert_eq!(blocks.len(), 2, "{blocks:?}");
         assert!(blocks.iter().all(|block| block.lines.len() == 2));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Locating the reference region (M4)
+// ---------------------------------------------------------------------------
+
+/// Where a document's reference list lives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReferenceRegion {
+    pub from_page: u32,
+    pub to_page: u32,
+    /// Mean page score across the region; higher is more confident.
+    pub score: f64,
+}
+
+/// How much a page looks like part of a reference list.
+///
+/// Deliberately a *combination of weak signals* rather than one strong rule, because no single
+/// feature of this corpus is reliable: headings vary in wording and position, numbering styles
+/// differ, and some bibliographies have no numbers at all. Density is what separates the two kinds
+/// of page in practice — a body page is full of citation *mentions* in prose, a reference page is
+/// full of entry *starts* — so that comparison carries the most weight.
+pub fn reference_page_score(text: &RawTextPage) -> f64 {
+    let lines = lines_from(text);
+    if lines.is_empty() {
+        return 0.0;
+    }
+
+    let page_text: String = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+    let heading = if looks_like_reference_heading(&page_text) {
+        1.0
+    } else {
+        0.0
+    };
+
+    let mut entry_starts = 0usize;
+    let mut surnames: Vec<String> = Vec::new();
+    for line in &lines {
+        let trimmed = line.text.trim();
+        if trimmed.chars().count() < 4 {
+            continue;
+        }
+        let label = entry_label(trimmed);
+        if label.is_empty() {
+            continue;
+        }
+        entry_starts += 1;
+        if let Some(surname) = label.split_whitespace().next() {
+            surnames.push(surname.to_ascii_lowercase());
+        }
+    }
+
+    // Mentions inside prose: bracketed numbers that are *not* at a line start.
+    let brackets = page_text.matches('[').count();
+    let prose_mentions = brackets.saturating_sub(entry_starts);
+
+    let ordered = surnames
+        .windows(2)
+        .filter(|pair| pair[0] <= pair[1])
+        .count();
+    let alphabetical = if surnames.len() >= 4 {
+        ordered as f64 / (surnames.len() - 1) as f64
+    } else {
+        0.0
+    };
+
+    let line_count = lines.len().max(1) as f64;
+    let entry_density = (entry_starts as f64 / line_count / 0.5).min(1.0);
+    let prose_density = (prose_mentions as f64 / line_count / 0.3).min(1.0);
+
+    2.0 * heading + 2.0 * entry_density + 1.0 * alphabetical - 1.5 * prose_density
+}
+
+/// Finds the longest run of consecutive pages that look like a reference list.
+///
+/// `pages` must be in reading order. A single non-candidate page is allowed inside a run, because
+/// a list can be interrupted (a figure, a page break artefact) without ending.
+pub fn locate_reference_region(pages: &[(u32, RawTextPage)]) -> Option<ReferenceRegion> {
+    // Measured: real reference pages in the sample corpus score 1.1-3.1 while body pages sit near
+    // 0 (prose is full of citation mentions, which the score penalises), so 1.0 separates them with
+    // margin. A stricter 1.5 cut a genuine list page out of the middle of one region and cost that
+    // paper half its entries.
+    const THRESHOLD: f64 = 1.0;
+
+    let scored: Vec<(u32, f64)> = pages
+        .iter()
+        .map(|(page, text)| (*page, reference_page_score(text)))
+        .collect();
+
+    let mut best: Option<ReferenceRegion> = None;
+    let mut start: Option<usize> = None;
+    let mut gap = 0usize;
+    let mut index = 0usize;
+
+    while index <= scored.len() {
+        let candidate = scored
+            .get(index)
+            .map(|(_, score)| *score >= THRESHOLD)
+            .unwrap_or(false);
+
+        if candidate {
+            start.get_or_insert(index);
+            gap = 0;
+        } else if let Some(begin) = start {
+            gap += 1;
+            if gap > 1 || index == scored.len() {
+                let end = index.saturating_sub(gap);
+                if end >= begin {
+                    let scores: Vec<f64> = scored[begin..=end].iter().map(|(_, s)| *s).collect();
+                    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+                    let region = ReferenceRegion {
+                        from_page: scored[begin].0,
+                        to_page: scored[end].0,
+                        score: mean,
+                    };
+                    if best
+                        .map(|current| region.score > current.score)
+                        .unwrap_or(true)
+                    {
+                        best = Some(region);
+                    }
+                }
+                start = None;
+                gap = 0;
+            }
+        }
+
+        index += 1;
+    }
+
+    best
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use aris_reader_core::{PageIndex, Point, RawCharBox, RawTextPage, Rect};
+
+    fn page_of(text: &str) -> RawTextPage {
+        let mut chars = Vec::new();
+        for (row, line) in text.lines().enumerate() {
+            for (column, character) in line.chars().enumerate() {
+                chars.push(RawCharBox {
+                    rect: Rect::new(column as f64 * 5.0, 800.0 - row as f64 * 12.0, 5.0, 10.0),
+                    origin: Point::new(column as f64 * 5.0, 800.0 - row as f64 * 12.0),
+                    unicode: character as u32,
+                    font_size: 10.0,
+                    angle: 0.0,
+                    font_name: "Body".to_string(),
+                });
+            }
+        }
+        RawTextPage {
+            page: PageIndex(0),
+            chars,
+            text: text.to_string(),
+            is_generated: false,
+            has_unicode_map_error: false,
+        }
+    }
+
+    #[test]
+    fn a_body_page_scores_lower_than_a_reference_page() {
+        let body = page_of(
+            "1 Introduction\nAs shown in [12] and [15], the method works (Kim et al. 2023).\n\
+             We compare against [3] and [22] on several benchmarks.\n",
+        );
+        let references = page_of(
+            "References\n[1] Aberman, K.: First work on the topic.\n[2] Barzel, R.: Second work.\n\
+             [3] Chen, X.: Third work.\n[4] Dhariwal, P.: Fourth work.\n",
+        );
+        assert!(
+            reference_page_score(&references) > reference_page_score(&body),
+            "reference {} vs body {}",
+            reference_page_score(&references),
+            reference_page_score(&body)
+        );
+    }
+
+    #[test]
+    fn the_region_is_the_run_of_reference_pages() {
+        let pages = vec![
+            (0u32, page_of("1 Introduction\nWe cite [1] and [2] here.\n")),
+            (
+                1u32,
+                page_of("2 Method\nOur approach [3] improves on [4].\n"),
+            ),
+            (
+                2u32,
+                page_of(
+                    "References\n[1] Aberman, K.: First.\n[2] Barzel, R.: Second.\n[3] Chen, X.: Third.\n",
+                ),
+            ),
+            (
+                3u32,
+                page_of("[4] Dhariwal, P.: Fourth.\n[5] Evans, R.: Fifth.\n[6] Fox, T.: Sixth.\n"),
+            ),
+        ];
+        let region = locate_reference_region(&pages).expect("a region");
+        assert_eq!((region.from_page, region.to_page), (2, 3), "{region:?}");
+    }
+
+    #[test]
+    fn a_document_without_references_has_no_region() {
+        let pages = vec![
+            (0u32, page_of("1 Introduction\nWe cite [1] and [2] here.\n")),
+            (
+                1u32,
+                page_of("2 Method\nOur approach [3] improves on [4].\n"),
+            ),
+        ];
+        assert!(locate_reference_region(&pages).is_none());
     }
 }

@@ -79,6 +79,7 @@ fn main() -> ExitCode {
         Some("analyze") => cmd_analyze(rest(&args)),
         Some("cite") => cmd_cite(rest(&args)),
         Some("blocks") => cmd_blocks(rest(&args)),
+        Some("region") => cmd_region(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -969,6 +970,17 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         }
     }
 
+    let region = aris_reader_text::locate_reference_region(&pages);
+    match region {
+        Some(region) => println!(
+            "  reference region: pages {}..{} (score {:.2})",
+            region.from_page + 1,
+            region.to_page + 1,
+            region.score
+        ),
+        None => println!("  reference region: not found"),
+    }
+
     let references = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
     println!("  reference entries parsed: {}", references.len());
     for entry in references.iter().take(3) {
@@ -1089,6 +1101,53 @@ fn cmd_blocks(args: &[String]) -> ExitCode {
             block.lines.len(),
             block.text.chars().take(54).collect::<String>()
         );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints the reference-list score of every page, so a mis-located region can be explained.
+fn cmd_region(args: &[String]) -> ExitCode {
+    let (positional, _) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli region <file.pdf>");
+        return ExitCode::from(64);
+    };
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let total = backend.page_count();
+    let mut pages = Vec::new();
+    for index in 0..total.min(120) {
+        if let Ok(text) = backend.raw_text_page(PageIndex(index)) {
+            pages.push((index, text));
+        }
+    }
+
+    match aris_reader_text::locate_reference_region(&pages) {
+        Some(region) => println!(
+            "region: pages {}..{} (score {:.2})",
+            region.from_page + 1,
+            region.to_page + 1,
+            region.score
+        ),
+        None => println!("region: not found"),
+    }
+
+    for (page, text) in &pages {
+        let score = aris_reader_text::reference_page_score(text);
+        let lines = aris_reader_text::lines_from(text);
+        let first = lines
+            .first()
+            .map(|line| line.text.chars().take(40).collect::<String>())
+            .unwrap_or_default();
+        let marker = if score >= 1.5 { "REF " } else { "    " };
+        println!("  {marker}p{:<3} score {:>6.2}  {first}", page + 1, score);
     }
     ExitCode::SUCCESS
 }
