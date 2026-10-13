@@ -75,6 +75,9 @@ public final class MetalCanvasView: NSView {
     private var pointerMoved = false
     /// ⌘C.
     public var onCopy: (() -> Void)?
+    /// ⌘Z / ⇧⌘Z.
+    public var onUndo: (() -> Void)?
+    public var onRedo: (() -> Void)?
     /// Horizontal offset of the content inside the viewport, in screen points.
     private var contentOffsetX: CGFloat = 0
     /// Viewport size in screen points, so the shell can compute what is visible.
@@ -188,9 +191,22 @@ public final class MetalCanvasView: NSView {
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // ⌘C without a menu item: the canvas is the first responder while reading.
         if event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers?.lowercased() == "c" {
-            onCopy?()
-            return true
+           let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "c":
+                onCopy?()
+                return true
+            case "z":
+                // ⇧⌘Z is redo, the convention every macOS app follows.
+                if event.modifierFlags.contains(.shift) {
+                    onRedo?()
+                } else {
+                    onUndo?()
+                }
+                return true
+            default:
+                break
+            }
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -474,6 +490,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onPointerDragged: (CGPoint) -> Void
     private let onPointerUp: (CGPoint, Bool) -> Void
     private let onCopy: () -> Void
+    private let onUndo: () -> Void
+    private let onRedo: () -> Void
 
     public init(
         pages: [CanvasPage] = [],
@@ -488,7 +506,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         onPointerDown: @escaping (CGPoint) -> Void = { _ in },
         onPointerDragged: @escaping (CGPoint) -> Void = { _ in },
         onPointerUp: @escaping (CGPoint, Bool) -> Void = { _, _ in },
-        onCopy: @escaping () -> Void = {}
+        onCopy: @escaping () -> Void = {},
+        onUndo: @escaping () -> Void = {},
+        onRedo: @escaping () -> Void = {}
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -503,6 +523,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onPointerDragged = onPointerDragged
         self.onPointerUp = onPointerUp
         self.onCopy = onCopy
+        self.onUndo = onUndo
+        self.onRedo = onRedo
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -525,6 +547,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onPointerDragged = onPointerDragged
         view.onPointerUp = onPointerUp
         view.onCopy = onCopy
+        view.onUndo = onUndo
+        view.onRedo = onRedo
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt

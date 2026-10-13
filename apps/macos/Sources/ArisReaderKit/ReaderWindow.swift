@@ -64,7 +64,9 @@ public struct ReaderWindow: View {
                 onPointerUp: { point, wasClick in
                     state.endPointerInteraction(at: point, wasClick: wasClick)
                 },
-                onCopy: { state.copySelection() }
+                onCopy: { state.copySelection() },
+                    onUndo: { state.undo() },
+                    onRedo: { state.redo() }
             )
             secondSurface
 
@@ -214,12 +216,28 @@ public struct ReaderWindow: View {
             }
 
             Button {
-                state.addHighlightFromSelection()
+                state.addAnnotationFromSelection(kind: .highlight)
             } label: {
                 Image(systemName: "highlighter")
             }
             .disabled(state.selection == nil)
-            .help("Highlight the selection (⌘H)")
+            .help("Highlight the selection")
+
+            Button {
+                state.addAnnotationFromSelection(kind: .underline)
+            } label: {
+                Image(systemName: "underline")
+            }
+            .disabled(state.selection == nil)
+            .help("Underline the selection")
+
+            Button {
+                state.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+            }
+            .disabled(!state.canUndo)
+            .help("Undo (⌘Z)")
 
             Button {
                 state.zoomOut()

@@ -212,12 +212,22 @@ public struct SidebarView: View {
                                 state.jump(to: annotation)
                             } label: {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(annotation.note.isEmpty ? "Page \(annotation.page + 1)" : annotation.note)
-                                        .font(.caption)
-                                        .lineLimit(2)
-                                    Text("\(annotation.end - annotation.start + 1) characters")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                    TextField(
+                                        "Note",
+                                        text: Binding(
+                                            get: { annotation.note },
+                                            set: { state.updateNote($0, for: annotation.id) }
+                                        )
+                                    )
+                                    .textFieldStyle(.plain)
+                                    .font(.caption)
+
+                                    Text(
+                                        "Page \(annotation.page + 1) · \(annotation.kind.rawValue) · "
+                                            + "\(annotation.end - annotation.start + 1) characters"
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())

@@ -446,15 +446,16 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {
-        // TODO(T1.3): rendering currently serialises **process-wide**.
+        // T1.3 (measured, 2026-10-12): rendering is serialised **process-wide**.
         //
-        // Four threads rendering four separate documents (one `reopen()`ed copy each)
-        // passes when it runs on its own — see `reopened_copies_render_in_parallel` — but
-        // the full test binary is still flaky with SIGSEGV, so parallel rendering cannot
-        // be declared safe yet. Serialising here is the conservative choice: the raster
-        // pool still keeps the main thread free, it just does not overlap work. The
-        // per-document lock stays in place so switching to real parallelism is a one-line
-        // change once the flakiness is understood.
+        // The pieces for parallelism are in place -- `reopen()` gives every worker its own
+        // `FPDF_DOCUMENT` with its own lock, and `reopened_copies_render_in_parallel` passes
+        // on its own -- but when the process-wide lock was removed and the full test binary
+        // was run twelve times, **four runs crashed with SIGSEGV**. Loading documents
+        // concurrently was one real hazard and is now serialised by `LOAD_LOCK`; concurrent
+        // *rendering* is the other, and this PDFium build does not tolerate it. So the lock
+        // stays until that is understood: the raster pool buys a responsive main thread, not
+        // overlapped work.
         let _guard = RASTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

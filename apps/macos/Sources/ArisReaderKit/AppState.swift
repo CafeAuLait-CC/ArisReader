@@ -119,7 +119,16 @@ public final class AppState: ObservableObject {
 /// `FPDF_SaveAsCopy`), and a sidecar keeps the original untouched until that lands. The
 /// durable model and its undo/redo transactions belong in `aris-reader-edit` (T3.1).
 public struct Annotation: Identifiable, Codable, Equatable, Sendable {
+    /// How the annotation is drawn. Highlights fill the character box, underlines sit on the
+    /// baseline; both address the same character range.
+    public enum Kind: String, Codable, Sendable {
+        case highlight
+        case underline
+    }
+
     public let id: UUID
+    /// Defaults to `.highlight` for sidecars written before kinds existed.
+    public var kind: Kind = .highlight
     public var page: Int
     /// Inclusive character range in the page's text layer.
     public var start: Int
@@ -535,35 +544,94 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// highlighting reuses the selection machinery.
     // MARK: - Annotations
 
-    /// Turns the current selection into a highlight.
+    /// Turns the current selection into an annotation.
     @discardableResult
-    public func addHighlightFromSelection(colorIndex: Int = 0) -> Bool {
+    public func addAnnotationFromSelection(
+        kind: Annotation.Kind = .highlight,
+        colorIndex: Int = 0,
+        note: String = ""
+    ) -> Bool {
         guard let selection, let url = document?.url else { return false }
 
-        annotations.append(
-            Annotation(
-                id: UUID(),
-                page: selection.page,
-                start: selection.range.lowerBound,
-                end: selection.range.upperBound,
-                colorIndex: min(max(colorIndex, 0), Self.highlightPalette.count - 1),
-                note: "",
-                createdAt: Date()
-            )
+        let annotation = Annotation(
+            id: UUID(),
+            kind: kind,
+            page: selection.page,
+            start: selection.range.lowerBound,
+            end: selection.range.upperBound,
+            colorIndex: min(max(colorIndex, 0), Self.highlightPalette.count - 1),
+            note: note,
+            createdAt: Date()
         )
+
         annotationsURL = Self.sidecarURL(for: url)
+        annotations.append(annotation)
+        undoStack.append(.added(annotation))
+        redoStack.removeAll()
         saveAnnotations()
         reloadVisiblePages()
-        statusMessage = "Highlighted \(selection.range.count) characters"
+        statusMessage = kind == .highlight
+            ? "Highlighted \(selection.range.count) characters"
+            : "Underlined \(selection.range.count) characters"
         return true
     }
 
+    @discardableResult
+    public func addHighlightFromSelection(colorIndex: Int = 0) -> Bool {
+        addAnnotationFromSelection(kind: .highlight, colorIndex: colorIndex)
+    }
+
     public func removeAnnotation(_ id: UUID) {
-        let before = annotations.count
-        annotations.removeAll { $0.id == id }
-        guard annotations.count != before else { return }
+        guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        let removed = annotations.remove(at: index)
+        undoStack.append(.removed(removed))
+        redoStack.removeAll()
         saveAnnotations()
         reloadVisiblePages()
+        statusMessage = "Deleted annotation"
+    }
+
+    // MARK: - Undo / redo
+
+    /// One reversible change. A stack of these is what the shell offers today; the durable
+    /// transaction model belongs in `aris-reader-edit` (T3.1).
+    public enum UndoableAction: Sendable {
+        case added(Annotation)
+        case removed(Annotation)
+    }
+
+    @Published public private(set) var undoStack: [UndoableAction] = []
+    @Published public private(set) var redoStack: [UndoableAction] = []
+
+    public var canUndo: Bool { !undoStack.isEmpty }
+    public var canRedo: Bool { !redoStack.isEmpty }
+
+    public func undo() {
+        guard let action = undoStack.popLast() else { return }
+        switch action {
+        case .added(let annotation):
+            annotations.removeAll { $0.id == annotation.id }
+        case .removed(let annotation):
+            annotations.append(annotation)
+        }
+        redoStack.append(action)
+        saveAnnotations()
+        reloadVisiblePages()
+        statusMessage = "Undo"
+    }
+
+    public func redo() {
+        guard let action = redoStack.popLast() else { return }
+        switch action {
+        case .added(let annotation):
+            annotations.append(annotation)
+        case .removed(let annotation):
+            annotations.removeAll { $0.id == annotation.id }
+        }
+        undoStack.append(action)
+        saveAnnotations()
+        reloadVisiblePages()
+        statusMessage = "Redo"
     }
 
     public func updateNote(_ note: String, for id: UUID) {
@@ -988,6 +1056,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 image: highlightTextures[annotation.colorIndex],
                 // Distinct ids keep the canvas from reusing a texture it already has.
                 idBase: 800_000_000 + annotationIndex * 4_096,
+                // An underline is a thin bar on the baseline instead of a filled box.
+                verticalScale: annotation.kind == .underline ? 0.1 : 1.0,
+                verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
                 to: &pages
             )
         }
@@ -998,6 +1069,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         range: ClosedRange<Int>,
         image: PageImage,
         idBase: Int,
+        verticalScale: CGFloat = 1.0,
+        verticalOffset: CGFloat = 0.0,
         to pages: inout [CanvasPage]
     ) {
         guard let textPage = textPages[page],
@@ -1010,10 +1083,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 CanvasPage(
                     placement: PagePlacement(
                         index: idBase + index,
-                        topPt: placement.topPt + character.yPt,
+                        topPt: placement.topPt + character.yPt
+                            + character.heightPt * verticalOffset,
                         leftPt: placement.leftPt + character.xPt,
                         widthPt: character.widthPt,
-                        heightPt: character.heightPt
+                        heightPt: max(character.heightPt * verticalScale, 1)
                     ),
                     image: image
                 )
