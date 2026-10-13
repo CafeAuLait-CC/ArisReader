@@ -62,6 +62,38 @@ public struct PageImage: Sendable {
     }
 }
 
+/// Where one page sits in the scrolling content.
+///
+/// Content space uses PDF points with the origin at the top-left of the first page and Y
+/// growing downwards (view space). The canvas multiplies by zoom × backing scale when it
+/// draws, so nothing here depends on the display.
+public struct PagePlacement: Equatable, Sendable {
+    public let index: Int
+    public let topPt: CGFloat
+    public let leftPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+
+    public init(index: Int, topPt: CGFloat, leftPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat) {
+        self.index = index
+        self.topPt = topPt
+        self.leftPt = leftPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+    }
+}
+
+/// One page ready to be drawn: where it goes and the bitmap that goes there.
+public struct CanvasPage: Sendable {
+    public let placement: PagePlacement
+    public let image: PageImage
+
+    public init(placement: PagePlacement, image: PageImage) {
+        self.placement = placement
+        self.image = image
+    }
+}
+
 /// Engine interface.
 ///
 /// The UI depends only on this protocol, so the real engine (`RustEngine`, backed by the
@@ -71,6 +103,21 @@ public protocol PDFEngine: AnyObject {
     func openDocument(at url: URL) throws -> LoadedDocument
     /// Rasterizes a page at `scale` (1.0 = 72 dpi, so pass zoom × backing scale).
     func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage
+    /// Total height of the scrolling content, in points.
+    func contentHeightPt(gapPt: CGFloat) -> CGFloat
+    /// Width of the widest page, in points (the canvas centres the content with it).
+    func contentWidthPt(gapPt: CGFloat) -> CGFloat
+    /// Pages overlapping the viewport, in reading order.
+    func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat
+    ) -> [PagePlacement]
+    /// Page under the viewport top (the "current page" for the HUD).
+    func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int
+    /// Top edge of a page in content space (used by "go to page").
+    func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat
     /// Engine version plus backend description (About panel, diagnostics).
     var version: String { get }
 }
@@ -130,6 +177,52 @@ public final class RustEngine: PDFEngine {
             generation: generation
         )
     }
+
+    public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
+        guard let document else { return 0 }
+        return CGFloat(document.contentHeightPt(gapPt: Double(gapPt)))
+    }
+
+    public func contentWidthPt(gapPt: CGFloat) -> CGFloat {
+        guard let document else { return 0 }
+        return CGFloat(document.contentWidthPt(gapPt: Double(gapPt)))
+    }
+
+    public func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat
+    ) -> [PagePlacement] {
+        guard let document else { return [] }
+        return document
+            .visiblePages(
+                scrollYPt: Double(scrollYPt),
+                viewportHeightPt: Double(viewportHeightPt),
+                gapPt: Double(gapPt),
+                marginPt: Double(marginPt)
+            )
+            .map { record in
+                PagePlacement(
+                    index: Int(record.index),
+                    topPt: CGFloat(record.topPt),
+                    leftPt: CGFloat(record.leftPt),
+                    widthPt: CGFloat(record.widthPt),
+                    heightPt: CGFloat(record.heightPt)
+                )
+            }
+    }
+
+    public func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int {
+        guard let document else { return 0 }
+        return Int(document.pageIndexAt(scrollYPt: Double(scrollYPt), gapPt: Double(gapPt)))
+    }
+
+    public func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat {
+        guard let document else { return 0 }
+        return CGFloat(document.pageTopPt(page: UInt32(index), gapPt: Double(gapPt)))
+}
+
 }
 
 /// Fallback engine for builds where the Rust backend cannot start (for example a build
@@ -155,4 +248,15 @@ public final class MockEngine: PDFEngine {
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize pages"]
         )
     }
+
+    public func contentHeightPt(gapPt: CGFloat) -> CGFloat { 0 }
+    public func contentWidthPt(gapPt: CGFloat) -> CGFloat { 0 }
+    public func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat
+    ) -> [PagePlacement] { [] }
+    public func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int { 0 }
+    public func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat { 0 }
 }

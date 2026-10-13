@@ -48,11 +48,31 @@ public final class MetalCanvasView: NSView {
     /// Reports the backing scale so the engine can rasterize at device resolution.
     public var onDeviceScale: ((CGFloat) -> Void)?
 
-    /// The page to draw; a new image is uploaded as a texture.
-    public var pageImage: PageImage? {
+    /// Pages to draw; new bitmaps are uploaded as textures and old ones released.
+    public var pages: [CanvasPage] = [] {
         didSet {
-            guard pageImage?.generation != oldValue?.generation else { return }
-            uploadPageTexture()
+            guard pages.map(\.image.generation) != oldValue.map(\.image.generation) else { return }
+            syncTextures()
+            markNeedsRender()
+        }
+    }
+
+    /// Scroll offset in content points (0 = top of the first page).
+    public var scrollYPt: CGFloat = 0 {
+        didSet {
+            guard scrollYPt != oldValue else { return }
+            markNeedsRender()
+        }
+    }
+
+    /// Scroll gestures, reported as deltas in screen points.
+    public var onScroll: ((CGFloat) -> Void)?
+    /// Viewport size in screen points, so the shell can compute what is visible.
+    public var onViewportSize: ((CGSize) -> Void)?
+    /// Width of the widest page in points; used to centre narrow documents.
+    public var contentWidthPt: CGFloat = 0 {
+        didSet {
+            guard contentWidthPt != oldValue else { return }
             markNeedsRender()
         }
     }
@@ -66,7 +86,8 @@ public final class MetalCanvasView: NSView {
     }
 
     private var surfaceId: UInt64 = 0
-    private var textureId: UInt64 = 0
+    /// One texture per page, with the generation it was uploaded from.
+    private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
     private var frameTask: Task<Void, Never>?
     private var configuredSize: CGSize = .zero
     private var reportedDeviceScale: CGFloat = 0
@@ -110,6 +131,38 @@ public final class MetalCanvasView: NSView {
     public override func layout() {
         super.layout()
         resizeSurfaceIfNeeded()
+        onViewportSize?(bounds.size)
+    }
+
+    // MARK: - Scrolling and keyboard
+
+    /// Self-managed scrolling (decision T1.4): `NSScrollView` would size its document view
+    /// to the whole document, and a `CAMetalLayer` cannot be hundreds of thousands of
+    /// pixels tall. AppKit still delivers the trackpad's momentum as scroll events.
+    public override func scrollWheel(with event: NSEvent) {
+        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
+        guard delta != 0 else { return }
+        onScroll?(delta)
+    }
+
+    public override var acceptsFirstResponder: Bool { true }
+
+    public override func keyDown(with event: NSEvent) {
+        let page = bounds.height * 0.9
+        switch event.charactersIgnoringModifiers {
+        case " ":
+            onScroll?(event.modifierFlags.contains(.shift) ? -page : page)
+        case "\u{F72D}": // page down
+            onScroll?(page)
+        case "\u{F72C}": // page up
+            onScroll?(-page)
+        case "\u{F701}": // down arrow
+            onScroll?(40)
+        case "\u{F700}": // up arrow
+            onScroll?(-40)
+        default:
+            super.keyDown(with: event)
+        }
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -154,10 +207,9 @@ public final class MetalCanvasView: NSView {
         surfaceId = newSurfaceId
         configuredSize = bounds.size
         reportDeviceScale()
+        onViewportSize?(bounds.size)
 
-        if pageImage != nil {
-            uploadPageTexture()
-        }
+        syncTextures()
         markNeedsRender()
         startFrameLoop()
 
@@ -185,7 +237,7 @@ public final class MetalCanvasView: NSView {
     private func detachSurface() {
         frameTask?.cancel()
         frameTask = nil
-        releasePageTexture()
+        releaseAllTextures()
         guard surfaceId != 0 else { return }
         _ = aris_reader_surface_detach(surfaceId)
         surfaceId = 0
@@ -193,10 +245,32 @@ public final class MetalCanvasView: NSView {
 
     // MARK: - Page texture
 
-    private func uploadPageTexture() {
-        releasePageTexture()
-        guard let image = pageImage, surfaceId != 0 else { return }
+    private func syncTextures() {
+        guard surfaceId != 0 else { return }
 
+        var wanted = Set<Int>()
+        for page in pages {
+            let index = page.placement.index
+            wanted.insert(index)
+            if textures[index]?.generation == page.image.generation { continue }
+            if let stale = textures.removeValue(forKey: index) {
+                _ = aris_reader_gpu_release_texture(stale.id)
+            }
+            if let id = uploadTexture(page.image) {
+                textures[index] = (page.image.generation, id)
+            }
+        }
+
+        // Release pages that scrolled away; the shell keeps a slightly larger cache, so
+        // this only drops what it no longer hands us.
+        for index in textures.keys where !wanted.contains(index) {
+            if let stale = textures.removeValue(forKey: index) {
+                _ = aris_reader_gpu_release_texture(stale.id)
+            }
+        }
+    }
+
+    private func uploadTexture(_ image: PageImage) -> UInt64? {
         var newTextureId: UInt64 = 0
         let code: Int32 = image.bgra.withUnsafeBytes { raw -> Int32 in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else {
@@ -210,18 +284,18 @@ public final class MetalCanvasView: NSView {
                 &newTextureId
             )
         }
-
         guard code == ArisStatus.ok.rawValue else {
             report("aris_reader_gpu_upload_texture failed (\(ArisStatus.describe(code)))")
-            return
+            return nil
         }
-        textureId = newTextureId
+        return newTextureId
     }
 
-    private func releasePageTexture() {
-        guard textureId != 0 else { return }
-        _ = aris_reader_gpu_release_texture(textureId)
-        textureId = 0
+    private func releaseAllTextures() {
+        for (_, texture) in textures {
+            _ = aris_reader_gpu_release_texture(texture.id)
+        }
+        textures.removeAll()
     }
 
     // MARK: - Frame loop
@@ -254,30 +328,44 @@ public final class MetalCanvasView: NSView {
     }
 
     private func renderFrame() {
-        guard surfaceId != 0, textureId != 0, let image = pageImage else {
-            // Nothing to draw yet; leaving the surface untouched keeps the window valid.
-            return
+        guard surfaceId != 0 else { return }
+
+        // Every visible page goes into one frame; the shell only hands us pages it has
+        // already rasterized, so an empty list simply means "nothing to draw yet".
+        let scale = backingScale()
+        let (surfaceWidth, _) = pixelSize()
+        // Centre the document horizontally when it is narrower than the viewport, which
+        // is the normal case for a maximised window.
+        let contentWidthPx = contentWidthPt * zoom * scale
+        let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
+
+        var textureIds: [UInt64] = []
+        var rects: [Float] = []
+        for page in pages {
+            guard let texture = textures[page.placement.index] else { continue }
+            textureIds.append(texture.id)
+            rects.append(Float(offsetX + page.placement.leftPt * zoom * scale))
+            rects.append(Float((page.placement.topPt - scrollYPt) * zoom * scale))
+            rects.append(Float(page.placement.widthPt * zoom * scale))
+            rects.append(Float(page.placement.heightPt * zoom * scale))
         }
 
-        let (surfaceWidth, surfaceHeight) = pixelSize()
-        let scale = backingScale()
-        let destinationWidth = Float(image.pointSize.width * zoom * scale)
-        let destinationHeight = Float(image.pointSize.height * zoom * scale)
-        let destinationX = (Float(surfaceWidth) - destinationWidth) / 2
-        let destinationY = (Float(surfaceHeight) - destinationHeight) / 2
+        guard !textureIds.isEmpty else { return }
 
         var stats = ArisFrameStats()
-        let code = aris_reader_surface_draw_page(
-            surfaceId,
-            textureId,
-            destinationX,
-            destinationY,
-            destinationWidth,
-            destinationHeight,
-            &stats
-        )
+        let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
+            rects.withUnsafeBufferPointer { rectangles in
+                aris_reader_surface_draw_pages(
+                    surfaceId,
+                    ids.baseAddress,
+                    rectangles.baseAddress,
+                    textureIds.count,
+                    &stats
+                )
+            }
+        }
         guard code == ArisStatus.ok.rawValue else {
-            report("aris_reader_surface_draw_page failed (\(ArisStatus.describe(code)))")
+            report("aris_reader_surface_draw_pages failed (\(ArisStatus.describe(code)))")
             return
         }
 
@@ -324,41 +412,57 @@ public final class MetalCanvasView: NSView {
 
 /// SwiftUI wrapper around [`MetalCanvasView`].
 public struct PDFCanvasView: NSViewRepresentable {
-    private let pageImage: PageImage?
+    private let pages: [CanvasPage]
+    private let scrollYPt: CGFloat
     private let zoom: CGFloat
+    private let contentWidthPt: CGFloat
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
+    private let onViewportSize: (CGSize) -> Void
+    private let onScroll: (CGFloat) -> Void
 
     public init(
-        pageImage: PageImage? = nil,
+        pages: [CanvasPage] = [],
+        scrollYPt: CGFloat = 0,
         zoom: CGFloat = 1.0,
+        contentWidthPt: CGFloat = 0,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
-        onDeviceScale: @escaping (CGFloat) -> Void = { _ in }
+        onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
+        onViewportSize: @escaping (CGSize) -> Void = { _ in },
+        onScroll: @escaping (CGFloat) -> Void = { _ in }
     ) {
-        self.pageImage = pageImage
+        self.pages = pages
+        self.scrollYPt = scrollYPt
         self.zoom = zoom
+        self.contentWidthPt = contentWidthPt
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
+        self.onViewportSize = onViewportSize
+        self.onScroll = onScroll
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
         let view = MetalCanvasView(frame: .zero)
-        view.pageImage = pageImage
-        view.zoom = zoom
-        view.onFrame = onFrame
-        view.onFailure = onFailure
-        view.onDeviceScale = onDeviceScale
+        configure(view)
         return view
     }
 
     public func updateNSView(_ nsView: MetalCanvasView, context: Context) {
-        nsView.onFrame = onFrame
-        nsView.onFailure = onFailure
-        nsView.onDeviceScale = onDeviceScale
-        nsView.zoom = zoom
-        nsView.pageImage = pageImage
+        configure(nsView)
+    }
+
+    private func configure(_ view: MetalCanvasView) {
+        view.onFrame = onFrame
+        view.onFailure = onFailure
+        view.onDeviceScale = onDeviceScale
+        view.onViewportSize = onViewportSize
+        view.onScroll = onScroll
+        view.zoom = zoom
+        view.scrollYPt = scrollYPt
+        view.contentWidthPt = contentWidthPt
+        view.pages = pages
     }
 }

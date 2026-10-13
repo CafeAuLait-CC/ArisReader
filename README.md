@@ -8,10 +8,12 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 > `ARIS_READER_*`, Swift targets `ArisReaderKit` / `ArisReaderFFI`). Suite-level shared modules will claim the `aris-*`
 > prefix later, to avoid ambiguity.
 
-Current status: **M0 in progress — the risky parts are proven**. The Rust workspace and the native macOS shell build and
-run, PDFium rasterizes pages (cross-checked against poppler), and wgpu draws into the AppKit-owned `CAMetalLayer` on two
-independent surfaces at once. What is still missing is the actual document pipeline: the engine renders a marker triangle
-where PDF page textures will go, and each crate carries `TODO(Tx.y)` anchors (see the [task list](docs/08-tasks.md)).
+Current status: **M1 in progress — the reader opens real PDFs**. M0 is complete (GPU interop verified on device, PDFium
+rasterization cross-checked against poppler, UniFFI control plane generated into Swift). The first M1 slice works end to
+end: open a document, rasterize pages through PDFium, upload them as GPU textures, scroll continuously, turn pages and
+zoom. Still missing: tiles with an LOD pyramid and a raster thread pool (so very large pages and deep zoom stay bounded),
+the text layer (selection, search, citations), and annotations. Every crate carries `TODO(Tx.y)` anchors pointing at the
+[task list](docs/08-tasks.md).
 
 ---
 
@@ -108,8 +110,8 @@ resolve locally.
 
 | Milestone | Theme | Status |
 | --- | --- | --- |
-| M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | 🚧 In progress |
-| M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | ⬜ |
+| M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
+| M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | 🚧 In progress — pages render on the GPU, continuous scrolling, page turn and zoom work; tiles, LOD and the raster pool are next |
 | M2 | Full reading experience: outline, thumbnails, search, text selection, links, tabs, reading position | ⬜ |
 | M3 | Annotation and editing: highlight/underline/ink/sticky notes, page operations, forms, incremental save | ⬜ |
 | M4 | Advanced reading: citation/figure **floating windows**, bibliography index, split view, presentation mode | ⬜ |

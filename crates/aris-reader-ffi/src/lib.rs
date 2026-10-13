@@ -369,6 +369,75 @@ pub unsafe extern "C" fn aris_reader_surface_draw_page(
     result
 }
 
+/// Draws several uploaded textures into **one frame** at device-pixel rectangles.
+///
+/// Continuous scrolling needs this: every visible page goes into a single frame instead
+/// of one acquire/present per page.
+///
+/// # Safety
+///
+/// `texture_ids` must point to `count` readable `u64`s, `rects` to `count * 4` readable
+/// `f32`s (`[x, y, width, height]` each) and `stats` must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aris_reader_surface_draw_pages(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    count: usize,
+    stats: *mut ArisFrameStats,
+) -> i32 {
+    if count == 0 || texture_ids.is_null() || rects.is_null() {
+        return code::ERR_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees both arrays cover `count` elements (documented above).
+    let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
+    let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
+
+    let mut draws = Vec::with_capacity(count);
+    for (index, id) in ids.iter().enumerate() {
+        let rect = &coordinates[index * 4..index * 4 + 4];
+        draws.push((
+            aris_reader_gpu::TextureId(*id),
+            [rect[0], rect[1], rect[2], rect[3]],
+        ));
+    }
+
+    let mut report = None;
+    let result = with_context(|context| {
+        let frame = context.render_pages(
+            SurfaceId(surface_id),
+            &draws,
+            // Neutral reading background; pages are drawn on top of it.
+            [0.13, 0.13, 0.15, 1.0],
+        )?;
+        if frame.surface_frame_index <= 2 || frame.surface_frame_index % 600 == 0 {
+            let summary: Vec<String> = draws
+                .iter()
+                .map(|(_, rect)| {
+                    format!(
+                        "({:.0},{:.0} {:.0}×{:.0})",
+                        rect[0], rect[1], rect[2], rect[3]
+                    )
+                })
+                .collect();
+            println!(
+                "aris-gpu: surface {} page frame {} — {} quads: {}",
+                surface_id,
+                frame.surface_frame_index,
+                draws.len(),
+                summary.join(" ")
+            );
+        }
+        report = Some(frame);
+        Ok(())
+    });
+
+    // SAFETY: the contract of the exported function requires a writable `stats`.
+    unsafe { write_stats(result, report, stats) };
+    result
+}
+
 /// Renders the spike content offscreen and copies it into `out_rgba`.
 ///
 /// This is the window-less self-test: it exercises device, shader, render pass and

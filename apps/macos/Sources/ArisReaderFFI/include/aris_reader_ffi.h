@@ -114,6 +114,16 @@ int32_t aris_reader_surface_draw_page(uint64_t surface_id,
                                       float height,
                                       ArisFrameStats *stats);
 
+/*
+ * Draws several uploaded textures into ONE frame at device-pixel rectangles
+ * (rects holds count * 4 floats: x, y, width, height). `stats` may be NULL.
+ */
+int32_t aris_reader_surface_draw_pages(uint64_t surface_id,
+                                       const uint64_t *texture_ids,
+                                       const float *rects,
+                                       size_t count,
+                                       ArisFrameStats *stats);
+
 /* Releases the device and every surface. */
 int32_t aris_reader_gpu_shutdown(void);
 

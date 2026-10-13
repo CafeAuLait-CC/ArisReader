@@ -62,8 +62,23 @@ public final class AppState: ObservableObject {
     @Published public var lastError: String?
     @Published public var showFileImporter: Bool = false
 
-    /// The page bitmap currently on screen (nil until a document is open).
-    @Published public private(set) var pageImage: PageImage?
+    /// Pages the canvas should draw right now (usually one or two while scrolling).
+    @Published public private(set) var canvasPages: [CanvasPage] = []
+    /// Scroll offset in content points; 0 is the top of the first page.
+    @Published public private(set) var scrollYPt: CGFloat = 0
+    /// Total content height in points (for scrollbars and clamping).
+    @Published public private(set) var contentHeightPt: CGFloat = 0
+    /// Width of the widest page in points; the canvas centres the content with it.
+    @Published public private(set) var contentWidthPt: CGFloat = 0
+
+    /// Gap between pages, in points.
+    public let pageGapPt: CGFloat = 12
+    /// Viewport size in screen points, reported by the canvas.
+    private var viewportSizePt: CGSize = .zero
+    /// Rasterized pages kept while scrolling; the canvas keeps one texture per entry, so
+    /// this doubles as the texture budget until the tile cache lands (T1.6).
+    private var pageCache: [Int: PageImage] = [:]
+    private let pageCacheLimit = 6
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
     private var deviceScale: CGFloat = 2.0
 
@@ -131,8 +146,13 @@ public final class AppState: ObservableObject {
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_ZOOM"],
                let zoom = Int(raw), zoom > 0 {
                 zoomPercent = zoom
+                pageCache.removeAll()
             }
-            reloadPage()
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL"],
+               let offset = Double(raw), offset > 0 {
+                scrollYPt = CGFloat(offset)
+            }
+            reloadVisiblePages()
         }
     }
 
@@ -161,7 +181,9 @@ public final class AppState: ObservableObject {
             } else {
                 statusMessage = "Opened \(loaded.title) (no pages reported)"
             }
-            reloadPage()
+            pageCache.removeAll()
+            scrollYPt = 0
+            reloadVisiblePages()
         } catch {
             lastError = String(describing: error)
             statusMessage = "Couldn't open the document"
@@ -170,55 +192,119 @@ public final class AppState: ObservableObject {
 
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
-        reloadPage()
+        pageCache.removeAll()
+        reloadVisiblePages()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
-        reloadPage()
+        pageCache.removeAll()
+        reloadVisiblePages()
     }
 
     public func zoomActual() {
         zoomPercent = 100
-        reloadPage()
+        pageCache.removeAll()
+        reloadVisiblePages()
     }
 
     public func nextPage() {
         guard let document, document.pageCount > 0 else { return }
-        currentPage = min(document.pageCount, currentPage + 1)
-        reloadPage()
+        gotoPage(min(document.pageCount, currentPage + 1) - 1)
     }
 
     public func previousPage() {
         guard currentPage > 1 else { return }
-        currentPage = max(1, currentPage - 1)
-        reloadPage()
+        gotoPage(max(1, currentPage - 1) - 1)
     }
 
     /// Called by the canvas once it knows the display's backing scale.
     public func setDeviceScale(_ scale: CGFloat) {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
-        reloadPage()
+        pageCache.removeAll()
+        reloadVisiblePages()
     }
 
-    /// Rasterizes the current page at the current zoom and hands it to the canvas.
+    /// Called by the canvas whenever its size changes.
+    public func setViewportSize(_ size: CGSize) {
+        guard size != viewportSizePt else { return }
+        viewportSizePt = size
+        reloadVisiblePages()
+    }
+
+    /// Scrolls by a delta measured in **screen points** (what `scrollWheel` reports).
+    public func scroll(byScreenPoints delta: CGFloat) {
+        guard document != nil else { return }
+        let contentDelta = delta / max(zoomFactor, 0.01)
+        let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
+        let next = min(max(0, scrollYPt - contentDelta), maxOffset)
+        guard abs(next - scrollYPt) > 0.01 else { return }
+        scrollYPt = next
+        reloadVisiblePages()
+    }
+
+    /// Jumps so that `page` (0-based) sits at the top of the viewport.
+    public func gotoPage(_ page: Int) {
+        guard document != nil else { return }
+        scrollYPt = engine.pageTopPt(max(0, page), gapPt: pageGapPt)
+        reloadVisiblePages()
+    }
+
+    public var zoomFactor: CGFloat {
+        CGFloat(zoomPercent) / 100.0
+    }
+
+    /// Viewport height in content points (the canvas draws at zoom × backing scale).
+    private var viewportHeightContentPt: CGFloat {
+        max(viewportSizePt.height / max(zoomFactor, 0.01), 1)
+    }
+
+    /// Rasterizes the pages overlapping the viewport and hands them to the canvas.
     ///
     /// Synchronous on purpose for this slice: a full A4 page takes single-digit
-    /// milliseconds with PDFium. Moving it to the raster pool (T1.3) is what makes
-    /// scrolling stay smooth once tiles arrive.
-    public func reloadPage() {
+    /// milliseconds with PDFium, and scrolling normally adds one page at a time. The
+    /// raster pool (T1.3) and tile caching (T1.5/T1.6) replace this next.
+    public func reloadVisiblePages() {
         guard document != nil else {
-            pageImage = nil
+            canvasPages = []
+            contentHeightPt = 0
             return
         }
-        let scale = CGFloat(zoomPercent) / 100.0 * deviceScale
-        do {
-            pageImage = try engine.renderPage(currentPage - 1, scale: scale)
-        } catch {
-            pageImage = nil
-            lastError = String(describing: error)
-            statusMessage = "Couldn't render page \(currentPage)"
+
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt)
+        contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt)
+        let viewportHeight = viewportHeightContentPt
+        // Prefetch half a viewport ahead so the next page is ready before it appears.
+        let visible = engine.visiblePages(
+            scrollYPt: scrollYPt,
+            viewportHeightPt: viewportHeight,
+            gapPt: pageGapPt,
+            marginPt: viewportHeight * 0.5
+        )
+
+        var pages: [CanvasPage] = []
+        var keep = Set<Int>()
+        for placement in visible {
+            keep.insert(placement.index)
+            if pageCache[placement.index] == nil {
+                pageCache[placement.index] = try? engine.renderPage(
+                    placement.index,
+                    scale: zoomFactor * deviceScale
+                )
+            }
+            if let image = pageCache[placement.index] {
+                pages.append(CanvasPage(placement: placement, image: image))
+            }
         }
+
+        if pageCache.count > pageCacheLimit {
+            for key in pageCache.keys where !keep.contains(key) {
+                pageCache.removeValue(forKey: key)
+            }
+        }
+
+        canvasPages = pages
+        currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
     }
 }

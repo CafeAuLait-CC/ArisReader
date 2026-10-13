@@ -14,7 +14,8 @@ use aris_reader_core::{
     DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, RasterRequest,
 };
 use aris_reader_pdfium::{PdfiumBackend, backend_description};
-use std::sync::Arc;
+use aris_reader_session::DocumentLayout;
+use std::sync::{Arc, Mutex};
 
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
@@ -165,6 +166,11 @@ pub struct PageBitmap {
 pub struct ArisDocument {
     backend: PdfiumBackend,
     path: String,
+    /// Page sizes in points, filled on first layout request (a 2000-page manual would
+    /// otherwise pay for every box at open time).
+    page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
+    /// Last computed layout, keyed by the page gap it was built for.
+    layout: Mutex<Option<(f64, Arc<DocumentLayout>)>>,
 }
 
 #[uniffi::export]
@@ -211,6 +217,108 @@ impl ArisDocument {
             pixels: tile.pixels,
         })
     }
+
+    /// Total height of the scrolling content for the given page gap.
+    pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
+        self.layout(gap_pt).content_height_pt()
+    }
+
+    /// Width of the widest page (pages are centred horizontally).
+    pub fn content_width_pt(&self, gap_pt: f64) -> f64 {
+        self.layout(gap_pt).content_width_pt()
+    }
+
+    /// Top edge of a page in content space (for "go to page" and anchoring).
+    pub fn page_top_pt(&self, page: u32, gap_pt: f64) -> f64 {
+        self.layout(gap_pt).page_top_pt(page).unwrap_or(0.0)
+    }
+
+    /// Page occupying the viewport top — the "current page" for the HUD.
+    pub fn page_index_at(&self, scroll_y_pt: f64, gap_pt: f64) -> u32 {
+        self.layout(gap_pt).page_at(scroll_y_pt)
+    }
+
+    /// Pages overlapping the viewport, in reading order.
+    ///
+    /// `margin_pt` widens the window so the shell can prefetch the next page.
+    pub fn visible_pages(
+        &self,
+        scroll_y_pt: f64,
+        viewport_height_pt: f64,
+        gap_pt: f64,
+        margin_pt: f64,
+    ) -> Vec<PagePlacementRecord> {
+        self.layout(gap_pt)
+            .visible_pages(scroll_y_pt, viewport_height_pt, margin_pt)
+            .iter()
+            .map(|page| PagePlacementRecord {
+                index: page.index,
+                top_pt: page.top_pt,
+                left_pt: page.left_pt,
+                width_pt: page.width_pt,
+                height_pt: page.height_pt,
+            })
+            .collect()
+    }
+}
+
+impl ArisDocument {
+    /// Builds (and caches) the layout for `gap_pt`.
+    fn layout(&self, gap_pt: f64) -> Arc<DocumentLayout> {
+        // Rust 2024 let-chains keep the lookups flat.
+        if let Ok(cache) = self.layout.lock()
+            && let Some((cached_gap, layout)) = cache.as_ref()
+            && (*cached_gap - gap_pt).abs() < f64::EPSILON
+        {
+            return Arc::clone(layout);
+        }
+
+        let sizes = self.page_sizes();
+        let layout = Arc::new(DocumentLayout::new(sizes.iter().copied(), gap_pt));
+
+        if let Ok(mut cache) = self.layout.lock() {
+            *cache = Some((gap_pt, Arc::clone(&layout)));
+        }
+        layout
+    }
+
+    /// Page sizes in points, computed once and cached.
+    fn page_sizes(&self) -> Vec<(f64, f64)> {
+        if let Ok(cache) = self.page_sizes.lock()
+            && let Some(sizes) = cache.as_ref()
+        {
+            return sizes.clone();
+        }
+
+        let count = self.backend.page_count();
+        let mut sizes = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let size = self
+                .backend
+                .page_info(PageIndex(index))
+                .map(|info| {
+                    let view = info.geometry.view_size(1.0);
+                    (view.width, view.height)
+                })
+                .unwrap_or((612.0, 792.0)); // US Letter as a safe fallback
+            sizes.push(size);
+        }
+
+        if let Ok(mut cache) = self.page_sizes.lock() {
+            *cache = Some(sizes.clone());
+        }
+        sizes
+    }
+}
+
+/// Where one page sits in the scrolling content (mirrors `PagePlacement`).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct PagePlacementRecord {
+    pub index: u32,
+    pub top_pt: f64,
+    pub left_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
 }
 
 #[uniffi::export]
@@ -223,7 +331,12 @@ impl ArisEngine {
         password: Option<String>,
     ) -> Result<Arc<ArisDocument>, ArisFfiError> {
         let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
-        Ok(Arc::new(ArisDocument { backend, path }))
+        Ok(Arc::new(ArisDocument {
+            backend,
+            path,
+            page_sizes: Mutex::new(None),
+            layout: Mutex::new(None),
+        }))
     }
 }
 

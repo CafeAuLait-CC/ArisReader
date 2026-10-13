@@ -90,7 +90,6 @@ pub struct PageState {
     shader: wgpu::ShaderModule,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     textures: HashMap<TextureId, wgpu::TextureView>,
     next_texture_id: u64,
@@ -148,18 +147,10 @@ impl PageState {
             ..Default::default()
         });
 
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aris-reader-page-uniforms"),
-            size: UNIFORM_BYTES,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Self {
             shader,
             bind_group_layout,
             sampler,
-            uniforms,
             pipelines: HashMap::new(),
             textures: HashMap::new(),
             next_texture_id: 1,
@@ -309,6 +300,21 @@ impl GpuContext {
         destination: [f32; 4],
         clear: [f64; 4],
     ) -> Result<FrameReport> {
+        self.render_pages(surface_id, &[(texture_id, destination)], clear)
+    }
+
+    /// Draws several textured quads into one frame and presents it.
+    ///
+    /// This is what continuous scrolling needs: every visible page (later: every visible
+    /// tile) goes into a single frame. Each quad gets its own small uniform buffer,
+    /// because `Queue::write_buffer` is ordered against submissions, not against draws
+    /// inside one encoder — sharing a buffer would make every quad use the last values.
+    pub fn render_pages(
+        &mut self,
+        surface_id: SurfaceId,
+        draws: &[(TextureId, [f32; 4])],
+        clear: [f64; 4],
+    ) -> Result<FrameReport> {
         let started = std::time::Instant::now();
 
         let (frame, format, width, height, settings, surface_frame_index) = {
@@ -356,35 +362,46 @@ impl GpuContext {
             )
         };
 
-        let uniforms: [f32; 8] = [
-            destination[0],
-            destination[1],
-            destination[2],
-            destination[3],
-            width as f32,
-            height as f32,
-            0.0,
-            0.0,
-        ];
-        self.queue
-            .write_buffer(&self.page.uniforms, 0, &f32s_to_bytes(&uniforms));
+        self.page.ensure_pipeline(&self.device, format);
 
-        // The bind group owns its references, so the borrow of the texture map ends here
-        // and the pipeline cache can be borrowed mutably below.
-        let bind_group = {
-            let texture_view = self.page.textures.get(&texture_id).ok_or_else(|| {
+        // Per-quad uniform buffers and bind groups. Each quad needs its own buffer because
+        // `Queue::write_buffer` is ordered against submissions, not against the draws
+        // inside a single encoder; the buffers stay alive until after the submit below.
+        let mut bind_groups = Vec::with_capacity(draws.len());
+        let mut uniform_buffers = Vec::with_capacity(draws.len());
+        for (texture_id, rect) in draws {
+            let uniforms: [f32; 8] = [
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                width as f32,
+                height as f32,
+                0.0,
+                0.0,
+            ];
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("aris-reader-page-uniforms"),
+                size: UNIFORM_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&buffer, 0, &f32s_to_bytes(&uniforms));
+
+            let texture_view = self.page.textures.get(texture_id).ok_or_else(|| {
                 ArisError::new(
                     ErrorCode::InvalidArgument,
                     format!("texture {} is not uploaded", texture_id.0),
                 )
             })?;
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("aris-reader-page-bind-group"),
                 layout: &self.page.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.page.uniforms.as_entire_binding(),
+                        resource: buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -395,10 +412,10 @@ impl GpuContext {
                         resource: wgpu::BindingResource::Sampler(&self.page.sampler),
                     },
                 ],
-            })
-        };
+            }));
+            uniform_buffers.push(buffer);
+        }
 
-        self.page.ensure_pipeline(&self.device, format);
         let pipeline = self
             .page
             .pipelines
@@ -414,32 +431,20 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("aris-page-frame"),
             });
-        {
-            let color_attachment = wgpu::RenderPassColorAttachment {
-                view: &target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: clear[0],
-                        g: clear[1],
-                        b: clear[2],
-                        a: clear[3],
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aris-page-pass"),
-                color_attachments: &[Some(color_attachment)],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..6, 0..1);
+
+        // The first pass clears, the rest load what is already there; with nothing to
+        // draw we still clear so the window never shows a stale frame.
+        for (index, bind_group) in bind_groups.iter().enumerate() {
+            begin_page_pass(
+                &mut encoder,
+                &target,
+                clear,
+                index == 0,
+                Some((pipeline, bind_group)),
+            );
+        }
+        if bind_groups.is_empty() {
+            begin_page_pass(&mut encoder, &target, clear, true, None);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -512,8 +517,14 @@ impl GpuContext {
             0.0,
             0.0,
         ];
+        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("page-probe-uniforms"),
+            size: UNIFORM_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         self.queue
-            .write_buffer(&self.page.uniforms, 0, &f32s_to_bytes(&uniforms));
+            .write_buffer(&uniform_buffer, 0, &f32s_to_bytes(&uniforms));
 
         let bind_group = {
             let texture_view = self.page.textures.get(&texture_id).ok_or_else(|| {
@@ -528,7 +539,7 @@ impl GpuContext {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.page.uniforms.as_entire_binding(),
+                        resource: uniform_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -615,6 +626,47 @@ impl GpuContext {
         }
         buffer.unmap();
         Ok(pixels)
+    }
+}
+
+/// Starts one page render pass: clears when `clear_first`, then draws one quad if given.
+fn begin_page_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    clear: [f64; 4],
+    clear_first: bool,
+    draw: Option<(&wgpu::RenderPipeline, &wgpu::BindGroup)>,
+) {
+    let color_attachment = wgpu::RenderPassColorAttachment {
+        view: target,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: if clear_first {
+                wgpu::LoadOp::Clear(wgpu::Color {
+                    r: clear[0],
+                    g: clear[1],
+                    b: clear[2],
+                    a: clear[3],
+                })
+            } else {
+                wgpu::LoadOp::Load
+            },
+            store: wgpu::StoreOp::Store,
+        },
+    };
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("aris-page-pass"),
+        color_attachments: &[Some(color_attachment)],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    if let Some((pipeline, bind_group)) = draw {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..6, 0..1);
     }
 }
 
