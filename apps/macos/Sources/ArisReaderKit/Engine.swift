@@ -233,6 +233,8 @@ public protocol PDFEngine: AnyObject {
     func citations(_ page: Int) async throws -> [Citation]
     /// The document's reference list (empty when none can be parsed).
     func references() async throws -> [Reference]
+    /// Resolves a citation's labels to a reference entry (one implementation, in Rust).
+    func resolveCitation(labels: [String]) async throws -> Reference?
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
@@ -562,6 +564,33 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func resolveCitation(labels: [String]) async throws -> Reference? {
+        guard let document else { return nil }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let entry = try document.resolveCitation(labels: labels)
+                    continuation.resume(
+                        returning: entry.map { record in
+                            Reference(
+                                label: record.label,
+                                text: record.text,
+                                page: Int(record.page),
+                                xPt: CGFloat(record.xPt),
+                                yPt: CGFloat(record.yPt),
+                                widthPt: CGFloat(record.widthPt),
+                                heightPt: CGFloat(record.heightPt)
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func outline() async throws -> [OutlineEntry] {
         guard let document else { return [] }
 
@@ -722,6 +751,8 @@ public final class MockEngine: PDFEngine {
     public func citations(_ page: Int) async throws -> [Citation] { [] }
 
     public func references() async throws -> [Reference] { [] }
+
+    public func resolveCitation(labels: [String]) async throws -> Reference? { nil }
 
     public func outline() async throws -> [OutlineEntry] { [] }
 

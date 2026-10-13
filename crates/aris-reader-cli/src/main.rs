@@ -875,12 +875,9 @@ fn cmd_cite(args: &[String]) -> ExitCode {
             }
             attempted += 1;
 
-            let hit = references.iter().find(|entry| {
-                citation
-                    .labels
-                    .iter()
-                    .any(|label| label.eq_ignore_ascii_case(&entry.label))
-            });
+            // One resolver for the whole project: exact label first, then position for a
+            // numeric citation against an unnumbered list.
+            let hit = aris_reader_text::resolve_reference(&citation.labels, &references);
 
             if let Some(entry) = hit {
                 resolved += 1;

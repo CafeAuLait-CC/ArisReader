@@ -533,6 +533,37 @@ impl ArisDocument {
         Ok(records)
     }
 
+    /// Resolves a citation's labels against the reference list.
+    ///
+    /// The shell calls this rather than matching labels itself, so the two conventions that
+    /// matter — exact label match, and position for a numeric citation against an unnumbered
+    /// list — live in one place.
+    pub fn resolve_citation(
+        &self,
+        labels: Vec<String>,
+    ) -> Result<Option<ReferenceRecord>, ArisFfiError> {
+        let references = self.references()?;
+        let parsed: Vec<aris_reader_text::ReferenceEntry> = references
+            .iter()
+            .map(|record| aris_reader_text::ReferenceEntry {
+                label: record.label.clone(),
+                text: record.text.clone(),
+                page: record.page,
+                start: 0,
+                end: 0,
+            })
+            .collect();
+
+        Ok(
+            aris_reader_text::resolve_reference(&labels, &parsed).and_then(|entry| {
+                references
+                    .iter()
+                    .find(|record| record.label == entry.label)
+                    .cloned()
+            }),
+        )
+    }
+
     /// Links on `page`, in **view space** (points, top-left origin).
     ///
     /// Only actionable links come back: a page to jump to, a URL to open, or both.

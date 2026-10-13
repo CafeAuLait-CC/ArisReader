@@ -485,6 +485,11 @@ pub fn parse_author_year_references(page: u32, text: &RawTextPage) -> Vec<Refere
 }
 
 /// `Baevski, A.` / `He, L.` / `Kim, S.` — capitalised surname, comma, initials.
+///
+/// Measured (2026-10-13): generalising this to accept full given names ("Yunfei Bai, Danny M
+/// Kaufman, …") parsed more entries for one paper but **regressed two others** — Leader went
+/// from 2/2 resolved to 1/2 and manuscript from 5/30 to 0/30 across the corpus. The initials
+/// rule is what the aggregate favours, so it stays; the full-name style is a known gap.
 fn looks_like_author_year_start(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut characters = trimmed.chars().peekable();
@@ -532,6 +537,50 @@ fn first_surname(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Resolves a citation label against the reference list.
+///
+/// Exact label match first; then, for a numeric citation against an **unnumbered** list, the
+/// position: `[12]` means the twelfth entry. That convention is real (ACM's `unsrt`-style lists
+/// carry no numbers while the body cites numbers) and without it such a paper matches nothing.
+pub fn resolve_reference<'a>(
+    labels: &[String],
+    references: &'a [ReferenceEntry],
+) -> Option<&'a ReferenceEntry> {
+    for label in labels {
+        if let Some(entry) = references
+            .iter()
+            .find(|entry| label.eq_ignore_ascii_case(&entry.label))
+        {
+            return Some(entry);
+        }
+    }
+
+    // Positional fallback, but only when the list itself is unnumbered: if the entries carry
+    // labels, a numeric miss means "no such reference", not "the Nth one".
+    let list_is_unnumbered = references.iter().all(|entry| {
+        !entry
+            .label
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    });
+    if !list_is_unnumbered {
+        return None;
+    }
+
+    for label in labels {
+        if let Ok(position) = label.parse::<usize>()
+            && position >= 1
+            && let Some(entry) = references.get(position - 1)
+        {
+            return Some(entry);
+        }
+    }
+
+    None
+}
+
 /// Finds the reference list across a document's pages.
 ///
 /// `pages` must be `(page index, raw text)` in reading order and may cover only part of the
@@ -541,39 +590,38 @@ pub fn find_references<'a>(
     pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
     max_entries: usize,
 ) -> Vec<ReferenceEntry> {
-    let mut entries = Vec::new();
-    let mut inside = false;
+    // Parse every page, then keep the **longest run of consecutive pages that produce entries**.
+    //
+    // Deriving the list from the entries themselves rather than from a heading is what the
+    // corpus taught: headings are inconsistent (mid-page, shared with the first entry, spelled
+    // differently), and scanning front to back means a body page that merely mentions
+    // "References" can start a bogus list and hide the real one further on. A real reference
+    // list is a long run of titled entries; a false start is short.
+    let mut best: Vec<ReferenceEntry> = Vec::new();
+    let mut current: Vec<ReferenceEntry> = Vec::new();
 
     for (page, text) in pages {
-        let page_text: String = text
-            .chars
-            .iter()
-            .filter_map(|character| char::from_u32(character.unicode))
-            .collect();
-
-        if !inside && looks_like_reference_heading(&page_text) {
-            inside = true;
-        }
-        if !inside {
-            continue;
-        }
-
-        let mut parsed = parse_numeric_references(page, &text.clone());
+        let mut parsed = parse_numeric_references(page, text);
         if parsed.is_empty() {
-            parsed = parse_author_year_references(page, &text.clone());
+            parsed = parse_author_year_references(page, text);
         }
-        if parsed.is_empty() && !entries.is_empty() {
-            // The list ended (or switched to an unparsed style).
-            break;
-        }
-        entries.extend(parsed);
-        if entries.len() >= max_entries {
-            entries.truncate(max_entries);
-            break;
+
+        if parsed.is_empty() {
+            if current.len() > best.len() {
+                best = std::mem::take(&mut current);
+            } else {
+                current.clear();
+            }
+        } else {
+            current.extend(parsed);
         }
     }
+    if current.len() > best.len() {
+        best = current;
+    }
 
-    entries
+    best.truncate(max_entries);
+    best
 }
 
 #[cfg(test)]
@@ -641,6 +689,44 @@ mod reference_tests {
             "{:?}",
             found[0].labels
         );
+    }
+
+    #[test]
+    fn a_numeric_citation_resolves_by_position_in_an_unnumbered_list() {
+        let references = vec![
+            ReferenceEntry {
+                label: "Bai 2016".to_string(),
+                text: "Artist-directed dynamics".to_string(),
+                page: 9,
+                start: 0,
+                end: 10,
+            },
+            ReferenceEntry {
+                label: "Barzel 1988".to_string(),
+                text: "A modeling system".to_string(),
+                page: 9,
+                start: 11,
+                end: 20,
+            },
+        ];
+
+        // `[2]` → the second entry, because the list carries no numbers of its own.
+        let resolved = resolve_reference(&["2".to_string()], &references).expect("resolved");
+        assert_eq!(resolved.label, "Barzel 1988");
+
+        // An exact label still wins when one exists.
+        let resolved = resolve_reference(&["Bai 2016".to_string()], &references).expect("label");
+        assert_eq!(resolved.text, "Artist-directed dynamics");
+
+        // A numbered list must not fall back to position.
+        let numbered = vec![ReferenceEntry {
+            label: "7".to_string(),
+            text: "Seven".to_string(),
+            page: 0,
+            start: 0,
+            end: 1,
+        }];
+        assert!(resolve_reference(&["2".to_string()], &numbered).is_none());
     }
 
     #[test]

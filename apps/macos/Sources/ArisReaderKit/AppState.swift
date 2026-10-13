@@ -449,6 +449,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         let point = CGPoint(x: parts[0], y: parts[1])
                         let followed = self.followLink(at: point)
                         let cited = followed ? false : self.openCitation(at: point)
+                        // Resolution is asynchronous when it goes through the reference list, so
+                        // give it a moment before reporting the status line.
+                        try? await Task.sleep(for: .milliseconds(700))
                         let line = "aris-click: (\(parts[0]),\(parts[1])) link=\(followed) citation=\(cited) status=\(self.statusMessage)\n"
                         FileHandle.standardError.write(Data(line.utf8))
                     }
@@ -939,13 +942,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
                 guard box.contains(local) else { continue }
 
-                // Try each label the citation names: `[12,13]` can match either entry.
-                for label in citation.labels {
-                    guard let reference = references.first(where: { $0.label == label }) else {
-                        continue
+                // Resolution lives in Rust: exact label match, then position for a numeric
+                // citation against an unnumbered list. The shell only draws the result.
+                let labels = citation.labels
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard let reference = try? await self.engine.resolveCitation(labels: labels)
+                    else {
+                        self.statusMessage = "Citation \"\(citation.text)\" has no matching entry"
+                        return
                     }
-                    let snippet = reference.text.prefix(48)
-                    openReferencePreview(
+
+                    self.openReferencePreview(
                         page: reference.page,
                         title: "Reference [\(reference.label)]",
                         from: "page \(placement.index + 1)",
@@ -956,13 +964,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             height: reference.heightPt
                         )
                     )
-                    statusMessage = "Reference [\(reference.label)]: \(snippet)"
-                    return true
+                    self.statusMessage = "Reference [\(reference.label)]: \(reference.text.prefix(48))"
                 }
-
-                // A citation we cannot resolve (author-year list, unusual numbering) still
-                // deserves feedback rather than a silent no-op.
-                statusMessage = "Citation \"\(citation.text)\" has no matching entry"
                 return true
             }
         }
