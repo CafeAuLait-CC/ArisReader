@@ -100,32 +100,69 @@ public struct ReaderWindow: View {
         .padding(40)
     }
 
-    /// A second, independent render surface in the same window.
+    /// The reference preview card (M4): page image, provenance, and the explicit jump.
     ///
-    /// This is the T0.5 multi-surface proof: two `CAMetalLayer`s attached to one wgpu
-    /// device, each with its own frame loop and surface id. The same shape will host
-    /// the citation/figure floating preview in M4.
+    /// This is the T0.5 multi-surface proof put to work: a second `CAMetalLayer` on the same
+    /// wgpu device, with its own surface id and frame loop, showing the referenced page while
+    /// the reader keeps their place in the text.
+    @ViewBuilder
+    private var referencePanel: some View {
+        if let preview = state.referencePreview {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(preview.title)
+                        .font(.caption)
+                        .bold()
+                    Text("from \(preview.source)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button {
+                        state.gotoPage(preview.page)
+                        state.closeReferencePreview()
+                    } label: {
+                        Image(systemName: "arrow.up.forward.square")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Go to this page")
+
+                    Button {
+                        state.closeReferencePreview()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Close preview")
+                }
+
+                PDFCanvasView(
+                    pages: state.referencePreviewPages,
+                    zoom: state.referencePreviewZoom,
+                    contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
+                    onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
+                    onFailure: { message in state.reportGpuFailure(message) }
+                )
+                .frame(width: 300, height: 380)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .background(Color.white)
+            }
+            .padding(10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .shadow(radius: 14)
+        }
+    }
+
+    /// Hosts the reference preview panel in the corner of the reader window.
     @ViewBuilder
     private var secondSurface: some View {
-        if state.showSecondSurface {
+        // Visible for the reference preview, or forced on for the M0 multi-surface spike.
+        if state.showSecondSurface || state.referencePreview != nil {
             VStack {
+                Spacer()
                 HStack {
                     Spacer()
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Second surface (T0.5)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        PDFCanvasView(
-                            onFrame: { stats in state.updateGpuStatus(stats, label: "surface 2") },
-                            onFailure: { message in state.reportGpuFailure(message) }
-                        )
-                        .frame(width: 220, height: 160)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    .padding(10)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    referencePanel
                 }
-                Spacer()
             }
             .padding(16)
         }

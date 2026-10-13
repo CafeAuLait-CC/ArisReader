@@ -147,6 +147,61 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @Published public private(set) var selection: Selection?
 
+    /// The citation/figure preview (M4): what the floating panel is showing, if anything.
+    ///
+    /// Following an internal link opens this instead of jumping, so the reader keeps their
+    /// place; the panel offers the jump explicitly.
+    public struct ReferencePreview: Equatable, Sendable {
+        public let page: Int
+        public let title: String
+        /// Where the link was found, shown in the panel for context.
+        public let source: String
+    }
+
+    @Published public private(set) var referencePreview: ReferencePreview?
+    /// Page content for the preview panel (its own render surface).
+    @Published public private(set) var referencePreviewPages: [CanvasPage] = []
+    @Published public private(set) var referencePreviewZoom: CGFloat = 1
+
+    /// Width the preview panel gives the page, in points.
+    private let referencePreviewWidthPt: CGFloat = 300
+
+    /// Opens a floating preview of `page`.
+    public func openReferencePreview(page: Int, title: String, from source: String) {
+        guard document != nil, page >= 0 else { return }
+        referencePreview = ReferencePreview(page: page, title: title, source: source)
+
+        let widthPt = max(engine.contentWidthPt(gapPt: pageGapPt), 1)
+        let scale = referencePreviewWidthPt / widthPt * deviceScale
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let image = try? await self.engine.renderPage(page, scale: scale) else { return }
+
+            self.referencePreviewPages = [
+                CanvasPage(
+                    placement: PagePlacement(
+                        index: 700_000_000,
+                        topPt: 0,
+                        leftPt: 0,
+                        widthPt: image.pointSize.width,
+                        heightPt: image.pointSize.height
+                    ),
+                    image: image
+                )
+            ]
+            self.referencePreviewZoom = self.referencePreviewWidthPt / max(image.pointSize.width, 1)
+            FileHandle.standardError.write(
+                Data("aris-preview: page \(page + 1) ready (\(image.pixelWidth)x\(image.pixelHeight) px)\n".utf8)
+            )
+        }
+    }
+
+    public func closeReferencePreview() {
+        referencePreview = nil
+        referencePreviewPages = []
+    }
+
     /// Highlights the reader added, and the file they are stored in.
     @Published public private(set) var annotations: [Annotation] = []
     private var annotationsURL: URL?
@@ -348,6 +403,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // between two points and copies, so the text path can be verified headlessly.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SELECT"], !raw.isEmpty {
                 selectForVerification(raw)
+            }
+
+            // Development aid: ARIS_READER_PREVIEW=<page> opens the reference panel, so M4
+            // is verifiable without clicking a link.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_PREVIEW"],
+               let page = Int(raw), page > 0 {
+                openReferencePreview(
+                    page: page - 1,
+                    title: "Page \(page)",
+                    from: "ARIS_READER_PREVIEW"
+                )
             }
 
             // Development aid: ARIS_READER_ANNOTATE="x1,y1;x2,y2" selects between two points
@@ -787,8 +853,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     }
                 }
                 if let page = link.page {
-                    gotoPage(page)
-                    statusMessage = "Jumped to page \(page + 1)"
+                    // M4: show the target in a floating panel rather than jumping, so the
+                    // citation can be read without losing the place in the text.
+                    openReferencePreview(
+                        page: page,
+                        title: "Page \(page + 1)",
+                        from: "page \(placement.index + 1)"
+                    )
+                    statusMessage = "Previewing page \(page + 1)"
                     return true
                 }
             }
