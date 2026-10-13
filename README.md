@@ -8,9 +8,10 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 > `ARIS_READER_*`, Swift targets `ArisReaderKit` / `ArisReaderFFI`). Suite-level shared modules will claim the `aris-*`
 > prefix later, to avoid ambiguity.
 
-Current status: **design complete, skeleton in place** (M0 in progress). Both the Rust workspace and the native macOS
-shell compile and run; engine features are not implemented yet — each crate holds only type sketches and `TODO(Tx.y)`
-anchors (see the [task list](docs/08-tasks.md)).
+Current status: **M0 in progress — the risky parts are proven**. The Rust workspace and the native macOS shell build and
+run, PDFium rasterizes pages (cross-checked against poppler), and wgpu draws into the AppKit-owned `CAMetalLayer` on two
+independent surfaces at once. What is still missing is the actual document pipeline: the engine renders a marker triangle
+where PDF page textures will go, and each crate carries `TODO(Tx.y)` anchors (see the [task list](docs/08-tasks.md)).
 
 ---
 

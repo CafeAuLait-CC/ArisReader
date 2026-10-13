@@ -49,7 +49,11 @@ public struct ReaderWindow: View {
 
     private var canvas: some View {
         ZStack {
-            PDFCanvasView()
+            PDFCanvasView(
+                onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
+                onFailure: { message in state.reportGpuFailure(message) }
+            )
+            secondSurface
 
             if state.document == nil {
                 emptyState
@@ -79,6 +83,37 @@ public struct ReaderWindow: View {
             .controlSize(.large)
         }
         .padding(40)
+    }
+
+    /// A second, independent render surface in the same window.
+    ///
+    /// This is the T0.5 multi-surface proof: two `CAMetalLayer`s attached to one wgpu
+    /// device, each with its own frame loop and surface id. The same shape will host
+    /// the citation/figure floating preview in M4.
+    @ViewBuilder
+    private var secondSurface: some View {
+        if state.showSecondSurface {
+            VStack {
+                HStack {
+                    Spacer()
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Second surface (T0.5)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        PDFCanvasView(
+                            onFrame: { stats in state.updateGpuStatus(stats, label: "surface 2") },
+                            onFailure: { message in state.reportGpuFailure(message) }
+                        )
+                        .frame(width: 220, height: 160)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .padding(10)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+                Spacer()
+            }
+            .padding(16)
+        }
     }
 
     private var pageHUD: some View {
@@ -124,7 +159,7 @@ public struct ReaderWindow: View {
             VStack(spacing: 0) {
                 Text(state.windowTitle)
                     .font(.headline)
-                Text(state.statusMessage)
+                Text(state.gpuStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -149,6 +184,13 @@ public struct ReaderWindow: View {
                 Image(systemName: "plus.magnifyingglass")
             }
             .help("Zoom in (⌘+)")
+
+            Button {
+                state.showSecondSurface.toggle()
+            } label: {
+                Image(systemName: "rectangle.on.rectangle")
+            }
+            .help("Show/hide the second render surface (multi-surface check)")
 
             Button {
                 sidebarVisible.toggle()

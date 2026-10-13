@@ -1,3 +1,4 @@
+import ArisReaderFFI
 import Combine
 import Foundation
 
@@ -60,6 +61,40 @@ public final class AppState: ObservableObject {
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"
     @Published public var lastError: String?
     @Published public var showFileImporter: Bool = false
+
+    /// Human-readable GPU/frame status shown in the toolbar (updated a few times
+    /// per second by the canvas, so it must stay cheap).
+    @Published public var gpuStatus: String = "GPU: starting…"
+    /// Whether the second render surface (a floating preview panel) is visible.
+    /// The M0 T0.5 spike turns it on with ARIS_READER_SPIKE_SECOND_SURFACE=1.
+    @Published public var showSecondSurface: Bool =
+        ProcessInfo.processInfo.environment["ARIS_READER_SPIKE_SECOND_SURFACE"] == "1"
+
+    /// Records a frame report coming from a canvas surface.
+    public func updateGpuStatus(_ stats: ArisFrameStats, label: String) {
+        let color = stats.center_bgra
+        let red = (color >> 16) & 0xFF
+        let green = (color >> 8) & 0xFF
+        let blue = color & 0xFF
+        let format = stats.srgb == 1 ? "sRGB" : "linear"
+        gpuStatus = String(
+            format: "%@: %llu frames · %ux%u px · %@ · centre #%02X%02X%02X · %.1f ms",
+            label,
+            stats.frame_index,
+            stats.width,
+            stats.height,
+            format,
+            red,
+            green,
+            blue,
+            Double(stats.elapsed_us) / 1000.0
+        )
+    }
+
+    /// Records a canvas failure (GPU unavailable, surface lost, …).
+    public func reportGpuFailure(_ message: String) {
+        gpuStatus = "GPU error: \(message)"
+    }
 
     public let engine: PDFEngine
 

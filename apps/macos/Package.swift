@@ -2,16 +2,25 @@
 // ArisReader macOS native shell (SwiftPM, see docs/adr/0006).
 //
 // Layout:
-//   ArisReaderKit     — UI library (reusable by smoke scenarios / future test targets)
-//   ArisReader  — executable app (@main)
+//   ArisReaderFFI  — C module exposing the Rust C ABI (header committed by hand,
+//                    see apps/macos/Sources/ArisReaderFFI/include/aris_reader_ffi.h)
+//   ArisReaderKit  — UI library (reusable by smoke scenarios / future test targets)
+//   ArisReader     — executable app (@main)
 //
-// Rust binding integration lands in M0 T0.9: scripts/build-rust.sh generates
-//   Sources/aris_reader_ffiFFI/{aris_reader_ffiFFI.h, module.modulemap}
-//   Sources/ArisReaderFFI/Generated/*.swift
-// and the binary target plus linker settings are added at the commented-out
-// spot below (see docs/05-ffi.md §8).
+// The Rust static library it links against is produced by:
+//   ./scripts/build-rust.sh          → apps/macos/.rust/lib/libaris_reader_ffi.a
+// UniFFI-generated Swift bindings land in Sources/ArisReaderFFI/Generated once
+// T0.8 is done (docs/05-ffi.md §8).
 
 import PackageDescription
+
+// Absolute path to this package, so the linker flag does not depend on the
+// working directory SwiftPM happens to use. (String surgery rather than
+// Foundation's URL: manifests do not import Foundation by default.)
+let packageRoot = #filePath
+    .split(separator: "/", omittingEmptySubsequences: false)
+    .dropLast()
+    .joined(separator: "/")
 
 let package = Package(
     name: "ArisReader",
@@ -22,7 +31,19 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "ArisReaderFFI",
+            path: "Sources/ArisReaderFFI",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .unsafeFlags(["-L", "\(packageRoot)/.rust/lib"]),
+                .linkedLibrary("aris_reader_ffi"),
+                .linkedFramework("Metal"),
+                .linkedFramework("QuartzCore"),
+            ]
+        ),
+        .target(
             name: "ArisReaderKit",
+            dependencies: ["ArisReaderFFI"],
             path: "Sources/ArisReaderKit"
         ),
         .executableTarget(
@@ -30,19 +51,5 @@ let package = Package(
             dependencies: ["ArisReaderKit"],
             path: "Sources/ArisReader"
         ),
-
-        // ── M0 T0.9: Rust static library and UniFFI-generated bindings (not yet enabled) ──────────────
-        // .target(
-        //     name: "aris_reader_ffiFFI",
-        //     path: "Sources/aris_reader_ffiFFI",
-        //     publicHeadersPath: ".",
-        //     linkerSettings: [
-        //         .unsafeFlags(["-L", ".rust/lib"]),
-        //         .linkedLibrary("aris_reader_ffi"),
-        //         .linkedFramework("Metal"),
-        //         .linkedFramework("QuartzCore"),
-        //     ]
-        // ),
-        // .target(name: "ArisReaderFFI", dependencies: ["aris_reader_ffiFFI"], path: "Sources/ArisReaderFFI"),
     ]
 )

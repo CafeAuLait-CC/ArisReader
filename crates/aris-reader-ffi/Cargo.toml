@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 aris-reader-core = { workspace = true }
 aris-reader-session = { workspace = true }
+aris-reader-gpu = { workspace = true }
 
 # M0 T0.8:
 # uniffi = { version = "0.32", features = ["build"] }

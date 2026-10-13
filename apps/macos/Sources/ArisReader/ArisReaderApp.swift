@@ -13,7 +13,12 @@ struct ArisReaderApp: App {
     @StateObject private var state = AppState()
 
     init() {
+        // Running the bare executable (swift run / swift build output) has no
+        // LaunchServices activation, so the window can stay behind the terminal —
+        // and a Metal surface reports itself as occluded while it is not on screen.
+        // A packaged .app gets this for free; doing it here keeps dev runs usable.
         NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     var body: some Scene {
