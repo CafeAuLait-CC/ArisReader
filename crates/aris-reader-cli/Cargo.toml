@@ -17,3 +17,6 @@ workspace = true
 aris-reader-core = { workspace = true }
 aris-reader-pdfium = { workspace = true }
 aris-reader-render = { workspace = true }
+# PNG encode/decode for the `render` and `compare` subcommands. Deliberately kept
+# out of the engine crates: the engine deals in raw pixel buffers only.
+image = { version = "0.25", default-features = false, features = ["png"] }

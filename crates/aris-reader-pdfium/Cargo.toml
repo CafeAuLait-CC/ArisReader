@@ -12,10 +12,19 @@ workspace = true
 [dependencies]
 aris-reader-core = { workspace = true }
 
-# Landed in M1 (see docs/09-dev-setup.md §4):
-# pdfium-render = { version = "0.9", default-features = false, features = ["thread_safe", "bindings"] }
+# Safe wrapper around Chromium's PDFium. The dynamic library is loaded at runtime
+# (see `library_candidates()`), so nothing is linked at build time and no PDFium
+# SDK is required to compile this crate. See docs/09-dev-setup.md §4.
+#
+# Feature notes: `pdfium_latest` selects which PDFium C API level gets bound (without
+# it the crate does not compile at all), and `thread_safe` adds `unsafe impl Send/Sync`
+# for handle types. The default `image_*` integration is deliberately not enabled:
+# the engine deals in raw BGRA buffers and `aris-reader-cli` owns PNG encoding.
+pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["pdfium_latest", "thread_safe"] }
 
 [features]
-default = []
-# Enables the real PDFium implementation; when off, only the stub remains, so platforms without PDFium can still cross-check.
-pdfium = []
+default = ["pdfium"]
+# Enables the real PDFium implementation. With `--no-default-features` only the stub
+# is built, which keeps `cargo check --target x86_64-unknown-linux-gnu` (and any
+# machine without PDFium) working.
+pdfium = ["dep:pdfium-render"]

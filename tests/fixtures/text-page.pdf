@@ -1,0 +1,64 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 1062 >>
+stream
+BT /F1 28 Tf 72 760 Td (ArisReader fixture) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (text, vector strokes, fills and hairlines on one A4 page) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: The quick brown fox jumps over the lazy dog.) Tj T*
+(Line 2: 0123456789 !@#$%^&*\(\) []{} <> /\\|;:'",.?) Tj T*
+(Line 3: Mixed CASE and lowercase ó typographic dash.) Tj T*
+(Line 4: Kerning pairs: AV WA To Ta Yo LT 1234567890.) Tj T*
+(Line 5: This paragraph exists to make the page look real.) Tj T*
+(Line 6: Compare the render against poppler at the same DPI.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1458
+%%EOF

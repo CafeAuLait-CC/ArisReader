@@ -67,8 +67,17 @@ cd apps/macos && swift build && swift run ArisReader
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/ArisReader.app
 
-# 4) Fetch and sign the PDFium dynamic library (needed from M1 on)
+# 4) Fetch and sign the PDFium dynamic library (needed for rendering)
 ./scripts/fetch-pdfium.sh
+
+# 5) Generate the test fixtures (stdlib-only Python script)
+python3 scripts/make-fixtures.py
+
+# 6) Render a page and compare against a reference rasterizer
+cargo run -p aris-reader-cli -- info tests/fixtures/text-page.pdf
+cargo run -p aris-reader-cli -- render tests/fixtures/text-page.pdf --dpi 144 -o /tmp/page.png
+pdftoppm -r 144 -png tests/fixtures/text-page.pdf /tmp/poppler
+cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
 ```
 
 ## Documentation index

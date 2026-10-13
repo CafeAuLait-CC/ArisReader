@@ -1,103 +1,76 @@
-//! PDFium backend: the first implementation of `aris_reader_core::DocumentBackend`.
+//! PDFium backend: the first implementation of [`aris_reader_core::DocumentBackend`].
 //!
-//! Currently a **skeleton**; see `docs/08-tasks.md` for the concrete work:
+//! Task map (see the task list in the local design docs):
 //!
-//! | Task | Scope |
-//! | --- | --- |
-//! | T1.3 | Loading, page info, rasterization (BGRA + stride + render flags), per-thread document copy pool |
-//! | T0.7 | `aris-reader-cli render` smoke test (symbol compatibility check: bindings 7881 vs released build 8100) |
-//! | T3.2 | Annotation read/write (`FPDFAnnot_*`), forms, incremental save |
-//! | T2.1 | Text page (`FPDFText_*` per-character boxes + structure-tree reading order) |
+//! | Task | Scope | Status |
+//! | --- | --- | --- |
+//! | T0.7 | load a document, rasterize a page, write a PNG through the CLI | done |
+//! | T1.3 | tile/region rasterization, per-thread document copies, failure placeholders | pending |
+//! | T2.1 | text page (per-character boxes, structure tree) | pending |
+//! | T2.4 | outline / bookmarks | pending |
+//! | T3.2 | annotation read/write, forms, incremental save | pending |
+//! | T4.1 | link enumeration and destinations | pending |
 //!
-//! # Threading model (critical)
+//! # Threading
 //!
-//! PDFium is not thread-safe; the official guidance is "parallel processing" rather than multithreading. Strategy:
+//! PDFium itself is **not thread-safe**, and its authors recommend parallel
+//! *processing* rather than multithreading. Note that `pdfium-render`'s
+//! `thread_safe` feature does **not** serialise calls behind a global mutex (an
+//! earlier assumption of ours); it only adds `unsafe impl Send/Sync` for handle
+//! types. The safety story therefore stays ours:
 //!
-//! - **Baseline**: the `thread_safe` feature of `pdfium-render` serializes every call behind one global lock (correct, but zero parallelism).
-//! - **Default**: each raster thread keeps its own independent `FPDF_DOCUMENT` copy (copy pool, LRU cap
-//!   [`aris_reader_core::EngineConfig::max_document_copies`]), which gives true parallel rasterization.
+//! * one `PdfDocument` per raster thread (a "document copy"), never shared
+//!   concurrently — see `docs/02-architecture.md` §3;
+//! * the loaded library bindings are process-global and immutable, which is what
+//!   makes the `OnceLock` in `backend` sound.
 //!
-//! See `docs/02-architecture.md` §3 for details.
+//! # Loading the dynamic library
+//!
+//! Nothing is linked at build time: [`PdfiumBackend::open`] resolves the library
+//! at runtime through [`library_candidates`], in this order:
+//!
+//! 1. `ARIS_READER_PDFIUM_PATH` (explicit override, e.g. a custom build);
+//! 2. `<repo>/vendor/pdfium/lib` (development layout, filled by `scripts/fetch-pdfium.sh`);
+//! 3. the bare library name, which the OS loader resolves through the executable's
+//!    rpath (`@executable_path/../Frameworks`) when running from `ArisReader.app`.
 
-#![cfg_attr(not(feature = "pdfium"), allow(dead_code))]
+#[cfg(feature = "pdfium")]
+mod backend;
+#[cfg(not(feature = "pdfium"))]
+mod stub;
 
-use aris_reader_core::{
-    ArisError, DocumentBackend, ErrorCode, LinkInfo, OutlineNode, PageIndex, PageInfo,
-    RasterRequest, RasterTile, RawTextPage, Result,
-};
-use std::path::Path;
+#[cfg(feature = "pdfium")]
+pub use backend::{PdfiumBackend, library_candidates};
+#[cfg(not(feature = "pdfium"))]
+pub use stub::PdfiumBackend;
 
-/// Source the dynamic library is loaded from (determines the `dlopen` search strategy).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LibrarySource {
-    /// Load from the app bundle's `Contents/Frameworks` (`@rpath`) — the production path.
-    Rpath,
-    /// Load from the path named by the `ARIS_READER_PDFIUM_PATH` environment variable — the development/CLI path.
-    EnvPath,
-}
+/// Environment variable that overrides the PDFium library location.
+pub const PDFIUM_PATH_ENV: &str = "ARIS_READER_PDFIUM_PATH";
 
-/// PDFium backend handle.
+/// Returns `true` when the PDFium dynamic library can be located and loaded.
 ///
-/// TODO(T1.3): will own the copy pool, the page size cache and the `FPDF_DOCUMENT` handle.
-pub struct PdfiumBackend {
-    _path: std::path::PathBuf,
-}
-
-impl PdfiumBackend {
-    /// Open a document. If the document is encrypted and `password` is `None`, returns [`ErrorCode::Encrypted`].
-    pub fn open(path: &Path, _password: Option<&str>) -> Result<Self> {
-        // TODO(T1.3): FPDF_LoadDocument / FPDF_LoadMemDocument + FPDF_GetLastError mapping
-        let _ = path;
-        Err(ArisError::new(
-            ErrorCode::BackendUnavailable,
-            "PDFium backend not implemented yet (see tasks T0.7 / T1.3)",
-        ))
-    }
-}
-
-impl DocumentBackend for PdfiumBackend {
-    fn page_count(&self) -> u32 {
-        0
-    }
-
-    fn page_info(&self, _page: PageIndex) -> Result<PageInfo> {
-        Err(ArisError::not_implemented(
-            "PdfiumBackend::page_info (T1.3)",
-        ))
-    }
-
-    fn outline(&self) -> Result<Vec<OutlineNode>> {
-        Err(ArisError::not_implemented("PdfiumBackend::outline (T2.4)"))
-    }
-
-    fn links(&self, _page: PageIndex) -> Result<Vec<LinkInfo>> {
-        Err(ArisError::not_implemented("PdfiumBackend::links (T4.1)"))
-    }
-
-    fn raw_text_page(&self, _page: PageIndex) -> Result<RawTextPage> {
-        Err(ArisError::not_implemented(
-            "PdfiumBackend::raw_text_page (T2.1)",
-        ))
-    }
-
-    fn rasterize(&self, _request: &RasterRequest) -> Result<RasterTile> {
-        Err(ArisError::not_implemented(
-            "PdfiumBackend::rasterize (T1.3)",
-        ))
-    }
-
-    fn is_encrypted(&self) -> bool {
-        false
-    }
-
-    fn is_tagged(&self) -> bool {
-        false
-    }
-}
-
-/// Whether the PDFium dynamic library can be found and loaded at runtime.
-///
-/// TODO(T0.6): implement the `dlopen` probe (`@rpath/libpdfium.dylib` → `ARIS_READER_PDFIUM_PATH`).
+/// This performs a real load attempt (cached process-wide by the loader), so it
+/// is cheap to call repeatedly but not free the first time.
 pub fn is_available() -> bool {
-    false
+    #[cfg(feature = "pdfium")]
+    {
+        backend::pdfium_instance().is_ok()
+    }
+    #[cfg(not(feature = "pdfium"))]
+    {
+        false
+    }
+}
+
+/// Human-readable description of the build-time backend selection, used by
+/// `--version` output and diagnostics.
+pub fn backend_description() -> &'static str {
+    #[cfg(feature = "pdfium")]
+    {
+        "pdfium (dynamic, loaded at runtime)"
+    }
+    #[cfg(not(feature = "pdfium"))]
+    {
+        "stub (built with --no-default-features)"
+    }
 }

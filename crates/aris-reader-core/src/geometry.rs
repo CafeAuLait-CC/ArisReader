@@ -288,10 +288,14 @@ impl Rotation {
 
 /// Page geometry: PDF page boxes, rotation, `UserUnit`, and the transform to View Space.
 ///
-/// TODO(T1.1): add unit tests (corner mapping, axis swap under rotation, round-trip consistency).
+/// **Box convention**: `media_box` and `crop_box` are expressed in PDF user space,
+/// where `origin` is the **bottom-left** corner and `size` is positive. This is
+/// deliberately *not* the top-left convention of [`Rect`] used in view space; the
+/// single Y-flip happens in [`PageGeometry::page_to_view`]. (`Rect::from_ltrb` is
+/// therefore the wrong helper for page boxes.)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PageGeometry {
-    /// `/MediaBox` (PDF user space)
+    /// `/MediaBox` (PDF user space, bottom-left origin)
     pub media_box: Rect,
     /// `/CropBox` (visible area; the origin is often not 0,0)
     pub crop_box: Rect,
