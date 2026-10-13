@@ -44,7 +44,7 @@ public struct SidebarView: View {
         case .bookmarks:
             emptyState("Bookmarks", "bookmark", task: "T2.4")
         case .annotations:
-            emptyState("Annotations", "highlighter", task: "T3.6")
+            annotationList
         case .ai:
             emptyState("AI assistant", "sparkles", task: "T5.4")
         }
@@ -188,6 +188,52 @@ public struct SidebarView: View {
                     .listRowBackground(
                         index == state.currentHitIndex ? Color.accentColor.opacity(0.15) : .clear
                     )
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
+    // MARK: - Annotations
+
+    private var annotationList: some View {
+        Group {
+            if state.annotations.isEmpty {
+                emptyState("No highlights yet", "highlighter", task: "T3.6")
+            } else {
+                List {
+                    ForEach(state.annotations) { annotation in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Color.accentColor.opacity(0.5))
+                                .frame(width: 8, height: 8)
+
+                            Button {
+                                state.jump(to: annotation)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(annotation.note.isEmpty ? "Page \(annotation.page + 1)" : annotation.note)
+                                        .font(.caption)
+                                        .lineLimit(2)
+                                    Text("\(annotation.end - annotation.start + 1) characters")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                state.removeAnnotation(annotation.id)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Delete highlight")
+                        }
+                    }
                 }
                 .listStyle(.sidebar)
             }

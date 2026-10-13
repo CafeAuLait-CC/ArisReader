@@ -112,13 +112,52 @@ public final class AppState: ObservableObject {
     /// Page placements from the last layout pass (hit-testing needs them).
     private var visiblePagePlacements: [PagePlacement] = []
 
-    /// A selection: a page and an inclusive character range in its text layer.
+    /// A highlight the reader added.
+///
+/// Stored in a sidecar JSON next to the document rather than inside the PDF itself: writing
+/// PDF annotations means round-tripping the file through PDFium (`FPDF_Annot_*` +
+/// `FPDF_SaveAsCopy`), and a sidecar keeps the original untouched until that lands. The
+/// durable model and its undo/redo transactions belong in `aris-reader-edit` (T3.1).
+public struct Annotation: Identifiable, Codable, Equatable, Sendable {
+    public let id: UUID
+    public var page: Int
+    /// Inclusive character range in the page's text layer.
+    public var start: Int
+    public var end: Int
+    /// Index into `AppState.highlightPalette`.
+    public var colorIndex: Int
+    public var note: String
+    public var createdAt: Date
+}
+
+/// A selection: a page and an inclusive character range in its text layer.
     public struct Selection: Equatable, Sendable {
         public let page: Int
         public let range: ClosedRange<Int>
     }
 
     @Published public private(set) var selection: Selection?
+
+    /// Highlights the reader added, and the file they are stored in.
+    @Published public private(set) var annotations: [Annotation] = []
+    private var annotationsURL: URL?
+    /// Highlight colours offered in the toolbar (BGRA, translucent so text stays readable).
+    public static let highlightPalette: [(name: String, bgra: [UInt8])] = [
+        ("Yellow", [0x40, 0xD8, 0xFF, 0x66]),
+        ("Green", [0x60, 0xD0, 0x70, 0x66]),
+        ("Blue", [0xF0, 0xA0, 0x60, 0x66]),
+        ("Pink", [0xB0, 0x70, 0xE0, 0x66]),
+    ]
+    private lazy var highlightTextures: [PageImage] = Self.highlightPalette.enumerated().map {
+        index, colour in
+        PageImage(
+            pixelWidth: 1,
+            pixelHeight: 1,
+            pointSize: .zero,
+            bgra: Data(colour.bgra),
+            generation: UInt64(2 + index)
+        )
+    }
 
     /// Links per page, fetched once and kept.
     private var linkCache: [Int: [DocumentLink]] = [:]
@@ -281,6 +320,9 @@ public final class AppState: ObservableObject {
                 Data("aris-tabs: \(tabs.count) tab(s), active \(activeTabIndex.map(String.init) ?? "none")\n".utf8)
             )
 
+            if let opened = document?.url {
+                loadAnnotations(for: opened)
+            }
             loadOutline()
             loadThumbnails()
             loadLinks()
@@ -297,6 +339,20 @@ public final class AppState: ObservableObject {
             // between two points and copies, so the text path can be verified headlessly.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SELECT"], !raw.isEmpty {
                 selectForVerification(raw)
+            }
+
+            // Development aid: ARIS_READER_ANNOTATE="x1,y1;x2,y2" selects between two points
+            // and highlights, so annotations are verifiable without a mouse.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_ANNOTATE"], !raw.isEmpty {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(1200))
+                    guard let self else { return }
+                    self.selectForVerification(raw)
+                    // `selectForVerification` settles the selection asynchronously (it waits
+                    // for the text layers), so give it longer than its own delay.
+                    try? await Task.sleep(for: .milliseconds(1100))
+                    _ = self.addHighlightFromSelection()
+                }
             }
 
             // Development aid: ARIS_READER_FIND="pattern" searches at launch and reports the
@@ -477,6 +533,91 @@ public final class AppState: ObservableObject {
 
     /// Shows a hit by selecting its character range and scrolling it into view, so
     /// highlighting reuses the selection machinery.
+    // MARK: - Annotations
+
+    /// Turns the current selection into a highlight.
+    @discardableResult
+    public func addHighlightFromSelection(colorIndex: Int = 0) -> Bool {
+        guard let selection, let url = document?.url else { return false }
+
+        annotations.append(
+            Annotation(
+                id: UUID(),
+                page: selection.page,
+                start: selection.range.lowerBound,
+                end: selection.range.upperBound,
+                colorIndex: min(max(colorIndex, 0), Self.highlightPalette.count - 1),
+                note: "",
+                createdAt: Date()
+            )
+        )
+        annotationsURL = Self.sidecarURL(for: url)
+        saveAnnotations()
+        reloadVisiblePages()
+        statusMessage = "Highlighted \(selection.range.count) characters"
+        return true
+    }
+
+    public func removeAnnotation(_ id: UUID) {
+        let before = annotations.count
+        annotations.removeAll { $0.id == id }
+        guard annotations.count != before else { return }
+        saveAnnotations()
+        reloadVisiblePages()
+    }
+
+    public func updateNote(_ note: String, for id: UUID) {
+        guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        annotations[index].note = note
+        saveAnnotations()
+    }
+
+    /// Shows an annotation: selects its range and scrolls it into view.
+    public func jump(to annotation: Annotation) {
+        selection = Selection(
+            page: annotation.page,
+            range: annotation.start...max(annotation.start, annotation.end)
+        )
+        selectionAnchor = nil
+
+        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt)
+        if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
+            scrollYPt = top
+        }
+        reloadVisiblePages()
+    }
+
+    /// `document.pdf` → `document.pdf.aris-annotations.json`.
+    private static func sidecarURL(for document: URL) -> URL {
+        document.appendingPathExtension("aris-annotations.json")
+    }
+
+    private func loadAnnotations(for url: URL) {
+        annotationsURL = Self.sidecarURL(for: url)
+        guard let annotationsURL,
+              let data = try? Data(contentsOf: annotationsURL),
+              let decoded = try? JSONDecoder().decode([Annotation].self, from: data)
+        else {
+            annotations = []
+            return
+        }
+        annotations = decoded
+        FileHandle.standardError.write(
+            Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
+        )
+    }
+
+    private func saveAnnotations() {
+        guard let annotationsURL else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(annotations) else { return }
+        try? data.write(to: annotationsURL, options: .atomic)
+        FileHandle.standardError.write(
+            Data("aris-annotate: saved \(annotations.count) annotation(s)\n".utf8)
+        )
+    }
+
     /// Public entry point for the sidebar's search results list.
     public func showSearchHit(_ index: Int) {
         currentHitIndex = index
@@ -824,25 +965,57 @@ public final class AppState: ObservableObject {
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
     }
 
-    /// Adds one translucent quad per selected character.
+    /// Adds one translucent quad per selected character, plus one per annotated character.
+    ///
+    /// Everything translucent — the selection and every highlight — is drawn by the same
+    /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
-        guard let selection,
-              let textPage = textPages[selection.page],
-              let placement = visiblePagePlacements.first(where: { $0.index == selection.page })
+        if let selection {
+            appendHighlight(
+                page: selection.page,
+                range: selection.range,
+                image: highlightImage,
+                idBase: 900_000_000,
+                to: &pages
+            )
+        }
+
+        for (annotationIndex, annotation) in annotations.enumerated() {
+            guard highlightTextures.indices.contains(annotation.colorIndex) else { continue }
+            appendHighlight(
+                page: annotation.page,
+                range: annotation.start...max(annotation.start, annotation.end),
+                image: highlightTextures[annotation.colorIndex],
+                // Distinct ids keep the canvas from reusing a texture it already has.
+                idBase: 800_000_000 + annotationIndex * 4_096,
+                to: &pages
+            )
+        }
+    }
+
+    private func appendHighlight(
+        page: Int,
+        range: ClosedRange<Int>,
+        image: PageImage,
+        idBase: Int,
+        to pages: inout [CanvasPage]
+    ) {
+        guard let textPage = textPages[page],
+              let placement = visiblePagePlacements.first(where: { $0.index == page })
         else { return }
 
-        for index in selection.range where index < textPage.chars.count {
+        for index in range where index < textPage.chars.count {
             let character = textPage.chars[index]
             pages.append(
                 CanvasPage(
                     placement: PagePlacement(
-                        index: 900_000_000 + index,
+                        index: idBase + index,
                         topPt: placement.topPt + character.yPt,
                         leftPt: placement.leftPt + character.xPt,
                         widthPt: character.widthPt,
                         heightPt: character.heightPt
                     ),
-                    image: highlightImage
+                    image: image
                 )
             )
         }

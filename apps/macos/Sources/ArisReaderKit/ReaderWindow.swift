@@ -214,6 +214,14 @@ public struct ReaderWindow: View {
             }
 
             Button {
+                state.addHighlightFromSelection()
+            } label: {
+                Image(systemName: "highlighter")
+            }
+            .disabled(state.selection == nil)
+            .help("Highlight the selection (⌘H)")
+
+            Button {
                 state.zoomOut()
             } label: {
                 Image(systemName: "minus.magnifyingglass")
