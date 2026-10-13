@@ -624,6 +624,72 @@ impl DocumentBackend for PdfiumBackend {
             });
         }
 
+        // Repair degenerate boxes at the source.
+        //
+        // PDFium reports a zero-width, zero-height box for a sizeable minority of characters --
+        // measured at 15-20% on every paper in the sample corpus. Consumers cope very differently:
+        // a union over many characters shrugs it off, but anything that walks characters in order
+        // (lines, blocks, columns) breaks, because a zero-width box looks like a huge gap to the
+        // next glyph. Repairing it here keeps that assumption in one place.
+        let mut heights: Vec<f64> = chars
+            .iter()
+            .map(|character| character.rect.size.height)
+            .filter(|height| *height > 0.0)
+            .collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_height = heights.get(heights.len() / 2).copied().unwrap_or(10.0);
+
+        let mut widths: Vec<f64> = chars
+            .iter()
+            .map(|character| character.rect.size.width)
+            .filter(|width| *width > 0.0)
+            .collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_width = widths
+            .get(widths.len() / 2)
+            .copied()
+            .unwrap_or(median_height * 0.5);
+
+        for index in 0..chars.len() {
+            let rect = chars[index].rect;
+            if rect.size.width > 0.0 && rect.size.height > 0.0 {
+                continue;
+            }
+
+            // Whitespace is left alone. Producers commonly emit a space with no glyph box at all,
+            // and inventing vertical geometry for it is not a repair but a fabrication: the
+            // vertical band-splitting that entries rely on then moves, which cost one paper six
+            // matched citations when this repair covered spaces too. Consumers that walk
+            // characters in order skip whitespace instead (see `lines_from`).
+            if char::from_u32(chars[index].unicode)
+                .map(|character| character.is_whitespace())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            // Width from the distance to the next glyph, but only when that distance is plausible
+            // for one character: across a line break it would stretch the box across the page.
+            let inferred = chars
+                .get(index + 1)
+                .map(|next| next.rect.origin.x - rect.origin.x)
+                .filter(|width| *width > 0.0 && *width <= median_height * 3.0)
+                .unwrap_or(median_width);
+
+            let height = if rect.size.height > 0.0 {
+                rect.size.height
+            } else {
+                median_height
+            };
+
+            chars[index].rect = Rect::new(
+                rect.origin.x,
+                rect.origin.y,
+                inferred.max(1.0),
+                height.max(1.0),
+            );
+        }
+
         Ok(RawTextPage {
             page,
             chars,
@@ -970,6 +1036,54 @@ mod tests {
         // A region at the very top of the page stays at the top.
         let top = destination_region_view_space(Rect::new(0.0, 792.0, 595.0, 50.0), 842.0);
         assert_eq!(top.origin.y, 0.0);
+    }
+
+    #[test]
+    fn glyph_boxes_are_never_degenerate() {
+        // PDFium reports a zero-size box for 15-20% of characters in the sample corpus (mostly
+        // spaces, but also real glyphs). Everything that walks characters in order -- lines,
+        // blocks, columns -- breaks on those, so `raw_text_page` repairs them and this pins that.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples");
+        if !dir.is_dir() || !crate::is_available() {
+            eprintln!("skipping: sample corpus or PDFium unavailable");
+            return;
+        }
+
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .expect("read corpus")
+            .flatten()
+            .take(3)
+        {
+            let path = entry.path();
+            if path.extension().map(|e| e != "pdf").unwrap_or(true) {
+                continue;
+            }
+            let Ok(backend) = PdfiumBackend::open(&path, None) else {
+                continue;
+            };
+            let Ok(text) = backend.raw_text_page(PageIndex(0)) else {
+                continue;
+            };
+
+            for character in &text.chars {
+                let is_whitespace = char::from_u32(character.unicode)
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false);
+                if is_whitespace {
+                    // Whitespace is deliberately left as the producer emitted it.
+                    continue;
+                }
+                assert!(
+                    character.rect.size.width > 0.0 && character.rect.size.height > 0.0,
+                    "degenerate box for {:?} in {}",
+                    char::from_u32(character.unicode),
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        eprintln!("checked {checked} sample document(s)");
     }
 
     #[test]
