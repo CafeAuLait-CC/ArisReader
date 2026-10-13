@@ -99,6 +99,21 @@ pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
     )))
 }
 
+/// A link the shell can act on.
+///
+/// Deliberately narrower than [`aris_reader_core::LinkInfo`], whose `Destination` carries a
+/// view mode: this is what navigation needs today (a page to jump to, or a URL to open).
+/// TODO(T4.1): map the full `LinkKind` (launch actions, view modes) onto `LinkInfo`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawLink {
+    /// Clickable rectangle (page space, bottom-left origin, like the text boxes).
+    pub rect: Rect,
+    /// External target.
+    pub uri: Option<String>,
+    /// Internal target page.
+    pub page: Option<PageIndex>,
+}
+
 /// A document opened through PDFium.
 pub struct PdfiumBackend {
     /// Borrows from the process-wide [`Pdfium`], hence `'static`.
@@ -171,6 +186,49 @@ impl PdfiumBackend {
     /// PDFium documents must not be shared between threads, so the raster pool keeps one
     /// copy per worker (`docs/02-architecture.md` §3). Reopening is cheap: PDFium
     /// memory-maps the file and reuses its caches.
+    /// Links on a page, reduced to what navigation needs.
+    pub fn link_targets(&self, page: PageIndex) -> Result<Vec<RawLink>> {
+        // Link actions live in document state, so they take the document lock.
+        let _guard = self
+            .raster_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let pdf_page = self.page(page)?;
+        let mut links = Vec::new();
+
+        for link in pdf_page.links().iter() {
+            // A link without a readable box cannot be clicked, so it is skipped.
+            let Ok(pdf_rect) = link.rect() else { continue };
+            let rect = rect_from_pdf(pdf_rect);
+            let mut uri = None;
+            let mut target = None;
+
+            if let Some(action) = link.action() {
+                if let Some(uri_action) = action.as_uri_action() {
+                    uri = uri_action.uri().ok();
+                } else if let Some(local) = action.as_local_destination_action() {
+                    target = local
+                        .destination()
+                        .ok()
+                        .and_then(|destination| destination.page_index().ok())
+                        .map(|index| PageIndex(index.max(0) as u32));
+                }
+            }
+
+            // A link that leads nowhere is not worth handing to the shell.
+            if uri.is_some() || target.is_some() {
+                links.push(RawLink {
+                    rect,
+                    uri,
+                    page: target,
+                });
+            }
+        }
+
+        Ok(links)
+    }
+
     pub fn reopen(&self) -> Result<Self> {
         Self::open(&self.path, self.password.as_deref())
     }

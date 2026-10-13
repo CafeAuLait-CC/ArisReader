@@ -120,6 +120,22 @@ public final class AppState: ObservableObject {
 
     @Published public private(set) var selection: Selection?
 
+    /// Links per page, fetched once and kept.
+    private var linkCache: [Int: [DocumentLink]] = [:]
+    private var linksInFlight: Set<Int> = []
+
+    /// An open document. The engine holds one document at a time for now, so switching tabs
+    /// reopens the file and reapplies the tab's own scroll offset.
+    public struct OpenTab: Identifiable, Sendable {
+        public let id = UUID()
+        public let url: URL
+        public var title: String
+        public var scrollYPt: CGFloat
+    }
+
+    @Published public private(set) var tabs: [OpenTab] = []
+    @Published public private(set) var activeTabIndex: Int?
+
     /// Document outline, loaded once per document.
     @Published public private(set) var outline: [OutlineEntry] = []
     /// Small page previews for the sidebar, keyed by page index.
@@ -250,8 +266,24 @@ public final class AppState: ObservableObject {
             if let opened = document?.url {
                 restoreReadingPosition(for: opened)
             }
+            // The first document opens a tab; later ones come through `newTab`.
+            if activeTabIndex == nil, let opened = document?.url {
+                tabs = [
+                    OpenTab(
+                        url: opened,
+                        title: opened.deletingPathExtension().lastPathComponent,
+                        scrollYPt: 0
+                    )
+                ]
+                activeTabIndex = 0
+            }
+            FileHandle.standardError.write(
+                Data("aris-tabs: \(tabs.count) tab(s), active \(activeTabIndex.map(String.init) ?? "none")\n".utf8)
+            )
+
             loadOutline()
             loadThumbnails()
+            loadLinks()
 
             // Development aid: report the sidebar's data so it can be checked headlessly.
             Task { @MainActor [weak self] in
@@ -486,6 +518,129 @@ public final class AppState: ObservableObject {
     }
 
     /// Scrolls to a 0…1 position (drag on the indicator).
+    /// Fetches the links of every visible page, so a click can be resolved immediately.
+    private func loadLinks() {
+        for placement in visiblePagePlacements where linkCache[placement.index] == nil {
+            guard !linksInFlight.contains(placement.index) else { continue }
+            linksInFlight.insert(placement.index)
+
+            let page = placement.index
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.linksInFlight.remove(page) }
+                if let links = try? await self.engine.links(page) {
+                    self.linkCache[page] = links
+                }
+            }
+        }
+    }
+
+    /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
+    /// ⌘C can copy it.
+    public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
+        if wasClick {
+            let followed = followLink(at: point)
+            if followed || selection == nil {
+                clearSelection()
+            }
+        }
+    }
+
+    /// Follows the link under a content-space point, if there is one.
+    ///
+    /// Called on a *click* (no drag): dragging selects text, clicking follows links — the
+    /// convention PDF readers share.
+    @discardableResult
+    public func followLink(at point: CGPoint) -> Bool {
+        for placement in visiblePagePlacements {
+            let pageRect = CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            )
+            guard pageRect.contains(point), let links = linkCache[placement.index] else {
+                continue
+            }
+
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            for link in links {
+                let box = CGRect(x: link.xPt, y: link.yPt, width: link.widthPt, height: link.heightPt)
+                guard box.contains(local) else { continue }
+
+                if let uri = link.uri, let url = URL(string: uri) {
+                    // Only hand schemes we trust to the system.
+                    if let scheme = url.scheme?.lowercased(),
+                       ["http", "https", "mailto"].contains(scheme) {
+                        NSWorkspace.shared.open(url)
+                        statusMessage = "Opened \(url.host ?? uri)"
+                        return true
+                    }
+                }
+                if let page = link.page {
+                    gotoPage(page)
+                    statusMessage = "Jumped to page \(page + 1)"
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // MARK: - Tabs
+
+    /// Opens a document in a new tab and switches to it.
+    public func newTab(url: URL) {
+        saveActiveTabPosition()
+        tabs.append(
+            OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent, scrollYPt: 0)
+        )
+        activeTabIndex = tabs.count - 1
+        open(url: url)
+        restoreActiveTabPosition()
+    }
+
+    /// Switches to a tab, reopening its document.
+    public func selectTab(_ index: Int) {
+        guard tabs.indices.contains(index), index != activeTabIndex else { return }
+        saveActiveTabPosition()
+        activeTabIndex = index
+        let tab = tabs[index]
+        open(url: tab.url)
+        restoreActiveTabPosition()
+    }
+
+    /// Closes a tab and activates a neighbour.
+    public func closeTab(_ index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        tabs.remove(at: index)
+
+        guard !tabs.isEmpty else {
+            activeTabIndex = nil
+            document = nil
+            canvasPages = []
+            return
+        }
+
+        let next = min(index, tabs.count - 1)
+        activeTabIndex = next
+        open(url: tabs[next].url)
+        restoreActiveTabPosition()
+    }
+
+    private func saveActiveTabPosition() {
+        guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
+        tabs[index].scrollYPt = scrollYPt
+    }
+
+    private func restoreActiveTabPosition() {
+        guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
+        let saved = tabs[index].scrollYPt
+        guard saved > 0 else { return }
+        scrollYPt = min(saved, max(0, contentHeightPt - viewportHeightContentPt))
+        reloadVisiblePages()
+    }
+
     /// Loads the document outline (once per document).
     public func loadOutline() {
         guard document != nil else {

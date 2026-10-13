@@ -392,6 +392,36 @@ impl ArisDocument {
         Ok(hits)
     }
 
+    /// Links on `page`, in **view space** (points, top-left origin).
+    ///
+    /// Only actionable links come back: a page to jump to, a URL to open, or both.
+    pub fn links(&self, page: u32) -> Result<Vec<LinkRecord>, ArisFfiError> {
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let transform = geometry.page_to_view(1.0);
+
+        Ok(self
+            .backend
+            .link_targets(PageIndex(page))?
+            .into_iter()
+            .map(|link| {
+                // Page boxes use a bottom-left origin; the view-space y is the top edge.
+                let top_left = Point::new(
+                    link.rect.origin.x,
+                    link.rect.origin.y + link.rect.size.height,
+                );
+                let view = transform.apply(top_left);
+                LinkRecord {
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: link.rect.size.width,
+                    height_pt: link.rect.size.height,
+                    uri: link.uri,
+                    page: link.page.map(|page| page.get()),
+                }
+            })
+            .collect())
+    }
+
     /// Document outline, flattened depth-first with a depth per entry.
     ///
     /// Flat is what a sidebar list wants; nesting is carried by `depth` instead of nested
@@ -523,6 +553,19 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     }
 
     scale
+}
+
+/// One link: a clickable box plus where it leads.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LinkRecord {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// External URL, when the link is a URI action.
+    pub uri: Option<String>,
+    /// Internal target page (0-based), when the link is a local destination.
+    pub page: Option<u32>,
 }
 
 /// One outline entry.
@@ -705,6 +748,39 @@ mod tests {
             text.text.chars().count(),
             text.chars.len()
         );
+    }
+
+    #[test]
+    fn links_are_reported_in_view_space() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multipage.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        // The fixture has no link annotations, so the contract is "empty, not an error" --
+        // and every link that does exist must be actionable and inside the page.
+        let size = document.page_size_pt(0).expect("page size");
+        for page in 0..document.page_count() {
+            for link in document.links(page).expect("links") {
+                assert!(
+                    link.uri.is_some() || link.page.is_some(),
+                    "a link with no target should not be reported"
+                );
+                assert!(link.x_pt >= -1.0 && link.x_pt <= size.width_pt + 1.0);
+                assert!(link.y_pt >= -1.0 && link.y_pt <= size.height_pt + 1.0);
+                assert!(link.width_pt > 0.0 && link.height_pt > 0.0);
+                if let Some(target) = link.page {
+                    assert!(target < document.page_count());
+                }
+            }
+        }
     }
 
     #[test]

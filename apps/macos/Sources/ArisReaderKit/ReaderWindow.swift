@@ -37,7 +37,7 @@ public struct ReaderWindow: View {
             switch result {
             case .success(let urls):
                 if let url = urls.first {
-                    state.open(url: url)
+                    state.newTab(url: url)
                 }
             case .failure(let error):
                 state.lastError = String(describing: error)
@@ -61,7 +61,9 @@ public struct ReaderWindow: View {
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
                 onPointerDown: { point in state.beginSelection(at: point) },
                 onPointerDragged: { point in state.extendSelection(to: point) },
-                onPointerUp: { state.clearSelection() },
+                onPointerUp: { point, wasClick in
+                    state.endPointerInteraction(at: point, wasClick: wasClick)
+                },
                 onCopy: { state.copySelection() }
             )
             secondSurface
@@ -281,5 +283,51 @@ public struct SettingsView: View {
             .tabItem { Label("AI", systemImage: "sparkles") }
         }
         .frame(width: 460, height: 260)
+    }
+}
+
+
+/// Tab strip: one chip per open document (`docs/04-ui-ux.md` §2.3).
+///
+/// The engine holds a single document today, so switching tabs reopens the file and
+/// reapplies that tab's scroll offset; per-tab offsets live in `AppState.OpenTab`.
+struct TabStrip: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
+                HStack(spacing: 6) {
+                    Text(tab.title)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Button {
+                        state.closeTab(index)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Close tab")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(
+                            index == state.activeTabIndex
+                                ? Color.accentColor.opacity(0.22)
+                                : Color.primary.opacity(0.06)
+                        )
+                )
+                .contentShape(Rectangle())
+                .onTapGesture { state.selectTab(index) }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }

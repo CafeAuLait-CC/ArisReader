@@ -100,6 +100,18 @@ public struct TextPage: Sendable {
     public let hasUnicodeMapError: Bool
 }
 
+/// One link: a clickable box in view space plus where it leads.
+public struct DocumentLink: Sendable {
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+    /// External URL, when this is a URI link.
+    public let uri: String?
+    /// Internal target page (0-based), when this is a document jump.
+    public let page: Int?
+}
+
 /// One outline entry, already flattened (nesting travels as `depth`).
 public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
@@ -182,6 +194,8 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Links on a page, in view space (empty when the page has none).
+    func links(_ page: Int) async throws -> [DocumentLink]
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
@@ -377,6 +391,32 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func links(_ page: Int) async throws -> [DocumentLink] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let links = try document.links(page: UInt32(page))
+                    continuation.resume(
+                        returning: links.map { link in
+                            DocumentLink(
+                                xPt: CGFloat(link.xPt),
+                                yPt: CGFloat(link.yPt),
+                                widthPt: CGFloat(link.widthPt),
+                                heightPt: CGFloat(link.heightPt),
+                                uri: link.uri,
+                                page: link.page.map { Int($0) }
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func outline() async throws -> [OutlineEntry] {
         guard let document else { return [] }
 
@@ -516,6 +556,8 @@ public final class MockEngine: PDFEngine {
             userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
         )
     }
+
+    public func links(_ page: Int) async throws -> [DocumentLink] { [] }
 
     public func outline() async throws -> [OutlineEntry] { [] }
 

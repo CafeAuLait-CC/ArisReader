@@ -70,7 +70,9 @@ public final class MetalCanvasView: NSView {
     /// Pointer events, reported in **content points** (the shell's layout space).
     public var onPointerDown: ((CGPoint) -> Void)?
     public var onPointerDragged: ((CGPoint) -> Void)?
-    public var onPointerUp: (() -> Void)?
+    public var onPointerUp: ((CGPoint, Bool) -> Void)?
+    /// Whether the pointer moved since mouseDown (a click follows links; a drag selects).
+    private var pointerMoved = false
     /// ⌘C.
     public var onCopy: (() -> Void)?
     /// Horizontal offset of the content inside the viewport, in screen points.
@@ -170,15 +172,17 @@ public final class MetalCanvasView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        pointerMoved = false
         onPointerDown?(contentPoint(for: event))
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        pointerMoved = true
         onPointerDragged?(contentPoint(for: event))
     }
 
     public override func mouseUp(with event: NSEvent) {
-        onPointerUp?()
+        onPointerUp?(contentPoint(for: event), !pointerMoved)
     }
 
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -468,7 +472,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onScroll: (CGFloat) -> Void
     private let onPointerDown: (CGPoint) -> Void
     private let onPointerDragged: (CGPoint) -> Void
-    private let onPointerUp: () -> Void
+    private let onPointerUp: (CGPoint, Bool) -> Void
     private let onCopy: () -> Void
 
     public init(
@@ -483,7 +487,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onScroll: @escaping (CGFloat) -> Void = { _ in },
         onPointerDown: @escaping (CGPoint) -> Void = { _ in },
         onPointerDragged: @escaping (CGPoint) -> Void = { _ in },
-        onPointerUp: @escaping () -> Void = {},
+        onPointerUp: @escaping (CGPoint, Bool) -> Void = { _, _ in },
         onCopy: @escaping () -> Void = {}
     ) {
         self.pages = pages
