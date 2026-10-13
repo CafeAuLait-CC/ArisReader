@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["Alex"]
+description = "ArisReader — native macOS PDF reader (Rust engine + GPU compositing + SwiftUI interface)"
+
+[workspace.dependencies]
+# ── Internal crates ───────────────────────────────────────────────────────────
+aris-reader-core    = { path = "crates/aris-reader-core" }
+aris-reader-pdfium  = { path = "crates/aris-reader-pdfium" }
+aris-reader-text    = { path = "crates/aris-reader-text" }
+aris-reader-edit    = { path = "crates/aris-reader-edit" }
+aris-reader-render  = { path = "crates/aris-reader-render" }
+aris-reader-gpu     = { path = "crates/aris-reader-gpu" }
+aris-reader-session = { path = "crates/aris-reader-session" }
+aris-reader-ai      = { path = "crates/aris-reader-ai" }
+aris-reader-ffi     = { path = "crates/aris-reader-ffi" }
+
+# ── External dependencies (from M1; versions in docs/09-dev-setup.md) ─────────
+# wgpu          = "30"          # GPU abstraction (Metal / Vulkan / DX12)
+# pdfium-render = "0.9"         # Safe PDFium wrapper (feature = "thread_safe")
+# tokio         = "1"           # AI/async (M5)
+# lyon          = "1"           # Path tessellation (M3 annotation rendering)
+# thiserror     = "2"           # Error definitions
+# tracing       = "0.1"         # Logging and instrumentation
+# uniffi        = "0.32"        # FFI binding generation (M0 T0.8)
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+# missing_docs = "warn"   # TODO(X.4): enable during implementation
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "allow"            # Many TODO anchors during the skeleton phase
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"          # The FFI boundary needs unwind to turn panics into error returns
+
+[profile.dev]
+opt-level = 1             # PDFium rasterization is CPU-bound, so dev builds need usable speed too
+
+[profile.dev.package."*"]
+opt-level = 3             # Dependencies are always compiled with optimizations

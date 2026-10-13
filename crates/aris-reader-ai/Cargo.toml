@@ -1,0 +1,16 @@
+[package]
+name = "aris-reader-ai"
+description = "AI layer: LLM provider abstraction, context building, citation/figure index (independent of any concrete model)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+
+# Landed in M5:
+# tokio = { version = "1", features = ["rt", "sync", "time"] }

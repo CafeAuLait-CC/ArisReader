@@ -1,0 +1,19 @@
+[package]
+name = "aris-reader-cli"
+description = "Headless CLI: render pages to images, export text, run benchmarks (also the entry point for golden tests)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aris-reader-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+aris-reader-pdfium = { workspace = true }
+aris-reader-render = { workspace = true }

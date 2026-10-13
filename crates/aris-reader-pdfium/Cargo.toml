@@ -1,0 +1,21 @@
+[package]
+name = "aris-reader-pdfium"
+description = "PDFium backend implementation (feature = \"pdfium\"); slot for a pure-Rust backend reserved"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+
+# Landed in M1 (see docs/09-dev-setup.md §4):
+# pdfium-render = { version = "0.9", default-features = false, features = ["thread_safe", "bindings"] }
+
+[features]
+default = []
+# Enables the real PDFium implementation; when off, only the stub remains, so platforms without PDFium can still cross-check.
+pdfium = []

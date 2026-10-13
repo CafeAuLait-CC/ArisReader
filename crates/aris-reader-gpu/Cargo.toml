@@ -1,0 +1,16 @@
+[package]
+name = "aris-reader-gpu"
+description = "GPU abstraction: wgpu device/surface/compositor, sharing MTLDevice with the native layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+
+# Enable for the M0 T0.4/T0.5 spike:
+# wgpu = { version = "30", features = ["metal"] }
