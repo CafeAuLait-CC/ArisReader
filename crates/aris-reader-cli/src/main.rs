@@ -13,6 +13,7 @@
 //! aris-reader-cli bench <file.pdf> [--pages N]
 //! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
 //! aris-reader-cli analyze <file.pdf> [--pages N]
+//! aris-reader-cli cite <file.pdf> [--body-pages N]
 //! ```
 
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
@@ -29,6 +30,7 @@ Usage:
   aris-reader-cli config                         print the default engine config
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
+  aris-reader-cli cite <file.pdf>                match body citations against the reference list
   aris-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   aris-reader-cli render <file.pdf>              render one page to PNG
@@ -75,6 +77,7 @@ fn main() -> ExitCode {
         Some("bench") => cmd_bench(rest(&args)),
         Some("corpus") => cmd_corpus(rest(&args)),
         Some("analyze") => cmd_analyze(rest(&args)),
+        Some("cite") => cmd_cite(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -803,4 +806,101 @@ fn is_math_font(name: &str) -> bool {
     ]
     .iter()
     .any(|marker| upper.contains(marker))
+}
+
+/// Citation → bibliography matching (M4): does a `[12]` in the body land on a reference entry?
+///
+/// This is the step that lets a citation be shown *in a floating window* even when the PDF has
+/// no link annotation for it: find the number, find the entry, preview the entry.
+fn cmd_cite(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli cite <file.pdf> [--body-pages N]");
+        return ExitCode::from(64);
+    };
+    let body_pages: u32 = options
+        .iter()
+        .find(|(key, _)| key == "--body-pages")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(3);
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let total = backend.page_count();
+    println!("{path}: {total} page(s)");
+
+    // The reference list lives at the end; scanning the last stretch keeps a stray mention of
+    // "References" in the body from being mistaken for the list.
+    let tail_start = total.saturating_sub(15);
+    let mut tail = Vec::new();
+    let mut tail_texts = Vec::new();
+    for index in tail_start..total {
+        if let Ok(text) = backend.raw_text_page(PageIndex(index)) {
+            tail_texts.push(text);
+        }
+    }
+    for (offset, text) in tail_texts.iter().enumerate() {
+        tail.push((tail_start + offset as u32, text));
+    }
+    let references = aris_reader_text::find_references(tail, 2000);
+    println!("  reference entries parsed: {}", references.len());
+    for entry in references.iter().take(3) {
+        println!(
+            "    [{}] {}",
+            entry.label,
+            entry.text.chars().take(70).collect::<String>()
+        );
+    }
+
+    let mut resolved = 0usize;
+    let mut attempted = 0usize;
+    for index in 0..total.min(body_pages) {
+        let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
+            continue;
+        };
+        for (label, rect) in find_citations(&text) {
+            // `[12]`, `[12,13]` and `[12-14]` all name concrete numbers inside the brackets.
+            let numbers: Vec<String> = label
+                .trim_matches(|character| character == '(' || character == ')')
+                .split(|character: char| !character.is_ascii_digit())
+                .filter(|part| !part.is_empty() && part.len() <= 4)
+                .map(str::to_string)
+                .collect();
+            if numbers.is_empty() {
+                continue;
+            }
+            attempted += 1;
+            let hit = references
+                .iter()
+                .find(|entry| numbers.iter().any(|number| number == &entry.label));
+            if let Some(entry) = hit {
+                resolved += 1;
+                if resolved <= 5 {
+                    println!(
+                        "    p{} {} → [{}] {} (at {:.0},{:.0})",
+                        index + 1,
+                        label,
+                        entry.label,
+                        entry.text.chars().take(50).collect::<String>(),
+                        rect.origin.x,
+                        rect.origin.y
+                    );
+                }
+            }
+        }
+    }
+
+    let share = if attempted == 0 {
+        0.0
+    } else {
+        resolved as f64 / attempted as f64 * 100.0
+    };
+    println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
+    ExitCode::SUCCESS
 }

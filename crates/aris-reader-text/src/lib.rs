@@ -234,3 +234,290 @@ mod search_tests {
         assert!(find_all("abc", "abcd").is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bibliography (M4)
+// ---------------------------------------------------------------------------
+
+/// One entry of the reference list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceEntry {
+    /// The label a citation would use: `12` for `[12]`, or the author-year key text.
+    pub label: String,
+    /// Entry text with the label stripped.
+    pub text: String,
+    /// Page the entry lives on.
+    pub page: u32,
+    /// First character index of the entry inside its page.
+    pub start: usize,
+    /// One past the last character of the entry.
+    pub end: usize,
+}
+
+/// Whether a page looks like the start of the reference list.
+///
+/// Publishers are inconsistent about the heading, so this accepts the common spellings and
+/// requires it to appear near the top of the page — a paper that mentions "References" in the
+/// body must not be mistaken for the list itself.
+pub fn looks_like_reference_heading(text: &str) -> bool {
+    const HEADINGS: [&str; 6] = [
+        "references",
+        "bibliography",
+        "literature cited",
+        "参考文献",
+        "referencias",
+        "bibliographie",
+    ];
+
+    // Measured on real papers: the heading often starts mid-page (right after the conclusion),
+    // so looking only at the top of the page misses it. Requiring the whole line to *be* the
+    // heading is what keeps a body sentence like "see References for details" out.
+    text.lines().any(|line| {
+        let trimmed = line
+            .trim()
+            .trim_end_matches(':')
+            .trim()
+            .to_ascii_lowercase();
+        trimmed.len() <= 24 && HEADINGS.iter().any(|heading| trimmed == *heading)
+    })
+}
+
+/// Parses numeric-style entries (`[12] Author, Title…`) out of one page's text.
+///
+/// Only the numeric style is parsed: it has an unambiguous delimiter. Author-year lists have no
+/// marker at all beyond typography, and inventing one here would produce confident nonsense.
+pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceEntry> {
+    let chars: Vec<char> = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+
+    let mut entries = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let at_line_start = chars[..index]
+            .iter()
+            .rev()
+            .take_while(|character| **character != '\n')
+            .all(|character| character.is_whitespace());
+        if !at_line_start {
+            index += 1;
+            continue;
+        }
+
+        // Two numbering styles are common: `[12] Author…` (ACM/IEEE) and `12. Author…`
+        // (Springer LNCS and friends). Both were found in the sample corpus, and a parser that
+        // knows only one of them silently reports zero references for half the papers.
+        let (label, body_start) = if chars[index] == '[' {
+            let mut digits_end = index + 1;
+            while digits_end < chars.len()
+                && chars[digits_end].is_ascii_digit()
+                && digits_end - index <= 5
+            {
+                digits_end += 1;
+            }
+            if digits_end == index + 1 || digits_end >= chars.len() || chars[digits_end] != ']' {
+                index += 1;
+                continue;
+            }
+            (
+                chars[index + 1..digits_end].iter().collect::<String>(),
+                digits_end + 1,
+            )
+        } else if chars[index].is_ascii_digit() {
+            let mut digits_end = index;
+            while digits_end < chars.len()
+                && chars[digits_end].is_ascii_digit()
+                && digits_end - index <= 4
+            {
+                digits_end += 1;
+            }
+            let terminator = chars.get(digits_end);
+            if !matches!(terminator, Some('.') | Some(')')) {
+                index += 1;
+                continue;
+            }
+            (
+                chars[index..digits_end].iter().collect::<String>(),
+                digits_end + 1,
+            )
+        } else {
+            index += 1;
+            continue;
+        };
+
+        if label.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // The entry runs to the next numeric label at a line start, or to the end of the page.
+        let mut scan = body_start;
+        while scan < chars.len() {
+            if chars[scan] == '\n'
+                && chars[scan + 1..]
+                    .iter()
+                    .take_while(|character| character.is_whitespace() && **character != '\n')
+                    .count()
+                    < 8
+            {
+                // A new entry starts here when the next non-space character begins another
+                // label: `[` or a digit followed by `.`/`)`.
+                let rest: Vec<char> = chars[scan + 1..].iter().copied().take(6).collect();
+                let starts_label = match rest.first() {
+                    Some('[') => true,
+                    Some(character) if character.is_ascii_digit() => {
+                        rest.iter().any(|c| *c == '.' || *c == ')')
+                    }
+                    _ => false,
+                };
+                if starts_label {
+                    break;
+                }
+            }
+            scan += 1;
+        }
+        let body_end = scan.min(chars.len());
+
+        let body: String = chars[body_start..body_end].iter().collect();
+        entries.push(ReferenceEntry {
+            label,
+            text: body.trim().to_string(),
+            page,
+            start: index,
+            end: body_end,
+        });
+
+        index = body_end.max(index + 1);
+    }
+
+    entries
+}
+
+/// Finds the reference list across a document's pages.
+///
+/// `pages` must be `(page index, raw text)` in reading order and may cover only part of the
+/// document; scanning is bounded by `max_entries` so a mis-detected heading cannot walk a whole
+/// book.
+pub fn find_references<'a>(
+    pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
+    max_entries: usize,
+) -> Vec<ReferenceEntry> {
+    let mut entries = Vec::new();
+    let mut inside = false;
+
+    for (page, text) in pages {
+        let page_text: String = text
+            .chars
+            .iter()
+            .filter_map(|character| char::from_u32(character.unicode))
+            .collect();
+
+        if !inside && looks_like_reference_heading(&page_text) {
+            inside = true;
+        }
+        if !inside {
+            continue;
+        }
+
+        let parsed = parse_numeric_references(page, &text.clone());
+        if parsed.is_empty() && !entries.is_empty() {
+            // The list ended (or switched to an unparsed style).
+            break;
+        }
+        entries.extend(parsed);
+        if entries.len() >= max_entries {
+            entries.truncate(max_entries);
+            break;
+        }
+    }
+
+    entries
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use aris_reader_core::{PageIndex, RawCharBox, RawTextPage, Rect};
+
+    fn page_from(text: &str) -> RawTextPage {
+        let mut chars = Vec::new();
+        for (index, character) in text.chars().enumerate() {
+            chars.push(RawCharBox {
+                rect: Rect::new(0.0, 0.0, 5.0, 10.0),
+                origin: aris_reader_core::Point::new(index as f64 * 5.0, 0.0),
+                unicode: character as u32,
+                font_size: 10.0,
+                angle: 0.0,
+                font_name: "Body".to_string(),
+            });
+        }
+        RawTextPage {
+            page: PageIndex(0),
+            chars,
+            text: text.to_string(),
+            is_generated: false,
+            has_unicode_map_error: false,
+        }
+    }
+
+    #[test]
+    fn numeric_entries_are_split_on_their_labels() {
+        let text = "[1] First entry about motion.\n[2] Second entry, with a comma.\n";
+        let entries = parse_numeric_references(0, &page_from(text));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "1");
+        assert!(entries[0].text.starts_with("First entry"));
+        assert_eq!(entries[1].label, "2");
+        assert!(entries[1].text.contains("with a comma"));
+    }
+
+    #[test]
+    fn bracketed_citations_in_prose_are_not_entries() {
+        // `[12]` mid-sentence is a citation, not a list entry: the label must start a line.
+        let text = "As shown in [12] the method works.\n";
+        assert!(parse_numeric_references(0, &page_from(text)).is_empty());
+    }
+
+    #[test]
+    fn headings_are_recognised_near_the_top_only() {
+        assert!(looks_like_reference_heading("References\n[1] A\n"));
+        assert!(looks_like_reference_heading("REFERENCES:\n"));
+        // A body paragraph that happens to contain the word must not trigger it.
+        assert!(!looks_like_reference_heading(
+            "1 Introduction\nWe discuss references in Section 5.\n"
+        ));
+    }
+
+    #[test]
+    fn springer_style_numbered_entries_are_parsed() {
+        let text = "21. Jones, M., Wang, S.Y.: Customizing text-to-image models (2024)\n22. Song, J.: Denoising diffusion models (2020)\n";
+        let entries = parse_numeric_references(0, &page_from(text));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "21");
+        assert!(entries[0].text.starts_with("Jones"));
+        assert_eq!(entries[1].label, "22");
+    }
+
+    #[test]
+    fn a_heading_is_found_mid_page() {
+        // Real papers often start the list right after the conclusion, not at the page top.
+        assert!(looks_like_reference_heading(
+            "6 Conclusion\nWe presented a method.\nReferences\n[1] Someone et al.\n"
+        ));
+    }
+
+    #[test]
+    fn the_scan_stops_when_entries_run_out() {
+        let first = page_from("References\n[1] One.\n[2] Two.\n");
+        let second = page_from("Appendix\nSome unrelated text.\n");
+        let entries = find_references([(0u32, &first), (1u32, &second)], 100);
+        assert_eq!(
+            entries.len(),
+            2,
+            "the appendix must not be parsed as references"
+        );
+    }
+}
