@@ -99,6 +99,14 @@ fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if matches!(
+            arg.as_str(),
+            "--show-misses" | "--show-entries" | "--no-landings"
+        ) {
+            options.push((arg.clone(), String::new()));
+            index += 1;
+            continue;
+        }
         if arg.starts_with('-') {
             let value = args.get(index + 1).cloned().unwrap_or_default();
             options.push((arg.clone(), value));
@@ -915,7 +923,9 @@ fn is_math_font(name: &str) -> bool {
 fn cmd_cite(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
     let Some(path) = positional.first() else {
-        eprintln!("usage: aris-reader-cli cite <file.pdf> [--body-pages N]");
+        eprintln!(
+            "usage: aris-reader-cli cite <file.pdf> [--body-pages N] [--show-misses] [--show-entries] [--no-landings]"
+        );
         return ExitCode::from(64);
     };
     let body_pages: u32 = options
@@ -936,7 +946,7 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     println!("{path}: {total} page(s)");
 
     // Scan from the front: a reference list can sit a third of the way in, with appendices
-    // after it, so a "last N pages" window misses it. The scan stops when the list ends.
+    // after it, so a "last N pages" window misses it. The page cap bounds extraction.
     let scan_end = total.min(120);
     let mut texts = Vec::new();
     for index in 0..scan_end {
@@ -946,12 +956,11 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     }
     let pages = texts
         .into_iter()
-        .enumerate()
-        .map(|(index, text)| (index as u32, text))
+        .map(|text| (text.page.get(), text))
         .collect::<Vec<_>>();
 
-    // The document's own link landings, when it has any: a paper that links its citations into
-    // the bibliography states where each entry starts, which beats pattern parsing.
+    // Collect candidate link landings; the shared builder validates them against
+    // the selected bibliography and rejects sparse/multi-column reconstructions.
     let mut landings: std::collections::BTreeMap<u32, Vec<f64>> = std::collections::BTreeMap::new();
     let provisional =
         aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000);
@@ -973,21 +982,41 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     let region = aris_reader_text::locate_reference_region(&pages);
     match region {
         Some(region) => println!(
-            "  reference region: pages {}..{} (score {:.2})",
+            "  page-score diagnostic: pages {}..{} (score {:.2}; not the selected bibliography)",
             region.from_page + 1,
             region.to_page + 1,
             region.score
         ),
-        None => println!("  reference region: not found"),
+        None => println!("  page-score diagnostic: no region"),
     }
 
-    let references = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
-    println!("  reference entries parsed: {}", references.len());
-    for entry in references.iter().take(3) {
+    let references = if options.iter().any(|(key, _)| key == "--no-landings") {
+        provisional
+    } else {
+        aris_reader_text::find_references_with_landings(&pages, &landings, 2000)
+    };
+    if let (Some(first), Some(last)) = (references.first(), references.last()) {
         println!(
-            "    [{}] {}",
+            "  selected bibliography: pages {}..{}",
+            first.page + 1,
+            last.page + 1
+        );
+    }
+    println!("  reference entries parsed: {}", references.len());
+    let show_all = options.iter().any(|(key, _)| key == "--show-entries");
+    for entry in references
+        .iter()
+        .take(if show_all { usize::MAX } else { 3 })
+    {
+        println!(
+            "    p{} [{}] {}",
+            entry.page + 1,
             entry.label,
-            entry.text.chars().take(70).collect::<String>()
+            if show_all {
+                entry.text.clone()
+            } else {
+                entry.text.chars().take(70).collect::<String>()
+            }
         );
     }
 
