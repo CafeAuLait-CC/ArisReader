@@ -78,6 +78,7 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(rest(&args)),
         Some("analyze") => cmd_analyze(rest(&args)),
         Some("cite") => cmd_cite(rest(&args)),
+        Some("blocks") => cmd_blocks(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -1030,5 +1031,64 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         resolved as f64 / attempted as f64 * 100.0
     };
     println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
+    ExitCode::SUCCESS
+}
+
+/// Dumps the geometric segmentation of one page: lines, then blocks.
+///
+/// This is the layer that answers layout questions without semantics — where a column starts and
+/// ends, where a paragraph breaks, and (for a bibliography) whether one block really is one entry.
+fn cmd_blocks(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli blocks <file.pdf> [--page N] [--gap F]");
+        return ExitCode::from(64);
+    };
+    let page = opt_usize(&options, &["--page"], 0);
+    let gap: f64 = options
+        .iter()
+        .find(|(key, _)| key == "--gap")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0.8);
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(text) = backend.raw_text_page(PageIndex(page as u32)) else {
+        eprintln!("cannot read page {page}");
+        return ExitCode::FAILURE;
+    };
+
+    let degenerate = text
+        .chars
+        .iter()
+        .filter(|character| character.rect.size.width <= 0.0 || character.rect.size.height <= 0.0)
+        .count();
+    let lines = aris_reader_text::lines_from(&text);
+    let blocks = aris_reader_text::blocks_from(&lines, gap);
+    println!(
+        "page {page}: {} characters ({} degenerate), {} lines, {} blocks (gap {gap})",
+        text.chars.len(),
+        degenerate,
+        lines.len(),
+        blocks.len()
+    );
+
+    for (index, block) in blocks.iter().enumerate().take(120) {
+        println!(
+            "  #{:<3} y {:>6.1}..{:<6.1} x {:>6.1}..{:<6.1} lines {:<2} {}",
+            index,
+            block.rect.origin.y,
+            block.rect.origin.y + block.rect.size.height,
+            block.rect.origin.x,
+            block.rect.origin.x + block.rect.size.width,
+            block.lines.len(),
+            block.text.chars().take(54).collect::<String>()
+        );
+    }
     ExitCode::SUCCESS
 }

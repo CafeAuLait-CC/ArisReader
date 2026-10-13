@@ -1379,3 +1379,291 @@ mod citation_tests {
         assert!(find_citations(&page("a (parenthetical aside) here")).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Geometric block segmentation (M4)
+// ---------------------------------------------------------------------------
+
+/// Groups a page's characters into lines.
+///
+/// Geometry first, semantics later: lines are the one unit the text layer really supports —
+/// characters sharing a baseline — and blocks, columns and entries are built from them.
+///
+/// Two data properties drove the rules here, both measured on the sample corpus:
+///
+/// * whitespace often arrives with no glyph box, so it must not take part in the adjacency test
+///   (otherwise every space splits a line);
+/// * a line break is whitespace too, but it must *end* a line rather than continue it.
+pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
+    if raw.chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut order: Vec<usize> = (0..raw.chars.len()).collect();
+    order.sort_by(|left, right| {
+        let a = &raw.chars[*left];
+        let b = &raw.chars[*right];
+        b.rect
+            .origin
+            .y
+            .partial_cmp(&a.rect.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.rect
+                    .origin
+                    .x
+                    .partial_cmp(&b.rect.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    let smallest = raw
+        .chars
+        .iter()
+        .map(|character| character.rect.size.height)
+        .filter(|height| *height > 0.0)
+        .fold(f64::MAX, f64::min);
+    let tolerance = (smallest / 2.0).max(1.0);
+
+    let mut widths: Vec<f64> = raw
+        .chars
+        .iter()
+        .map(|character| character.rect.size.width)
+        .filter(|width| *width > 0.0)
+        .collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_width = widths.get(widths.len() / 2).copied().unwrap_or(5.0);
+
+    // Wider than a space: a column gutter, a tab, or the jump between two text runs.
+    let max_advance = (median_width * 3.0).max(15.0);
+
+    let mut lines: Vec<TextLine> = Vec::new();
+    let mut visible_right: Vec<f64> = Vec::new();
+    let mut pending_break = false;
+
+    for index in order {
+        let character = &raw.chars[index];
+        let decoded = char::from_u32(character.unicode);
+        let is_break = matches!(decoded, Some('\n') | Some('\r'));
+        let is_space = decoded
+            .map(|character| character.is_whitespace() && !is_break)
+            .unwrap_or(false);
+
+        if is_break {
+            pending_break = true;
+            continue;
+        }
+
+        if is_space {
+            // Attach to the current line without moving its measured right edge.
+            if let Some(line) = lines.last_mut() {
+                line.rect = union_rect(line.rect, character.rect);
+                line.range.end = line.range.end.max(index as u32 + 1);
+                if let Some(character) = decoded {
+                    line.text.push(character);
+                }
+                continue;
+            }
+        }
+
+        let starts_new_line = match lines.last() {
+            None => true,
+            Some(line) => {
+                let reference = visible_right
+                    .last()
+                    .copied()
+                    .unwrap_or(line.rect.origin.x + line.rect.size.width);
+                pending_break
+                    || (line.rect.origin.y - character.rect.origin.y).abs() > tolerance
+                    || character.rect.origin.x - reference > max_advance
+            }
+        };
+
+        if starts_new_line {
+            lines.push(TextLine {
+                rect: character.rect,
+                range: (index as u32)..(index as u32 + 1),
+                text: decoded.map(|c| c.to_string()).unwrap_or_default(),
+            });
+            visible_right.push(character.rect.origin.x + character.rect.size.width);
+        } else if let Some(line) = lines.last_mut() {
+            line.rect = union_rect(line.rect, character.rect);
+            line.range.end = line.range.end.max(index as u32 + 1);
+            if let Some(character) = decoded {
+                line.text.push(character);
+            }
+            if let Some(right) = visible_right.last_mut() {
+                *right = character.rect.origin.x + character.rect.size.width;
+            }
+        }
+
+        pending_break = false;
+    }
+
+    lines
+}
+
+/// Buckets a left edge so lines from the same column compare equal.
+fn column_index(rect: Rect) -> i64 {
+    (rect.origin.x / 20.0).round() as i64
+}
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let min_x = a.origin.x.min(b.origin.x);
+    let min_y = a.origin.y.min(b.origin.y);
+    let max_x = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+    let max_y = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Groups lines into blocks: same column, vertically adjacent, no paragraph-sized gap.
+///
+/// `gap_factor` is the multiple of the median line height that still reads as "same paragraph";
+/// 0.8 suits tight academic setting.
+pub fn blocks_from(lines: &[TextLine], gap_factor: f64) -> Vec<TextBlock> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut heights: Vec<f64> = lines
+        .iter()
+        .map(|line| line.rect.size.height)
+        .filter(|height| *height > 0.0)
+        .collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_height = heights.get(heights.len() / 2).copied().unwrap_or(10.0);
+    let max_gap = median_height * gap_factor;
+
+    let mut blocks: Vec<TextBlock> = Vec::new();
+    for line in lines {
+        // Match against *any* block, not just the previous line: with columns separated, line
+        // order interleaves them (left-1, right-1, left-2, right-2), so the previous line is not
+        // the one this line continues.
+        let mut target: Option<usize> = None;
+        for (index, block) in blocks.iter().enumerate() {
+            let Some(previous) = block.lines.last() else {
+                continue;
+            };
+            let gap = previous.rect.origin.y - (line.rect.origin.y + line.rect.size.height);
+            let overlaps_horizontally = line.rect.origin.x
+                < previous.rect.origin.x + previous.rect.size.width
+                && previous.rect.origin.x < line.rect.origin.x + line.rect.size.width;
+
+            if gap >= 0.0
+                && gap <= max_gap
+                && overlaps_horizontally
+                && column_index(block.rect) == column_index(line.rect)
+            {
+                target = Some(index);
+                break;
+            }
+        }
+
+        match target {
+            Some(index) => {
+                let block = &mut blocks[index];
+                block.rect = union_rect(block.rect, line.rect);
+                block.text.push(' ');
+                block.text.push_str(line.text.trim());
+                block.lines.push(line.clone());
+            }
+            None => blocks.push(TextBlock {
+                rect: line.rect,
+                lines: vec![line.clone()],
+                text: line.text.trim().to_string(),
+                is_heading: false,
+            }),
+        }
+    }
+
+    for block in blocks.iter_mut() {
+        block.text = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        block.is_heading = block.lines.len() == 1 && block.text.chars().count() <= 60;
+    }
+
+    blocks
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use aris_reader_core::{PageIndex, Point, RawCharBox, RawTextPage, Rect};
+
+    /// A page built from `(x, top, text)` runs, each character 5 pt wide and 10 pt tall.
+    fn page_of_lines(lines: &[(f64, f64, &str)]) -> RawTextPage {
+        let mut chars = Vec::new();
+        for (x, top, text) in lines {
+            for (column, character) in text.chars().enumerate() {
+                chars.push(RawCharBox {
+                    rect: Rect::new(x + column as f64 * 5.0, top - 10.0, 5.0, 10.0),
+                    origin: Point::new(x + column as f64 * 5.0, top - 10.0),
+                    unicode: character as u32,
+                    font_size: 10.0,
+                    angle: 0.0,
+                    font_name: "Body".to_string(),
+                });
+            }
+        }
+        RawTextPage {
+            page: PageIndex(0),
+            chars,
+            text: String::new(),
+            is_generated: false,
+            has_unicode_map_error: false,
+        }
+    }
+
+    #[test]
+    fn one_baseline_becomes_one_line() {
+        let page = page_of_lines(&[(100.0, 800.0, "hello"), (130.0, 800.0, "world")]);
+        let lines = lines_from(&page);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].text.contains("hello") && lines[0].text.contains("world"));
+    }
+
+    #[test]
+    fn a_space_with_no_box_does_not_split_a_line() {
+        // Exactly what PDFium produces: the space has a degenerate box, sitting far from the next
+        // glyph because the producer gave it no advance.
+        let mut page = page_of_lines(&[(100.0, 800.0, "hello"), (130.0, 800.0, "world")]);
+        page.chars.insert(
+            5,
+            RawCharBox {
+                rect: Rect::new(126.0, 790.0, 0.0, 0.0),
+                origin: Point::new(126.0, 790.0),
+                unicode: ' ' as u32,
+                font_size: 0.0,
+                angle: 0.0,
+                font_name: "Body".to_string(),
+            },
+        );
+        let lines = lines_from(&page);
+        assert_eq!(lines.len(), 1, "a space must not break the line: {lines:?}");
+    }
+
+    #[test]
+    fn a_gap_splits_paragraphs() {
+        let page = page_of_lines(&[
+            (100.0, 800.0, "first line of the paragraph"),
+            (100.0, 790.0, "second line of the paragraph"),
+            (100.0, 780.0, "third line of the paragraph"),
+            (100.0, 750.0, "a separate entry"),
+        ]);
+        let blocks = blocks_from(&lines_from(&page), 0.8);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn columns_do_not_merge() {
+        let page = page_of_lines(&[
+            (50.0, 800.0, "left column line one"),
+            (50.0, 790.0, "left column line two"),
+            (320.0, 800.0, "right column line one"),
+            (320.0, 790.0, "right column line two"),
+        ]);
+        let blocks = blocks_from(&lines_from(&page), 0.8);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert!(blocks.iter().all(|block| block.lines.len() == 2));
+    }
+}
