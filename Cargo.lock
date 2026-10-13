@@ -65,6 +65,7 @@ dependencies = [
  "aris-reader-gpu",
  "aris-reader-pdfium",
  "aris-reader-session",
+ "aris-reader-text",
  "uniffi",
 ]
 

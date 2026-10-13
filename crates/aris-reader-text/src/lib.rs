@@ -147,3 +147,90 @@ pub struct SearchHit {
     /// Context snippet around the hit (a few characters before and after), used in the result list.
     pub context: String,
 }
+
+// ---------------------------------------------------------------------------
+// Search (T2.2)
+// ---------------------------------------------------------------------------
+
+/// One match inside a page's character sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Match {
+    /// Index of the first matching character.
+    pub start: usize,
+    /// Index one past the last matching character.
+    pub end: usize,
+}
+
+/// Finds every non-overlapping occurrence of `needle` in `haystack`.
+///
+/// Matching ignores ASCII case; callers pass the page text **built from the character
+/// sequence itself**, so the returned indices address the same character array that
+/// selection and highlighting use — no byte/character mapping anywhere else.
+pub fn find_all(haystack: &str, needle: &str) -> Vec<Match> {
+    if needle.is_empty() || haystack.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+
+    let haystack: Vec<char> = haystack.chars().collect();
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.len() > haystack.len() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let mut index = 0;
+    while index + needle.len() <= haystack.len() {
+        let hit = (0..needle.len())
+            .all(|offset| haystack[index + offset].eq_ignore_ascii_case(&needle[offset]));
+        if hit {
+            matches.push(Match {
+                start: index,
+                end: index + needle.len(),
+            });
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    matches
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn finds_every_non_overlapping_match() {
+        let matches = find_all("the quick brown fox, the lazy dog", "the");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], Match { start: 0, end: 3 });
+        assert_eq!(matches[1].start, 21);
+    }
+
+    #[test]
+    fn matching_ignores_ascii_case() {
+        let matches = find_all("Page 3 of 3", "page");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            &"Page 3 of 3".chars().collect::<Vec<_>>()[matches[0].start..matches[0].end]
+                .iter()
+                .collect::<String>(),
+            "Page"
+        );
+    }
+
+    #[test]
+    fn indices_address_characters_not_bytes() {
+        // Four two-byte characters before the match: a byte-based index would report 8.
+        let matches = find_all("日本語版 PDF", "PDF");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start, 5, "indices must count characters");
+    }
+
+    #[test]
+    fn empty_and_oversized_needles_find_nothing() {
+        assert!(find_all("abc", "").is_empty());
+        assert!(find_all("", "abc").is_empty());
+        assert!(find_all("abc", "abcd").is_empty());
+    }
+}

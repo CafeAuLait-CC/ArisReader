@@ -113,7 +113,7 @@ resolve locally.
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | ✅ Complete — pages render as 512 px tiles at a discrete LOD chosen from the zoom, continuous scrolling and the overlay scroll indicator work, deep zoom stays sharp while memory stays bounded by what is visible (400% needs 140 tiles for the page and touches 45), and rasterization runs off the main thread under a memory budget. Region rasterization is verified pixel-for-pixel against whole-page renders |
-| M2 | Full reading experience: outline, thumbnails, search, text selection, links, tabs, reading position | 🚧 In progress — the text layer is in: per-character boxes come out of PDFium in view space, drag-selection highlights them, and ⌘C copies the selected text. Outline, thumbnails, search, links and tabs remain |
+| M2 | Full reading experience: outline, thumbnails, search, text selection, links, tabs, reading position | 🚧 In progress — the text layer is in: per-character boxes come out of PDFium in view space, drag-selection highlights them, ⌘C copies, and the toolbar searches every page (a hit is shown by selecting its range, so highlighting and scrolling come for free). Outline, thumbnails, links, tabs and reading-position restore remain |
 | M3 | Annotation and editing: highlight/underline/ink/sticky notes, page operations, forms, incremental save | ⬜ |
 | M4 | Advanced reading: citation/figure **floating windows**, bibliography index, split view, presentation mode | ⬜ |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |

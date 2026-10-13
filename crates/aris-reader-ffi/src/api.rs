@@ -357,6 +357,41 @@ impl ArisDocument {
         })
     }
 
+    /// Searches every page for `pattern` (ASCII-case-insensitive).
+    ///
+    /// Returns at most `limit` hits in reading order. A hit is a **character range** into
+    /// the page's text layer, which is exactly what the shell's selection and highlighting
+    /// already address, so showing a hit needs no new machinery.
+    pub fn search(&self, pattern: String, limit: u32) -> Result<Vec<SearchHit>, ArisFfiError> {
+        if pattern.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::new();
+        let page_count = self.backend.page_count();
+        for page in 0..page_count {
+            let raw = self.backend.raw_text_page(PageIndex(page))?;
+            let haystack = text_of(&raw);
+            for hit in aris_reader_text::find_all(&haystack, &pattern) {
+                if hits.len() >= limit as usize {
+                    return Ok(hits);
+                }
+                let snippet: String = haystack
+                    .chars()
+                    .skip(hit.start.saturating_sub(24))
+                    .take((hit.end - hit.start) + 48)
+                    .collect();
+                hits.push(SearchHit {
+                    page,
+                    start: hit.start as u32,
+                    end: hit.end as u32,
+                    snippet,
+                });
+            }
+        }
+        Ok(hits)
+    }
+
     /// Total height of the scrolling content for the given page gap.
     pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
         self.layout(gap_pt).content_height_pt()
@@ -478,6 +513,28 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     }
 
     scale
+}
+
+/// One search hit: a character range in a page's text layer.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchHit {
+    pub page: u32,
+    /// First matching character index.
+    pub start: u32,
+    /// One past the last matching character.
+    pub end: u32,
+    /// Surrounding text, for the results list.
+    pub snippet: String,
+}
+
+/// The page text **rebuilt from the character sequence**, so indices address the same
+/// array that selection uses (PDFium's own string may insert separators that have no
+/// character box).
+fn text_of(raw: &aris_reader_core::RawTextPage) -> String {
+    raw.chars
+        .iter()
+        .map(|character| char::from_u32(character.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 /// One character of a page's text layer, boxed in **view space** (points, top-left origin).
@@ -611,6 +668,46 @@ mod tests {
             "the page string looks truncated: {} chars of text for {} boxes",
             text.text.chars().count(),
             text.chars.len()
+        );
+    }
+
+    #[test]
+    fn search_finds_text_across_pages() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multipage.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        // Every page of this fixture carries "Page N of 3".
+        let hits = document.search("page".to_string(), 50).expect("search");
+        assert!(hits.len() >= 3, "only {} hits", hits.len());
+        assert_eq!(hits[0].page, 0, "hits come back in reading order");
+        assert!(
+            hits.iter().any(|hit| hit.page == 2),
+            "page 3 was not searched"
+        );
+        assert!(hits[0].end > hits[0].start);
+        assert!(!hits[0].snippet.is_empty());
+
+        // A pattern that cannot occur returns nothing rather than erroring.
+        assert!(
+            document
+                .search("zzzzz".to_string(), 50)
+                .expect("search")
+                .is_empty()
+        );
+        assert!(
+            document
+                .search("   ".to_string(), 50)
+                .expect("blank")
+                .is_empty()
         );
     }
 

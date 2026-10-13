@@ -177,6 +177,40 @@ public struct ReaderWindow: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: Binding(
+                    get: { state.searchQuery },
+                    set: { state.searchQuery = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 150)
+                .onSubmit { state.runSearch() }
+
+                if !state.searchHits.isEmpty {
+                    Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    state.findPrevious()
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+                .disabled(state.searchHits.isEmpty)
+                .help("Previous match (⇧⌘G)")
+
+                Button {
+                    state.findNext()
+                } label: {
+                    Image(systemName: "chevron.down")
+                }
+                .disabled(state.searchHits.isEmpty)
+                .help("Next match (⌘G)")
+            }
+
             Button {
                 state.zoomOut()
             } label: {

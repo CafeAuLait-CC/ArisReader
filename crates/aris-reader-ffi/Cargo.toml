@@ -22,6 +22,7 @@ path = "src/bin/uniffi-bindgen.rs"
 workspace = true
 
 [dependencies]
+aris-reader-text = { path = "../aris-reader-text" }
 aris-reader-core = { workspace = true }
 aris-reader-session = { workspace = true }
 aris-reader-gpu = { workspace = true }

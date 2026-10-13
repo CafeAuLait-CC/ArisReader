@@ -100,6 +100,14 @@ public struct TextPage: Sendable {
     public let hasUnicodeMapError: Bool
 }
 
+/// One search hit: a character range in a page's text layer.
+public struct SearchHit: Sendable {
+    public let page: Int
+    public let start: Int
+    public let end: Int
+    public let snippet: String
+}
+
 /// One rasterized tile: what `rasterizeTile` hands back.
 ///
 /// Tiles are the unit the shell thinks in once zoom passes what a single page texture can
@@ -166,6 +174,8 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
+    func search(_ pattern: String, limit: Int) async throws -> [SearchHit]
     /// Total height of the scrolling content, in points.
     func contentHeightPt(gapPt: CGFloat) -> CGFloat
     /// Width of the widest page, in points (the canvas centres the content with it).
@@ -357,6 +367,30 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let hits = try document.search(pattern: pattern, limit: UInt32(limit))
+                    continuation.resume(
+                        returning: hits.map { hit in
+                            SearchHit(
+                                page: Int(hit.page),
+                                start: Int(hit.start),
+                                end: Int(hit.end),
+                                snippet: hit.snippet
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
         guard let document else { return 0 }
         return CGFloat(document.contentHeightPt(gapPt: Double(gapPt)))
@@ -449,6 +483,8 @@ public final class MockEngine: PDFEngine {
             userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
         )
     }
+
+    public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] { [] }
 
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat { 0 }
     public func contentWidthPt(gapPt: CGFloat) -> CGFloat { 0 }

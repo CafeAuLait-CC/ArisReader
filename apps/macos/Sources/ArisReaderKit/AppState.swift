@@ -117,6 +117,13 @@ public final class AppState: ObservableObject {
     }
 
     @Published public private(set) var selection: Selection?
+
+    /// Search state. A hit is shown by selecting its character range, so highlighting and
+    /// scrolling come for free.
+    @Published public var searchQuery: String = ""
+    @Published public private(set) var searchHits: [SearchHit] = []
+    @Published public private(set) var currentHitIndex: Int?
+    @Published public private(set) var isSearching = false
     /// Character the drag started on, so extending the selection stays anchored.
     private var selectionAnchor: Int?
     /// 1×1 texture drawn as a translucent quad over selected characters — the same
@@ -228,6 +235,22 @@ public final class AppState: ObservableObject {
             // between two points and copies, so the text path can be verified headlessly.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SELECT"], !raw.isEmpty {
                 selectForVerification(raw)
+            }
+
+            // Development aid: ARIS_READER_FIND="pattern" searches at launch and reports the
+            // hits on stderr, so search is verifiable without typing.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_FIND"], !raw.isEmpty {
+                searchQuery = raw
+                runSearch()
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(1200))
+                    guard let self else { return }
+                    let summary = self.searchHits.prefix(4).map { hit in
+                        "p\(hit.page + 1):\(hit.snippet.prefix(28))"
+                    }.joined(separator: " | ")
+                    let line = "aris-find: \(self.searchHits.count) hits: \(summary)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
             }
         }
     }
@@ -346,6 +369,64 @@ public final class AppState: ObservableObject {
             let line = "aris-select: \(selected.count) characters: \"\(selected)\"\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
+    }
+
+    /// Runs a search over the whole document.
+    public func runSearch() {
+        let pattern = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard document != nil, !pattern.isEmpty else {
+            searchHits = []
+            currentHitIndex = nil
+            return
+        }
+
+        isSearching = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let hits = (try? await self.engine.search(pattern, limit: 500)) ?? []
+            self.searchHits = hits
+            self.isSearching = false
+            self.currentHitIndex = hits.isEmpty ? nil : 0
+            if hits.isEmpty {
+                self.statusMessage = "No matches"
+            } else {
+                self.showHit(at: 0)
+            }
+        }
+    }
+
+    /// Moves to the next (or previous) hit, wrapping around.
+    public func findNext() {
+        advanceHit(by: 1)
+    }
+
+    public func findPrevious() {
+        advanceHit(by: -1)
+    }
+
+    private func advanceHit(by delta: Int) {
+        guard !searchHits.isEmpty else { return }
+        let current = currentHitIndex ?? -1
+        let next = ((current + delta) % searchHits.count + searchHits.count) % searchHits.count
+        currentHitIndex = next
+        showHit(at: next)
+    }
+
+    /// Shows a hit by selecting its character range and scrolling it into view, so
+    /// highlighting reuses the selection machinery.
+    private func showHit(at index: Int) {
+        guard searchHits.indices.contains(index) else { return }
+        let hit = searchHits[index]
+
+        selection = Selection(page: hit.page, range: hit.start...(max(hit.start, hit.end - 1)))
+        selectionAnchor = nil
+
+        let top = engine.pageTopPt(hit.page, gapPt: pageGapPt)
+        if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
+            scrollYPt = top
+        }
+        reloadVisiblePages()
+        statusMessage = "Match \(index + 1) of \(searchHits.count)"
     }
 
     /// 0…1 position of the viewport inside the content (drives the scroll indicator).
