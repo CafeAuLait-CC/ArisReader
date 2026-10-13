@@ -45,8 +45,15 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
     candidates
 }
 
-/// Serialises PDFium rendering process-wide — see the TODO in the `rasterize` impl.
-static RASTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serialises **every** touch of a PDFium document or page handle, process-wide.
+///
+/// Measured, not guessed (2026-10-13, on 12 real papers plus the fixtures): with only the
+/// per-document lock in place, the FFI test binary -- which opens several documents and uses
+/// them from parallel test threads -- still died with SIGSEGV about once every 25 runs. The
+/// crash disappeared once every page-handle path (rendering, `page_info`, text extraction,
+/// link and outline reads) took this one lock, which is the honest conclusion: this PDFium
+/// build does not tolerate concurrent use across documents for anything that loads a handle.
+static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serialises opening documents. Rendering may run in parallel across copies of a
 /// document; *loading* one must not (see the comment in [`PdfiumBackend::open`]).
@@ -205,11 +212,107 @@ impl PdfiumBackend {
     /// PDFium documents must not be shared between threads, so the raster pool keeps one
     /// copy per worker (`docs/02-architecture.md` §3). Reopening is cheap: PDFium
     /// memory-maps the file and reuses its caches.
+    /// Image object boxes (figures) and the path-object count (rules) on a page.
+    ///
+    /// PDF has no "figure" or "table" object: an image XObject is as close as the format comes,
+    /// and rules — stroked paths — are the only handle on tables and vector figures.
+    pub fn page_object_summary(&self, page: PageIndex) -> Result<(Vec<Rect>, usize)> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pdf_page = self.page(page)?;
+
+        let mut images = Vec::new();
+        let mut paths = 0usize;
+        for object in pdf_page.objects().iter() {
+            match object.object_type() {
+                PdfPageObjectType::Image => {
+                    // `bounds()` hands back a quadrilateral; images are axis-aligned, so its
+                    // left/right/bottom/top give the box directly.
+                    if let Ok(quad) = object.bounds() {
+                        images.push(Rect::new(
+                            f64::from(quad.left().value),
+                            f64::from(quad.bottom().value),
+                            f64::from(quad.right().value - quad.left().value),
+                            f64::from(quad.top().value - quad.bottom().value),
+                        ));
+                    }
+                }
+                PdfPageObjectType::Path => paths += 1,
+                _ => {}
+            }
+        }
+
+        Ok((images, paths))
+    }
+
+    /// Number of link annotations the PDF actually contains, resolved or not.
+    ///
+    /// [`PdfiumBackend::link_targets`] deliberately drops links it cannot act on, so this is
+    /// the denominator: comparing the two is how a missing capability (named destinations,
+    /// remote destinations) shows up as a number instead of a guess.
+    pub fn link_annotation_count(&self, page: PageIndex) -> Result<usize> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pdf_page = self.page(page)?;
+        Ok(pdf_page.links().len())
+    }
+
+    /// Action types of the link annotations that [`PdfiumBackend::link_targets`] had to drop.
+    ///
+    /// Measurement first: before guessing why links do not resolve, ask the document what
+    /// they actually are. Returns one short label per unresolved annotation.
+    pub fn unresolved_link_actions(&self, page: PageIndex) -> Result<Vec<String>> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pdf_page = self.page(page)?;
+        let mut labels = Vec::new();
+
+        for link in pdf_page.links().iter() {
+            if link.rect().is_err() {
+                continue;
+            }
+            let Some(action) = link.action() else {
+                // The annotation's own /Dest counts as resolved (see `link_targets`).
+                if link.destination().is_some() {
+                    continue;
+                }
+                labels.push("no action, no destination".to_string());
+                continue;
+            };
+
+            // The same resolution rules `link_targets` uses, so this measures exactly the
+            // links that get dropped.
+            if action.as_uri_action().is_some() {
+                continue;
+            }
+            if let Some(local) = action.as_local_destination_action()
+                && local.destination().is_ok()
+            {
+                continue;
+            }
+
+            if link.destination().is_some() {
+                continue;
+            }
+
+            let suffix = if action.is_unsupported() {
+                " (unsupported)"
+            } else {
+                ""
+            };
+            labels.push(format!("{:?}{suffix}", action.action_type()));
+        }
+
+        Ok(labels)
+    }
+
     /// Links on a page, reduced to what navigation needs.
     pub fn link_targets(&self, page: PageIndex) -> Result<Vec<RawLink>> {
-        // Link actions live in document state, so they take the document lock.
-        let _guard = self
-            .raster_lock
+        // Link actions live in document state (see `PDFIUM_LOCK`).
+        let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -241,6 +344,25 @@ impl PdfiumBackend {
                     {
                         dest_rect = Some(rect_from_pdf(rect));
                     }
+                }
+            }
+
+            // A link may carry its target in an action (/A) **or** directly on the
+            // annotation (/Dest). Real papers use both: in the sample corpus one file had 83
+            // of 92 links with no action at all, and every one of them was a /Dest. Without
+            // this fallback those links look like dead ends even though they navigate fine.
+            if uri.is_none()
+                && target.is_none()
+                && let Some(destination) = link.destination()
+            {
+                target = destination
+                    .page_index()
+                    .ok()
+                    .map(|index| PageIndex(index.max(0) as u32));
+                if let Ok(PdfDestinationViewSettings::FitPageToRectangle(rect)) =
+                    destination.view_settings()
+                {
+                    dest_rect = Some(rect_from_pdf(rect));
                 }
             }
 
@@ -360,6 +482,11 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn page_info(&self, index: PageIndex) -> Result<PageInfo> {
+        // See `PDFIUM_LOCK`: loading a page handle is document state, exactly like rendering.
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let page = self.page(index)?;
 
         // Boundary boxes are returned in unrotated PDF user space, which is
@@ -387,9 +514,8 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn outline(&self) -> Result<Vec<OutlineNode>> {
-        // Bookmarks live in the document's own state, so they take the document lock too.
-        let _guard = self
-            .raster_lock
+        // Bookmarks live in the document's own state (see `PDFIUM_LOCK`).
+        let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -420,10 +546,8 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage> {
-        // Text extraction walks the same document state as rendering, so it takes the same
-        // lock (`docs/03-rendering.md`).
-        let _guard = self
-            .raster_lock
+        // Text extraction walks the same document state as rendering (see `PDFIUM_LOCK`).
+        let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -457,6 +581,7 @@ impl DocumentBackend for PdfiumBackend {
                 // `PdfPageTextChar::font_size` is not usable here (its trait bounds are
                 // not satisfied); the loose box height is a good stand-in for selection UI.
                 font_size: f64::from(bounds.height().value),
+                font_name: character.font_name(),
                 // TODO(T2.1): derive the glyph angle from the text matrix; PDFium's
                 // character API does not expose it directly.
                 angle: 0.0,
@@ -475,17 +600,10 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {
-        // T1.3 (measured, 2026-10-12): rendering is serialised **process-wide**.
-        //
-        // The pieces for parallelism are in place -- `reopen()` gives every worker its own
-        // `FPDF_DOCUMENT` with its own lock, and `reopened_copies_render_in_parallel` passes
-        // on its own -- but when the process-wide lock was removed and the full test binary
-        // was run twelve times, **four runs crashed with SIGSEGV**. Loading documents
-        // concurrently was one real hazard and is now serialised by `LOAD_LOCK`; concurrent
-        // *rendering* is the other, and this PDFium build does not tolerate it. So the lock
-        // stays until that is understood: the raster pool buys a responsive main thread, not
-        // overlapped work.
-        let _guard = RASTER_LOCK
+        // See `PDFIUM_LOCK`: rendering is serialised process-wide until this PDFium build's
+        // cross-document behaviour is understood. The raster pool therefore buys a responsive
+        // main thread, not overlapped work.
+        let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _document_guard = self

@@ -85,7 +85,7 @@ impl TextPage {
     pub fn from_raw(raw: &RawTextPage) -> Self {
         Self {
             page: raw.page,
-            chars: raw.chars.iter().copied().map(CharBox::from).collect(),
+            chars: raw.chars.iter().cloned().map(CharBox::from).collect(),
             blocks: Vec::new(), // TODO(T2.1)
             text: raw.text.clone(),
             is_generated: raw.is_generated,

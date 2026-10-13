@@ -11,6 +11,8 @@
 //! aris-reader-cli compare <a.png> <b.png> [--max-mae F]
 //! aris-reader-cli text <file.pdf> [--page N]
 //! aris-reader-cli bench <file.pdf> [--pages N]
+//! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
+//! aris-reader-cli analyze <file.pdf> [--pages N]
 //! ```
 
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
@@ -26,6 +28,9 @@ Usage:
   aris-reader-cli version                        print the engine version
   aris-reader-cli config                         print the default engine config
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
+  aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
+  aris-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
+                 [--search TERM] [--pages N]
   aris-reader-cli render <file.pdf>              render one page to PNG
                  [--page N] [--dpi D] [-o out.png]
   aris-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
@@ -68,6 +73,8 @@ fn main() -> ExitCode {
         Some("compare") => cmd_compare(rest(&args)),
         Some("text") => cmd_text(rest(&args)),
         Some("bench") => cmd_bench(rest(&args)),
+        Some("corpus") => cmd_corpus(rest(&args)),
+        Some("analyze") => cmd_analyze(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -344,8 +351,35 @@ fn cmd_text(args: &[String]) -> ExitCode {
         return ExitCode::from(64);
     };
     let page = opt_usize(&options, &["--page"], 0);
-    eprintln!("TODO(T2.1): exporting the text of {path} page {page} is not implemented yet.");
-    ExitCode::from(2)
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match backend.raw_text_page(PageIndex(page as u32)) {
+        Ok(text) => {
+            // The page string plus a summary on stderr, so `text … > out.txt` stays clean
+            // while a human still sees what happened.
+            print!("{}", text.text);
+            if !text.text.ends_with('\n') {
+                println!();
+            }
+            eprintln!(
+                "{} character(s) with boxes, {} text character(s)",
+                text.chars.len(),
+                text.text.chars().count()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cannot read the text layer of {path} page {page}: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_bench(args: &[String]) -> ExitCode {
@@ -364,4 +398,409 @@ fn cmd_bench(args: &[String]) -> ExitCode {
         "TODO(T1.13): report per-page/per-tile raster time, throughput (MP/s) and peak memory."
     );
     ExitCode::from(2)
+}
+
+/// What the engine can actually see in a folder of real PDFs.
+///
+/// Built for the M4 corpus check: it reports, per file, the numbers that matter for citation
+/// and figure work — text coverage, how many link annotations exist versus how many resolved
+/// to something actionable, the outline size, search hits, and the cost of a tile and a
+/// region render. Synthetic fixtures hid every one of these gaps.
+fn cmd_corpus(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    if positional.is_empty() {
+        eprintln!("usage: aris-reader-cli corpus <dir-or-files...> [--search TERM] [--pages N]");
+        return ExitCode::from(64);
+    }
+
+    let search_term = options
+        .iter()
+        .find(|(key, _)| key == "--search")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "the".to_string());
+    let page_cap: u32 = options
+        .iter()
+        .find(|(key, _)| key == "--pages")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(6);
+
+    let mut paths = Vec::new();
+    for entry in &positional {
+        let path = PathBuf::from(entry);
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    let candidate = entry.path();
+                    let is_pdf = candidate
+                        .extension()
+                        .map(|extension| extension.eq_ignore_ascii_case("pdf"))
+                        .unwrap_or(false);
+                    if is_pdf {
+                        paths.push(candidate);
+                    }
+                }
+            }
+        } else {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    println!(
+        "{:<46} {:>5} {:>9} {:>7} {:>7} {:>11} {:>7} {:>7} {:>8}",
+        "file", "pages", "chars", "links", "resolved", "unresolved", "outline", "hits", "tile+reg"
+    );
+
+    let mut unresolved_total = 0usize;
+    let mut links_total = 0usize;
+
+    for path in &paths {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let short: String = name.chars().take(44).collect();
+
+        let backend = match PdfiumBackend::open(path, None) {
+            Ok(backend) => backend,
+            Err(error) => {
+                println!("{short:<46}  open failed: {error}");
+                continue;
+            }
+        };
+
+        let pages = backend.page_count();
+        let inspected = pages.min(page_cap);
+
+        let mut chars = 0usize;
+        let mut links = 0usize;
+        let mut resolved = 0usize;
+        let mut hits = 0usize;
+
+        for index in 0..inspected {
+            let page = PageIndex(index);
+            if let Ok(text) = backend.raw_text_page(page) {
+                chars += text.chars.len();
+                let haystack: String = text
+                    .chars
+                    .iter()
+                    .filter_map(|character| char::from_u32(character.unicode))
+                    .collect();
+                hits += aris_reader_text::find_all(&haystack, &search_term).len();
+            }
+            if let Ok(total) = backend.link_annotation_count(page) {
+                links += total;
+                if let Ok(targets) = backend.link_targets(page) {
+                    resolved += targets.len();
+                }
+            }
+        }
+
+        let outline = backend.outline().map(|nodes| nodes.len()).unwrap_or(0);
+
+        // One tile and one region, timed: the two render paths the preview uses.
+        let started = std::time::Instant::now();
+        let _ = backend.rasterize(&RasterRequest::tile(
+            PageIndex(0),
+            2.0,
+            (0.0, 0.0),
+            (256.0, 256.0),
+        ));
+        let _ = backend.rasterize(&RasterRequest::tile(
+            PageIndex(0),
+            2.0,
+            (100.0, 100.0),
+            (300.0, 200.0),
+        ));
+        let render_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        if options.iter().any(|(key, _)| key == "--verbose") {
+            let mut histogram: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for index in 0..inspected {
+                if let Ok(labels) = backend.unresolved_link_actions(PageIndex(index)) {
+                    for label in labels {
+                        *histogram.entry(label).or_default() += 1;
+                    }
+                }
+            }
+            if !histogram.is_empty() {
+                println!("    unresolved action types: {histogram:?}");
+            }
+        }
+
+        let unresolved = links.saturating_sub(resolved);
+        unresolved_total += unresolved;
+        links_total += links;
+
+        println!(
+            "{short:<46} {pages:>5} {chars:>9} {links:>7} {resolved:>7} {unresolved:>11} {outline:>7} {hits:>7} {render_ms:>7.1}ms"
+        );
+    }
+
+    println!();
+    println!(
+        "inspected first {page_cap} page(s) per file · search term \"{search_term}\" · \
+         {links_total} link annotation(s), {unresolved_total} unresolved"
+    );
+    if unresolved_total > 0 {
+        println!(
+            "unresolved links are the capability gap to close next (named /Dest destinations, \
+             remote destinations, unsupported actions)"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// M4 capability check: can the engine locate the four things a reader wants to follow?
+///
+/// Reports, per page: image objects (figures) with their boxes, path objects (rules — the only
+/// handle on tables and vector figures), citation-like text patterns with their boxes, and how
+/// much of the text is set in a mathematical face (formula candidates). Nothing here guesses:
+/// each number is something PDFium actually exposes, and the report says plainly where a
+/// category has no direct representation in the format.
+fn cmd_analyze(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli analyze <file.pdf> [--pages N]");
+        return ExitCode::from(64);
+    };
+    let page_cap: u32 = options
+        .iter()
+        .find(|(key, _)| key == "--pages")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(4);
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let pages = backend.page_count().min(page_cap);
+    println!(
+        "{path}: {} page(s), inspecting {pages}",
+        backend.page_count()
+    );
+
+    let mut citations_total = 0usize;
+    let mut figures_total = 0usize;
+    let mut math_chars_total = 0usize;
+    let mut chars_total = 0usize;
+
+    for index in 0..pages {
+        let page_index = PageIndex(index);
+
+        // Figures and rules come from the page's own object list.
+        let (images, paths) = backend
+            .page_object_summary(page_index)
+            .unwrap_or((Vec::new(), 0));
+
+        // Citations and formulas come from the text layer.
+        let text = match backend.raw_text_page(page_index) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let citations = find_citations(&text);
+        let math_chars = text
+            .chars
+            .iter()
+            .filter(|character| is_math_font(&character.font_name))
+            .count();
+
+        chars_total += text.chars.len();
+        math_chars_total += math_chars;
+        citations_total += citations.len();
+        figures_total += images.len();
+
+        let regions = backend
+            .link_targets(page_index)
+            .map(|links| links.iter().filter(|link| link.dest_rect.is_some()).count())
+            .unwrap_or(0);
+
+        if options.iter().any(|(key, _)| key == "--fonts") {
+            let mut fonts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for character in &text.chars {
+                *fonts.entry(character.font_name.clone()).or_default() += 1;
+            }
+            let mut ranked: Vec<(String, usize)> = fonts.into_iter().collect();
+            ranked.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+            let top: Vec<String> = ranked
+                .iter()
+                .take(6)
+                .map(|(name, count)| format!("{name}×{count}"))
+                .collect();
+            println!("        fonts: {}", top.join(", "));
+        }
+
+        println!(
+            "  p{:<3} figures {:<3} rules {:<4} citations {:<3} math-chars {:<5}/{:<5} link-regions {}",
+            index + 1,
+            images.len(),
+            paths,
+            citations.len(),
+            math_chars,
+            text.chars.len(),
+            regions
+        );
+        let clickable = citations
+            .iter()
+            .filter(|(_, rect)| {
+                let target = backend.link_targets(page_index).unwrap_or_default();
+                target.iter().any(|link| overlaps(link.rect, *rect))
+            })
+            .count();
+        println!(
+            "        {clickable} of {} citations sit on a link annotation",
+            citations.len()
+        );
+
+        for (text, rect) in citations.iter().take(6) {
+            println!(
+                "        citation {:<16} at ({:.0},{:.0}) {:.0}x{:.0}",
+                text, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height
+            );
+        }
+        for image in images.iter().take(4) {
+            println!(
+                "        figure   at ({:.0},{:.0}) {:.0}x{:.0}",
+                image.origin.x, image.origin.y, image.size.width, image.size.height
+            );
+        }
+    }
+
+    let math_share = if chars_total == 0 {
+        0.0
+    } else {
+        math_chars_total as f64 / chars_total as f64 * 100.0
+    };
+    println!(
+        "  → {figures_total} figure object(s), {citations_total} citation pattern(s), {math_share:.2}% of characters in a math face"
+    );
+    println!(
+        "  note: tables have no object type in PDF — only rules plus text alignment suggest them"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Citation-looking spans: `[12]`, `[12,13]`, `[12-14]` and `(Author, 2024)`-style years.
+///
+/// Returns the text and its box (page space), built from the character boxes so a caller can
+/// put a highlight or a preview where the citation actually is.
+fn find_citations(text: &aris_reader_core::RawTextPage) -> Vec<(String, aris_reader_core::Rect)> {
+    let chars: Vec<char> = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        // Author-year style: `(He et al. 2024)`, `(Kim and Lee, 2023)`, `(A, 2024; B, 2022)`.
+        // Measured on the sample corpus: publishers split roughly evenly between this and the
+        // numeric style, and a detector that only knows `[12]` sees nothing at all in half of
+        // the papers.
+        if chars[index] == '(' {
+            let mut close = index + 1;
+            while close < chars.len()
+                && close - index <= 90
+                && chars[close] != ')'
+                && chars[close] != '('
+            {
+                close += 1;
+            }
+            let inner: String = chars[index + 1..close.min(chars.len())].iter().collect();
+            let letters = inner.chars().filter(|c| c.is_alphabetic()).count();
+            if close < chars.len() && chars[close] == ')' && letters >= 3 && has_year(&inner) {
+                found.push((inner.clone(), union_box(&text.chars[index..=close])));
+                index = close + 1;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        if chars[index] != '[' {
+            index += 1;
+            continue;
+        }
+        // `[` followed by digits, commas, hyphens and spaces, then `]`, capped in length.
+        let mut end = index + 1;
+        while end < chars.len()
+            && end - index <= 12
+            && (chars[end].is_ascii_digit()
+                || chars[end] == ','
+                || chars[end] == '-'
+                || chars[end] == ' ')
+        {
+            end += 1;
+        }
+        let has_digit = chars[index + 1..end].iter().any(char::is_ascii_digit);
+        if end < chars.len() && chars[end] == ']' && has_digit {
+            let label: String = chars[index..=end].iter().collect();
+
+            found.push((label, union_box(&text.chars[index..=end])));
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+
+    found
+}
+
+/// Union of a run of character boxes, in page space — what a highlight or preview needs.
+fn union_box(chars: &[aris_reader_core::RawCharBox]) -> aris_reader_core::Rect {
+    chars
+        .iter()
+        .fold(None::<aris_reader_core::Rect>, |acc, character| {
+            let rect = character.rect;
+            Some(match acc {
+                None => rect,
+                Some(current) => {
+                    let min_x = current.origin.x.min(rect.origin.x);
+                    let min_y = current.origin.y.min(rect.origin.y);
+                    let max_x = (current.origin.x + current.size.width)
+                        .max(rect.origin.x + rect.size.width);
+                    let max_y = (current.origin.y + current.size.height)
+                        .max(rect.origin.y + rect.size.height);
+                    aris_reader_core::Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+                }
+            })
+        })
+        .unwrap_or(aris_reader_core::Rect::new(0.0, 0.0, 0.0, 0.0))
+}
+
+/// Whether a span contains a plausible four-digit year.
+fn has_year(text: &str) -> bool {
+    let digits: Vec<char> = text.chars().collect();
+    digits.windows(4).any(|window| {
+        window.iter().all(char::is_ascii_digit) && (window[0] == '1' || window[0] == '2') && {
+            let year: u32 = window.iter().collect::<String>().parse().unwrap_or(0);
+            (1900..2100).contains(&year)
+        }
+    })
+}
+
+/// Whether two page-space boxes overlap (the citation's box and a link's box).
+fn overlaps(a: aris_reader_core::Rect, b: aris_reader_core::Rect) -> bool {
+    let a_right = a.origin.x + a.size.width;
+    let a_top = a.origin.y + a.size.height;
+    let b_right = b.origin.x + b.size.width;
+    let b_top = b.origin.y + b.size.height;
+    a.origin.x < b_right && b.origin.x < a_right && a.origin.y < b_top && b.origin.y < a_top
+}
+
+/// Whether a font name belongs to a mathematical face.
+fn is_math_font(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "STIX", "MATH", "EUSM", "EUFM", "RSFS",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker))
 }

@@ -43,6 +43,7 @@ dependencies = [
  "aris-reader-core",
  "aris-reader-pdfium",
  "aris-reader-render",
+ "aris-reader-text",
  "image",
 ]
 

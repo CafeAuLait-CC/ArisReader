@@ -106,7 +106,7 @@ impl RasterTile {
 }
 
 /// Raw geometry of a single character (from `FPDFText_GetCharBox` and similar).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RawCharBox {
     /// Bounding box of the character in Page Space.
     pub rect: Rect,
@@ -118,6 +118,12 @@ pub struct RawCharBox {
     pub font_size: f64,
     /// Text rotation angle (radians; 0 = horizontal).
     pub angle: f64,
+    /// Font name as the engine reports it.
+    ///
+    /// Kept because it is the only practical handle on mathematical typesetting: LaTeX
+    /// formulas come out in CMMI/CMSY/CMEX (or STIX/MathJax) rather than the body font, so a
+    /// run of characters in those faces is a formula candidate.
+    pub font_name: String,
 }
 
 /// Raw text layer of a single page.
