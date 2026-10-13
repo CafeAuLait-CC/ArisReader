@@ -57,13 +57,18 @@ ArisReader/
 ## Quick start
 
 ```bash
-# 1) Check the Rust side (compiles with no external dependencies)
+# 1) Check the Rust side
 cargo check --workspace
 
-# 2) Build and run the native macOS shell (currently a mock engine, no PDF rendering)
+# 2) Build the Rust static library AND generate the UniFFI Swift bindings
+#    (both are build artifacts and are not committed)
+./scripts/build-rust.sh
+
+# 3) Build and run the native macOS shell
 cd apps/macos && swift build && swift run ArisReader
 #    In a sandboxed shell (CI, agent runners) add --disable-sandbox: SwiftPM's nested
 #    sandbox-exec is rejected there. scripts/check.sh retries automatically.
+#    Tip: ARIS_READER_OPEN=/path/to.pdf swift run ArisReader opens a document at launch.
 
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/ArisReader.app

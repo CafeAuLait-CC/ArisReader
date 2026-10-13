@@ -1,0 +1,11 @@
+# UniFFI bindings configuration.
+#
+# The generated Swift lands in a dedicated `ArisReaderBindings` module and talks to the
+# C module `ArisReaderFFI`, which also carries the hand-written data-plane header
+# (include/aris_reader_ffi.h). Both live in the same Swift package, so callers do not
+# care which layer a symbol comes from.
+
+[bindings.swift]
+module_name = "ArisReaderBindings"
+ffi_module_name = "ArisReaderFFI"
+cdylib_name = "aris_reader_ffi"

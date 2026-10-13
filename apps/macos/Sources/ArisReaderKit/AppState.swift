@@ -53,7 +53,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
 /// toolchain compatibility; see the "Negatives / costs" section of `docs/adr/0006`.
 @MainActor
 public final class AppState: ObservableObject {
-    @Published public var document: DocumentSummary?
+    @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails
     @Published public var sidebarVisible: Bool = true
     @Published public var zoomPercent: Int = 100
@@ -98,8 +98,24 @@ public final class AppState: ObservableObject {
 
     public let engine: PDFEngine
 
-    public init(engine: PDFEngine = MockEngine()) {
-        self.engine = engine
+    public init(engine: PDFEngine? = nil) {
+        // Prefer the real engine; fall back to the mock so the window still works when
+        // the Rust backend cannot start (docs/02-architecture.md §8).
+        if let engine {
+            self.engine = engine
+        } else if let rustEngine = try? RustEngine() {
+            self.engine = rustEngine
+        } else {
+            self.engine = MockEngine()
+        }
+        statusMessage = self.engine.version
+
+        // Developer/test affordance: open a document at launch
+        // (`ARIS_READER_OPEN=/path/to.pdf ArisReader`), which also lets a headless run
+        // exercise the whole Swift → UniFFI → PDFium path.
+        if let path = ProcessInfo.processInfo.environment["ARIS_READER_OPEN"], !path.isEmpty {
+            open(url: URL(fileURLWithPath: path))
+        }
     }
 
     public var windowTitle: String {
@@ -113,12 +129,20 @@ public final class AppState: ObservableObject {
 
     public func open(url: URL) {
         do {
-            let summary = try engine.openDocument(at: url)
-            document = summary
+            let loaded = try engine.openDocument(at: url)
+            document = loaded
             currentPage = 1
-            statusMessage = summary.pageCount > 0
-                ? "Opened \(summary.pageCount) pages"
-                : "Opened (engine not wired up yet: page count and content arrive after M0 T0.8)"
+            if loaded.pageCount > 0 {
+                statusMessage = String(
+                    format: "Opened %d page(s) · first page %.0f×%.0f pt · %@",
+                    loaded.pageCount,
+                    loaded.firstPageSize.width,
+                    loaded.firstPageSize.height,
+                    loaded.backend
+                )
+            } else {
+                statusMessage = "Opened \(loaded.title) (no pages reported)"
+            }
         } catch {
             lastError = String(describing: error)
             statusMessage = "Couldn't open the document"

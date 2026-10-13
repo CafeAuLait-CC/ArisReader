@@ -36,20 +36,30 @@ for name in libaris_reader_ffi.a libaris_reader_ffi.dylib; do
   fi
 done
 
-# ── UniFFI binding generation (M0 T0.8) ───────────────────────────────────────
-if cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -q '"uniffi"'; then
+# ── UniFFI bindings (task T0.8) ──────────────────────────────────────────────
+# The control plane (objects, records, errors) is generated from the Rust interface in
+# crates/aris-reader-ffi/src/api.rs. Generated sources are NOT committed: run this
+# script after a fresh clone, before `swift build`.
+LIB="$LIB_DIR/libaris_reader_ffi.dylib"
+if [ -f "$LIB" ]; then
+  BINDINGS_DIR="$ROOT/apps/macos/Sources/ArisReaderBindings"
+  HEADERS_DIR="$ROOT/apps/macos/Sources/ArisReaderFFI/include"
+
   echo "==> Generating UniFFI Swift bindings"
-  OUT_SWIFT="$ROOT/apps/macos/Sources/ArisReaderFFI/Generated"
-  OUT_FFI="$ROOT/apps/macos/Sources/aris_reader_ffiFFI"
-  mkdir -p "$OUT_SWIFT" "$OUT_FFI"
-  cargo run -p aris-reader-ffi --bin uniffi-bindgen -- generate \
-    --library "$LIB_DIR/libaris_reader_ffi.dylib" \
-    --language swift --out-dir "$OUT_SWIFT"
-  cp "$OUT_SWIFT"/*.h "$OUT_FFI/" 2>/dev/null || true
-  cp "$OUT_SWIFT"/*.modulemap "$OUT_FFI/module.modulemap" 2>/dev/null || true
+  rm -rf "$BINDINGS_DIR"
+  mkdir -p "$BINDINGS_DIR" "$HEADERS_DIR"
+  cargo run -q -p aris-reader-ffi --bin uniffi-bindgen -- generate \
+    --library "$LIB" --language swift --out-dir "$BINDINGS_DIR"
+
+  # SwiftPM generates the modulemap for the C target itself. The scaffolding header must
+  # NOT be named after that target: SwiftPM would treat it as the umbrella header and
+  # hide the hand-written data-plane declarations (aris_reader_ffi.h).
+  cp "$BINDINGS_DIR"/*FFI.h "$HEADERS_DIR/uniffi_scaffolding.h"
+  rm -f "$BINDINGS_DIR"/*.modulemap "$BINDINGS_DIR"/*.h
+  echo "    bindings: $(ls "$BINDINGS_DIR" | tr '\n' ' ')"
+  echo "    header  : include/uniffi_scaffolding.h"
 else
-  echo "==> Skipping UniFFI bindings (not wired up yet, see task T0.8)"
-  echo "    Once wired up, this script generates the Swift bindings into apps/macos/Sources/ArisReaderFFI/Generated/"
+  echo "==> Skipping UniFFI bindings (libaris_reader_ffi.dylib not built)"
 fi
 
 echo

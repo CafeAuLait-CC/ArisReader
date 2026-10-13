@@ -34,6 +34,13 @@ use aris_reader_gpu::{GpuContext, SurfaceConfig, SurfaceId, SurfaceTarget};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+// UniFFI scaffolding for the control plane declared in `api` (T0.8). The generated
+// Swift bindings and their C header are produced by `scripts/build-rust.sh`.
+uniffi::setup_scaffolding!();
+
+pub mod api;
+pub use api::{ArisEngine, ArisFfiError, DocumentSummary};
+
 /// ABI version. **Must be bumped whenever the signature or semantics of any exported function changes**.
 pub const ABI_VERSION: u32 = 1;
 

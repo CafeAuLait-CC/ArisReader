@@ -1,6 +1,6 @@
 [package]
 name = "aris-reader-ffi"
-description = "Public FFI: UniFFI control plane + hand-written C ABI (GPU device/surface handoff)"
+description = "Public FFI: UniFFI control plane + hand-written C ABI (GPU surface handoff)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,13 @@ name = "aris_reader_ffi"
 # staticlib → SwiftPM static linking; cdylib → future C#/Kotlin shells; rlib → Rust-internal tests
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# `uniffi-bindgen` lives in this crate so that generating bindings never requires a
+# separately installed tool: scripts/build-rust.sh runs `cargo run -p aris-reader-ffi
+# --bin uniffi-bindgen -- generate --library …` (docs/05-ffi.md §8).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
 [lints]
 workspace = true
 
@@ -18,8 +25,8 @@ workspace = true
 aris-reader-core = { workspace = true }
 aris-reader-session = { workspace = true }
 aris-reader-gpu = { workspace = true }
-
-# M0 T0.8:
-# uniffi = { version = "0.32", features = ["build"] }
-# [build-dependencies]
-# uniffi = { version = "0.32", features = ["build"] }
+aris-reader-pdfium = { workspace = true }
+# The control plane (object handles, records, errors, events) is generated, not
+# hand-written — see docs/adr/0004. `cli` pulls in the bindings generator used by the
+# `uniffi-bindgen` binary above.
+uniffi = { version = "0.32", features = ["cli"] }
