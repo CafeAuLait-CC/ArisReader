@@ -66,6 +66,10 @@ public final class AppState: ObservableObject {
     @Published public private(set) var canvasPages: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public private(set) var scrollYPt: CGFloat = 0
+    /// True while the user is scrolling, so the indicator stays on screen.
+    @Published public private(set) var isScrolling = false
+    /// Fades the indicator out once scrolling stops.
+    private var scrollIdleTask: Task<Void, Never>?
     /// Total content height in points (for scrollbars and clamping).
     @Published public private(set) var contentHeightPt: CGFloat = 0
     /// Width of the widest page in points; the canvas centres the content with it.
@@ -190,6 +194,7 @@ public final class AppState: ObservableObject {
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL"],
                let offset = Double(raw), offset > 0 {
                 scrollYPt = CGFloat(offset)
+                beginScrollActivity()
             }
             reloadVisiblePages()
         }
@@ -278,9 +283,52 @@ public final class AppState: ObservableObject {
         let contentDelta = delta / max(zoomFactor, 0.01)
         let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
         let next = min(max(0, scrollYPt - contentDelta), maxOffset)
+        beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
         reloadVisiblePages()
+    }
+
+    /// 0…1 position of the viewport inside the content (drives the scroll indicator).
+    public var scrollFraction: Double {
+        let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
+        guard scrollable > 0 else { return 0 }
+        return Double(min(max(scrollYPt / scrollable, 0), 1))
+    }
+
+    /// 0…1 share of the content the viewport covers (the indicator's thumb length).
+    public var viewportFraction: Double {
+        guard contentHeightPt > 0 else { return 1 }
+        return Double(min(max(viewportHeightContentPt / contentHeightPt, 0.02), 1))
+    }
+
+    /// Whether the indicator should be visible: only while scrolling, and only when there is
+    /// something to scroll.
+    public var showsScrollIndicator: Bool {
+        contentHeightPt > viewportHeightContentPt && isScrolling
+    }
+
+    /// Scrolls to a 0…1 position (drag on the indicator).
+    public func scroll(toFraction fraction: Double) {
+        guard document != nil else { return }
+        let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
+        let next = CGFloat(min(max(fraction, 0), 1)) * scrollable
+        beginScrollActivity()
+        guard abs(next - scrollYPt) > 0.01 else { return }
+        scrollYPt = next
+        reloadVisiblePages()
+    }
+
+    /// Marks the indicator as in use and schedules it to fade out. The task is replaced on
+    /// every scroll event, so momentum scrolling keeps it visible.
+    private func beginScrollActivity() {
+        isScrolling = true
+        scrollIdleTask?.cancel()
+        scrollIdleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            self?.isScrolling = false
+        }
     }
 
     /// Jumps so that `page` (0-based) sits at the top of the viewport.
