@@ -100,6 +100,14 @@ public struct TextPage: Sendable {
     public let hasUnicodeMapError: Bool
 }
 
+/// One outline entry, already flattened (nesting travels as `depth`).
+public struct OutlineEntry: Sendable, Identifiable {
+    public let title: String
+    public let page: Int?
+    public let depth: Int
+    public var id: String { "\(depth):\(page ?? -1):\(title)" }
+}
+
 /// One search hit: a character range in a page's text layer.
 public struct SearchHit: Sendable {
     public let page: Int
@@ -174,6 +182,8 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Document outline (empty when the PDF has no bookmarks).
+    func outline() async throws -> [OutlineEntry]
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
     func search(_ pattern: String, limit: Int) async throws -> [SearchHit]
     /// Total height of the scrolling content, in points.
@@ -367,6 +377,29 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func outline() async throws -> [OutlineEntry] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let entries = try document.outline()
+                    continuation.resume(
+                        returning: entries.map { entry in
+                            OutlineEntry(
+                                title: entry.title,
+                                page: entry.page.map { Int($0) },
+                                depth: Int(entry.depth)
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] {
         guard let document else { return [] }
 
@@ -483,6 +516,8 @@ public final class MockEngine: PDFEngine {
             userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
         )
     }
+
+    public func outline() async throws -> [OutlineEntry] { [] }
 
     public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] { [] }
 

@@ -120,6 +120,17 @@ public final class AppState: ObservableObject {
 
     @Published public private(set) var selection: Selection?
 
+    /// Document outline, loaded once per document.
+    @Published public private(set) var outline: [OutlineEntry] = []
+    /// Small page previews for the sidebar, keyed by page index.
+    @Published public private(set) var thumbnails: [Int: PageImage] = [:]
+    private var thumbnailsInFlight: Set<Int> = []
+    /// Thumbnail width in points; height follows the page's aspect ratio.
+    public let thumbnailWidthPt: CGFloat = 132
+    /// How many pages get a preview. Loading every page of a 2000-page manual up front would
+    /// be wasteful; the strip grows on demand (T2.5).
+    private let thumbnailLimit = 24
+
     /// Search state. A hit is shown by selecting its character range, so highlighting and
     /// scrolling come for free.
     @Published public var searchQuery: String = ""
@@ -238,6 +249,16 @@ public final class AppState: ObservableObject {
             // the content is (the offset is clamped against it).
             if let opened = document?.url {
                 restoreReadingPosition(for: opened)
+            }
+            loadOutline()
+            loadThumbnails()
+
+            // Development aid: report the sidebar's data so it can be checked headlessly.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(1500))
+                guard let self else { return }
+                let line = "aris-sidebar: outline \(self.outline.count) entries, thumbnails \(self.thumbnails.count)\n"
+                FileHandle.standardError.write(Data(line.utf8))
             }
 
             // Development aid: ARIS_READER_SELECT="x1,y1;x2,y2" (content points) selects
@@ -424,6 +445,12 @@ public final class AppState: ObservableObject {
 
     /// Shows a hit by selecting its character range and scrolling it into view, so
     /// highlighting reuses the selection machinery.
+    /// Public entry point for the sidebar's search results list.
+    public func showSearchHit(_ index: Int) {
+        currentHitIndex = index
+        showHit(at: index)
+    }
+
     private func showHit(at index: Int) {
         guard searchHits.indices.contains(index) else { return }
         let hit = searchHits[index]
@@ -459,6 +486,40 @@ public final class AppState: ObservableObject {
     }
 
     /// Scrolls to a 0…1 position (drag on the indicator).
+    /// Loads the document outline (once per document).
+    public func loadOutline() {
+        guard document != nil else {
+            outline = []
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.outline = (try? await self.engine.outline()) ?? []
+        }
+    }
+
+    /// Rasterizes the first pages at thumbnail size for the sidebar.
+    public func loadThumbnails() {
+        guard let document, document.pageCount > 0 else {
+            thumbnails = [:]
+            return
+        }
+
+        let scale = thumbnailWidthPt / max(document.firstPageSize.width, 1)
+        for page in 0..<min(document.pageCount, thumbnailLimit) {
+            guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page) else { continue }
+            thumbnailsInFlight.insert(page)
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.thumbnailsInFlight.remove(page) }
+                if let image = try? await self.engine.renderPage(page, scale: scale) {
+                    self.thumbnails[page] = image
+                }
+            }
+        }
+    }
+
     /// Resumes where the reader left off.
     ///
     /// Saved per document path, debounced while scrolling, and clamped to the content so a

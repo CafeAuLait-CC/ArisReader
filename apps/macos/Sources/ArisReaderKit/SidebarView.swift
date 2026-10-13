@@ -1,9 +1,10 @@
+import CoreGraphics
 import SwiftUI
 
 /// Sidebar: tab switching plus the content of each tab (`docs/04-ui-ux.md` §2.2).
 ///
-/// The skeleton phase provides only the structure and empty states; real content is filled in
-/// tab by tab starting in M2 (thumbnails T2.5, outline T2.4, annotations T3.6, search T2.6, AI T5.4).
+/// Thumbnails, outline and search results are real as of M2; the remaining tabs
+/// (bookmarks, annotations, AI) keep their empty state until their milestone.
 public struct SidebarView: View {
     @ObservedObject private var state: AppState
 
@@ -35,17 +36,161 @@ public struct SidebarView: View {
     private var content: some View {
         switch state.sidebarTab {
         case .thumbnails:
-            emptyState("Thumbnails", "square.grid.2x2", task: "T2.5")
+            thumbnailStrip
         case .outline:
-            emptyState("Document outline", "list.bullet.indent", task: "T2.4")
+            outlineList
+        case .search:
+            searchResults
         case .bookmarks:
             emptyState("Bookmarks", "bookmark", task: "T2.4")
         case .annotations:
             emptyState("Annotations", "highlighter", task: "T3.6")
-        case .search:
-            emptyState("Search results", "magnifyingglass", task: "T2.6")
         case .ai:
             emptyState("AI assistant", "sparkles", task: "T5.4")
+        }
+    }
+
+    // MARK: - Thumbnails
+
+    private var thumbnailStrip: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: state.thumbnailWidthPt))], spacing: 10) {
+                ForEach(0..<max(state.document?.pageCount ?? 0, 0), id: \.self) { page in
+                    Button {
+                        state.gotoPage(page)
+                    } label: {
+                        VStack(spacing: 4) {
+                            thumbnail(for: page)
+                            Text("\(page + 1)")
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(page + 1 == state.currentPage ? .primary : .secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(page + 1 == state.currentPage ? Color.accentColor.opacity(0.18) : .clear)
+                    )
+                }
+            }
+            .padding(10)
+        }
+        .onAppear { state.loadThumbnails() }
+    }
+
+    @ViewBuilder
+    private func thumbnail(for page: Int) -> some View {
+        if let image = state.thumbnails[page], let rendered = Self.image(from: image) {
+            rendered
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: state.thumbnailWidthPt)
+                .background(Color.white)
+                .overlay(Rectangle().stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
+        } else {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.primary.opacity(0.06))
+                .frame(
+                    width: state.thumbnailWidthPt,
+                    height: state.thumbnailWidthPt * 1.414
+                )
+        }
+    }
+
+    /// Wraps a BGRA bitmap in a `CGImage`. The format matches what PDFium produced
+    /// (premultiplied first, little endian), so no channel shuffling is needed.
+    private static func image(from page: PageImage) -> Image? {
+        guard page.pixelWidth > 0, page.pixelHeight > 0 else { return nil }
+
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let provider = CGDataProvider(data: page.bgra as CFData),
+              let cgImage = CGImage(
+                  width: page.pixelWidth,
+                  height: page.pixelHeight,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: page.pixelWidth * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: bitmapInfo,
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: true,
+                  intent: .defaultIntent
+              )
+        else { return nil }
+
+        return Image(decorative: cgImage, scale: 1)
+    }
+
+    // MARK: - Outline
+
+    private var outlineList: some View {
+        Group {
+            if state.outline.isEmpty {
+                emptyState("No outline", "list.bullet.indent", task: "T2.4")
+            } else {
+                List(state.outline) { entry in
+                    Button {
+                        if let page = entry.page {
+                            state.gotoPage(page)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(entry.title)
+                                .lineLimit(2)
+                                .font(entry.depth == 0 ? .callout : .caption)
+                            Spacer(minLength: 0)
+                            if let page = entry.page {
+                                Text("\(page + 1)")
+                                    .font(.caption2)
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.leading, CGFloat(entry.depth) * 12)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
+    // MARK: - Search
+
+    private var searchResults: some View {
+        Group {
+            if state.searchHits.isEmpty {
+                emptyState("Search results", "magnifyingglass", task: "T2.6")
+            } else {
+                List(Array(state.searchHits.enumerated()), id: \.offset) { index, hit in
+                    Button {
+                        state.showSearchHit(index)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Page \(hit.page + 1)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(hit.snippet)
+                                .font(.caption)
+                                .lineLimit(3)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(
+                        index == state.currentHitIndex ? Color.accentColor.opacity(0.15) : .clear
+                    )
+                }
+                .listStyle(.sidebar)
+            }
         }
     }
 
