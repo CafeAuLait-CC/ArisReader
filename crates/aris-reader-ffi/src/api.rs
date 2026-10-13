@@ -392,6 +392,16 @@ impl ArisDocument {
         Ok(hits)
     }
 
+    /// Document outline, flattened depth-first with a depth per entry.
+    ///
+    /// Flat is what a sidebar list wants; nesting is carried by `depth` instead of nested
+    /// records, which keeps the FFI surface small.
+    pub fn outline(&self) -> Result<Vec<OutlineEntry>, ArisFfiError> {
+        let mut entries = Vec::new();
+        flatten_outline(&self.backend.outline()?, 0, &mut entries);
+        Ok(entries)
+    }
+
     /// Total height of the scrolling content for the given page gap.
     pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
         self.layout(gap_pt).content_height_pt()
@@ -513,6 +523,32 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     }
 
     scale
+}
+
+/// One outline entry.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OutlineEntry {
+    pub title: String,
+    /// Target page (0-based), when the destination resolves to one.
+    pub page: Option<u32>,
+    /// Nesting level; 0 is a top-level entry.
+    pub depth: u32,
+}
+
+/// Flattens an outline tree into sidebar rows.
+fn flatten_outline(
+    nodes: &[aris_reader_core::OutlineNode],
+    depth: u32,
+    out: &mut Vec<OutlineEntry>,
+) {
+    for node in nodes {
+        out.push(OutlineEntry {
+            title: node.title.clone(),
+            page: node.page.map(|page| page.get()),
+            depth,
+        });
+        flatten_outline(&node.children, depth + 1, out);
+    }
 }
 
 /// One search hit: a character range in a page's text layer.
@@ -669,6 +705,36 @@ mod tests {
             text.text.chars().count(),
             text.chars.len()
         );
+    }
+
+    #[test]
+    fn outline_is_reported_flat_with_depths() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multipage.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        // The fixture has no bookmarks, so the contract to pin down is "no outline is an
+        // empty list, not an error" plus well-formed entries when there are some.
+        let entries = document.outline().expect("outline");
+        for entry in &entries {
+            assert!(!entry.title.is_empty() || entry.page.is_some());
+            assert!(
+                entry.depth < 32,
+                "implausible nesting depth {}",
+                entry.depth
+            );
+            if let Some(page) = entry.page {
+                assert!(page < document.page_count());
+            }
+        }
     }
 
     #[test]

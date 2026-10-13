@@ -300,7 +300,32 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn outline(&self) -> Result<Vec<OutlineNode>> {
-        Err(ArisError::not_implemented("PdfiumBackend::outline (T2.4)"))
+        // Bookmarks live in the document's own state, so they take the document lock too.
+        let _guard = self
+            .raster_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut nodes = Vec::new();
+        for bookmark in self.document.bookmarks().iter() {
+            // A bookmark without a resolvable page is still shown (its title is useful in
+            // the sidebar) but cannot be navigated to.
+            let page = bookmark
+                .destination()
+                .and_then(|destination| destination.page_index().ok())
+                .map(|index| PageIndex(index.max(0) as u32));
+
+            nodes.push(OutlineNode {
+                title: bookmark.title().unwrap_or_default(),
+                // TODO(T2.3): resolve the destination view mode (`FPDFDest_GetView`) so the
+                // sidebar can restore the exact scroll position, not just the page.
+                dest: None,
+                page,
+                children: Vec::new(),
+            });
+        }
+
+        Ok(nodes)
     }
 
     fn links(&self, _page: PageIndex) -> Result<Vec<LinkInfo>> {

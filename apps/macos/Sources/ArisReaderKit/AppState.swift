@@ -71,6 +71,8 @@ public final class AppState: ObservableObject {
     @Published public private(set) var isScrolling = false
     /// Fades the indicator out once scrolling stops.
     private var scrollIdleTask: Task<Void, Never>?
+    /// Debounces writing the reading position to `UserDefaults`.
+    private var positionSaveTask: Task<Void, Never>?
     /// Total content height in points (for scrollbars and clamping).
     @Published public private(set) var contentHeightPt: CGFloat = 0
     /// Width of the widest page in points; the canvas centres the content with it.
@@ -228,8 +230,15 @@ public final class AppState: ObservableObject {
                let offset = Double(raw), offset > 0 {
                 scrollYPt = CGFloat(offset)
                 beginScrollActivity()
+                schedulePositionSave()
             }
             reloadVisiblePages()
+
+            // Resume where this document was left off, now that the layout knows how tall
+            // the content is (the offset is clamped against it).
+            if let opened = document?.url {
+                restoreReadingPosition(for: opened)
+            }
 
             // Development aid: ARIS_READER_SELECT="x1,y1;x2,y2" (content points) selects
             // between two points and copies, so the text path can be verified headlessly.
@@ -342,6 +351,7 @@ public final class AppState: ObservableObject {
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
         reloadVisiblePages()
+        schedulePositionSave()
     }
 
     /// Selects between two content-space points and copies the result (development aid).
@@ -449,6 +459,40 @@ public final class AppState: ObservableObject {
     }
 
     /// Scrolls to a 0…1 position (drag on the indicator).
+    /// Resumes where the reader left off.
+    ///
+    /// Saved per document path, debounced while scrolling, and clamped to the content so a
+    /// window resize between sessions cannot put the reader past the end.
+    private func restoreReadingPosition(for url: URL) {
+        guard let saved = UserDefaults.standard.object(forKey: Self.positionKey(for: url)) as? Double
+        else { return }
+
+        let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
+        let clamped = min(max(0, CGFloat(saved)), maxOffset)
+        guard clamped > 0 else { return }
+
+        scrollYPt = clamped
+        reloadVisiblePages()
+        FileHandle.standardError.write(
+            Data("aris-position: restored \(Int(clamped)) pt of \(Int(contentHeightPt)) pt\n".utf8)
+        )
+    }
+
+    private func schedulePositionSave() {
+        guard let url = document?.url else { return }
+        let offset = Double(scrollYPt)
+        positionSaveTask?.cancel()
+        positionSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            UserDefaults.standard.set(offset, forKey: Self.positionKey(for: url))
+        }
+    }
+
+    private static func positionKey(for url: URL) -> String {
+        "readingPosition:" + url.path
+    }
+
     public func scroll(toFraction fraction: Double) {
         guard document != nil else { return }
         let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
@@ -476,6 +520,7 @@ public final class AppState: ObservableObject {
         guard document != nil else { return }
         scrollYPt = engine.pageTopPt(max(0, page), gapPt: pageGapPt)
         reloadVisiblePages()
+        schedulePositionSave()
     }
 
     public var zoomFactor: CGFloat {
