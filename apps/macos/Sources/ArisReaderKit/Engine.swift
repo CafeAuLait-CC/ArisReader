@@ -110,6 +110,8 @@ public struct DocumentLink: Sendable {
     public let uri: String?
     /// Internal target page (0-based), when this is a document jump.
     public let page: Int?
+    /// Region of the target page the citation points at (`/FitR`), in view space.
+    public let region: CGRect?
 }
 
 /// One outline entry, already flattened (nesting travels as `depth`).
@@ -461,7 +463,15 @@ public final class RustEngine: PDFEngine {
                                 widthPt: CGFloat(link.widthPt),
                                 heightPt: CGFloat(link.heightPt),
                                 uri: link.uri,
-                                page: link.page.map { Int($0) }
+                                page: link.page.map { Int($0) },
+                                region: link.region.map { region in
+                                    CGRect(
+                                        x: region.xPt,
+                                        y: region.yPt,
+                                        width: region.widthPt,
+                                        height: region.heightPt
+                                    )
+                                }
                             )
                         }
                     )

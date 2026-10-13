@@ -889,11 +889,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
                 if let page = link.page {
                     // M4: show the target in a floating panel rather than jumping, so the
-                    // citation can be read without losing the place in the text.
+                    // citation can be read without losing the place in the text. When the
+                    // destination names a region (/FitR), only that region is shown -- which
+                    // is what a citation to a figure or table means.
                     openReferencePreview(
                         page: page,
-                        title: "Page \(page + 1)",
-                        from: "page \(placement.index + 1)"
+                        title: link.region == nil
+                            ? "Page \(page + 1)"
+                            : "Figure on page \(page + 1)",
+                        from: "page \(placement.index + 1)",
+                        region: link.region
                     )
                     statusMessage = "Previewing page \(page + 1)"
                     return true

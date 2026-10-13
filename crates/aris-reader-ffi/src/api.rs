@@ -454,6 +454,26 @@ impl ArisDocument {
                     link.rect.origin.y + link.rect.size.height,
                 );
                 let view = transform.apply(top_left);
+                // The destination region lives on the *target* page, so it needs that
+                // page's geometry to flip into view space.
+                let region = link.dest_rect.and_then(|rect| {
+                    let target = link.page?;
+                    let target_height = self
+                        .backend
+                        .page_info(target)
+                        .ok()?
+                        .geometry
+                        .view_size(1.0)
+                        .height;
+                    let flipped = aris_reader_pdfium::destination_view_rect(rect, target_height);
+                    Some(LinkRegion {
+                        x_pt: flipped.origin.x,
+                        y_pt: flipped.origin.y,
+                        width_pt: flipped.size.width,
+                        height_pt: flipped.size.height,
+                    })
+                });
+
                 LinkRecord {
                     x_pt: view.x,
                     y_pt: view.y,
@@ -461,6 +481,7 @@ impl ArisDocument {
                     height_pt: link.rect.size.height,
                     uri: link.uri,
                     page: link.page.map(|page| page.get()),
+                    region,
                 }
             })
             .collect())
@@ -610,6 +631,17 @@ pub struct LinkRecord {
     pub uri: Option<String>,
     /// Internal target page (0-based), when the link is a local destination.
     pub page: Option<u32>,
+    /// Region of the target page the citation points at, when the destination is a `/FitR`.
+    pub region: Option<LinkRegion>,
+}
+
+/// A rectangle on a page, in view space (points, top-left origin).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct LinkRegion {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
 }
 
 /// One outline entry.

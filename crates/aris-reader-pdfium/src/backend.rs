@@ -112,6 +112,25 @@ pub struct RawLink {
     pub uri: Option<String>,
     /// Internal target page.
     pub page: Option<PageIndex>,
+    /// Region the destination points at (page space, bottom-left origin), when the PDF says so.
+    ///
+    /// A citation to a figure or table uses a `/FitR` destination; a `/Fit` or `/XYZ`
+    /// destination has no rectangle and means "the whole page".
+    pub dest_rect: Option<Rect>,
+}
+
+/// Converts a `/FitR` destination rectangle into view space.
+///
+/// Page boxes use a bottom-left origin and view space a top-left one, so this is the single
+/// Y-flip for a destination — the same rule [`PageGeometry::page_to_view`] applies to points.
+/// It lives on its own so it can be unit-tested without a PDFium document.
+pub fn destination_region_view_space(rect: Rect, page_height: f64) -> Rect {
+    Rect::new(
+        rect.origin.x,
+        page_height - (rect.origin.y + rect.size.height),
+        rect.size.width,
+        rect.size.height,
+    )
 }
 
 /// A document opened through PDFium.
@@ -203,16 +222,25 @@ impl PdfiumBackend {
             let rect = rect_from_pdf(pdf_rect);
             let mut uri = None;
             let mut target = None;
+            let mut dest_rect = None;
 
             if let Some(action) = link.action() {
                 if let Some(uri_action) = action.as_uri_action() {
                     uri = uri_action.uri().ok();
-                } else if let Some(local) = action.as_local_destination_action() {
-                    target = local
-                        .destination()
+                } else if let Some(local) = action.as_local_destination_action()
+                    && let Ok(destination) = local.destination()
+                {
+                    target = destination
+                        .page_index()
                         .ok()
-                        .and_then(|destination| destination.page_index().ok())
                         .map(|index| PageIndex(index.max(0) as u32));
+
+                    // `/FitR` is the case a figure or table citation uses.
+                    if let Ok(PdfDestinationViewSettings::FitPageToRectangle(rect)) =
+                        destination.view_settings()
+                    {
+                        dest_rect = Some(rect_from_pdf(rect));
+                    }
                 }
             }
 
@@ -222,6 +250,7 @@ impl PdfiumBackend {
                     rect,
                     uri,
                     page: target,
+                    dest_rect,
                 });
             }
         }
@@ -654,6 +683,21 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn destination_rectangles_flip_into_view_space() {
+        // A 100x50 region whose bottom-left corner sits 200 pt above the page bottom, on an
+        // 842 pt tall page: its top edge is 592 pt down from the top in view space.
+        let region = destination_region_view_space(Rect::new(30.0, 200.0, 100.0, 50.0), 842.0);
+        assert_eq!(region.origin.x, 30.0);
+        assert_eq!(region.origin.y, 842.0 - 250.0);
+        assert_eq!(region.size.width, 100.0);
+        assert_eq!(region.size.height, 50.0);
+
+        // A region at the very top of the page stays at the top.
+        let top = destination_region_view_space(Rect::new(0.0, 792.0, 595.0, 50.0), 842.0);
+        assert_eq!(top.origin.y, 0.0);
     }
 
     #[test]

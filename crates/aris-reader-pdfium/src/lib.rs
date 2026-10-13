@@ -40,7 +40,9 @@ mod backend;
 mod stub;
 
 #[cfg(feature = "pdfium")]
-pub use backend::{PdfiumBackend, library_candidates};
+pub use backend::{
+    PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
+};
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
 
