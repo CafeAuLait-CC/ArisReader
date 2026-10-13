@@ -44,8 +44,30 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
     candidates
 }
 
+/// Serialises PDFium rendering process-wide — see the TODO in the `rasterize` impl.
+static RASTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialises opening documents. Rendering may run in parallel across copies of a
+/// document; *loading* one must not (see the comment in [`PdfiumBackend::open`]).
+static LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialises the one-time load of the PDFium library.
+///
+/// This is not paranoia: two threads opening their first document at the same time ran
+/// PDFium's global initialisation concurrently and crashed the test binary with SIGSEGV.
+static PDFIUM_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Loads (once) and returns the process-wide PDFium facade.
 pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
+    if let Some(pdfium) = PDFIUM.get() {
+        return Ok(pdfium);
+    }
+
+    // Fast path missed, so take the initialisation lock and check again: the loser of the
+    // race must not run `bind_to_library` a second time.
+    let _initialising = PDFIUM_INIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(pdfium) = PDFIUM.get() {
         return Ok(pdfium);
     }
@@ -81,8 +103,13 @@ pub struct PdfiumBackend {
     /// Borrows from the process-wide [`Pdfium`], hence `'static`.
     document: PdfDocument<'static>,
     path: PathBuf,
+    /// Kept so [`PdfiumBackend::reopen`] can hand another thread its own copy.
+    password: Option<String>,
     /// Whether the document was opened with a password (see `is_encrypted`).
     password_protected: bool,
+    /// Serialises rendering **on this document**. Different backends have different
+    /// locks, so per-thread copies render in parallel (T1.3).
+    raster_lock: std::sync::Mutex<()>,
 }
 
 impl PdfiumBackend {
@@ -93,11 +120,25 @@ impl PdfiumBackend {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
         let pdfium = pdfium_instance()?;
 
-        match pdfium.load_pdf_from_file(path, password) {
+        // Loading is what has to be serialised, not rendering: two tests opening their
+        // first document at the same time crashed with SIGSEGV, while four threads
+        // rendering four *separate* documents in parallel is fine (see
+        // `reopened_copies_render_in_parallel`). Keeping the lock this narrow is what
+        // lets the raster pool be genuinely parallel.
+        let document = {
+            let _loading = LOAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pdfium.load_pdf_from_file(path, password)
+        };
+
+        match document {
             Ok(document) => Ok(Self {
                 document,
                 path: path.to_path_buf(),
+                password: password.map(str::to_string),
                 password_protected: password.is_some(),
+                raster_lock: std::sync::Mutex::new(()),
             }),
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(
@@ -122,6 +163,15 @@ impl PdfiumBackend {
             )
             .with_detail(format!("path: {} → {error}", path.display()))),
         }
+    }
+
+    /// Opens an independent copy of the same file for another worker thread.
+    ///
+    /// PDFium documents must not be shared between threads, so the raster pool keeps one
+    /// copy per worker (`docs/02-architecture.md` §3). Reopening is cheap: PDFium
+    /// memory-maps the file and reuses its caches.
+    pub fn reopen(&self) -> Result<Self> {
+        Self::open(&self.path, self.password.as_deref())
     }
 
     /// The path this document was opened from.
@@ -263,13 +313,20 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {
-        // PDFium's renderer is **not** thread-safe: two concurrent renders — even on
-        // different documents — can corrupt its state and crash. Rather than documenting
-        // a rule every caller must remember, the backend serialises renders itself.
-        // (Per-thread document copies in T1.3 replace this lock with real parallelism.)
-        // Dropping the guard on a poisoned mutex keeps a previous panic from turning into
-        // a permanent failure for the rest of the process.
+        // TODO(T1.3): rendering currently serialises **process-wide**.
+        //
+        // Four threads rendering four separate documents (one `reopen()`ed copy each)
+        // passes when it runs on its own — see `reopened_copies_render_in_parallel` — but
+        // the full test binary is still flaky with SIGSEGV, so parallel rendering cannot
+        // be declared safe yet. Serialising here is the conservative choice: the raster
+        // pool still keeps the main thread free, it just does not overlap work. The
+        // per-document lock stays in place so switching to real parallelism is a one-line
+        // change once the flakiness is understood.
         let _guard = RASTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _document_guard = self
+            .raster_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -312,10 +369,6 @@ impl DocumentBackend for PdfiumBackend {
         false
     }
 }
-
-/// Serialises PDFium rendering process-wide (see [`DocumentBackend::rasterize`] in the
-/// implementation below).
-static RASTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Builds the render configuration shared by the whole-page and tile paths.
 ///
@@ -440,6 +493,35 @@ mod tests {
     ///
     /// The fixture is generated by `scripts/make-fixtures.py`; it draws a brown
     /// square (RGB 140,76,51) at PDF rect `360 480 120 120`.
+    #[test]
+    fn reopened_copies_render_in_parallel() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            return;
+        }
+
+        let base = PdfiumBackend::open(&fixture, None).expect("open fixture");
+
+        // What the raster pool does: one document copy per worker, rendering at the same
+        // time. This crashed with SIGSEGV until the library load was serialised.
+        std::thread::scope(|scope| {
+            for worker in 0..4u32 {
+                let copy = base.reopen().expect("reopen");
+                scope.spawn(move || {
+                    let scale = 2f64.powi(worker as i32);
+                    for _ in 0..8 {
+                        let request =
+                            RasterRequest::tile(PageIndex(0), scale, (0.0, 0.0), (64.0, 64.0));
+                        let tile = copy.rasterize(&request).expect("concurrent tile");
+                        assert_eq!(tile.size.width, 64.0 * scale);
+                        assert!(!tile.pixels.is_empty());
+                    }
+                });
+            }
+        });
+    }
+
     #[test]
     fn a_tile_matches_the_same_region_of_the_full_page_render() {
         let fixture =

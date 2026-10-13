@@ -65,6 +65,18 @@ pub struct RasterRequest {
 }
 
 impl RasterRequest {
+    /// A sub-rectangle of a page ("tile") in **view space** (points, top-left origin).
+    ///
+    /// Tiles are how deep zoom stays sharp and bounded: each one is rasterised on its own
+    /// through PDFium's matrix path, so a 4× render costs 16 tiles of 1× work instead of
+    /// one enormous bitmap.
+    pub fn tile(page: PageIndex, scale: f64, origin: (f64, f64), size: (f64, f64)) -> Self {
+        Self {
+            region: Some(Rect::new(origin.0, origin.1, size.0, size.1)),
+            ..Self::full_page(page, scale)
+        }
+    }
+
     pub fn full_page(page: PageIndex, scale: f64) -> Self {
         Self {
             page,

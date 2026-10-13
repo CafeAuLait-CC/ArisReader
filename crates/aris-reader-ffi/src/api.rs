@@ -170,6 +170,8 @@ pub struct PageBitmap {
 pub struct ArisDocument {
     backend: PdfiumBackend,
     path: String,
+    /// Kept so [`ArisDocument::reopen`] can hand a worker its own copy.
+    password: Option<String>,
     /// Page sizes in points, filled on first layout request (a 2000-page manual would
     /// otherwise pay for every box at open time).
     page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
@@ -240,6 +242,77 @@ impl ArisDocument {
             width_pt: view.width,
             height_pt: view.height,
             scale_used: scale,
+            pixels: tile.pixels,
+        })
+    }
+
+    /// Opens an independent copy of this document for another worker thread.
+    ///
+    /// PDFium documents must not be shared between threads, so a raster pool keeps one
+    /// copy per worker; [`ArisDocument::rasterize_tile`] on each copy then runs in
+    /// parallel with the others.
+    pub fn reopen(&self) -> Result<Arc<ArisDocument>, ArisFfiError> {
+        let backend =
+            PdfiumBackend::open(std::path::Path::new(&self.path), self.password.as_deref())?;
+        Ok(Arc::new(ArisDocument {
+            backend,
+            path: self.path.clone(),
+            password: self.password.clone(),
+            page_sizes: Mutex::new(None),
+            layout: Mutex::new(None),
+        }))
+    }
+
+    /// Rasterizes one tile of `page` at a discrete LOD (`scale = 2^lod`).
+    ///
+    /// Tile `(tile_x, tile_y)` covers device pixels `[x·S, y·S, S, S]` at that scale,
+    /// which is `S / 2^lod` points of view space. Deep zoom costs more tiles rather than
+    /// one unbounded bitmap — the memory clamp in [`ArisDocument::rasterize_page`] never
+    /// applies here, because a tile is small by construction.
+    pub fn rasterize_tile(
+        &self,
+        page: u32,
+        lod: u8,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+    ) -> Result<TileBitmap, ArisFfiError> {
+        let max_lod = EngineConfig::default().max_lod;
+        if lod > max_lod {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("lod {lod} exceeds the maximum of {max_lod}"),
+            });
+        }
+        if tile_size == 0 || tile_size > 4096 {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("tile size {tile_size} is outside 1..=4096"),
+            });
+        }
+        if page >= self.backend.page_count() {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("page {page} is out of range"),
+            });
+        }
+
+        let scale = 2f64.powi(i32::from(lod));
+        let tile_size_pt = f64::from(tile_size) / scale;
+        let request = RasterRequest::tile(
+            PageIndex(page),
+            scale,
+            (
+                f64::from(tile_x) * tile_size_pt,
+                f64::from(tile_y) * tile_size_pt,
+            ),
+            (tile_size_pt, tile_size_pt),
+        );
+
+        let tile = self.backend.rasterize(&request)?;
+        Ok(TileBitmap {
+            page,
+            lod,
+            tile_x,
+            tile_y,
+            size_px: tile.size.width.round() as u32,
             pixels: tile.pixels,
         })
     }
@@ -367,6 +440,19 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     scale
 }
 
+/// One rasterized tile of a page.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TileBitmap {
+    pub page: u32,
+    /// Pyramid level; the raster scale is `2^lod`.
+    pub lod: u8,
+    pub tile_x: u32,
+    pub tile_y: u32,
+    /// Actual edge length in pixels (BGRA, tightly packed).
+    pub size_px: u32,
+    pub pixels: Vec<u8>,
+}
+
 /// Where one page sits in the scrolling content (mirrors `PagePlacement`).
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct PagePlacementRecord {
@@ -390,6 +476,7 @@ impl ArisEngine {
         Ok(Arc::new(ArisDocument {
             backend,
             path,
+            password,
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
         }))
