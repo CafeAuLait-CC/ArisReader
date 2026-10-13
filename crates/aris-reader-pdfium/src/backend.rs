@@ -124,6 +124,35 @@ pub struct RawLink {
     /// A citation to a figure or table uses a `/FitR` destination; a `/Fit` or `/XYZ`
     /// destination has no rectangle and means "the whole page".
     pub dest_rect: Option<Rect>,
+    /// Top edge of the destination in page space, when the PDF says where to land.
+    ///
+    /// A `/XYZ` or `/FitH` destination carries a y coordinate — the only thing most papers
+    /// give us. It is enough to know **where an entry starts**, which is what lets entry
+    /// boundaries be derived from the document's own links instead of from numbering patterns.
+    pub dest_top_y: Option<f64>,
+}
+
+/// Extracts where a destination lands, from its view settings (page space).
+///
+/// Returns the rectangle when the destination is a `/FitR`, and the top edge for the two
+/// coordinate-carrying forms. `/Fit` and `/FitB` say nothing about position.
+fn destination_landing(settings: &PdfDestinationViewSettings) -> (Option<Rect>, Option<f64>) {
+    match settings {
+        PdfDestinationViewSettings::FitPageToRectangle(rect) => {
+            let rect = rect_from_pdf(*rect);
+            (Some(rect), Some(rect.origin.y + rect.size.height))
+        }
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, Some(y), _) => {
+            (None, Some(f64::from(y.value)))
+        }
+        PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(y)) => {
+            (None, Some(f64::from(y.value)))
+        }
+        PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(Some(y)) => {
+            (None, Some(f64::from(y.value)))
+        }
+        _ => (None, None),
+    }
 }
 
 /// Converts a `/FitR` destination rectangle into view space.
@@ -234,6 +263,24 @@ impl PdfiumBackend {
         Ok((images, paths))
     }
 
+    /// Axis-aligned rules on a page, split into horizontal and vertical.
+    ///
+    /// PDF has no table object, so table borders have to be recognised geometrically. A border is
+    /// a path whose bounding box is a long thin rectangle; separating the two orientations is what
+    /// makes a grid detectable instead of a pile of vector art.
+    pub fn page_rules(&self, page: PageIndex) -> Result<(Vec<Rect>, Vec<Rect>)> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pdf_page = self.page(page)?;
+
+        let mut horizontal = Vec::new();
+        let mut vertical = Vec::new();
+        collect_rules(pdf_page.objects().iter(), &mut horizontal, &mut vertical, 0);
+
+        Ok((horizontal, vertical))
+    }
+
     /// Number of link annotations the PDF actually contains, resolved or not.
     ///
     /// [`PdfiumBackend::link_targets`] deliberately drops links it cannot act on, so this is
@@ -314,6 +361,7 @@ impl PdfiumBackend {
             let mut uri = None;
             let mut target = None;
             let mut dest_rect = None;
+            let mut dest_top_y = None;
 
             if let Some(action) = link.action() {
                 if let Some(uri_action) = action.as_uri_action() {
@@ -326,11 +374,10 @@ impl PdfiumBackend {
                         .ok()
                         .map(|index| PageIndex(index.max(0) as u32));
 
-                    // `/FitR` is the case a figure or table citation uses.
-                    if let Ok(PdfDestinationViewSettings::FitPageToRectangle(rect)) =
-                        destination.view_settings()
-                    {
-                        dest_rect = Some(rect_from_pdf(rect));
+                    if let Ok(settings) = destination.view_settings() {
+                        let (rect, top) = destination_landing(&settings);
+                        dest_rect = rect;
+                        dest_top_y = top;
                     }
                 }
             }
@@ -347,10 +394,10 @@ impl PdfiumBackend {
                     .page_index()
                     .ok()
                     .map(|index| PageIndex(index.max(0) as u32));
-                if let Ok(PdfDestinationViewSettings::FitPageToRectangle(rect)) =
-                    destination.view_settings()
-                {
-                    dest_rect = Some(rect_from_pdf(rect));
+                if let Ok(settings) = destination.view_settings() {
+                    let (rect, top) = destination_landing(&settings);
+                    dest_rect = rect;
+                    dest_top_y = top;
                 }
             }
 
@@ -361,6 +408,7 @@ impl PdfiumBackend {
                     uri,
                     page: target,
                     dest_rect,
+                    dest_top_y,
                 });
             }
         }
@@ -679,6 +727,61 @@ fn tile_from_bitmap(bitmap: &PdfBitmap) -> RasterTile {
         stride,
         pixels,
         format: RasterFormat::Bgra8Premultiplied,
+    }
+}
+
+/// Collects long thin objects as rules (the geometry tables and bordered boxes leave behind).
+fn collect_rules<'a>(
+    objects: impl Iterator<Item = PdfPageObject<'a>>,
+    horizontal: &mut Vec<Rect>,
+    vertical: &mut Vec<Rect>,
+    depth: u32,
+) {
+    if depth > 4 {
+        return;
+    }
+
+    for object in objects {
+        if object.object_type() == PdfPageObjectType::XObjectForm {
+            let PdfPageObject::XObjectForm(form) = &object else {
+                continue;
+            };
+            collect_rules(form.iter(), horizontal, vertical, depth + 1);
+            continue;
+        }
+
+        if object.object_type() != PdfPageObjectType::Path {
+            continue;
+        }
+        let PdfPageObject::Path(path) = &object else {
+            continue;
+        };
+
+        // Segments, not the object's bounding box: a table's grid is usually **one** path object
+        // containing many lines, so its bounds are the whole table and no thin rectangle ever
+        // appears. Per-segment geometry is what makes a border visible.
+        // The segment API exposes each segment's end point, so a line is the step from the
+        // previous point to this one. Curves connect their endpoints too; the resulting box is
+        // simply not thin, and the filter below drops it.
+        let mut previous: Option<(PdfPoints, PdfPoints)> = None;
+        for segment in path.segments().iter() {
+            let current = segment.point();
+            let Some(from) = previous.replace(current) else {
+                continue;
+            };
+
+            let (x1, y1) = (f64::from(from.0.value), f64::from(from.1.value));
+            let (x2, y2) = (f64::from(current.0.value), f64::from(current.1.value));
+
+            let rect = Rect::new(x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs());
+
+            // Thresholds in points: a rule is at least 20 pt long and at most 3 pt thick.
+            if rect.size.height <= 3.0 && rect.size.width >= 20.0 {
+                horizontal.push(rect);
+            } else if rect.size.width <= 3.0 && rect.size.height >= 20.0 {
+                vertical.push(rect);
+            }
+        }
     }
 }
 

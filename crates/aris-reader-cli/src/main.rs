@@ -639,6 +639,24 @@ fn cmd_analyze(args: &[String]) -> ExitCode {
             println!("        fonts: {}", top.join(", "));
         }
 
+        let captions = aris_reader_text::find_captions(&text);
+        let (horizontal, vertical) = backend.page_rules(page_index).unwrap_or_default();
+        if !captions.is_empty() || !horizontal.is_empty() {
+            println!(
+                "        captions {} ({}), rules {}h/{}v, table candidates {}",
+                captions.len(),
+                captions
+                    .iter()
+                    .take(3)
+                    .map(|caption| format!("{} {}", caption.kind, caption.label))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                horizontal.len(),
+                vertical.len(),
+                table_candidates(&horizontal, &vertical)
+            );
+        }
+
         println!(
             "  p{:<3} figures {:<3} rules {:<4} citations {:<3} math-chars {:<5}/{:<5} link-regions {}",
             index + 1,
@@ -789,6 +807,86 @@ fn has_year(text: &str) -> bool {
     })
 }
 
+/// Counts table-like grids: horizontal rule pairs bridged by at least two vertical rules.
+///
+/// Returns the number of **distinct regions**, not of rule pairs: a table with 12 horizontal and
+/// 8 vertical rules describes dozens of pairs but is one table. Counting pairs produced a
+/// nonsense figure (tens of thousands) the first time this ran, which is why the candidate boxes
+/// are merged before being counted.
+fn table_candidates(
+    horizontal: &[aris_reader_core::Rect],
+    vertical: &[aris_reader_core::Rect],
+) -> usize {
+    let mut regions: Vec<aris_reader_core::Rect> = Vec::new();
+
+    for (index, first) in horizontal.iter().enumerate() {
+        for second in horizontal.iter().skip(index + 1) {
+            let (upper, lower) = if first.origin.y >= second.origin.y {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let gap = upper.origin.y - (lower.origin.y + lower.size.height);
+            if !(6.0..=400.0).contains(&gap) {
+                continue;
+            }
+
+            let left = upper.origin.x.max(lower.origin.x);
+            let right = (upper.origin.x + upper.size.width).min(lower.origin.x + lower.size.width);
+            if right - left < 40.0 {
+                continue;
+            }
+
+            let bridging = vertical
+                .iter()
+                .filter(|rule| {
+                    let x = rule.origin.x;
+                    x >= left - 2.0
+                        && x <= right + 2.0
+                        && rule.origin.y <= lower.origin.y + 2.0
+                        && rule.origin.y + rule.size.height >= upper.origin.y - 2.0
+                })
+                .count();
+            if bridging < 2 {
+                continue;
+            }
+
+            // Merge into an existing region when they overlap, so a grid counts once.
+            let candidate = aris_reader_core::Rect::new(
+                left,
+                lower.origin.y,
+                right - left,
+                upper.origin.y + upper.size.height - lower.origin.y,
+            );
+            match regions
+                .iter_mut()
+                .find(|region| overlaps_rect(**region, candidate))
+            {
+                Some(region) => {
+                    let min_x = region.origin.x.min(candidate.origin.x);
+                    let min_y = region.origin.y.min(candidate.origin.y);
+                    let max_x = (region.origin.x + region.size.width)
+                        .max(candidate.origin.x + candidate.size.width);
+                    let max_y = (region.origin.y + region.size.height)
+                        .max(candidate.origin.y + candidate.size.height);
+                    *region =
+                        aris_reader_core::Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+                }
+                None => regions.push(candidate),
+            }
+        }
+    }
+
+    regions.len()
+}
+
+fn overlaps_rect(a: aris_reader_core::Rect, b: aris_reader_core::Rect) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
+}
+
 /// Whether two page-space boxes overlap (the citation's box and a link's box).
 fn overlaps(a: aris_reader_core::Rect, b: aris_reader_core::Rect) -> bool {
     let a_right = a.origin.x + a.size.width;
@@ -844,12 +942,33 @@ fn cmd_cite(args: &[String]) -> ExitCode {
             texts.push(text);
         }
     }
-    let tail = texts
-        .iter()
+    let pages = texts
+        .into_iter()
         .enumerate()
         .map(|(index, text)| (index as u32, text))
         .collect::<Vec<_>>();
-    let references = aris_reader_text::find_references(tail, 2000);
+
+    // The document's own link landings, when it has any: a paper that links its citations into
+    // the bibliography states where each entry starts, which beats pattern parsing.
+    let mut landings: std::collections::BTreeMap<u32, Vec<f64>> = std::collections::BTreeMap::new();
+    let provisional =
+        aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000);
+    if let Some(first_list_page) = provisional.iter().map(|entry| entry.page).min() {
+        for body_page in 0..first_list_page {
+            let Ok(links) = backend.link_targets(PageIndex(body_page)) else {
+                continue;
+            };
+            for link in links {
+                if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
+                    && target.get() >= first_list_page
+                {
+                    landings.entry(target.get()).or_default().push(top);
+                }
+            }
+        }
+    }
+
+    let references = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
     println!("  reference entries parsed: {}", references.len());
     for entry in references.iter().take(3) {
         println!(

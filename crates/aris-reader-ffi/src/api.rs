@@ -493,8 +493,33 @@ impl ArisDocument {
             }
         }
 
-        let entries =
-            aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000);
+        // Ground-truth pass: a paper that links its citations into the bibliography is telling us
+        // exactly where each entry starts, and those landings beat any numbering rule. Collect
+        // them first, then let the shared locator decide page by page.
+        let mut landings: std::collections::BTreeMap<u32, Vec<f64>> =
+            std::collections::BTreeMap::new();
+        if let Some(first_list_page) =
+            aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000)
+                .iter()
+                .map(|entry| entry.page)
+                .min()
+        {
+            // Only the body can point into the list, so there is no need to scan past it.
+            for body_page in 0..first_list_page {
+                let Ok(links) = self.backend.link_targets(PageIndex(body_page)) else {
+                    continue;
+                };
+                for link in links {
+                    if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
+                        && target.get() >= first_list_page
+                    {
+                        landings.entry(target.get()).or_default().push(top);
+                    }
+                }
+            }
+        }
+
+        let entries = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
 
         let mut records = Vec::with_capacity(entries.len());
         for entry in entries {

@@ -537,6 +537,232 @@ fn first_surname(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A figure or table caption found in the text layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Caption {
+    /// `Figure` or `Table`.
+    pub kind: String,
+    /// The number as printed: `3`, `3a`, `IV`.
+    pub label: String,
+    /// Caption text after the label.
+    pub text: String,
+    /// Bounding box of the caption line(s) in page space.
+    pub rect: Rect,
+    /// Character range inside the page's text layer.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Finds `Figure N` / `Table N` captions.
+///
+/// A caption is the one structural element the text layer makes easy: papers label them
+/// consistently and the label sits at the start of a line. It is also the only handle we have on
+/// figures that are drawn as vector art, and on tables, which have no object type at all — the
+/// caption box plus the object nearest above it is a usable region even when the graphic itself
+/// is unidentifiable.
+pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
+    let chars: Vec<char> = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+
+    let mut line_starts = vec![0usize];
+    for (index, character) in chars.iter().enumerate() {
+        if *character == '\n' {
+            line_starts.push(index + 1);
+        }
+    }
+
+    let mut captions = Vec::new();
+    for (position, start) in line_starts.iter().enumerate() {
+        let end = line_starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(chars.len());
+        let line: String = chars[*start..end].iter().collect();
+        let trimmed = line.trim_start();
+        let offset = line.len() - trimmed.len();
+
+        let lower = trimmed.to_ascii_lowercase();
+        let kind = if lower.starts_with("figure") || lower.starts_with("fig.") {
+            "Figure"
+        } else if lower.starts_with("table") {
+            "Table"
+        } else {
+            continue;
+        };
+
+        // After the word: an optional space, then a number or roman numeral, then `.`/`:` or space.
+        let after: String = trimmed
+            .chars()
+            .skip(if lower.starts_with("fig.") { 4 } else { 6 })
+            .collect();
+        let after = after.trim_start();
+        let label: String = after
+            .chars()
+            .take_while(|character| character.is_ascii_digit() || *character == '.')
+            .collect();
+        let label = label.trim_end_matches('.').to_string();
+        if label.is_empty() || !label.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+
+        let caption_start = start + offset;
+        let caption_end = end.min(chars.len());
+        let body: String = chars[caption_start..caption_end]
+            .iter()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        captions.push(Caption {
+            kind: kind.to_string(),
+            label,
+            text: body
+                .trim_start_matches(|character: char| !character.is_whitespace())
+                .trim()
+                .to_string(),
+            rect: union_boxes(
+                &text.chars[caption_start.min(text.chars.len())..caption_end.min(text.chars.len())],
+            ),
+            start: caption_start,
+            end: caption_end,
+        });
+    }
+
+    captions
+}
+
+/// Locates the reference list, preferring the document's own link landings over pattern parsing.
+///
+/// `landings` maps a page to the page-space top edges that links from the body land on. When a
+/// list page is covered by landings, its entries are rebuilt from them — the PDF is stating where
+/// each entry starts, which is better than any numbering rule. Pages without landings keep the
+/// pattern-parsed entries.
+///
+/// The two callers (the CLI's corpus tooling and the FFI) share this so that what is measured is
+/// what the app actually does.
+pub fn find_references_with_landings(
+    pages: &[(u32, RawTextPage)],
+    landings: &std::collections::BTreeMap<u32, Vec<f64>>,
+    max_entries: usize,
+) -> Vec<ReferenceEntry> {
+    let parsed = find_references(pages.iter().map(|(page, text)| (*page, text)), max_entries);
+    if landings.is_empty() {
+        return parsed;
+    }
+
+    let mut rebuilt = Vec::new();
+    for (page, text) in pages {
+        if let Some(tops) = landings.get(page) {
+            let from_landings = entries_from_bands(*page, text, tops);
+            if from_landings.len() >= 2 {
+                rebuilt.extend(from_landings);
+                continue;
+            }
+        }
+        rebuilt.extend(parsed.iter().filter(|entry| entry.page == *page).cloned());
+    }
+
+    if rebuilt.is_empty() {
+        return parsed;
+    }
+    rebuilt.truncate(max_entries);
+    rebuilt
+}
+
+/// Derives a reference entry's label from its own text.
+///
+/// `[12] Author…` → `12`; `12. Author…` → `12`; otherwise the author-year key `Surname Year`.
+pub fn entry_label(text: &str) -> String {
+    let trimmed = text.trim_start();
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() && rest[digits.len()..].starts_with(']') {
+            return digits;
+        }
+    }
+
+    let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty()
+        && matches!(
+            trimmed[digits.len()..].chars().next(),
+            Some('.') | Some(')')
+        )
+    {
+        return digits;
+    }
+
+    match (first_surname(trimmed), first_year(trimmed)) {
+        (Some(surname), Some(year)) => format!("{surname} {year}"),
+        _ => String::new(),
+    }
+}
+
+/// Splits a page's text layer into entries using the positions the document's own links land on.
+///
+/// This is the ground-truth path: a paper that links every `[12]` to its bibliography is telling
+/// us exactly where each entry begins, which beats inferring boundaries from numbering patterns
+/// (the source of every regression measured so far). `tops` are page-space top edges; bands run
+/// from one top down to the next, and the last one to the bottom of the page.
+pub fn entries_from_bands(page: u32, text: &RawTextPage, tops: &[f64]) -> Vec<ReferenceEntry> {
+    if tops.len() < 2 {
+        return Vec::new();
+    }
+
+    // Descending: page-space y grows upwards, and an entry list reads from the top of the page
+    // down, so the first band is the one with the largest y.
+    let mut sorted: Vec<f64> = tops.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    // Two links to the same entry land within a couple of points of each other.
+    sorted.dedup_by(|a, b| (*a - *b).abs() < 3.0);
+
+    let mut entries = Vec::new();
+    for (index, top) in sorted.iter().enumerate() {
+        let next = sorted.get(index + 1).copied();
+
+        let mut start = usize::MAX;
+        let mut end = 0usize;
+        let mut body = String::new();
+        for (char_index, character) in text.chars.iter().enumerate() {
+            let char_top = character.rect.origin.y + character.rect.size.height;
+            let in_band =
+                char_top <= top + 3.0 && next.map(|limit| char_top > limit + 3.0).unwrap_or(true);
+            if !in_band {
+                continue;
+            }
+            start = start.min(char_index);
+            end = end.max(char_index + 1);
+            if let Some(character) = char::from_u32(character.unicode) {
+                body.push(character);
+            }
+        }
+
+        if start == usize::MAX {
+            continue;
+        }
+
+        let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let label = entry_label(&collapsed);
+        if label.is_empty() {
+            continue;
+        }
+
+        entries.push(ReferenceEntry {
+            label,
+            text: collapsed,
+            page,
+            start,
+            end,
+        });
+    }
+
+    entries
+}
+
 /// Resolves a citation label against the reference list.
 ///
 /// Exact label match first; then, for a numeric citation against an **unnumbered** list, the
@@ -567,6 +793,32 @@ pub fn resolve_reference<'a>(
     });
     if !list_is_unnumbered {
         return None;
+    }
+
+    // Author-year, but the citation names a different author than the entry leads with:
+    // `(He et al. 2024)` against an entry filed under its first author. Match on the surname
+    // appearing **anywhere** in the entry plus the year.
+    for label in labels {
+        let mut parts = label.split_whitespace();
+        let (Some(surname), Some(year)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if surname.len() < 2
+            || !surname
+                .chars()
+                .next()
+                .map(char::is_uppercase)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if let Some(entry) = references
+            .iter()
+            .find(|entry| entry.text.contains(surname) && entry.text.contains(year))
+        {
+            return Some(entry);
+        }
     }
 
     for label in labels {
@@ -622,6 +874,112 @@ pub fn find_references<'a>(
 
     best.truncate(max_entries);
     best
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    #[test]
+    fn figure_and_table_captions_are_found_with_labels() {
+        let text = "Body text here.\nFigure 3: Overview of the method.\nmore text\nTable 2. Results on the test set.\n";
+        let captions = find_captions(&crate::test_page(text));
+        assert_eq!(captions.len(), 2, "{captions:?}");
+        assert_eq!(captions[0].kind, "Figure");
+        assert_eq!(captions[0].label, "3");
+        assert!(captions[0].text.contains("Overview"));
+        assert_eq!(captions[1].kind, "Table");
+        assert_eq!(captions[1].label, "2");
+    }
+
+    #[test]
+    fn a_sentence_mentioning_a_figure_is_not_a_caption() {
+        // "as Figure 3 shows" is mid-line, not a caption: captions start their line.
+        let captions = find_captions(&crate::test_page("As Figure 3 shows, the method works.\n"));
+        assert!(captions.is_empty(), "{captions:?}");
+    }
+
+    #[test]
+    fn figure_without_a_number_is_ignored() {
+        assert!(find_captions(&crate::test_page("Figure: a sketch\n")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// Three stacked bands, each one line of 10 pt text, 30 pt apart.
+    fn page_with_bands() -> RawTextPage {
+        let lines = [
+            "[1] Aberman, K.: First entry.",
+            "[2] Barzel, R.: Second entry.",
+            "[3] Chen, X.: Third entry.",
+        ];
+        let mut chars = Vec::new();
+        for (line, text) in lines.iter().enumerate() {
+            let baseline = 800.0 - (line as f64) * 30.0;
+            for (column, character) in text.chars().enumerate() {
+                chars.push(aris_reader_core::RawCharBox {
+                    rect: aris_reader_core::Rect::new(
+                        column as f64 * 5.0,
+                        baseline - 10.0,
+                        5.0,
+                        10.0,
+                    ),
+                    origin: aris_reader_core::Point::new(column as f64 * 5.0, baseline - 10.0),
+                    unicode: character as u32,
+                    font_size: 10.0,
+                    angle: 0.0,
+                    font_name: "Body".to_string(),
+                });
+            }
+        }
+        RawTextPage {
+            page: aris_reader_core::PageIndex(0),
+            chars,
+            text: lines.join("\n"),
+            is_generated: false,
+            has_unicode_map_error: false,
+        }
+    }
+
+    #[test]
+    fn bands_split_entries_where_the_links_land() {
+        let page = page_with_bands();
+        // The three links land on the top edges of the three lines (page space).
+        let entries = entries_from_bands(0, &page, &[800.0, 770.0, 740.0]);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].label, "1");
+        assert!(entries[0].text.contains("First entry"));
+        assert_eq!(entries[2].label, "3");
+        assert!(entries[2].text.contains("Third entry"));
+    }
+
+    #[test]
+    fn duplicate_landings_collapse() {
+        let page = page_with_bands();
+        // Several citations to the same entry land within a point of each other.
+        let entries = entries_from_bands(0, &page, &[800.0, 800.4, 770.0, 740.0]);
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn a_single_landing_is_not_enough_to_build_bands() {
+        let page = page_with_bands();
+        assert!(entries_from_bands(0, &page, &[800.0]).is_empty());
+    }
+
+    #[test]
+    fn labels_come_from_the_entry_text() {
+        assert_eq!(entry_label("[12] Author, A."), "12");
+        assert_eq!(entry_label("21. Jones, M."), "21");
+        assert_eq!(
+            entry_label("Baevski, A.; Zhou, Y. 2020. wav2vec"),
+            "Baevski 2020"
+        );
+        assert_eq!(entry_label("no label here"), "");
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +1085,20 @@ mod reference_tests {
             end: 1,
         }];
         assert!(resolve_reference(&["2".to_string()], &numbered).is_none());
+    }
+
+    #[test]
+    fn a_citation_can_match_an_entry_through_any_author() {
+        // `(He et al. 2024)` where the entry is filed under its first author.
+        let references = vec![ReferenceEntry {
+            label: "Baevski 2024".to_string(),
+            text: "Baevski, A.; He, L.; and Liu, Y. 2024. InstructAvatar.".to_string(),
+            page: 0,
+            start: 0,
+            end: 0,
+        }];
+        let resolved = resolve_reference(&["He 2024".to_string()], &references).expect("resolved");
+        assert_eq!(resolved.label, "Baevski 2024");
     }
 
     #[test]
