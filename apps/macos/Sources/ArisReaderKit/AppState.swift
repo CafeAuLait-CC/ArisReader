@@ -249,6 +249,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
+    /// Citations per page and the document's reference list.
+    private var citationsByPage: [Int: [Citation]] = [:]
+    private var citationsInFlight: Set<Int> = []
+    @Published public private(set) var references: [Reference] = []
+
     /// Links per page, fetched once and kept.
     private var linkCache: [Int: [DocumentLink]] = [:]
     private var linksInFlight: Set<Int> = []
@@ -416,6 +421,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadOutline()
             loadThumbnails()
             loadLinks()
+            loadCitations()
+            loadReferences()
 
             // Development aid: report the sidebar's data so it can be checked headlessly.
             Task { @MainActor [weak self] in
@@ -429,6 +436,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // between two points and copies, so the text path can be verified headlessly.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SELECT"], !raw.isEmpty {
                 selectForVerification(raw)
+            }
+
+            // Development aid: ARIS_READER_CLICK="x,y" (content points) performs the click
+            // path, so citation following is verifiable without a mouse.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_CLICK"], !raw.isEmpty {
+                let parts = raw.split(separator: ",").compactMap { Double($0) }
+                if parts.count == 2 {
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .milliseconds(1500))
+                        guard let self else { return }
+                        let point = CGPoint(x: parts[0], y: parts[1])
+                        let followed = self.followLink(at: point)
+                        let cited = followed ? false : self.openCitation(at: point)
+                        let line = "aris-click: (\(parts[0]),\(parts[1])) link=\(followed) citation=\(cited) status=\(self.statusMessage)\n"
+                        FileHandle.standardError.write(Data(line.utf8))
+                    }
+                }
             }
 
             // Development aid: ARIS_READER_PREVIEW=<page> opens the reference panel, so M4
@@ -848,12 +872,101 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
     /// ⌘C can copy it.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
-        if wasClick {
-            let followed = followLink(at: point)
-            if followed || selection == nil {
-                clearSelection()
+        guard wasClick else { return }
+
+        // A click first tries a link annotation, then an in-text citation. Keeping the order
+        // means the PDF's own link always wins when both describe the same spot.
+        let handled = followLink(at: point) || openCitation(at: point)
+        if handled || selection == nil {
+            clearSelection()
+        }
+    }
+
+    /// Fetches the citations of every visible page, so a click resolves immediately.
+    private func loadCitations() {
+        for placement in visiblePagePlacements where citationsByPage[placement.index] == nil {
+            guard !citationsInFlight.contains(placement.index) else { continue }
+            citationsInFlight.insert(placement.index)
+
+            let page = placement.index
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.citationsInFlight.remove(page) }
+                if let found = try? await self.engine.citations(page) {
+                    self.citationsByPage[page] = found
+                }
             }
         }
+    }
+
+    /// Loads the reference list once (it never changes for an open document).
+    private func loadReferences() {
+        guard references.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.references = (try? await self.engine.references()) ?? []
+            FileHandle.standardError.write(
+                Data("aris-references: \(self.references.count) entries\n".utf8)
+            )
+        }
+    }
+
+    /// Opens the reference an in-text citation points at (M4).
+    ///
+    /// This is the path that works **without** a link annotation: detect `[12]`, resolve it
+    /// against the reference list, and preview the entry's own rectangle. Returns false when
+    /// the point is not on a citation, or when the citation names nothing we can resolve.
+    @discardableResult
+    public func openCitation(at point: CGPoint) -> Bool {
+        for placement in visiblePagePlacements {
+            let pageRect = CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            )
+            guard pageRect.contains(point), let citations = citationsByPage[placement.index] else {
+                continue
+            }
+
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            for citation in citations {
+                let box = CGRect(
+                    x: citation.xPt,
+                    y: citation.yPt,
+                    width: citation.widthPt,
+                    height: citation.heightPt
+                )
+                guard box.contains(local) else { continue }
+
+                // Try each label the citation names: `[12,13]` can match either entry.
+                for label in citation.labels {
+                    guard let reference = references.first(where: { $0.label == label }) else {
+                        continue
+                    }
+                    let snippet = reference.text.prefix(48)
+                    openReferencePreview(
+                        page: reference.page,
+                        title: "Reference [\(reference.label)]",
+                        from: "page \(placement.index + 1)",
+                        region: CGRect(
+                            x: reference.xPt,
+                            y: reference.yPt,
+                            width: reference.widthPt,
+                            height: reference.heightPt
+                        )
+                    )
+                    statusMessage = "Reference [\(reference.label)]: \(snippet)"
+                    return true
+                }
+
+                // A citation we cannot resolve (author-year list, unusual numbering) still
+                // deserves feedback rather than a silent no-op.
+                statusMessage = "Citation \"\(citation.text)\" has no matching entry"
+                return true
+            }
+        }
+        return false
     }
 
     /// Follows the link under a content-space point, if there is one.

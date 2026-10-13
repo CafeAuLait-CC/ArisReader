@@ -270,15 +270,23 @@ pub fn looks_like_reference_heading(text: &str) -> bool {
     ];
 
     // Measured on real papers: the heading often starts mid-page (right after the conclusion),
-    // so looking only at the top of the page misses it. Requiring the whole line to *be* the
-    // heading is what keeps a body sentence like "see References for details" out.
+    // and it often shares its line with the first entry -- PDFium's text extraction produces
+    // `References [1] Aberman, K. …`, which a strict equality check rejects, after which a whole
+    // paper looks like it has no bibliography. Requiring the line to *start* with a heading and
+    // continue with nothing but the first entry is what keeps a body sentence out.
     text.lines().any(|line| {
-        let trimmed = line
-            .trim()
-            .trim_end_matches(':')
-            .trim()
-            .to_ascii_lowercase();
-        trimmed.len() <= 24 && HEADINGS.iter().any(|heading| trimmed == *heading)
+        let trimmed = line.trim().trim_end_matches(':').trim();
+        let lower = trimmed.to_ascii_lowercase();
+        HEADINGS.iter().any(|heading| {
+            if !lower.starts_with(heading) {
+                return false;
+            }
+            let rest = trimmed[heading.len()..].trim_start_matches([':', ' ']);
+            lower == *heading
+                || rest.is_empty()
+                || rest.starts_with('[')
+                || rest.starts_with(|character: char| character.is_ascii_digit())
+        })
     })
 }
 
@@ -295,6 +303,10 @@ pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceE
 
     let mut entries = Vec::new();
     let mut index = 0;
+    // Numbered lists are sequential. Requiring the next label to be the previous one plus one
+    // is what stops a wrapped line that happens to begin with a number (a year, "3D", …) from
+    // being mistaken for a new entry -- which truncated entries to their first line.
+    let mut expected_next: Option<u32> = None;
 
     while index < chars.len() {
         let at_line_start = chars[..index]
@@ -339,6 +351,18 @@ pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceE
                 index += 1;
                 continue;
             }
+            let number: u32 = chars[index..digits_end]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            if let Some(expected) = expected_next
+                && number != expected
+            {
+                index += 1;
+                continue;
+            }
+            expected_next = Some(number + 1);
             (
                 chars[index..digits_end].iter().collect::<String>(),
                 digits_end + 1,
@@ -369,7 +393,14 @@ pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceE
                 let starts_label = match rest.first() {
                     Some('[') => true,
                     Some(character) if character.is_ascii_digit() => {
-                        rest.iter().any(|c| *c == '.' || *c == ')')
+                        // Same rule as above: only the *expected* number ends the entry.
+                        let digits: String =
+                            rest.iter().take_while(|c| c.is_ascii_digit()).collect();
+                        let terminator = rest.get(digits.len());
+                        matches!(terminator, Some('.') | Some(')'))
+                            && expected_next
+                                .map(|expected| digits.parse::<u32>().ok() == Some(expected))
+                                .unwrap_or(false)
                     }
                     _ => false,
                 };
@@ -394,6 +425,111 @@ pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceE
     }
 
     entries
+}
+
+/// Parses author-year entries (`Baevski, A.; Zhou, Y.; … 2020. Title…`) out of one page.
+///
+/// Entries have no delimiter at all — no number, no bracket — so the start of the next entry is
+/// recognised by typography: a line beginning with `Surname, I.` is a new entry. That is what
+/// every author-year style in the sample corpus does, and it fails loudly (a single huge entry)
+/// rather than silently inventing boundaries.
+pub fn parse_author_year_references(page: u32, text: &RawTextPage) -> Vec<ReferenceEntry> {
+    let chars: Vec<char> = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+
+    // Line start offsets, so a candidate can be checked against its own line only.
+    let mut line_starts = vec![0usize];
+    for (index, character) in chars.iter().enumerate() {
+        if *character == '\n' {
+            line_starts.push(index + 1);
+        }
+    }
+
+    let mut starts = Vec::new();
+    for (position, start) in line_starts.iter().enumerate() {
+        let end = line_starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(chars.len());
+        let line: String = chars[*start..end].iter().collect();
+        if looks_like_author_year_start(&line) {
+            starts.push(*start);
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (position, start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(chars.len());
+        let body: String = chars[*start..end].iter().collect();
+        let cleaned = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some(year) = first_year(&cleaned) else {
+            continue;
+        };
+        let Some(surname) = first_surname(&cleaned) else {
+            continue;
+        };
+
+        entries.push(ReferenceEntry {
+            label: format!("{surname} {year}"),
+            text: cleaned,
+            page,
+            start: *start,
+            end,
+        });
+    }
+
+    entries
+}
+
+/// `Baevski, A.` / `He, L.` / `Kim, S.` — capitalised surname, comma, initials.
+fn looks_like_author_year_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut characters = trimmed.chars().peekable();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+
+    let mut surname_length = 1;
+    while let Some(character) = characters.peek() {
+        if character.is_alphabetic() || *character == '-' || *character == '\'' {
+            surname_length += 1;
+            characters.next();
+        } else {
+            break;
+        }
+    }
+    if !(2..=20).contains(&surname_length) {
+        return false;
+    }
+
+    let rest: String = characters.collect();
+    let rest = rest.trim_start();
+    rest.starts_with(',')
+        && rest
+            .chars()
+            .nth(1)
+            .map(|character| character.is_whitespace())
+            .unwrap_or(false)
+}
+
+/// First capitalised word of a span, with punctuation removed: `He et al. 2024` → `He`.
+fn first_surname(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .find(|word| {
+            word.chars().next().map(char::is_uppercase).unwrap_or(false)
+                && word
+                    .chars()
+                    .all(|character| character.is_alphabetic() || character == '-')
+                && word.len() >= 2
+        })
+        .map(str::to_string)
 }
 
 /// Finds the reference list across a document's pages.
@@ -422,7 +558,10 @@ pub fn find_references<'a>(
             continue;
         }
 
-        let parsed = parse_numeric_references(page, &text.clone());
+        let mut parsed = parse_numeric_references(page, &text.clone());
+        if parsed.is_empty() {
+            parsed = parse_author_year_references(page, &text.clone());
+        }
         if parsed.is_empty() && !entries.is_empty() {
             // The list ended (or switched to an unparsed style).
             break;
@@ -440,27 +579,10 @@ pub fn find_references<'a>(
 #[cfg(test)]
 mod reference_tests {
     use super::*;
-    use aris_reader_core::{PageIndex, RawCharBox, RawTextPage, Rect};
+    use aris_reader_core::RawTextPage;
 
     fn page_from(text: &str) -> RawTextPage {
-        let mut chars = Vec::new();
-        for (index, character) in text.chars().enumerate() {
-            chars.push(RawCharBox {
-                rect: Rect::new(0.0, 0.0, 5.0, 10.0),
-                origin: aris_reader_core::Point::new(index as f64 * 5.0, 0.0),
-                unicode: character as u32,
-                font_size: 10.0,
-                angle: 0.0,
-                font_name: "Body".to_string(),
-            });
-        }
-        RawTextPage {
-            page: PageIndex(0),
-            chars,
-            text: text.to_string(),
-            is_generated: false,
-            has_unicode_map_error: false,
-        }
+        crate::test_page(text)
     }
 
     #[test]
@@ -502,6 +624,55 @@ mod reference_tests {
     }
 
     #[test]
+    fn author_year_entries_are_keyed_by_surname_and_year() {
+        let text = "References\nBaevski, A.; Zhou, Y.; Mohamed, A.; and Auli, M. 2020.\nwav2vec 2.0: A framework.\nHe, L.; Wang, S.; and Liu, Y. 2024. InstructAvatar.\n";
+        let entries = parse_author_year_references(0, &page_from(text));
+        assert_eq!(entries.len(), 2, "two entries: {entries:?}");
+        assert_eq!(entries[0].label, "Baevski 2020");
+        assert_eq!(entries[1].label, "He 2024");
+    }
+
+    #[test]
+    fn author_year_citations_carry_a_surname_year_key() {
+        let found = find_citations(&page_from("Prior work (He et al. 2024) agrees"));
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].labels.contains(&"He 2024".to_string()),
+            "{:?}",
+            found[0].labels
+        );
+    }
+
+    #[test]
+    fn prose_lines_are_not_entry_starts() {
+        // Lower-case continuations and ordinary sentences must not split an entry.
+        assert!(!looks_like_author_year_start("wav2vec 2.0: A framework."));
+        assert!(!looks_like_author_year_start("the model was trained"));
+        assert!(looks_like_author_year_start("Baevski, A.; Zhou, Y."));
+    }
+
+    #[test]
+    fn a_wrapped_line_starting_with_a_number_does_not_end_an_entry() {
+        // The bug this pins: "2024." at the start of a continuation line looked like entry 2024.
+        let text = "12. Author, A.: A title that wraps\n2024. and continues here.\n13. Next, B.: Another\n";
+        let entries = parse_numeric_references(0, &page_from(text));
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(
+            entries[0].text.contains("continues here"),
+            "{}",
+            entries[0].text
+        );
+        assert_eq!(entries[1].label, "13");
+    }
+
+    #[test]
+    fn a_heading_sharing_its_line_with_the_first_entry_is_found() {
+        assert!(looks_like_reference_heading(
+            "References [1] Aberman, K. et al. Skeleton-aware networks.\n"
+        ));
+    }
+
+    #[test]
     fn a_heading_is_found_mid_page() {
         // Real papers often start the list right after the conclusion, not at the page top.
         assert!(looks_like_reference_heading(
@@ -519,5 +690,234 @@ mod reference_tests {
             2,
             "the appendix must not be parsed as references"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Citations (M4)
+// ---------------------------------------------------------------------------
+
+/// A citation found in the body text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Citation {
+    /// The text as it appears, e.g. `[12,13]` or `He et al. 2024`.
+    pub text: String,
+    /// Reference labels it names. Numeric styles give concrete numbers (`12`, `13`, and the
+    /// expansion of ranges like `12-14`); author-year styles give the year, which is all the
+    /// matcher can use until the reference list is parsed in that style too.
+    pub labels: Vec<String>,
+    /// Bounding box in **page space** (the union of the character boxes).
+    pub rect: Rect,
+    /// Character range inside the page's text layer.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Finds citations in a page's text layer.
+///
+/// Two styles are recognised because the corpus splits roughly evenly between them, and a
+/// detector that knows only one silently reports nothing for half the papers:
+///
+/// * numeric — `[12]`, `[12,13]`, `[12-14]`
+/// * author-year — `(He et al. 2024)`, `(Kim and Lee, 2023)`, `(A, 2024; B, 2022)`
+pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
+    let chars: Vec<char> = text
+        .chars
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+
+    let mut found = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        // Author-year: a parenthesised span containing a plausible year and real words.
+        if chars[index] == '(' {
+            let mut close = index + 1;
+            while close < chars.len()
+                && close - index <= 90
+                && chars[close] != ')'
+                && chars[close] != '('
+            {
+                close += 1;
+            }
+            let inner: String = chars[index + 1..close.min(chars.len())].iter().collect();
+            let letters = inner
+                .chars()
+                .filter(|character| character.is_alphabetic())
+                .count();
+            if close < chars.len()
+                && chars[close] == ')'
+                && letters >= 3
+                && let Some(year) = first_year(&inner)
+            {
+                // Author-year lists have no numbers, so the matching key is
+                // "first surname + year" -- the same key `parse_author_year_references`
+                // builds for the entries themselves.
+                let mut labels = vec![year.clone()];
+                if let Some(surname) = first_surname(&inner) {
+                    labels.push(format!("{surname} {year}"));
+                }
+                found.push(Citation {
+                    text: inner.trim().to_string(),
+                    labels,
+                    rect: union_boxes(&text.chars[index..=close]),
+                    start: index,
+                    end: close,
+                });
+                index = close + 1;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        // Numeric: `[` digits and separators `]`.
+        if chars[index] != '[' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < chars.len()
+            && end - index <= 12
+            && (chars[end].is_ascii_digit()
+                || chars[end] == ','
+                || chars[end] == '-'
+                || chars[end] == ' ')
+        {
+            end += 1;
+        }
+        let has_digit = chars[index + 1..end].iter().any(char::is_ascii_digit);
+        if end < chars.len() && chars[end] == ']' && has_digit {
+            let inner: String = chars[index + 1..end].iter().collect();
+            found.push(Citation {
+                text: chars[index..=end].iter().collect(),
+                labels: numeric_labels(&inner),
+                rect: union_boxes(&text.chars[index..=end]),
+                start: index,
+                end,
+            });
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+
+    found
+}
+
+/// Expands `12,13` and `12-14` into the individual labels a reference list can be keyed by.
+fn numeric_labels(inner: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if let Some((from, to)) = part.split_once('-')
+            && let (Ok(from), Ok(to)) = (from.trim().parse::<u32>(), to.trim().parse::<u32>())
+            && from <= to
+            && to - from <= 40
+        {
+            labels.extend((from..=to).map(|number| number.to_string()));
+            continue;
+        }
+        if !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()) {
+            labels.push(part.to_string());
+        }
+    }
+    labels
+}
+
+/// First plausible four-digit year in a span.
+fn first_year(text: &str) -> Option<String> {
+    let digits: Vec<char> = text.chars().collect();
+    digits.windows(4).find_map(|window| {
+        if !window.iter().all(char::is_ascii_digit) {
+            return None;
+        }
+        let year: u32 = window.iter().collect::<String>().parse().ok()?;
+        (1900..2100).contains(&year).then(|| year.to_string())
+    })
+}
+
+/// Union of a run of character boxes (page space).
+fn union_boxes(chars: &[RawCharBox]) -> Rect {
+    chars
+        .iter()
+        .fold(None::<Rect>, |accumulated, character| {
+            let rect = character.rect;
+            Some(match accumulated {
+                None => rect,
+                Some(current) => {
+                    let min_x = current.origin.x.min(rect.origin.x);
+                    let min_y = current.origin.y.min(rect.origin.y);
+                    let max_x = (current.origin.x + current.size.width)
+                        .max(rect.origin.x + rect.size.width);
+                    let max_y = (current.origin.y + current.size.height)
+                        .max(rect.origin.y + rect.size.height);
+                    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+                }
+            })
+        })
+        .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
+}
+
+#[cfg(test)]
+pub(crate) fn test_page(text: &str) -> RawTextPage {
+    use aris_reader_core::{PageIndex, RawCharBox, RawTextPage, Rect};
+    RawTextPage {
+        page: PageIndex(0),
+        chars: text
+            .chars()
+            .enumerate()
+            .map(|(index, character)| RawCharBox {
+                rect: Rect::new(index as f64 * 5.0, 700.0, 5.0, 10.0),
+                origin: aris_reader_core::Point::new(index as f64 * 5.0, 700.0),
+                unicode: character as u32,
+                font_size: 10.0,
+                angle: 0.0,
+                font_name: "Body".to_string(),
+            })
+            .collect(),
+        text: text.to_string(),
+        is_generated: false,
+        has_unicode_map_error: false,
+    }
+}
+
+#[cfg(test)]
+mod citation_tests {
+    use super::*;
+
+    fn page(text: &str) -> RawTextPage {
+        crate::test_page(text)
+    }
+
+    #[test]
+    fn numeric_citations_expand_their_labels() {
+        let found = find_citations(&page("As shown in [12,13] and [7-9] we see"));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].labels, vec!["12", "13"]);
+        assert_eq!(found[1].labels, vec!["7", "8", "9"]);
+        assert_eq!(found[0].text, "[12,13]");
+    }
+
+    #[test]
+    fn author_year_citations_are_found() {
+        let found = find_citations(&page("Prior work (He et al. 2024) agrees"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].labels, vec!["2024", "He 2024"]);
+    }
+
+    #[test]
+    fn citations_carry_a_real_box() {
+        let found = find_citations(&page("see [3] here"));
+        assert_eq!(found.len(), 1);
+        // Five points per character: the box spans `[3]` on the text's baseline band.
+        assert!(found[0].rect.size.width >= 15.0);
+        assert_eq!(found[0].rect.origin.y, 700.0);
+    }
+
+    #[test]
+    fn parentheses_without_a_year_are_not_citations() {
+        assert!(find_citations(&page("a (parenthetical aside) here")).is_empty());
     }
 }

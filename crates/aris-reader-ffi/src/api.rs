@@ -177,6 +177,8 @@ pub struct ArisDocument {
     page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
     /// Last computed layout, keyed by the page gap it was built for.
     layout: Mutex<Option<(f64, Arc<DocumentLayout>)>>,
+    /// Parsed reference list (scanning the tail pages is not free, and it never changes).
+    references: Mutex<Option<Vec<ReferenceRecord>>>,
 }
 
 #[uniffi::export]
@@ -260,6 +262,7 @@ impl ArisDocument {
             password: self.password.clone(),
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
+            references: Mutex::new(None),
         }))
     }
 
@@ -434,6 +437,100 @@ impl ArisDocument {
             }
         }
         Ok(hits)
+    }
+
+    /// Citations in the body text of `page`, boxed in view space.
+    pub fn citations(&self, page: u32) -> Result<Vec<CitationRecord>, ArisFfiError> {
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .page_to_view(1.0);
+
+        Ok(aris_reader_text::find_citations(&raw)
+            .into_iter()
+            .map(|citation| {
+                let top_left = Point::new(
+                    citation.rect.origin.x,
+                    citation.rect.origin.y + citation.rect.size.height,
+                );
+                let view = transform.apply(top_left);
+                CitationRecord {
+                    page,
+                    text: citation.text,
+                    labels: citation.labels,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: citation.rect.size.width,
+                    height_pt: citation.rect.size.height,
+                }
+            })
+            .collect())
+    }
+
+    /// The document's reference list, parsed once and cached.
+    ///
+    /// This is what makes a citation work **without** a link annotation: the shell resolves
+    /// `[12]` to an entry and previews the entry's own rectangle.
+    pub fn references(&self) -> Result<Vec<ReferenceRecord>, ArisFfiError> {
+        if let Ok(cache) = self.references.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        // Scanning from the front with a cap, rather than only the tail: real papers put the
+        // list anywhere from a third of the way in (with appendices after it) to the very end.
+        // `find_references` stops as soon as the list ends, so the cost is bounded by the list's
+        // position, and the cap keeps a 2000-page manual from being read page by page.
+        let total = self.backend.page_count();
+        let scan_end = total.min(120);
+        let mut pages = Vec::new();
+        for index in 0..scan_end {
+            if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
+                pages.push((index, text));
+            }
+        }
+
+        let entries =
+            aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000);
+
+        let mut records = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // The entry's box comes from the character boxes of its own range, so the preview
+            // can show exactly the entry rather than a whole page.
+            let Ok(text) = self.backend.raw_text_page(PageIndex(entry.page)) else {
+                continue;
+            };
+            let slice =
+                &text.chars[entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
+            let Some(rect) = union_of_char_boxes(slice) else {
+                continue;
+            };
+            let transform = self
+                .backend
+                .page_info(PageIndex(entry.page))?
+                .geometry
+                .page_to_view(1.0);
+            let top_left = Point::new(rect.origin.x, rect.origin.y + rect.size.height);
+            let view = transform.apply(top_left);
+
+            records.push(ReferenceRecord {
+                label: entry.label,
+                text: entry.text,
+                page: entry.page,
+                x_pt: view.x,
+                y_pt: view.y,
+                width_pt: rect.size.width,
+                height_pt: rect.size.height,
+            });
+        }
+
+        if let Ok(mut cache) = self.references.lock() {
+            *cache = Some(records.clone());
+        }
+        Ok(records)
     }
 
     /// Links on `page`, in **view space** (points, top-left origin).
@@ -670,6 +767,32 @@ fn flatten_outline(
     }
 }
 
+/// A citation in the body text, boxed in **view space**.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CitationRecord {
+    pub page: u32,
+    /// As it appears, e.g. `[12,13]` or `He et al. 2024`.
+    pub text: String,
+    /// Reference labels it names (`12`, `13`, …), or the year for author-year styles.
+    pub labels: Vec<String>,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// One entry of the reference list, with the box it occupies on its page.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReferenceRecord {
+    pub label: String,
+    pub text: String,
+    pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
 /// One search hit: a character range in a page's text layer.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SearchHit {
@@ -680,6 +803,27 @@ pub struct SearchHit {
     pub end: u32,
     /// Surrounding text, for the results list.
     pub snippet: String,
+}
+
+/// Union of a run of character boxes (page space), or `None` when the run is empty.
+fn union_of_char_boxes(chars: &[aris_reader_core::RawCharBox]) -> Option<aris_reader_core::Rect> {
+    chars
+        .iter()
+        .fold(None::<aris_reader_core::Rect>, |accumulated, character| {
+            let rect = character.rect;
+            Some(match accumulated {
+                None => rect,
+                Some(current) => {
+                    let min_x = current.origin.x.min(rect.origin.x);
+                    let min_y = current.origin.y.min(rect.origin.y);
+                    let max_x = (current.origin.x + current.size.width)
+                        .max(rect.origin.x + rect.size.width);
+                    let max_y = (current.origin.y + current.size.height)
+                        .max(rect.origin.y + rect.size.height);
+                    aris_reader_core::Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+                }
+            })
+        })
 }
 
 /// The page text **rebuilt from the character sequence**, so indices address the same
@@ -752,6 +896,7 @@ impl ArisEngine {
             password,
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
+            references: Mutex::new(None),
         }))
     }
 }
@@ -824,6 +969,36 @@ mod tests {
             text.text.chars().count(),
             text.chars.len()
         );
+    }
+
+    #[test]
+    fn citations_and_references_are_reported_without_erroring() {
+        // The fixtures carry neither citations nor a reference list, so the contract to pin
+        // down is "absent means empty, not an error". Real-document behaviour is measured by
+        // `aris-reader-cli cite` against the sample corpus.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        let citations = document.citations(0).expect("citations");
+        assert!(citations.is_empty(), "the fixture has no citations");
+
+        let references = document.references().expect("references");
+        assert!(references.is_empty(), "the fixture has no reference list");
+
+        let size = document.page_size_pt(0).expect("page size");
+        for citation in document.citations(0).expect("citations") {
+            assert!(citation.x_pt >= -1.0 && citation.x_pt <= size.width_pt + 1.0);
+            assert!(citation.y_pt >= -1.0 && citation.y_pt <= size.height_pt + 1.0);
+        }
     }
 
     #[test]

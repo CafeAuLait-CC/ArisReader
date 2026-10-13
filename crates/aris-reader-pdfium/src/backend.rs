@@ -214,8 +214,13 @@ impl PdfiumBackend {
     /// memory-maps the file and reuses its caches.
     /// Image object boxes (figures) and the path-object count (rules) on a page.
     ///
-    /// PDF has no "figure" or "table" object: an image XObject is as close as the format comes,
-    /// and rules — stroked paths — are the only handle on tables and vector figures.
+    /// PDF has no "figure" object: an image XObject is as close as the format comes, and rules
+    /// — stroked paths — are the only handle on tables and vector figures.
+    ///
+    /// Forms are descended into, because figures are routinely wrapped in one: stopping at the
+    /// top level was why several real papers reported no images at all. A nested image's own
+    /// bounds live in the form's coordinate system, so the **form's** bounds (which are in page
+    /// space) are what gets reported — geometrically right, and enough to place a preview.
     pub fn page_object_summary(&self, page: PageIndex) -> Result<(Vec<Rect>, usize)> {
         let _guard = PDFIUM_LOCK
             .lock()
@@ -224,24 +229,7 @@ impl PdfiumBackend {
 
         let mut images = Vec::new();
         let mut paths = 0usize;
-        for object in pdf_page.objects().iter() {
-            match object.object_type() {
-                PdfPageObjectType::Image => {
-                    // `bounds()` hands back a quadrilateral; images are axis-aligned, so its
-                    // left/right/bottom/top give the box directly.
-                    if let Ok(quad) = object.bounds() {
-                        images.push(Rect::new(
-                            f64::from(quad.left().value),
-                            f64::from(quad.bottom().value),
-                            f64::from(quad.right().value - quad.left().value),
-                            f64::from(quad.top().value - quad.bottom().value),
-                        ));
-                    }
-                }
-                PdfPageObjectType::Path => paths += 1,
-                _ => {}
-            }
-        }
+        collect_page_objects(pdf_page.objects().iter(), &mut images, &mut paths, 0);
 
         Ok((images, paths))
     }
@@ -692,6 +680,69 @@ fn tile_from_bitmap(bitmap: &PdfBitmap) -> RasterTile {
         pixels,
         format: RasterFormat::Bgra8Premultiplied,
     }
+}
+
+/// Walks page objects, descending into form XObjects.
+///
+/// Figures are routinely wrapped in a form, so stopping at the top level reported no images at
+/// all for several real papers. A nested image's own bounds live in the form's coordinate
+/// system; the **form's** bounds are in page space, so that is what gets reported.
+fn collect_page_objects<'a>(
+    objects: impl Iterator<Item = PdfPageObject<'a>>,
+    images: &mut Vec<Rect>,
+    paths: &mut usize,
+    depth: u32,
+) {
+    if depth > 4 {
+        // Bounded so a pathological file cannot recurse forever.
+        return;
+    }
+
+    for object in objects {
+        match object.object_type() {
+            PdfPageObjectType::Image => {
+                if let Ok(quad) = object.bounds() {
+                    images.push(rect_from_quad(quad));
+                }
+            }
+            PdfPageObjectType::Path => *paths += 1,
+            PdfPageObjectType::XObjectForm => {
+                let Ok(bounds) = object.bounds() else {
+                    continue;
+                };
+                let form_box = rect_from_quad(bounds);
+
+                let PdfPageObject::XObjectForm(form) = &object else {
+                    continue;
+                };
+
+                let mut nested_images = Vec::new();
+                let mut nested_paths = 0usize;
+                collect_page_objects(
+                    form.iter(),
+                    &mut nested_images,
+                    &mut nested_paths,
+                    depth + 1,
+                );
+                *paths += nested_paths;
+
+                if !nested_images.is_empty() {
+                    images.push(form_box);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An axis-aligned box from PDFium's quadrilateral bounds.
+fn rect_from_quad(quad: PdfQuadPoints) -> Rect {
+    Rect::new(
+        f64::from(quad.left().value),
+        f64::from(quad.bottom().value),
+        f64::from(quad.right().value - quad.left().value),
+        f64::from(quad.top().value - quad.bottom().value),
+    )
 }
 
 /// Converts a PDFium rectangle (PDF user space, origin bottom-left) into our [`Rect`].

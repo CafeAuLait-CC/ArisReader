@@ -835,19 +835,20 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     let total = backend.page_count();
     println!("{path}: {total} page(s)");
 
-    // The reference list lives at the end; scanning the last stretch keeps a stray mention of
-    // "References" in the body from being mistaken for the list.
-    let tail_start = total.saturating_sub(15);
-    let mut tail = Vec::new();
-    let mut tail_texts = Vec::new();
-    for index in tail_start..total {
+    // Scan from the front: a reference list can sit a third of the way in, with appendices
+    // after it, so a "last N pages" window misses it. The scan stops when the list ends.
+    let scan_end = total.min(120);
+    let mut texts = Vec::new();
+    for index in 0..scan_end {
         if let Ok(text) = backend.raw_text_page(PageIndex(index)) {
-            tail_texts.push(text);
+            texts.push(text);
         }
     }
-    for (offset, text) in tail_texts.iter().enumerate() {
-        tail.push((tail_start + offset as u32, text));
-    }
+    let tail = texts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| (index as u32, text))
+        .collect::<Vec<_>>();
     let references = aris_reader_text::find_references(tail, 2000);
     println!("  reference entries parsed: {}", references.len());
     for entry in references.iter().take(3) {
@@ -864,32 +865,34 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
             continue;
         };
-        for (label, rect) in find_citations(&text) {
-            // `[12]`, `[12,13]` and `[12-14]` all name concrete numbers inside the brackets.
-            let numbers: Vec<String> = label
-                .trim_matches(|character| character == '(' || character == ')')
-                .split(|character: char| !character.is_ascii_digit())
-                .filter(|part| !part.is_empty() && part.len() <= 4)
-                .map(str::to_string)
-                .collect();
-            if numbers.is_empty() {
+
+        // One detector for the whole project: the crate produces the labels (including the
+        // surname-year keys author-year lists are matched by). The CLI used to re-extract
+        // numbers itself, which silently ignored every citation that was not numeric.
+        for citation in aris_reader_text::find_citations(&text) {
+            if citation.labels.is_empty() {
                 continue;
             }
             attempted += 1;
-            let hit = references
-                .iter()
-                .find(|entry| numbers.iter().any(|number| number == &entry.label));
+
+            let hit = references.iter().find(|entry| {
+                citation
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(&entry.label))
+            });
+
             if let Some(entry) = hit {
                 resolved += 1;
                 if resolved <= 5 {
                     println!(
                         "    p{} {} → [{}] {} (at {:.0},{:.0})",
                         index + 1,
-                        label,
+                        citation.text,
                         entry.label,
                         entry.text.chars().take(50).collect::<String>(),
-                        rect.origin.x,
-                        rect.origin.y
+                        citation.rect.origin.x,
+                        citation.rect.origin.y
                     );
                 }
             }

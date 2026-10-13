@@ -114,6 +114,28 @@ public struct DocumentLink: Sendable {
     public let region: CGRect?
 }
 
+/// A citation in the body text, boxed in view space.
+public struct Citation: Sendable {
+    public let page: Int
+    public let text: String
+    public let labels: [String]
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+}
+
+/// One entry of the reference list, with the box it occupies on its page.
+public struct Reference: Sendable {
+    public let label: String
+    public let text: String
+    public let page: Int
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+}
+
 /// One outline entry, already flattened (nesting travels as `depth`).
 public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
@@ -207,6 +229,10 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> PageImage
     /// Links on a page, in view space (empty when the page has none).
     func links(_ page: Int) async throws -> [DocumentLink]
+    /// Citations in the body text of a page.
+    func citations(_ page: Int) async throws -> [Citation]
+    /// The document's reference list (empty when none can be parsed).
+    func references() async throws -> [Reference]
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
@@ -482,6 +508,60 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func citations(_ page: Int) async throws -> [Citation] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let found = try document.citations(page: UInt32(page))
+                    continuation.resume(
+                        returning: found.map { citation in
+                            Citation(
+                                page: page,
+                                text: citation.text,
+                                labels: citation.labels,
+                                xPt: CGFloat(citation.xPt),
+                                yPt: CGFloat(citation.yPt),
+                                widthPt: CGFloat(citation.widthPt),
+                                heightPt: CGFloat(citation.heightPt)
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func references() async throws -> [Reference] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let entries = try document.references()
+                    continuation.resume(
+                        returning: entries.map { entry in
+                            Reference(
+                                label: entry.label,
+                                text: entry.text,
+                                page: Int(entry.page),
+                                xPt: CGFloat(entry.xPt),
+                                yPt: CGFloat(entry.yPt),
+                                widthPt: CGFloat(entry.widthPt),
+                                heightPt: CGFloat(entry.heightPt)
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func outline() async throws -> [OutlineEntry] {
         guard let document else { return [] }
 
@@ -638,6 +718,10 @@ public final class MockEngine: PDFEngine {
     }
 
     public func links(_ page: Int) async throws -> [DocumentLink] { [] }
+
+    public func citations(_ page: Int) async throws -> [Citation] { [] }
+
+    public func references() async throws -> [Reference] { [] }
 
     public func outline() async throws -> [OutlineEntry] { [] }
 
