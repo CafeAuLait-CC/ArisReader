@@ -83,6 +83,39 @@ public struct PagePlacement: Equatable, Sendable {
     }
 }
 
+/// One rasterized tile: what `rasterizeTile` hands back.
+///
+/// Tiles are the unit the shell thinks in once zoom passes what a single page texture can
+/// hold; the canvas never learns the difference, because a tile is just another placement
+/// with a bitmap.
+public struct TileImage: Sendable {
+    public let page: Int
+    public let lod: UInt8
+    public let tileX: Int
+    public let tileY: Int
+    public let sizePx: Int
+    public let bgra: Data
+    public let generation: UInt64
+
+    public init(
+        page: Int,
+        lod: UInt8,
+        tileX: Int,
+        tileY: Int,
+        sizePx: Int,
+        bgra: Data,
+        generation: UInt64
+    ) {
+        self.page = page
+        self.lod = lod
+        self.tileX = tileX
+        self.tileY = tileY
+        self.sizePx = sizePx
+        self.bgra = bgra
+        self.generation = generation
+    }
+}
+
 /// One page ready to be drawn: where it goes and the bitmap that goes there.
 public struct CanvasPage: Sendable {
     public let placement: PagePlacement
@@ -106,6 +139,14 @@ public protocol PDFEngine: AnyObject {
     /// Asynchronous because it runs off the main thread: PDFium is not thread-safe, so
     /// implementations serialise calls, but the UI must never wait for them.
     func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage
+    /// Rasterizes one tile of a page at a discrete LOD (`scale = 2^lod`).
+    func rasterizeTile(
+        page: Int,
+        lod: UInt8,
+        tileX: Int,
+        tileY: Int,
+        tileSize: Int
+    ) async throws -> TileImage
     /// Total height of the scrolling content, in points.
     func contentHeightPt(gapPt: CGFloat) -> CGFloat
     /// Width of the widest page, in points (the canvas centres the content with it).
@@ -215,6 +256,52 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func rasterizeTile(
+        page: Int,
+        lod: UInt8,
+        tileX: Int,
+        tileY: Int,
+        tileSize: Int
+    ) async throws -> TileImage {
+        guard let document else {
+            throw NSError(
+                domain: "ArisReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+
+        generation += 1
+        let generation = self.generation
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let tile = try document.rasterizeTile(
+                        page: UInt32(page),
+                        lod: lod,
+                        tileX: UInt32(tileX),
+                        tileY: UInt32(tileY),
+                        tileSize: UInt32(tileSize)
+                    )
+                    continuation.resume(
+                        returning: TileImage(
+                            page: page,
+                            lod: lod,
+                            tileX: tileX,
+                            tileY: tileY,
+                            sizePx: Int(tile.sizePx),
+                            bgra: tile.pixels,
+                            generation: generation
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
         guard let document else { return 0 }
         return CGFloat(document.contentHeightPt(gapPt: Double(gapPt)))
@@ -283,6 +370,20 @@ public final class MockEngine: PDFEngine {
             domain: "ArisReader",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize pages"]
+        )
+    }
+
+    public func rasterizeTile(
+        page: Int,
+        lod: UInt8,
+        tileX: Int,
+        tileY: Int,
+        tileSize: Int
+    ) async throws -> TileImage {
+        throw NSError(
+            domain: "ArisReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize tiles"]
         )
     }
 

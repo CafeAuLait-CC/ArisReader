@@ -75,16 +75,49 @@ public final class AppState: ObservableObject {
     public let pageGapPt: CGFloat = 12
     /// Viewport size in screen points, reported by the canvas.
     private var viewportSizePt: CGSize = .zero
-    /// Rasterized pages kept while scrolling; the canvas keeps one texture per entry, so
-    /// this doubles as the texture budget until the tile cache lands (T1.6).
-    private var pageCache: [Int: PageImage] = [:]
-    private let pageCacheLimit = 6
-    /// Pages whose rasterization is currently in flight, so a scroll does not queue the
-    /// same page twice.
-    private var inFlight: Set<Int> = []
+    /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
+    private let tileSizePx = 512
+    /// Highest pyramid level we build (matches `EngineConfig::max_lod`).
+    private let maxLod: UInt8 = 4
+
+    /// Identity of one tile in the pyramid.
+    private struct TileKey: Hashable {
+        let page: Int
+        let lod: UInt8
+        let x: Int
+        let y: Int
+    }
+
+    /// Rasterized tiles, ready to draw (each carries its placement in content space).
+    private var tileCache: [TileKey: CanvasPage] = [:]
+    /// Insertion order, used to evict the oldest tiles first.
+    private var tileOrder: [TileKey] = []
+    /// Tiles whose rasterization is in flight, so scrolling does not queue one twice.
+    private var tilesInFlight: Set<TileKey> = []
+    private let tileCacheLimit = 48
     /// Bumped whenever the cache is invalidated (zoom or document change): results that
     /// arrive afterwards are stale and get dropped.
     private var renderEpoch: UInt64 = 0
+
+    /// Raster scale as a discrete pyramid level: the smallest LOD whose scale covers the
+    /// zoom. Zooming therefore stops re-rasterizing anything — the GPU scales the quad from
+    /// the nearest LOD, and only the tile *set* changes.
+    private var rasterLod: UInt8 {
+        let scale = max(zoomFactor * deviceScale, 0.05)
+        let level = Int(ceil(log2(scale)))
+        return UInt8(min(max(level, 0), Int(maxLod)))
+    }
+
+    /// Unique id per tile, used by the canvas as its texture-cache key.
+    private func tileIdentifier(_ key: TileKey) -> Int {
+        (key.page << 24) | (Int(key.lod) << 20) | (key.y << 10) | key.x
+    }
+
+    private func invalidateTiles() {
+        tileCache.removeAll()
+        tileOrder.removeAll()
+        renderEpoch &+= 1
+    }
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
     private var deviceScale: CGFloat = 2.0
 
@@ -152,8 +185,7 @@ public final class AppState: ObservableObject {
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_ZOOM"],
                let zoom = Int(raw), zoom > 0 {
                 zoomPercent = zoom
-                pageCache.removeAll()
-        renderEpoch &+= 1
+                invalidateTiles()
             }
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL"],
                let offset = Double(raw), offset > 0 {
@@ -188,8 +220,7 @@ public final class AppState: ObservableObject {
             } else {
                 statusMessage = "Opened \(loaded.title) (no pages reported)"
             }
-            pageCache.removeAll()
-        renderEpoch &+= 1
+            invalidateTiles()
             scrollYPt = 0
             reloadVisiblePages()
         } catch {
@@ -200,22 +231,19 @@ public final class AppState: ObservableObject {
 
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
-        pageCache.removeAll()
-        renderEpoch &+= 1
+        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
-        pageCache.removeAll()
-        renderEpoch &+= 1
+        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomActual() {
         zoomPercent = 100
-        pageCache.removeAll()
-        renderEpoch &+= 1
+        invalidateTiles()
         reloadVisiblePages()
     }
 
@@ -233,8 +261,7 @@ public final class AppState: ObservableObject {
     public func setDeviceScale(_ scale: CGFloat) {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
-        pageCache.removeAll()
-        renderEpoch &+= 1
+        invalidateTiles()
         reloadVisiblePages()
     }
 
@@ -272,11 +299,12 @@ public final class AppState: ObservableObject {
         max(viewportSizePt.height / max(zoomFactor, 0.01), 1)
     }
 
-    /// Rasterizes the pages overlapping the viewport and hands them to the canvas.
+    /// Makes sure the tiles covering the viewport exist, and hands the ready ones to the
+    /// canvas.
     ///
-    /// Synchronous on purpose for this slice: a full A4 page takes single-digit
-    /// milliseconds with PDFium, and scrolling normally adds one page at a time. The
-    /// raster pool (T1.3) and tile caching (T1.5/T1.6) replace this next.
+    /// Rasterization happens off the main thread, so a tile that is not ready yet is simply
+    /// not drawn this frame and appears when it lands. LOD selection is discrete: zooming
+    /// changes which tiles are wanted, never how an existing one was rasterized.
     public func reloadVisiblePages() {
         guard document != nil else {
             canvasPages = []
@@ -286,66 +314,121 @@ public final class AppState: ObservableObject {
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt)
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt)
+
         let viewportHeight = viewportHeightContentPt
-        // Prefetch half a viewport ahead so the next page is ready before it appears.
+        let margin = viewportHeight * 0.5
         let visible = engine.visiblePages(
             scrollYPt: scrollYPt,
             viewportHeightPt: viewportHeight,
             gapPt: pageGapPt,
-            marginPt: viewportHeight * 0.5
+            marginPt: margin
         )
 
+        let lod = rasterLod
+        let scale = CGFloat(1 << Int(lod))
+        let tilePt = CGFloat(tileSizePx) / scale
+
+        // Viewport in content points, expanded by the prefetch margin. Every column is
+        // taken: a page is a handful of columns wide, and horizontal scrolling does not
+        // exist yet.
+        let top = scrollYPt - margin
+        let bottom = scrollYPt + viewportHeight + margin
+
+        var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
-        var keep = Set<Int>()
+
         for placement in visible {
-            keep.insert(placement.index)
-            if let image = pageCache[placement.index] {
-                pages.append(CanvasPage(placement: placement, image: image))
-            } else {
-                // Rasterize off the main thread; the page appears as soon as it lands.
-                scheduleRender(of: placement.index)
+            let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
+            let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
+            let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
+            let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
+            guard firstRow <= lastRow else { continue }
+
+            for ty in firstRow...lastRow {
+                for tx in 0..<columns {
+                    let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
+                    wanted.insert(key)
+
+                    let tilePlacement = PagePlacement(
+                        index: tileIdentifier(key),
+                        topPt: placement.topPt + CGFloat(ty) * tilePt,
+                        leftPt: placement.leftPt + CGFloat(tx) * tilePt,
+                        widthPt: tilePt,
+                        heightPt: tilePt
+                    )
+
+                    if let cached = tileCache[key] {
+                        pages.append(CanvasPage(placement: tilePlacement, image: cached.image))
+                    } else {
+                        scheduleTile(key, placement: tilePlacement)
+                    }
+                }
             }
         }
 
-        if pageCache.count > pageCacheLimit {
-            for key in pageCache.keys where !keep.contains(key) {
-                pageCache.removeValue(forKey: key)
-            }
-        }
-
+        evictTiles(keeping: wanted)
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
     }
 
-    /// Rasterizes one page in the background and folds it into the cache.
-    private func scheduleRender(of page: Int) {
-        guard !inFlight.contains(page) else { return }
-        inFlight.insert(page)
+    /// Rasterizes one tile in the background and folds it into the cache.
+    private func scheduleTile(_ key: TileKey, placement: PagePlacement) {
+        guard !tilesInFlight.contains(key) else { return }
+        tilesInFlight.insert(key)
 
         let epoch = renderEpoch
-        let scale = zoomFactor * deviceScale
+        let tileSize = tileSizePx
         Task { @MainActor [weak self] in
             guard let self else { return }
 
             do {
-                let image = try await self.engine.renderPage(page, scale: scale)
-                // Clear the in-flight mark *before* re-scheduling: otherwise a stale
-                // result would be dropped and the page would never be rendered again.
-                self.inFlight.remove(page)
+                let tile = try await self.engine.rasterizeTile(
+                    page: key.page,
+                    lod: key.lod,
+                    tileX: key.x,
+                    tileY: key.y,
+                    tileSize: tileSize
+                )
+                // Clear the in-flight mark first: a stale result must still lead to a
+                // re-request, otherwise the tile never appears at the new LOD.
+                self.tilesInFlight.remove(key)
 
                 guard epoch == self.renderEpoch else {
-                    // Zoom or document changed while rasterizing — this bitmap is stale,
-                    // but the page is still wanted, at the new scale.
                     self.reloadVisiblePages()
                     return
                 }
-                self.pageCache[page] = image
+
+                let image = PageImage(
+                    pixelWidth: tile.sizePx,
+                    pixelHeight: tile.sizePx,
+                    pointSize: CGSize(width: placement.widthPt, height: placement.heightPt),
+                    bgra: tile.bgra,
+                    generation: tile.generation
+                )
+                self.tileCache[key] = CanvasPage(placement: placement, image: image)
+                self.tileOrder.append(key)
                 self.reloadVisiblePages()
             } catch {
-                self.inFlight.remove(page)
+                self.tilesInFlight.remove(key)
                 self.lastError = String(describing: error)
-                self.statusMessage = "Couldn't render page \(page + 1)"
             }
         }
+    }
+
+    /// Keeps the cache bounded by dropping the oldest tiles that are no longer wanted.
+    private func evictTiles(keeping wanted: Set<TileKey>) {
+        guard tileCache.count > tileCacheLimit else { return }
+
+        var remaining = tileCache.count - tileCacheLimit
+        var scanned = 0
+        while remaining > 0, scanned < tileOrder.count {
+            let key = tileOrder[scanned]
+            scanned += 1
+            guard !wanted.contains(key) else { continue }
+            if tileCache.removeValue(forKey: key) != nil {
+                remaining -= 1
+            }
+        }
+        tileOrder.removeFirst(min(scanned, tileOrder.count))
     }
 }
