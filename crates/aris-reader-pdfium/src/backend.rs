@@ -130,29 +130,65 @@ pub struct RawLink {
     /// give us. It is enough to know **where an entry starts**, which is what lets entry
     /// boundaries be derived from the document's own links instead of from numbering patterns.
     pub dest_top_y: Option<f64>,
+    /// Left edge of the destination in page space, when the PDF says where to land.
+    ///
+    /// The y alone is not enough to rebuild an entry in a two-column bibliography: horizontal
+    /// bands cut across both columns and merge them. Keeping x is what makes a column-aware
+    /// reconstruction (and a preview rectangle that stays inside one column) possible.
+    pub dest_left_x: Option<f64>,
 }
 
 /// Extracts where a destination lands, from its view settings (page space).
 ///
 /// Returns the rectangle when the destination is a `/FitR`, and the top edge for the two
 /// coordinate-carrying forms. `/Fit` and `/FitB` say nothing about position.
-fn destination_landing(settings: &PdfDestinationViewSettings) -> (Option<Rect>, Option<f64>) {
+fn destination_landing(settings: &PdfDestinationViewSettings) -> DestinationLanding {
     match settings {
         PdfDestinationViewSettings::FitPageToRectangle(rect) => {
             let rect = rect_from_pdf(*rect);
-            (Some(rect), Some(rect.origin.y + rect.size.height))
+            DestinationLanding {
+                rect: Some(rect),
+                top_y: Some(rect.origin.y + rect.size.height),
+                left_x: Some(rect.origin.x),
+            }
         }
-        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, Some(y), _) => {
-            (None, Some(f64::from(y.value)))
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(Some(x), Some(y), _) => {
+            DestinationLanding {
+                rect: None,
+                top_y: Some(f64::from(y.value)),
+                left_x: Some(f64::from(x.value)),
+            }
         }
-        PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(y)) => {
-            (None, Some(f64::from(y.value)))
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(None, Some(y), _) => {
+            DestinationLanding {
+                rect: None,
+                top_y: Some(f64::from(y.value)),
+                left_x: None,
+            }
         }
-        PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(Some(y)) => {
-            (None, Some(f64::from(y.value)))
-        }
-        _ => (None, None),
+        PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(y)) => DestinationLanding {
+            rect: None,
+            top_y: Some(f64::from(y.value)),
+            left_x: None,
+        },
+        PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(Some(y)) => DestinationLanding {
+            rect: None,
+            top_y: Some(f64::from(y.value)),
+            left_x: None,
+        },
+        _ => DestinationLanding::default(),
     }
+}
+
+/// Where a destination lands: a rectangle, a top edge, a left edge, or nothing.
+///
+/// `/Fit` and `/FitB` say nothing about position; `/FitH` carries only y; `/XYZ` may carry x and
+/// y; `/FitR` carries both through its rectangle.
+#[derive(Clone, Copy, Debug, Default)]
+struct DestinationLanding {
+    rect: Option<Rect>,
+    top_y: Option<f64>,
+    left_x: Option<f64>,
 }
 
 /// Converts a `/FitR` destination rectangle into view space.
@@ -362,6 +398,7 @@ impl PdfiumBackend {
             let mut target = None;
             let mut dest_rect = None;
             let mut dest_top_y = None;
+            let mut dest_left_x = None;
 
             if let Some(action) = link.action() {
                 if let Some(uri_action) = action.as_uri_action() {
@@ -375,9 +412,10 @@ impl PdfiumBackend {
                         .map(|index| PageIndex(index.max(0) as u32));
 
                     if let Ok(settings) = destination.view_settings() {
-                        let (rect, top) = destination_landing(&settings);
-                        dest_rect = rect;
-                        dest_top_y = top;
+                        let landing = destination_landing(&settings);
+                        dest_rect = landing.rect;
+                        dest_top_y = landing.top_y;
+                        dest_left_x = landing.left_x;
                     }
                 }
             }
@@ -395,9 +433,10 @@ impl PdfiumBackend {
                     .ok()
                     .map(|index| PageIndex(index.max(0) as u32));
                 if let Ok(settings) = destination.view_settings() {
-                    let (rect, top) = destination_landing(&settings);
-                    dest_rect = rect;
-                    dest_top_y = top;
+                    let landing = destination_landing(&settings);
+                    dest_rect = landing.rect;
+                    dest_top_y = landing.top_y;
+                    dest_left_x = landing.left_x;
                 }
             }
 
@@ -409,6 +448,7 @@ impl PdfiumBackend {
                     page: target,
                     dest_rect,
                     dest_top_y,
+                    dest_left_x,
                 });
             }
         }
