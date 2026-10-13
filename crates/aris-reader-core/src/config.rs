@@ -33,7 +33,12 @@ pub struct EngineConfig {
     pub tile_size: u32,
     /// Maximum tile pyramid level (LOD n corresponds to raster scale `2^n`).
     pub max_lod: u8,
-    /// Render the whole page when the page pixel area stays at or below this threshold and zoom ≤ 2.0 (avoids re-interpreting the content stream).
+    /// Pixel budget for a **single page texture**.
+    ///
+    /// Until the tile pipeline lands (T1.5), one page is one texture, so this doubles as
+    /// the memory ceiling for a visible page: 8 MP ≈ 32 MB. It still gives A4 a crisp
+    /// render at 400% zoom (2380 × 3368) and clamps only beyond that, which is also what
+    /// keeps `ArisDocument::rasterize_page` from allocating 128 MB at 800%.
     pub full_page_max_pixels: u64,
     /// Enable the wgpu validation layer (during development).
     pub gpu_validation: bool,
@@ -47,7 +52,7 @@ impl Default for EngineConfig {
             max_document_copies: 4,
             tile_size: 512,
             max_lod: 4,
-            full_page_max_pixels: 4096 * 4096,
+            full_page_max_pixels: 8 * 1024 * 1024,
             gpu_validation: cfg!(debug_assertions),
         }
     }

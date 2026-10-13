@@ -153,6 +153,10 @@ pub struct PageBitmap {
     pub stride: u32,
     pub width_pt: f64,
     pub height_pt: f64,
+    /// Scale actually used. May be **lower** than requested: see
+    /// [`ArisDocument::rasterize_page`]'s clamp, which keeps a single page texture inside
+    /// a sane memory budget until tiles land (T1.5).
+    pub scale_used: f64,
     pub pixels: Vec<u8>,
 }
 
@@ -196,12 +200,32 @@ impl ArisDocument {
     }
 
     /// Rasterizes `page` at `scale` (1.0 = 72 dpi) into a BGRA buffer.
+    ///
+    /// # Clamping
+    ///
+    /// A whole page is one texture until the tile pipeline lands, so deep zoom would
+    /// allocate enormous bitmaps (400% on A4 is 32 MP ≈ 128 MB). The request is therefore
+    /// clamped to [`EngineConfig::full_page_max_pixels`] (and to a maximum edge length),
+    /// and the scale actually used is reported back in [`PageBitmap::scale_used`]; the
+    /// shell keeps drawing the quad at its layout size, so the GPU upscales.
+    ///
+    /// # Threading
+    ///
+    /// PDFium is not thread-safe. Callers must never run two rasterizations on the same
+    /// document concurrently — the shell serialises them on a dedicated queue.
     pub fn rasterize_page(&self, page: u32, scale: f64) -> Result<PageBitmap, ArisFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(ArisFfiError::InvalidArgument {
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
+
+        let size = self
+            .page_sizes()
+            .get(page as usize)
+            .copied()
+            .unwrap_or((612.0, 792.0));
+        let scale = clamp_scale(size, scale);
 
         let request = RasterRequest::full_page(PageIndex(page), scale);
         let tile = self.backend.rasterize(&request)?;
@@ -214,6 +238,7 @@ impl ArisDocument {
             stride: tile.stride as u32,
             width_pt: view.width,
             height_pt: view.height,
+            scale_used: scale,
             pixels: tile.pixels,
         })
     }
@@ -311,6 +336,36 @@ impl ArisDocument {
     }
 }
 
+/// Largest edge length a single page texture may have.
+///
+/// 8192 is safe across the Metal/Vulkan/DX12 backends we target; the pixel-count clamp
+/// below is usually the tighter of the two.
+const MAX_PAGE_EDGE_PX: f64 = 8192.0;
+
+/// Reduces `scale` so that the resulting bitmap stays within the engine's budget.
+fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
+    let config = EngineConfig::default();
+    let (width_pt, height_pt) = page_size_pt;
+    if width_pt <= 0.0 || height_pt <= 0.0 {
+        return requested;
+    }
+
+    let requested_pixels = width_pt * requested * height_pt * requested;
+    let budget = config.full_page_max_pixels as f64;
+    let mut scale = requested;
+
+    if requested_pixels > budget {
+        scale *= (budget / requested_pixels).sqrt();
+    }
+
+    let longest_edge = width_pt.max(height_pt) * scale;
+    if longest_edge > MAX_PAGE_EDGE_PX {
+        scale *= MAX_PAGE_EDGE_PX / longest_edge;
+    }
+
+    scale
+}
+
 /// Where one page sits in the scrolling content (mirrors `PagePlacement`).
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct PagePlacementRecord {
@@ -360,6 +415,63 @@ mod tests {
             Err(ArisFfiError::Document { message }) => assert!(!message.is_empty()),
             other => panic!("expected a document error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deep_zoom_is_clamped_to_the_page_budget() {
+        let budget = EngineConfig::default().full_page_max_pixels as f64;
+
+        // 400% on A4 is 2380x3368 = 8 MP, which still fits the 16.7 MP budget: untouched.
+        assert_eq!(clamp_scale((595.0, 842.0), 4.0), 4.0);
+
+        // 800% is 32 MP, so the scale comes down until the page fits (rounding the pixel
+        // dimensions up can leave a few hundred pixels over, hence the 1% tolerance).
+        let clamped = clamp_scale((595.0, 842.0), 8.0);
+        assert!(clamped < 8.0, "scale should be reduced, got {clamped}");
+        let pixels = 595.0 * clamped * 842.0 * clamped;
+        assert!(
+            pixels <= budget * 1.01,
+            "clamped page is still {pixels:.0} px"
+        );
+
+        // The edge cap covers long, narrow pages whose pixel count alone would pass.
+        let narrow = clamp_scale((20.0, 20_000.0), 1.0);
+        assert!(
+            20_000.0 * narrow <= MAX_PAGE_EDGE_PX * 1.01,
+            "edge not clamped: {narrow}"
+        );
+    }
+
+    #[test]
+    fn rasterizing_a_fixture_page_reports_the_scale_used() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        let bitmap = document.rasterize_page(0, 2.0).expect("rasterize");
+        assert_eq!(
+            bitmap.scale_used, 2.0,
+            "a normal request must not be clamped"
+        );
+        assert_eq!(bitmap.width_px, 1190);
+        assert_eq!(bitmap.height_px, 1684);
+
+        let huge = document.rasterize_page(0, 8.0).expect("rasterize huge");
+        assert!(huge.scale_used < 8.0, "deep zoom must be clamped");
+        let pixels = u64::from(huge.width_px) * u64::from(huge.height_px);
+        let budget = EngineConfig::default().full_page_max_pixels;
+        assert!(
+            pixels <= budget + budget / 100,
+            "clamped page is {pixels} px"
+        );
     }
 
     #[test]

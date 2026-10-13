@@ -102,7 +102,10 @@ public struct CanvasPage: Sendable {
 public protocol PDFEngine: AnyObject {
     func openDocument(at url: URL) throws -> LoadedDocument
     /// Rasterizes a page at `scale` (1.0 = 72 dpi, so pass zoom × backing scale).
-    func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage
+    ///
+    /// Asynchronous because it runs off the main thread: PDFium is not thread-safe, so
+    /// implementations serialise calls, but the UI must never wait for them.
+    func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage
     /// Total height of the scrolling content, in points.
     func contentHeightPt(gapPt: CGFloat) -> CGFloat
     /// Width of the widest page, in points (the canvas centres the content with it).
@@ -130,6 +133,9 @@ public final class RustEngine: PDFEngine {
     /// graph (several windows, shared documents, event streams) is M1 work.
     private var document: ArisDocument?
     private var generation: UInt64 = 0
+    /// Serialises PDFium: the library is not thread-safe, so rasterizations run one at a
+    /// time on a dedicated queue and never on the main thread.
+    private let rasterQueue = DispatchQueue(label: "com.arisreader.raster", qos: .userInitiated)
 
     public init() throws {
         self.engine = try ArisEngine()
@@ -157,7 +163,7 @@ public final class RustEngine: PDFEngine {
         )
     }
 
-    public func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage {
+    public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         guard let document else {
             throw NSError(
                 domain: "ArisReader",
@@ -166,16 +172,47 @@ public final class RustEngine: PDFEngine {
             )
         }
 
-        let bitmap = try document.rasterizePage(page: UInt32(page), scale: Double(scale))
         generation += 1
+        let generation = self.generation
+        let requestedScale = Double(scale)
 
-        return PageImage(
-            pixelWidth: Int(bitmap.widthPx),
-            pixelHeight: Int(bitmap.heightPx),
-            pointSize: CGSize(width: bitmap.widthPt, height: bitmap.heightPt),
-            bgra: bitmap.pixels,
-            generation: generation
-        )
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                let started = DispatchTime.now()
+                do {
+                    let bitmap = try document.rasterizePage(
+                        page: UInt32(page),
+                        scale: requestedScale
+                    )
+                    let milliseconds =
+                        Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+                    // Written to stderr (unbuffered) on purpose: it is how the
+                    // "rasterisation really happens off the main thread" claim stays
+                    // verifiable, including when the process is killed mid-run.
+                    let line = String(
+                        format: "aris-raster: page %d at %.2fx → %dx%d px in %.1f ms (main thread: %@)\n",
+                        page,
+                        bitmap.scaleUsed,
+                        bitmap.widthPx,
+                        bitmap.heightPx,
+                        milliseconds,
+                        Thread.isMainThread ? "yes" : "no"
+                    )
+                    FileHandle.standardError.write(Data(line.utf8))
+                    continuation.resume(
+                        returning: PageImage(
+                            pixelWidth: Int(bitmap.widthPx),
+                            pixelHeight: Int(bitmap.heightPx),
+                            pointSize: CGSize(width: bitmap.widthPt, height: bitmap.heightPt),
+                            bgra: bitmap.pixels,
+                            generation: generation
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
@@ -241,7 +278,7 @@ public final class MockEngine: PDFEngine {
         )
     }
 
-    public func renderPage(_ page: Int, scale: CGFloat) throws -> PageImage {
+    public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         throw NSError(
             domain: "ArisReader",
             code: 2,

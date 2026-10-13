@@ -139,7 +139,11 @@ impl GpuContext {
         });
 
         // Built before the struct literal: the literal moves `device`.
-        let page = crate::page::PageState::new(&device);
+        let mut page = crate::page::PageState::new(&device);
+        // Prewarm the shader: Metal compiles the WGSL at pipeline creation, and paying for
+        // it on the first *page* frame showed up as ~400 ms of jank on open.
+        page.ensure_pipeline(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        page.ensure_pipeline(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
         Ok(Self {
             instance,

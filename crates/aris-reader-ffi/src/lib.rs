@@ -210,7 +210,7 @@ pub unsafe extern "C" fn aris_reader_surface_render(
         let frame = context.render_frame(SurfaceId(surface_id), [0.09, 0.09, 0.11, 1.0])?;
         // First frame and then roughly every ten seconds: enough to verify from a
         // log without drowning the console at display rate.
-        if frame.surface_frame_index <= 2 || frame.surface_frame_index % 600 == 0 {
+        if frame.surface_frame_index <= 4 || frame.surface_frame_index % 600 == 0 {
             let pixel = frame.center_pixel_bgra.unwrap_or([0, 0, 0, 0]);
             println!(
                 "aris-gpu: surface {} frame {} — {}×{} px, sRGB={}, presented={}, centre=#{:02X}{:02X}{:02X}",
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn aris_reader_surface_draw_page(
             // Neutral reading background; pages are drawn on top of it.
             [0.13, 0.13, 0.15, 1.0],
         )?;
-        if frame.surface_frame_index <= 2 || frame.surface_frame_index % 600 == 0 {
+        if frame.surface_frame_index <= 4 || frame.surface_frame_index % 600 == 0 {
             println!(
                 "aris-gpu: surface {} page frame {} — {}×{} px, presented={}, quad=({:.0},{:.0} {:.0}×{:.0})",
                 surface_id,
@@ -411,7 +411,7 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
             // Neutral reading background; pages are drawn on top of it.
             [0.13, 0.13, 0.15, 1.0],
         )?;
-        if frame.surface_frame_index <= 2 || frame.surface_frame_index % 600 == 0 {
+        if frame.surface_frame_index <= 4 || frame.surface_frame_index % 600 == 0 {
             let summary: Vec<String> = draws
                 .iter()
                 .map(|(_, rect)| {
@@ -422,10 +422,11 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
                 })
                 .collect();
             println!(
-                "aris-gpu: surface {} page frame {} — {} quads: {}",
+                "aris-gpu: surface {} page frame {} — {} quads in {:.1} ms: {}",
                 surface_id,
                 frame.surface_frame_index,
                 draws.len(),
+                frame.elapsed_us as f64 / 1000.0,
                 summary.join(" ")
             );
         }

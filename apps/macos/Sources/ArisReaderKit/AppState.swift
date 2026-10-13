@@ -79,6 +79,12 @@ public final class AppState: ObservableObject {
     /// this doubles as the texture budget until the tile cache lands (T1.6).
     private var pageCache: [Int: PageImage] = [:]
     private let pageCacheLimit = 6
+    /// Pages whose rasterization is currently in flight, so a scroll does not queue the
+    /// same page twice.
+    private var inFlight: Set<Int> = []
+    /// Bumped whenever the cache is invalidated (zoom or document change): results that
+    /// arrive afterwards are stale and get dropped.
+    private var renderEpoch: UInt64 = 0
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
     private var deviceScale: CGFloat = 2.0
 
@@ -147,6 +153,7 @@ public final class AppState: ObservableObject {
                let zoom = Int(raw), zoom > 0 {
                 zoomPercent = zoom
                 pageCache.removeAll()
+        renderEpoch &+= 1
             }
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL"],
                let offset = Double(raw), offset > 0 {
@@ -182,6 +189,7 @@ public final class AppState: ObservableObject {
                 statusMessage = "Opened \(loaded.title) (no pages reported)"
             }
             pageCache.removeAll()
+        renderEpoch &+= 1
             scrollYPt = 0
             reloadVisiblePages()
         } catch {
@@ -193,18 +201,21 @@ public final class AppState: ObservableObject {
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
         pageCache.removeAll()
+        renderEpoch &+= 1
         reloadVisiblePages()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
         pageCache.removeAll()
+        renderEpoch &+= 1
         reloadVisiblePages()
     }
 
     public func zoomActual() {
         zoomPercent = 100
         pageCache.removeAll()
+        renderEpoch &+= 1
         reloadVisiblePages()
     }
 
@@ -223,6 +234,7 @@ public final class AppState: ObservableObject {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
         pageCache.removeAll()
+        renderEpoch &+= 1
         reloadVisiblePages()
     }
 
@@ -287,14 +299,11 @@ public final class AppState: ObservableObject {
         var keep = Set<Int>()
         for placement in visible {
             keep.insert(placement.index)
-            if pageCache[placement.index] == nil {
-                pageCache[placement.index] = try? engine.renderPage(
-                    placement.index,
-                    scale: zoomFactor * deviceScale
-                )
-            }
             if let image = pageCache[placement.index] {
                 pages.append(CanvasPage(placement: placement, image: image))
+            } else {
+                // Rasterize off the main thread; the page appears as soon as it lands.
+                scheduleRender(of: placement.index)
             }
         }
 
@@ -306,5 +315,37 @@ public final class AppState: ObservableObject {
 
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
+    }
+
+    /// Rasterizes one page in the background and folds it into the cache.
+    private func scheduleRender(of page: Int) {
+        guard !inFlight.contains(page) else { return }
+        inFlight.insert(page)
+
+        let epoch = renderEpoch
+        let scale = zoomFactor * deviceScale
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let image = try await self.engine.renderPage(page, scale: scale)
+                // Clear the in-flight mark *before* re-scheduling: otherwise a stale
+                // result would be dropped and the page would never be rendered again.
+                self.inFlight.remove(page)
+
+                guard epoch == self.renderEpoch else {
+                    // Zoom or document changed while rasterizing — this bitmap is stale,
+                    // but the page is still wanted, at the new scale.
+                    self.reloadVisiblePages()
+                    return
+                }
+                self.pageCache[page] = image
+                self.reloadVisiblePages()
+            } catch {
+                self.inFlight.remove(page)
+                self.lastError = String(describing: error)
+                self.statusMessage = "Couldn't render page \(page + 1)"
+            }
+        }
     }
 }

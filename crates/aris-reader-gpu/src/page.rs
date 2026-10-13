@@ -158,7 +158,7 @@ impl PageState {
     }
 
     /// Creates (once per target format) the textured-quad pipeline.
-    fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
+    pub(crate) fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         if self.pipelines.contains_key(&format) {
             return;
         }
