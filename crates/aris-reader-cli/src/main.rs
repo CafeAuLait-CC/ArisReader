@@ -998,6 +998,15 @@ fn cmd_cite(args: &[String]) -> ExitCode {
             // numeric citation against an unnumbered list.
             let hit = aris_reader_text::resolve_reference(&citation.labels, &references);
 
+            if options.iter().any(|(key, _)| key == "--show-misses") && hit.is_none() {
+                println!(
+                    "    p{} MISS {:?} → labels {:?}",
+                    index + 1,
+                    citation.text.chars().take(28).collect::<String>(),
+                    citation.labels
+                );
+            }
+
             if let Some(entry) = hit {
                 resolved += 1;
                 if resolved <= 5 {
