@@ -149,6 +149,70 @@ impl PdfiumBackend {
                 .with_detail(error.to_string())
         })
     }
+    /// Renders a sub-rectangle ("tile") of a page through PDFium's matrix path.
+    ///
+    /// PDFium composes the matrix on top of its own display transform, which already
+    /// applies the page's intrinsic `/Rotate`, so a tile lands in exactly the same
+    /// orientation as a whole-page render — the `a_tile_matches_the_full_page_render`
+    /// test pins that down by comparing against a crop of the full render.
+    ///
+    /// Region rendering is what makes a tile pipeline affordable at all: rendering the
+    /// whole page and cropping would re-interpret the content stream once per tile.
+    fn rasterize_region(
+        &self,
+        page: &PdfPage<'_>,
+        request: &RasterRequest,
+        region: Rect,
+    ) -> Result<RasterTile> {
+        let width_px = (region.size.width * request.scale).ceil().max(1.0) as i32;
+        let height_px = (region.size.height * request.scale).ceil().max(1.0) as i32;
+
+        // Device pixel = (view point − region origin) × scale. The region is in view
+        // space (top-left origin, like everything the renderer consumes).
+        let scale = request.scale as f32;
+        let matrix = PdfMatrix::new(
+            scale,
+            0.0,
+            0.0,
+            scale,
+            -(region.origin.x as f32) * scale,
+            -(region.origin.y as f32) * scale,
+        );
+
+        // Deliberately *not* `set_target_size`: pdfium-render turns a target size into a
+        // "fit the whole page into it" scale and composes that on top of our matrix, which
+        // would shrink the page into the tile instead of cropping it. The tile bitmap is
+        // therefore allocated here, and the matrix alone defines the page→device mapping.
+        let config = render_config(request)
+            .clip(0, 0, width_px, height_px)
+            .reset_matrix(matrix)
+            .map_err(|error| {
+                ArisError::new(ErrorCode::Internal, "PDFium rejected the tile transform")
+                    .with_detail(format!("{error}"))
+            })?;
+
+        let mut bitmap =
+            PdfBitmap::empty(width_px, height_px, PdfBitmapFormat::BGRA).map_err(|error| {
+                ArisError::new(ErrorCode::RenderFailed, "could not allocate a tile bitmap")
+                    .with_detail(format!("{error}"))
+            })?;
+
+        page.render_into_bitmap_with_config(&mut bitmap, &config)
+            .map_err(|error| {
+                ArisError::new(ErrorCode::RenderFailed, "PDFium failed to render a tile")
+                    .with_detail(format!(
+                        "page {} tile ({:.0},{:.0} {:.0}×{:.0}) @ {:.3}x → {error}",
+                        request.page.get(),
+                        region.origin.x,
+                        region.origin.y,
+                        region.size.width,
+                        region.size.height,
+                        request.scale
+                    ))
+            })?;
+
+        Ok(tile_from_bitmap(&bitmap))
+    }
 }
 
 impl DocumentBackend for PdfiumBackend {
@@ -199,13 +263,21 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {
-        if request.region.is_some() {
-            // Region rendering needs `FPDF_RenderPageBitmapWithMatrix`, which
-            // pdfium-render does not expose; it lands with the tile pipeline in T1.3.
-            return Err(ArisError::not_implemented("region rasterization (T1.3)"));
-        }
+        // PDFium's renderer is **not** thread-safe: two concurrent renders — even on
+        // different documents — can corrupt its state and crash. Rather than documenting
+        // a rule every caller must remember, the backend serialises renders itself.
+        // (Per-thread document copies in T1.3 replace this lock with real parallelism.)
+        // Dropping the guard on a poisoned mutex keeps a previous panic from turning into
+        // a permanent failure for the rest of the process.
+        let _guard = RASTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let page = self.page(request.page)?;
+
+        if let Some(region) = request.region {
+            return self.rasterize_region(&page, request, region);
+        }
 
         // `FPDF_GetPageWidthF/HeightF` already account for `/Rotate`, and
         // `render_with_config` renders the rotated page, so the two agree.
@@ -216,22 +288,7 @@ impl DocumentBackend for PdfiumBackend {
             .round()
             .max(1.0) as i32;
 
-        let [r, g, b, a] = request.background;
-        let config = PdfRenderConfig::new()
-            .set_target_size(width_px, height_px)
-            // BGRA matches `wgpu::TextureFormat::Bgra8UnormSrgb`, so uploads need no
-            // conversion. `pdfium-render` defaults to `FPDF_REVERSE_BYTE_ORDER`, which
-            // would hand us RGBA instead — hence the explicit `false`. The byte order is
-            // pinned by the `rasterize_keeps_native_bgra_channel_order` test below.
-            .set_format(PdfBitmapFormat::BGRA)
-            .set_reverse_byte_order(false)
-            .render_annotations(request.flags.annotations)
-            .render_form_data(request.flags.annotations)
-            .use_lcd_text_rendering(request.flags.lcd_text)
-            .limit_render_image_cache_size(request.flags.limit_image_cache)
-            .clear_before_rendering(true)
-            .set_clear_color(PdfColor::new(r, g, b, a));
-
+        let config = render_config(request).set_target_size(width_px, height_px);
         let bitmap = page.render_with_config(&config).map_err(|error| {
             ArisError::new(ErrorCode::RenderFailed, "PDFium failed to render the page").with_detail(
                 format!(
@@ -242,24 +299,7 @@ impl DocumentBackend for PdfiumBackend {
             )
         })?;
 
-        let width = bitmap.width();
-        let height = bitmap.height();
-        let stride = usize::try_from(width).unwrap_or(0) * 4;
-
-        let mut pixels = bitmap.as_raw_bytes();
-        let expected = stride * usize::try_from(height).unwrap_or(0);
-        if pixels.len() < expected {
-            // Defensive: a short buffer would otherwise be interpreted as a
-            // partially transparent tile further down the pipeline.
-            pixels.resize(expected, 0);
-        }
-
-        Ok(RasterTile {
-            size: Size::new(f64::from(width), f64::from(height)),
-            stride,
-            pixels,
-            format: RasterFormat::Bgra8Premultiplied,
-        })
+        Ok(tile_from_bitmap(&bitmap))
     }
 
     fn is_encrypted(&self) -> bool {
@@ -270,6 +310,53 @@ impl DocumentBackend for PdfiumBackend {
         // TODO(T2.1): `FPDFCatalog_IsTagged` decides whether the structure tree can
         // be used for a reliable reading order; pdfium-render does not expose it yet.
         false
+    }
+}
+
+/// Serialises PDFium rendering process-wide (see [`DocumentBackend::rasterize`] in the
+/// implementation below).
+static RASTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Builds the render configuration shared by the whole-page and tile paths.
+///
+/// The caller adds the target size (whole-page path) or a matrix and clip (tile path);
+/// the two are mutually exclusive in pdfium-render.
+fn render_config(request: &RasterRequest) -> PdfRenderConfig {
+    let [r, g, b, a] = request.background;
+    PdfRenderConfig::new()
+        // BGRA matches `wgpu::TextureFormat::Bgra8UnormSrgb`, so uploads need no
+        // conversion. `pdfium-render` defaults to `FPDF_REVERSE_BYTE_ORDER`, which would
+        // hand us RGBA instead — hence the explicit `false`. The byte order is pinned by
+        // the `rasterize_keeps_native_bgra_channel_order` test.
+        .set_format(PdfBitmapFormat::BGRA)
+        .set_reverse_byte_order(false)
+        .render_annotations(request.flags.annotations)
+        .render_form_data(request.flags.annotations)
+        .use_lcd_text_rendering(request.flags.lcd_text)
+        .limit_render_image_cache_size(request.flags.limit_image_cache)
+        .clear_before_rendering(true)
+        .set_clear_color(PdfColor::new(r, g, b, a))
+}
+
+/// Copies a PDFium bitmap into our own buffer.
+fn tile_from_bitmap(bitmap: &PdfBitmap) -> RasterTile {
+    let width = bitmap.width();
+    let height = bitmap.height();
+    let stride = usize::try_from(width).unwrap_or(0) * 4;
+
+    let mut pixels = bitmap.as_raw_bytes();
+    let expected = stride * usize::try_from(height).unwrap_or(0);
+    if pixels.len() < expected {
+        // Defensive: a short buffer would otherwise be interpreted as a partially
+        // transparent tile further down the pipeline.
+        pixels.resize(expected, 0);
+    }
+
+    RasterTile {
+        size: Size::new(f64::from(width), f64::from(height)),
+        stride,
+        pixels,
+        format: RasterFormat::Bgra8Premultiplied,
     }
 }
 
@@ -353,6 +440,100 @@ mod tests {
     ///
     /// The fixture is generated by `scripts/make-fixtures.py`; it draws a brown
     /// square (RGB 140,76,51) at PDF rect `360 480 120 120`.
+    #[test]
+    fn a_tile_matches_the_same_region_of_the_full_page_render() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
+        let full = backend
+            .rasterize(&RasterRequest::full_page(PageIndex(0), 1.0))
+            .expect("full page");
+
+        // A 100×100 pt window 120 pt from the left and 200 pt from the top of the page.
+        let region = Rect::new(120.0, 200.0, 100.0, 100.0);
+        let mut request = RasterRequest::full_page(PageIndex(0), 1.0);
+        request.region = Some(region);
+        let tile = backend.rasterize(&request).expect("tile");
+
+        assert_eq!(tile.size.width, 100.0);
+        assert_eq!(tile.size.height, 100.0);
+
+        // Compare the interior: the clip can antialias a tile's own edges slightly
+        // differently, but the content must be the same picture.
+        let mut total = 0i64;
+        let mut samples = 0i64;
+        let mut outliers = 0i64;
+        let mut worst = 0i32;
+        for y in 2..98usize {
+            for x in 2..98usize {
+                let tile_index = y * tile.stride + x * 4;
+                let full_index = (y + 200) * full.stride + (x + 120) * 4;
+                for channel in 0..3 {
+                    let delta = (i32::from(tile.pixels[tile_index + channel])
+                        - i32::from(full.pixels[full_index + channel]))
+                    .abs();
+                    worst = worst.max(delta);
+                    total += i64::from(delta);
+                    samples += 1;
+                    if delta > 40 {
+                        outliers += 1;
+                    }
+                }
+            }
+        }
+
+        let mean = total as f64 / samples as f64;
+        let outlier_share = outliers as f64 / samples as f64;
+
+        // The geometry is exact: PDFium's matrix path works in view space (top-left
+        // origin, Y downwards, one unit per point) and composes on top of the display
+        // transform that applies /Rotate, so a tile is the same picture as a crop of the
+        // full render. The measured mean is 0.02/255. The handful of strongly differing
+        // pixels are glyph antialiasing: rasterising a glyph inside a tile can land on a
+        // different subpixel grid than rasterising it as part of the whole page, so a few
+        // edge pixels differ outright. Assert on the mean and on how rare those are.
+        assert!(
+            mean <= 0.5,
+            "tile differs from the full-page render: mean {mean:.2}/255, worst {worst}/255"
+        );
+        assert!(
+            outlier_share < 0.005,
+            "{:.2}% of samples differ by more than 40/255 (worst {worst})",
+            outlier_share * 100.0
+        );
+    }
+
+    #[test]
+    fn tiles_are_sharp_when_the_zoom_exceeds_one_texture() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            return;
+        }
+
+        let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
+        // 4x on A4 is 8 MP: a tile of it must render at the requested scale rather than
+        // being clamped, which is the whole point of the tile pipeline.
+        let mut request = RasterRequest::full_page(PageIndex(0), 4.0);
+        request.region = Some(Rect::new(0.0, 0.0, 256.0, 256.0));
+        let tile = backend.rasterize(&request).expect("tile at 4x");
+        assert_eq!(tile.size.width, 1024.0);
+        assert_eq!(tile.size.height, 1024.0);
+
+        // The top-left tile must not be blank: this fixture has a heading there.
+        let dark = tile
+            .pixels
+            .chunks(4)
+            .filter(|pixel| pixel[0] < 128 && pixel[1] < 128 && pixel[2] < 128)
+            .count();
+        assert!(dark > 0, "the tile looks empty");
+    }
+
     #[test]
     fn rasterize_keeps_native_bgra_channel_order() {
         let fixture =

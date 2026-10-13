@@ -211,8 +211,9 @@ impl ArisDocument {
     ///
     /// # Threading
     ///
-    /// PDFium is not thread-safe. Callers must never run two rasterizations on the same
-    /// document concurrently — the shell serialises them on a dedicated queue.
+    /// Callable from any thread: the PDFium backend serialises rendering process-wide,
+    /// because PDFium's renderer is not thread-safe even across documents. The shell still
+    /// keeps its own queue so the main thread never blocks.
     pub fn rasterize_page(&self, page: u32, scale: f64) -> Result<PageBitmap, ArisFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(ArisFfiError::InvalidArgument {

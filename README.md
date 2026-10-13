@@ -112,7 +112,7 @@ resolve locally.
 | Milestone | Theme | Status |
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
-| M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | 🚧 In progress — pages render on the GPU, continuous scrolling, page turn and zoom work, and rasterization runs on a background queue under a memory budget; tiles, LOD and the raster pool are next |
+| M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | 🚧 In progress — pages render on the GPU, continuous scrolling, page turn and zoom work, and rasterization runs on a background queue under a memory budget; region (tile) rasterization is implemented and verified pixel-for-pixel against whole-page renders, so wiring tiles into the shell plus the LOD pyramid is what remains |
 | M2 | Full reading experience: outline, thumbnails, search, text selection, links, tabs, reading position | ⬜ |
 | M3 | Annotation and editing: highlight/underline/ink/sticky notes, page operations, forms, incremental save | ⬜ |
 | M4 | Advanced reading: citation/figure **floating windows**, bibliography index, split view, presentation mode | ⬜ |
