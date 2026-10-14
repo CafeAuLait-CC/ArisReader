@@ -10,7 +10,7 @@
 //! aris-reader-cli render <file.pdf> [--page N] [--dpi D] [-o out.png]
 //! aris-reader-cli compare <a.png> <b.png> [--max-mae F]
 //! aris-reader-cli text <file.pdf> [--page N]
-//! aris-reader-cli bench <file.pdf> [--pages N]
+//! aris-reader-cli bench <file.pdf> [--pages N] [--dpi D] [--search TERM]
 //! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
 //! aris-reader-cli analyze <file.pdf> [--pages N]
 //! aris-reader-cli cite <file.pdf> [--body-pages N]
@@ -23,6 +23,8 @@ use aris_reader_pdfium::{PdfiumBackend, backend_description};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
+
+mod bench;
 
 const USAGE: &str = "\
 aris-reader-cli — ArisReader headless tool
@@ -44,11 +46,41 @@ Usage:
   aris-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
                  [--max-mae F]                   exit non-zero when MAE exceeds F
   aris-reader-cli text <file.pdf> [--page N]     export the text of one page
-  aris-reader-cli bench <file.pdf> [--pages N]   rasterization benchmark
+  aris-reader-cli bench <file.pdf>               measure the engine: first frame, scroll raster
+                 [--pages N] [--dpi D]           times, RSS peak, first search results and a
+                 [--viewport WxH]                per-page render checksum baseline
+                 [--first-frame-scale S] [--repeat N]
+                 [--scroll-steps N] [--scroll-step-pt P] [--cache-tiles N]
+                 [--search TERM] [--search-limit N]
+                 [--skip-first-frame] [--skip-scroll] [--skip-search] [--skip-baseline]
+                 [--save-baseline FILE] [--check-baseline FILE]
+
+Bench method — what each number is, and what it is not:
+  first frame   open + page info + rasterizing the tiles that cover the initial viewport at
+                --first-frame-scale. Run 0 is cold inside the process (it includes loading
+                the PDFium dylib and opening the document); later runs are warm. For a cold
+                process, invoke the command twice: the first invocation is the cold one.
+                GPU upload / composite / present are NOT measured — the CLI has no surface.
+  scroll        each step advances the viewport by --scroll-step-pt; the reported time is the
+                wall time to rasterize the tiles that step newly needs (cached tiles cost ~0).
+                That is raster work per step, not a presented frame: the compositor and the
+                display link live in the shell, not here. The cache mirrors the shell's policy
+                (tileCacheLimit = 96, counted in tiles, not bytes) and keeps the tile pixels, so
+                the RSS number below covers what a scrolling reader actually holds.
+  rss-peak      getrusage(RUSAGE_SELF).ru_maxrss, the kernel's own peak resident set size for
+                the whole process (bytes on macOS). It covers every phase; use --skip-* to
+                attribute it to one phase.
+  search        the same page-by-page loop as the FFI search (text layer + find_all), timed
+                until the result list is complete; both the first hit and the full call are
+                reported. It is the engine path only, without the shell's UI work.
+  baseline      the first --pages pages at --dpi, one FNV-1a 64 checksum per page over the raw
+                BGRA rows (dimensions included). --save-baseline writes it, --check-baseline
+                re-renders and compares, exiting non-zero on any mismatch.
+  ARIS_READER_RENDER_STATS=1 adds per-frame and per-cache detail here; the app honours the same
+                variable (per-frame log in the FFI, tile-cache counters in the shell).
 
 Notes:
-  `render` and `info` need the PDFium dynamic library (see scripts/fetch-pdfium.sh).
-  `text` is implemented in T2.1 and `bench` in T1.13; until then they exit with code 2.
+  `render`, `info` and `bench` need the PDFium dynamic library (see scripts/fetch-pdfium.sh).
 ";
 
 fn main() -> ExitCode {
@@ -101,7 +133,7 @@ fn rest(args: &[String]) -> &[String] {
 }
 
 /// Minimal argument parsing: `--key value` and `-o value`; everything else is positional.
-fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
+pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
     let mut positional = Vec::new();
     let mut options = Vec::new();
     let mut index = 0;
@@ -109,7 +141,13 @@ fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
         let arg = &args[index];
         if matches!(
             arg.as_str(),
-            "--show-misses" | "--show-entries" | "--no-landings"
+            "--show-misses"
+                | "--show-entries"
+                | "--no-landings"
+                | "--skip-first-frame"
+                | "--skip-scroll"
+                | "--skip-search"
+                | "--skip-baseline"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;
@@ -127,14 +165,14 @@ fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
     (positional, options)
 }
 
-fn opt<'a>(options: &'a [(String, String)], names: &[&str]) -> Option<&'a str> {
+pub(crate) fn opt<'a>(options: &'a [(String, String)], names: &[&str]) -> Option<&'a str> {
     options
         .iter()
         .find(|(key, _)| names.contains(&key.as_str()))
         .map(|(_, value)| value.as_str())
 }
 
-fn opt_usize(options: &[(String, String)], names: &[&str], default: usize) -> usize {
+pub(crate) fn opt_usize(options: &[(String, String)], names: &[&str], default: usize) -> usize {
     opt(options, names)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
@@ -277,6 +315,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
         elapsed.as_millis(),
         megapixels / seconds
     );
+    bench::print_render_stats(width, height, tile.stride, elapsed);
     ExitCode::SUCCESS
 }
 
@@ -403,22 +442,15 @@ fn cmd_text(args: &[String]) -> ExitCode {
     }
 }
 
+/// `bench`: the T1.13 measurement tool.
+///
+/// The placeholder this replaces printed a plan and exited 2; every number the milestone
+/// criteria ask for (300-page first frame, scroll frame times, RSS peak, first search
+/// results, a 20-page checksum baseline) is now measured. The method behind each number —
+/// including what the CLI cannot see, which is the GPU — is documented in [`bench`] and
+/// summarised in `USAGE`, so a result can be reproduced from `--help` alone.
 fn cmd_bench(args: &[String]) -> ExitCode {
-    let (positional, options) = parse(args);
-    let Some(path) = positional.first() else {
-        eprintln!("usage: aris-reader-cli bench <file.pdf> [--pages N]");
-        return ExitCode::from(64);
-    };
-    let pages = opt_usize(&options, &["--pages"], 20);
-    let config = EngineConfig::default();
-    println!(
-        "benchmark plan: {path}, {pages} pages, tile {}px, max LOD {}",
-        config.tile_size, config.max_lod
-    );
-    println!(
-        "TODO(T1.13): report per-page/per-tile raster time, throughput (MP/s) and peak memory."
-    );
-    ExitCode::from(2)
+    bench::run(args)
 }
 
 /// What the engine can actually see in a folder of real PDFs.

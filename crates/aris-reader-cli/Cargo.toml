@@ -21,3 +21,6 @@ aris-reader-render = { workspace = true }
 # PNG encode/decode for the `render` and `compare` subcommands. Deliberately kept
 # out of the engine crates: the engine deals in raw pixel buffers only.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# `bench` reports peak RSS through `getrusage(RUSAGE_SELF)`: the kernel's own high-water
+# mark, which a sampler can miss and a profiler is not always available for.
+libc = "0.2"

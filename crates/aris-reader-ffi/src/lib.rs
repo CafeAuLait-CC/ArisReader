@@ -411,7 +411,15 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
             // Neutral reading background; pages are drawn on top of it.
             [0.13, 0.13, 0.15, 1.0],
         )?;
-        if frame.surface_frame_index <= 4 || frame.surface_frame_index % 600 == 0 {
+        // Frame time is only logged for the first frames and then rarely: an idle window must
+        // not spam a terminal. `ARIS_READER_RENDER_STATS=1` (the switch docs/09 §9 documents)
+        // lifts that throttle so a scroll can be measured frame by frame; the shell adds its
+        // own tile-cache counters under the same variable, and this line keeps its format so
+        // existing log parsers keep working.
+        if frame.surface_frame_index <= 4
+            || frame.surface_frame_index % 600 == 0
+            || render_stats_enabled()
+        {
             let summary: Vec<String> = draws
                 .iter()
                 .map(|(_, rect)| {
@@ -480,6 +488,16 @@ pub extern "C" fn aris_reader_gpu_shutdown() -> i32 {
     };
     *guard = None;
     code::OK
+}
+
+/// Whether `ARIS_READER_RENDER_STATS=1` asks for the verbose render statistics.
+///
+/// Read per frame instead of cached: the switch is a development aid, and the value is only
+/// consulted on a path that already logs. `1` and `true` are accepted; anything else is off.
+fn render_stats_enabled() -> bool {
+    std::env::var("ARIS_READER_RENDER_STATS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Runs `body` against the live GPU context and maps errors to C ABI codes.
