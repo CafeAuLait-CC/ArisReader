@@ -97,6 +97,7 @@ struct ReaderChecks {
         try await annotationChecks(a: a, b: b)
         try await annotationRecoveryChecks(a: a, b: b)
         try await previewChecks(url: b)
+        try await tileCacheChecks(url: b)
         print("All reader regression checks passed")
     }
 }

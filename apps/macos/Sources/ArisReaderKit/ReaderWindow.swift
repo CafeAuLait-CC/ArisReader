@@ -373,12 +373,14 @@ public struct ReaderWindow: View {
     }
 }
 
-/// Settings window (`⌘,`). During the skeleton phase it exposes only two performance toggles;
-/// the real configuration is held by the Rust side (`docs/02-architecture.md` §9).
+/// Settings window (`⌘,`). During the skeleton phase it exposes one performance setting —
+/// the tile-cache byte budget, which `AppState` adopts live (ADR 0007). The tile size is *not*
+/// a setting: it is fixed at 512 px because changing it moves the LOD math and the cache
+/// semantics with it, and no measurement supports that trade. The rest of the configuration is
+/// held by the Rust side (`docs/02-architecture.md` §9).
 public struct SettingsView: View {
     @ObservedObject private var state: AppState
-    @AppStorage("cacheBudgetMB") private var cacheBudgetMB = 512
-    @AppStorage("tileSize") private var tileSize = 512
+    @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
 
     public init(state: AppState) {
         self.state = state
@@ -390,10 +392,14 @@ public struct SettingsView: View {
                 Text("Engine: \(state.engine.version)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Stepper("Texture cache budget: \(cacheBudgetMB) MB",
-                        value: $cacheBudgetMB, in: 128...4096, step: 128)
-                Stepper("Tile size: \(tileSize) px",
-                        value: $tileSize, in: 256...1024, step: 256)
+                Stepper("Tile cache budget: \(cacheBudgetMB) MB",
+                        value: $cacheBudgetMB, in: 16...1024, step: 16)
+                    .onChange(of: cacheBudgetMB) { _, _ in state.applyCacheBudgetSetting() }
+                Text("Rasterized tiles are cached up to this many bytes; tiles the current view still "
+                     + "needs are never evicted. The tile size is fixed at 512 px. Budgets below ~40 MB "
+                     + "make zooming back re-rasterize instead of reusing cached tiles.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(20)
             .tabItem { Label("Performance", systemImage: "speedometer") }

@@ -103,26 +103,71 @@ public final class AppState: ObservableObject {
     /// Highest pyramid level we build (matches `EngineConfig::max_lod`).
     private let maxLod: UInt8 = 4
 
-    /// Identity of one tile in the pyramid.
-    private struct TileKey: Hashable {
-        let page: Int
-        let lod: UInt8
-        let x: Int
-        let y: Int
+    /// Default tile-cache budget in MB, for a reader who never opened Settings.
+    ///
+    /// Chosen by measurement, not by inheritance (ADR 0007; the shell used to cap the cache at
+    /// 96 tiles, which is ~96 MiB of pixels and no bound at all once every wanted tile is
+    /// pinned). What the measurements say:
+    ///
+    /// * the wanted band (visible + prefetch, pinned — see `wantedTiles`) peaks at ~28-32 MiB
+    ///   on a real paper at 100% zoom in a 959×715 pt window, and at ~94-99 MiB at 400% zoom;
+    /// * evicting *pinned* tiles is a loss: the scheduler immediately re-rasterizes them, and
+    ///   the churn cost 150-200 MiB of RSS at 400% zoom (an effectively unbounded budget
+    ///   reproduced the pre-change numbers exactly, which is what attributes the difference);
+    /// * evicting *stale* tiles is free: the bench's 120-step scroll rasterizes exactly the same
+    ///   636 (synthetic) / 675 (real paper) tiles with the same 60.7%/60.1% hit rate at 16 MB
+    ///   as at 96 MB, while peak occupancy falls from 61.2/59.2 MiB to 20.9/20.2 MiB;
+    /// * below ~40 MB the budget can no longer hold two adjacent LODs of one page at once
+    ///   (8.0 MB at LOD 1 + 32.1 MB at LOD 2 for the regression fixture), so zooming back
+    ///   re-rasterizes instead of reusing the cache — the behaviour `InteractionChecks` pins.
+    ///   Measured: 32 MB passed 2 of 3 check runs, 40 MB 3 of 3, 48 MB 3 of 3.
+    ///
+    /// 48 MB is therefore the smallest budget that keeps zoom-back reuse and still bounds a
+    /// sustained scroll: ~52 MiB peak occupancy against the old count cap's ~60 MiB, with
+    /// identical rasterization and hit rate. Above it the extra bytes only buy scroll-back
+    /// history nobody measured a need for; below it, the cache starts re-rasterizing on zoom.
+    public static let defaultTileCacheBudgetMB = 48
+
+    /// Byte budget for the tile cache, resolved the same way for `AppState` and the checks:
+    /// the `ARIS_READER_CACHE_BUDGET_MB` override (measurement only) → the `cacheBudgetMB`
+    /// setting written by the Settings window → `defaultTileCacheBudgetMB`.
+    ///
+    /// The value is clamped, not trusted: a 0 or negative setting would disable the cache and an
+    /// absurd one would make the budget meaningless, which is the bug ADR 0007 fixes rather than
+    /// a feature. The Settings stepper's own range starts higher (16 MB), so the floor only
+    /// catches a corrupt stored value or a bad override.
+    public static func configuredTileCacheBudgetBytes(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> Int {
+        let override = environment["ARIS_READER_CACHE_BUDGET_MB"].flatMap(Int.init)
+        let stored = defaults.integer(forKey: cacheBudgetSettingKey)
+        let megabytes = override ?? (stored > 0 ? stored : defaultTileCacheBudgetMB)
+        return min(max(megabytes, 1), 4096) * 1024 * 1024
     }
 
-    /// Rasterized tiles, ready to draw (each carries its placement in content space).
-    private var tileCache: [TileKey: CanvasPage] = [:]
-    /// Insertion order, used to evict the oldest tiles first.
-    private var tileOrder: [TileKey] = []
+    /// `@AppStorage` key shared with `SettingsView`.
+    public static let cacheBudgetSettingKey = "cacheBudgetMB"
+
+    /// Rasterized tiles, ready to draw, under the byte budget of ADR 0007 (`TileCache`).
+    ///
+    /// The policy — byte budget, LOD-aware LRU, pinned tiles never evicted — is the one
+    /// `crates/aris-reader-render/src/cache.rs` encodes; the hot path stays here per ADR 0007.
+    private var tileCache = TileCache(budgetBytes: AppState.configuredTileCacheBudgetBytes())
+    /// Tiles the last viewport update wanted: the visible band *and* the prefetch band. These
+    /// are the pinned set, and the reason is measured rather than aesthetic.
+    ///
+    /// Pinning only the tiles on screen and evicting the prefetch band looks like the obvious
+    /// reading of "never evict a visible tile", and it is what this change first did. It was
+    /// 150-200 MiB **worse** at 400% zoom: the scheduler re-requests any wanted tile it does
+    /// not find, so every eviction bought a fresh rasterization (and a fresh GPU upload), and
+    /// the churn's transient allocations outgrew the bytes the budget saved (before: 462-510
+    /// MiB with 0 evictions; evicting prefetch: 651-697 MiB with ~280 evictions). Pinning the
+    /// whole wanted band keeps scrolling smooth and still bounds what the budget is for: the
+    /// tiles the reader has scrolled *away* from, and the previous LOD's tiles after a zoom.
+    private var wantedTiles: Set<TileKey> = []
     /// Tiles whose rasterization is in flight, so scrolling does not queue one twice.
     private var tilesInFlight: Set<TileKey> = []
-    private let tileCacheLimit = 96
-    /// Tile-cache counters for `ARIS_READER_RENDER_STATS=1` (see `reportTileCacheStats`).
-    /// Frame times for the same HUD come from the FFI's per-frame log, because only that side
-    /// sees the GPU; these counters are the half only the shell knows.
-    private var tileCacheHits = 0
-    private var tileCacheMisses = 0
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["ARIS_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
@@ -515,8 +560,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func invalidateTiles() {
         tileCache.removeAll()
-        tileOrder.removeAll()
         tilesInFlight.removeAll()
+        wantedTiles.removeAll()
         pendingTiles = []
         failedTiles = []
         pagePreviews = [:]
@@ -525,6 +570,34 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         failedPreviewPages = []
         renderEpoch &+= 1
     }
+
+    /// Adopts the `cacheBudgetMB` setting into the live cache (ADR 0007 wired the setting to a
+    /// real consumer; the Settings window calls this when its stepper moves, so a change takes
+    /// effect without a relaunch).
+    ///
+    /// `environment`/`defaults` are injectable so the checks can drive the same resolution the
+    /// app uses without depending on how the test machine is configured.
+    public func applyCacheBudgetSetting(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) {
+        let bytes = Self.configuredTileCacheBudgetBytes(environment: environment, defaults: defaults)
+        guard bytes != tileCache.budgetBytes else { return }
+        tileCache.setBudget(bytes)
+        evictTiles()
+    }
+
+    /// Tile-cache occupancy, for `ARIS_READER_RENDER_STATS=1` and the budget checks: bytes in
+    /// use, the budget they fit, the high-water mark, and how many tiles were evicted.
+    public var tileCacheUsedBytes: Int { tileCache.usedBytes }
+    public var tileCacheBudgetBytes: Int { tileCache.budgetBytes }
+    public var tileCachePeakBytes: Int { tileCache.peakBytes }
+    public var tileCacheEvictions: Int { tileCache.stats.evictions }
+    public var tileCacheTileCount: Int { tileCache.count }
+
+    /// Whether one tile is cached. The budget checks use it to prove that a visible tile
+    /// survived an eviction pass that a stale tile did not.
+    public func isTileCached(_ key: TileKey) -> Bool { tileCache.contains(key) }
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
     private var deviceScale: CGFloat = 2.0
 
@@ -567,7 +640,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public let engine: PDFEngine
 
-    public init(engine: PDFEngine? = nil) {
+    /// `tileCacheBudgetBytes` pins the tile-cache budget instead of resolving it from the
+    /// environment and the `cacheBudgetMB` setting; the checks use it so their arithmetic does
+    /// not depend on how the machine running them is configured.
+    public init(engine: PDFEngine? = nil, tileCacheBudgetBytes: Int? = nil) {
         // Prefer the real engine; fall back to the mock so the window still works when
         // the Rust backend cannot start (docs/02-architecture.md §8).
         if let engine {
@@ -578,6 +654,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             self.engine = MockEngine()
         }
         statusMessage = self.engine.version
+        if let tileCacheBudgetBytes { tileCache.setBudget(max(1, tileCacheBudgetBytes)) }
 
         // Developer/test affordance: open a document at launch
         // (`ARIS_READER_OPEN=/path/to.pdf ArisReader`), which also lets a headless run
@@ -2128,6 +2205,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         visiblePagePlacements = Array(visible)
 
+        // `wanted` is the scheduling set (viewport + prefetch band); it doubles as the pinned
+        // set for eviction and is rebuilt with every viewport update.
+        wantedTiles.removeAll()
+
         pendingTiles = []
         // Whole-page previews are bounded and prepared ahead of the scroll direction.
         desiredPreviewPages = visible.sorted {
@@ -2147,6 +2228,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
             let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
             guard firstRow <= lastRow else { continue }
+            // The pinned set is the *shown* band, not the prefetch band above: a tile the
+            // reader cannot see may be re-rasterized, a visible one may not be dropped.
 
             for ty in firstRow...lastRow {
                 for tx in 0..<columns {
@@ -2161,11 +2244,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         heightPt: min(tilePt, placement.heightPt - CGFloat(ty) * tilePt)
                     )
 
-                    if let cached = tileCache[key] {
-                        tileCacheHits += 1
-                        ready.append(CanvasPage(placement: tilePlacement, image: cached.image))
+                    if let cached = tileCache.image(for: key) {
+                        ready.append(CanvasPage(placement: tilePlacement, image: cached))
                     } else {
-                        tileCacheMisses += 1
+                        tileCache.recordMiss()
                         if tilePlacement.topPt < scrollYPt + viewportHeight,
                            tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
                             complete = false
@@ -2203,22 +2285,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         loadCaptionMentions()
         loadLinks()
         loadCitations()
-        evictTiles(keeping: wanted)
+        wantedTiles = wanted
+        evictTiles()
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
         reportTileCacheStats(wanted: wanted.count, scheduled: pendingTiles.count)
     }
 
     /// `ARIS_READER_RENDER_STATS=1`: the shell's half of the HUD documented in docs/09 §9 —
-    /// tile-cache occupancy and hit rate per viewport update. Off by default and silent unless
-    /// asked for; it changes no scheduling decision, it only counts and reports.
+    /// tile-cache occupancy in tiles *and bytes*, hit rate, evictions and the byte peak per
+    /// viewport update. Off by default and silent unless asked for; it changes no scheduling
+    /// decision, it only counts and reports. The byte counters are what proves the ADR 0007
+    /// budget actually bounds the cache.
     private func reportTileCacheStats(wanted: Int, scheduled: Int) {
         guard Self.renderStatsEnabled else { return }
-        let total = tileCacheHits + tileCacheMisses
-        let hitRate = total == 0 ? 0.0 : 100.0 * Double(tileCacheHits) / Double(total)
+        let stats = tileCache.stats
+        let mib = 1024.0 * 1024.0
         let line = String(
-            format: "aris-stats: cache %d/%d tiles · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%%\n",
-            tileCache.count, tileCacheLimit, wanted, scheduled, tileCacheHits, tileCacheMisses, hitRate
+            format: "aris-stats: cache %d tiles · %.1f/%.1f MiB · peak %.1f MiB · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
+            tileCache.count,
+            Double(tileCache.usedBytes) / mib, Double(tileCache.budgetBytes) / mib,
+            Double(tileCache.peakBytes) / mib,
+            wanted, scheduled, stats.hits, stats.misses, stats.hitRate * 100.0,
+            stats.insertions, stats.evictions, Double(stats.evictedBytes) / mib
         )
         FileHandle.standardError.write(Data(line.utf8))
     }
@@ -2414,8 +2503,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 self.tilesInFlight.remove(key)
 
                 let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
-                self.tileCache[key] = CanvasPage(placement: placement, image: image)
-                self.tileOrder.append(key)
+                self.tileCache.insert(image, for: key)
                 self.reloadVisiblePages()
             } catch {
                 guard epoch == self.renderEpoch else { return }
@@ -2452,15 +2540,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Keeps the cache bounded by dropping the oldest tiles that are no longer wanted.
-    private func evictTiles(keeping wanted: Set<TileKey>) {
-        guard tileCache.count > tileCacheLimit else { return }
-
-        var remaining = tileCache.count - tileCacheLimit
-        tileOrder.removeAll { key in
-            guard remaining > 0, !wanted.contains(key) else { return false }
-            if tileCache.removeValue(forKey: key) != nil { remaining -= 1 }
-            return true
-        }
+    /// Brings the cache back inside its byte budget (ADR 0007).
+    ///
+    /// Pinned: every tile the current viewport update wants (the visible band *and* the
+    /// prefetch band — see `wantedTiles` for the measurement behind that) plus every raster in
+    /// flight. Everything else is evictable, and the order is LOD-aware LRU
+    /// (`TileCache.evictToFit`): a tile from a LOD the reader has zoomed away from goes first,
+    /// then the least recently used tile the reader has scrolled past.
+    ///
+    /// If the wanted band alone exceeds the budget the cache stays over it: evicting a tile the
+    /// scheduler is about to ask for again trades a bounded number of bytes for an unbounded
+    /// number of re-rasterizations, and the measurement says that trade is a loss.
+    private func evictTiles() {
+        guard tileCache.usedBytes > tileCache.budgetBytes else { return }
+        tileCache.evictToFit(pinned: wantedTiles.union(tilesInFlight), currentLod: rasterLod)
     }
 }
