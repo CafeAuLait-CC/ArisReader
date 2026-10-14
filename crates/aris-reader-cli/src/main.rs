@@ -14,6 +14,7 @@
 //! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
 //! aris-reader-cli analyze <file.pdf> [--pages N]
 //! aris-reader-cli cite <file.pdf> [--body-pages N]
+//! aris-reader-cli figures <file.pdf> [--pages N]
 //! ```
 
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
@@ -31,6 +32,8 @@ Usage:
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
   aris-reader-cli cite <file.pdf>                match body citations against the reference list
+  aris-reader-cli figures <file.pdf>             figure/table captions and the region to preview
+                 [--pages N]
   aris-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   aris-reader-cli render <file.pdf>              render one page to PNG
@@ -78,6 +81,7 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(rest(&args)),
         Some("analyze") => cmd_analyze(rest(&args)),
         Some("cite") => cmd_cite(rest(&args)),
+        Some("figures") => cmd_figures(rest(&args)),
         Some("blocks") => cmd_blocks(rest(&args)),
         Some("region") => cmd_region(rest(&args)),
         Some(other) => {
@@ -1072,6 +1076,83 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         resolved as f64 / attempted as f64 * 100.0
     };
     println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
+    ExitCode::SUCCESS
+}
+
+/// Figure/table index (M4): every caption in the document and the region a floating preview
+/// should show for it.
+///
+/// The point of printing this is that the shell derives the same region through the same crate
+/// function ([`aris_reader_text::caption_region`]), called with the same two inputs — the page's
+/// image objects and its height — so these numbers describe what a click on `Figure 3` will
+/// actually show, not a copy of the rule that drifts from it.
+///
+/// The region is in **page space** here (bottom-left origin), like every other CLI report; the
+/// FFI converts it to view space for the shell.
+fn cmd_figures(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli figures <file.pdf> [--pages N]");
+        return ExitCode::from(64);
+    };
+    // A figure index is wanted for the whole readable body, so the cap is flat; the same 120
+    // pages bound the reference scan in `cite` and in the FFI.
+    let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
+
+    let backend = match PdfiumBackend::open(Path::new(path), None) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let total = backend.page_count();
+    let scan_end = total.min(page_cap);
+    println!("{path}: {total} page(s), scanning {scan_end}");
+
+    let mut found = 0usize;
+    let mut with_image = 0usize;
+    for index in 0..scan_end {
+        let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
+            continue;
+        };
+        // The same three inputs the FFI's `figures()` uses, read the same way.
+        let (images, _rule_count) = backend
+            .page_object_summary(PageIndex(index))
+            .unwrap_or_default();
+        let page_height = backend
+            .page_info(PageIndex(index))
+            .map(|info| info.geometry.crop_box.size.height)
+            .unwrap_or(0.0);
+
+        for caption in aris_reader_text::find_captions(&text) {
+            found += 1;
+            let region = aris_reader_text::caption_region(&caption, &images, page_height);
+            // Asking the same function for the region of a page with no objects gives the
+            // caption-only answer, so the difference is exactly "an image was paired with it".
+            // Whether that happened is the number that says how much of the index is real
+            // artwork rather than a caption box with padding.
+            if region != aris_reader_text::caption_region(&caption, &[], page_height) {
+                with_image += 1;
+            }
+            println!(
+                "  p{:<3} {:<6} {:<4} region ({:>6.1},{:>6.1}) {:>6.1}x{:<6.1}  {}",
+                index + 1,
+                caption.kind,
+                caption.label,
+                region.origin.x,
+                region.origin.y,
+                region.size.width,
+                region.size.height,
+                caption.text.chars().take(50).collect::<String>()
+            );
+        }
+    }
+
+    println!(
+        "  → {found} caption(s), {with_image} with an image object above them (the rest preview the caption box alone)"
+    );
     ExitCode::SUCCESS
 }
 
