@@ -166,8 +166,108 @@ public final class AppState: ObservableObject {
     /// whole wanted band keeps scrolling smooth and still bounds what the budget is for: the
     /// tiles the reader has scrolled *away* from, and the previous LOD's tiles after a zoom.
     private var wantedTiles: Set<TileKey> = []
+    /// The scheduler's wanted set from the last viewport update (visible + prefetch band): the
+    /// tiles the byte cache may not evict.
+    ///
+    /// Public so `ArisReaderChecks` can assert the band's invariants — that every tile the
+    /// viewport can show is wanted at any zoom, and that the band does not reach for columns the
+    /// reader cannot scroll to. Nothing else observes it; drawing goes through `canvasPages`.
+    public var pinnedTiles: Set<TileKey> { wantedTiles }
     /// Tiles whose rasterization is in flight, so scrolling does not queue one twice.
     private var tilesInFlight: Set<TileKey> = []
+
+    // MARK: - Prefetch band
+
+    /// Longest prefetch ring the band may use, in viewport heights (ADR 0007 shipped 3.5
+    /// viewports of *band*, i.e. a 2.5-viewport ring plus the viewport itself).
+    ///
+    /// This is the ceiling, not the value: `prefetchRingVh` shortens the ring whenever the
+    /// band it would produce does not fit `prefetchBandBudgetBytes`. The reason is measured — at
+    /// 400% zoom the fixed band pinned 110 tiles / 99.2 MiB, of which the viewport showed 16
+    /// tiles: the band, not the cache budget, was most of what the peak RSS was made of.
+    static let maxPrefetchRingVh: CGFloat = 2.5
+    /// Ring distance below which the band is not shortened further.
+    ///
+    /// The floor is measured, not chosen: the bench's step scroll (`phase_scroll`) records the
+    /// raster time the viewport spent *waiting* for tiles that were not ready — p95 0.00 ms and
+    /// 9 misses over 120 steps at a 1.0-viewport ring, but p95 8.1 ms and 141 misses (worst
+    /// 120 ms) at 0.5. A ring shorter than a viewport cannot cover one step of the bench's
+    /// scroll (half a viewport) plus raster time, so the reader starts seeing the preview
+    /// instead of the page. 0.75 is the shortest ring that measured no worse than 1.0.
+    static let minPrefetchRingVh: CGFloat = 0.75
+    /// Columns kept ready beyond the ones on screen.
+    ///
+    /// Zero, deliberately. The canvas left-aligns a page that is wider than the viewport and
+    /// there is no horizontal scrolling, so an off-screen column can only be revealed by a
+    /// widening window — and the band's byte budget is spent better on the ring the reader
+    /// actually moves through. A resize rasterizes the new column on demand, behind the
+    /// whole-page preview that is already there for exactly this case.
+    static let prefetchColumnsToTheRight = 0
+    /// Ceiling on the whole-page previews kept ready (they are bounded by the band as well).
+    /// `ARIS_READER_PREVIEW_PAGES=<n>` overrides it for measurement.
+    static let defaultMaxPreviewPages = 4
+    private static let maxPreviewPages = ProcessInfo.processInfo.environment["ARIS_READER_PREVIEW_PAGES"]
+        .flatMap(Int.init).map { min(max($0, 0), 32) } ?? defaultMaxPreviewPages
+
+    /// Byte target for the whole wanted band (visible + ring + the ready columns).
+    ///
+    /// The band is the *pinned* set — `TileCache.evictToFit` never drops it — so a fixed band
+    /// in viewport heights is an unbounded commitment in bytes: the same 3.5 viewports cost
+    /// 27 MiB at 100% zoom and 99 MiB at 400%, and the peak followed (measured on a real
+    /// 115-page paper: 417.7 MiB and 515.1 MiB). A third of the cache budget is the rule, with
+    /// an 8 MiB floor so that a reader who shrinks the cache in Settings still gets a band:
+    /// the pinned third keeps scrolling fed, the rest stays for what the reader scrolled *away*
+    /// from and for the previous LOD — which is what makes scrolling and zooming back cache
+    /// hits — and raising the budget raises both together.
+    ///
+    /// 16 MiB at the default 48 MB budget is the measured operating point; the curve it was
+    /// chosen from is in the pull request (peak RSS against the bench's raster wait at 8, 16,
+    /// 24 and 48 MiB, and against the fixed 3.5-viewport band).
+    public static func prefetchBandBudgetBytes(cacheBudgetBytes: Int) -> Int {
+        max(8 * 1024 * 1024, cacheBudgetBytes / 3)
+    }
+
+    /// `ARIS_READER_PREFETCH_RING_VH=<viewports>`: measurement override that pins the ring to
+    /// exactly that distance instead of deriving it from the byte target (`2.5` reproduces the
+    /// pre-change band). Documented next to the cache-budget override, and used the same way.
+    static func configuredPrefetchRingOverride(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> CGFloat? {
+        guard let raw = environment["ARIS_READER_PREFETCH_RING_VH"], let value = Double(raw) else {
+            return nil
+        }
+        return min(max(CGFloat(value), 0), 4)
+    }
+
+    /// `ARIS_READER_PREFETCH_ALL_COLUMNS=1`: measurement override that restores the pre-change
+    /// "every column of the page is wanted" rule, so the two halves of the band can be
+    /// attributed separately.
+    static func configuredWantAllColumns(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["ARIS_READER_PREFETCH_ALL_COLUMNS"] == "1"
+    }
+
+    /// `ARIS_READER_PREFETCH_BAND_MIB=<N>`: measurement override for the band's byte target, so
+    /// the curve can be swept without also changing the cache budget (which is what makes the
+    /// zoom-back interaction work). `ARIS_READER_PREFETCH_COLUMNS=<N>` overrides the number of
+    /// columns kept ready beyond the visible ones.
+    static func configuredPrefetchColumns(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard let raw = environment["ARIS_READER_PREFETCH_COLUMNS"], let columns = Int(raw) else {
+            return prefetchColumnsToTheRight
+        }
+        return min(max(columns, 0), 16)
+    }
+
+    /// The `ARIS_READER_PREFETCH_*` overrides are read once: they are constants for the
+    /// process, and the band is rebuilt (with `bandSpans` several times inside it) on every
+    /// viewport update, i.e. on the scrolling path.
+    private static let prefetchRingOverride = configuredPrefetchRingOverride()
+    private static let wantAllColumns = configuredWantAllColumns()
+    private static let prefetchColumns = configuredPrefetchColumns()
+    private static let prefetchBandMiB = ProcessInfo.processInfo.environment["ARIS_READER_PREFETCH_BAND_MIB"]
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["ARIS_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
@@ -782,6 +882,39 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     let line = "aris-position: hook scrolled to \(Int(self.scrollYPt)) pt"
                         + " at +\(milliseconds) ms (\(fraction) of the content)\n"
                     FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
+
+            // Development aid: ARIS_READER_ZOOM_SEQUENCE="100,400,100" applies each zoom level
+            // in turn, ARIS_READER_ZOOM_STEP_MS apart (default 1200 ms), so the raster cost of
+            // a zoom-in → zoom-out → zoom-in sequence is measurable headlessly: every step logs
+            // the tile cache's cumulative insertion counter, and the difference between two
+            // steps is how many tiles that leg rasterized. Zoom changes here go through the
+            // same path as the UI's (`zoomPercent` + `reloadVisiblePages`), *without*
+            // `invalidateTiles`, because dropping the cache would answer the question by
+            // construction.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_ZOOM_SEQUENCE"], !raw.isEmpty {
+                let levels = raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                let stepMs = Int(ProcessInfo.processInfo.environment["ARIS_READER_ZOOM_STEP_MS"] ?? "") ?? 1200
+                Task { @MainActor [weak self] in
+                    for (index, level) in levels.enumerated() {
+                        if index > 0 { try? await Task.sleep(for: .milliseconds(stepMs)) }
+                        guard let self, self.document != nil else { return }
+                        self.zoomPercent = min(400, max(25, level))
+                        self.reloadVisiblePages()
+                        // Report the counters once this leg's band has settled: read at the
+                        // instant of the zoom they would bill the *next* leg for this leg's
+                        // rasters (measured: a zoom-out looked like 24 rasters that the
+                        // preceding zoom-in had queued).
+                        for _ in 0..<400 where !(self.pendingTiles.isEmpty && self.tilesInFlight.isEmpty) {
+                            try? await Task.sleep(for: .milliseconds(25))
+                        }
+                        let stats = self.tileCache.stats
+                        let line = "aris-zoom: step \(index) → \(self.zoomPercent)% (lod \(self.rasterLod))"
+                            + " insertions \(stats.insertions) evictions \(stats.evictions)"
+                            + " queue \(self.pendingTiles.count) inFlight \(self.tilesInFlight.count)\n"
+                        FileHandle.standardError.write(Data(line.utf8))
+                    }
                 }
             }
 
@@ -2197,11 +2330,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let scale = CGFloat(1 << Int(lod))
         let tilePt = CGFloat(tileSizePx) / scale
 
-        // Viewport in content points, expanded by the prefetch margin. Every column is
-        // taken: a page is a handful of columns wide, and horizontal scrolling does not
-        // exist yet.
-        let top = scrollYPt - viewportHeight * (scrollDirection < 0 ? 2 : 0.5)
-        let bottom = scrollYPt + viewportHeight * (scrollDirection > 0 ? 3 : 1.5)
+        // What the reader can actually see, in content points. The canvas centres the content
+        // when it is narrower than the viewport, which is the same transform `PDFCanvasView`
+        // applies to every page; when the page is wider there is no horizontal scrolling, so
+        // the visible window is the left one.
+        let viewport = visibleContentRect(viewportHeight: viewportHeight)
+
+        // The band: viewport + ring, where the ring is picked so the band's bytes fit the
+        // band budget (see `prefetchRingVh`).
+        let ringVh = prefetchRingVh(viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
+        let band = bandSpans(ringVh: ringVh, viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
 
         visiblePagePlacements = Array(visible)
 
@@ -2210,29 +2348,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles.removeAll()
 
         pendingTiles = []
-        // Whole-page previews are bounded and prepared ahead of the scroll direction.
-        desiredPreviewPages = visible.sorted {
-            abs($0.topPt - scrollYPt) < abs($1.topPt - scrollYPt)
-        }.prefix(8).map(\.index)
+        // Whole-page previews are the fallback an incomplete page is drawn from, so they only
+        // need to cover the pages the band reaches — that is the set whose tiles can be missing
+        // while the reader is looking at them — and they are prepared ahead of the scroll
+        // direction. Bounding them by the band instead of by a fixed eight pages is worth
+        // 3.7 MiB on a real paper at 100% zoom (9.2 -> 5.5 MiB, band HUD measurement).
+        let bandPages = Set(band.map(\.placement.index))
+        desiredPreviewPages = visible
+            .filter { bandPages.contains($0.index) }
+            .sorted { abs($0.topPt - scrollYPt) < abs($1.topPt - scrollYPt) }
+            .prefix(Self.maxPreviewPages).map(\.index)
         schedulePagePreview()
         var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
+        var bandReport = BandReport()
 
-        for placement in visible {
+        for span in band {
+            let placement = span.placement
             var ready: [CanvasPage] = []
             var complete = true
             let previous = canvasTiles.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == placement.index }
             let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
-            let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
-            let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
-            let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
-            let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
-            guard firstRow <= lastRow else { continue }
-            // The pinned set is the *shown* band, not the prefetch band above: a tile the
-            // reader cannot see may be re-rasterized, a visible one may not be dropped.
+            // The pinned set is the *shown* band plus the ring the byte budget allows: a tile
+            // outside the band may be re-rasterized, a visible one may not be dropped.
 
-            for ty in firstRow...lastRow {
-                for tx in 0..<columns {
+            for ty in span.rows {
+                for tx in span.columns {
                     let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
                     wanted.insert(key)
 
@@ -2243,14 +2384,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         widthPt: min(tilePt, placement.widthPt - CGFloat(tx) * tilePt),
                         heightPt: min(tilePt, placement.heightPt - CGFloat(ty) * tilePt)
                     )
+                    let classOf = BandClass(
+                        rect: CGRect(x: tilePlacement.leftPt, y: tilePlacement.topPt,
+                                     width: tilePlacement.widthPt, height: tilePlacement.heightPt),
+                        viewport: viewport
+                    )
 
                     if let cached = tileCache.image(for: key) {
                         ready.append(CanvasPage(placement: tilePlacement, image: cached))
+                        bandReport.record(classOf, bytes: cached.bgra.count)
                     } else {
                         tileCache.recordMiss()
+                        bandReport.record(classOf, bytes: 0)
                         if tilePlacement.topPt < scrollYPt + viewportHeight,
                            tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
                             complete = false
+                            if classOf == .visible { bandReport.visibleMisses += 1 }
                         }
                         scheduleTile(key, placement: tilePlacement)
                     }
@@ -2289,7 +2438,177 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         evictTiles()
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
-        reportTileCacheStats(wanted: wanted.count, scheduled: pendingTiles.count)
+        reportTileCacheStats(
+            wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
+            ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
+        )
+    }
+
+    /// Where one wanted tile sits relative to what the viewport shows. The band HUD reports
+    /// tiles and bytes per class, because "the prefetch band" is three different costs: what is
+    /// on screen (which may not be dropped), the rows above and below (the ring), and the
+    /// columns a page wider than the viewport adds (which nothing can scroll to).
+    enum BandClass {
+        case visible
+        case ring
+        case offscreenColumn
+
+        init(rect: CGRect, viewport: CGRect) {
+            if rect.intersects(viewport) {
+                self = .visible
+            } else if rect.maxY > viewport.minY && rect.minY < viewport.maxY {
+                self = .offscreenColumn
+            } else {
+                self = .ring
+            }
+        }
+    }
+
+    /// Running totals for one viewport update (`ARIS_READER_RENDER_STATS=1`).
+    struct BandReport {
+        var tileCounts: [Int] = [0, 0, 0]
+        var byteCounts: [Int] = [0, 0, 0]
+        /// Visible tiles that were *not* cached: raster work the reader is waiting for. It is
+        /// the number the band exists to keep at zero, and the one a shorter band can push up.
+        var visibleMisses = 0
+
+        private func index(_ kind: BandClass) -> Int {
+            switch kind {
+            case .visible: return 0
+            case .ring: return 1
+            case .offscreenColumn: return 2
+            }
+        }
+
+        mutating func record(_ kind: BandClass, bytes: Int) {
+            tileCounts[index(kind)] += 1
+            byteCounts[index(kind)] += bytes
+        }
+
+        func tiles(_ kind: BandClass) -> Int { tileCounts[index(kind)] }
+        func bytes(_ kind: BandClass) -> Int { byteCounts[index(kind)] }
+    }
+
+    /// The part of the content the viewport shows, in content points. The canvas centres the
+    /// content when it is narrower than the viewport (`PDFCanvasView.renderFrame`), which is
+    /// the same transform; when a page is wider there is no horizontal scrolling, so the
+    /// visible window is its left edge.
+    private func visibleContentRect(viewportHeight: CGFloat) -> CGRect {
+        let zoom = max(zoomFactor, 0.01)
+        let centreOffsetPt = max(0, (viewportSizePt.width - contentWidthPt * zoomFactor) / 2)
+        return CGRect(
+            x: -centreOffsetPt / zoom,
+            y: scrollYPt,
+            width: max(1, viewportSizePt.width) / zoom,
+            height: viewportHeight
+        )
+    }
+
+    /// The ring above and below the viewport, in viewport heights.
+    ///
+    /// Both numbers are distances from the viewport's *top* edge (`scrollYPt`), which is how
+    /// ADR 0007 wrote them: the viewport itself is the interval [0, 1], so a ring of `R`
+    /// viewports is `above + below = 1 + R` and never less than 1 — the band must contain the
+    /// viewport whatever the budget says, or the reader stares at tiles the scheduler decided
+    /// not to want.
+    ///
+    /// The ring is asymmetric on purpose — most of it points the way the reader is scrolling —
+    /// and the shape ADR 0007 shipped (0.5 above / 2.0 below the viewport going down, 2.0/0.5
+    /// going up) is kept as the *ratio* for every shorter ring, so shortening the band never
+    /// changes which side it favours, only how far it reaches.
+    private func ringSplit(_ ringVh: CGFloat) -> (above: CGFloat, below: CGFloat) {
+        if scrollDirection < 0 {
+            return (ringVh * 2.0 / Self.maxPrefetchRingVh, 1 + ringVh * 0.5 / Self.maxPrefetchRingVh)
+        }
+        return (ringVh * 0.5 / Self.maxPrefetchRingVh, 1 + ringVh * 2.0 / Self.maxPrefetchRingVh)
+    }
+
+    /// Rungs the ring is chosen from, longest first, ending at the floor. The ladder is coarse
+    /// on purpose: each rung is a whole row of tiles at ordinary geometries, so a finer ladder
+    /// would buy bytes the band HUD cannot even show.
+    static let prefetchRingLadder: [CGFloat] = [2.5, 2.0, 1.5, 1.25, 1.0, minPrefetchRingVh]
+
+    /// Picks the ring distance: the longest rung whose band fits `prefetchBandBudgetBytes`.
+    ///
+    /// The estimate is the band this update is about to build, tile for tile — cached tiles at
+    /// their real (often cropped) size, the rest at a full tile — so the choice and the
+    /// scheduling loop cannot drift apart.
+    private func prefetchRingVh(
+        viewportHeight: CGFloat,
+        tilePt: CGFloat,
+        pages: [PagePlacement]
+    ) -> CGFloat {
+        if let override = Self.prefetchRingOverride {
+            return min(override, Self.maxPrefetchRingVh)
+        }
+        let budget = Self.prefetchBandMiB.flatMap(Int.init)
+            .map { min(max($0, 1), 512) * 1024 * 1024 }
+            ?? Self.prefetchBandBudgetBytes(cacheBudgetBytes: tileCache.budgetBytes)
+        let lod = rasterLod
+        let fullTileBytes = tileSizePx * tileSizePx * 4
+        for rung in Self.prefetchRingLadder {
+            let bytes = bandSpans(ringVh: rung, viewportHeight: viewportHeight, tilePt: tilePt, pages: pages)
+                .reduce(0) { bandBytes, span in
+                    bandBytes + span.rows.reduce(0) { rowBytes, ty in
+                        rowBytes + span.columns.reduce(0) { columnBytes, tx in
+                            columnBytes + (tileCache.bytes(for: TileKey(page: span.placement.index, lod: lod, x: tx, y: ty))
+                                ?? fullTileBytes)
+                        }
+                    }
+                }
+            if bytes <= budget { return rung }
+        }
+        return Self.prefetchRingLadder.last ?? Self.minPrefetchRingVh
+    }
+
+    /// The tile rows and columns the band covers, per visible page.
+    private struct BandSpan {
+        let placement: PagePlacement
+        let columns: ClosedRange<Int>
+        let rows: ClosedRange<Int>
+    }
+
+    /// The rows and columns of every visible page that the band covers.
+    ///
+    /// Rows come from the ring; columns come from what the viewport can reveal. ADR 0007 wanted
+    /// *every* column, on the grounds that "a page is a handful of columns wide" — true at 100%
+    /// zoom (3 columns, all on screen), false at 400% (10 columns, 3 on screen), where the
+    /// unreachable ones were 24 of the 110 tiles (22.2 of 99.2 MiB). There is no horizontal
+    /// scrolling, so the columns off to the right can only be revealed by a widening window,
+    /// which rasterizes them on demand behind the whole-page preview that is already there for
+    /// an incomplete page — that trade is measured, not assumed: see `minPrefetchRingVh`.
+    private func bandSpans(
+        ringVh: CGFloat,
+        viewportHeight: CGFloat,
+        tilePt: CGFloat,
+        pages: [PagePlacement]
+    ) -> [BandSpan] {
+        let (above, below) = ringSplit(ringVh)
+        let top = scrollYPt - viewportHeight * above
+        let bottom = scrollYPt + viewportHeight * below
+        let viewport = visibleContentRect(viewportHeight: viewportHeight)
+        let allColumns = Self.wantAllColumns
+
+        return pages.compactMap { placement in
+            let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
+            let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
+            let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
+            guard firstRow <= lastRow else { return nil }
+
+            let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
+            var firstColumn = 0
+            var lastColumn = columns - 1
+            if !allColumns {
+                firstColumn = max(0, min(columns - 1, Int(floor((viewport.minX - placement.leftPt) / tilePt))))
+                lastColumn = min(columns - 1, max(firstColumn, Int(floor((viewport.maxX - placement.leftPt) / tilePt))
+                    + Self.prefetchColumns))
+            }
+            return BandSpan(
+                placement: placement,
+                columns: firstColumn...lastColumn,
+                rows: firstRow...lastRow
+            )
+        }
     }
 
     /// `ARIS_READER_RENDER_STATS=1`: the shell's half of the HUD documented in docs/09 §9 —
@@ -2297,7 +2616,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// viewport update. Off by default and silent unless asked for; it changes no scheduling
     /// decision, it only counts and reports. The byte counters are what proves the ADR 0007
     /// budget actually bounds the cache.
-    private func reportTileCacheStats(wanted: Int, scheduled: Int) {
+    private func reportTileCacheStats(
+        wanted: Int,
+        scheduled: Int,
+        band: BandReport,
+        ringVh: CGFloat,
+        lod: UInt8,
+        tilePt: CGFloat,
+        pages: Int
+    ) {
         guard Self.renderStatsEnabled else { return }
         let stats = tileCache.stats
         let mib = 1024.0 * 1024.0
@@ -2310,6 +2637,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             stats.insertions, stats.evictions, Double(stats.evictedBytes) / mib
         )
         FileHandle.standardError.write(Data(line.utf8))
+
+        // What the peak is actually made of: the band split by what the reader can see, what
+        // the cache holds *besides* the band (scroll-back history and the previous LOD), and
+        // the other rasters the shell keeps (page previews, sidebar thumbnails, text layers).
+        var staleTiles = 0
+        var staleBytes = 0
+        for key in tileCache.keys() where !wantedTiles.contains(key) {
+            staleTiles += 1
+            staleBytes += tileCache.bytes(for: key) ?? 0
+        }
+        let previewBytes = pagePreviews.values.reduce(0) { $0 + $1.bgra.count }
+        let thumbnailBytes = thumbnails.values.reduce(0) { $0 + $1.bgra.count }
+        let textBytes = textPages.values.reduce(0) { $0 + $1.chars.count * MemoryLayout<TextChar>.size }
+        let bandLine = String(
+            format: "aris-band: visible %d tiles (%.1f MiB) · ring %d (%.1f MiB) · offscreenCols %d (%.1f MiB) · stale %d (%.1f MiB) · previews %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · ringVh %.2f · visibleMiss %d · lod %d · tilePt %.0f · bandPages %d\n",
+            band.tiles(.visible), Double(band.bytes(.visible)) / mib,
+            band.tiles(.ring), Double(band.bytes(.ring)) / mib,
+            band.tiles(.offscreenColumn), Double(band.bytes(.offscreenColumn)) / mib,
+            staleTiles, Double(staleBytes) / mib,
+            Double(previewBytes) / mib, Double(thumbnailBytes) / mib, Double(textBytes) / mib,
+            ringVh, band.visibleMisses, Int(lod), tilePt, pages
+        )
+        FileHandle.standardError.write(Data(bandLine.utf8))
     }
 
     /// Updates overlays without reloading tiles or scheduling document analysis during a drag.

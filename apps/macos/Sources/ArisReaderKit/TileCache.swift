@@ -91,6 +91,21 @@ public struct TileCache {
         entries[key] != nil
     }
 
+    /// The exact bytes one cached tile occupies, or `nil` when it is not cached.
+    ///
+    /// The band HUD (`ARIS_READER_RENDER_STATS=1`) uses this to split the pinned set into the
+    /// part the reader can see and the part that is prefetch — by *bytes*, not by count: an
+    /// edge tile is a fraction of a full one, and the decision the HUD informs is about bytes.
+    public func bytes(for key: TileKey) -> Int? {
+        entries[key].map { Self.byteCount(of: $0.image) }
+    }
+
+    /// Every key the cache holds, so a caller can account for what it did *not* want this
+    /// viewport update (stale tiles) without the cache having to know the wanted set.
+    public func keys() -> [TileKey] {
+        Array(entries.keys)
+    }
+
     /// Looks a tile up and marks it as most recently used; a hit is counted.
     public mutating func image(for key: TileKey) -> PageImage? {
         guard var entry = entries[key] else { return nil }
