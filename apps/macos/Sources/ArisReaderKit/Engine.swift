@@ -136,6 +136,47 @@ public struct Reference: Sendable {
     public let heightPt: CGFloat
 }
 
+/// One figure or table caption, with the region of its page to preview.
+///
+/// The region is the caption box unioned with the artwork above it, or the caption box alone
+/// when the figure is vector art — already the rectangle a click on `Figure 3` should show,
+/// so the shell never derives it.
+public struct Figure: Sendable {
+    /// `Figure` or `Table`.
+    public let kind: String
+    /// The number as printed: `"3"`, `"12"`.
+    public let label: String
+    /// Page the caption lives on (0-based); the region is on that same page.
+    public let page: Int
+    /// Caption text after the label, shown in the preview panel.
+    public let captionText: String
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+
+    /// `"Figure 3"` — how the caption is named in the text and in the panel's title bar.
+    public var title: String { "\(kind) \(label)" }
+}
+
+/// A `Figure 3` / `Table 2` reference in a page's body text, boxed in view space.
+public struct CaptionMention: Sendable {
+    public let page: Int
+    public let kind: String
+    public let label: String
+    /// First character of the mention inside its page's text layer.
+    public let start: Int
+    /// One past the last character of the mention.
+    public let end: Int
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+
+    /// `"Figure 3"` — the key into `figures()`.
+    public var title: String { "\(kind) \(label)" }
+}
+
 /// One outline entry, already flattened (nesting travels as `depth`).
 public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
@@ -231,6 +272,11 @@ public protocol PDFEngine: AnyObject {
     func links(_ page: Int) async throws -> [DocumentLink]
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
+    /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
+    func captionMentions(page: Int) async throws -> [CaptionMention]
+    /// Every figure and table caption in the document, each carrying the region to preview
+    /// (empty when none can be found). Document-wide, so implementations cache it.
+    func figures() async throws -> [Figure]
     /// The document's reference list (empty when none can be parsed).
     func references() async throws -> [Reference]
     /// Resolves a citation's labels to **every** reference entry they name, in label order
@@ -270,6 +316,10 @@ public final class RustEngine: PDFEngine {
     /// Serialises PDFium: the library is not thread-safe, so rasterizations run one at a
     /// time on a dedicated queue and never on the main thread.
     private let rasterQueue = DispatchQueue(label: "com.arisreader.raster", qos: .userInitiated)
+    /// The document's caption index. `figures()` walks up to 120 pages, so it is fetched
+    /// once per open document (the caption set cannot change while the file is open) and
+    /// dropped by `openDocument` — the same lifetime the Rust side gives its own cache.
+    private var figuresCache: [Figure]?
 
     public init() throws {
         self.engine = try ArisEngine()
@@ -282,6 +332,9 @@ public final class RustEngine: PDFEngine {
     public func openDocument(at url: URL) throws -> LoadedDocument {
         let opened = try engine.openDocument(path: url.path, password: nil)
         document = opened
+        // A new document means a new caption index; keeping the old one would resolve a
+        // `Figure 3` click to the previous paper's artwork.
+        figuresCache = nil
 
         let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
 
@@ -538,6 +591,66 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func captionMentions(page: Int) async throws -> [CaptionMention] {
+        guard let document else { return [] }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let found = try document.captionMentions(page: UInt32(page))
+                    continuation.resume(
+                        returning: found.map { mention in
+                            CaptionMention(
+                                page: page,
+                                kind: mention.kind,
+                                label: mention.label,
+                                start: Int(mention.start),
+                                end: Int(mention.end),
+                                xPt: CGFloat(mention.xPt),
+                                yPt: CGFloat(mention.yPt),
+                                widthPt: CGFloat(mention.widthPt),
+                                heightPt: CGFloat(mention.heightPt)
+                            )
+                        }
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func figures() async throws -> [Figure] {
+        // The index is document-wide and the Rust call walks up to 120 pages, so a second
+        // click must not pay for the scan again.
+        if let figuresCache { return figuresCache }
+        guard let document else { return [] }
+
+        let records: [FigureRecord] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.figures())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        let figures = records.map { record in
+            Figure(
+                kind: record.kind,
+                label: record.label,
+                page: Int(record.page),
+                captionText: record.captionText,
+                xPt: CGFloat(record.xPt),
+                yPt: CGFloat(record.yPt),
+                widthPt: CGFloat(record.widthPt),
+                heightPt: CGFloat(record.heightPt)
+            )
+        }
+        figuresCache = figures
+        return figures
+    }
+
     public func references() async throws -> [Reference] {
         guard let document else { return [] }
 
@@ -750,6 +863,10 @@ public final class MockEngine: PDFEngine {
     public func links(_ page: Int) async throws -> [DocumentLink] { [] }
 
     public func citations(_ page: Int) async throws -> [Citation] { [] }
+
+    public func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
+
+    public func figures() async throws -> [Figure] { [] }
 
     public func references() async throws -> [Reference] { [] }
 
