@@ -27,7 +27,7 @@ pub use document::{
     PageIndex, PageInfo,
 };
 pub use error::{ArisError, ErrorCode, Result, Severity};
-pub use geometry::{PageGeometry, Point, Rect, Rotation, Size, Transform2D};
+pub use geometry::{LineSegment, PageGeometry, Point, Rect, Rotation, Size, Transform2D};
 
 /// Engine semantic version (tied to the interface stability of [`crate::backend`]).
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -4,9 +4,9 @@
 //! order. Everything in this module is compiled only with `feature = "pdfium"`.
 
 use aris_reader_core::{
-    ArisError, DocumentBackend, ErrorCode, LinkInfo, OutlineNode, PageGeometry, PageIndex,
-    PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawCharBox, RawTextPage, Rect,
-    Result, Rotation, Size,
+    ArisError, DocumentBackend, ErrorCode, LineSegment, LinkInfo, OutlineNode, PageGeometry,
+    PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawCharBox, RawTextPage,
+    Rect, Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -307,6 +307,43 @@ impl PdfiumBackend {
         collect_rules(pdf_page.objects().iter(), &mut horizontal, &mut vertical, 0);
 
         Ok((horizontal, vertical))
+    }
+
+    /// The axis-aligned line segments of a page's vector geometry, in page space.
+    ///
+    /// This is the raw material a table region is built from. A table border *is* a line, and the
+    /// only way to see one is per segment: a path object's bounds are the whole drawing, and
+    /// `page_rules` already showed that counting objects says nothing about grids.
+    ///
+    /// Accessors used, and why each one matters (`pdfium-render` 0.9.4):
+    ///
+    /// * `PdfPagePathObject::segments()` — there is no start-point accessor, only
+    ///   `PdfPathSegment::point()`, which is a segment's **end** point. A line is therefore the
+    ///   step from the previous point to this one.
+    /// * `PdfPathSegment::segment_type()` — `MoveTo` *starts* a subpath, so it is a point to
+    ///   remember and not a segment to emit. Walking endpoints without this check invents a
+    ///   segment from the end of one subpath to the start of the next; where those happen to be
+    ///   collinear, that phantom is a long thin rule, which is precisely the shape a table
+    ///   detector looks for.
+    /// * `PdfPathSegmentType::BezierTo` — a curve is artwork. Its chord can be long and
+    ///   axis-aligned (a wide arc's ends share a y), so it is dropped rather than measured.
+    /// * `PdfPagePathObject::matrix()` — `segments()` documents its points as the *untransformed*
+    ///   values supplied when the segment was created, so the object's matrix is applied to land
+    ///   in page space.
+    ///
+    /// Forms are descended into, like [`PdfiumBackend::page_object_summary`]. A path inside a
+    /// form reports coordinates in the form's space; the form's own matrix is not composed here,
+    /// which is a known limit (measured on the sample corpus: tables are drawn in the page
+    /// content stream, so this does not bite — see the module notes on `table_region`).
+    pub fn page_line_segments(&self, page: PageIndex) -> Result<Vec<LineSegment>> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pdf_page = self.page(page)?;
+
+        let mut segments = Vec::new();
+        collect_line_segments(pdf_page.objects().iter(), &mut segments, 0);
+        Ok(segments)
     }
 
     /// Number of link annotations the PDF actually contains, resolved or not.
@@ -877,6 +914,89 @@ fn tile_from_bitmap(bitmap: &PdfBitmap) -> RasterTile {
         format: RasterFormat::Bgra8Premultiplied,
     }
 }
+
+/// Walks page objects and reports every axis-aligned line segment, in page space.
+///
+/// See [`PdfiumBackend::page_line_segments`] for why `MoveTo` points are remembered rather than
+/// emitted, why curves are dropped, and why the object matrix is applied.
+fn collect_line_segments<'a>(
+    objects: impl Iterator<Item = PdfPageObject<'a>>,
+    segments: &mut Vec<LineSegment>,
+    depth: u32,
+) {
+    if depth > 4 {
+        return;
+    }
+
+    for object in objects {
+        if object.object_type() == PdfPageObjectType::XObjectForm {
+            let PdfPageObject::XObjectForm(form) = &object else {
+                continue;
+            };
+            collect_line_segments(form.iter(), segments, depth + 1);
+            continue;
+        }
+
+        if object.object_type() != PdfPageObjectType::Path {
+            continue;
+        }
+        let PdfPageObject::Path(path) = &object else {
+            continue;
+        };
+
+        // The object's own placement. Without it a path that was created and then transformed
+        // reports the coordinates it was built with, not where it is on the page.
+        let matrix = path.matrix().ok();
+        let segments_iter = match matrix {
+            Some(matrix) => path.segments().transform(matrix),
+            None => path.segments().raw(),
+        };
+
+        // `previous` is a subpath position, kept across `MoveTo` so the step from it to the next
+        // `LineTo` is a real segment; a `MoveTo` itself is a new subpath and emits nothing.
+        let mut previous: Option<(f64, f64)> = None;
+        for segment in segments_iter.iter() {
+            if segment.segment_type() == PdfPathSegmentType::MoveTo {
+                let point = segment.point();
+                previous = Some((f64::from(point.0.value), f64::from(point.1.value)));
+                continue;
+            }
+
+            let current = segment.point();
+            let here = (f64::from(current.0.value), f64::from(current.1.value));
+
+            let Some((x1, y1)) = previous.replace(here) else {
+                continue;
+            };
+            if segment.segment_type() == PdfPathSegmentType::BezierTo {
+                continue;
+            }
+
+            let (x2, y2) = here;
+            let line = LineSegment::new(Point::new(x1, y1), Point::new(x2, y2));
+            if line.length() < MIN_SEGMENT_LENGTH_PT {
+                continue;
+            }
+            if line.is_horizontal(SEGMENT_AXIS_TOLERANCE_PT)
+                || line.is_vertical(SEGMENT_AXIS_TOLERANCE_PT)
+            {
+                segments.push(line);
+            }
+        }
+    }
+}
+
+/// Shortest segment worth reporting from [`collect_line_segments`] (points).
+///
+/// Two points is the floor at which a "line" is still a line; anything shorter is a degenerate
+/// path or a rounding artifact, and the grid detector discards it again by length anyway.
+const MIN_SEGMENT_LENGTH_PT: f64 = 2.0;
+
+/// How far off an axis a segment may lie and still be a candidate rule (points).
+///
+/// Table borders are exactly axis-aligned; this exists for the hair of floating-point error and
+/// for a page whose content stream rotates a table by a fraction of a degree.
+const SEGMENT_AXIS_TOLERANCE_PT: f64 = 1.0;
 
 /// Collects long thin objects as rules (the geometry tables and bordered boxes leave behind).
 fn collect_rules<'a>(

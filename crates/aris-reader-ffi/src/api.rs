@@ -683,10 +683,11 @@ impl ArisDocument {
     /// the whole readable body, so the scan is a flat cap of the first 120 pages (the cap that
     /// `references` and the CLI already use for a 2000-page manual).
     ///
-    /// The box is the region `aris_reader_text::caption_region` derives — the caption plus its
-    /// nearby image object for raster figures, or the full page when the artwork cannot be bounded
-    /// reliably (vector figures, tables, and algorithms) — converted to **view space**, so it can
-    /// be handed straight to [`ArisDocument::rasterize_region`].
+    /// The box is the region `aris_reader_text::caption_region_from` derives, converted to **view
+    /// space** so it can be handed straight to [`ArisDocument::rasterize_region`]: the caption
+    /// plus the table grid for a `Table` whose borders are drawn, the caption plus its nearby
+    /// image object for a raster figure, and the full page when neither can be bounded reliably
+    /// (vector figures, `booktabs` tables with too few rules, algorithms).
     pub fn figures(&self) -> Result<Vec<FigureRecord>, ArisFfiError> {
         if let Ok(cache) = self.figures.lock()
             && let Some(cached) = cache.as_ref()
@@ -710,12 +711,25 @@ impl ArisDocument {
                 .backend
                 .page_object_summary(PageIndex(index))
                 .unwrap_or_default();
+            // A table has no object of its own; its grid is in the page's vector geometry, and
+            // the text inside the cells is what confirms it. Both are best-effort for the same
+            // reason the images are.
+            let rules = self
+                .backend
+                .page_line_segments(PageIndex(index))
+                .unwrap_or_default();
+            let lines = aris_reader_text::lines_from(&text);
+            let evidence = aris_reader_text::PageEvidence {
+                images: &images,
+                rules: &rules,
+                lines: &lines,
+            };
             // Regions are derived in page space and clamped to the full visible CropBox; its
             // origin can be non-zero. Transforming all four corners below also handles /Rotate.
             let page_bounds = info.geometry.crop_box;
 
             for caption in aris_reader_text::find_captions(&text) {
-                let region = aris_reader_text::caption_region(&caption, &images, page_bounds);
+                let region = aris_reader_text::caption_region_from(&caption, evidence, page_bounds);
                 let view = page_region_to_view(region, info.geometry);
                 records.push(FigureRecord {
                     kind: caption.kind,
