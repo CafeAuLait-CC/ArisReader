@@ -25,7 +25,7 @@ done
 echo "==> cargo build -p aris-reader-ffi $CARGO_FLAG"
 cargo build -p aris-reader-ffi $CARGO_FLAG
 
-LIB_DIR="$ROOT/target/$PROFILE"
+LIB_DIR="${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-$ROOT/target}}/$PROFILE"
 DST_DIR="$ROOT/apps/macos/.rust/lib"
 mkdir -p "$DST_DIR"
 
