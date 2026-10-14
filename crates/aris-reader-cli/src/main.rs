@@ -33,7 +33,7 @@ Usage:
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
   aris-reader-cli cite <file.pdf>                match body citations against the reference list
-  aris-reader-cli figures <file.pdf>             figure/table captions and the region to preview
+  aris-reader-cli figures <file.pdf>...          figure/table captions and the region to preview
                  [--pages N]                    (grid / image / page per caption)
   aris-reader-cli tables <file.pdf>...           table previews: grid-derived or full-page fallback
                  [--pages N] [--all]
@@ -1095,19 +1095,43 @@ fn cmd_cite(args: &[String]) -> ExitCode {
 /// FFI converts it to view space for the shell.
 fn cmd_figures(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
-    let Some(path) = positional.first() else {
-        eprintln!("usage: aris-reader-cli figures <file.pdf> [--pages N]");
+    if positional.is_empty() {
+        eprintln!("usage: aris-reader-cli figures <file.pdf>... [--pages N]");
         return ExitCode::from(64);
-    };
+    }
     // A figure index is wanted for the whole readable body, so the cap is flat; the same 120
     // pages bound the reference scan in `cite` and in the FFI.
     let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
 
+    let mut found = 0usize;
+    let mut with_image = 0usize;
+    let mut with_grid = 0usize;
+    for path in &positional {
+        match figures_of_file(path, page_cap) {
+            Ok((captions, images, grids)) => {
+                found += captions;
+                with_image += images;
+                with_grid += grids;
+            }
+            Err(code) => return code,
+        }
+    }
+
+    println!(
+        "  → {found} caption(s): {with_grid} table(s) from a grid, {with_image} figure(s) from a \
+         raster object, the rest preview the full page"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Prints one line per caption of one file, and returns
+/// `(captions, figures paired with a raster object, tables bounded by a grid)`.
+fn figures_of_file(path: &str, page_cap: u32) -> Result<(usize, usize, usize), ExitCode> {
     let backend = match PdfiumBackend::open(Path::new(path), None) {
         Ok(backend) => backend,
         Err(error) => {
             eprintln!("cannot open {path}: {error}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
 
@@ -1178,11 +1202,7 @@ fn cmd_figures(args: &[String]) -> ExitCode {
         }
     }
 
-    println!(
-        "  → {found} caption(s): {with_grid} table(s) from a grid, {with_image} figure(s) from a \
-         raster object, the rest preview the full page"
-    );
-    ExitCode::SUCCESS
+    Ok((found, with_image, with_grid))
 }
 
 /// Dumps the geometric segmentation of one page: lines, then blocks.
