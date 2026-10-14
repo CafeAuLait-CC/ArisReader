@@ -89,7 +89,6 @@ public struct SidebarView: View {
         if let image = state.thumbnails[page], let rendered = Self.image(from: image) {
             rendered
                 .resizable()
-                .interpolation(.high)
                 .aspectRatio(contentMode: .fit)
                 .frame(width: state.thumbnailWidthPt)
                 .background(Color.white)
