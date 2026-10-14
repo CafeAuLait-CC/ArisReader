@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out the merge result
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # rust-toolchain.toml already pins `channel = "stable"`; this makes the rustfmt and
       # clippy components explicit instead of relying on rustup's auto-install.
@@ -92,7 +92,7 @@ jobs:
       ARIS_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
     steps:
       - name: Check out the merge result
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
