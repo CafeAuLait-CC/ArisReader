@@ -1183,6 +1183,15 @@ mod tests {
 
     #[test]
     fn probing_a_missing_file_is_a_document_error() {
+        // Without a PDFium library the engine fails before it can look at the path, so it
+        // answers `BackendUnavailable` and the mapping pinned down here is unreachable. Same
+        // guard as the other engine-backed tests below: the Linux CI job has no PDFium, and
+        // scripts/fetch-pdfium.sh only downloads the macOS build.
+        if !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+
         let engine = ArisEngine::new();
         let result = engine.probe_document("/nonexistent/aris-reader.pdf".to_string(), None);
         match result {
