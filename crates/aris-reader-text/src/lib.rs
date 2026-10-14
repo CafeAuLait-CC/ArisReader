@@ -896,6 +896,37 @@ pub fn resolve_reference<'a>(
     None
 }
 
+/// Resolves **every** label of a citation against the reference list.
+///
+/// A citation often names several works at once — `[1,2]` or `(He et al. 2024; Kim 2023)` — and
+/// the reader expects all of them, not whichever label the list happens to match first. Each
+/// label is resolved on its own, so an unknown label never hides the labels next to it, and the
+/// results keep label order. Entries are de-duplicated by `(label, page)`, so a citation that
+/// repeats itself (`[3,3]`) or whose labels point at one work (a numeric label that falls back
+/// to the same position as an author-year label) lists that work once.
+pub fn resolve_references<'a>(
+    labels: &[String],
+    references: &'a [ReferenceEntry],
+) -> Vec<&'a ReferenceEntry> {
+    let mut resolved: Vec<&ReferenceEntry> = Vec::new();
+
+    for label in labels {
+        // One label at a time: the single-label helper owns the matching conventions, and
+        // handing it the whole group would let the first match hide the rest.
+        let Some(entry) = resolve_reference(std::slice::from_ref(label), references) else {
+            continue;
+        };
+        let already_listed = resolved
+            .iter()
+            .any(|listed| listed.label == entry.label && listed.page == entry.page);
+        if !already_listed {
+            resolved.push(entry);
+        }
+    }
+
+    resolved
+}
+
 /// Finds the reference list across a document's pages.
 ///
 /// `pages` must be `(page index, raw text)` in reading order and may cover only part of the
@@ -1242,15 +1273,12 @@ pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
             if close < chars.len()
                 && chars[close] == ')'
                 && letters >= 3
-                && let Some(year) = first_year(&inner)
+                && first_year(&inner).is_some()
             {
-                // Author-year lists have no numbers, so the matching key is
-                // "first surname + year" -- the same key `parse_author_year_references`
-                // builds for the entries themselves.
-                let mut labels = Vec::new();
-                if let Some(surname) = citation_surname(&inner) {
-                    labels.push(format!("{surname} {year}"));
-                }
+                // Author-year lists have no numbers, so the matching key is "first surname
+                // + year" -- the same key `parse_author_year_references` builds for the
+                // entries themselves. A group carries one key per work it names.
+                let labels = citation_labels(&inner);
                 if labels.is_empty() {
                     index = close + 1;
                     continue;
@@ -1312,6 +1340,26 @@ pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
     }
 
     found
+}
+
+/// Every work a parenthesised citation names, as `surname year` keys.
+///
+/// Author-year groups list several works at once — `(He et al. 2024; Kim 2023)`,
+/// `(Smith, 2020; Jones and Lee, 2021)` — and each `;`-separated part is a work of its own.
+/// A part with no name-like word (a bare year, or a month like `(July 2017)`) contributes
+/// nothing; when no part does, the caller records no citation at all.
+fn citation_labels(inner: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for part in inner.split(';') {
+        let (Some(year), Some(surname)) = (first_year(part), citation_surname(part)) else {
+            continue;
+        };
+        let label = format!("{surname} {year}");
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
 }
 
 fn citation_surname(text: &str) -> Option<String> {

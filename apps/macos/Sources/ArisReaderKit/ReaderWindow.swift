@@ -145,6 +145,29 @@ public struct ReaderWindow: View {
                 .frame(width: 300, height: 380)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .background(Color.white)
+
+                // A grouped citation names several works: the image above shows the first,
+                // and this list gives every one of them a label and the beginning of its text.
+                if !preview.entries.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(preview.entries.indices, id: \.self) { index in
+                                let entry = preview.entries[index]
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(entry.label)
+                                        .font(.caption2)
+                                        .bold()
+                                    Text(entry.text)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: 300, maxHeight: 132)
+                }
             }
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))

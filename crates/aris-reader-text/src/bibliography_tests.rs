@@ -134,6 +134,85 @@ fn year_suffixes_resolve_to_distinct_works_and_ambiguity_abstains() {
     assert!(resolve_reference(&["Tan 2024".into()], &duplicated).is_none());
 }
 
+/// Labels of a resolved slice, in the order they came back.
+fn resolved_labels<'a>(resolved: &[&'a ReferenceEntry]) -> Vec<&'a str> {
+    resolved.iter().map(|entry| entry.label.as_str()).collect()
+}
+
+#[test]
+fn a_grouped_numeric_citation_resolves_every_label_in_order() {
+    let entries = references("References\n[1] One 2020.\n[2] Two 2021.\n[3] Three 2022.\n");
+    // The detector hands over the whole group, and the citation reads `[3,1]`, so the
+    // preview must follow the reader's order, not the list's.
+    let citations = find_citations(&test_page("See [3,1] for details."));
+    assert_eq!(citations[0].labels, ["3", "1"]);
+
+    let resolved = resolve_references(&citations[0].labels, &entries);
+    assert_eq!(resolved_labels(&resolved), ["3", "1"]);
+    assert!(resolved[0].text.contains("Three"));
+    assert!(resolved[1].text.contains("One"));
+}
+
+#[test]
+fn every_label_of_an_unnumbered_list_resolves_by_position() {
+    // ACM-style lists carry no numbers while the body cites them, so `[1,2]` must take the
+    // first two entries -- each label separately, not just the first one.
+    let entries = references(
+        "References\nBai, X. 2016. Artist-directed dynamics.\nBarzel, R. 1988. A modeling system.\n",
+    );
+    assert_eq!(entries.len(), 2, "{entries:?}");
+
+    let resolved = resolve_references(&["1".into(), "2".into()], &entries);
+    assert_eq!(resolved_labels(&resolved), ["Bai 2016", "Barzel 1988"]);
+}
+
+#[test]
+fn a_grouped_author_year_citation_resolves_every_label() {
+    let entries =
+        references("References\nHe, T.; Guo, J. 2024. GAIA.\nMa, Y.; Wang, S. 2023a. TalkCLIP.\n");
+    // The detector keys each `;`-separated part of the group separately, and the resolver
+    // follows the order the group was written in.
+    let citations = find_citations(&test_page("(He et al. 2024; Ma et al. 2023a)"));
+    assert_eq!(citations[0].labels, ["He 2024", "Ma 2023a"]);
+
+    let resolved = resolve_references(&citations[0].labels, &entries);
+    assert_eq!(resolved_labels(&resolved), ["He 2024", "Ma 2023a"]);
+    assert!(resolved[0].text.contains("GAIA"));
+    assert!(resolved[1].text.contains("TalkCLIP"));
+}
+
+#[test]
+fn a_parenthesised_date_is_still_not_a_citation() {
+    // Splitting a group on `;` must not turn a year-only span into a work.
+    assert!(find_citations(&test_page("Publication date (July 2017).")).is_empty());
+    assert!(find_citations(&test_page("Accepted (2020; 2021).")).is_empty());
+}
+
+#[test]
+fn an_unknown_label_is_skipped_and_does_not_hide_its_neighbours() {
+    // A grouped citation often names a work the parser could not recover; the rest of the
+    // group must still resolve, and an entirely unknown group is empty rather than fatal.
+    let entries = references("References\n[1] One 2020.\n[2] Two 2021.\n");
+
+    let resolved = resolve_references(&["1".into(), "99".into(), "2".into()], &entries);
+    assert_eq!(resolved_labels(&resolved), ["1", "2"]);
+    assert!(resolve_references(&["99".into()], &entries).is_empty());
+    assert!(resolve_references(&[], &entries).is_empty());
+}
+
+#[test]
+fn duplicate_labels_collapse_to_one_entry() {
+    let entries = references("References\n[1] One 2020.\n[2] Two 2021.\n");
+    // `[1,1]` and `[1, 1]` mean one work; the panel must not list it twice.
+    let resolved = resolve_references(&["1".into(), "1".into()], &entries);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved_labels(&resolved), ["1"]);
+
+    let authors = references("References\nHe, T. 2024. GAIA.\nMa, Y. 2023a. TalkCLIP.\n");
+    let resolved = resolve_references(&["He 2024".into(), "He 2024".into()], &authors);
+    assert_eq!(resolved_labels(&resolved), ["He 2024"]);
+}
+
 #[test]
 fn surname_mentions_in_a_title_do_not_resolve() {
     let entries =

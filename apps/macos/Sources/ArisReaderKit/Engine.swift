@@ -233,8 +233,9 @@ public protocol PDFEngine: AnyObject {
     func citations(_ page: Int) async throws -> [Citation]
     /// The document's reference list (empty when none can be parsed).
     func references() async throws -> [Reference]
-    /// Resolves a citation's labels to a reference entry (one implementation, in Rust).
-    func resolveCitation(labels: [String]) async throws -> Reference?
+    /// Resolves a citation's labels to **every** reference entry they name, in label order
+    /// (one implementation, in Rust; empty when nothing resolves).
+    func resolveCitations(labels: [String]) async throws -> [Reference]
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
@@ -564,15 +565,15 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    public func resolveCitation(labels: [String]) async throws -> Reference? {
-        guard let document else { return nil }
+    public func resolveCitations(labels: [String]) async throws -> [Reference] {
+        guard let document else { return [] }
 
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
-                    let entry = try document.resolveCitation(labels: labels)
+                    let records = try document.resolveCitations(labels: labels)
                     continuation.resume(
-                        returning: entry.map { record in
+                        returning: records.map { record in
                             Reference(
                                 label: record.label,
                                 text: record.text,
@@ -752,7 +753,7 @@ public final class MockEngine: PDFEngine {
 
     public func references() async throws -> [Reference] { [] }
 
-    public func resolveCitation(labels: [String]) async throws -> Reference? { nil }
+    public func resolveCitations(labels: [String]) async throws -> [Reference] { [] }
 
     public func outline() async throws -> [OutlineEntry] { [] }
 

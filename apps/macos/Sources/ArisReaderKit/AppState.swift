@@ -159,6 +159,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// Region of the target page to show, when the citation points at a figure or table
         /// rather than at the top of a page (view space, points).
         public let region: CGRect?
+        /// Every bibliography entry the citation named, in citation order. A grouped citation
+        /// (`[1,2]`, `(He et al. 2024; Kim 2023)`) names several works and the panel lists all
+        /// of them; a plain link or a figure preview has none.
+        public let entries: [CitationEntry]
+    }
+
+    /// One resolved bibliography entry, as the panel lists it.
+    public struct CitationEntry: Equatable, Sendable {
+        public let label: String
+        public let text: String
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -170,19 +180,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private let referencePreviewWidthPt: CGFloat = 300
 
     /// Opens a floating preview of `page`.
+    ///
+    /// `entries` is the citation's whole group of resolved works; `page`, `title` and `region`
+    /// describe the **first** of them, which is what the panel's page image shows.
     public func openReferencePreview(
         page: Int,
         title: String,
         from source: String,
-        region: CGRect? = nil
+        region: CGRect? = nil,
+        entries: [CitationEntry] = []
     ) {
         guard document != nil, page >= 0 else { return }
         referencePreview = ReferencePreview(
             page: page,
             title: title,
             source: source,
-            region: region
+            region: region,
+            entries: entries
         )
+
+        if !entries.isEmpty {
+            // stderr, not print: it is flushed immediately and survives SIGTERM, which is how
+            // the "the panel received every entry" claim stays verifiable in the dev hooks.
+            let labels = entries.map(\.label).joined(separator: ", ")
+            FileHandle.standardError.write(
+                Data("aris-preview: \"\(title)\" lists \(entries.count) entries: \(labels)\n".utf8)
+            )
+        }
 
         let widthPt = max(region?.width ?? engine.contentWidthPt(gapPt: pageGapPt), 1)
         let scale = referencePreviewWidthPt / widthPt * deviceScale
@@ -914,11 +938,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Opens the reference an in-text citation points at (M4).
+    /// Opens the references an in-text citation points at (M4).
     ///
-    /// This is the path that works **without** a link annotation: detect `[12]`, resolve it
-    /// against the reference list, and preview the entry's own rectangle. Returns false when
-    /// the point is not on a citation, or when the citation names nothing we can resolve.
+    /// This is the path that works **without** a link annotation: detect `[12,13]`, resolve
+    /// **every** label against the reference list, and preview them. The panel's image shows
+    /// the first entry's own rectangle and lists all of them. Returns false when the point is
+    /// not on a citation, or when the citation names nothing we can resolve.
     @discardableResult
     public func openCitation(at point: CGPoint) -> Bool {
         for placement in visiblePagePlacements {
@@ -943,28 +968,43 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard box.contains(local) else { continue }
 
                 // Resolution lives in Rust: exact label match, then position for a numeric
-                // citation against an unnumbered list. The shell only draws the result.
+                // citation against an unnumbered list, once per label so a group resolves
+                // whole. The shell only draws the result.
                 let labels = citation.labels
+                // A long group can wrap in the text layer; the title and the log stay one line.
+                let written = citation.text
+                    .split(whereSeparator: \.isWhitespace)
+                    .joined(separator: " ")
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    guard let reference = try? await self.engine.resolveCitation(labels: labels)
-                    else {
-                        self.statusMessage = "Citation \"\(citation.text)\" has no matching entry"
+                    let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
+                    guard let first = resolved.first else {
+                        self.statusMessage = "Citation \"\(written)\" has no matching entry"
                         return
                     }
 
                     self.openReferencePreview(
-                        page: reference.page,
-                        title: "Reference [\(reference.label)]",
+                        page: first.page,
+                        // The panel names the citation as it appears in the text, so a group
+                        // is recognisable at a glance.
+                        title: written,
                         from: "page \(placement.index + 1)",
                         region: CGRect(
-                            x: reference.xPt,
-                            y: reference.yPt,
-                            width: reference.widthPt,
-                            height: reference.heightPt
-                        )
+                            x: first.xPt,
+                            y: first.yPt,
+                            width: first.widthPt,
+                            height: first.heightPt
+                        ),
+                        entries: resolved.map {
+                            CitationEntry(label: $0.label, text: $0.text)
+                        }
                     )
-                    self.statusMessage = "Reference [\(reference.label)]: \(reference.text.prefix(48))"
+                    if resolved.count == 1 {
+                        self.statusMessage = "Reference [\(first.label)]: \(first.text.prefix(48))"
+                    } else {
+                        let named = resolved.map(\.label).joined(separator: ", ")
+                        self.statusMessage = "\(written) names \(resolved.count) references: \(named)"
+                    }
                 }
                 return true
             }
