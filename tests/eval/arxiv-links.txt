@@ -1,0 +1,101 @@
+# Evaluation corpus for the citation/reference index (task T4.10).
+#
+# The PDFs are NEVER committed. This file is the only record of the corpus:
+# ./scripts/fetch-eval-papers.sh downloads it into the git-ignored eval-papers/ directory,
+# exactly like pdf-samples/ and vendor/. CI never needs the PDFs — when they are absent the
+# harness says the evaluation did not run instead of passing quietly.
+#
+# These twenty papers are deliberately different from the twelve in pdf-samples/, which is the
+# corpus the parser was tuned on and which therefore flatters it. That corpus is almost entirely
+# one shape — single-column, numeric, similar publishers — so this set exists to reach the shapes
+# it never met: two-column reference lists, superscript citations, alphanumeric labels,
+# author-year lists of several hundred entries, romanized non-Latin names.
+#
+# Line format (the fetch script reads the first field as the arXiv id):
+#
+#   <arxiv-id>  family=<template> | body=<page layout> | cite=<in-text citation style> |
+#               bib=<reference-list typography> | head=<heading and list structure> |
+#               doc=<measured document facts> | why=<what this paper is here to catch>
+#
+# `bib` is the property the twelve-paper corpus has none of: a reference list set in two columns.
+# Every property below was checked against the fetched PDF (pdftotext layout/heading probes plus
+# the harness's own link-annotation count), not inferred from the venue — the arXiv version of a
+# CVPR paper is not always the CVPR layout, and 1512.03385 is exactly that trap.
+
+1512.03385  family=CVPR | cite=numeric [n], grouped [n, m] | bib=two-column reference list, run-in entries, entries carry arXiv ids | head="References" heads the left column and shares its baseline with the top of the right column | doc=12 pages, 288 link annotations, 2015 | why=two-column bibliography, and a heading that shares a line with an entry
+1706.03762  family=NeurIPS | body=single column | cite=numeric [n], grouped | bib=single-column reference list, run-in entries, full-width lines | head="References" mid-page | doc=15 pages, 113 link annotations, 2017 | why=the most-cited numeric layout of the last decade; grouped labels [n, m] everywhere
+1810.04805  family=ACL/NAACL | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, author-year entry text ("Akbik et al. 2018") | head="References" mid-column; content follows the list | doc=16 pages, 290 link annotations, 2018 | why=two-column ACL list whose entries read author-year while the citations are numeric
+2005.14165  family=NeurIPS | body=single column | cite=alphanumeric labels, grouped: [MCCD13, PSM14], [VSP+ 17] | bib=single-column, small type, 55+ distinct alphanumeric labels over five pages (the parser groups them into 6 entries) | head="References" at the very end of the report (p68/75); the appendices precede it | doc=75 pages, 398 link annotations, 2020 | why=alphanumeric citation labels — a style the detector has no path for at all
+2303.08774  family=plain arXiv article | body=single column | cite=numeric [n], grouped [n, m] | bib=single-column, run-in entries, references in the middle of a 100-page report | head="References" starts on its own page, appendices follow | doc=100 pages, 164 link annotations, 2023 | why=a bibliography nowhere near the end of the file
+2103.00020  family=ICML | body=two columns | cite=numeric [n], grouped | bib=two-column reference list, run-in, 204 parsed entries (100+) | head="References" mid-page | doc=48 pages, 795 link annotations, 2021 | why=label matching at scale: >100 entries, heavy "et al." trimming
+1905.11946  family=ICML | body=two columns | cite=numeric [n] | bib=two-column reference list, run-in | head="References" mid-page | doc=11 pages, 328 link annotations, romanized Chinese/Korean author names, 2019 | why=non-Latin (romanized CJK) author names on every entry
+1912.01703  family=NeurIPS | body=single column | cite=numeric [n], grouped | bib=single-column, run-in, long author lists | head="References" mid-page | doc=12 pages, 66 link annotations, 60 authors on the paper itself, 2019 | why=author lists long enough to wrap, many non-Latin surnames
+1301.3781   family=plain arXiv preprint | body=single column | cite=numeric [n] | bib=single-column, run-in, 32 parsed entries | head="References" near the end | doc=12 pages, 92 link annotations, 2013, older LaTeX layout | why=an old preprint whose text layer and spacing differ from every 2020s template
+1602.05629  family=PMLR/AISTATS | body=single column | cite=numeric [n], grouped | bib=two-column reference list under a single-column body, run-in | head="References" mid-page, list crosses a page break | doc=11 pages, 103 link annotations, 2017 | why=body and bibliography disagree about columns, and the list breaks across pages
+1408.5882   family=EMNLP (short paper) | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, author-year entry text | head="References" mid-page and shared with the right column | doc=6 pages, no link annotations, 2014 | why=the short-paper case: 46 spans, one page of references, and no link landings to help
+2010.11929  family=ICLR | body=single column | cite=author-year, parenthetical and narrative ("Kolesnikov et al. (2020)") | bib=single-column, hanging indent, author-year entries | head="R EFERENCES" (small caps extracted with a space) mid-page | doc=22 pages, 282 link annotations, 2020 | why=author-year matching, with narrative citations the detector must read out of prose
+1807.06209  family=A&A (EDP Sciences) | body=single column | cite=author-year, parenthetical and narrative | bib=single-column, hanging indent, 366 parsed entries, DOIs and URLs | head="References" mid-page; the list spans 20+ pages | doc=73 pages, 2198 link annotations, collaboration author lists, diacritics, 2018 | why=the largest author-year list in the set: 257 spans against 366 entries
+1710.05833  family=ApJL (AAS) | body=two columns | cite=author-year, parenthetical and narrative | bib=two-column reference list, hanging indent, 382 parsed entries | head="References" repeated as a running head on 13 pages | doc=59 pages, 5915 link annotations, collaboration-sized author lists, 2017 | why=two-column *and* author-year, with institution-sized author lists
+1712.01815  family=Science | body=single column | cite=superscript numerals, rendered parenthesised in the text layer: (9), (2, 14) | bib=single-column numbered list "1. ", "2. " | head="References" mid-page, list heading "References" with Notes | doc=19 pages, 13 link annotations, 2017 | why=superscript citations: 20 parenthesised numerals in the body, 0 spans detected
+1710.05463  family=Nature | body=single column | cite=superscript numerals attached to words: "winds5,6,23-26", "r-process1-3,10" | bib=single-column numbered list "34. ", "35. ", ~68 entries | head=no "References" heading in the text layer at all; the numbered list follows "Code availability" | doc=29 pages, no link annotations, 2017 | why=superscripts with no delimiter, plus a numbered list the heading heuristics cannot key on
+1909.05722  family=IEEE (RA-L) | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, DOI-bearing entries | head="R EFERENCES" (IEEEtran caps, extracted with a space) | doc=8 pages, 167 link annotations, 2019 | why=IEEEtran: uppercase heading, DOI entries, and equation numbers "(12)" that look like citations
+2104.08886  family=Elsevier (elsarticle) | body=two columns | cite=numeric [n], grouped | bib=two-column reference list, 144 parsed entries | head="References" mid-page; the list spans 5 pages | doc=17 pages, 460 link annotations, 2021 | why=an Elsevier review: two-column layout with a five-page numeric list
+2110.12477  family=ACM (acmart) | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, DOIs | head="REFERENCES" heads the right column of a body page, entries continue on the next page | doc=9 pages, 147 link annotations, 2021 | why=ACM two-column layout whose reference list starts inside a body page's column
+2403.04370  family=Springer LNCS | body=single column | cite=numeric [n] | bib=single-column, hanging indent, entries labelled "1. ", "2. " | head="References" mid-page | doc=14 pages, 67 link annotations, 2024 | why=LNCS: compact single-column numeric, labelled with "n." rather than "[n]"
+
+# ── Coverage summary ─────────────────────────────────────────────────────────────────────────
+#
+# Format: checklist row -> the papers that cover it. Anything not listed under COVERED is a gap
+# and is named under GAPS; a visible gap is worth more than an implied coverage.
+#
+# COVERED
+# numeric brackets [12]                     | 1512.03385 1706.03762 1810.04805 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 1408.5882 1909.05722 2104.08886 2110.12477
+# numeric with punctuation "12."            | 1712.01815 1710.05463 2403.04370 (list labels; their in-text forms are superscripts)
+# superscript numerals                      | 1710.05463 (attached to words: "winds5,6,23-26") 1712.01815 (parenthesised superscripts: "(2, 14)")
+# alphanumeric labels                       | 2005.14165 ("[HR18]", "[VSP+ 17]")
+# no numbers at all (author-year)           | 2010.11929 1807.06209 1710.05833
+# grouped labels [1,2] / [1-3] / (A 2020; B 2021) | 1512.03385 1706.03762 2303.08774 2103.00020 1912.01703 1602.05629 2104.08886 2005.14165 1807.06209 1710.05833
+# narrative citations "Author (2020) argued" | 2010.11929 1807.06209 1710.05833 2103.00020
+# "et al." vs full author lists             | 1912.01703 (60 authors) 1807.06209 1710.05833 (collaborations)
+# two-column reference list                 | 1512.03385 1810.04805 2103.00020 1905.11946 1602.05629 1408.5882 1710.05833 1909.05722 2104.08886 2110.12477
+# single-column reference list              | 1706.03762 2005.14165 2303.08774 1912.01703 1301.3781 2010.11929 1807.06209 1712.01815 1710.05463 2403.04370
+# hanging indent                            | 1810.04805 1408.5882 2010.11929 1807.06209 1710.05833 1909.05722 2110.12477 2403.04370
+# run-in entries                            | 1512.03385 1706.03762 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 2005.14165
+# entries carrying DOIs/URLs                | 1807.06209 1909.05722 2110.12477 (arXiv ids: 1512.03385, 2005.14165, 1602.05629, 1301.3781)
+# CVPR/ICCV                                 | 1512.03385
+# NeurIPS                                   | 1706.03762 2005.14165 1912.01703
+# ACL/EMNLP                                 | 1810.04805 1408.5882
+# Springer LNCS                             | 2403.04370
+# IEEE                                      | 1909.05722
+# Elsevier elsarticle                       | 2104.08886
+# ACM                                       | 2110.12477
+# AAAI / IJCAI / PMLR                       | none / none / 1602.05629
+# Nature/Science superscripts               | 1710.05463 (Nature) 1712.01815 (Science)
+# plain arXiv article/preprint              | 2303.08774 1301.3781
+# ICLR / ICML / A&A / ApJL                  | 2010.11929 / 2103.00020 1905.11946 / 1807.06209 / 1710.05833
+# "References" heading                      | 1512.03385 1706.03762 1810.04805 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 1408.5882 1807.06209 1712.01815 2104.08886 2403.04370
+# "REFERENCES"/small-caps heading           | 1909.05722 2010.11929 2110.12477 ("R EFERENCES"/"REFERENCES")
+# heading missing from the text layer      | 1710.05463 (the numbered list simply follows the previous section)
+# heading mid-page or mid-column            | 1706.03762 1810.04805 1602.05629 2010.11929 1807.06209 1712.01815 2104.08886 2110.12477 2403.04370 1905.11946 1912.01703 2103.00020
+# heading sharing its line with an entry    | 1512.03385 1408.5882 (heading at the top of the left column, an entry at the top of the right)
+# list split across pages                   | 1602.05629 1912.01703 1807.06209 1710.05833 2104.08886 2005.14165
+# list repeated under a running head        | 1710.05833 ("References" on 13 pages)
+# appendices after the bibliography         | 1810.04805 2303.08774 1512.03385
+# appendices before the bibliography        | 2005.14165 (appendices in the middle, the list last)
+# list starting late in a long document     | 2005.14165 (p70/75) 1807.06209 (p62/73) 2303.08774 (p71/100)
+# link annotations present                  | 1512.03385 1706.03762 1810.04805 2005.14165 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 2010.11929 1807.06209 1710.05833 1712.01815 1909.05722 2104.08886 2110.12477 2403.04370
+# no link annotations                       | 1408.5882 1710.05463
+# short paper (6 pages)                    | 1408.5882
+# 30+ page papers                          | 2303.08774 (100) 2005.14165 (75) 1807.06209 (73) 1710.05833 (59) 2103.00020 (48) 1710.05463 (29)
+# 100+ entry bibliography                  | 2103.00020 1807.06209 1710.05833 2104.08886
+# non-Latin author names                   | 1905.11946 1912.01703 2005.14165 (romanized CJK), 1807.06209 (diacritics)
+#
+# GAPS — not covered by any paper in this set
+# numeric with the "(12)" round form       | Nature/Science use superscripts, not round brackets, in the body; the round form appears only in the extracted text layer
+# alphanumeric labels of the "A.1"/"S3" kind | 2005.14165 covers [HR18]-style labels, not supplementary numbering
+# a non-English bibliography heading       | every paper here is written in English ("Referencias"/"Literaturverzeichnis" untested)
+# a "Bibliography" heading                 | all twenty use "References"/"REFERENCES"/none
+# a bibliography inside a table or a box   | no candidate found in the time available
+# a thesis or manuscript                   | arXiv does not carry theses; the twelve-paper corpus has one and it cannot be shared
+# a scanned or OCR'd PDF with a poor text layer | the oldest paper here (1301.3781, 2013) still has a clean LaTeX text layer; a genuinely poor layer would need a pre-2000 scan
+# non-Latin script in the reference list (CJK/Cyrillic/Devanagari glyphs) | every name here is romanized; a real case needs a paper citing non-English works

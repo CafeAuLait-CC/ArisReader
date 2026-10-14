@@ -22,6 +22,11 @@
 #   * `pdf-samples/` — the twelve-paper corpus, withheld for copyright — is not in the
 #     repository, so the corpus regressions (reference_corpus, table_corpus and the 226/227
 #     sampled citation spans) never run here, on either runner.
+#   * `eval-papers/` — the twenty-paper evaluation corpus for the reference index (T4.10),
+#     fetched from the committed list of links in tests/eval/arxiv-links.txt — is not in the
+#     repository either, so `cargo test --workspace` says nothing about recall. A manual
+#     workflow_dispatch run with `fetch_eval_papers` downloads it and measures; every other run
+#     prints a ::notice:: saying the evaluation did NOT run.
 
 name: CI
 
@@ -31,6 +36,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      fetch_eval_papers:
+        description: "Download the arXiv evaluation corpus (20 PDFs) and run the reference-index evaluation"
+        type: boolean
+        default: false
 
 # A run that has been superseded by a newer push is worthless: stop it and free the runners.
 concurrency:
@@ -81,9 +91,15 @@ jobs:
 
       # `cargo test --workspace` above is green even though the corpus regressions were never
       # run: their two test targets are `#[ignore]`d and need the private samples. Say it.
+      # The evaluation corpus (T4.10) is a second, separate absence: it *is* reproducible from
+      # committed links, but this job still never fetches it, so recall stays unmeasured here.
       - name: Record that the corpus regression did not run
         run: |
           echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need ARIS_READER_PDF_SAMPLES. A green cargo test says nothing about them. Run them on a machine that holds the corpus: ARIS_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p aris-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
+
+      - name: Record that the reference-index evaluation did not run
+        run: |
+          echo "::notice title=Reference eval NOT run::The twenty-paper evaluation corpus is not in this repository (the PDFs are never committed; tests/eval/arxiv-links.txt is the list of links). reference_eval is #[ignore]d and needs eval-papers/, so recall and the precision audit were NOT measured here. Fetch it and measure on a machine that can hold it: ./scripts/fetch-eval-papers.sh && cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture"
 
   macos-shell:
     name: macos-shell (check.sh · ArisReaderChecks)
@@ -181,3 +197,34 @@ jobs:
       - name: Record that the corpus regression did not run
         run: |
           echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need ARIS_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
+
+      # ---------------------------------------------------------- the reference-index evaluation
+      # Opt-in on purpose: the twenty-paper evaluation corpus (tests/eval/arxiv-links.txt) is
+      # third-party material and is never committed, so the default behaviour of this job is to
+      # say that the evaluation did not run. Dispatch the workflow with `fetch_eval_papers` to
+      # download the corpus here and measure it for real.
+      - name: Fetch the evaluation corpus (opt-in, manual dispatch only)
+        id: eval_corpus
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.fetch_eval_papers == 'true'
+        continue-on-error: true
+        run: ./scripts/fetch-eval-papers.sh
+
+      # The step that cannot pass silently: either the harness runs and meets its floors (and
+      # fails the job when it does not), or the log carries a ::notice:: saying it did not run.
+      # `--ignored` because both modes are #[ignore]d like every other corpus test; `--nocapture`
+      # because the per-paper table is the product here, not a test result line.
+      - name: Evaluate the reference index, or say that it did not run
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -d eval-papers ] && ls eval-papers/*.pdf >/dev/null 2>&1; then
+            cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
+              | tee "$RUNNER_TEMP/reference-eval.log"
+          else
+            echo "::notice title=Reference eval NOT run::No evaluation corpus (eval-papers/) is present, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
+          fi
+
+      - name: Say it when the opt-in corpus download failed
+        if: steps.eval_corpus.outcome == 'failure'
+        run: |
+          echo "::warning title=Reference eval corpus download failed::./scripts/fetch-eval-papers.sh did not fetch every paper (arXiv rate limits or a withdrawn id), so the evaluation ran on a partial corpus or not at all. The step above names exactly what it did."
