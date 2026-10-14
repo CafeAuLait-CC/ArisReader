@@ -1,0 +1,43 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 733 >>
+stream
+0 0 0 rg
+BT /F1 10 Tf 60 760 Td ([1] Alpha, A.: A first work on motion. 2020.) Tj ET
+BT /F1 10 Tf 60 745 Td ([2] Beta, B.: A second work whose title is) Tj ET
+BT /F1 10 Tf 60 730 Td (long enough to wrap twice in the left) Tj ET
+BT /F1 10 Tf 60 715 Td (column and then carry on to the right) Tj ET
+BT /F1 10 Tf 60 700 Td (hand column of the very same page.) Tj ET
+BT /F1 10 Tf 330 760 Td (It ends here, on the first line.) Tj ET
+BT /F1 10 Tf 330 745 Td ([3] Gamma, C.: A third work on style. 2018.) Tj ET
+BT /F1 10 Tf 330 730 Td ([4] Delta, D.: A fourth work on shape. 2017.) Tj ET
+BT /F1 10 Tf 330 715 Td ([5] Epsilon, E.: A fifth work on light. 2016.) Tj ET
+BT /F1 10 Tf 330 700 Td ([6] Zeta, F.: A sixth work on sound. 2015.) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1128
+%%EOF

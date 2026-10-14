@@ -18,6 +18,7 @@ mod bibliography;
 #[cfg(test)]
 mod bibliography_tests;
 mod figures;
+mod fragments;
 pub mod tables;
 
 pub use figures::{
@@ -256,13 +257,55 @@ pub struct ReferenceEntry {
     /// The label a citation would use: `12` for `[12]`, or the author-year key text.
     pub label: String,
     /// Entry text with the label stripped.
+    ///
+    /// Text of the entry's first page, plus the opening lines of the following page when the
+    /// entry continues there (see [`EntryFragment`] and [`fragments`](crate::fragments)).
     pub text: String,
-    /// Page the entry lives on.
+    /// Page the entry starts on (the first fragment's page).
     pub page: u32,
-    /// First character index of the entry inside its page.
+    /// First character index of the entry inside its first page.
     pub start: usize,
-    /// One past the last character of the entry.
+    /// One past the last character of the entry **on its first page**; a continuation on the
+    /// following page is a separate fragment, not part of this range.
     pub end: usize,
+    /// The pieces the entry is drawn in, in reading order.
+    ///
+    /// One fragment for the common case — one column, one page — where the fragment's range is
+    /// `start..end` and its box is the entry's rectangle as it has always been. Two or more when
+    /// the entry crosses a column gutter or continues onto the following page, which is what a
+    /// single rectangle cannot express. Empty means the geometry was never derived (an entry
+    /// built by hand); callers then use `page`/`start`/`end` as before.
+    pub fragments: Vec<EntryFragment>,
+}
+
+/// One piece of a reference entry: a contiguous glyph range on one page and the box it occupies
+/// in **page space**.
+///
+/// An entry is split into fragments where the layout breaks it — at a column gutter, or at the
+/// foot of a page. A fragment's box never spans a column gutter; see
+/// [`fragments`](crate::fragments) for how the cut is derived and measured.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntryFragment {
+    /// Page the fragment is drawn on.
+    pub page: u32,
+    /// First character index of the fragment inside its page.
+    pub start: usize,
+    /// One past the last character of the fragment.
+    pub end: usize,
+    /// The box the fragment's glyphs occupy, in page space (bottom-left origin).
+    pub rect: Rect,
+}
+
+impl EntryFragment {
+    /// Characters the fragment's range covers.
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Whether the fragment's range is empty (it then carries no glyphs).
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
 }
 
 /// Whether a page looks like the start of the reference list.
@@ -392,6 +435,8 @@ pub fn parse_numeric_references(page: u32, text: &RawTextPage) -> Vec<ReferenceE
                 page,
                 start: *start,
                 end,
+                // Derived from the page's geometry once the entry list is selected.
+                fragments: Vec::new(),
             }
         })
         .collect()
@@ -460,6 +505,8 @@ pub fn parse_author_year_references(page: u32, text: &RawTextPage) -> Vec<Refere
             page,
             start: *start,
             end,
+            // Derived from the page's geometry once the entry list is selected.
+            fragments: Vec::new(),
         });
     }
 
@@ -745,6 +792,11 @@ pub fn find_references_with_landings(
         return parsed;
     }
     rebuilt.truncate(max_entries);
+    // Entries rebuilt from bands carry no geometry yet, and the ones cloned from `parsed` must
+    // agree with them fragment for fragment; deriving both here keeps the two paths identical.
+    let references: Vec<(u32, &RawTextPage)> =
+        pages.iter().map(|(page, text)| (*page, text)).collect();
+    fragments::assign(&mut rebuilt, &references);
     rebuilt
 }
 
@@ -843,6 +895,8 @@ pub fn entries_from_bands(page: u32, text: &RawTextPage, tops: &[f64]) -> Vec<Re
             page,
             start,
             end,
+            // Derived from the page's geometry once the entry list is selected.
+            fragments: Vec::new(),
         });
     }
 
@@ -962,7 +1016,15 @@ pub fn find_references<'a>(
     pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
     max_entries: usize,
 ) -> Vec<ReferenceEntry> {
-    bibliography::select_reference_run(pages, max_entries)
+    let pages: Vec<(u32, &RawTextPage)> = pages.into_iter().collect();
+    let mut entries = bibliography::select_reference_run(
+        pages.iter().map(|(page, text)| (*page, *text)),
+        max_entries,
+    );
+    // Geometry comes after selection: which run of entries is the bibliography must not depend
+    // on where the columns fall.
+    fragments::assign(&mut entries, &pages);
+    entries
 }
 
 #[cfg(test)]
@@ -1172,6 +1234,7 @@ mod reference_tests {
                 page: 9,
                 start: 0,
                 end: 10,
+                fragments: Vec::new(),
             },
             ReferenceEntry {
                 label: "Barzel 1988".to_string(),
@@ -1179,6 +1242,7 @@ mod reference_tests {
                 page: 9,
                 start: 11,
                 end: 20,
+                fragments: Vec::new(),
             },
         ];
 
@@ -1197,6 +1261,7 @@ mod reference_tests {
             page: 0,
             start: 0,
             end: 1,
+            fragments: Vec::new(),
         }];
         assert!(resolve_reference(&["2".to_string()], &numbered).is_none());
     }
@@ -1210,6 +1275,7 @@ mod reference_tests {
             page: 0,
             start: 0,
             end: 0,
+            fragments: Vec::new(),
         }];
         assert!(resolve_reference(&["He 2024".to_string()], &references).is_none());
     }
