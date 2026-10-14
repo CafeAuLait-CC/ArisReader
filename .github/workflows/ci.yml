@@ -1,0 +1,141 @@
+# Continuous integration for ArisReader (Lyra).
+#
+# Two jobs:
+#   * linux-core  — fast, platform-independent Rust signal (fmt, clippy, workspace tests)
+#   * macos-shell — the gate that actually protects this project: scripts/check.sh plus the
+#                   ArisReaderChecks harness (the native regression suite)
+#
+# Pull requests are checked against the **merge result**, not against the head branch: that is
+# what `actions/checkout` does by default on `pull_request`, and it is the entire point of this
+# file. Two pull requests each passed their own runs here, yet the combination left
+# `ArisReaderChecks` failing with no PASS lines at all. Nothing below may change that default —
+# no explicit `ref:`, no `github.event.pull_request.head.sha`, no "merge commit" toggle.
+#
+# What this workflow cannot cover, said out loud instead of hidden (see the annotated steps):
+#   * PDFium is a downloaded dynamic library and is not committed. If the download fails, the
+#     suites that need a real PDF engine are skipped, and the run says so.
+#   * `pdf-samples/` — the twelve-paper corpus, withheld for copyright — is not in the
+#     repository, so the corpus regressions (reference_corpus, table_corpus and the 226/227
+#     sampled citation spans) never run here, on either runner.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# A run that has been superseded by a newer push is worthless: stop it and free the runners.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux-core:
+    name: linux-core (fmt · clippy · tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml already pins `channel = "stable"`; this makes the rustfmt and
+      # clippy components explicit instead of relying on rustup's auto-install.
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # `cargo test --workspace` above is green even though the corpus regressions were never
+      # run: their two test targets are `#[ignore]`d and need the private samples. Say it.
+      - name: Record that the corpus regression did not run
+        run: |
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need ARIS_READER_PDF_SAMPLES. A green cargo test says nothing about them. Run them on a machine that holds the corpus: ARIS_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p aris-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
+
+  macos-shell:
+    name: macos-shell (check.sh · ArisReaderChecks)
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      # How the Rust engine finds the library at run time (crates/aris-reader-pdfium/src/lib.rs).
+      ARIS_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # PDFium is a downloaded dynamic library, not a committed one. A failure here must not
+      # kill the job by itself — but it must also never be mistaken for a pass, so the next
+      # step names exactly which suites drop out.
+      - name: Fetch PDFium
+        id: pdfium
+        continue-on-error: true
+        run: ./scripts/fetch-pdfium.sh
+
+      - name: Name the suites a missing PDFium takes off the table
+        if: steps.pdfium.outcome != 'success'
+        run: |
+          echo "::warning title=PDFium unavailable::./scripts/fetch-pdfium.sh failed, so this run is SKIPPED for every suite that needs a real PDF engine: the aris-reader-pdfium crate tests, the aris-reader-ffi tests, and the ArisReaderChecks harness (it opens documents, so without the library it exits with no PASS lines). Nothing here is a pass for those suites. The pure-Rust crates are still checked."
+
+      # ---------------------------------------------------------------- the Rust artifacts
+      # apps/macos/.rust/lib/libaris_reader_ffi.a and Sources/ArisReaderBindings/ are build
+      # products (git-ignored), so a fresh checkout has neither and `swift build` cannot link.
+      # scripts/check.sh does NOT produce them; this step does, and duplicates nothing.
+      - name: Build the Rust static library and the UniFFI Swift bindings
+        run: ./scripts/build-rust.sh --debug
+
+      # fmt, clippy, the workspace tests, the Swift compile probe and `swift build`.
+      # (Its own ArisReaderChecks run happens inside; the explicit step below is what puts the
+      # harness output in the job log, because check.sh redirects it to build/reader-checks.log.)
+      - name: Run ./scripts/check.sh
+        if: steps.pdfium.outcome == 'success'
+        run: ./scripts/check.sh
+
+      # The gate this workflow exists for. Argument is the repository root: the harness resolves
+      # its fixtures as <root>/tests/fixtures/*.pdf (apps/macos/Checks/ReaderChecks.swift).
+      # `set -o pipefail` keeps the exit status while still showing every line in the log.
+      - name: ArisReaderChecks (native regression suite)
+        if: steps.pdfium.outcome == 'success'
+        shell: bash
+        run: |
+          set -o pipefail
+          "$GITHUB_WORKSPACE/apps/macos/.build/debug/ArisReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
+
+      - name: Say it when the macOS gate did not run
+        if: steps.pdfium.outcome != 'success'
+        run: |
+          echo "::warning title=ArisReaderChecks NOT run::The Swift check harness was skipped because PDFium could not be downloaded. This run is NOT evidence that the harness passes; a failing merge result would look exactly the same."
+
+      # Same statement as in linux-core: the corpus is not in the repository, so nothing above
+      # covered it. Do not let a future reader assume otherwise.
+      - name: Record that the corpus regression did not run
+        run: |
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need ARIS_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
