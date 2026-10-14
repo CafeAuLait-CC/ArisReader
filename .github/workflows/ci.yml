@@ -1,7 +1,12 @@
 # Continuous integration for ArisReader (Lyra).
 #
 # Two jobs:
-#   * linux-core  — fast, platform-independent Rust signal (fmt, clippy, workspace tests)
+#   * rust-core   — the fast Rust signal (fmt, clippy, workspace tests) on ubuntu-latest.
+#                   The platform is part of the point, not an accident: this is the only job that
+#                   compiles the workspace for a non-Apple target, which is how it caught
+#                   `aris-reader-gpu` using an Apple-only wgpu surface target and failing to build
+#                   on Linux at all. It does not replace the macOS job, and the macOS job does not
+#                   replace it.
 #   * macos-shell — the gate that actually protects this project: scripts/check.sh plus the
 #                   ArisReaderChecks harness (the native regression suite)
 #
@@ -40,8 +45,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  linux-core:
-    name: linux-core (fmt · clippy · tests)
+  rust-core:
+    name: rust-core (fmt · clippy · tests on ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -171,7 +176,7 @@ jobs:
         run: |
           echo "::warning title=ArisReaderChecks NOT run::The Swift check harness was skipped because PDFium could not be downloaded. This run is NOT evidence that the harness passes; a failing merge result would look exactly the same."
 
-      # Same statement as in linux-core: the corpus is not in the repository, so nothing above
+      # Same statement as in rust-core: the corpus is not in the repository, so nothing above
       # covered it. Do not let a future reader assume otherwise.
       - name: Record that the corpus regression did not run
         run: |
