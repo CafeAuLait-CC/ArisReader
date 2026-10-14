@@ -2,7 +2,7 @@ import ArisReaderKit
 import Foundation
 
 // Deliberately completes the earlier request last to exercise the actual race.
-@MainActor final class PreviewEngine: PDFEngine {
+@MainActor class PreviewEngine: PDFEngine {
     let version = "controlled preview test engine"
     func openDocument(at url: URL) throws -> LoadedDocument {
         LoadedDocument(title: "Preview fixture", pageCount: 3, url: url,
