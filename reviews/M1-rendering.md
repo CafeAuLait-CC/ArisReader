@@ -37,3 +37,15 @@ requested tiles are pinned. Configuration settings are not wired to that cache.
 Validation: PDFium unit tests plus the lifecycle stress test; see the final review
 report for workspace, corpus and native-shell checks. Passing stress tests does not
 prove that unsupported concurrent PDFium calls would be safe.
+
+## Native tile-composition regression found during review
+
+The actual GPU canvas showed gray vertical bands through rendered text. Matrix
+rendering allocated a tile larger than the unscaled page dimensions, but the
+wrapper's implicit clear covered only the smaller dimensions. The rest retained
+alpha zero. A 1024×1024 tile of the 595-point fixture reproduced this at pixel 595.
+
+Initialize the entire tile with the requested premultiplied BGRA background and
+disable the implicit partial clear, preserving the rendering matrix. The new test
+checks every alpha byte and the overlap with a whole-page raster. All 11 PDFium
+tests pass after this correction. The shell-side edge-pixel crop is in the M4 PR.
