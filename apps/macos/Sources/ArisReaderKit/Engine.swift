@@ -62,6 +62,29 @@ public struct PageImage: Sendable {
     }
 }
 
+extension PageImage {
+    /// High-quality reduction preserves fractional coverage of hairlines. Rendering
+    /// directly at thumbnail resolution instead rounds those strokes up to dark pixels.
+    public func downsampled(toWidth width: Int) -> PageImage {
+        guard width > 0, width < pixelWidth, pixelHeight > 0 else { return self }
+        let height = max(1, Int((CGFloat(pixelHeight) * CGFloat(width) / CGFloat(pixelWidth)).rounded()))
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue)
+        guard let provider = CGDataProvider(data: bgra as CFData),
+              let source = CGImage(width: pixelWidth, height: pixelHeight, bitsPerComponent: 8,
+                bitsPerPixel: 32, bytesPerRow: pixelWidth * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: info, provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info.rawValue)
+        else { return self }
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let bytes = context.data else { return self }
+        return PageImage(pixelWidth: width, pixelHeight: height, pointSize: pointSize,
+                         bgra: Data(bytes: bytes, count: width * height * 4), generation: generation)
+    }
+}
+
 /// Where one page sits in the scrolling content.
 ///
 /// Content space uses PDF points with the origin at the top-left of the first page and Y
@@ -90,6 +113,14 @@ public struct TextChar: Sendable {
     public let yPt: CGFloat
     public let widthPt: CGFloat
     public let heightPt: CGFloat
+
+    public init(unicode: UInt32, xPt: CGFloat, yPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat) {
+        self.unicode = unicode
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+    }
 }
 
 /// A page's text layer.
@@ -98,6 +129,82 @@ public struct TextPage: Sendable {
     public let chars: [TextChar]
     public let text: String
     public let hasUnicodeMapError: Bool
+    private let selectionLines: [SelectionLine]
+
+    public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool) {
+        self.page = page
+        self.chars = chars
+        self.text = text
+        self.hasUnicodeMapError = hasUnicodeMapError
+        self.selectionLines = SelectionLine.build(chars)
+    }
+
+    /// Resolve the visual line before resolving x. Ink-free spaces must never make
+    /// a character on a neighbouring line win merely because its x is closer.
+    public func characterIndex(at point: CGPoint) -> Int? {
+        func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
+            max(low - value, value - high, 0)
+        }
+        guard let line = selectionLines.min(by: { a, b in
+            let ay = distance(point.y, a.bounds.minY, a.bounds.maxY)
+            let by = distance(point.y, b.bounds.minY, b.bounds.maxY)
+            if ay != by { return ay < by }
+            let ax = distance(point.x, a.bounds.minX, a.bounds.maxX)
+            let bx = distance(point.x, b.bounds.minX, b.bounds.maxX)
+            if ax != bx { return ax < bx }
+            return abs(a.bounds.midY - point.y) < abs(b.bounds.midY - point.y)
+        }), abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14)
+        else { return nil }
+        return line.stops.min { a, b in
+            let ad = distance(point.x, a.rect.minX, a.rect.maxX)
+            let bd = distance(point.x, b.rect.minX, b.rect.maxX)
+            if ad != bd { return ad < bd }
+            return abs(a.rect.midX - point.x) < abs(b.rect.midX - point.x)
+        }?.index
+    }
+}
+
+private struct SelectionLine: Sendable {
+    var bounds: CGRect
+    var stops: [(index: Int, rect: CGRect)]
+
+    static func build(_ chars: [TextChar]) -> [SelectionLine] {
+        var lines: [SelectionLine] = []
+        var current: SelectionLine?
+        for (index, char) in chars.enumerated() {
+            if char.unicode == 10 || char.unicode == 13 {
+                if let current { lines.append(current) }
+                current = nil
+                continue
+            }
+            // PDFium may give whitespace a zero box or an unrelated y coordinate.
+            if Unicode.Scalar(char.unicode).map({ CharacterSet.whitespaces.contains($0) }) == true { continue }
+            let rect = CGRect(x: char.xPt, y: char.yPt, width: char.widthPt, height: char.heightPt)
+            guard rect.width > 0, rect.height > 0 else { continue }
+            if var line = current {
+                let overlap = min(line.bounds.maxY, rect.maxY) - max(line.bounds.minY, rect.minY)
+                if overlap >= min(line.bounds.height, rect.height) * 0.35 {
+                    // Interpolate missing space boxes between neighbouring ink boxes.
+                    if let previous = line.stops.last, previous.index + 1 < index {
+                        let gaps = (previous.index + 1)..<index
+                        let width = max(0, rect.minX - previous.rect.maxX) / CGFloat(gaps.count)
+                        for (offset, gapIndex) in gaps.enumerated() where Unicode.Scalar(chars[gapIndex].unicode).map({ CharacterSet.whitespaces.contains($0) }) == true {
+                            line.stops.append((gapIndex, CGRect(x: previous.rect.maxX + CGFloat(offset) * width,
+                                y: line.bounds.minY, width: width, height: line.bounds.height)))
+                        }
+                    }
+                    line.bounds = line.bounds.union(rect)
+                    line.stops.append((index, rect))
+                    current = line
+                    continue
+                }
+                lines.append(line)
+            }
+            current = SelectionLine(bounds: rect, stops: [(index, rect)])
+        }
+        if let current { lines.append(current) }
+        return lines
+    }
 }
 
 /// One link: a clickable box in view space plus where it leads.
@@ -904,4 +1011,33 @@ public final class MockEngine: PDFEngine {
     ) -> [PagePlacement] { [] }
     public func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int { 0 }
     public func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat { 0 }
+}
+
+// PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
+// line so spaces and the gaps between letters are included, without bridging columns.
+extension TextPage {
+    public func selectionRects(in range: ClosedRange<Int>) -> [CGRect] {
+        var result: [CGRect] = []
+        for line in selectionLines {
+            var run: CGRect?
+            for stop in line.stops where range.contains(stop.index) {
+                // Use one stable line height, including spaces with no PDF ink box.
+                let rect = CGRect(x: stop.rect.minX, y: line.bounds.minY,
+                                  width: stop.rect.width, height: line.bounds.height)
+                if let current = run {
+                    let gap = max(rect.minX - current.maxX, current.minX - rect.maxX)
+                    if gap <= line.bounds.height * 1.5 {
+                        run = current.union(rect)
+                    } else {
+                        result.append(current)
+                        run = rect
+                    }
+                } else {
+                    run = rect
+                }
+            }
+            if let run { result.append(run) }
+        }
+        return result
+    }
 }

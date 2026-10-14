@@ -157,6 +157,10 @@ def main() -> int:
             )
             for number in (1, 2, 3)
         ],
+        # Fine header and table rules: thumbnail supersampling must retain subpixel coverage.
+        "thin-lines.pdf": [("0 G 0.25 w 72 760 m 523 760 l S\n"
+                            "0.5 w 72 500 m 523 500 l S\n"
+                            "0.25 w 72 485 m 523 485 l S\n", 0)],
         # 3) Rotated page: exercises /Rotate handling and the page geometry code.
         "rotated.pdf": [
             (text_page("Rotated 90°", "this page uses /Rotate 90", ["Rotated body line."]), 90),
