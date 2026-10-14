@@ -24,6 +24,9 @@
   or drawing white page content beyond its right/bottom edges.
 - Native UI testing exposed inverted wheel scrolling; normalize AppKit deltas
   for both main and preview canvases. Keep the page HUD behind the preview.
+- Link the Rust archive explicitly. The old `-l` flag silently selected the
+  colocated dylib and embedded a path into Cargo's build directory; rebuilding Rust
+  could mismatch generated bindings, and copied app bundles depended on the repo.
 
 ## Validation
 

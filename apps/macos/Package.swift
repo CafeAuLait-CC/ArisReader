@@ -40,8 +40,10 @@ let package = Package(
             path: "Sources/ArisReaderFFI",
             publicHeadersPath: "include",
             linkerSettings: [
-                .unsafeFlags(["-L", "\(packageRoot)/.rust/lib"]),
-                .linkedLibrary("aris_reader_ffi"),
+                // Name the archive explicitly: -l prefers a colocated dylib, whose
+                // Cargo install name points back into target/debug/deps. That can
+                // change under a running app and does not survive packaging.
+                .unsafeFlags(["\(packageRoot)/.rust/lib/libaris_reader_ffi.a"]),
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),
             ]
