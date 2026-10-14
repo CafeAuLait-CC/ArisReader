@@ -118,6 +118,13 @@ public final class AppState: ObservableObject {
     /// Tiles whose rasterization is in flight, so scrolling does not queue one twice.
     private var tilesInFlight: Set<TileKey> = []
     private let tileCacheLimit = 96
+    /// Tile-cache counters for `ARIS_READER_RENDER_STATS=1` (see `reportTileCacheStats`).
+    /// Frame times for the same HUD come from the FFI's per-frame log, because only that side
+    /// sees the GPU; these counters are the half only the shell knows.
+    private var tileCacheHits = 0
+    private var tileCacheMisses = 0
+    private static let renderStatsEnabled =
+        ProcessInfo.processInfo.environment["ARIS_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
     private var pagePreviews: [Int: PageImage] = [:]
     private var pagePreviewInFlight: Int?
@@ -2155,8 +2162,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     )
 
                     if let cached = tileCache[key] {
+                        tileCacheHits += 1
                         ready.append(CanvasPage(placement: tilePlacement, image: cached.image))
                     } else {
+                        tileCacheMisses += 1
                         if tilePlacement.topPt < scrollYPt + viewportHeight,
                            tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
                             complete = false
@@ -2197,6 +2206,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         evictTiles(keeping: wanted)
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
+        reportTileCacheStats(wanted: wanted.count, scheduled: pendingTiles.count)
+    }
+
+    /// `ARIS_READER_RENDER_STATS=1`: the shell's half of the HUD documented in docs/09 §9 —
+    /// tile-cache occupancy and hit rate per viewport update. Off by default and silent unless
+    /// asked for; it changes no scheduling decision, it only counts and reports.
+    private func reportTileCacheStats(wanted: Int, scheduled: Int) {
+        guard Self.renderStatsEnabled else { return }
+        let total = tileCacheHits + tileCacheMisses
+        let hitRate = total == 0 ? 0.0 : 100.0 * Double(tileCacheHits) / Double(total)
+        let line = String(
+            format: "aris-stats: cache %d/%d tiles · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%%\n",
+            tileCache.count, tileCacheLimit, wanted, scheduled, tileCacheHits, tileCacheMisses, hitRate
+        )
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// Updates overlays without reloading tiles or scheduling document analysis during a drag.

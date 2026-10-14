@@ -8,6 +8,14 @@ Why a generator instead of committed binaries:
 
 Usage:
     python3 scripts/make-fixtures.py [output-dir]      # default: tests/fixtures
+    python3 scripts/make-fixtures.py [output-dir] --long-pages 300 [--long-name NAME]
+
+`--long-pages` additionally writes a synthetic long document (default `long-<N>.pdf`)
+for the T1.13 first-frame measurement: no license-clean ~300-page PDF exists in this
+repository, so the long fixture repeats a six-page cycle with the page number woven into
+the text. Repetition is the artifact to remember when reading its numbers: after the
+first cycle the engine's glyph cache is warm, so per-page raster cost there is a lower
+bound for a real paper of the same length.
 
 Requires Python 3 only (no third-party packages). Standard library is enough:
 PDF objects and a correct cross-reference table are emitted by hand.
@@ -137,8 +145,58 @@ def references_page(left: list[str], right: list[str]) -> str:
     return "\n".join(parts)
 
 
+def long_document(page_count: int) -> list[tuple[str, int]]:
+    """A synthetic long document for the T1.13 measurement (~300 pages).
+
+    Six page layouts repeat in a cycle, with the page number woven into both the heading
+    and the body so no two pages are byte-identical. The repetition is deliberate: the
+    fixtures have to stay license-clean and small, and repeating pages is the only way to
+    reach 300 pages here. It also means the engine's glyph cache is warm after the first
+    cycle, so any per-page cost measured on this file is a lower bound for a real paper.
+    """
+    variants = 6
+    return [
+        (
+            text_page(
+                f"Bench fixture {index + 1} of {page_count}",
+                f"cycle variant {index % variants + 1} of {variants} - synthetic long document",
+                [
+                    f"Page {index + 1}: this line differs on every page.",
+                    f"Variant {index % variants + 1}: the cycle repeats every {variants} pages.",
+                    "Body text gives the rasterizer glyphs, rules and a filled path to draw.",
+                    "The file exists to measure open, first frame and scroll cost at 300 pages.",
+                    "Generated, never committed: scripts/make-fixtures.py --long-pages 300",
+                ],
+            ),
+            0,
+        )
+        for index in range(page_count)
+    ]
+
+
 def main() -> int:
-    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("tests/fixtures")
+    args = sys.argv[1:]
+    out_dir = Path("tests/fixtures")
+    long_pages = 0
+    long_name: str | None = None
+
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if argument == "--long-pages":
+            long_pages = int(args[index + 1])
+            index += 2
+            continue
+        if argument == "--long-name":
+            long_name = args[index + 1]
+            index += 2
+            continue
+        out_dir = Path(argument)
+        index += 1
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fixtures: dict[str, list[tuple[str, int]]] = {
@@ -213,6 +271,12 @@ def main() -> int:
 
     for name, pages in fixtures.items():
         path = out_dir / name
+        path.write_bytes(build_pdf(pages))
+        print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
+
+    if long_pages > 0:
+        pages = long_document(long_pages)
+        path = out_dir / (long_name or f"long-{long_pages}.pdf")
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
     return 0

@@ -45,6 +45,7 @@ dependencies = [
  "aris-reader-render",
  "aris-reader-text",
  "image",
+ "libc",
 ]
 
 [[package]]
