@@ -647,7 +647,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var windowTitle: String {
-        document?.title ?? "ArisReader"
+        document?.title ?? "Lyra"
     }
 
     public var pageLabel: String {
@@ -1029,7 +1029,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 && $0.start >= 0 && $0.end >= $0.start
                 && Self.highlightPalette.indices.contains($0.colorIndex) }),
                 Set(decoded.map(\.id)).count == decoded.count else {
-                throw NSError(domain: "ArisReader", code: 3,
+                throw NSError(domain: "Lyra", code: 3,
                     userInfo: [NSLocalizedDescriptionKey: "Invalid annotation page, range, color or duplicate identity"])
             }
             annotations = decoded

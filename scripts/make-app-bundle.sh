@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Assemble ArisReader.app (SwiftPM artifacts + Info.plist + optional PDFium + code signing).
+# Assemble Lyra.app (SwiftPM artifacts + Info.plist + optional PDFium + code signing).
 #
 # Usage: ./scripts/make-app-bundle.sh [--debug] [--no-sign]
 #
-# Artifacts: build/ArisReader.app
+# Artifacts: build/Lyra.app
+#
+# The bundle is named after the user-visible app (Lyra); the executable copied into
+# Contents/MacOS stays `ArisReader` (SwiftPM product name, matches CFBundleExecutable).
 #
 # Works under Command Line Tools (no actool / stapler; see docs/09-dev-setup.md §2.1).
 set -euo pipefail
@@ -17,11 +20,11 @@ for arg in "$@"; do
   case "$arg" in
     --debug) CONFIG="debug" ;;
     --no-sign) SIGN=0 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
   esac
 done
 
-APP="$ROOT/build/ArisReader.app"
+APP="$ROOT/build/Lyra.app"
 PDFIUM_LIB="$ROOT/vendor/pdfium/lib/libpdfium.dylib"
 
 mkdir -p "$ROOT/build"
