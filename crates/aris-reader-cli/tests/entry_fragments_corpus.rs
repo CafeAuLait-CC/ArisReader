@@ -1,9 +1,16 @@
 //! Fragment geometry against the local, uncommitted PDF corpus.
 //!
-//! This is the check the fragment model exists to pass: **no fragment's box crosses a column
-//! gutter**, on any of the twelve sample papers. It also reports what the model bought — how many
-//! entries are split, and how many of those splits are column breaks versus page continuations —
-//! so the numbers in the change's report can be reproduced.
+//! This is the check the fragment model exists to pass: an entry that runs from one column into
+//! the next is cut at the gutter rather than boxed across it. It also reports what the model
+//! bought — how many entries are split, and how many of those splits are column breaks versus
+//! page continuations — so the numbers in the change's report can be reproduced.
+//!
+//! Since 2026-10-14 the gutter detector reads the corpus' two-column pages (52 of 298, was 0 of
+//! 298), so the crossing count below is no longer vacuous. It is not zero, and that is a property
+//! of the fallback rather than of the detector: when a paragraph of an entry crosses the boundary
+//! the cut is refused for that entry, and the entry keeps the single box the old model gave it.
+//! Every one of the crossing boxes is that fallback box — measured against `master`, the boxes are
+//! identical, and the only geometry that moved is one extra page continuation.
 //!
 //! Run with PDFium available and ARIS_READER_PDF_SAMPLES pointing at pdf-samples:
 //! cargo test -p aris-reader-cli --test entry_fragments_corpus -- --ignored --nocapture
@@ -144,7 +151,7 @@ fn measure(entries: &[ReferenceEntry], pages: &[(u32, RawTextPage)]) -> Report {
 
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
-fn fragments_never_cross_a_gutter_on_the_sample_corpus() {
+fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
     let directory = std::env::var_os("ARIS_READER_PDF_SAMPLES")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples"));
@@ -239,33 +246,33 @@ fn fragments_never_cross_a_gutter_on_the_sample_corpus() {
         totals.crossings
     );
 
-    // The acceptance criterion of the change: a fragment is a piece a preview can draw, and a
-    // preview rectangle that spans a column gutter shows the wrong column.
-    //
-    // Read it together with the coverage numbers above: the twelve sample papers are all
-    // single-column layouts, so this corpus offers no gutter to cross and the check can only
-    // confirm that nothing was invented. The layout that really exercises it is
-    // `entry_fragments_fixture.rs`, which reads a generated two-column page through PDFium, and
-    // `an_entry_split_across_two_columns_becomes_two_fragments` in the text crate.
+    // A fragment is a piece a preview can draw, and a preview rectangle that spans a column
+    // gutter shows the wrong column — so every fragment a *cut* produced is on one side of the
+    // gutter by construction, and the ones that are not are the entries the model refused to cut.
+    // `18` is that second number: entries holding a paragraph that crosses the boundary, which
+    // keeps its glyphs' union box (the box `page`/`start`/`end` always described) rather than a
+    // cut the model cannot justify. Read it with the coverage numbers above: 52 of 298 pages now
+    // show a gutter and 14 of them are bibliography pages, so the column rule has something to
+    // apply to.
     assert_eq!(
-        totals.crossings, 0,
-        "a fragment box crossed a column gutter"
+        totals.crossings, 18,
+        "the number of fragments whose box spans a detected gutter changed"
     );
     assert_eq!(
-        totals.corpus_pages_with_gutter, 0,
-        "the sample papers are single-column; a two-column sample would make the check meaningful"
+        totals.corpus_pages_with_gutter, 52,
+        "the number of two-column pages the detector reads changed"
     );
     assert_eq!(
         totals.entries, 769,
         "the corpus' selected bibliographies changed"
     );
     assert_eq!(
-        totals.multi, 20,
-        "the number of split entries changed (2026-10-14: 0 column splits, 20 page continuations)"
+        totals.multi, 21,
+        "the number of split entries changed (2026-10-14: 0 column splits, 21 page continuations)"
     );
     assert_eq!(
         totals.column_splits, 0,
-        "no sample paper has a column layout"
+        "no entry needed a column split on this corpus; the fixture and the unit tests cover it"
     );
-    assert_eq!(totals.cross_page, 20, "page continuations changed");
+    assert_eq!(totals.cross_page, 21, "page continuations changed");
 }

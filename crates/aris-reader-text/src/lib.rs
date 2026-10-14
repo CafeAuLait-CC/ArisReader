@@ -62,12 +62,37 @@ impl From<RawCharBox> for CharBox {
     }
 }
 
+/// A run of characters inside a line: the smallest interval holding a group of character boxes
+/// with no gap wider than [`INK_RUN_GAP_PT`] between them.
+///
+/// Runs are what tells a line that *is* one line of text from a line box that only looks like
+/// one. PDFium happily reports a left-column line and its right-column neighbour as a single
+/// line when their baselines agree and the gutter between them is narrower than the line-break
+/// threshold, and the union box of that pair spans the whole page. The runs show the gap the box
+/// hides, which is what the column-gutter test reads ([`crate::tables::column_gutter`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkRun {
+    /// Left edge of the run (points).
+    pub from: f64,
+    /// Right edge of the run (points).
+    pub to: f64,
+}
+
+/// Two character boxes closer than this are one run of ink (points).
+///
+/// Kerning and rounding move neighbouring character boxes by a fraction of a point; a word space
+/// is several points wide and a column gutter some twenty, so a threshold well under a space
+/// keeps words whole while leaving every real gap visible.
+pub const INK_RUN_GAP_PT: f64 = 1.0;
+
 /// One line of text (consecutive characters on the same baseline).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextLine {
     pub rect: Rect,
     pub range: std::ops::Range<u32>,
     pub text: String,
+    /// Where this line's characters actually are, left to right; see [`InkRun`].
+    pub ink: Vec<InkRun>,
 }
 
 /// A text block (paragraph level; used for retrieval and AI context chunking).
@@ -1729,6 +1754,7 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
             if let Some(line) = lines.last_mut() {
                 line.rect = union_rect(line.rect, character.rect);
                 line.range.end = line.range.end.max(index as u32 + 1);
+                push_ink(line, character.rect);
                 if let Some(character) = decoded {
                     line.text.push(character);
                 }
@@ -1750,11 +1776,14 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
         };
 
         if starts_new_line {
-            lines.push(TextLine {
+            let mut line = TextLine {
                 rect: character.rect,
                 range: (index as u32)..(index as u32 + 1),
                 text: decoded.map(|c| c.to_string()).unwrap_or_default(),
-            });
+                ink: Vec::new(),
+            };
+            push_ink(&mut line, character.rect);
+            lines.push(line);
             visible_right.push(character.rect.origin.x + character.rect.size.width);
         } else if let Some(line) = lines.last_mut() {
             line.rect = union_rect(line.rect, character.rect);
@@ -1762,6 +1791,7 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
             if let Some(character) = decoded {
                 line.text.push(character);
             }
+            push_ink(line, character.rect);
             if let Some(right) = visible_right.last_mut() {
                 *right = character.rect.origin.x + character.rect.size.width;
             }
@@ -1770,7 +1800,41 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
         pending_break = false;
     }
 
+    // Characters reach a line in reading order, which is by baseline first: a superscript can
+    // therefore arrive after the glyphs that sit to its right. Sorting and merging here gives
+    // every consumer runs that are disjoint and left to right, whatever the extraction order was.
+    for line in lines.iter_mut() {
+        line.ink = merge_ink_runs(std::mem::take(&mut line.ink));
+    }
+
     lines
+}
+
+/// Adds one character box to a line's runs, keeping them in the order the boxes arrive.
+///
+/// A box with no width is a character the extractor placed but did not measure — a soft hyphen,
+/// a zero-advance mark — and drawing nothing is what it does.
+fn push_ink(line: &mut TextLine, rect: Rect) {
+    if rect.size.width <= 0.0 {
+        return;
+    }
+    line.ink.push(InkRun {
+        from: rect.origin.x,
+        to: rect.max_x(),
+    });
+}
+
+/// Sorts character runs left to right and fuses those that touch, so the result is disjoint.
+fn merge_ink_runs(mut runs: Vec<InkRun>) -> Vec<InkRun> {
+    runs.sort_by(|left, right| left.from.total_cmp(&right.from));
+    let mut merged: Vec<InkRun> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match merged.last_mut() {
+            Some(last) if run.from <= last.to + INK_RUN_GAP_PT => last.to = last.to.max(run.to),
+            _ => merged.push(run),
+        }
+    }
+    merged
 }
 
 /// Buckets a left edge so lines from the same column compare equal.

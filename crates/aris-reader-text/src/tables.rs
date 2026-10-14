@@ -79,9 +79,9 @@
 //! * **A caption much narrower than its table.** The border rule is required to be no wider than
 //!   the caption plus half again, which is what stops a full-width rule from being taken for a
 //!   small table's border. A one-line centred caption under a wide table is therefore lost.
-//! * **Full-width tables in a two-column page** are given up: a grid crossing the gutter is
-//!   rejected rather than returned, because the earlier column work showed a region spanning a
-//!   gutter is always wrong for a preview.
+//! * **A caption on the far side of a column gutter** is not accepted: a grid in one column under
+//!   a caption in the other would show the wrong column's table. A full-width table — which covers
+//!   the gutter, as its caption does — is *not* that case and is returned.
 //! * **A grid is not a table.** A ruled box holding text — a framed algorithm, a sidebar —
 //!   satisfies every test here. The region is still a better preview than the whole page, but the
 //!   word `Table` on it comes from the caption, not from this code.
@@ -90,7 +90,7 @@
 
 use aris_reader_core::{LineSegment, Rect};
 
-use crate::{Caption, TextLine};
+use crate::{Caption, InkRun, TextLine};
 
 /// How far off an axis a segment may lie and still be read as a rule (points).
 pub const AXIS_TOLERANCE_PT: f64 = 1.0;
@@ -203,6 +203,60 @@ pub const TEXT_COLUMN_TOLERANCE_PT: f64 = 6.0;
 /// A gutter narrower than this is a wide space, not a column boundary (points).
 pub const GUTTER_MIN_WIDTH_PT: f64 = 14.0;
 
+/// Fewest lines a page must show before its column structure is read at all.
+///
+/// Below this there is not enough text to tell a column from a caption, and the answer that costs
+/// nothing — "no gutter" — is the right one.
+pub const MIN_GUTTER_LINES: usize = 6;
+
+/// How far from the middle of the body a column boundary may sit, as a share of the body width.
+///
+/// A two-column page is set with two balanced columns, so its gutter straddles the middle of the
+/// text block: measured on the twelve sample papers, every gutter found sits within 1% of the
+/// body's centre. Anything further out is a ragged right margin, a gap beside a figure, or the
+/// edge of a table — not a boundary between columns of body text.
+pub const GUTTER_CENTRE_SHARE: f64 = 0.05;
+
+/// A line at least this share of the body wide is a full-width element, not column text.
+///
+/// A figure caption, a paper title, a wide equation and a table rule all cross a gutter. They are
+/// why the detector may not simply require that *no* line crosses the boundary.
+pub const SPANNER_WIDTH_SHARE: f64 = 0.8;
+
+/// A line narrower than this is a mark, not text (points).
+///
+/// Superscripts, formula fragments and stray glyphs of a broken text layer sit in the gutter
+/// without being a column of text; a line this short carries no words.
+pub const STRAY_WIDTH_PT: f64 = 12.0;
+
+/// Share of the page's lines that may be *ordinary text* inside the boundary.
+///
+/// Deliberately near zero: two columns of text do not overlap each other, so any line of body
+/// text lying in the strip means the strip is not a gutter between columns. What the share
+/// absorbs is extraction noise — a line whose box runs a few points past its column edge.
+pub const MAX_TEXT_LINES_IN_GUTTER_SHARE: f64 = 0.02;
+
+/// Share of the page's lines that must stop at the boundary's left edge, and start after its
+/// right edge, for the boundary to be a column edge rather than a hole in the page.
+///
+/// A fifth each side is the guard the previous version of this function used; it survives every
+/// measurement below unchanged.
+pub const MIN_GUTTER_SIDE_SHARE: f64 = 0.2;
+
+/// Share of the page's lines that may reach into the boundary *at all*, spanners included.
+///
+/// This is the "the lines that respect it clearly dominate" half of the test. Without it a
+/// single-column page of full-width prose passes every other guard, because on such a page every
+/// line is "wide enough to be a spanner" and a strip through the middle of the text still has a
+/// fifth of the lines ending before it and a fifth starting after it. Measured on the corpus:
+/// capping the crossings at a tenth keeps all 52 gutter pages and drops the 21 single-column
+/// pages a looser cap produced.
+pub const MAX_CROSSING_LINES_SHARE: f64 = 0.1;
+
+/// How far outside the boundary a line may end or start and still count as being on that side
+/// (points).
+pub const GUTTER_EDGE_TOLERANCE_PT: f64 = 0.5;
+
 /// What a grid region rests on.
 ///
 /// Reported rather than hidden because the two tiers have different failure modes, and a reader
@@ -234,7 +288,7 @@ pub enum GridOutcome {
     NotEnoughRows,
     /// A grid-shaped candidate whose cells hold too little text to be a table.
     NoTextInCells,
-    /// A grid-shaped candidate that crosses the gutter of a multi-column page.
+    /// A grid-shaped candidate on the far side of the page's gutter from its caption.
     CrossesColumn,
     /// A grid-shaped candidate narrower than [`MIN_GRID_WIDTH_PT`].
     TooNarrow,
@@ -418,15 +472,21 @@ fn nearest_grid(
             outcome = GridOutcome::TooNarrow;
             continue;
         }
-        // A region spanning a two-column gutter is wrong for a preview, and a table that wide is
-        // a different layout question than the one this answers. The gutter is measured without
-        // this grid's own cells: they are short lines with gaps between them, which is what a
-        // gutter looks like.
-        if let Some(gutter) = column_gutter(lines, Some(grid))
-            && (grid.origin.x < gutter) != (caption.rect.center().x < gutter)
-        {
-            outcome = GridOutcome::CrossesColumn;
-            continue;
+        // A grid on one side of the page's gutter with its caption on the other is not that
+        // caption's table: the anchor rule followed a rule across the column boundary, and the
+        // preview would show one column's table under the other column's caption. What matters is
+        // a *disagreement*, not spanning: a full-width table (a spanner) legitimately covers both
+        // columns, and so does its caption, so such a region is the table itself and stays.
+        //
+        // The gutter is measured without this grid's own cells: they are short lines with gaps
+        // between them, which is what a gutter looks like.
+        if let Some(gutter) = column_gutter(lines, Some(grid)) {
+            let grid_at = side_of_gutter(grid, gutter);
+            let caption_at = side_of_gutter(caption.rect, gutter);
+            if grid_at != Side::Spanning && caption_at != Side::Spanning && grid_at != caption_at {
+                outcome = GridOutcome::CrossesColumn;
+                continue;
+            }
         }
         return (
             Some(grid),
@@ -832,15 +892,45 @@ fn text_columns(inside: &[&TextLine]) -> usize {
 
 /// The x position of the gutter between two text columns, when the page has two.
 ///
-/// Deliberately simple and conservative. A gutter is a vertical strip that is
-/// [`GUTTER_MIN_WIDTH_PT`] wide, inside the middle of the body text, **crossed by no line at
-/// all**, with at least a fifth of the page's lines on each side. A page whose body is one column
-/// returns `None`; a page with three columns returns one of its gutters, which is enough to keep
-/// a region out of the neighbouring column — the whole point of asking.
+/// # The rule
 ///
-/// A full-width line (a paper's title on page 1, a wide equation) crosses every gutter, so such a
-/// page reports none. That is a failure of *detection*, not a wrong answer: the caller then
-/// simply does not apply the column rule.
+/// A gutter is a strip of the **middle of the body** that no ordinary text enters, with text
+/// stopping on one side of it and starting on the other. Each part of that sentence is a
+/// measured guard:
+///
+/// 1. the strip is at least [`GUTTER_MIN_WIDTH_PT`] wide;
+/// 2. its own centre lies within [`GUTTER_CENTRE_SHARE`] of the body's centre — two columns are
+///    balanced, so their boundary straddles the middle of the text block;
+/// 3. the lines that respect it dominate: at least [`MIN_GUTTER_SIDE_SHARE`] of the page's lines
+///    stop at or before its left edge, and as many start at or after its right edge. A line drawn
+///    on *both* sides of the strip — a pair of column lines that arrived as one box — is evidence
+///    for both sides at once;
+/// 4. the lines that cross it are explained: at most [`MAX_CROSSING_LINES_SHARE`] of the page's
+///    lines may reach into the strip at all, and of those at most
+///    [`MAX_TEXT_LINES_IN_GUTTER_SHARE`] may be ordinary text. A full-width element
+///    ([`SPANNER_WIDTH_SHARE`] of the body or wider: a caption, a title, a wide equation) is not
+///    ordinary column text, and neither is a mark narrower than [`STRAY_WIDTH_PT`].
+///
+/// A page whose body is one column returns `None`; a page with three columns returns one of its
+/// gutters, which is enough to keep a region out of the neighbouring column — the whole point of
+/// asking.
+///
+/// # Why the test reads characters and not line boxes
+///
+/// The first version of this function required that *no line cross* the strip. Every two-column
+/// paper contains full-width elements, so one caption disqualified the whole page: on the sample
+/// corpus it reported **0 of 298 pages** as having a gutter, and that zero was then read as "these
+/// papers are all single-column". They are not — seven of the twelve are two-column.
+///
+/// Reading the runs of characters inside each line ([`crate::InkRun`]) rather than the line boxes
+/// is what makes the difference, and it cuts both ways:
+///
+/// * a **spanner** — a caption, a heading, a wide table row — really does cross the boundary, and
+///   is allowed by (4);
+/// * a **merged pair** — a left-column line and its right-column neighbour that `lines_from`
+///   reported as one box because their baselines agree — does *not* cross the boundary, however
+///   wide its box is, because the gutter between the two runs is empty. Counting its box would
+///   have made the busiest part of a two-column page look like a page-wide paragraph.
 ///
 /// Lines centred inside `ignore` are left out. A table's own cells are short lines separated by
 /// gaps that look exactly like a gutter, and taking them for the page's column structure would
@@ -854,7 +944,7 @@ pub fn column_gutter(lines: &[TextLine], ignore: Option<Rect>) -> Option<f64> {
             None => true,
         })
         .collect();
-    if visible.len() < 6 {
+    if visible.len() < MIN_GUTTER_LINES {
         return None;
     }
 
@@ -865,49 +955,126 @@ pub fn column_gutter(lines: &[TextLine], ignore: Option<Rect>) -> Option<f64> {
         return None;
     }
 
-    let mut edges: Vec<f64> = visible
-        .iter()
-        .flat_map(|line| [line.rect.origin.x, line.rect.max_x()])
-        .collect();
-    edges.sort_by(f64::total_cmp);
-    edges.dedup_by(|left, right| (*left - *right).abs() < 0.5);
+    // Candidate boundaries: a strip can start where some run of characters ends and end where
+    // another starts. Its own centre must sit near the middle of the body — a balanced two-column
+    // page puts its gutter there, and a "boundary" at the edge of the body is a margin. The widest
+    // strip that survives the guards below is the answer; its centre is what callers place a
+    // region against.
+    let body_centre = body.origin.x + body.size.width * 0.5;
+    let reach = body.size.width * GUTTER_CENTRE_SHARE;
+    let mut left_edges: Vec<f64> = Vec::new();
+    let mut right_edges: Vec<f64> = Vec::new();
+    for line in &visible {
+        for run in text_runs(line).iter() {
+            left_edges.push(run.to);
+            right_edges.push(run.from);
+        }
+    }
+    left_edges.sort_by(f64::total_cmp);
+    left_edges.dedup_by(|left, right| (*left - *right).abs() < GUTTER_EDGE_TOLERANCE_PT);
+    right_edges.sort_by(f64::total_cmp);
+    right_edges.dedup_by(|left, right| (*left - *right).abs() < GUTTER_EDGE_TOLERANCE_PT);
+
+    let lines_f = visible.len() as f64;
+    let side_need = (lines_f * MIN_GUTTER_SIDE_SHARE).ceil() as usize;
+    let text_allowance = (lines_f * MAX_TEXT_LINES_IN_GUTTER_SHARE) as usize;
+    let crossing_allowance = (lines_f * MAX_CROSSING_LINES_SHARE) as usize;
 
     let mut best: Option<(f64, f64)> = None;
-    for pair in edges.windows(2) {
-        let (left_edge, right_edge) = (pair[0], pair[1]);
-        let width = right_edge - left_edge;
-        if width < GUTTER_MIN_WIDTH_PT {
+    for left_edge in &left_edges {
+        // `|left + right - 2 * centre| <= 2 * reach`, the widest strip first.
+        let band_from =
+            (2.0 * body_centre - 2.0 * reach - left_edge).max(left_edge + GUTTER_MIN_WIDTH_PT);
+        let band_to = 2.0 * body_centre + 2.0 * reach - left_edge;
+        if band_from > band_to {
             continue;
         }
-        // Only the middle of the page can hold a column boundary; a wide margin is not a gutter.
-        if left_edge < body.origin.x + body.size.width * 0.2
-            || right_edge > body.max_x() - body.size.width * 0.2
-        {
-            continue;
-        }
-        if visible
-            .iter()
-            .any(|line| line.rect.origin.x < right_edge && line.rect.max_x() > left_edge)
-        {
-            continue;
-        }
-        let left = visible
-            .iter()
-            .filter(|line| line.rect.max_x() <= left_edge + 0.5)
-            .count();
-        let right = visible
-            .iter()
-            .filter(|line| line.rect.origin.x >= right_edge - 0.5)
-            .count();
-        if left * 5 < visible.len() || right * 5 < visible.len() {
-            continue;
-        }
-        if best.is_none_or(|(best_width, _)| width > best_width) {
-            best = Some((width, (left_edge + right_edge) * 0.5));
+        let first = right_edges.partition_point(|edge| *edge < band_from);
+        let last = right_edges.partition_point(|edge| *edge <= band_to);
+        for right_edge in &right_edges[first..last] {
+            let width = right_edge - left_edge;
+            if width < GUTTER_MIN_WIDTH_PT {
+                continue;
+            }
+            let mut stops_before = 0usize;
+            let mut starts_after = 0usize;
+            let mut drawn_across = 0usize;
+            let mut crossing = 0usize;
+            let mut text_inside = 0usize;
+            for line in &visible {
+                let runs = text_runs(line);
+                let ink_from = runs.iter().fold(f64::MAX, |min, run| min.min(run.from));
+                let ink_to = runs.iter().fold(f64::MIN, |max, run| max.max(run.to));
+                let inside = runs.iter().any(|run| {
+                    run.from < right_edge - GUTTER_EDGE_TOLERANCE_PT
+                        && run.to > left_edge + GUTTER_EDGE_TOLERANCE_PT
+                });
+                if inside {
+                    crossing += 1;
+                    // A spanner and a stray mark are not column text; only the rest counts.
+                    let width = line.rect.size.width;
+                    if width < body.size.width * SPANNER_WIDTH_SHARE && width > STRAY_WIDTH_PT {
+                        text_inside += 1;
+                    }
+                    if crossing > crossing_allowance || text_inside > text_allowance {
+                        break;
+                    }
+                } else if ink_to <= left_edge + GUTTER_EDGE_TOLERANCE_PT {
+                    stops_before += 1;
+                } else if ink_from >= right_edge - GUTTER_EDGE_TOLERANCE_PT {
+                    starts_after += 1;
+                } else {
+                    drawn_across += 1;
+                }
+            }
+            if text_inside > text_allowance || crossing > crossing_allowance {
+                continue;
+            }
+            if stops_before + drawn_across < side_need || starts_after + drawn_across < side_need {
+                continue;
+            }
+            if best.is_none_or(|(best_width, _)| width > best_width) {
+                best = Some((width, (left_edge + right_edge) * 0.5));
+            }
         }
     }
 
     best.map(|(_, centre)| centre)
+}
+
+/// Where a line's characters are: the runs it carries, or its own box when it carries none.
+///
+/// A line built by hand — a fixture, a caller that grouped characters itself — has no runs, and
+/// then its box is the only honest reading of where its text is.
+fn text_runs(line: &TextLine) -> std::borrow::Cow<'_, [InkRun]> {
+    if line.ink.is_empty() {
+        std::borrow::Cow::Owned(vec![InkRun {
+            from: line.rect.origin.x,
+            to: line.rect.max_x(),
+        }])
+    } else {
+        std::borrow::Cow::Borrowed(&line.ink)
+    }
+}
+
+/// Which side of the page's gutter a box sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+    /// The boundary cuts the box: a full-width element, or a box that straddles two columns.
+    Spanning,
+}
+
+/// Which side of `gutter` a box is on, with [`GUTTER_EDGE_TOLERANCE_PT`] of slack.
+fn side_of_gutter(rect: Rect, gutter: f64) -> Side {
+    if rect.max_x() <= gutter + GUTTER_EDGE_TOLERANCE_PT {
+        Side::Left
+    } else if rect.origin.x >= gutter - GUTTER_EDGE_TOLERANCE_PT {
+        Side::Right
+    } else {
+        Side::Spanning
+    }
 }
 
 /// Keeps a region inside the page box; a no-op when the box is degenerate.
@@ -954,11 +1121,35 @@ mod table_tests {
         LineSegment::new(Point::new(x, y0), Point::new(x, y1))
     }
 
+    /// A line whose glyphs fill its box: the ordinary case a fixture wants.
     fn text_line(x: f64, y: f64, width: f64, text: &str) -> TextLine {
         TextLine {
             rect: Rect::new(x, y, width, 9.0),
             range: 0..0,
             text: text.to_string(),
+            ink: vec![InkRun {
+                from: x,
+                to: x + width,
+            }],
+        }
+    }
+
+    /// A line whose glyphs sit in the given runs, the way `lines_from` reports a left-column line
+    /// and its right-column neighbour when their baselines agree and it hands both back as one box.
+    fn runs_text_line(y: f64, runs: &[(f64, f64)], text: &str) -> TextLine {
+        let from = runs.iter().fold(f64::MAX, |from, run| from.min(run.0));
+        let to = runs.iter().fold(f64::MIN, |to, run| to.max(run.1));
+        TextLine {
+            rect: Rect::new(from, y, to - from, 9.0),
+            range: 0..0,
+            text: text.to_string(),
+            ink: runs
+                .iter()
+                .map(|(from, to)| InkRun {
+                    from: *from,
+                    to: *to,
+                })
+                .collect(),
         }
     }
 
@@ -1073,8 +1264,44 @@ mod table_tests {
     }
 
     #[test]
-    fn a_grid_spanning_a_two_column_gutter_is_refused() {
-        // Two columns of body text with a 30 pt gutter at x = 300, and a grid drawn across both.
+    fn a_grid_on_the_far_side_of_the_gutter_is_not_this_captions_table() {
+        // Two columns of body text with a gutter at x ≈ 295, and a grid drawn inside the right
+        // one. A caption in the left column therefore labels something else: the anchor rule
+        // followed a rule across the column boundary, and its preview would show one column's
+        // table under the other column's caption.
+        let mut lines = Vec::new();
+        for row in 0..14 {
+            let y = 600.0 - row as f64 * 14.0;
+            lines.push(text_line(60.0, y, 200.0, "left column text"));
+            lines.push(text_line(330.0, y, 200.0, "right column text"));
+        }
+        // The table's own cells, inside the right column where its rules are.
+        lines.extend(
+            [106.0, 126.0, 146.0, 166.0].map(|y| text_line(336.0, y, 138.0, "method 1.0 2.0")),
+        );
+        let mut right_column = Vec::new();
+        for y in [100.0, 120.0, 140.0, 160.0, 180.0] {
+            right_column.push(horizontal(y, 330.0, 530.0));
+        }
+        for x in [380.0, 430.0] {
+            right_column.push(vertical(x, 100.0, 180.0));
+        }
+
+        let caption = caption_at(60.0, 190.0, 150.0);
+        assert_eq!(
+            table_region(&caption, &right_column, &lines, page()),
+            None,
+            "a grid on the far side of the gutter is not this caption's table"
+        );
+        // The same grid with its caption in its own column is accepted.
+        let caption = caption_at(330.0, 190.0, 150.0);
+        assert!(table_region(&caption, &right_column, &lines, page()).is_some());
+    }
+
+    #[test]
+    fn a_full_width_table_is_not_refused_for_covering_the_gutter() {
+        // A table wider than one column covers the gutter, and so does its caption. Spanning the
+        // boundary is what a spanner does, not evidence that the grid strayed out of its column.
         let mut lines = Vec::new();
         for row in 0..14 {
             let y = 600.0 - row as f64 * 14.0;
@@ -1082,26 +1309,16 @@ mod table_tests {
             lines.push(text_line(330.0, y, 200.0, "right column text"));
         }
         lines.extend(clean_grid_text());
-
         let wide: Vec<LineSegment> = clean_grid()
             .into_iter()
-            .map(|segment| {
-                if segment.is_horizontal(0.1) {
-                    horizontal(segment.from.y, 60.0, 540.0)
-                } else {
-                    segment
-                }
+            .map(|segment| match segment.is_horizontal(0.1) {
+                true => horizontal(segment.from.y, 60.0, 540.0),
+                false => segment,
             })
             .collect();
-        let caption = caption_at(60.0, 190.0, 150.0);
-        assert_eq!(
-            table_region(&caption, &wide, &lines, page()),
-            None,
-            "a region spanning the gutter is always wrong for a preview"
-        );
-        // The same grid inside one column is accepted.
-        let caption = caption_at(200.0, 190.0, 150.0);
-        assert!(table_region(&caption, &clean_grid(), &lines, page()).is_some());
+
+        let caption = caption_at(60.0, 190.0, 400.0);
+        assert!(table_region(&caption, &wide, &lines, page()).is_some());
     }
 
     #[test]
@@ -1209,5 +1426,77 @@ mod table_tests {
             .map(|row| text_line(60.0, 600.0 - row as f64 * 14.0, 490.0, "body text"))
             .collect();
         assert_eq!(column_gutter(&one_column, None), None);
+    }
+
+    /// Two columns of body text at x 60 and x 330, on a 612 pt page.
+    fn two_column_body() -> Vec<TextLine> {
+        let mut lines = Vec::new();
+        for row in 0..16 {
+            let y = 600.0 - row as f64 * 14.0;
+            lines.push(text_line(60.0, y, 200.0, "left column text"));
+            lines.push(text_line(330.0, y, 200.0, "right column text"));
+        }
+        lines
+    }
+
+    #[test]
+    fn a_full_width_caption_does_not_disqualify_a_two_column_page() {
+        // The bug this rule replaced: one full-width element — a caption, a title, a wide
+        // equation — meant "a line crosses the boundary", so the page reported no gutter at all,
+        // and 0 of the corpus' 298 pages were read as two-column.
+        let mut lines = two_column_body();
+        lines.push(text_line(
+            60.0,
+            620.0,
+            470.0,
+            "Figure 2. Approach overview. (a) A preprocessing step, (b) the pipeline.",
+        ));
+        let gutter = column_gutter(&lines, None).expect("the caption is a spanner, not a column");
+        assert!((280.0..=320.0).contains(&gutter), "gutter at {gutter}");
+    }
+
+    #[test]
+    fn lines_that_merge_two_columns_do_not_hide_their_gutter() {
+        // `lines_from` returns a left-column line and its right-column neighbour as one box when
+        // their baselines agree. Reading boxes alone, every one of these lines "crosses" the
+        // gutter; reading the runs of glyphs inside them shows the gutter is empty.
+        let mut lines = Vec::new();
+        for row in 0..16 {
+            let y = 600.0 - row as f64 * 14.0;
+            if row % 2 == 0 {
+                lines.push(text_line(60.0, y, 200.0, "left column text"));
+                lines.push(text_line(330.0, y, 200.0, "right column text"));
+            } else {
+                lines.push(runs_text_line(
+                    y,
+                    &[(60.0, 260.0), (330.0, 530.0)],
+                    "left column text right column text",
+                ));
+            }
+        }
+        let gutter = column_gutter(&lines, None).expect("the runs show a gutter");
+        assert!((280.0..=320.0).contains(&gutter), "gutter at {gutter}");
+    }
+
+    #[test]
+    fn a_single_column_page_with_a_wide_heading_has_no_gutter() {
+        // Body text every line of which spans the body: whatever gap a heading leaves in the
+        // middle, the body is inside it, so no boundary there separates two columns.
+        let mut lines: Vec<TextLine> = (0..20)
+            .map(|row| {
+                text_line(
+                    60.0,
+                    600.0 - row as f64 * 14.0,
+                    460.0,
+                    "a line of body text",
+                )
+            })
+            .collect();
+        lines.push(runs_text_line(
+            620.0,
+            &[(100.0, 288.0), (302.0, 480.0)],
+            "2 Experiments and Evaluation",
+        ));
+        assert_eq!(column_gutter(&lines, None), None);
     }
 }
