@@ -179,6 +179,8 @@ pub struct ArisDocument {
     layout: Mutex<Option<(f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list (scanning the tail pages is not free, and it never changes).
     references: Mutex<Option<Vec<ReferenceRecord>>>,
+    /// Figure/table captions with their preview regions; same caching rule as `references`.
+    figures: Mutex<Option<Vec<FigureRecord>>>,
 }
 
 #[uniffi::export]
@@ -263,6 +265,7 @@ impl ArisDocument {
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
+            figures: Mutex::new(None),
         }))
     }
 
@@ -469,6 +472,44 @@ impl ArisDocument {
             .collect())
     }
 
+    /// `Figure N` / `Fig. N` / `Table N` references in the body text of `page`, boxed in view
+    /// space.
+    ///
+    /// These are the click targets: `kind` + `label` are the key into
+    /// [`ArisDocument::figures`], which carries the region to preview, and the box is where the
+    /// pointer has to be. The caption's own label is not among them (it is already on screen);
+    /// see `aris_reader_text::find_caption_mentions`.
+    ///
+    /// Not cached, for the same reason as [`ArisDocument::citations`]: it reads one page.
+    pub fn caption_mentions(&self, page: u32) -> Result<Vec<CaptionMentionRecord>, ArisFfiError> {
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .page_to_view(1.0);
+
+        Ok(aris_reader_text::find_caption_mentions(&raw)
+            .into_iter()
+            .map(|mention| {
+                // Page boxes use a bottom-left origin, so the mention's top edge is its y.
+                let top_left = Point::new(mention.rect.origin.x, mention.rect.max_y());
+                let view = transform.apply(top_left);
+                CaptionMentionRecord {
+                    page,
+                    kind: mention.kind,
+                    label: mention.label,
+                    start: mention.start as u32,
+                    end: mention.end as u32,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: mention.rect.size.width,
+                    height_pt: mention.rect.size.height,
+                }
+            })
+            .collect())
+    }
+
     /// The document's reference list, parsed once and cached.
     ///
     /// This is what makes a citation work **without** a link annotation: the shell resolves
@@ -595,6 +636,71 @@ impl ArisDocument {
                     .cloned()
             })
             .collect())
+    }
+
+    /// Figure and table captions across the document, each with the region to preview.
+    ///
+    /// This is what makes a `Figure 3` in the body work **without** a link annotation: the shell
+    /// resolves the mention's `kind` + `label` here and previews the record's own box. Cached
+    /// like [`ArisDocument::references`], and for the same reason — the caption set cannot change
+    /// while the document is open.
+    ///
+    /// Unlike the reference scan there is nothing to stop early on: a figure index is wanted for
+    /// the whole readable body, so the scan is a flat cap of the first 120 pages (the cap that
+    /// `references` and the CLI already use for a 2000-page manual).
+    ///
+    /// The box is the region `aris_reader_text::caption_region` derives — the caption plus the
+    /// image object it belongs to, or the padded caption when the page has none — converted to
+    /// **view space**, so it can be handed straight to [`ArisDocument::rasterize_region`].
+    pub fn figures(&self) -> Result<Vec<FigureRecord>, ArisFfiError> {
+        if let Ok(cache) = self.figures.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        let total = self.backend.page_count();
+        let scan_end = total.min(120);
+        let mut records = Vec::new();
+        for index in 0..scan_end {
+            let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
+                continue;
+            };
+            let Ok(info) = self.backend.page_info(PageIndex(index)) else {
+                continue;
+            };
+            // Images are a best-effort input: a caption with no image object still previews its
+            // own box, so a page whose objects cannot be read is not a page with no figures.
+            let (images, _rule_count) = self
+                .backend
+                .page_object_summary(PageIndex(index))
+                .unwrap_or_default();
+            let transform = info.geometry.page_to_view(1.0);
+            // The region is derived from page-space boxes, so the clamp wants the *page-space*
+            // height (the crop box), not the view-space height, which swaps under /Rotate.
+            let page_height = info.geometry.crop_box.size.height;
+
+            for caption in aris_reader_text::find_captions(&text) {
+                let region = aris_reader_text::caption_region(&caption, &images, page_height);
+                let top_left = Point::new(region.origin.x, region.max_y());
+                let view = transform.apply(top_left);
+                records.push(FigureRecord {
+                    kind: caption.kind,
+                    label: caption.label,
+                    page: index,
+                    caption_text: caption.text,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: region.size.width,
+                    height_pt: region.size.height,
+                });
+            }
+        }
+
+        if let Ok(mut cache) = self.figures.lock() {
+            *cache = Some(records.clone());
+        }
+        Ok(records)
     }
 
     /// Links on `page`, in **view space** (points, top-left origin).
@@ -857,6 +963,43 @@ pub struct ReferenceRecord {
     pub height_pt: f64,
 }
 
+/// A figure or table caption, with the region of its page a floating preview should show.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FigureRecord {
+    /// `Figure` or `Table`.
+    pub kind: String,
+    /// The number as printed: `3`, `12`.
+    pub label: String,
+    /// Page the caption lives on (0-based); the region is on that same page.
+    pub page: u32,
+    /// Caption text after the label, for the preview's title bar.
+    pub caption_text: String,
+    /// Region to preview, in **view space** (points, top-left origin).
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// A `Figure N` / `Fig. N` / `Table N` reference in the body text, boxed in **view space**.
+///
+/// `kind` + `label` resolve against [`FigureRecord`]s; `start`/`end` address the page's text
+/// layer, the same range [`CitationRecord`] uses for a citation.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CaptionMentionRecord {
+    pub page: u32,
+    pub kind: String,
+    pub label: String,
+    /// First character of the mention inside its page's text layer.
+    pub start: u32,
+    /// One past the last character of the mention.
+    pub end: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
 /// One search hit: a character range in a page's text layer.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SearchHit {
@@ -961,6 +1104,7 @@ impl ArisEngine {
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
+            figures: Mutex::new(None),
         }))
     }
 }
@@ -1062,6 +1206,48 @@ mod tests {
         for citation in document.citations(0).expect("citations") {
             assert!(citation.x_pt >= -1.0 && citation.x_pt <= size.width_pt + 1.0);
             assert!(citation.y_pt >= -1.0 && citation.y_pt <= size.height_pt + 1.0);
+        }
+    }
+
+    #[test]
+    fn figures_and_caption_mentions_are_reported_without_erroring() {
+        // The fixture's text is placeholder prose with no captions, so the contract to pin down
+        // is "absent means empty, not an error" plus well-formed boxes when there are any. The
+        // real-document behaviour is measured by `aris-reader-cli figures` against the corpus.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        let figures = document.figures().expect("figures");
+        assert!(figures.is_empty(), "the fixture has no figure captions");
+        assert!(
+            document.figures().expect("cached figures").is_empty(),
+            "the cached read must agree with the first"
+        );
+        assert!(document.caption_mentions(0).expect("mentions").is_empty());
+
+        // The same well-formedness rules as citations: a record that exists must be boxed
+        // inside its page.
+        let size = document.page_size_pt(0).expect("page size");
+        for figure in &figures {
+            assert_eq!(figure.page, 0);
+            assert!(figure.x_pt >= -1.0 && figure.x_pt <= size.width_pt + 1.0);
+            assert!(figure.y_pt >= -1.0 && figure.y_pt <= size.height_pt + 1.0);
+            assert!(figure.width_pt > 0.0 && figure.height_pt > 0.0);
+        }
+        for mention in document.caption_mentions(0).expect("mentions") {
+            assert!(mention.x_pt >= -1.0 && mention.x_pt <= size.width_pt + 1.0);
+            assert!(mention.y_pt >= -1.0 && mention.y_pt <= size.height_pt + 1.0);
+            assert!(mention.width_pt > 0.0 && mention.height_pt > 0.0);
+            assert!(mention.end > mention.start);
         }
     }
 

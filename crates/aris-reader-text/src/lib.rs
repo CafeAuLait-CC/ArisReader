@@ -17,6 +17,9 @@
 mod bibliography;
 #[cfg(test)]
 mod bibliography_tests;
+mod figures;
+
+pub use figures::{CaptionMention, caption_region, find_caption_mentions};
 
 use aris_reader_core::{Point, RawCharBox, RawTextPage, Rect};
 
