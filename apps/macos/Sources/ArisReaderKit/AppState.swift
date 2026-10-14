@@ -73,6 +73,12 @@ public final class AppState: ObservableObject {
     private var scrollIdleTask: Task<Void, Never>?
     /// Debounces writing the reading position to `UserDefaults`.
     private var positionSaveTask: Task<Void, Never>?
+    /// The position waiting for that debounce, so a flush can write it without waiting.
+    private struct PendingPosition {
+        let url: URL
+        let offset: CGFloat
+    }
+    private var pendingPosition: PendingPosition?
     /// Total content height in points (for scrollbars and clamping).
     @Published public private(set) var contentHeightPt: CGFloat = 0
     /// Width of the widest page in points; the canvas centres the content with it.
@@ -357,10 +363,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Highlights the reader added, and the file they are stored in.
+    ///
+    /// This is the array this version can *render and edit*. Entries a newer version wrote in
+    /// a shape this one does not understand are not in here: they live in
+    /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
+    /// `AnnotationSidecar`).
     @Published public private(set) var annotations: [Annotation] = []
+    /// Number of sidecar entries preserved verbatim because this version cannot interpret
+    /// them (unknown `kind`, colour outside the palette, unknown fields).
+    @Published public private(set) var preservedAnnotationEntryCount = 0
+    /// How many times this document's sidecar has been written since the document opened.
+    /// Instrumentation: it is what makes write coalescing measurable instead of asserted.
+    @Published public private(set) var annotationWriteCount = 0
+    /// True while the note editor holds text that has not reached the sidecar yet.
+    @Published public private(set) var hasPendingAnnotationWrite = false
+    /// The last recovery backup, so the UI can offer to reveal it in Finder.
+    @Published public private(set) var lastSidecarBackupURL: URL?
     private var annotationsURL: URL?
     /// A failed read permanently blocks writes for this document, protecting its sidecar.
+    /// The only way out is the explicit recovery action, which backs the file up first.
     private var annotationWritesBlockedReason: String?
+    /// The order entries had in the sidecar, so foreign entries keep their place across saves.
+    private var annotationSidecarSlots: [AnnotationSidecar.Slot] = []
+    /// Open coalescing window for note typing; see `updateNote`.
+    private var noteFlushTask: Task<Void, Never>?
+    /// True when a keystroke arrived after the current window's flush was scheduled, i.e. the
+    /// reader is still typing and the window should stay open for another round.
+    private var noteWindowSawKeystrokes = false
+    /// How long a note edit may stay in memory only. At most one sidecar write per window
+    /// while typing, plus immediate writes on commit, blur, undo, redo and flush points.
+    private static let noteCoalescingWindow = Duration.milliseconds(500)
     /// Highlight colours offered in the toolbar (BGRA, translucent so text stays readable).
     public static let highlightPalette: [(name: String, bgra: [UInt8])] = [
         ("Yellow", [0x40, 0xD8, 0xFF, 0x66]),
@@ -628,6 +660,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
+            // Development aid: ARIS_READER_SCROLL_AFTER=<ms> scrolls that long after launch
+            // (ARIS_READER_SCROLL_FRACTION, default 0.5), so a quit or a kill can be aimed
+            // inside the position debounce window instead of racing the app's startup.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_AFTER"],
+               let milliseconds = Int(raw), milliseconds >= 0 {
+                let fraction = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_FRACTION"]
+                    .flatMap(Double.init) ?? 0.5
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(milliseconds))
+                    guard let self, self.document != nil else { return }
+                    self.scroll(toFraction: fraction)
+                    let line = "aris-position: hook scrolled to \(Int(self.scrollYPt)) pt"
+                        + " at +\(milliseconds) ms (\(fraction) of the content)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
+
             // Development aid: ARIS_READER_FIND="pattern" searches at launch and reports the
             // hits on stderr, so search is verifiable without typing.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_FIND"], !raw.isEmpty {
@@ -643,8 +692,91 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     FileHandle.standardError.write(Data(line.utf8))
                 }
             }
+            // Development aid: ARIS_READER_NOTE="text" types that text into the first
+            // annotation's note one character at a time (a TextField setter per keystroke), so
+            // write coalescing is measurable: ARIS_READER_NOTE_INTERVAL_MS sets the delay
+            // between keystrokes, ARIS_READER_NOTE_COMMIT=1 commits the field at the end.
+            if let text = ProcessInfo.processInfo.environment["ARIS_READER_NOTE"], !text.isEmpty {
+                let interval = Int(ProcessInfo.processInfo.environment["ARIS_READER_NOTE_INTERVAL_MS"] ?? "") ?? 30
+                let commit = ProcessInfo.processInfo.environment["ARIS_READER_NOTE_COMMIT"] == "1"
+                Task { @MainActor [weak self] in
+                    // `ARIS_READER_ANNOTATE` needs ~2.3 s to settle a selection; typing into
+                    // its annotation starts after that.
+                    try? await Task.sleep(for: .milliseconds(2500))
+                    guard let self, let id = self.annotations.first?.id else {
+                        FileHandle.standardError.write(
+                            Data("aris-annotate: note hook found no annotation to type into\n".utf8)
+                        )
+                        return
+                    }
+                    let prefix = self.annotations.first(where: { $0.id == id })?.note ?? ""
+                    var typed = prefix
+                    for character in text {
+                        typed.append(character)
+                        self.updateNote(typed, for: id)
+                        try? await Task.sleep(for: .milliseconds(interval))
+                    }
+                    if commit { self.commitNoteEdits() }
+                    let line = "aris-annotate: note hook typed \(text.count) character(s)"
+                        + " in \(interval) ms steps, writes so far #\(self.annotationWriteCount)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
+
+            // Development aid: ARIS_READER_RECOVER_SIDECAR=1 runs the explicit recovery for a
+            // sidecar that failed to load, so the backup path is visible on stderr.
+            if ProcessInfo.processInfo.environment["ARIS_READER_RECOVER_SIDECAR"] == "1" {
+                if let reason = annotationWritesBlockedReason {
+                    FileHandle.standardError.write(
+                        Data("aris-annotate: writes blocked: \(reason)\n".utf8)
+                    )
+                    let backup = recoverUnreadableAnnotationSidecar()
+                    FileHandle.standardError.write(
+                        Data("aris-annotate: recovery \(backup == nil ? "failed" : "backup=\(backup!.path)")\n".utf8)
+                    )
+                } else {
+                    FileHandle.standardError.write(
+                        Data("aris-annotate: recovery hook found no blocked sidecar\n".utf8)
+                    )
+                }
+            }
         }
     }
+
+    /// Installs the flush hooks a shell needs: the normal AppKit quit path, and the signals a
+    /// harness or the OS uses to stop the app. Called once by the window when it appears — the
+    /// check harness deliberately does not install it.
+    public func installTerminationHandling() {
+        guard terminationObserver == nil else { return }
+
+        // A normal quit: ⌘Q, the app menu, or `NSApplication.terminate`. Delivered synchronously
+        // on the posting (main) thread, before the process leaves.
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.flushPendingWrites() }
+        }
+
+        // SIGTERM/SIGINT (what a harness or the OS sends). Flush and leave directly rather than
+        // asking AppKit to terminate: a *modal alert* holds `terminate` back indefinitely, and a
+        // process that ignores SIGTERM is worse than one that exits without animation.
+        for number in [SIGTERM, SIGINT] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in
+                self?.flushPendingWrites()
+                exit(128 + number) // the conventional "terminated by signal N" status
+            }
+            source.resume()
+            terminationSignalSources.append(source)
+        }
+    }
+
+    /// Kept so the observers can be removed if the state ever outlives the notification centre.
+    private var terminationObserver: NSObjectProtocol?
+    private var terminationSignalSources: [DispatchSourceSignal] = []
 
     public var windowTitle: String {
         document?.title ?? "Lyra"
@@ -694,9 +826,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        // Pending writes describe the document being replaced or closed, so they have to land
+        // before the state that carries them (sidecar URL, scroll offset) is cleared.
+        flushPendingWrites()
         documentEpoch &+= 1
         searchEpoch &+= 1
         positionSaveTask?.cancel()
+        pendingPosition = nil
         closeReferencePreview()
         invalidateTiles()
         canvasPages = []
@@ -722,6 +858,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotations = []
         annotationsURL = nil
         annotationWritesBlockedReason = nil
+        annotationSidecarSlots = []
+        preservedAnnotationEntryCount = 0
+        hasPendingAnnotationWrite = false
+        noteFlushTask?.cancel()
+        noteFlushTask = nil
         undoStack = []
         redoStack = []
         scrollYPt = 0
@@ -887,7 +1028,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
         var updated = annotations
         updated.append(annotation)
-        guard saveAnnotations(updated) else { return false }
+        guard saveAnnotations(updated, trigger: "add") else { return false }
         undoStack.append(.added(annotation))
         redoStack.removeAll()
         reloadVisiblePages()
@@ -907,7 +1048,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let removed = annotations[index]
         var updated = annotations
         updated.remove(at: index)
-        guard saveAnnotations(updated) else { return }
+        guard saveAnnotations(updated, trigger: "remove") else { return }
         undoStack.append(.removed(removed))
         redoStack.removeAll()
         reloadVisiblePages()
@@ -932,8 +1073,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func undo() {
         guard let action = undoStack.last else { return }
+        flushPendingAnnotationWrite()
         let updated = annotations(applying: action, undoing: true)
-        guard saveAnnotations(updated) else { return }
+        guard saveAnnotations(updated, trigger: "undo") else { return }
         undoStack.removeLast()
         redoStack.append(action)
         reloadVisiblePages()
@@ -942,8 +1084,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func redo() {
         guard let action = redoStack.last else { return }
+        flushPendingAnnotationWrite()
         let updated = annotations(applying: action, undoing: false)
-        guard saveAnnotations(updated) else { return }
+        guard saveAnnotations(updated, trigger: "redo") else { return }
         redoStack.removeLast()
         undoStack.append(action)
         reloadVisiblePages()
@@ -973,27 +1116,120 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return updated
     }
 
+    /// Applies a note keystroke.
+    ///
+    /// Memory and the undo stack update on every call — typing has to stay responsive — but the
+    /// *disk* write is coalesced: the first keystroke of a window writes as every other
+    /// mutation does (candidate first, publish only if it landed), and further keystrokes
+    /// within `noteCoalescingWindow` are carried to disk by one scheduled flush. Committing the
+    /// field, blurring it, undo/redo, switching documents and quitting all flush immediately.
     public func updateNote(_ note: String, for id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         let oldNote = annotations[index].note
         guard oldNote != note else { return }
+
         var updated = annotations
         updated[index].note = note
-        guard saveAnnotations(updated) else { return }
+        let mergedUndo = undoStack(mergingNoteEditFor: id, from: oldNote, to: note)
 
-        // SwiftUI's TextField setter fires for each keystroke. Merge consecutive edits to
-        // the same note into one undo step while preserving the original value.
-        if let last = undoStack.last,
+        if noteFlushTask != nil {
+            // A coalescing window is already open: publish now, let the scheduled flush write.
+            annotations = updated
+            undoStack = mergedUndo
+            redoStack.removeAll()
+            hasPendingAnnotationWrite = true
+            noteWindowSawKeystrokes = true
+            return
+        }
+
+        // First keystroke of a window: exactly the old, safe path — the candidate goes to disk
+        // first and memory/undo are published only if that write succeeded.
+        guard saveAnnotations(updated, trigger: "keystroke") else { return }
+        annotations = updated
+        undoStack = mergedUndo
+        redoStack.removeAll()
+        scheduleNoteFlush()
+    }
+
+    /// SwiftUI's TextField setter fires for each keystroke. Merge consecutive edits to
+    /// the same note into one undo step while preserving the original value.
+    private func undoStack(
+        mergingNoteEditFor id: UUID,
+        from oldNote: String,
+        to note: String
+    ) -> [UndoableAction] {
+        var stack = undoStack
+        if let last = stack.last,
            case .noteChanged(let lastID, let original, let previous) = last,
            lastID == id, previous == oldNote {
-            undoStack.removeLast()
+            stack.removeLast()
             if original != note {
-                undoStack.append(.noteChanged(id: id, oldNote: original, newNote: note))
+                stack.append(.noteChanged(id: id, oldNote: original, newNote: note))
             }
         } else {
-            undoStack.append(.noteChanged(id: id, oldNote: oldNote, newNote: note))
+            stack.append(.noteChanged(id: id, oldNote: oldNote, newNote: note))
         }
-        redoStack.removeAll()
+        return stack
+    }
+
+    private func scheduleNoteFlush() {
+        noteFlushTask?.cancel()
+        noteWindowSawKeystrokes = false
+        noteFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.noteCoalescingWindow)
+            guard !Task.isCancelled else { return }
+            self?.noteCoalescingWindowElapsed()
+        }
+    }
+
+    /// One coalescing window is over: write what is pending, and stay open while the reader is
+    /// still typing. That is what bounds a burst to roughly one write per window instead of
+    /// one write per keystroke *and* a second one each time a window closes.
+    private func noteCoalescingWindowElapsed() {
+        noteFlushTask = nil
+        if hasPendingAnnotationWrite {
+            _ = saveAnnotations(annotations, trigger: "coalesced")
+        }
+        // A failed write closes the window instead of rescheduling: the next keystroke then
+        // takes the safe synchronous path again and can report the failure to the reader.
+        guard noteWindowSawKeystrokes, !hasPendingAnnotationWrite else { return }
+        scheduleNoteFlush()
+    }
+
+    /// True while an open coalescing window is still holding note text back from the sidecar.
+    /// (Instrumentation: it is what lets a check or a log line tell "queued" from "written".)
+    public var noteWriteWindowIsOpen: Bool { noteFlushTask != nil }
+
+    /// Called when the note field is committed (Return) or loses focus: the text reaches the
+    /// sidecar now instead of at the end of the coalescing window.
+    public func commitNoteEdits() {
+        flushPendingAnnotationWrite()
+    }
+
+    /// Writes a note edit that is still only in memory. Returns false when the write failed
+    /// (the pending state is kept, so the next flush point retries it).
+    @discardableResult
+    public func flushPendingAnnotationWrite() -> Bool {
+        noteFlushTask?.cancel()
+        noteFlushTask = nil
+        noteWindowSawKeystrokes = false
+        guard hasPendingAnnotationWrite else { return true }
+        return saveAnnotations(annotations, trigger: "flush")
+    }
+
+    /// Lands everything that is still only in memory. Called on quit, on document switch, on
+    /// tab close and by `resetDocumentState`, so a scroll or a typed note cannot be lost just
+    /// because the debounce had not expired yet.
+    public func flushPendingWrites() {
+        let pendingNote = hasPendingAnnotationWrite
+        let pendingPosition = self.pendingPosition != nil
+        guard pendingNote || pendingPosition else { return }
+        if pendingNote { flushPendingAnnotationWrite() }
+        if pendingPosition { flushPendingPositionSave() }
+        let written = [pendingNote ? "note" : nil, pendingPosition ? "position" : nil]
+            .compactMap { $0 }
+            .joined(separator: " + ")
+        FileHandle.standardError.write(Data("aris-annotate: flushed pending \(written)\n".utf8))
     }
 
     /// Shows an annotation: selects its range and scrolls it into view.
@@ -1020,24 +1256,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let sidecarURL = Self.sidecarURL(for: url)
         annotationsURL = sidecarURL
         annotationWritesBlockedReason = nil
+        preservedAnnotationEntryCount = 0
+        annotationSidecarSlots = []
+        annotationWriteCount = 0
+        hasPendingAnnotationWrite = false
 
         do {
             _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
             let data = try Data(contentsOf: sidecarURL)
-            let decoded = try JSONDecoder().decode([Annotation].self, from: data)
-            guard decoded.allSatisfy({ $0.page >= 0 && $0.page < (document?.pageCount ?? 0)
-                && $0.start >= 0 && $0.end >= $0.start
-                && Self.highlightPalette.indices.contains($0.colorIndex) }),
-                Set(decoded.map(\.id)).count == decoded.count else {
-                throw NSError(domain: "Lyra", code: 3,
-                    userInfo: [NSLocalizedDescriptionKey: "Invalid annotation page, range, color or duplicate identity"])
-            }
-            annotations = decoded
+            let contents = try AnnotationSidecar.decode(
+                data,
+                pageCount: document?.pageCount ?? 0,
+                paletteCount: Self.highlightPalette.count
+            )
+            annotations = contents.annotations
+            annotationSidecarSlots = contents.slots
+            preservedAnnotationEntryCount = contents.preservedCount
             undoStack.removeAll()
             redoStack.removeAll()
-            FileHandle.standardError.write(
-                Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
-            )
+            let line = "aris-annotate: loaded \(contents.annotations.count) annotation(s)"
+                + ", \(contents.preservedCount) preserved from a newer version\n"
+            FileHandle.standardError.write(Data(line.utf8))
         } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             annotations = []
             undoStack.removeAll()
@@ -1057,8 +1296,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Writes a candidate first and publishes it only after the atomic write succeeds.
     /// Any unreadable/corrupt existing sidecar is protected from accidental replacement.
+    ///
+    /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
+    /// happened (a keystroke, a coalesced flush, a tab switch, …).
     @discardableResult
-    private func saveAnnotations(_ candidate: [Annotation]) -> Bool {
+    private func saveAnnotations(_ candidate: [Annotation], trigger: String) -> Bool {
         guard let annotationsURL else {
             statusMessage = "Could not save annotations: no document sidecar is selected"
             lastError = statusMessage
@@ -1068,29 +1310,122 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage = "Could not save annotations because the sidecar could not be loaded; it was left untouched"
             lastError = statusMessage
             FileHandle.standardError.write(
-                Data("aris-annotate: write blocked: \(reason)\n".utf8)
+                Data("aris-annotate: write blocked [\(trigger)]: \(reason)\n".utf8)
             )
             return false
         }
 
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(candidate)
+            let data = try AnnotationSidecar.encode(
+                annotations: candidate,
+                slots: annotationSidecarSlots
+            )
             try data.write(to: annotationsURL, options: .atomic)
             annotations = candidate
-            FileHandle.standardError.write(
-                Data("aris-annotate: saved \(candidate.count) annotation(s)\n".utf8)
-            )
+            hasPendingAnnotationWrite = false
+            annotationWriteCount += 1
+            let line = "aris-annotate: saved \(candidate.count) annotation(s)"
+                + " (\(preservedAnnotationEntryCount) preserved),"
+                + " write #\(annotationWriteCount) [\(trigger)]\n"
+            FileHandle.standardError.write(Data(line.utf8))
             return true
         } catch {
             statusMessage = "Could not save annotations: \(error.localizedDescription)"
             lastError = statusMessage
             FileHandle.standardError.write(
-                Data("aris-annotate: save failed: \(error)\n".utf8)
+                Data("aris-annotate: save failed [\(trigger)]: \(error)\n".utf8)
             )
             return false
         }
+    }
+
+    // MARK: - Recovery from a sidecar that cannot be read
+
+    /// True when this document's sidecar failed to load, so writes are refused until the
+    /// reader explicitly decides what to do with the file.
+    public var canRecoverUnreadableAnnotationSidecar: Bool {
+        annotationsURL != nil && annotationWritesBlockedReason != nil
+    }
+
+    /// The explicit way out of the blocked state.
+    ///
+    /// It never overwrites the unreadable file: the sidecar is *moved* to
+    /// `<name>.corrupt-<timestamp>.json` in the same directory, so the reader can inspect or
+    /// restore it, and only then is a fresh empty sidecar written. Returns the backup URL, or
+    /// `nil` when nothing was recovered (in which case the blocked state is kept and the
+    /// reason is reported).
+    @discardableResult
+    public func recoverUnreadableAnnotationSidecar() -> URL? {
+        guard let sidecarURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
+
+        let fileManager = FileManager.default
+        var backupURL: URL?
+        if fileManager.fileExists(atPath: sidecarURL.path) {
+            let destination = Self.uniqueBackupURL(for: sidecarURL)
+            do {
+                try fileManager.moveItem(at: sidecarURL, to: destination)
+                backupURL = destination
+                FileHandle.standardError.write(
+                    Data("aris-annotate: moved unreadable sidecar to \(destination.path)\n".utf8)
+                )
+            } catch {
+                let message = "Could not back up the unreadable annotation sidecar: \(error.localizedDescription)"
+                statusMessage = message
+                lastError = message
+                FileHandle.standardError.write(
+                    Data("aris-annotate: recovery failed, sidecar left in place: \(error)\n".utf8)
+                )
+                return nil
+            }
+        }
+
+        // The path is free now, so a stale blocked flag must not stop the fresh write.
+        annotationWritesBlockedReason = nil
+        annotations = []
+        annotationSidecarSlots = []
+        preservedAnnotationEntryCount = 0
+        undoStack.removeAll()
+        redoStack.removeAll()
+        lastSidecarBackupURL = backupURL
+
+        guard saveAnnotations([], trigger: "recovery") else {
+            // The rename succeeded but the directory is not writable: keep refusing writes so
+            // the state stays honest, and let the reader retry (the file is already backed up).
+            annotationWritesBlockedReason = lastError ?? "the sidecar could not be recreated"
+            return nil
+        }
+
+        statusMessage = backupURL.map {
+            "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh sidecar"
+        } ?? "Started a fresh annotation sidecar"
+        return backupURL
+    }
+
+    /// `<doc>.pdf.aris-annotations.json` → `<doc>.pdf.aris-annotations.corrupt-<stamp>.json`,
+    /// with a numeric suffix if that name is taken: an earlier backup is never overwritten.
+    static func uniqueBackupURL(for sidecarURL: URL, now: Date = Date()) -> URL {
+        let base = sidecarURL.deletingPathExtension()
+        let stamp = backupStampFormatter.string(from: now)
+        var candidate = base.appendingPathExtension("corrupt-\(stamp).json")
+        var counter = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = base.appendingPathExtension("corrupt-\(stamp)-\(counter).json")
+            counter += 1
+        }
+        return candidate
+    }
+
+    private static let backupStampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter
+    }()
+
+    /// Reveals a recovery backup in Finder (called by the UI, never by the checks).
+    public func revealSidecarBackupInFinder(_ url: URL? = nil) {
+        guard let target = url ?? lastSidecarBackupURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([target])
     }
 
     /// Public entry point for the sidebar's search results list.
@@ -1623,13 +1958,38 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func schedulePositionSave() {
         guard let url = document?.url else { return }
-        let offset = Double(scrollYPt)
+        pendingPosition = PendingPosition(url: url, offset: scrollYPt)
         positionSaveTask?.cancel()
-        positionSaveTask = Task { @MainActor in
+        positionSaveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            UserDefaults.standard.set(offset, forKey: Self.positionKey(for: url))
+            self?.positionSaveTask = nil
+            _ = self?.commitPendingPositionSave(trigger: "debounce")
         }
+    }
+
+    /// Writes a position that is still only in memory (quit, document switch, tab close).
+    @discardableResult
+    public func flushPendingPositionSave() -> Bool {
+        positionSaveTask?.cancel()
+        positionSaveTask = nil
+        return commitPendingPositionSave(trigger: "flush")
+    }
+
+    private func commitPendingPositionSave(trigger: String) -> Bool {
+        guard let pending = pendingPosition else { return true }
+        pendingPosition = nil
+        // Prefer the live offset: while its document is still on screen it is the reader's
+        // real position, which matters when a restore or a resize moved it after scheduling.
+        let offset = document?.url == pending.url ? scrollYPt : pending.offset
+        UserDefaults.standard.set(Double(offset), forKey: Self.positionKey(for: pending.url))
+        // The system flushes defaults on a normal quit but not when the process is killed,
+        // and losing the reading position is exactly what this flush exists to prevent.
+        UserDefaults.standard.synchronize()
+        FileHandle.standardError.write(
+            Data("aris-position: saved \(Int(offset)) pt [\(trigger)]\n".utf8)
+        )
+        return true
     }
 
     private static func positionKey(for url: URL) -> String {
@@ -1644,6 +2004,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
         reloadVisiblePages()
+        // A scrollbar drag is a scroll like any other: it has to schedule the same debounced
+        // position save, or a drag right before quitting would be lost.
+        schedulePositionSave()
     }
 
     /// Marks the indicator as in use and schedules it to fade out. The task is replaced on

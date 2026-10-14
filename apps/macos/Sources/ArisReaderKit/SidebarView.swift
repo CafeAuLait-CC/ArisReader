@@ -7,6 +7,9 @@ import SwiftUI
 /// (bookmarks, annotations, AI) keep their empty state until their milestone.
 public struct SidebarView: View {
     @ObservedObject private var state: AppState
+    /// Which note field has focus, so losing it commits the pending write immediately instead
+    /// of leaving the text to the coalescing window (`AppState.updateNote`).
+    @FocusState private var focusedNote: UUID?
 
     public init(state: AppState) {
         self.state = state
@@ -222,6 +225,8 @@ public struct SidebarView: View {
                                     )
                                     .textFieldStyle(.plain)
                                     .font(.caption)
+                                    .focused($focusedNote, equals: annotation.id)
+                                    .onSubmit { state.commitNoteEdits() }
 
                                     Text(
                                         "Page \(annotation.page + 1) · \(annotation.kind.rawValue) · "
@@ -247,6 +252,10 @@ public struct SidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .onChange(of: focusedNote) { previous, current in
+                    // Blur (or moving to another note) commits what was typed.
+                    if previous != nil, previous != current { state.commitNoteEdits() }
+                }
             }
         }
     }

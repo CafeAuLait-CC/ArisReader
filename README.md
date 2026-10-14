@@ -80,6 +80,14 @@ cd apps/macos && swift build && swift run ArisReader
 #    In a sandboxed shell (CI, agent runners) add --disable-sandbox: SwiftPM's nested
 #    sandbox-exec is rejected there. scripts/check.sh retries automatically.
 #    Tip: ARIS_READER_OPEN=/path/to.pdf swift run ArisReader opens a document at launch.
+#    Dev hooks for headless checks (all optional, all logged on stderr):
+#      ARIS_READER_ANNOTATE="x1,y1;x2,y2"  highlight the text between two content points
+#      ARIS_READER_NOTE="text"             type into the first note, one keystroke at a time
+#                                          (ARIS_READER_NOTE_INTERVAL_MS, ARIS_READER_NOTE_COMMIT=1)
+#      ARIS_READER_RECOVER_SIDECAR=1       back up an unreadable sidecar and start fresh
+#      ARIS_READER_QUIT_AFTER=<ms>         quit through the normal flush path
+#    Sidecar writes are instrumented as `aris-annotate: saved N annotation(s) … write #K [trigger]`,
+#    which is what makes note-write coalescing measurable (at most one write per ~500 ms of typing).
 
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/Lyra.app
@@ -122,7 +130,7 @@ resolve locally.
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Cross-page selection, incremental search, history, split/facing views and full session restoration remain. |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. PDF annotation import/write-back, ink, page operations and export remain. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. A sidecar that cannot be read still refuses every write, but the reader can now back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. PDF annotation import/write-back, ink, page operations and export remain. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. Unlinked equations, cross-page bibliography fragments, vector-figure segmentation, pinning and index persistence remain. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
