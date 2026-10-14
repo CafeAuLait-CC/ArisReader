@@ -18,7 +18,9 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 Current status: **M1–M4 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
 tabs, sidecar highlights/underlines/notes, and citation/figure/table/algorithm previews.
-Milestone acceptance criteria are not all met: see the [review reports](reviews/) for concrete
+Milestone acceptance criteria are not all met: the milestone table below names what is missing, and the
+full review record (findings, evidence and follow-ups) is kept with the project's design notes rather than in
+this repository. Concrete
 fixes, validation evidence and outstanding work. PDFium remains serialized within a process;
 background execution does not imply parallel PDFium rendering.
 
@@ -118,10 +120,10 @@ resolve locally.
 | Milestone | Theme | Status |
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
-| M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: [M1](reviews/M1-rendering.md) |
-| M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Cross-page selection, incremental search, history, split/facing views and full session restoration remain. [M2](reviews/M2-reading.md) |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. PDF annotation import/write-back, ink, page operations and export remain. [M3](reviews/M3-annotations.md) |
-| M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. Unlinked equations, cross-page bibliography fragments, precise table/vector segmentation, pinning and index persistence remain. [M4](reviews/M4-previews.md) |
+| M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: |
+| M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Cross-page selection, incremental search, history, split/facing views and full session restoration remain. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. PDF annotation import/write-back, ink, page operations and export remain. |
+| M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. Unlinked equations, cross-page bibliography fragments, vector-figure segmentation, pinning and index persistence remain. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
 | M7 | Polish: performance, accessibility, internationalization, auto-update, notarized distribution | ⬜ |
