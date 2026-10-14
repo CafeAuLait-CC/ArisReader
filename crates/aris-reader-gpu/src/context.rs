@@ -45,6 +45,58 @@ fn fs_main() -> @location(0) vec4<f32> {
 /// Colour of the spike triangle in linear-ish sRGB, used by the verification.
 pub const SPIKE_TRIANGLE_RGBA: [u8; 4] = [242, 89, 38, 255];
 
+/// Creates the wgpu surface for a native target.
+///
+/// Only the Apple `CAMetalLayer` path exists today, and `SurfaceTargetUnsafe::CoreAnimationLayer`
+/// is (correctly) Apple-only in wgpu 30 — one definition for every platform therefore does not
+/// compile: on Linux the whole crate failed with `E0599` in CI's `linux-core` job. The second
+/// definition below keeps the crate building there and reports the same "not implemented" as the
+/// unfinished targets.
+#[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
+fn create_surface(
+    instance: &wgpu::Instance,
+    target: SurfaceTarget,
+) -> Result<wgpu::Surface<'static>> {
+    let pointer = match target {
+        SurfaceTarget::CoreAnimationLayer(pointer) => pointer,
+        other => {
+            return Err(ArisError::not_implemented(&format!(
+                "surface target {other:?} (Windows/Linux land in M6)"
+            )));
+        }
+    };
+    if pointer.is_null() {
+        return Err(ArisError::new(
+            ErrorCode::InvalidArgument,
+            "CAMetalLayer pointer is null",
+        ));
+    }
+    // SAFETY: the caller guarantees (documented on `SurfaceTarget`) that the layer stays alive
+    // until `detach_surface`, and that it is a valid `CAMetalLayer`. `'static` is the lifetime
+    // wgpu requires for unsafe surface creation; the FFI layer enforces it by keeping the
+    // layer's owner (the NSView) alive for the whole surface lifetime.
+    unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(pointer))
+    }
+    .map_err(|error| {
+        ArisError::new(ErrorCode::GpuUnavailable, "could not create a wgpu surface")
+            .with_detail(error.to_string())
+    })
+}
+
+/// Non-Apple platforms: the Metal-only surface path is not available, and wgpu does not even
+/// declare the `CoreAnimationLayer` target there.
+#[cfg(not(target_vendor = "apple"))]
+fn create_surface(
+    _instance: &wgpu::Instance,
+    target: SurfaceTarget,
+) -> Result<wgpu::Surface<'static>> {
+    Err(ArisError::not_implemented(&format!(
+        "surface target {target:?} (Windows/Linux land in M6)"
+    )))
+}
+
 /// What happened during one rendered frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameReport {
@@ -100,6 +152,18 @@ impl GpuContext {
     /// `validation` enables wgpu's validation layer; the FFI layer turns it on for
     /// debug builds (see `ARIS_READER_GPU_VALIDATION`).
     pub fn new(validation: bool) -> Result<Self> {
+        // wgpu *panics* when the target platform has no backend compiled in, and this workspace
+        // enables only Metal (crates/aris-reader-gpu/Cargo.toml), so on Linux every caller used
+        // to die inside `Instance::new` instead of taking the "no GPU" path the tests, the FFI
+        // and `check.sh` already handle. Report it like a missing adapter.
+        if !wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::METAL) {
+            return Err(ArisError::new(
+                ErrorCode::GpuUnavailable,
+                "this build has no wgpu backend for the target platform",
+            )
+            .with_detail("only the Metal backend is enabled (crates/aris-reader-gpu/Cargo.toml)"));
+        }
+
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::METAL;
         descriptor.flags = if validation {
@@ -175,43 +239,14 @@ impl GpuContext {
 
     /// Registers a native layer as a render target and configures it.
     ///
-    /// The only `unsafe` in this crate: wgpu cannot verify the raw layer pointer, so the
-    /// contract documented on [`SurfaceTarget`] is ours to uphold.
-    #[allow(unsafe_code)]
+    /// The `unsafe` part (wgpu cannot verify the raw layer pointer, so the contract documented
+    /// on [`SurfaceTarget`] is ours to uphold) lives in `create_surface`.
     pub fn attach_surface(
         &mut self,
         target: SurfaceTarget,
         config: SurfaceConfig,
     ) -> Result<SurfaceId> {
-        let surface = match target {
-            SurfaceTarget::CoreAnimationLayer(pointer) => {
-                if pointer.is_null() {
-                    return Err(ArisError::new(
-                        ErrorCode::InvalidArgument,
-                        "CAMetalLayer pointer is null",
-                    ));
-                }
-                // SAFETY: the caller guarantees (documented on `SurfaceTarget`) that
-                // the layer stays alive until `detach_surface`, and that it is a valid
-                // `CAMetalLayer`. `'static` is the lifetime wgpu requires for unsafe
-                // surface creation; the FFI layer enforces it by keeping the layer's
-                // owner (the NSView) alive for the whole surface lifetime.
-                unsafe {
-                    self.instance.create_surface_unsafe(
-                        wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(pointer),
-                    )
-                }
-            }
-            other => {
-                return Err(ArisError::not_implemented(&format!(
-                    "surface target {other:?} (Windows/Linux land in M6)"
-                )));
-            }
-        }
-        .map_err(|error| {
-            ArisError::new(ErrorCode::GpuUnavailable, "could not create a wgpu surface")
-                .with_detail(error.to_string())
-        })?;
+        let surface = create_surface(&self.instance, target)?;
 
         let capabilities = surface.get_capabilities(&self.adapter);
         let format = capabilities
