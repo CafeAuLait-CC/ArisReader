@@ -65,6 +65,7 @@ public final class AppState: ObservableObject {
 
     /// Pages the canvas should draw right now (usually one or two while scrolling).
     @Published public private(set) var canvasPages: [CanvasPage] = []
+    private var canvasTiles: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public private(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
@@ -107,7 +108,14 @@ public final class AppState: ObservableObject {
     private var tileOrder: [TileKey] = []
     /// Tiles whose rasterization is in flight, so scrolling does not queue one twice.
     private var tilesInFlight: Set<TileKey> = []
-    private let tileCacheLimit = 48
+    private let tileCacheLimit = 96
+    private var pendingTiles: [(TileKey, PagePlacement)] = []
+    private var pagePreviews: [Int: PageImage] = [:]
+    private var pagePreviewInFlight: Int?
+    private var desiredPreviewPages: [Int] = []
+    private var failedPreviewPages: Set<Int> = []
+    private var failedTiles: Set<TileKey> = []
+    private var scrollDirection: CGFloat = 1
     /// Bumped whenever the cache is invalidated (zoom or document change): results that
     /// arrive afterwards are stale and get dropped.
     private var renderEpoch: UInt64 = 0
@@ -450,6 +458,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Small page previews for the sidebar, keyed by page index.
     @Published public private(set) var thumbnails: [Int: PageImage] = [:]
     private var thumbnailsInFlight: Set<Int> = []
+    private var pendingThumbnails: [Int] = []
     /// Thumbnail width in points; height follows the page's aspect ratio.
     public let thumbnailWidthPt: CGFloat = 132
     /// How many pages get a preview. Loading every page of a 2000-page manual up front would
@@ -466,11 +475,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var selectionAnchor: Int?
     /// 1×1 texture drawn as a translucent quad over selected characters — the same
     /// textured-quad pipeline the pages use, so selection needs no new GPU path.
-    private lazy var highlightImage = PageImage(
+    private lazy var selectionImage = PageImage(
         pixelWidth: 1,
         pixelHeight: 1,
         pointSize: .zero,
-        bgra: Data([0x40, 0xC0, 0xFF, 0x55]),
+        bgra: Data([0xFF, 0x80, 0x00, 0x55]),
         generation: 1
     )
 
@@ -492,6 +501,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         tileCache.removeAll()
         tileOrder.removeAll()
         tilesInFlight.removeAll()
+        pendingTiles = []
+        failedTiles = []
+        pagePreviews = [:]
+        pagePreviewInFlight = nil
+        desiredPreviewPages = []
+        failedPreviewPages = []
         renderEpoch &+= 1
     }
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
@@ -836,6 +851,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         closeReferencePreview()
         invalidateTiles()
         canvasPages = []
+        canvasTiles = []
         visiblePagePlacements = []
         textPages = [:]
         textPagesInFlight = []
@@ -850,6 +866,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         outline = []
         thumbnails = [:]
         thumbnailsInFlight = []
+        pendingThumbnails = []
         searchHits = []
         currentHitIndex = nil
         isSearching = false
@@ -872,19 +889,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
-        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
-        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomActual() {
         zoomPercent = 100
-        invalidateTiles()
         reloadVisiblePages()
     }
 
@@ -902,7 +916,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func setDeviceScale(_ scale: CGFloat) {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
-        invalidateTiles()
+        thumbnails = [:]
+        loadThumbnails()
         reloadVisiblePages()
     }
 
@@ -917,8 +932,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func scroll(byScreenPoints delta: CGFloat) {
         guard document != nil else { return }
         let contentDelta = delta / max(zoomFactor, 0.01)
+        if delta != 0 { scrollDirection = delta > 0 ? 1 : -1 }
         let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
-        let next = min(max(0, scrollYPt - contentDelta), maxOffset)
+        let next = min(max(0, scrollYPt + contentDelta), maxOffset)
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
@@ -1492,7 +1508,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
     /// ⌘C can copy it.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
-        guard wasClick else { return }
+        guard wasClick else {
+            extendSelection(to: point)
+            return
+        }
         previewEpoch &+= 1
 
         // A click tries three things, in this order:
@@ -1918,22 +1937,39 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
 
-        let scale = thumbnailWidthPt / max(document.firstPageSize.width, 1)
         let pages = requestedPage.map { [$0] } ?? Array(0..<min(document.pageCount, thumbnailLimit))
         for page in pages where page >= 0 && page < document.pageCount {
-            guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page) else { continue }
-            thumbnailsInFlight.insert(page)
+            guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page), !pendingThumbnails.contains(page) else { continue }
+            if requestedPage != nil { pendingThumbnails.insert(page, at: 0) }
+            else { pendingThumbnails.append(page) }
+        }
+        pumpThumbnails()
+    }
 
-            let epoch = documentEpoch
-            Task { @MainActor [weak self] in
-                guard let self else { return }
+    private func pumpThumbnails() {
+        guard thumbnailsInFlight.isEmpty, !pendingThumbnails.isEmpty, let document else { return }
+        let page = pendingThumbnails.removeFirst()
+        thumbnailsInFlight.insert(page)
+        let backingScale = deviceScale
+        let targetWidth = Int((thumbnailWidthPt * max(backingScale, 1)).rounded())
+        // Supersample before reduction: a PDFium minimum-width stroke must not
+        // become an opaque pixel in the final thumbnail (or two on a Retina display).
+        let scale = CGFloat(targetWidth * 4) / max(document.firstPageSize.width, 1)
+        let epoch = documentEpoch
+        Task { @MainActor [weak self] in
+            guard let self, epoch == self.documentEpoch else { return }
+            let image = try? await self.engine.renderPage(page, scale: scale)
+            guard epoch == self.documentEpoch else { return }
+            if backingScale == self.deviceScale, let image {
+                let reduced = await Task.detached { image.downsampled(toWidth: targetWidth) }.value
                 guard epoch == self.documentEpoch else { return }
-                defer { if epoch == self.documentEpoch { self.thumbnailsInFlight.remove(page) } }
-                if let image = try? await self.engine.renderPage(page, scale: scale) {
-                    guard epoch == self.documentEpoch else { return }
-                    self.thumbnails[page] = image
-                }
+                if backingScale == self.deviceScale { self.thumbnails[page] = reduced }
+                else { self.pendingThumbnails.insert(page, at: 0) }
+            } else if backingScale != self.deviceScale {
+                self.pendingThumbnails.insert(page, at: 0)
             }
+            self.thumbnailsInFlight.remove(page)
+            self.pumpThumbnails()
         }
     }
 
@@ -2041,12 +2077,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Makes sure the tiles covering the viewport exist, and hands the ready ones to the
     /// canvas.
     ///
-    /// Rasterization happens off the main thread, so a tile that is not ready yet is simply
-    /// not drawn this frame and appears when it lands. LOD selection is discrete: zooming
-    /// changes which tiles are wanted, never how an existing one was rasterized.
+    /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
+    /// tiles until all visible tiles on that page are ready, then replace them together.
+    /// This prevents the page from disappearing or sharpening in a visible diagonal sweep.
     public func reloadVisiblePages() {
         guard document != nil else {
             canvasPages = []
+            canvasTiles = []
             contentHeightPt = 0
             return
         }
@@ -2055,7 +2092,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt)
 
         let viewportHeight = viewportHeightContentPt
-        let margin = viewportHeight * 0.5
+        let margin = viewportHeight * 2
         let visible = engine.visiblePages(
             scrollYPt: scrollYPt,
             viewportHeightPt: viewportHeight,
@@ -2070,15 +2107,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // Viewport in content points, expanded by the prefetch margin. Every column is
         // taken: a page is a handful of columns wide, and horizontal scrolling does not
         // exist yet.
-        let top = scrollYPt - margin
-        let bottom = scrollYPt + viewportHeight + margin
+        let top = scrollYPt - viewportHeight * (scrollDirection < 0 ? 2 : 0.5)
+        let bottom = scrollYPt + viewportHeight * (scrollDirection > 0 ? 3 : 1.5)
 
         visiblePagePlacements = Array(visible)
 
+        pendingTiles = []
+        // Whole-page previews are bounded and prepared ahead of the scroll direction.
+        desiredPreviewPages = visible.sorted {
+            abs($0.topPt - scrollYPt) < abs($1.topPt - scrollYPt)
+        }.prefix(8).map(\.index)
+        schedulePagePreview()
         var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
 
         for placement in visible {
+            var ready: [CanvasPage] = []
+            var complete = true
+            let previous = canvasTiles.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == placement.index }
+            let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
             let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
             let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
             let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
@@ -2099,14 +2146,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     )
 
                     if let cached = tileCache[key] {
-                        pages.append(CanvasPage(placement: tilePlacement, image: cached.image))
+                        ready.append(CanvasPage(placement: tilePlacement, image: cached.image))
                     } else {
+                        if tilePlacement.topPt < scrollYPt + viewportHeight,
+                           tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
+                            complete = false
+                        }
                         scheduleTile(key, placement: tilePlacement)
                     }
                 }
             }
+            if changingLOD && !complete {
+                pages.append(contentsOf: previous)
+            } else if !complete, let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
+                // A complete, lower-resolution page replaces the checkerboard of arriving tiles.
+                pages.append(CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
+                    topPt: placement.topPt, leftPt: placement.leftPt,
+                    widthPt: placement.widthPt, heightPt: placement.heightPt), image: preview))
+            } else if complete {
+                pages.append(contentsOf: ready)
+            }
         }
+        let viewportTop = scrollYPt
+        pendingTiles.sort { a, b in
+            func priority(_ item: (TileKey, PagePlacement)) -> CGFloat {
+                let rect = item.1
+                let distance = max(viewportTop - rect.topPt - rect.heightPt,
+                    rect.topPt - viewportTop - viewportHeight, 0)
+                return distance
+            }
+            return priority(a) < priority(b)
+        }
+        pumpTiles()
 
+        canvasTiles = pages
         appendSelectionHighlights(to: &pages)
         prefetchTextLayers(for: visible)
         loadCaptionMentions()
@@ -2117,7 +2190,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
     }
 
-    /// Adds one translucent quad per selected character, plus one per annotated character.
+    /// Updates overlays without reloading tiles or scheduling document analysis during a drag.
+    private func refreshSelectionOverlay() {
+        var pages = canvasTiles
+        appendSelectionHighlights(to: &pages)
+        canvasPages = pages
+    }
+
+    /// Adds continuous line rectangles for selection and annotations.
     ///
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
@@ -2126,8 +2206,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             appendHighlight(
                 page: selection.page,
                 range: selection.range,
-                image: highlightImage,
-                idBase: 900_000_000,
+                image: selectionImage,
+                idBase: -1_000_000_000,
                 to: &pages
             )
         }
@@ -2139,7 +2219,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 range: annotation.start...max(annotation.start, annotation.end),
                 image: highlightTextures[annotation.colorIndex],
                 // Distinct ids keep the canvas from reusing a texture it already has.
-                idBase: 800_000_000 + annotationIndex * 4_096,
+                idBase: -2_000_000_000 + annotationIndex * 4_096,
                 // An underline is a thin bar on the baseline instead of a filled box.
                 verticalScale: annotation.kind == .underline ? 0.1 : 1.0,
                 verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
@@ -2161,21 +2241,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               let placement = visiblePagePlacements.first(where: { $0.index == page })
         else { return }
 
-        for index in range where index < textPage.chars.count {
-            let character = textPage.chars[index]
-            pages.append(
-                CanvasPage(
-                    placement: PagePlacement(
-                        index: idBase + index,
-                        topPt: placement.topPt + character.yPt
-                            + character.heightPt * verticalOffset,
-                        leftPt: placement.leftPt + character.xPt,
-                        widthPt: character.widthPt,
-                        heightPt: max(character.heightPt * verticalScale, 1)
-                    ),
-                    image: image
-                )
-            )
+        for (index, rect) in textPage.selectionRects(in: range).enumerated() {
+            pages.append(CanvasPage(
+                placement: PagePlacement(
+                    index: idBase + index,
+                    topPt: placement.topPt + rect.minY + rect.height * verticalOffset,
+                    leftPt: placement.leftPt + rect.minX,
+                    widthPt: rect.width,
+                    heightPt: max(rect.height * verticalScale, 1)
+                ),
+                image: image
+            ))
         }
     }
 
@@ -2210,7 +2286,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         selectionAnchor = hit.index
         selection = Selection(page: hit.page, range: hit.index...hit.index)
-        reloadVisiblePages()
+        refreshSelectionOverlay()
     }
 
     /// Extends the selection to a point in content space.
@@ -2221,18 +2297,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               hit.page == current.page
         else { return }
 
-        selection = Selection(
-            page: current.page,
-            range: min(anchor, hit.index)...max(anchor, hit.index)
-        )
-        reloadVisiblePages()
+        let range = min(anchor, hit.index)...max(anchor, hit.index)
+        guard range != current.range else { return }
+        selection = Selection(page: current.page, range: range)
+        refreshSelectionOverlay()
     }
 
     public func clearSelection() {
         guard selection != nil || selectionAnchor != nil else { return }
         selection = nil
         selectionAnchor = nil
-        reloadVisiblePages()
+        refreshSelectionOverlay()
     }
 
     /// Copies the selected characters (⌘C from the canvas).
@@ -2250,8 +2325,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage = "Copied \(string.count) characters"
     }
 
-    /// Character under a content-space point: containment first, then the nearest box on
-    /// the same line, so clicking just past the end of a word still lands somewhere useful.
+    /// Hit-test the nearest visual line, including inferred whitespace, before its characters.
     private func characterIndex(at point: CGPoint) -> (page: Int, index: Int)? {
         for placement in visiblePagePlacements {
             let pageRect = CGRect(
@@ -2268,26 +2342,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 x: point.x - placement.leftPt,
                 y: point.y - placement.topPt
             )
-            var best: (index: Int, distance: CGFloat)?
-
-            for (index, character) in textPage.chars.enumerated() {
-                let box = CGRect(
-                    x: character.xPt,
-                    y: character.yPt,
-                    width: character.widthPt,
-                    height: character.heightPt
-                )
-                if box.contains(local) {
-                    return (placement.index, index)
-                }
-                guard abs(box.midY - local.y) < max(box.height * 1.5, 14) else { continue }
-                let distance = abs(box.midX - local.x)
-                if best == nil || distance < best!.distance {
-                    best = (index, distance)
-                }
-            }
-
-            if let best { return (placement.index, best.index) }
+            if let index = textPage.characterIndex(at: local) { return (placement.index, index) }
             return nil
         }
         return nil
@@ -2295,7 +2350,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Rasterizes one tile in the background and folds it into the cache.
     private func scheduleTile(_ key: TileKey, placement: PagePlacement) {
-        guard !tilesInFlight.contains(key) else { return }
+        guard !tilesInFlight.contains(key), !failedTiles.contains(key) else { return }
+        pendingTiles.append((key, placement))
+    }
+
+    private func pumpTiles() {
+        while tilesInFlight.count < 2, !pendingTiles.isEmpty {
+            let (key, placement) = pendingTiles.removeFirst()
+            startTile(key, placement: placement)
+        }
+    }
+
+    private func startTile(_ key: TileKey, placement: PagePlacement) {
         tilesInFlight.insert(key)
 
         let epoch = renderEpoch
@@ -2321,8 +2387,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } catch {
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
+                self.failedTiles.insert(key)
                 self.lastError = String(describing: error)
+                self.reloadVisiblePages()
             }
+        }
+    }
+
+    /// Only one preview is queued at a time, so fast scrolling can change the next
+    /// destination without leaving an entire document's raster work ahead of it.
+    private func schedulePagePreview() {
+        let keeping = Set(desiredPreviewPages)
+        pagePreviews = pagePreviews.filter { keeping.contains($0.key) }
+        guard pagePreviewInFlight == nil,
+              let page = desiredPreviewPages.first(where: { pagePreviews[$0] == nil && !failedPreviewPages.contains($0) })
+        else { return }
+        pagePreviewInFlight = page
+        let epoch = renderEpoch
+        Task { @MainActor [weak self] in
+            guard let self, epoch == self.renderEpoch else { return }
+            do {
+                let image = try await self.engine.renderPage(page, scale: 1)
+                guard epoch == self.renderEpoch else { return }
+                if self.desiredPreviewPages.contains(page) { self.pagePreviews[page] = image }
+            } catch {
+                guard epoch == self.renderEpoch else { return }
+                self.failedPreviewPages.insert(page)
+            }
+            self.pagePreviewInFlight = nil
+            self.reloadVisiblePages()
         }
     }
 
@@ -2331,15 +2424,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard tileCache.count > tileCacheLimit else { return }
 
         var remaining = tileCache.count - tileCacheLimit
-        var scanned = 0
-        while remaining > 0, scanned < tileOrder.count {
-            let key = tileOrder[scanned]
-            scanned += 1
-            guard !wanted.contains(key) else { continue }
-            if tileCache.removeValue(forKey: key) != nil {
-                remaining -= 1
-            }
+        tileOrder.removeAll { key in
+            guard remaining > 0, !wanted.contains(key) else { return false }
+            if tileCache.removeValue(forKey: key) != nil { remaining -= 1 }
+            return true
         }
-        tileOrder.removeFirst(min(scanned, tileOrder.count))
     }
 }
