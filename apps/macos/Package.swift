@@ -30,6 +30,11 @@ let package = Package(
         .library(name: "ArisReaderKit", targets: ["ArisReaderKit"]),
     ],
     targets: [
+        .executableTarget(
+            name: "ArisReaderChecks",
+            dependencies: ["ArisReaderKit"],
+            path: "Checks"
+        ),
         .target(
             name: "ArisReaderFFI",
             path: "Sources/ArisReaderFFI",

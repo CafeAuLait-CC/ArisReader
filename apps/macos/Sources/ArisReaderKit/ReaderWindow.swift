@@ -10,7 +10,6 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
-    @State private var sidebarVisible = true
 
     public init(state: AppState) {
         self.state = state
@@ -18,17 +17,27 @@ public struct ReaderWindow: View {
 
     public var body: some View {
         HStack(spacing: 0) {
-            if sidebarVisible {
+            if state.sidebarVisible {
                 SidebarView(state: state)
                     .frame(width: 240)
                     .background(Color(nsColor: .windowBackgroundColor))
                 Divider()
             }
-            canvas
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                if !state.tabs.isEmpty { TabStrip(state: state) }
+                canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .frame(minWidth: 900, minHeight: 600)
         .toolbar { toolbarContent }
+        .alert("ArisReader", isPresented: Binding(
+            get: { state.lastError != nil },
+            set: { if !$0 { state.lastError = nil } }
+        )) {
+            Button("OK") { state.lastError = nil }
+        } message: {
+            Text(state.lastError ?? "")
+        }
         .fileImporter(
             isPresented: $state.showFileImporter,
             allowedContentTypes: [.pdf],
@@ -68,6 +77,7 @@ public struct ReaderWindow: View {
                     onUndo: { state.undo() },
                     onRedo: { state.redo() }
             )
+            HStack { Spacer(); ScrollIndicator(state: state) }
             secondSurface
 
             if state.document == nil {
@@ -326,7 +336,7 @@ public struct ReaderWindow: View {
             .help("Show/hide the second render surface (multi-surface check)")
 
             Button {
-                sidebarVisible.toggle()
+                state.sidebarVisible.toggle()
             } label: {
                 Image(systemName: "sidebar.left")
             }

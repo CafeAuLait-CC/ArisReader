@@ -320,6 +320,7 @@ public final class RustEngine: PDFEngine {
     /// once per open document (the caption set cannot change while the file is open) and
     /// dropped by `openDocument` — the same lifetime the Rust side gives its own cache.
     private var figuresCache: [Figure]?
+    private var documentEpoch: UInt64 = 0
 
     public init() throws {
         self.engine = try ArisEngine()
@@ -331,12 +332,13 @@ public final class RustEngine: PDFEngine {
 
     public func openDocument(at url: URL) throws -> LoadedDocument {
         let opened = try engine.openDocument(path: url.path, password: nil)
-        document = opened
         // A new document means a new caption index; keeping the old one would resolve a
         // `Figure 3` click to the previous paper's artwork.
-        figuresCache = nil
-
         let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
+
+        document = opened
+        documentEpoch &+= 1
+        figuresCache = nil
 
         return LoadedDocument(
             title: url.deletingPathExtension().lastPathComponent,
@@ -624,6 +626,7 @@ public final class RustEngine: PDFEngine {
         // The index is document-wide and the Rust call walks up to 120 pages, so a second
         // click must not pay for the scan again.
         if let figuresCache { return figuresCache }
+        let epoch = documentEpoch
         guard let document else { return [] }
 
         let records: [FigureRecord] = try await withCheckedThrowingContinuation { continuation in
@@ -647,7 +650,7 @@ public final class RustEngine: PDFEngine {
                 heightPt: CGFloat(record.heightPt)
             )
         }
-        figuresCache = figures
+        if epoch == documentEpoch { figuresCache = figures }
         return figures
     }
 
