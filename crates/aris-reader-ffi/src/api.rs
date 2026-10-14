@@ -177,10 +177,21 @@ pub struct ArisDocument {
     page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
     /// Last computed layout, keyed by the page gap it was built for.
     layout: Mutex<Option<(f64, Arc<DocumentLayout>)>>,
-    /// Parsed reference list (scanning the tail pages is not free, and it never changes).
-    references: Mutex<Option<Vec<ReferenceRecord>>>,
+    /// Parsed reference list, with the citation style it implies (scanning the tail pages is
+    /// not free, and neither ever changes while the document is open).
+    references: Mutex<Option<ReferenceCache>>,
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
+}
+
+/// The parsed reference list together with the citation style it implies.
+///
+/// One cache rather than two: both are derived from the same scan of the document, and the
+/// detector must judge a superscript run against exactly the list the resolver will answer from.
+#[derive(Clone)]
+struct ReferenceCache {
+    records: Vec<ReferenceRecord>,
+    style: aris_reader_text::CitationStyle,
 }
 
 #[uniffi::export]
@@ -477,6 +488,13 @@ impl ArisDocument {
     }
 
     /// Citations in the body text of `page`, boxed in view space.
+    ///
+    /// A page's citations are not a page-local question any more: a superscript numeral is only
+    /// a citation when the document's bibliography carries its label, so this call now depends
+    /// on [`ArisDocument::references`] and pays its one-time scan the first time it runs. The
+    /// shell loads the reference list when a document opens, so in practice the cache is warm;
+    /// the alternative — guessing on page one and correcting on page twenty — would make the
+    /// same citation clickable or not depending on how far the reader had scrolled.
     pub fn citations(&self, page: u32) -> Result<Vec<CitationRecord>, ArisFfiError> {
         let raw = self.backend.raw_text_page(PageIndex(page))?;
         let transform = self
@@ -485,7 +503,11 @@ impl ArisDocument {
             .geometry
             .page_to_view(1.0);
 
-        Ok(aris_reader_text::find_citations(&raw)
+        // Superscript numerals are only reported when the document's own bibliography
+        // corroborates them, which is why this reads the shared style rather than the page.
+        let style = self.reference_cache()?.style;
+
+        Ok(aris_reader_text::find_citations_with(&raw, &style)
             .into_iter()
             .map(|citation| {
                 let top_left = Point::new(
@@ -549,126 +571,7 @@ impl ArisDocument {
     /// This is what makes a citation work **without** a link annotation: the shell resolves
     /// `[12]` to an entry and previews the entry's own rectangle.
     pub fn references(&self) -> Result<Vec<ReferenceRecord>, ArisFfiError> {
-        if let Ok(cache) = self.references.lock()
-            && let Some(cached) = cache.as_ref()
-        {
-            return Ok(cached.clone());
-        }
-
-        // Scanning from the front with a cap, rather than only the tail: real papers put the
-        // list anywhere from a third of the way in (with appendices after it) to the very end.
-        // `find_references` stops as soon as the list ends, so the cost is bounded by the list's
-        // position, and the cap keeps a 2000-page manual from being read page by page.
-        let total = self.backend.page_count();
-        let scan_end = total.min(120);
-        let mut pages = Vec::new();
-        for index in 0..scan_end {
-            if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
-                pages.push((index, text));
-            }
-        }
-
-        // Ground-truth pass: a paper that links its citations into the bibliography is telling us
-        // exactly where each entry starts, and those landings beat any numbering rule. Collect
-        // them first, then let the shared locator decide page by page.
-        let mut landings: std::collections::BTreeMap<u32, Vec<f64>> =
-            std::collections::BTreeMap::new();
-        if let Some(first_list_page) =
-            aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000)
-                .iter()
-                .map(|entry| entry.page)
-                .min()
-        {
-            // Only the body can point into the list, so there is no need to scan past it.
-            for body_page in 0..first_list_page {
-                let Ok(links) = self.backend.link_targets(PageIndex(body_page)) else {
-                    continue;
-                };
-                for link in links {
-                    if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
-                        && target.get() >= first_list_page
-                    {
-                        landings.entry(target.get()).or_default().push(top);
-                    }
-                }
-            }
-        }
-
-        let entries = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
-
-        let mut records = Vec::with_capacity(entries.len());
-        // One page → view transform per page, not per fragment: a bibliography page holds dozens
-        // of entries and each of their fragments asks for the same page again.
-        let mut transforms: std::collections::HashMap<u32, aris_reader_core::Transform2D> =
-            std::collections::HashMap::new();
-        for entry in entries {
-            // The entry's box comes from the character boxes of its own range, so the preview
-            // can show exactly the entry rather than a whole page.
-            let Ok(text) = self.backend.raw_text_page(PageIndex(entry.page)) else {
-                continue;
-            };
-            if document_page_view(&self.backend, &mut transforms, entry.page).is_none() {
-                continue;
-            }
-            // The single rectangle stays the box on the entry's own page. For one fragment that
-            // is the fragment's own box, unchanged; when the entry is split, it is the union of
-            // the pieces that page carries. A continuation on another page cannot be part of a
-            // box here: the record names one page, and the preview rasterizes that page.
-            let on_page = entry
-                .fragments
-                .iter()
-                .filter(|fragment| fragment.page == entry.page)
-                .map(|fragment| fragment.rect)
-                .reduce(aris_reader_core::Rect::union);
-            let rect = match on_page {
-                Some(rect) => rect,
-                // No fragment geometry (the text layer offered no boxes): fall back to the
-                // character boxes of the entry's own range, as this used to read.
-                None => {
-                    let slice = &text.chars
-                        [entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
-                    let Some(rect) = union_of_char_boxes(slice) else {
-                        continue;
-                    };
-                    rect
-                }
-            };
-            let Some(view) = view_box(&self.backend, &mut transforms, entry.page, rect) else {
-                continue;
-            };
-
-            let mut fragments = Vec::with_capacity(entry.fragments.len());
-            for fragment in &entry.fragments {
-                let Some(view) =
-                    view_box(&self.backend, &mut transforms, fragment.page, fragment.rect)
-                else {
-                    continue;
-                };
-                fragments.push(ReferenceFragment {
-                    page: fragment.page,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: fragment.rect.size.width,
-                    height_pt: fragment.rect.size.height,
-                });
-            }
-
-            records.push(ReferenceRecord {
-                label: entry.label,
-                text: entry.text,
-                page: entry.page,
-                x_pt: view.x,
-                y_pt: view.y,
-                width_pt: rect.size.width,
-                height_pt: rect.size.height,
-                fragments,
-            });
-        }
-
-        if let Ok(mut cache) = self.references.lock() {
-            *cache = Some(records.clone());
-        }
-        Ok(records)
+        Ok(self.reference_cache()?.records.clone())
     }
 
     /// Resolves every label of a citation against the reference list.
@@ -931,6 +834,137 @@ impl ArisDocument {
         }
         sizes
     }
+
+    /// The reference list plus the citation style it implies, parsed once.
+    ///
+    /// [`ArisDocument::citations`] needs the same list: a superscript numeral is only a citation
+    /// if the bibliography carries its label and the body does not bracket its citations. Both
+    /// answers come from this one scan, so the detector can never disagree with the resolver
+    /// about which labels exist.
+    fn reference_cache(&self) -> Result<ReferenceCache, ArisFfiError> {
+        if let Ok(cache) = self.references.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        // Scanning from the front with a cap, rather than only the tail: real papers put the
+        // list anywhere from a third of the way in (with appendices after it) to the very end.
+        // `find_references` stops as soon as the list ends, so the cost is bounded by the list's
+        // position, and the cap keeps a 2000-page manual from being read page by page.
+        let total = self.backend.page_count();
+        let scan_end = total.min(120);
+        let mut pages = Vec::new();
+        for index in 0..scan_end {
+            if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
+                pages.push((index, text));
+            }
+        }
+
+        // Ground-truth pass: a paper that links its citations into the bibliography is telling us
+        // exactly where each entry starts, and those landings beat any numbering rule. Collect
+        // them first, then let the shared locator decide page by page.
+        let mut landings: std::collections::BTreeMap<u32, Vec<f64>> =
+            std::collections::BTreeMap::new();
+        if let Some(first_list_page) =
+            aris_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000)
+                .iter()
+                .map(|entry| entry.page)
+                .min()
+        {
+            // Only the body can point into the list, so there is no need to scan past it.
+            for body_page in 0..first_list_page {
+                let Ok(links) = self.backend.link_targets(PageIndex(body_page)) else {
+                    continue;
+                };
+                for link in links {
+                    if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
+                        && target.get() >= first_list_page
+                    {
+                        landings.entry(target.get()).or_default().push(top);
+                    }
+                }
+            }
+        }
+
+        let entries = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
+        let style = aris_reader_text::CitationStyle::for_document(&pages, &entries);
+
+        let mut records = Vec::with_capacity(entries.len());
+        // One page → view transform per page, not per fragment: a bibliography page holds dozens
+        // of entries and each of their fragments asks for the same page again.
+        let mut transforms: std::collections::HashMap<u32, aris_reader_core::Transform2D> =
+            std::collections::HashMap::new();
+        for entry in entries {
+            // The entry's box comes from the character boxes of its own range, so the preview
+            // can show exactly the entry rather than a whole page.
+            let Ok(text) = self.backend.raw_text_page(PageIndex(entry.page)) else {
+                continue;
+            };
+            if document_page_view(&self.backend, &mut transforms, entry.page).is_none() {
+                continue;
+            }
+            // The single rectangle stays the box on the entry's own page. For one fragment that
+            // is the fragment's own box, unchanged; when the entry is split, it is the union of
+            // the pieces that page carries. A continuation on another page cannot be part of a
+            // box here: the record names one page, and the preview rasterizes that page.
+            let on_page = entry
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.page == entry.page)
+                .map(|fragment| fragment.rect)
+                .reduce(aris_reader_core::Rect::union);
+            let rect = match on_page {
+                Some(rect) => rect,
+                // No fragment geometry (the text layer offered no boxes): fall back to the
+                // character boxes of the entry's own range, as this used to read.
+                None => {
+                    let slice = &text.chars
+                        [entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
+                    let Some(rect) = union_of_char_boxes(slice) else {
+                        continue;
+                    };
+                    rect
+                }
+            };
+            let Some(view) = view_box(&self.backend, &mut transforms, entry.page, rect) else {
+                continue;
+            };
+
+            let mut fragments = Vec::with_capacity(entry.fragments.len());
+            for fragment in &entry.fragments {
+                let Some(view) =
+                    view_box(&self.backend, &mut transforms, fragment.page, fragment.rect)
+                else {
+                    continue;
+                };
+                fragments.push(ReferenceFragment {
+                    page: fragment.page,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: fragment.rect.size.width,
+                    height_pt: fragment.rect.size.height,
+                });
+            }
+
+            records.push(ReferenceRecord {
+                label: entry.label,
+                text: entry.text,
+                page: entry.page,
+                x_pt: view.x,
+                y_pt: view.y,
+                width_pt: rect.size.width,
+                height_pt: rect.size.height,
+                fragments,
+            });
+        }
+
+        let cache = ReferenceCache { records, style };
+        if let Ok(mut guard) = self.references.lock() {
+            *guard = Some(cache.clone());
+        }
+        Ok(cache)
+    }
 }
 
 /// Largest edge length a single page texture may have.
@@ -1014,6 +1048,7 @@ fn flatten_outline(
 }
 
 /// A citation in the body text, boxed in **view space**.
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CitationRecord {
     pub page: u32,

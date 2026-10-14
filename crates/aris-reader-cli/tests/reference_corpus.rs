@@ -5,7 +5,8 @@
 use aris_reader_core::{DocumentBackend, PageIndex};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{
-    find_citations, find_references, find_references_with_landings, resolve_reference,
+    CitationStyle, find_citations_with, find_references, find_references_with_landings,
+    resolve_reference,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -72,10 +73,14 @@ fn sample_citations_resolve_to_bibliography_entries() {
                 "{prefix}: {entry:?}"
             );
         }
+        // The app's detector, style included: the corpus cites as `[n]` throughout, so the
+        // superscript path stays off here — which is the point of measuring it, rather than
+        // assuming it.
+        let style = CitationStyle::for_document(&pages, &references);
         let citations: Vec<_> = pages
             .iter()
             .take(3)
-            .flat_map(|(_, text)| find_citations(text))
+            .flat_map(|(_, text)| find_citations_with(text, &style))
             .collect();
         let hits = citations
             .iter()

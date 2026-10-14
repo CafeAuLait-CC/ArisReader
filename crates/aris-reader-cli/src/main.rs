@@ -1102,6 +1102,10 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         }
     }
 
+    // One style for the whole document: superscript numerals are only reported when the
+    // bibliography above carries their labels and the body does not bracket its citations.
+    let style = aris_reader_text::CitationStyle::for_document(&pages, &references);
+
     let mut resolved = 0usize;
     let mut attempted = 0usize;
     for index in 0..total.min(body_pages) {
@@ -1112,7 +1116,7 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         // One detector for the whole project: the crate produces the labels (including the
         // surname-year keys author-year lists are matched by). The CLI used to re-extract
         // numbers itself, which silently ignored every citation that was not numeric.
-        for citation in aris_reader_text::find_citations(&text) {
+        for citation in aris_reader_text::find_citations_with(&text, &style) {
             if citation.labels.is_empty() {
                 continue;
             }

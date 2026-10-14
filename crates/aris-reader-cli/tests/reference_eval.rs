@@ -30,8 +30,8 @@
 use aris_reader_core::{DocumentBackend, PageIndex, RawTextPage};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{
-    Citation, ReferenceEntry, find_citations, find_references, find_references_with_landings,
-    resolve_reference, resolve_references,
+    Citation, CitationStyle, ReferenceEntry, find_citations_with, find_references,
+    find_references_with_landings, resolve_reference, resolve_references,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -127,8 +127,8 @@ const FLOORS: &[Floor] = &[
         recall: 0.90,
     }, // measured 100% (13/13)
     // Papers whose citation style the detector has no path for. The floor is 0.00 because the
-    // measurement is vacuous, NOT because the parser is fine: these two rows are the milestone's
-    // worst result and the table's probe columns are what expose them.
+    // measurement is vacuous, NOT because the parser is fine: the table's probe columns are what
+    // expose them.
     Floor {
         id: "2005.14165",
         recall: 0.00,
@@ -136,11 +136,16 @@ const FLOORS: &[Floor] = &[
     Floor {
         id: "1712.01815",
         recall: 0.00,
-    }, // superscript numerals: 20 in the body, 0 spans detected
+    }, // NOT superscripts in this text layer: its citations are ordinary `(9)` / `(2, 14)` at
+    // body size on the baseline (height ratio 0.97, rise +0.27 pt against a 10.69 pt body), so
+    // no geometric rule can see them; the 20 shapes are counted by the `(12)` column
     Floor {
         id: "1710.05463",
-        recall: 0.00,
-    }, // superscript numerals: 16 in the body, 0 spans detected
+        recall: 0.90,
+    }, // measured 100% (18/18) once superscript numerals were detected; the floor is new, and it
+       // is 0.90 rather than 1.00 because only the part of the list the bibliography parser
+       // selects (entries 34-68) can corroborate a label: its main-text citations, labels 1-33,
+       // are dropped by the label guard instead of being guessed at
 ];
 
 /// Floor for a paper in the corpus that has no row above. Deliberately low: the explicit rows
@@ -396,9 +401,12 @@ fn measure(id: &str, path: &Path) -> Paper {
     // counting those would measure the bibliography against itself. With no bibliography found,
     // fall back to the first three pages, the window the regression contract samples.
     let body_end = first_entry_page.unwrap_or(3).max(1);
+    // The app's detector, not a stand-in for it: the same style object decides whether a raised
+    // numeral is a superscript citation, so "0 spans" here means the app shows 0 too.
+    let style = CitationStyle::for_document(&pages, &references);
     let mut citations: Vec<(u32, Citation)> = Vec::new();
     for (page, text) in pages.iter().filter(|(page, _)| *page < body_end) {
-        for citation in find_citations(text) {
+        for citation in find_citations_with(text, &style) {
             citations.push((*page, citation));
         }
         let (alnum, paren) = unmodelled_shapes(&text.text);

@@ -50,8 +50,14 @@
 #
 # COVERED
 # numeric brackets [12]                     | 1512.03385 1706.03762 1810.04805 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 1408.5882 1909.05722 2104.08886 2110.12477
-# numeric with punctuation "12."            | 1712.01815 1710.05463 2403.04370 (list labels; their in-text forms are superscripts)
-# superscript numerals                      | 1710.05463 (attached to words: "winds5,6,23-26") 1712.01815 (parenthesised superscripts: "(2, 14)")
+# numeric with punctuation "12."            | 1712.01815 1710.05463 2403.04370 (list labels; 1710.05463 cites
+#                                            | them as superscripts, 1712.01815 as round numerals)
+# superscript numerals                      | 1710.05463 (attached to words: "winds5,6,23-26"; detected since the
+#                                            | superscript path landed: 18 of its 18 body spans resolve)
+#                                            | 1712.01815 is NOT covered here: measured 2026-10-14, its arXiv
+#                                            | text layer draws "(9)" and "(2, 14)" at body size on the baseline
+#                                            | (height ratio 0.97, rise +0.27 pt against a 10.69 pt body), so it
+#                                            | carries no superscript geometry for a box-based rule to find
 # alphanumeric labels                       | 2005.14165 ("[HR18]", "[VSP+ 17]")
 # no numbers at all (author-year)           | 2010.11929 1807.06209 1710.05833
 # grouped labels [1,2] / [1-3] / (A 2020; B 2021) | 1512.03385 1706.03762 2303.08774 2103.00020 1912.01703 1602.05629 2104.08886 2005.14165 1807.06209 1710.05833
@@ -91,7 +97,10 @@
 # non-Latin author names                   | 1905.11946 1912.01703 2005.14165 (romanized CJK), 1807.06209 (diacritics)
 #
 # GAPS — not covered by any paper in this set
-# numeric with the "(12)" round form       | Nature/Science use superscripts, not round brackets, in the body; the round form appears only in the extracted text layer
+# numeric with the "(12)" round form       | still open, and not fixable by the superscript path: 1712.01815 has 20
+#                                            | of them with no superscript geometry at all; 1909.05722 has 55 and
+#                                            | 2110.12477 has 52, most of them equation numbers, so a
+#                                            | parenthesised-numeral detector is not simply the same feature
 # alphanumeric labels of the "A.1"/"S3" kind | 2005.14165 covers [HR18]-style labels, not supplementary numbering
 # a non-English bibliography heading       | every paper here is written in English ("Referencias"/"Literaturverzeichnis" untested)
 # a "Bibliography" heading                 | all twenty use "References"/"REFERENCES"/none
