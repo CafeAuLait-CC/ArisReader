@@ -31,7 +31,7 @@ public struct ReaderWindow: View {
         }
         .frame(minWidth: 900, minHeight: 600)
         .toolbar { toolbarContent }
-        .alert("ArisReader", isPresented: Binding(
+        .alert("Lyra", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
         )) {

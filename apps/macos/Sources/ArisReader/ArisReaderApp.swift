@@ -22,7 +22,7 @@ struct ArisReaderApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("ArisReader") {
+        WindowGroup("Lyra") {
             ReaderWindow(state: state)
         }
         .defaultSize(width: 1200, height: 800)

@@ -370,7 +370,7 @@ public final class RustEngine: PDFEngine {
     public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         guard let document else {
             throw NSError(
-                domain: "ArisReader",
+                domain: "Lyra",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No document is open"]
             )
@@ -428,7 +428,7 @@ public final class RustEngine: PDFEngine {
     ) async throws -> TileImage {
         guard let document else {
             throw NSError(
-                domain: "ArisReader",
+                domain: "Lyra",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No document is open"]
             )
@@ -468,7 +468,7 @@ public final class RustEngine: PDFEngine {
     public func textPage(_ page: Int) async throws -> TextPage {
         guard let document else {
             throw NSError(
-                domain: "ArisReader",
+                domain: "Lyra",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No document is open"]
             )
@@ -511,7 +511,7 @@ public final class RustEngine: PDFEngine {
     ) async throws -> PageImage {
         guard let document else {
             throw NSError(
-                domain: "ArisReader",
+                domain: "Lyra",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No document is open"]
             )
@@ -835,7 +835,7 @@ public final class MockEngine: PDFEngine {
 
     public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         throw NSError(
-            domain: "ArisReader",
+            domain: "Lyra",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize pages"]
         )
@@ -849,7 +849,7 @@ public final class MockEngine: PDFEngine {
         tileSize: Int
     ) async throws -> TileImage {
         throw NSError(
-            domain: "ArisReader",
+            domain: "Lyra",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize tiles"]
         )
@@ -857,7 +857,7 @@ public final class MockEngine: PDFEngine {
 
     public func textPage(_ page: Int) async throws -> TextPage {
         throw NSError(
-            domain: "ArisReader",
+            domain: "Lyra",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
         )
@@ -872,7 +872,7 @@ public final class MockEngine: PDFEngine {
         heightPt: CGFloat
     ) async throws -> PageImage {
         throw NSError(
-            domain: "ArisReader",
+            domain: "Lyra",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "The mock engine cannot rasterize regions"]
         )

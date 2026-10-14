@@ -1,4 +1,11 @@
-# ArisReader
+# Lyra
+
+> The application is called **Lyra**. The repository, the Rust crates (`aris-reader-*`), the Swift
+> modules (`ArisReaderKit`, `ArisReaderFFI`), the C ABI symbols (`aris_reader_*`) and the developer
+> environment variables (`ARIS_READER_*`) keep the original `aris` naming: it is the shared toolkit
+> prefix, it is an explicit project constraint, and renaming it would touch the FFI header, the
+> generated bindings and every test for no user-visible gain. Only what a reader sees — the app
+> name, its icon, its window titles and the bundle — says Lyra.
 
 A **native macOS PDF reader** for papers and technical documents: Rust engine + GPU-composited rendering + native SwiftUI/AppKit interface.
 The goal is PDF Expert-level simplicity and fluidity, with two advanced capabilities layered on top of the reading experience: citation/figure popovers and an AI assistant.
@@ -73,7 +80,7 @@ cd apps/macos && swift build && swift run ArisReader
 #    Tip: ARIS_READER_OPEN=/path/to.pdf swift run ArisReader opens a document at launch.
 
 # 3) Package a .app bundle
-./scripts/make-app-bundle.sh          # output: build/ArisReader.app
+./scripts/make-app-bundle.sh          # output: build/Lyra.app
 
 # 4) Fetch and sign the PDFium dynamic library (needed for rendering)
 ./scripts/fetch-pdfium.sh
