@@ -278,6 +278,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var citationsInFlight: Set<Int> = []
     @Published public private(set) var references: [Reference] = []
 
+    /// `Figure 3` / `Table 2` mentions per page, and the document's caption index.
+    ///
+    /// Mentions are keyed by `(kind, label)`, which is exactly how `figures` is looked up:
+    /// the mention says *what* was referenced (and where the pointer has to be), the caption
+    /// record says *where it is*. Both are view-state-free, so they live here rather than in
+    /// the panel.
+    private var captionMentionsByPage: [Int: [CaptionMention]] = [:]
+    private var captionMentionsInFlight: Set<Int> = []
+    @Published public private(set) var figures: [Figure] = []
+    /// Bumped on every document open, so caption data that arrives afterwards is dropped
+    /// instead of being attributed to the document now on screen (the `renderEpoch` idea).
+    private var figureEpoch: UInt64 = 0
+
     /// Links per page, fetched once and kept.
     private var linkCache: [Int: [DocumentLink]] = [:]
     private var linksInFlight: Set<Int> = []
@@ -473,10 +486,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         let point = CGPoint(x: parts[0], y: parts[1])
                         let followed = self.followLink(at: point)
                         let cited = followed ? false : self.openCitation(at: point)
+                        let figured = (followed || cited) ? false : self.openFigureMention(at: point)
                         // Resolution is asynchronous when it goes through the reference list, so
                         // give it a moment before reporting the status line.
                         try? await Task.sleep(for: .milliseconds(700))
-                        let line = "aris-click: (\(parts[0]),\(parts[1])) link=\(followed) citation=\(cited) status=\(self.statusMessage)\n"
+                        let line = "aris-click: (\(parts[0]),\(parts[1])) link=\(followed) citation=\(cited) figure=\(figured) status=\(self.statusMessage)\n"
                         FileHandle.standardError.write(Data(line.utf8))
                     }
                 }
@@ -561,7 +575,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             invalidateTiles()
             scrollYPt = 0
+
+            // A figure/table index belongs to exactly one document, so the previous one is
+            // dropped before the new captions are fetched: a stale index would resolve a
+            // `Figure 3` click to the *previous* paper's artwork. Clearing before the layout
+            // pass also lets that pass start the new document's mention fetches. This is the
+            // only place the index is started, which keeps it to one scan per open — the Rust
+            // engine caches the result for the document's lifetime.
+            figures = []
+            captionMentionsByPage.removeAll()
+            captionMentionsInFlight.removeAll()
+            figureEpoch &+= 1
             reloadVisiblePages()
+            loadFigures()
         } catch {
             lastError = String(describing: error)
             statusMessage = "Couldn't open the document"
@@ -901,11 +927,58 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         guard wasClick else { return }
 
-        // A click first tries a link annotation, then an in-text citation. Keeping the order
-        // means the PDF's own link always wins when both describe the same spot.
-        let handled = followLink(at: point) || openCitation(at: point)
+        // A click tries three things, in this order:
+        //   1. a link annotation — the PDF's own target, and the only one that can leave the
+        //      document (a URI), so it always wins;
+        //   2. an in-text citation — `[12]`, `(Kim 2023)`;
+        //   3. a `Figure 3` / `Table 2` mention.
+        // Citation before mention because the two can overlap at one point (a citation group
+        // inside a sentence that also names a figure), and the citation is the narrower,
+        // more specific match; a mention never resolves to something a citation resolves to,
+        // so nothing is lost by the order. Each step returns false when it has nothing, so
+        // the chain falls through cleanly.
+        let handled = followLink(at: point)
+            || openCitation(at: point)
+            || openFigureMention(at: point)
         if handled || selection == nil {
             clearSelection()
+        }
+    }
+
+    /// Fetches the figure/table mentions of every visible page, so a click resolves immediately.
+    ///
+    /// Called from `reloadVisiblePages`, so a page that has just been scrolled into view gets
+    /// its mentions before the pointer can reach them; the cache makes the repeated calls free.
+    private func loadCaptionMentions() {
+        for placement in visiblePagePlacements where captionMentionsByPage[placement.index] == nil {
+            guard !captionMentionsInFlight.contains(placement.index) else { continue }
+            captionMentionsInFlight.insert(placement.index)
+
+            let page = placement.index
+            let epoch = figureEpoch
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.captionMentionsInFlight.remove(page) }
+                if let found = try? await self.engine.captionMentions(page: page) {
+                    guard epoch == self.figureEpoch else { return }
+                    self.captionMentionsByPage[page] = found
+                }
+            }
+        }
+    }
+
+    /// Loads the figure/table caption index once per open document (see `open(url:)`).
+    private func loadFigures() {
+        guard figures.isEmpty else { return }
+        let epoch = figureEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let found = (try? await self.engine.figures()) ?? []
+            guard epoch == self.figureEpoch else { return }
+            self.figures = found
+            FileHandle.standardError.write(
+                Data("aris-figures: \(self.figures.count) caption(s)\n".utf8)
+            )
         }
     }
 
@@ -1010,6 +1083,130 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
         return false
+    }
+
+    /// Opens the caption a `Figure 3` / `Table 2` mention in the body points at (M4).
+    ///
+    /// This is the path that works **without** a link annotation: the mention is found in the
+    /// page's text layer, its `kind` + `label` are the key into the document-wide caption
+    /// index (`figures()`), and the record carries the region to preview — the artwork plus
+    /// its caption, or the caption alone for vector figures.
+    ///
+    /// True means the preview was opened. False means it was not: the point is not on a
+    /// mention, the caption is not in the index (the scan stops after 120 pages, so a
+    /// reference to a late figure has nothing to show), or the page's mentions are still on
+    /// their way — that last case continues in `resolveFigureMention`, so the panel opens a
+    /// moment later even though this call could not know it yet.
+    @discardableResult
+    public func openFigureMention(at point: CGPoint) -> Bool {
+        for placement in visiblePagePlacements {
+            let pageRect = CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            )
+            guard pageRect.contains(point) else { continue }
+
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            guard let mentions = captionMentionsByPage[placement.index] else {
+                // The page's mentions are still being fetched — their first read is queued
+                // behind the document-wide scans, so a click can beat them. The pointer has
+                // already said which page it meant: resolve when the data lands instead of
+                // dropping the click. Nothing is known synchronously, so report "not handled"
+                // and let the panel appear a moment later.
+                resolveFigureMention(on: placement.index, at: local)
+                return false
+            }
+            guard let mention = mention(at: local, in: mentions) else { continue }
+            return openFigure(mention, from: placement.index)
+        }
+        return false
+    }
+
+    /// The mention whose box contains a view-space point, if any.
+    private func mention(at local: CGPoint, in mentions: [CaptionMention]) -> CaptionMention? {
+        mentions.first { mention in
+            CGRect(
+                x: mention.xPt,
+                y: mention.yPt,
+                width: mention.widthPt,
+                height: mention.heightPt
+            ).contains(local)
+        }
+    }
+
+    /// Opens the preview for the caption `mention` names (the tail both click paths share).
+    @discardableResult
+    private func openFigure(_ mention: CaptionMention, from page: Int) -> Bool {
+        guard let figure = figures.first(where: {
+            $0.kind == mention.kind && $0.label == mention.label
+        }) else {
+            statusMessage = "No caption indexed for \"\(mention.title)\""
+            return false
+        }
+
+        let title = figure.title
+        // stderr, not print: unbuffered, so the hit is visible even when the process is killed
+        // right after the click (the same reason the raster log exists).
+        FileHandle.standardError.write(
+            Data(String(
+                format: "aris-figure: \"%@\" -> page %d region (%.1f, %.1f, %.1f, %.1f)\n",
+                title,
+                figure.page + 1,
+                figure.xPt,
+                figure.yPt,
+                figure.widthPt,
+                figure.heightPt
+            ).utf8)
+        )
+
+        openReferencePreview(
+            page: figure.page,
+            title: title,
+            from: "page \(page + 1)",
+            region: CGRect(
+                x: figure.xPt,
+                y: figure.yPt,
+                width: figure.widthPt,
+                height: figure.heightPt
+            ),
+            // The panel's body is the reference-entry list, so the caption rides in it as a
+            // single entry rather than a second text path in the panel.
+            entries: [CitationEntry(label: title, text: figure.captionText)]
+        )
+        statusMessage = "Previewing \(title)"
+        return true
+    }
+
+    /// Fetches what the cold click path is missing (the page's mentions, the caption index)
+    /// and opens the caption if the point really was on a mention.
+    ///
+    /// The document-wide index is usually already in flight (`loadFigures`); asking the engine
+    /// again here costs one extra scan only in the rare case where a click beats both loads,
+    /// which is cheaper than keeping a second copy of the in-flight state.
+    private func resolveFigureMention(on page: Int, at local: CGPoint) {
+        let epoch = figureEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let index = self.figures.isEmpty
+                ? ((try? await self.engine.figures()) ?? [])
+                : self.figures
+            let mentions: [CaptionMention]
+            if let cached = self.captionMentionsByPage[page] {
+                mentions = cached
+            } else {
+                mentions = (try? await self.engine.captionMentions(page: page)) ?? []
+            }
+
+            // A document switch while the answers were in flight: they describe another file.
+            guard epoch == self.figureEpoch else { return }
+            self.figures = index
+            self.captionMentionsByPage[page] = mentions
+
+            guard let mention = self.mention(at: local, in: mentions) else { return }
+            self.openFigure(mention, from: page)
+        }
     }
 
     /// Follows the link under a content-space point, if there is one.
@@ -1296,6 +1493,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         appendSelectionHighlights(to: &pages)
         prefetchTextLayers(for: visible)
+        loadCaptionMentions()
         evictTiles(keeping: wanted)
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
