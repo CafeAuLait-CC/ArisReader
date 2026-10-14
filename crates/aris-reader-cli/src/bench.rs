@@ -69,6 +69,13 @@ struct Plan {
     /// pre-ADR 0007 shell policy (`tileCacheLimit`), which is what the M1/M2 baseline numbers
     /// were measured under.
     cache_tiles: u64,
+    /// Prefetch ring in viewport heights. `None` keeps the shell's adaptive choice — the
+    /// longest rung of `PREFETCH_RING_LADDER` whose band fits `band_budget_bytes`;
+    /// `--prefetch-ring 2.5` with `--prefetch-all-columns` reproduces ADR 0007's fixed band.
+    prefetch_ring: Option<f64>,
+    /// Want every column of a page instead of the columns the viewport can reveal (the
+    /// pre-change rule; see `band_columns`).
+    prefetch_all_columns: bool,
     search: String,
     search_limit: usize,
     skip_first_frame: bool,
@@ -87,6 +94,7 @@ impl Plan {
                 "usage: aris-reader-cli bench <file.pdf> [--pages N] [--dpi D] [--viewport WxH]\n\
                  \x20      [--first-frame-scale S] [--repeat N] [--scroll-steps N]\n\
                  \x20      [--scroll-step-pt P] [--cache-bytes MiB] [--cache-tiles N]\n\
+                 \x20      [--prefetch-ring V] [--prefetch-all-columns]\n\
                  \x20      [--search TERM] [--search-limit N]\n\
                  \x20      [--skip-first-frame] [--skip-scroll] [--skip-search] [--skip-baseline]\n\
                  \x20      [--save-baseline FILE] [--check-baseline FILE]\n\
@@ -122,6 +130,19 @@ impl Plan {
                 * 1024
                 * 1024,
             cache_tiles: crate::opt_usize(&options, &["--cache-tiles"], 0) as u64,
+            prefetch_ring: match crate::opt(&options, &["--prefetch-ring"]) {
+                Some(value) => match value.parse::<f64>() {
+                    Ok(ring) if (0.0..=4.0).contains(&ring) => Some(ring),
+                    _ => {
+                        eprintln!(
+                            "error: --prefetch-ring wants viewport heights in [0, 4], e.g. 2.5"
+                        );
+                        return Err(ExitCode::from(64));
+                    }
+                },
+                None => None,
+            },
+            prefetch_all_columns: flag("--prefetch-all-columns"),
             search: crate::opt(&options, &["--search"])
                 .unwrap_or("the")
                 .to_string(),
@@ -271,6 +292,176 @@ fn phase_first_frame(plan: &Plan, backend: &PdfiumBackend, open_ms: f64) {
     );
 }
 
+/// One tile the band wants, with everything the raster loop and the ordering need.
+struct WantedTile {
+    key: TileKey,
+    page: u32,
+    origin: (f64, f64),
+    size: (f64, f64),
+    /// True when the tile intersects the viewport itself (not just the ring): these are the
+    /// tiles the reader is actually waiting for.
+    visible: bool,
+    /// Distance in points from the viewport, the shell's `pumpTiles` ordering.
+    distance: f64,
+}
+
+/// Longest prefetch ring, in viewport heights: ADR 0007's band, and the ceiling the adaptive
+/// ring is allowed to reach. Mirrors `AppState.maxPrefetchRingVh`.
+const MAX_PREFETCH_RING_VH: f64 = 2.5;
+/// Shortest ring the shell shortens to (`AppState.minPrefetchRingVh`). Measured here: at 0.5 the
+/// viewport waits for tiles (p95 8.1 ms, 141 misses over 120 steps); at 1.0 it does not.
+const MIN_PREFETCH_RING_VH: f64 = 0.75;
+/// Rungs the adaptive ring is chosen from, longest first, ending at the floor
+/// (`AppState.prefetchRingLadder`).
+const PREFETCH_RING_LADDER: [f64; 6] = [2.5, 2.0, 1.5, 1.25, 1.0, MIN_PREFETCH_RING_VH];
+/// Extra columns kept ready to the right of the ones on screen (`AppState`): none, because the
+/// canvas left-aligns a page wider than the viewport and there is no horizontal scrolling, so
+/// only a widening window can reveal them.
+const PREFETCH_COLUMNS_TO_THE_RIGHT: u32 = 0;
+
+/// The byte target for the whole wanted band, mirroring `AppState.prefetchBandBudgetBytes`:
+/// half the cache budget, with an 8 MiB floor. The band is the *pinned* set, so a band measured
+/// in viewport heights alone is an unbounded commitment in bytes.
+fn band_budget_bytes(cache_bytes: u64) -> u64 {
+    (cache_bytes / 2).max(8 * 1024 * 1024)
+}
+
+/// The ring above and below the viewport, in viewport heights, as distances from the viewport's
+/// top edge. Mirrors `AppState.ringSplit`: the viewport is the interval [0, 1] and a ring of `R`
+/// viewports is `above + below = 1 + R`, never less than 1 — the band always contains the
+/// viewport, whatever the budget says. `down` keeps ADR 0007's 0.5-above / 2.0-below shape.
+fn ring_split(ring: f64, down: bool) -> (f64, f64) {
+    if down {
+        (
+            ring * 0.5 / MAX_PREFETCH_RING_VH,
+            1.0 + ring * 2.0 / MAX_PREFETCH_RING_VH,
+        )
+    } else {
+        (
+            ring * 2.0 / MAX_PREFETCH_RING_VH,
+            1.0 + ring * 0.5 / MAX_PREFETCH_RING_VH,
+        )
+    }
+}
+
+/// The columns the band covers on a page: exactly what the viewport can reveal.
+/// `--prefetch-all-columns` restores the pre-change rule, which at 400% zoom wanted seven
+/// unreachable columns of a ten-column page (24 of 110 tiles).
+fn band_columns(
+    plan: &Plan,
+    cols: u32,
+    scale: f64,
+    tile_px: u32,
+    page_width_pt: f64,
+) -> (u32, u32) {
+    if plan.prefetch_all_columns {
+        return (0, cols);
+    }
+    let tile_pt = f64::from(tile_px) / scale;
+    let visible = ((plan.viewport.0 * scale / f64::from(tile_px)).ceil() as u32).min(cols);
+    let last = (visible + PREFETCH_COLUMNS_TO_THE_RIGHT).min(cols).min(
+        // Never want a column that does not exist: the page's own width bounds the page.
+        ((page_width_pt / tile_pt).ceil() as u32).max(1),
+    );
+    (0, last.max(1))
+}
+
+/// The tiles a band covers, in content points: `[band_top, band_bottom]` vertically, the
+/// viewport's columns horizontally.
+#[allow(clippy::too_many_arguments)]
+fn band_tiles(
+    plan: &Plan,
+    layouts: &[(u32, f64, f64, f64)],
+    band_top: f64,
+    band_bottom: f64,
+    scroll_y: f64,
+    scale: f64,
+    tile_px: u32,
+    tile_pt: f64,
+) -> Vec<WantedTile> {
+    let mut out = Vec::new();
+    for (page, top, width_pt, height_pt) in layouts {
+        // Page-local band, clipped to the page.
+        let page_band_top = (band_top - top).max(0.0);
+        let page_band_bottom = (band_bottom - top).min(*height_pt);
+        if page_band_bottom <= page_band_top {
+            continue;
+        }
+        let rows = (height_pt * scale / f64::from(tile_px)).ceil().max(1.0) as u32;
+        let cols = (width_pt * scale / f64::from(tile_px)).ceil().max(1.0) as u32;
+        let row0 = (page_band_top * scale / f64::from(tile_px)).floor() as u32;
+        let row1 = ((page_band_bottom * scale / f64::from(tile_px)).ceil() as u32).min(rows);
+        let (col0, col1) = band_columns(plan, cols, scale, tile_px, *width_pt);
+        for row in row0.min(rows)..row1 {
+            for col in col0..col1 {
+                let origin = (f64::from(col) * tile_pt, f64::from(row) * tile_pt);
+                let size = (
+                    tile_pt.min(width_pt - origin.0),
+                    tile_pt.min(height_pt - origin.1),
+                );
+                if size.0 <= 0.0 || size.1 <= 0.0 {
+                    continue;
+                }
+                let tile_top = top + origin.1;
+                let tile_bottom = tile_top + size.1;
+                let tile_left = origin.0;
+                let tile_right = tile_left + size.0;
+                // A real rectangle intersection: the tile is on screen vertically *and*
+                // horizontally (the bench models the shell's left-aligned content, so the
+                // viewport starts at x = 0).
+                let visible = tile_bottom > scroll_y
+                    && tile_top < scroll_y + plan.viewport.1
+                    && tile_right > 0.0
+                    && tile_left < plan.viewport.0;
+                let distance = (scroll_y - tile_bottom)
+                    .max(tile_top - (scroll_y + plan.viewport.1))
+                    .max(0.0);
+                out.push(WantedTile {
+                    key: TileKey::new(DocId(1), PageIndex(*page), Lod(1), col, row, 0),
+                    page: *page,
+                    origin,
+                    size,
+                    visible,
+                    distance,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The shell's adaptive ring: the longest rung whose band fits `band_budget_bytes`, estimated
+/// from the geometry this bench is about to rasterize (full tiles, so the estimate is an upper
+/// bound — the shell uses the real, often cropped, cached sizes where it has them).
+fn choose_prefetch_ring(
+    plan: &Plan,
+    layouts: &[(u32, f64, f64, f64)],
+    scroll_y: f64,
+    scale: f64,
+    tile_px: u32,
+    tile_pt: f64,
+) -> f64 {
+    let budget = band_budget_bytes(plan.cache_bytes);
+    let full_tile_bytes = u64::from(tile_px) * u64::from(tile_px) * 4;
+    for rung in PREFETCH_RING_LADDER {
+        let (above, below) = ring_split(rung, true);
+        let tiles = band_tiles(
+            plan,
+            layouts,
+            scroll_y - plan.viewport.1 * above,
+            scroll_y + plan.viewport.1 * below,
+            scroll_y,
+            scale,
+            tile_px,
+            tile_pt,
+        );
+        if tiles.len() as u64 * full_tile_bytes <= budget {
+            return rung;
+        }
+    }
+    *PREFETCH_RING_LADDER.last().unwrap()
+}
+
 /// Scroll: per step, rasterize exactly the tiles that step newly needs.
 fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
     let config = EngineConfig::default();
@@ -302,7 +493,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
 
     println!();
     println!(
-        "scroll: {} step(s) x {:.0} pt over {} page(s) laid out ({} in the document) - viewport {:.0}x{:.0} pt, LOD {} (scale {scale:.0}), {} px tiles, cache {} MiB{}",
+        "scroll: {} step(s) x {:.0} pt over {} page(s) laid out ({} in the document) - viewport {:.0}x{:.0} pt, LOD {} (scale {scale:.0}), {} px tiles, cache {} MiB{}{}",
         plan.scroll_steps,
         plan.scroll_step_pt,
         layouts.len(),
@@ -317,14 +508,37 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
         } else {
             String::new()
         },
+        match plan.prefetch_ring {
+            Some(ring) => format!(
+                ", prefetch ring {ring:.2} viewport(s){}",
+                if plan.prefetch_all_columns {
+                    ", all columns"
+                } else {
+                    ""
+                }
+            ),
+            None => format!(
+                ", prefetch ring adaptive (band <= {:.0} MiB{})",
+                band_budget_bytes(plan.cache_bytes) as f64 / (1024.0 * 1024.0),
+                if plan.prefetch_all_columns {
+                    ", all columns"
+                } else {
+                    ""
+                }
+            ),
+        },
     );
 
     let mut cache = PixelCache::new(plan.cache_bytes, plan.cache_tiles as usize);
     let mut frames_ms = Vec::new();
+    let mut visible_ms = Vec::new();
+    let mut visible_misses = 0u64;
     let mut tiles_rasterized = 0u64;
     let mut rastered_mp = 0.0;
     let mut raster_s = 0.0f64;
     let mut peak_tiles = 0usize;
+    let mut peak_band_bytes = 0u64;
+    let mut ring_used = plan.prefetch_ring.unwrap_or(0.0);
     let mut skipped_steps = 0usize;
 
     for step in 0..plan.scroll_steps {
@@ -334,63 +548,77 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
             break;
         }
 
+        // The band this step wants, exactly as the shell draws it: the viewport plus a
+        // prefetch ring, over the columns the viewport can reveal. `ring` is chosen per step
+        // (the shell re-chooses it on every viewport update).
+        let ring = match plan.prefetch_ring {
+            Some(ring) => ring,
+            None => choose_prefetch_ring(plan, &layouts, scroll_y, scale, tile_px, tile_pt),
+        };
+        ring_used = ring;
+        let (above, below) = ring_split(ring, true);
+        let band_top = scroll_y - plan.viewport.1 * above;
+        let band_bottom = scroll_y + plan.viewport.1 * below;
+        let mut wanted = band_tiles(
+            plan,
+            &layouts,
+            band_top,
+            band_bottom,
+            scroll_y,
+            scale,
+            tile_px,
+            tile_pt,
+        );
+        // Nearest to the viewport first: `pumpTiles` sorts its queue by distance from the
+        // viewport, so the tiles the reader is waiting for are rasterized before the prefetch.
+        wanted.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let step_started = Instant::now();
         let mut hits = 0u64;
         let mut misses = 0u64;
-        // The tiles this step shows: pinned, so eviction cannot drop what the reader is looking
-        // at (the shell's visible set, ADR 0007). Everything cached from earlier steps is fair
-        // game.
-        let mut pinned: HashSet<TileKey> = HashSet::new();
+        let mut visible_raster_s = 0.0f64;
+        // The whole wanted band is pinned, not just what is on screen: pinning only the visible
+        // tiles costs 150-200 MiB of churn at 400% zoom (ADR 0007's measurement, reproduced by
+        // `TileCacheChecks`). Everything cached from earlier steps is fair game.
+        let pinned: HashSet<TileKey> = wanted.iter().map(|tile| tile.key).collect();
 
-        for (page, top, width_pt, height_pt) in &layouts {
-            // The viewport's band on this page, in points (view space, top-left origin).
-            let band_top = (scroll_y - top).max(0.0);
-            let band_bottom = (scroll_y + plan.viewport.1 - top).min(*height_pt);
-            if band_bottom <= band_top {
+        for tile in &wanted {
+            if cache.get(&tile.key) {
+                hits += 1;
                 continue;
             }
-            let page_px_w = width_pt * scale;
-            let page_px_h = height_pt * scale;
-            let rows = (page_px_h / f64::from(tile_px)).ceil().max(1.0) as u32;
-            let cols = (page_px_w / f64::from(tile_px)).ceil().max(1.0) as u32;
-            let row0 = (band_top * scale / f64::from(tile_px)).floor() as u32;
-            let row1 = ((band_bottom * scale / f64::from(tile_px)).ceil() as u32).min(rows);
-            let col1 = ((plan.viewport.0 * scale / f64::from(tile_px)).ceil() as u32).min(cols);
-
-            for row in row0.min(rows)..row1 {
-                for col in 0..col1.max(1) {
-                    let key = TileKey::new(DocId(1), PageIndex(*page), lod, col, row, 0);
-                    pinned.insert(key);
-                    if cache.get(&key) {
-                        hits += 1;
-                        continue;
+            cache.record_miss();
+            misses += 1;
+            if tile.visible {
+                visible_misses += 1;
+            }
+            let request = RasterRequest::tile(
+                PageIndex(tile.page),
+                scale,
+                (tile.origin.0, tile.origin.1),
+                (tile.size.0, tile.size.1),
+            );
+            let tile_started = Instant::now();
+            match backend.rasterize(&request) {
+                Ok(rasterized) => {
+                    let elapsed = tile_started.elapsed();
+                    raster_s += elapsed.as_secs_f64();
+                    if tile.visible {
+                        visible_raster_s += elapsed.as_secs_f64();
                     }
-                    cache.record_miss();
-                    misses += 1;
-                    let origin = (f64::from(col) * tile_pt, f64::from(row) * tile_pt);
-                    let size = (
-                        tile_pt.min(width_pt - origin.0),
-                        tile_pt.min(height_pt - origin.1),
-                    );
-                    if size.0 <= 0.0 || size.1 <= 0.0 {
-                        continue;
-                    }
-                    let request = RasterRequest::tile(PageIndex(*page), scale, origin, size);
-                    let tile_started = Instant::now();
-                    match backend.rasterize(&request) {
-                        Ok(tile) => {
-                            raster_s += tile_started.elapsed().as_secs_f64();
-                            rastered_mp += tile.size.width * tile.size.height / 1e6;
-                            tiles_rasterized += 1;
-                            // The pixels are kept, not just accounted for: peak RSS must
-                            // include what a reader that caches tiles actually holds.
-                            cache.insert(key, tile.pixels);
-                        }
-                        Err(error) => {
-                            eprintln!("error: scroll tile failed: {error}");
-                            return;
-                        }
-                    }
+                    rastered_mp += rasterized.size.width * rasterized.size.height / 1e6;
+                    tiles_rasterized += 1;
+                    // The pixels are kept, not just accounted for: peak RSS must
+                    // include what a reader that caches tiles actually holds.
+                    cache.insert(tile.key, rasterized.pixels);
+                }
+                Err(error) => {
+                    eprintln!("error: scroll tile failed: {error}");
+                    return;
                 }
             }
         }
@@ -398,10 +626,13 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
 
         let frame_ms = ms(step_started.elapsed());
         frames_ms.push(frame_ms);
+        visible_ms.push(visible_raster_s * 1000.0);
         peak_tiles = peak_tiles.max(cache.len());
+        peak_band_bytes = peak_band_bytes.max(cache.bytes_of(&pinned));
         if stats_enabled() {
             println!(
-                "  stats frame {step:>4}: {frame_ms:>8.3} ms raster · {misses} new tile(s) · {hits} cached"
+                "  stats frame {step:>4}: {frame_ms:>8.3} ms raster ({:.3} ms of it visible) · {misses} new tile(s) · {hits} cached · ring {ring:.2}",
+                visible_raster_s * 1000.0
             );
         }
     }
@@ -414,6 +645,12 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let budget = 1000.0 / 60.0;
     let within_budget = sorted.iter().filter(|value| **value <= budget).count();
+    let mut visible_sorted = visible_ms.clone();
+    visible_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let visible_within = visible_sorted
+        .iter()
+        .filter(|value| **value <= budget)
+        .count();
 
     println!(
         "  raster ms per step: p50 {:.3} · p95 {:.3} · max {:.3} · mean {:.3} (n={})",
@@ -422,6 +659,18 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
         sorted.last().copied().unwrap_or(0.0),
         sorted.iter().sum::<f64>() / sorted.len() as f64,
         sorted.len(),
+    );
+    println!(
+        "  ... of which the viewport was waiting for (tiles on screen that were not ready): p50 {:.3} · p95 {:.3} · max {:.3} · {visible_misses} visible miss(es), {visible_within}/{} step(s) inside the frame budget",
+        percentile(&visible_sorted, 0.50),
+        percentile(&visible_sorted, 0.95),
+        visible_sorted.last().copied().unwrap_or(0.0),
+        visible_sorted.len(),
+    );
+    println!(
+        "  band: ring {ring_used:.2} viewport(s), peak pinned {:.1} MiB / {peak_tiles} tile(s) (whole cache) · stale after eviction {:.1} MiB",
+        peak_band_bytes as f64 / (1024.0 * 1024.0),
+        cache.used_bytes() as f64 / (1024.0 * 1024.0),
     );
     println!(
         "  steps whose raster work fits one 60 fps frame (<= {budget:.1} ms): {within_budget}/{} ({:.1}%)",
@@ -795,6 +1044,15 @@ impl PixelCache {
 
     fn used_bytes(&self) -> u64 {
         self.used_bytes_inner()
+    }
+
+    /// Bytes held for a set of keys — the pinned band's share of the cache, which is what the
+    /// band's byte target is about.
+    fn bytes_of(&self, keys: &HashSet<TileKey>) -> u64 {
+        keys.iter()
+            .filter_map(|key| self.pixels.get(key))
+            .map(|(pixels, _)| pixels.len() as u64)
+            .sum()
     }
 
     fn used_bytes_inner(&self) -> u64 {
