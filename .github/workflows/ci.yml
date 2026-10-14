@@ -82,7 +82,10 @@ jobs:
 
   macos-shell:
     name: macos-shell (check.sh · ArisReaderChecks)
-    runs-on: macos-14
+    # macos-14 cannot build this package: its newest Xcode (16.2) ships Swift 6.1, while the
+    # sources use `isolated deinit` (apps/macos/Sources/ArisReaderKit/PDFCanvasView.swift),
+    # which needs Swift 6.2. macos-15 ships Xcode 26.x, and the step below selects it.
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       # How the Rust engine finds the library at run time (crates/aris-reader-pdfium/src/lib.rs).
@@ -96,21 +99,30 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # macos-14 defaults to Xcode 15.4 (Swift 5.10) while apps/macos/Package.swift declares
-      # `swift-tools-version: 6.0`, so the default toolchain cannot even load the manifest
-      # ("package 'macos' is using Swift tools version 6.0.0 but the installed version is
-      # 5.10.0" — the first CI run died exactly there). The image also ships Xcode 16.x: point
-      # DEVELOPER_DIR (and with it swift/xcrun) at the newest one, and fail loudly here rather
-      # than inside `swift build` if the image ever stops shipping a Swift 6 compiler.
-      - name: Select an Xcode that ships Swift 6
+      # apps/macos/Package.swift declares swift-tools-version 6.0, but the sources need a Swift
+      # 6.2 compiler: `isolated deinit` in PDFCanvasView.swift. Both runner defaults are older
+      # and both were real CI failures (macos-14's Xcode 15.4/Swift 5.10 cannot even load the
+      # manifest; macos-15's default Xcode 16.4/Swift 6.1 fails with "consecutive declarations on
+      # a line must be separated by ';'" at that deinit). Rather than pin a path, take the newest
+      # Xcode whose Swift is >= 6.2 and fail loudly here if the image ever ships none.
+      - name: Select an Xcode with Swift >= 6.2
         run: |
           set -euo pipefail
-          XCODE="$(ls -d /Applications/Xcode_1[6-9].*.app 2>/dev/null | sort -V | tail -1 || true)"
-          if [ -z "$XCODE" ]; then
-            echo "::error::the runner image ships no Xcode 16+ (Swift 6), which apps/macos/Package.swift requires (swift-tools-version 6.0)"
+          DEVELOPER=""
+          for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
+            version="$(DEVELOPER_DIR="$app/Contents/Developer" swift --version 2>/dev/null \
+              | sed -nE 's/.*Swift version ([0-9]+\.[0-9]+).*/\1/p' | head -1 || true)"
+            [ -n "$version" ] || continue
+            if [ "$(printf '%s\n6.2\n' "$version" | sort -V | head -1)" = "6.2" ]; then
+              DEVELOPER="$app/Contents/Developer"
+              break
+            fi
+          done
+          if [ -z "$DEVELOPER" ]; then
+            echo "::error::this image ships no Xcode with Swift >= 6.2, which the sources need (isolated deinit in PDFCanvasView.swift)"
             exit 1
           fi
-          export DEVELOPER_DIR="$XCODE/Contents/Developer"
+          export DEVELOPER_DIR="$DEVELOPER"
           echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           swift --version
 
