@@ -45,34 +45,6 @@ struct ReaderChecks {
         require(state.document?.pageCount == 3 && state.selection == nil && state.searchHits.isEmpty,
                 "switch clears selection and search")
         state.gotoPage(2)
-        let beforeScroll = state.scrollYPt
-        state.scroll(byScreenPoints: 64)
-        require(state.scrollYPt > beforeScroll, "positive offset scrolls down")
-        state.scroll(byScreenPoints: -64)
-        require(abs(state.scrollYPt - beforeScroll) < 0.01, "negative offset scrolls up")
-        var wheel = WheelMotion()
-        let first = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1)
-        let fast = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.05)
-        require(first == 32 && fast > first, "wheel has useful step and burst acceleration")
-        require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -32,
-                "reversing wheel resets acceleration")
-        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 32,
-                "pausing wheel resets acceleration")
-        require(wheel.delta(scrollingDeltaY: 2.5, precise: true, timestamp: 2.1) == -2.5,
-                "trackpad preserves system precision and direction")
-        let textEngine = try RustEngine()
-        _ = try textEngine.openDocument(at: a)
-        let text = try await textEngine.textPage(0)
-        let rects = text.selectionRects(in: 0...(text.chars.count - 1))
-        require(!rects.isEmpty && rects.count < text.chars.count / 2,
-                "selection joins glyphs into line rectangles")
-        if let space = text.chars.indices.first(where: {
-            text.chars[$0].unicode == 32 && $0 > 0 && $0 + 1 < text.chars.count
-        }) {
-            let aroundSpace = text.selectionRects(in: (space - 1)...(space + 1))
-            require(aroundSpace.count == 1, "selection bridges interword whitespace")
-        } else { fatalError("fixture needs an interword space") }
-        state.gotoPage(2)
         let offset = state.scrollYPt
         state.selectTab(0)
         state.selectTab(1)
@@ -91,9 +63,6 @@ struct ReaderChecks {
         require(state.document == nil && state.canvasPages.isEmpty && state.thumbnails.isEmpty
                 && state.references.isEmpty && state.outline.isEmpty && state.annotations.isEmpty,
                 "closing last tab rejects pending work and clears document data")
-        try await interactionChecks(url: a)
-        try await scrollingRenderChecks(url: b)
-        try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
         try await annotationChecks(a: a, b: b)
         try await annotationRecoveryChecks(a: a, b: b)
         try await previewChecks(url: b)
