@@ -1,4 +1,17 @@
-//! GPU texture tile cache (LRU + budget + pinned set).
+//! Tile cache policy: **byte budget + LRU + pinned set** (the specification and test bed).
+//!
+//! ADR 0007 (`docs/adr/0007-tile-cache-and-scheduling.md`) decided where the production cache
+//! lives and what this module is for: the hot-path cache stays in the shell, because a cache
+//! lookup must sit next to the draw call rather than behind one FFI round trip per tile; and
+//! the *policy* is this one — a budget in **bytes**, LRU order, and a pinned set that is never
+//! evicted. The shell's `TileCache` (`apps/macos/Sources/ArisReaderKit/TileCache.swift`) is the
+//! port of that policy onto the path users actually run, and it is checked against these
+//! cases.
+//!
+//! So this module is deliberately *not* called by the app: deleting it would delete the
+//! specification the shell is held to, and calling it from the shell would undo ADR 0007's
+//! reason for keeping the cache in Swift. The eviction tests below are the executable half of
+//! that specification.
 //!
 //! The current implementation is a **naive LRU** (each eviction scans for the oldest entry), good enough for the skeleton phase.
 //! TODO(T1.6): switch to LRU-K with batch eviction (release 10% of capacity at once) to avoid frame-time jitter;
