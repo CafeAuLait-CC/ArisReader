@@ -63,6 +63,7 @@ struct ReaderChecks {
         require(state.document == nil && state.canvasPages.isEmpty && state.thumbnails.isEmpty
                 && state.references.isEmpty && state.outline.isEmpty && state.annotations.isEmpty,
                 "closing last tab rejects pending work and clears document data")
+        try await annotationChecks(a: a, b: b)
         print("All reader regression checks passed")
     }
 }

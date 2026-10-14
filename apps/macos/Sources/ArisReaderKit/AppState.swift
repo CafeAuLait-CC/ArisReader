@@ -137,6 +137,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var colorIndex: Int
     public var note: String
     public var createdAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, page, start, end, colorIndex, note, createdAt
+    }
+
+    public init(
+        id: UUID,
+        kind: Kind = .highlight,
+        page: Int,
+        start: Int,
+        end: Int,
+        colorIndex: Int,
+        note: String,
+        createdAt: Date
+    ) {
+        self.id = id
+        self.kind = kind
+        self.page = page
+        self.start = start
+        self.end = end
+        self.colorIndex = colorIndex
+        self.note = note
+        self.createdAt = createdAt
+    }
+
+    /// Older sidecars predate `kind`; decode them as highlights while preserving all
+    /// explicitly stored kinds in newer sidecars.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        kind = try values.decodeIfPresent(Kind.self, forKey: .kind) ?? .highlight
+        page = try values.decode(Int.self, forKey: .page)
+        start = try values.decode(Int.self, forKey: .start)
+        end = try values.decode(Int.self, forKey: .end)
+        colorIndex = try values.decode(Int.self, forKey: .colorIndex)
+        note = try values.decode(String.self, forKey: .note)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+    }
 }
 
 /// A selection: a page and an inclusive character range in its text layer.
@@ -256,6 +294,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Highlights the reader added, and the file they are stored in.
     @Published public private(set) var annotations: [Annotation] = []
     private var annotationsURL: URL?
+    /// A failed read permanently blocks writes for this document, protecting its sidecar.
+    private var annotationWritesBlockedReason: String?
     /// Highlight colours offered in the toolbar (BGRA, translucent so text stays readable).
     public static let highlightPalette: [(name: String, bgra: [UInt8])] = [
         ("Yellow", [0x40, 0xD8, 0xFF, 0x66]),
@@ -616,6 +656,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectionAnchor = nil
         annotations = []
         annotationsURL = nil
+        annotationWritesBlockedReason = nil
         undoStack = []
         redoStack = []
         scrollYPt = 0
@@ -767,6 +808,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         note: String = ""
     ) -> Bool {
         guard let selection, let url = document?.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
 
         let annotation = Annotation(
             id: UUID(),
@@ -778,12 +820,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             note: note,
             createdAt: Date()
         )
-
-        annotationsURL = Self.sidecarURL(for: url)
-        annotations.append(annotation)
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated) else { return false }
         undoStack.append(.added(annotation))
         redoStack.removeAll()
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = kind == .highlight
             ? "Highlighted \(selection.range.count) characters"
@@ -798,21 +839,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func removeAnnotation(_ id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
-        let removed = annotations.remove(at: index)
+        let removed = annotations[index]
+        var updated = annotations
+        updated.remove(at: index)
+        guard saveAnnotations(updated) else { return }
         undoStack.append(.removed(removed))
         redoStack.removeAll()
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Deleted annotation"
     }
 
     // MARK: - Undo / redo
 
-    /// One reversible change. A stack of these is what the shell offers today; the durable
-    /// transaction model belongs in `aris-reader-edit` (T3.1).
+    /// One reversible change. Note edits are represented as old/new values so an edit can
+    /// be undone and redone together with annotation creation and deletion.
     public enum UndoableAction: Sendable {
         case added(Annotation)
         case removed(Annotation)
+        case noteChanged(id: UUID, oldNote: String, newNote: String)
     }
 
     @Published public private(set) var undoStack: [UndoableAction] = []
@@ -822,37 +866,69 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canRedo: Bool { !redoStack.isEmpty }
 
     public func undo() {
-        guard let action = undoStack.popLast() else { return }
-        switch action {
-        case .added(let annotation):
-            annotations.removeAll { $0.id == annotation.id }
-        case .removed(let annotation):
-            annotations.append(annotation)
-        }
+        guard let action = undoStack.last else { return }
+        let updated = annotations(applying: action, undoing: true)
+        guard saveAnnotations(updated) else { return }
+        undoStack.removeLast()
         redoStack.append(action)
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Undo"
     }
 
     public func redo() {
-        guard let action = redoStack.popLast() else { return }
-        switch action {
-        case .added(let annotation):
-            annotations.append(annotation)
-        case .removed(let annotation):
-            annotations.removeAll { $0.id == annotation.id }
-        }
+        guard let action = redoStack.last else { return }
+        let updated = annotations(applying: action, undoing: false)
+        guard saveAnnotations(updated) else { return }
+        redoStack.removeLast()
         undoStack.append(action)
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Redo"
     }
 
+    private func annotations(applying action: UndoableAction, undoing: Bool) -> [Annotation] {
+        var updated = annotations
+        switch action {
+        case .added(let annotation):
+            if undoing {
+                updated.removeAll { $0.id == annotation.id }
+            } else if !updated.contains(where: { $0.id == annotation.id }) {
+                updated.append(annotation)
+            }
+        case .removed(let annotation):
+            if undoing {
+                if !updated.contains(where: { $0.id == annotation.id }) { updated.append(annotation) }
+            } else {
+                updated.removeAll { $0.id == annotation.id }
+            }
+        case .noteChanged(let id, let oldNote, let newNote):
+            if let index = updated.firstIndex(where: { $0.id == id }) {
+                updated[index].note = undoing ? oldNote : newNote
+            }
+        }
+        return updated
+    }
+
     public func updateNote(_ note: String, for id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
-        annotations[index].note = note
-        saveAnnotations()
+        let oldNote = annotations[index].note
+        guard oldNote != note else { return }
+        var updated = annotations
+        updated[index].note = note
+        guard saveAnnotations(updated) else { return }
+
+        // SwiftUI's TextField setter fires for each keystroke. Merge consecutive edits to
+        // the same note into one undo step while preserving the original value.
+        if let last = undoStack.last,
+           case .noteChanged(let lastID, let original, let previous) = last,
+           lastID == id, previous == oldNote {
+            undoStack.removeLast()
+            if original != note {
+                undoStack.append(.noteChanged(id: id, oldNote: original, newNote: note))
+            }
+        } else {
+            undoStack.append(.noteChanged(id: id, oldNote: oldNote, newNote: note))
+        }
+        redoStack.removeAll()
     }
 
     /// Shows an annotation: selects its range and scrolls it into view.
@@ -876,29 +952,80 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func loadAnnotations(for url: URL) {
-        annotationsURL = Self.sidecarURL(for: url)
-        guard let annotationsURL,
-              let data = try? Data(contentsOf: annotationsURL),
-              let decoded = try? JSONDecoder().decode([Annotation].self, from: data)
-        else {
+        let sidecarURL = Self.sidecarURL(for: url)
+        annotationsURL = sidecarURL
+        annotationWritesBlockedReason = nil
+
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
+            let data = try Data(contentsOf: sidecarURL)
+            let decoded = try JSONDecoder().decode([Annotation].self, from: data)
+            guard decoded.allSatisfy({ $0.page >= 0 && $0.page < (document?.pageCount ?? 0)
+                && $0.start >= 0 && $0.end >= $0.start
+                && Self.highlightPalette.indices.contains($0.colorIndex) }),
+                Set(decoded.map(\.id)).count == decoded.count else {
+                throw NSError(domain: "ArisReader", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid annotation page, range, color or duplicate identity"])
+            }
+            annotations = decoded
+            undoStack.removeAll()
+            redoStack.removeAll()
+            FileHandle.standardError.write(
+                Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
+            )
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             annotations = []
-            return
+            undoStack.removeAll()
+            redoStack.removeAll()
+        } catch {
+            annotations = []
+            undoStack.removeAll()
+            redoStack.removeAll()
+            annotationWritesBlockedReason = error.localizedDescription
+            statusMessage = "Could not read annotations; the sidecar is protected from overwrite"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: read failed; writes blocked: \(error)\n".utf8)
+            )
         }
-        annotations = decoded
-        FileHandle.standardError.write(
-            Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
-        )
     }
 
-    private func saveAnnotations() {
-        guard let annotationsURL else { return }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(annotations) else { return }
-        try? data.write(to: annotationsURL, options: .atomic)
-        FileHandle.standardError.write(
-            Data("aris-annotate: saved \(annotations.count) annotation(s)\n".utf8)
-        )
+    /// Writes a candidate first and publishes it only after the atomic write succeeds.
+    /// Any unreadable/corrupt existing sidecar is protected from accidental replacement.
+    @discardableResult
+    private func saveAnnotations(_ candidate: [Annotation]) -> Bool {
+        guard let annotationsURL else {
+            statusMessage = "Could not save annotations: no document sidecar is selected"
+            lastError = statusMessage
+            return false
+        }
+        if let reason = annotationWritesBlockedReason {
+            statusMessage = "Could not save annotations because the sidecar could not be loaded; it was left untouched"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: write blocked: \(reason)\n".utf8)
+            )
+            return false
+        }
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(candidate)
+            try data.write(to: annotationsURL, options: .atomic)
+            annotations = candidate
+            FileHandle.standardError.write(
+                Data("aris-annotate: saved \(candidate.count) annotation(s)\n".utf8)
+            )
+            return true
+        } catch {
+            statusMessage = "Could not save annotations: \(error.localizedDescription)"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: save failed: \(error)\n".utf8)
+            )
+            return false
+        }
     }
 
     /// Public entry point for the sidebar's search results list.
