@@ -67,6 +67,13 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # No Metal device here, and the workspace compiles only wgpu's Metal backend
+      # (crates/aris-reader-gpu/Cargo.toml), so the offscreen GPU probes report "skipping:" and
+      # pass without rendering anything. A green Linux run is not evidence for the GPU path.
+      - name: Record what a GPU-less Linux runner does not exercise
+        run: |
+          echo "::notice title=GPU path not exercised on Linux::this runner has no Metal device and wgpu is built with the Metal backend only, so aris-reader-gpu's offscreen probe and the matching aris-reader-ffi test print \"skipping:\" instead of rendering. The GPU path runs in macos-shell (and in the ArisReaderChecks harness)."
+
       # `cargo test --workspace` above is green even though the corpus regressions were never
       # run: their two test targets are `#[ignore]`d and need the private samples. Say it.
       - name: Record that the corpus regression did not run
@@ -88,6 +95,24 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # macos-14 defaults to Xcode 15.4 (Swift 5.10) while apps/macos/Package.swift declares
+      # `swift-tools-version: 6.0`, so the default toolchain cannot even load the manifest
+      # ("package 'macos' is using Swift tools version 6.0.0 but the installed version is
+      # 5.10.0" — the first CI run died exactly there). The image also ships Xcode 16.x: point
+      # DEVELOPER_DIR (and with it swift/xcrun) at the newest one, and fail loudly here rather
+      # than inside `swift build` if the image ever stops shipping a Swift 6 compiler.
+      - name: Select an Xcode that ships Swift 6
+        run: |
+          set -euo pipefail
+          XCODE="$(ls -d /Applications/Xcode_1[6-9].*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$XCODE" ]; then
+            echo "::error::the runner image ships no Xcode 16+ (Swift 6), which apps/macos/Package.swift requires (swift-tools-version 6.0)"
+            exit 1
+          fi
+          export DEVELOPER_DIR="$XCODE/Contents/Developer"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          swift --version
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
