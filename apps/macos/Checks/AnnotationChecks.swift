@@ -186,15 +186,40 @@ extension ReaderChecks {
             .joined(separator: ",\n") + "\n]"
         try Data(futureFile.utf8).write(to: futureSidecar)
 
-        let futureState = AppState(engine: try RustEngine())
+        let futureEngine = try RustEngine()
+        let futureState = AppState(engine: futureEngine)
         futureState.setViewportSize(CGSize(width: 700, height: 500))
         futureState.newTab(url: future)
         require(futureState.annotations.count == 1, "a newer sidecar still loads this version's entries")
         require(futureState.preservedAnnotationEntryCount == 4,
                 "entries this version cannot draw are preserved, not rejected")
-        try await eventually("the known annotation still renders", {
-            futureState.canvasPages.contains { $0.placement.index >= 800_000_000 }
-        })
+        let text = try await futureEngine.textPage(known.page)
+        let expectedRects = text.selectionRects(in: known.start...known.end)
+        let placement = futureEngine.visiblePages(scrollYPt: futureState.scrollYPt,
+            viewportHeightPt: 500, gapPt: futureState.pageGapPt, marginPt: 0)
+            .first { $0.index == known.page }!
+        let expectedColor = Data(AppState.highlightPalette[known.colorIndex].bgra)
+        require(!expectedRects.isEmpty, "known annotation has nonempty text geometry")
+        // Texture-cache IDs are private allocation details. Assert that the actual
+        // annotation-colored quads cover the expected text, not a numeric ID range
+        // that can change or accidentally match a page tile / preview instead.
+        @MainActor func knownAnnotationRenders() -> Bool {
+            expectedRects.allSatisfy { rect in
+                futureState.canvasPages.contains { canvas in
+                    canvas.image.pixelWidth == 1 && canvas.image.pixelHeight == 1
+                        && canvas.image.bgra == expectedColor
+                        && canvas.placement.leftPt == placement.leftPt + rect.minX
+                        && canvas.placement.topPt == placement.topPt + rect.minY
+                        && canvas.placement.widthPt == rect.width
+                        && canvas.placement.heightPt == max(rect.height, 1)
+                }
+            }
+        }
+        try await eventually("the known annotation still renders", knownAnnotationRenders)
+        futureState.removeAnnotation(known.id)
+        require(!knownAnnotationRenders(), "removing the annotation removes its rendered quads")
+        futureState.undo()
+        try await eventually("undo restores the known annotation's rendered quads", knownAnnotationRenders)
 
         futureState.jump(to: known)
         require(futureState.addHighlightFromSelection(), "an edit is still possible on a newer sidecar")

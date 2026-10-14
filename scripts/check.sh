@@ -7,7 +7,7 @@
 #   1. Print toolchain facts (Rust / Swift / SDK / Xcode / PDFium)
 #   2. Diagnose known Swift toolchain mismatches (see docs/09-dev-setup.md §2)
 #   3. cargo check / test / clippy
-#   4. swift build (only when the Swift probe passes)
+#   4. swift build + ArisReaderChecks (only when the Swift probe passes)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -139,21 +139,34 @@ fi
 
 # ── 4. Swift build ────────────────────────────────────────────────────────────
 section "Native macOS shell"
+SWIFT_BUILT=0
 if [ "$SKIP_SWIFT" = "1" ]; then
   warn "skipped (--no-swift)"
 elif [ "$SWIFT_OK" = "1" ]; then
   # In a restricted sandbox (including CI/agent environments) SwiftPM's nested sandbox-exec is rejected, so fall back to --disable-sandbox
   if (cd apps/macos && swift build >"$ROOT/build/swift-build.log" 2>&1); then
     ok "swift build (apps/macos)"
+    SWIFT_BUILT=1
   elif grep -q "sandbox_apply" "$ROOT/build/swift-build.log" \
     && (cd apps/macos && swift build --disable-sandbox >"$ROOT/build/swift-build.log" 2>&1); then
     ok "swift build (apps/macos, --disable-sandbox: this environment forbids SwiftPM's nested sandbox-exec)"
+    SWIFT_BUILT=1
   else
     bad "swift build failed (see build/swift-build.log)"
     tail -15 "$ROOT/build/swift-build.log" | sed 's/^/      /'
   fi
 else
   warn "skipping swift build (compile probe did not pass)"
+fi
+
+if [ "$SWIFT_BUILT" = "1" ]; then
+  if ARIS_READER_PDFIUM_PATH="${ARIS_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
+    "$ROOT/apps/macos/.build/debug/ArisReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then
+    ok "ArisReaderChecks (complete native regression suite)"
+  else
+    bad "ArisReaderChecks failed (see build/reader-checks.log)"
+    tail -30 "$ROOT/build/reader-checks.log"
+  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

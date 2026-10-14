@@ -89,8 +89,9 @@ public struct ReaderWindow: View {
                     state.endPointerInteraction(at: point, wasClick: wasClick)
                 },
                 onCopy: { state.copySelection() },
-                    onUndo: { state.undo() },
-                    onRedo: { state.redo() }
+                onUndo: { state.undo() },
+                onRedo: { state.redo() },
+                interactionSnapshot: { (state.canvasPages, state.scrollYPt) }
             )
             HStack { Spacer(); ScrollIndicator(state: state) }
 
@@ -169,7 +170,8 @@ public struct ReaderWindow: View {
                         onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
                         onFailure: { message in state.reportGpuFailure(message) },
                         onViewportSize: { size in state.setReferencePreviewViewport(size) },
-                        onScroll: { delta in state.scrollReferencePreview(by: delta) }
+                        onScroll: { delta in state.scrollReferencePreview(by: delta) },
+                        interactionSnapshot: { (state.referencePreviewPages, state.referencePreviewScrollYPt) }
                     )
                     if state.referencePreviewLoading { ProgressView("Loading preview…") }
                     if let error = state.referencePreviewError {

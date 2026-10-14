@@ -104,7 +104,21 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
-    private var frameTask: Task<Void, Never>?
+    private var frameTimer: Timer?
+    private var wheelMotion = WheelMotion()
+    /// Reads the just-updated model during AppKit event tracking, before SwiftUI commits.
+    public var interactionSnapshot: (() -> ([CanvasPage], CGFloat))?
+
+    private func syncInteraction() {
+        if let snapshot = interactionSnapshot?() {
+            pages = snapshot.0
+            scrollYPt = snapshot.1
+        }
+        if needsRender {
+            needsRender = false
+            renderFrame()
+        }
+    }
     private var configuredSize: CGSize = .zero
     private var reportedDeviceScale: CGFloat = 0
     private var needsRender = true
@@ -131,8 +145,8 @@ public final class MetalCanvasView: NSView {
         fatalError("MetalCanvasView only supports programmatic creation")
     }
 
-    deinit {
-        frameTask?.cancel()
+    isolated deinit {
+        frameTimer?.invalidate()
     }
 
     public override func viewDidMoveToWindow() {
@@ -156,10 +170,16 @@ public final class MetalCanvasView: NSView {
     /// to the whole document, and a `CAMetalLayer` cannot be hundreds of thousands of
     /// pixels tall. AppKit still delivers the trackpad's momentum as scroll events.
     public override func scrollWheel(with event: NSEvent) {
-        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
+        // NSEvent already applies the user's natural-scrolling preference. Convert
+        // content motion to a top-origin offset exactly once; never invert by device.
+        let delta = wheelMotion.delta(
+            scrollingDeltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas,
+            timestamp: event.timestamp
+        )
         guard delta != 0 else { return }
-        // AppKit reports wheel motion; content offsets increase in the opposite direction.
-        onScroll?(-delta)
+        onScroll?(delta)
+        syncInteraction()
     }
 
     public override var acceptsFirstResponder: Bool { true }
@@ -179,17 +199,21 @@ public final class MetalCanvasView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        wheelMotion.reset()
         pointerMoved = false
         onPointerDown?(contentPoint(for: event))
+        syncInteraction()
     }
 
     public override func mouseDragged(with event: NSEvent) {
         pointerMoved = true
         onPointerDragged?(contentPoint(for: event))
+        syncInteraction()
     }
 
     public override func mouseUp(with event: NSEvent) {
         onPointerUp?(contentPoint(for: event), !pointerMoved)
+        syncInteraction()
     }
 
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -303,8 +327,8 @@ public final class MetalCanvasView: NSView {
     }
 
     private func detachSurface() {
-        frameTask?.cancel()
-        frameTask = nil
+        frameTimer?.invalidate()
+        frameTimer = nil
         releaseAllTextures()
         guard surfaceId != 0 else { return }
         _ = aris_reader_surface_detach(surfaceId)
@@ -373,26 +397,21 @@ public final class MetalCanvasView: NSView {
     }
 
     private func startFrameLoop() {
-        frameTask?.cancel()
-        // Render on demand: the task only notices a dirty flag, so an idle window does no
-        // GPU work. M1 T1.10 replaces it with a display link driven by the session's
-        // dirty flags.
-        frameTask = Task { @MainActor [weak self] in
-            var tick: UInt64 = 0
-            while !Task.isCancelled {
+        frameTimer?.invalidate()
+        // Common run-loop modes continue to deliver frames while AppKit tracks a drag.
+        var tick: UInt64 = 0
+        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
                 tick += 1
-                if let self {
-                    // Render when something changed, and — while the window is occluded —
-                    // retry at ~7 Hz so the page appears as soon as it becomes visible.
-                    let retryWhileOccluded = self.wasOccluded && tick % 8 == 0
-                    if self.needsRender || retryWhileOccluded {
-                        self.needsRender = false
-                        self.renderFrame()
-                    }
+                if self.needsRender || (self.wasOccluded && tick % 16 == 0) {
+                    self.needsRender = false
+                    self.renderFrame()
                 }
-                try? await Task.sleep(for: .milliseconds(16))
             }
         }
+        frameTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func renderFrame() {
@@ -496,6 +515,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onCopy: () -> Void
     private let onUndo: () -> Void
     private let onRedo: () -> Void
+    private let interactionSnapshot: (() -> ([CanvasPage], CGFloat))?
 
     public init(
         pages: [CanvasPage] = [],
@@ -512,7 +532,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         onPointerUp: @escaping (CGPoint, Bool) -> Void = { _, _ in },
         onCopy: @escaping () -> Void = {},
         onUndo: @escaping () -> Void = {},
-        onRedo: @escaping () -> Void = {}
+        onRedo: @escaping () -> Void = {},
+        interactionSnapshot: (() -> ([CanvasPage], CGFloat))? = nil
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -529,6 +550,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onCopy = onCopy
         self.onUndo = onUndo
         self.onRedo = onRedo
+        self.interactionSnapshot = interactionSnapshot
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -542,6 +564,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 
     private func configure(_ view: MetalCanvasView) {
+        view.interactionSnapshot = interactionSnapshot
         view.onFrame = onFrame
         view.onFailure = onFailure
         view.onDeviceScale = onDeviceScale
@@ -557,5 +580,35 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
         view.pages = pages
+    }
+}
+
+/// Discrete wheels need a useful line step; precise devices already carry system
+/// acceleration and momentum. A short same-direction burst gets a bounded boost.
+public struct WheelMotion {
+    private var lastTime: TimeInterval?
+    private var lastDelta: CGFloat = 0
+    private var boost: CGFloat = 1
+    public init() {}
+    public mutating func reset() {
+        lastTime = nil
+        lastDelta = 0
+        boost = 1
+    }
+    public mutating func delta(scrollingDeltaY: CGFloat, precise: Bool, timestamp: TimeInterval) -> CGFloat {
+        if precise {
+            reset()
+            return -scrollingDeltaY
+        }
+        guard scrollingDeltaY != 0 else { return 0 }
+        if let lastTime, timestamp > lastTime, timestamp - lastTime < 0.12,
+           scrollingDeltaY * lastDelta > 0 {
+            boost = min(3, boost + 0.35)
+        } else {
+            boost = 1
+        }
+        lastTime = timestamp
+        lastDelta = scrollingDeltaY
+        return -scrollingDeltaY * 32 * boost
     }
 }
