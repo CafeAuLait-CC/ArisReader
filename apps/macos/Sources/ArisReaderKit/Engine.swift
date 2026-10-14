@@ -905,3 +905,37 @@ public final class MockEngine: PDFEngine {
     public func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int { 0 }
     public func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat { 0 }
 }
+
+// PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
+// line so spaces and the gaps between letters are included, without bridging columns.
+extension TextPage {
+    public func selectionRects(in range: ClosedRange<Int>) -> [CGRect] {
+        var result: [CGRect] = []
+        var line: CGRect?
+        for index in range where chars.indices.contains(index) {
+            let char = chars[index]
+            if char.unicode == 10 || char.unicode == 13 {
+                if let rect = line { result.append(rect) }
+                line = nil
+                continue
+            }
+            let rect = CGRect(x: char.xPt, y: char.yPt, width: char.widthPt, height: char.heightPt)
+            guard rect.width > 0, rect.height > 0 else { continue }
+            if let current = line {
+                let overlap = min(current.maxY, rect.maxY) - max(current.minY, rect.minY)
+                let gap = max(rect.minX - current.maxX, current.minX - rect.maxX)
+                if overlap >= min(current.height, rect.height) * 0.35,
+                   gap <= max(current.height, rect.height) * 1.5 {
+                    line = current.union(rect)
+                } else {
+                    result.append(current)
+                    line = rect
+                }
+            } else {
+                line = rect
+            }
+        }
+        if let line { result.append(line) }
+        return result
+    }
+}

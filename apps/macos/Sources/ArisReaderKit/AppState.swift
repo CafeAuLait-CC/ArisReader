@@ -65,6 +65,7 @@ public final class AppState: ObservableObject {
 
     /// Pages the canvas should draw right now (usually one or two while scrolling).
     @Published public private(set) var canvasPages: [CanvasPage] = []
+    private var canvasTiles: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public private(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
@@ -434,11 +435,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var selectionAnchor: Int?
     /// 1×1 texture drawn as a translucent quad over selected characters — the same
     /// textured-quad pipeline the pages use, so selection needs no new GPU path.
-    private lazy var highlightImage = PageImage(
+    private lazy var selectionImage = PageImage(
         pixelWidth: 1,
         pixelHeight: 1,
         pointSize: .zero,
-        bgra: Data([0x40, 0xC0, 0xFF, 0x55]),
+        bgra: Data([0xFF, 0x80, 0x00, 0x55]),
         generation: 1
     )
 
@@ -700,6 +701,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         closeReferencePreview()
         invalidateTiles()
         canvasPages = []
+        canvasTiles = []
         visiblePagePlacements = []
         textPages = [:]
         textPagesInFlight = []
@@ -731,19 +733,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func zoomIn() {
         zoomPercent = min(400, zoomPercent + 10)
-        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomOut() {
         zoomPercent = max(25, zoomPercent - 10)
-        invalidateTiles()
         reloadVisiblePages()
     }
 
     public func zoomActual() {
         zoomPercent = 100
-        invalidateTiles()
         reloadVisiblePages()
     }
 
@@ -761,7 +760,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func setDeviceScale(_ scale: CGFloat) {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
-        invalidateTiles()
         reloadVisiblePages()
     }
 
@@ -777,7 +775,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard document != nil else { return }
         let contentDelta = delta / max(zoomFactor, 0.01)
         let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
-        let next = min(max(0, scrollYPt - contentDelta), maxOffset)
+        let next = min(max(0, scrollYPt + contentDelta), maxOffset)
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
@@ -1157,7 +1155,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
     /// ⌘C can copy it.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
-        guard wasClick else { return }
+        guard wasClick else {
+            extendSelection(to: point)
+            return
+        }
         previewEpoch &+= 1
 
         // A click tries three things, in this order:
@@ -1678,12 +1679,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Makes sure the tiles covering the viewport exist, and hands the ready ones to the
     /// canvas.
     ///
-    /// Rasterization happens off the main thread, so a tile that is not ready yet is simply
-    /// not drawn this frame and appears when it lands. LOD selection is discrete: zooming
-    /// changes which tiles are wanted, never how an existing one was rasterized.
+    /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
+    /// tiles until all requested tiles on that page are ready, then replace them together.
+    /// This prevents the page from disappearing or sharpening in a visible diagonal sweep.
     public func reloadVisiblePages() {
         guard document != nil else {
             canvasPages = []
+            canvasTiles = []
             contentHeightPt = 0
             return
         }
@@ -1716,6 +1718,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var pages: [CanvasPage] = []
 
         for placement in visible {
+            var ready: [CanvasPage] = []
+            var complete = true
+            let previous = canvasTiles.filter { $0.placement.index >> 24 == placement.index }
+            let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
             let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
             let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
             let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
@@ -1736,14 +1742,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     )
 
                     if let cached = tileCache[key] {
-                        pages.append(CanvasPage(placement: tilePlacement, image: cached.image))
+                        ready.append(CanvasPage(placement: tilePlacement, image: cached.image))
                     } else {
+                        complete = false
                         scheduleTile(key, placement: tilePlacement)
                     }
                 }
             }
+            if changingLOD && !complete {
+                pages.append(contentsOf: previous)
+            } else {
+                pages.append(contentsOf: ready)
+            }
         }
 
+        canvasTiles = pages
         appendSelectionHighlights(to: &pages)
         prefetchTextLayers(for: visible)
         loadCaptionMentions()
@@ -1754,7 +1767,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
     }
 
-    /// Adds one translucent quad per selected character, plus one per annotated character.
+    /// Updates overlays without reloading tiles or scheduling document analysis during a drag.
+    private func refreshSelectionOverlay() {
+        var pages = canvasTiles
+        appendSelectionHighlights(to: &pages)
+        canvasPages = pages
+    }
+
+    /// Adds continuous line rectangles for selection and annotations.
     ///
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
@@ -1763,8 +1783,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             appendHighlight(
                 page: selection.page,
                 range: selection.range,
-                image: highlightImage,
-                idBase: 900_000_000,
+                image: selectionImage,
+                idBase: -1_000_000_000,
                 to: &pages
             )
         }
@@ -1776,7 +1796,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 range: annotation.start...max(annotation.start, annotation.end),
                 image: highlightTextures[annotation.colorIndex],
                 // Distinct ids keep the canvas from reusing a texture it already has.
-                idBase: 800_000_000 + annotationIndex * 4_096,
+                idBase: -2_000_000_000 + annotationIndex * 4_096,
                 // An underline is a thin bar on the baseline instead of a filled box.
                 verticalScale: annotation.kind == .underline ? 0.1 : 1.0,
                 verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
@@ -1798,21 +1818,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               let placement = visiblePagePlacements.first(where: { $0.index == page })
         else { return }
 
-        for index in range where index < textPage.chars.count {
-            let character = textPage.chars[index]
-            pages.append(
-                CanvasPage(
-                    placement: PagePlacement(
-                        index: idBase + index,
-                        topPt: placement.topPt + character.yPt
-                            + character.heightPt * verticalOffset,
-                        leftPt: placement.leftPt + character.xPt,
-                        widthPt: character.widthPt,
-                        heightPt: max(character.heightPt * verticalScale, 1)
-                    ),
-                    image: image
-                )
-            )
+        for (index, rect) in textPage.selectionRects(in: range).enumerated() {
+            pages.append(CanvasPage(
+                placement: PagePlacement(
+                    index: idBase + index,
+                    topPt: placement.topPt + rect.minY + rect.height * verticalOffset,
+                    leftPt: placement.leftPt + rect.minX,
+                    widthPt: rect.width,
+                    heightPt: max(rect.height * verticalScale, 1)
+                ),
+                image: image
+            ))
         }
     }
 
@@ -1847,7 +1863,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         selectionAnchor = hit.index
         selection = Selection(page: hit.page, range: hit.index...hit.index)
-        reloadVisiblePages()
+        refreshSelectionOverlay()
     }
 
     /// Extends the selection to a point in content space.
@@ -1858,18 +1874,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               hit.page == current.page
         else { return }
 
-        selection = Selection(
-            page: current.page,
-            range: min(anchor, hit.index)...max(anchor, hit.index)
-        )
-        reloadVisiblePages()
+        let range = min(anchor, hit.index)...max(anchor, hit.index)
+        guard range != current.range else { return }
+        selection = Selection(page: current.page, range: range)
+        refreshSelectionOverlay()
     }
 
     public func clearSelection() {
         guard selection != nil || selectionAnchor != nil else { return }
         selection = nil
         selectionAnchor = nil
-        reloadVisiblePages()
+        refreshSelectionOverlay()
     }
 
     /// Copies the selected characters (⌘C from the canvas).
