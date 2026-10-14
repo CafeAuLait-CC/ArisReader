@@ -517,6 +517,10 @@ impl PdfiumBackend {
         // would shrink the page into the tile instead of cropping it. The tile bitmap is
         // therefore allocated here, and the matrix alone defines the page→device mapping.
         let config = render_config(request)
+            // PDFium's implicit clear uses the unscaled page dimensions. For tiles
+            // larger than the page (common at low zoom), that leaves the rest of the
+            // bitmap transparent. Initialize the entire bitmap below instead.
+            .clear_before_rendering(false)
             .clip(0, 0, width_px, height_px)
             .reset_matrix(matrix)
             .map_err(|error| {
@@ -524,11 +528,35 @@ impl PdfiumBackend {
                     .with_detail(format!("{error}"))
             })?;
 
-        let mut bitmap =
-            PdfBitmap::empty(width_px, height_px, PdfBitmapFormat::BGRA).map_err(|error| {
-                ArisError::new(ErrorCode::RenderFailed, "could not allocate a tile bitmap")
-                    .with_detail(format!("{error}"))
+        let [red, green, blue, alpha] = request.background;
+        let premultiply = |channel: u8| ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8;
+        let background = [
+            premultiply(blue),
+            premultiply(green),
+            premultiply(red),
+            alpha,
+        ];
+        let byte_count = usize::try_from(width_px)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height_px)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                ArisError::new(ErrorCode::RenderFailed, "tile bitmap size is too large")
             })?;
+        let mut pixels = vec![0; byte_count];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&background);
+        }
+        let mut bitmap =
+            PdfBitmap::from_bytes(width_px, height_px, PdfBitmapFormat::BGRA, &mut pixels)
+                .map_err(|error| {
+                    ArisError::new(ErrorCode::RenderFailed, "could not allocate a tile bitmap")
+                        .with_detail(format!("{error}"))
+                })?;
 
         page.render_into_bitmap_with_config(&mut bitmap, &config)
             .map_err(|error| {
@@ -1211,6 +1239,40 @@ mod tests {
             "{:.2}% of samples differ by more than 40/255 (worst {worst})",
             outlier_share * 100.0
         );
+    }
+
+    #[test]
+    fn oversized_tile_background_is_opaque_and_matches_full_page_alpha() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
+        let full = backend
+            .rasterize(&RasterRequest::full_page(PageIndex(0), 1.0))
+            .expect("full page");
+        let mut request = RasterRequest::full_page(PageIndex(0), 1.0);
+        request.region = Some(Rect::new(0.0, 0.0, 1024.0, 1024.0));
+        let tile = backend.rasterize(&request).expect("oversized tile");
+
+        assert_eq!(tile.size.width, 1024.0);
+        assert_eq!(tile.size.height, 1024.0);
+        for (index, pixel) in tile.pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(pixel[3], 0xFF, "tile pixel {index} is not opaque");
+        }
+
+        let overlap_width = (full.size.width as usize).min(tile.size.width as usize);
+        let overlap_height = (full.size.height as usize).min(tile.size.height as usize);
+        for y in 0..overlap_height {
+            for x in 0..overlap_width {
+                let tile_alpha = tile.pixels[y * tile.stride + x * 4 + 3];
+                let full_alpha = full.pixels[y * full.stride + x * 4 + 3];
+                assert_eq!(tile_alpha, full_alpha, "alpha differs at ({x}, {y})");
+            }
+        }
     }
 
     #[test]
