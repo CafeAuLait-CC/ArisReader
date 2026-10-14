@@ -105,6 +105,27 @@ pdftoppm -r 144 -png tests/fixtures/text-page.pdf /tmp/poppler
 cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
 ```
 
+## Development workflow
+
+This repository is trunk-based. A push to `master` runs CI; a **pull request** is used when a gate
+before merging earns its ceremony, which is decided by what the change does rather than by who wrote
+it:
+
+**Straight to `master`** — additive, self-contained work that does not change the behaviour of an
+existing code path: new modules or functions, tests, documentation, milestone and task lists, CI
+configuration. Code produced by an automated agent lands this way too, once it has been verified.
+
+**Through a pull request** — anything that changes existing behaviour: bug fixes, performance work,
+refactors, model or FFI signature changes, and anything touching the rendering, annotation or
+selection paths. Also use one for work that lands in pieces, for a new subsystem whose blast radius
+is not yet known, and for **anything done while another session is working in this repository** —
+that last case is what genuinely needs it, because a pull request is checked against the **merge
+result**, and an integration regression between two in-flight branches is invisible to either
+branch's own checks.
+
+Prefer a **merge commit** for a pull request whose individual commits carry meaning; squash only when
+the branch is a single commit or its history is noise.
+
 ## Documentation index
 
 The design documents live in `docs/` in the working copy (not committed yet — see the note above), so the links below
