@@ -11,6 +11,8 @@ import SwiftUI
 @main
 struct ArisReaderApp: App {
     @StateObject private var state = AppState()
+    /// Keeps the fallback timer alive until it fires (or the app is gone before that).
+    private static var quitWatchdog: DispatchSourceTimer?
 
     init() {
         // Running the bare executable (swift run / swift build output) has no
@@ -19,6 +21,31 @@ struct ArisReaderApp: App {
         // A packaged .app gets this for free; doing it here keeps dev runs usable.
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+
+        // Development aid: ARIS_READER_QUIT_AFTER=<ms> quits through the normal AppKit path
+        // (applicationWillTerminate → flush), so "quit inside the debounce window" — and the
+        // flush that must cover it — can be verified headlessly.
+        if let raw = ProcessInfo.processInfo.environment["ARIS_READER_QUIT_AFTER"],
+           let milliseconds = Int(raw), milliseconds >= 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
+                NSApplication.shared.terminate(nil)
+                // An attached sheet (the "sidecar could not be read" alert) holds AppKit's
+                // termination back until the reader answers it. Fall back to the signal path,
+                // which flushes and exits, so a dev run cannot become an unkillable process.
+                // A timer on a background queue, because the run loop may be in a modal mode.
+                let watchdog = DispatchSource.makeTimerSource(queue: .global())
+                watchdog.schedule(deadline: .now() + .milliseconds(1500))
+                // Explicitly nonisolated: a closure written here would inherit this type's
+                // main-actor isolation and trap when libdispatch runs it on its own queue.
+                watchdog.setEventHandler(handler: Self.raiseTerminationSignal)
+                watchdog.resume()
+                Self.quitWatchdog = watchdog
+            }
+        }
+    }
+
+    private nonisolated static func raiseTerminationSignal() {
+        raise(SIGTERM)
     }
 
     var body: some Scene {
@@ -57,6 +84,22 @@ struct ArisReaderApp: App {
                     .keyboardShortcut("-", modifiers: .command)
                 Button("Actual Size") { state.zoomActual() }
                     .keyboardShortcut("0", modifiers: .command)
+
+                Divider()
+
+                // Recovery for a sidecar that could not be read. The file is moved aside, never
+                // overwritten, and a fresh empty sidecar takes its place.
+                Button("Back Up Unreadable Annotations and Start Fresh…") {
+                    if let backup = state.recoverUnreadableAnnotationSidecar() {
+                        state.revealSidecarBackupInFinder(backup)
+                    }
+                }
+                .disabled(!state.canRecoverUnreadableAnnotationSidecar)
+
+                Button("Reveal Annotation Backup in Finder") {
+                    state.revealSidecarBackupInFinder()
+                }
+                .disabled(state.lastSidecarBackupURL == nil)
             }
         }
 

@@ -30,12 +30,26 @@ public struct ReaderWindow: View {
             }
         }
         .frame(minWidth: 900, minHeight: 600)
+        .onAppear {
+            // Flush hooks for the shell: normal quit and SIGTERM/SIGINT (see AppState). Installed
+            // here rather than in `AppState.init` so the check harness never takes over signals.
+            state.installTerminationHandling()
+        }
         .toolbar { toolbarContent }
         .alert("Lyra", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
         )) {
-            Button("OK") { state.lastError = nil }
+            // The way out of a sidecar that failed to load: an explicit action that moves the
+            // unreadable file aside (never overwrites it) and starts a fresh one.
+            if state.canRecoverUnreadableAnnotationSidecar {
+                Button("Back Up Sidecar and Start Fresh") {
+                    if let backup = state.recoverUnreadableAnnotationSidecar() {
+                        state.revealSidecarBackupInFinder(backup)
+                    }
+                }
+            }
+            Button("OK", role: .cancel) { state.lastError = nil }
         } message: {
             Text(state.lastError ?? "")
         }

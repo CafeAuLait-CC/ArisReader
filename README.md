@@ -80,6 +80,14 @@ cd apps/macos && swift build && swift run ArisReader
 #    In a sandboxed shell (CI, agent runners) add --disable-sandbox: SwiftPM's nested
 #    sandbox-exec is rejected there. scripts/check.sh retries automatically.
 #    Tip: ARIS_READER_OPEN=/path/to.pdf swift run ArisReader opens a document at launch.
+#    Dev hooks for headless checks (all optional, all logged on stderr):
+#      ARIS_READER_ANNOTATE="x1,y1;x2,y2"  highlight the text between two content points
+#      ARIS_READER_NOTE="text"             type into the first note, one keystroke at a time
+#                                          (ARIS_READER_NOTE_INTERVAL_MS, ARIS_READER_NOTE_COMMIT=1)
+#      ARIS_READER_RECOVER_SIDECAR=1       back up an unreadable sidecar and start fresh
+#      ARIS_READER_QUIT_AFTER=<ms>         quit through the normal flush path
+#    Sidecar writes are instrumented as `aris-annotate: saved N annotation(s) … write #K [trigger]`,
+#    which is what makes note-write coalescing measurable (at most one write per ~500 ms of typing).
 
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/Lyra.app
