@@ -597,24 +597,61 @@ impl ArisDocument {
         let entries = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
 
         let mut records = Vec::with_capacity(entries.len());
+        // One page → view transform per page, not per fragment: a bibliography page holds dozens
+        // of entries and each of their fragments asks for the same page again.
+        let mut transforms: std::collections::HashMap<u32, aris_reader_core::Transform2D> =
+            std::collections::HashMap::new();
         for entry in entries {
             // The entry's box comes from the character boxes of its own range, so the preview
             // can show exactly the entry rather than a whole page.
             let Ok(text) = self.backend.raw_text_page(PageIndex(entry.page)) else {
                 continue;
             };
-            let slice =
-                &text.chars[entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
-            let Some(rect) = union_of_char_boxes(slice) else {
+            if document_page_view(&self.backend, &mut transforms, entry.page).is_none() {
+                continue;
+            }
+            // The single rectangle stays the box on the entry's own page. For one fragment that
+            // is the fragment's own box, unchanged; when the entry is split, it is the union of
+            // the pieces that page carries. A continuation on another page cannot be part of a
+            // box here: the record names one page, and the preview rasterizes that page.
+            let on_page = entry
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.page == entry.page)
+                .map(|fragment| fragment.rect)
+                .reduce(aris_reader_core::Rect::union);
+            let rect = match on_page {
+                Some(rect) => rect,
+                // No fragment geometry (the text layer offered no boxes): fall back to the
+                // character boxes of the entry's own range, as this used to read.
+                None => {
+                    let slice = &text.chars
+                        [entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
+                    let Some(rect) = union_of_char_boxes(slice) else {
+                        continue;
+                    };
+                    rect
+                }
+            };
+            let Some(view) = view_box(&self.backend, &mut transforms, entry.page, rect) else {
                 continue;
             };
-            let transform = self
-                .backend
-                .page_info(PageIndex(entry.page))?
-                .geometry
-                .page_to_view(1.0);
-            let top_left = Point::new(rect.origin.x, rect.origin.y + rect.size.height);
-            let view = transform.apply(top_left);
+
+            let mut fragments = Vec::with_capacity(entry.fragments.len());
+            for fragment in &entry.fragments {
+                let Some(view) =
+                    view_box(&self.backend, &mut transforms, fragment.page, fragment.rect)
+                else {
+                    continue;
+                };
+                fragments.push(ReferenceFragment {
+                    page: fragment.page,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: fragment.rect.size.width,
+                    height_pt: fragment.rect.size.height,
+                });
+            }
 
             records.push(ReferenceRecord {
                 label: entry.label,
@@ -624,6 +661,7 @@ impl ArisDocument {
                 y_pt: view.y,
                 width_pt: rect.size.width,
                 height_pt: rect.size.height,
+                fragments,
             });
         }
 
@@ -655,6 +693,9 @@ impl ArisDocument {
                 page: record.page,
                 start: 0,
                 end: 0,
+                // Only labels and pages matter for resolution; the record handed back below
+                // carries the geometry the cache built.
+                fragments: Vec::new(),
             })
             .collect();
 
@@ -987,11 +1028,37 @@ pub struct CitationRecord {
 }
 
 /// One entry of the reference list, with the box it occupies on its page.
+///
+/// `x_pt`/`y_pt`/`width_pt`/`height_pt` are the entry's box **on `page`**, which is what the
+/// preview has always drawn: for an entry that fits in one column that box is unchanged, and for
+/// one that is split it is the union of the pieces on `page` (see `fragments`). The pieces
+/// themselves are in `fragments`; an entry spanning two pages has one there per page, and the
+/// single box here can only ever describe `page`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ReferenceRecord {
     pub label: String,
     pub text: String,
+    /// Page the entry starts on (0-based).
     pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// The pieces the entry is drawn in, in reading order, in **view space**.
+    ///
+    /// One element for the common case — one column, one page — where it equals the box above.
+    /// Two or more when the entry crosses a column gutter or continues on the next page; a
+    /// preview that draws a rectangle per fragment never spans a gutter. Empty when the page's
+    /// text layer offered no boxes at all, in which case the box above is the only geometry.
+    pub fragments: Vec<ReferenceFragment>,
+}
+
+/// One piece of a reference entry: the page to draw on and the box to show, in **view space**.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReferenceFragment {
+    /// Page the fragment is drawn on (0-based).
+    pub page: u32,
+    /// Box in view space (points, top-left origin), ready for `rasterize_region`.
     pub x_pt: f64,
     pub y_pt: f64,
     pub width_pt: f64,
@@ -1074,6 +1141,35 @@ fn page_region_to_view(
     geometry: aris_reader_core::PageGeometry,
 ) -> aris_reader_core::Rect {
     geometry.page_to_view(1.0).apply_rect(region)
+}
+
+/// The view transform of `page`, remembered in `cache` for the rest of the scan.
+fn document_page_view(
+    backend: &PdfiumBackend,
+    cache: &mut std::collections::HashMap<u32, aris_reader_core::Transform2D>,
+    page: u32,
+) -> Option<aris_reader_core::Transform2D> {
+    if let Some(transform) = cache.get(&page) {
+        return Some(*transform);
+    }
+    let transform = backend
+        .page_info(PageIndex(page))
+        .ok()?
+        .geometry
+        .page_to_view(1.0);
+    cache.insert(page, transform);
+    Some(transform)
+}
+
+/// A page-space box as its view-space **top-left corner**, the convention the preview uses.
+fn view_box(
+    backend: &PdfiumBackend,
+    cache: &mut std::collections::HashMap<u32, aris_reader_core::Transform2D>,
+    page: u32,
+    rect: aris_reader_core::Rect,
+) -> Option<Point> {
+    let transform = document_page_view(backend, cache, page)?;
+    Some(transform.apply(Point::new(rect.origin.x, rect.origin.y + rect.size.height)))
 }
 
 /// The page text **rebuilt from the character sequence**, so indices address the same

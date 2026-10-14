@@ -1011,21 +1011,63 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         );
     }
     println!("  reference entries parsed: {}", references.len());
+    // Fragments are the pieces an entry is really drawn in: one for an entry inside a single
+    // column on a single page, more when it crosses the gutter or continues on the next page.
+    // The preview draws one rectangle per fragment, so this is what it will show.
+    let column_splits = references
+        .iter()
+        .filter(|entry| {
+            entry.fragments.len() > 1 && entry.fragments.iter().all(|f| f.page == entry.page)
+        })
+        .count();
+    let cross_page = references
+        .iter()
+        .filter(|entry| entry.fragments.iter().any(|f| f.page != entry.page))
+        .count();
+    println!(
+        "  entries with more than one fragment: {} (column splits: {column_splits}, cross-page: {cross_page})",
+        references
+            .iter()
+            .filter(|entry| entry.fragments.len() > 1)
+            .count()
+    );
     let show_all = options.iter().any(|(key, _)| key == "--show-entries");
     for entry in references
         .iter()
         .take(if show_all { usize::MAX } else { 3 })
     {
         println!(
-            "    p{} [{}] {}",
+            "    p{} [{}] {}{}",
             entry.page + 1,
             entry.label,
             if show_all {
                 entry.text.clone()
             } else {
                 entry.text.chars().take(70).collect::<String>()
-            }
+            },
+            fragment_mark(entry)
         );
+    }
+    // Print the pieces of every split entry, even when the entry list itself is truncated:
+    // this is the part of the report the change exists for.
+    for entry in references.iter().filter(|entry| entry.fragments.len() > 1) {
+        println!(
+            "    p{} [{}] → {} fragments",
+            entry.page + 1,
+            entry.label,
+            entry.fragments.len()
+        );
+        for (index, fragment) in entry.fragments.iter().enumerate() {
+            println!(
+                "      fragment {}: p{} box {:.1},{:.1} {:.1}×{:.1} pt (page space)",
+                index + 1,
+                fragment.page + 1,
+                fragment.rect.origin.x,
+                fragment.rect.origin.y,
+                fragment.rect.size.width,
+                fragment.rect.size.height
+            );
+        }
     }
 
     let mut resolved = 0usize;
@@ -1061,11 +1103,12 @@ fn cmd_cite(args: &[String]) -> ExitCode {
                 resolved += 1;
                 if resolved <= 5 {
                     println!(
-                        "    p{} {} → [{}] {} (at {:.0},{:.0})",
+                        "    p{} {} → [{}] {}{} (at {:.0},{:.0})",
                         index + 1,
                         citation.text,
                         entry.label,
                         entry.text.chars().take(50).collect::<String>(),
+                        fragment_mark(entry),
                         citation.rect.origin.x,
                         citation.rect.origin.y
                     );
@@ -1081,6 +1124,15 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     };
     println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
     ExitCode::SUCCESS
+}
+
+/// Marks an entry that is drawn in more than one piece, so `cite` output shows which
+/// rectangles a preview would draw.
+fn fragment_mark(entry: &aris_reader_text::ReferenceEntry) -> String {
+    match entry.fragments.len() {
+        0 | 1 => String::new(),
+        count => format!(" [{count} fragments]"),
+    }
 }
 
 /// Figure/table index (M4): every caption in the document and the region a floating preview

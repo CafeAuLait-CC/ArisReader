@@ -118,6 +118,25 @@ def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def references_page(left: list[str], right: list[str]) -> str:
+    """A two-column bibliography page, left column first in the content stream.
+
+    Text is placed one line at a time at an explicit position, because the columns
+    have to be exact: the gutter between them is what `column_gutter` has to find,
+    and entry 2 is meant to start in the left column and end in the right one, which
+    is the layout the fragment model exists for. The columns are far enough apart
+    (70 pt) that no line can be mistaken for spanning both.
+    """
+    parts = ["0 0 0 rg"]
+    for x, lines in ((60, left), (330, right)):
+        for index, line in enumerate(lines):
+            y = 760 - index * 15
+            parts.append(
+                f"BT /F1 10 Tf {x} {y} Td ({escape_pdf_string(line)}) Tj ET"
+            )
+    return "\n".join(parts)
+
+
 def main() -> int:
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("tests/fixtures")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +184,30 @@ def main() -> int:
         "rotated.pdf": [
             (text_page("Rotated 90°", "this page uses /Rotate 90", ["Rotated body line."]), 90),
             (text_page("Rotated 180°", "this page uses /Rotate 180", ["Rotated body line."]), 180),
+        ],
+        # 4) Two-column bibliography: entry 2 starts at the foot of the left column and
+        #    ends at the head of the right one, so it is drawn in two pieces. The other
+        #    entries stay inside one column each.
+        "two-column-references.pdf": [
+            (
+                references_page(
+                    [
+                        "[1] Alpha, A.: A first work on motion. 2020.",
+                        "[2] Beta, B.: A second work whose title is",
+                        "long enough to wrap twice in the left",
+                        "column and then carry on to the right",
+                        "hand column of the very same page.",
+                    ],
+                    [
+                        "It ends here, on the first line.",
+                        "[3] Gamma, C.: A third work on style. 2018.",
+                        "[4] Delta, D.: A fourth work on shape. 2017.",
+                        "[5] Epsilon, E.: A fifth work on light. 2016.",
+                        "[6] Zeta, F.: A sixth work on sound. 2015.",
+                    ],
+                ),
+                0,
+            )
         ],
     }
 
