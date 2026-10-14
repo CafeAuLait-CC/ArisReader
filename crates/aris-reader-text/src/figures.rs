@@ -6,16 +6,41 @@
 //!   [`find_caption_mentions`]. The answer is a click target, so it needs character boxes and
 //!   nothing else.
 //! * **What should the floating preview show for it?** — a geometry question about the caption
-//!   and the artwork around it, answered by [`caption_region`]. The answer is a rectangle of the
-//!   page, which the shell rasterizes.
+//!   and the artwork around it, answered by [`caption_region_from`] (and by the narrower
+//!   [`caption_region`], which is the same call with the page's rules withheld). The answer is a
+//!   rectangle of the page, which the shell rasterizes.
 //!
 //! Keeping them apart is what lets the second one be measured: the corpus numbers reported for
 //! `aris-reader-cli figures` are the regions the shell will actually show.
 
-use aris_reader_core::{RawTextPage, Rect};
+use aris_reader_core::{LineSegment, RawTextPage, Rect};
 use std::collections::HashSet;
 
-use crate::{Caption, union_boxes, union_rect};
+use crate::tables::table_region;
+use crate::{Caption, TextLine, union_boxes, union_rect};
+
+/// The page evidence a preview region can be derived from.
+///
+/// This is an input bundle rather than four arguments because the four travel together: a caller
+/// that can read one of them can read all of them from the same open page, and a caller that
+/// cannot read the rules (an older test, a synthetic page) simply passes an empty slice and gets
+/// the pre-table behaviour.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageEvidence<'a> {
+    /// Image-object boxes, from `page_object_summary`.
+    pub images: &'a [Rect],
+    /// Axis-aligned rules of the page's vector geometry, from `page_line_segments`.
+    ///
+    /// Tables are drawn as lines and have no object of their own, so this is the only handle on
+    /// them at all. Empty means "the caller could not read the geometry", which costs the table
+    /// region but never changes a figure's.
+    pub rules: &'a [LineSegment],
+    /// The page's text layer grouped into lines, from [`crate::lines_from`].
+    ///
+    /// This confirms a candidate grid: rules alone cannot tell a table from a figure made of
+    /// lines, and the text inside the cells is what separates them.
+    pub lines: &'a [TextLine],
+}
 
 /// Distance above a caption (points) within which an image object can be its artwork.
 ///
@@ -189,7 +214,8 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
 ///
 /// * **Vector figures and tables have no image object at all.** Those previews use the full page,
 ///   preserving the artwork or grid in context instead of claiming the caption is the preview.
-///   On the Ye paper, most figures are vector art.
+///   On the Ye paper, most figures are vector art. (A `Table` does better when the caller can
+///   supply the page's rules: see [`caption_region_from`].)
 /// * **An image object's reported box is often a form's, not the picture's**, because PDFium
 ///   reports the enclosing form XObject's bounds (the core documents this in
 ///   `page_object_summary`). On page 18 of the Ye paper one such box spans two figures at once, so
@@ -203,6 +229,42 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
 /// image object reporting bounds larger than the page — form
 /// XObjects routinely do — cannot push the preview off it.
 pub fn caption_region(caption: &Caption, images: &[Rect], page_bounds: Rect) -> Rect {
+    caption_region_from(
+        caption,
+        PageEvidence {
+            images,
+            ..PageEvidence::default()
+        },
+        page_bounds,
+    )
+}
+
+/// [`caption_region`], with the whole page as evidence instead of only its image objects.
+///
+/// The extra inputs buy exactly one thing, and it is the one the task asked for: a `Table`
+/// caption whose table is drawn as a grid can be bounded by that grid
+/// ([`crate::tables::table_region`]) instead of falling back to the full page. Every other
+/// decision is unchanged, so a caller that switches to this entry point cannot regress a figure.
+///
+/// The three sources are consulted in the order of how much they claim:
+///
+/// 1. a table grid, for `Table` captions only — geometry the page itself draws;
+/// 2. an image object near a `Figure` caption — the historical rule;
+/// 3. the full visible page.
+///
+/// A `Table` caption whose page yields no grid keeps the full page, which is the honest answer:
+/// the reader asked for one table and the alternative is a crop of the caption alone.
+pub fn caption_region_from(
+    caption: &Caption,
+    evidence: PageEvidence<'_>,
+    page_bounds: Rect,
+) -> Rect {
+    if caption.kind == "Table"
+        && let Some(region) = table_region(caption, evidence.rules, evidence.lines, page_bounds)
+    {
+        return region;
+    }
+    let images = evidence.images;
     if caption.kind != "Figure" {
         return page_bounds;
     }

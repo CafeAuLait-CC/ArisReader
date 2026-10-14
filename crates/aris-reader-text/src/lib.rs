@@ -18,8 +18,12 @@ mod bibliography;
 #[cfg(test)]
 mod bibliography_tests;
 mod figures;
+pub mod tables;
 
-pub use figures::{CaptionMention, caption_region, find_caption_mentions};
+pub use figures::{
+    CaptionMention, PageEvidence, caption_region, caption_region_from, find_caption_mentions,
+};
+pub use tables::table_region;
 
 use aris_reader_core::{Point, RawCharBox, RawTextPage, Rect};
 

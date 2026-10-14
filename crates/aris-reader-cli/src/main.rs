@@ -15,6 +15,7 @@
 //! aris-reader-cli analyze <file.pdf> [--pages N]
 //! aris-reader-cli cite <file.pdf> [--body-pages N]
 //! aris-reader-cli figures <file.pdf> [--pages N]
+//! aris-reader-cli tables <file.pdf>... [--pages N] [--all]
 //! ```
 
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
@@ -32,8 +33,10 @@ Usage:
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
   aris-reader-cli cite <file.pdf>                match body citations against the reference list
-  aris-reader-cli figures <file.pdf>             figure/table captions and the region to preview
-                 [--pages N]
+  aris-reader-cli figures <file.pdf>...          figure/table captions and the region to preview
+                 [--pages N]                    (grid / image / page per caption)
+  aris-reader-cli tables <file.pdf>...           table previews: grid-derived or full-page fallback
+                 [--pages N] [--all]
   aris-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   aris-reader-cli render <file.pdf>              render one page to PNG
@@ -84,6 +87,7 @@ fn main() -> ExitCode {
         Some("figures") => cmd_figures(rest(&args)),
         Some("blocks") => cmd_blocks(rest(&args)),
         Some("region") => cmd_region(rest(&args)),
+        Some("tables") => cmd_tables(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -1091,19 +1095,43 @@ fn cmd_cite(args: &[String]) -> ExitCode {
 /// FFI converts it to view space for the shell.
 fn cmd_figures(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
-    let Some(path) = positional.first() else {
-        eprintln!("usage: aris-reader-cli figures <file.pdf> [--pages N]");
+    if positional.is_empty() {
+        eprintln!("usage: aris-reader-cli figures <file.pdf>... [--pages N]");
         return ExitCode::from(64);
-    };
+    }
     // A figure index is wanted for the whole readable body, so the cap is flat; the same 120
     // pages bound the reference scan in `cite` and in the FFI.
     let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
 
+    let mut found = 0usize;
+    let mut with_image = 0usize;
+    let mut with_grid = 0usize;
+    for path in &positional {
+        match figures_of_file(path, page_cap) {
+            Ok((captions, images, grids)) => {
+                found += captions;
+                with_image += images;
+                with_grid += grids;
+            }
+            Err(code) => return code,
+        }
+    }
+
+    println!(
+        "  → {found} caption(s): {with_grid} table(s) from a grid, {with_image} figure(s) from a \
+         raster object, the rest preview the full page"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Prints one line per caption of one file, and returns
+/// `(captions, figures paired with a raster object, tables bounded by a grid)`.
+fn figures_of_file(path: &str, page_cap: u32) -> Result<(usize, usize, usize), ExitCode> {
     let backend = match PdfiumBackend::open(Path::new(path), None) {
         Ok(backend) => backend,
         Err(error) => {
             eprintln!("cannot open {path}: {error}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
 
@@ -1113,6 +1141,7 @@ fn cmd_figures(args: &[String]) -> ExitCode {
 
     let mut found = 0usize;
     let mut with_image = 0usize;
+    let mut with_grid = 0usize;
     for index in 0..scan_end {
         let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
             continue;
@@ -1125,33 +1154,55 @@ fn cmd_figures(args: &[String]) -> ExitCode {
             .page_info(PageIndex(index))
             .map(|info| info.geometry.crop_box)
             .unwrap_or_default();
+        // Tables are drawn, not placed, so they need the page's vector geometry and its text:
+        // a grid is only believed when the cells inside it hold text.
+        let rules = backend
+            .page_line_segments(PageIndex(index))
+            .unwrap_or_default();
+        let lines = aris_reader_text::lines_from(&text);
+        let evidence = aris_reader_text::PageEvidence {
+            images: &images,
+            rules: &rules,
+            lines: &lines,
+        };
 
         for caption in aris_reader_text::find_captions(&text) {
             found += 1;
-            let region = aris_reader_text::caption_region(&caption, &images, page_bounds);
-            // Comparing with the no-object fallback counts figures whose raster artwork was
-            // confidently paired; vector figures, tables, and algorithms use the full page.
-            if region != aris_reader_text::caption_region(&caption, &[], page_bounds) {
-                with_image += 1;
+            let region = aris_reader_text::caption_region_from(&caption, evidence, page_bounds);
+            // Comparing with the no-evidence fallback counts figures whose raster artwork was
+            // confidently paired and tables whose grid was found; vector figures and algorithms
+            // still preview the full page.
+            let fallback = aris_reader_text::caption_region(&caption, &[], page_bounds);
+            if region != fallback {
+                if caption.kind == "Table" {
+                    with_grid += 1;
+                } else {
+                    with_image += 1;
+                }
             }
+            let source = if region == fallback {
+                "page"
+            } else if caption.kind == "Table" {
+                "grid"
+            } else {
+                "image"
+            };
             println!(
-                "  p{:<3} {:<6} {:<4} region ({:>6.1},{:>6.1}) {:>6.1}x{:<6.1}  {}",
+                "  p{:<3} {:<10} {:<4} {:<5} region ({:>6.1},{:>6.1}) {:>6.1}x{:<6.1}  {}",
                 index + 1,
                 caption.kind,
                 caption.label,
+                source,
                 region.origin.x,
                 region.origin.y,
                 region.size.width,
                 region.size.height,
-                caption.text.chars().take(50).collect::<String>()
+                caption.text.chars().take(46).collect::<String>()
             );
         }
     }
 
-    println!(
-        "  → {found} caption(s), {with_image} with a confidently paired raster object (the rest preview the full page)"
-    );
-    ExitCode::SUCCESS
+    Ok((found, with_image, with_grid))
 }
 
 /// Dumps the geometric segmentation of one page: lines, then blocks.
@@ -1210,6 +1261,138 @@ fn cmd_blocks(args: &[String]) -> ExitCode {
             block.text.chars().take(54).collect::<String>()
         );
     }
+    ExitCode::SUCCESS
+}
+
+/// The table-preview report: every `Table` caption, and whether its preview is the table.
+///
+/// This exists because "the fallback is the full page" is a claim that needs a denominator. The
+/// numbers it prints — how many captions there are, how many got a grid, and how large those
+/// regions are — are the ones quoted in `aris-reader-text::tables`' module docs.
+fn cmd_tables(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    if positional.is_empty() {
+        eprintln!("usage: aris-reader-cli tables <file.pdf>... [--pages N] [--all]");
+        return ExitCode::from(64);
+    }
+    let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
+    let show_all = options.iter().any(|(key, _)| key == "--all");
+
+    let mut caption_total = 0usize;
+    let mut grid_total = 0usize;
+    let mut widths: Vec<f64> = Vec::new();
+    let mut heights: Vec<f64> = Vec::new();
+
+    for path in &positional {
+        let backend = match PdfiumBackend::open(Path::new(path), None) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("cannot open {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let name = Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let short: String = name.chars().take(26).collect();
+        let mut file_captions = 0usize;
+        let mut file_grids = 0usize;
+
+        for index in 0..backend.page_count().min(page_cap) {
+            let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
+                continue;
+            };
+            let tables: Vec<_> = aris_reader_text::find_captions(&text)
+                .into_iter()
+                .filter(|caption| caption.kind == "Table")
+                .collect();
+            if tables.is_empty() {
+                continue;
+            }
+            let rules = backend
+                .page_line_segments(PageIndex(index))
+                .unwrap_or_default();
+            let lines = aris_reader_text::lines_from(&text);
+            let (images, _) = backend
+                .page_object_summary(PageIndex(index))
+                .unwrap_or_default();
+            let bounds = backend
+                .page_info(PageIndex(index))
+                .map(|info| info.geometry.crop_box)
+                .unwrap_or_default();
+
+            for caption in tables {
+                file_captions += 1;
+                let (outcome, grid) =
+                    aris_reader_text::tables::table_outcome(&caption, &rules, &lines);
+                // The preview the shell shows is the grid plus the caption that labels it.
+                let region = aris_reader_text::caption_region_from(
+                    &caption,
+                    aris_reader_text::PageEvidence {
+                        images: &images,
+                        rules: &rules,
+                        lines: &lines,
+                    },
+                    bounds,
+                );
+                if grid.is_some() {
+                    file_grids += 1;
+                    widths.push(region.size.width);
+                    heights.push(region.size.height);
+                }
+                if show_all || grid.is_none() {
+                    match grid {
+                        Some(_) => println!(
+                            "{short} p{:<3} Table {:<3} {:<9} region ({:>6.1},{:>6.1}) {:>6.1}x{:<6.1}",
+                            index + 1,
+                            caption.label,
+                            outcome.label(),
+                            region.origin.x,
+                            region.origin.y,
+                            region.size.width,
+                            region.size.height
+                        ),
+                        None => println!(
+                            "{short} p{:<3} Table {:<3} FALLBACK  [{}] caption ({:>6.1},{:>6.1}) {:>6.1}x{:<6.1}  {}",
+                            index + 1,
+                            caption.label,
+                            outcome.label(),
+                            caption.rect.origin.x,
+                            caption.rect.origin.y,
+                            caption.rect.size.width,
+                            caption.rect.size.height,
+                            caption.text.chars().take(40).collect::<String>()
+                        ),
+                    }
+                }
+            }
+        }
+        caption_total += file_captions;
+        grid_total += file_grids;
+        println!("{short}: {file_captions} table caption(s), {file_grids} with a grid region");
+    }
+
+    widths.sort_by(f64::total_cmp);
+    heights.sort_by(f64::total_cmp);
+    let median = |values: &[f64]| values.get(values.len() / 2).copied().unwrap_or(0.0);
+    println!(
+        "  -> {caption_total} table caption(s), {grid_total} grid-derived, {} fallback to the page",
+        caption_total - grid_total
+    );
+    println!(
+        "  -> region width  min {:.0} median {:.0} max {:.0} pt",
+        widths.first().copied().unwrap_or(0.0),
+        median(&widths),
+        widths.last().copied().unwrap_or(0.0)
+    );
+    println!(
+        "  -> region height min {:.0} median {:.0} max {:.0} pt",
+        heights.first().copied().unwrap_or(0.0),
+        median(&heights),
+        heights.last().copied().unwrap_or(0.0)
+    );
     ExitCode::SUCCESS
 }
 

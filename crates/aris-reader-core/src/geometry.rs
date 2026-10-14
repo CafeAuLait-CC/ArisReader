@@ -133,6 +133,55 @@ impl Rect {
     }
 }
 
+/// A straight line between two points, as a page's vector geometry reports it.
+///
+/// This is the primitive a table is built from: PDF has no table object and no cell object, but
+/// a border *is* a line, and a grid is lines that cross. Curves are deliberately not represented
+/// here — a curve is artwork, and treating its chord as a rule is how vector figures turn into
+/// phantom tables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineSegment {
+    /// Start point (page space).
+    pub from: Point,
+    /// End point (page space).
+    pub to: Point,
+}
+
+impl LineSegment {
+    pub const fn new(from: Point, to: Point) -> Self {
+        Self { from, to }
+    }
+
+    /// Euclidean length in points.
+    pub fn length(self) -> f64 {
+        let dx = self.to.x - self.from.x;
+        let dy = self.to.y - self.from.y;
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Whether the segment stays within `tolerance` points of a horizontal line.
+    pub fn is_horizontal(self, tolerance: f64) -> bool {
+        (self.to.y - self.from.y).abs() <= tolerance
+    }
+
+    /// Whether the segment stays within `tolerance` points of a vertical line.
+    pub fn is_vertical(self, tolerance: f64) -> bool {
+        (self.to.x - self.from.x).abs() <= tolerance
+    }
+
+    /// Axis-aligned bounding box (degenerate along the axis the segment runs on).
+    pub fn bounding_rect(self) -> Rect {
+        let min_x = self.from.x.min(self.to.x);
+        let min_y = self.from.y.min(self.to.y);
+        Rect::new(
+            min_x,
+            min_y,
+            (self.to.x - self.from.x).abs(),
+            (self.to.y - self.from.y).abs(),
+        )
+    }
+}
+
 /// 2D affine transform; memory layout matches `CGAffineTransform` (column-major):
 ///
 /// ```text
