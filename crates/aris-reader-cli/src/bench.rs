@@ -38,7 +38,7 @@
 use aris_reader_core::{DocId, DocumentBackend, EngineConfig, PageIndex, RasterRequest, Rect};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_render::{Lod, TileKey, visible_tiles};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -47,6 +47,10 @@ use std::time::{Duration, Instant};
 const BASELINE_HEADER: &str = "aris-baseline-v1";
 /// Gap between pages, in points, mirroring `AppState.pageGapPt` in the shell.
 const PAGE_GAP_PT: f64 = 12.0;
+/// Default byte budget of the modeled tile cache, mirroring
+/// `AppState.defaultTileCacheBudgetMB` in the shell. The two must agree or the bench would
+/// report memory for a reader that does not exist (ADR 0007).
+const DEFAULT_CACHE_BUDGET_MIB: usize = 48;
 
 /// The resolved measurement plan (all defaults are printed in the header, so an output line
 /// can always be traced back to the settings that produced it).
@@ -59,6 +63,11 @@ struct Plan {
     runs: usize,
     scroll_steps: usize,
     scroll_step_pt: f64,
+    /// Byte budget of the modeled tile cache (the shell's ADR 0007 policy).
+    cache_bytes: u64,
+    /// Optional count ceiling on top of the byte budget; `0` disables it. `96` reproduces the
+    /// pre-ADR 0007 shell policy (`tileCacheLimit`), which is what the M1/M2 baseline numbers
+    /// were measured under.
     cache_tiles: u64,
     search: String,
     search_limit: usize,
@@ -77,7 +86,8 @@ impl Plan {
             eprintln!(
                 "usage: aris-reader-cli bench <file.pdf> [--pages N] [--dpi D] [--viewport WxH]\n\
                  \x20      [--first-frame-scale S] [--repeat N] [--scroll-steps N]\n\
-                 \x20      [--scroll-step-pt P] [--cache-tiles N] [--search TERM] [--search-limit N]\n\
+                 \x20      [--scroll-step-pt P] [--cache-bytes MiB] [--cache-tiles N]\n\
+                 \x20      [--search TERM] [--search-limit N]\n\
                  \x20      [--skip-first-frame] [--skip-scroll] [--skip-search] [--skip-baseline]\n\
                  \x20      [--save-baseline FILE] [--check-baseline FILE]\n\
                  run `aris-reader-cli --help` for the method behind every number"
@@ -107,7 +117,11 @@ impl Plan {
             scroll_step_pt: crate::opt(&options, &["--scroll-step-pt"])
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(viewport.1 / 2.0),
-            cache_tiles: crate::opt_usize(&options, &["--cache-tiles"], 96) as u64,
+            cache_bytes: crate::opt_usize(&options, &["--cache-bytes"], DEFAULT_CACHE_BUDGET_MIB)
+                as u64
+                * 1024
+                * 1024,
+            cache_tiles: crate::opt_usize(&options, &["--cache-tiles"], 0) as u64,
             search: crate::opt(&options, &["--search"])
                 .unwrap_or("the")
                 .to_string(),
@@ -266,7 +280,6 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
     let scale = lod.scale();
     let tile_px = config.tile_size;
     let tile_pt = f64::from(tile_px) / scale;
-    let cache_bytes = plan.cache_tiles * u64::from(tile_px) * u64::from(tile_px) * 4;
 
     let page_count = backend.page_count();
     let mut layouts = Vec::new();
@@ -289,7 +302,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
 
     println!();
     println!(
-        "scroll: {} step(s) x {:.0} pt over {} page(s) laid out ({} in the document) - viewport {:.0}x{:.0} pt, LOD {} (scale {scale:.0}), {} px tiles, cache {} tiles (<= {:.0} MiB)",
+        "scroll: {} step(s) x {:.0} pt over {} page(s) laid out ({} in the document) - viewport {:.0}x{:.0} pt, LOD {} (scale {scale:.0}), {} px tiles, cache {} MiB{}",
         plan.scroll_steps,
         plan.scroll_step_pt,
         layouts.len(),
@@ -298,16 +311,19 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
         plan.viewport.1,
         lod.0,
         tile_px,
-        plan.cache_tiles,
-        cache_bytes as f64 / (1024.0 * 1024.0),
+        plan.cache_bytes as f64 / (1024.0 * 1024.0),
+        if plan.cache_tiles > 0 {
+            format!(" + {} tiles (pre-ADR 0007 policy)", plan.cache_tiles)
+        } else {
+            String::new()
+        },
     );
 
-    let mut cache = PixelCache::new(plan.cache_tiles as usize);
+    let mut cache = PixelCache::new(plan.cache_bytes, plan.cache_tiles as usize);
     let mut frames_ms = Vec::new();
     let mut tiles_rasterized = 0u64;
     let mut rastered_mp = 0.0;
     let mut raster_s = 0.0f64;
-    let mut peak_bytes = 0u64;
     let mut peak_tiles = 0usize;
     let mut skipped_steps = 0usize;
 
@@ -321,6 +337,10 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
         let step_started = Instant::now();
         let mut hits = 0u64;
         let mut misses = 0u64;
+        // The tiles this step shows: pinned, so eviction cannot drop what the reader is looking
+        // at (the shell's visible set, ADR 0007). Everything cached from earlier steps is fair
+        // game.
+        let mut pinned: HashSet<TileKey> = HashSet::new();
 
         for (page, top, width_pt, height_pt) in &layouts {
             // The viewport's band on this page, in points (view space, top-left origin).
@@ -340,6 +360,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
             for row in row0.min(rows)..row1 {
                 for col in 0..col1.max(1) {
                     let key = TileKey::new(DocId(1), PageIndex(*page), lod, col, row, 0);
+                    pinned.insert(key);
                     if cache.get(&key) {
                         hits += 1;
                         continue;
@@ -373,10 +394,10 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
                 }
             }
         }
+        cache.evict_to_fit(&pinned);
 
         let frame_ms = ms(step_started.elapsed());
         frames_ms.push(frame_ms);
-        peak_bytes = peak_bytes.max(cache.used_bytes());
         peak_tiles = peak_tiles.max(cache.len());
         if stats_enabled() {
             println!(
@@ -408,13 +429,20 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
         100.0 * within_budget as f64 / sorted.len() as f64
     );
     println!(
-        "  tiles rasterized {tiles_rasterized} · cache hits {} · misses {} · hit rate {:.1}% · evictions {} · peak occupancy {} tile(s) / {:.1} MiB",
+        "  tiles rasterized {tiles_rasterized} · cache hits {} · misses {} · hit rate {:.1}% · evictions {} ({:.1} MiB) · peak occupancy {} tile(s) / {:.1} MiB of a {:.0} MiB budget",
         cache.hits,
         cache.misses,
         cache.hit_rate() * 100.0,
         cache.evictions,
+        cache.evicted_bytes() as f64 / (1024.0 * 1024.0),
         peak_tiles,
-        peak_bytes as f64 / (1024.0 * 1024.0),
+        cache.peak_bytes() as f64 / (1024.0 * 1024.0),
+        cache.budget_bytes() as f64 / (1024.0 * 1024.0),
+    );
+    println!(
+        "  cache holds {:.1} MiB in {} tile(s) when the scroll ends",
+        cache.used_bytes() as f64 / (1024.0 * 1024.0),
+        cache.len(),
     );
     println!(
         "  rasterized {rastered_mp:.1} MP in {raster_s:.2} s of raster time -> {:.0} MP/s",
@@ -666,44 +694,62 @@ fn check_baseline(path: &Path, records: &[BaselineRecord]) -> std::io::Result<Ve
 
 // ── The scroll phase's cache ─────────────────────────────────────────────────
 
-/// A tile cache whose limit is a **tile count**, mirroring the shell's `tileCacheLimit = 96`.
+/// The scroll phase's cache: **byte budget + LRU + pinned set**, the shell's policy (ADR 0007).
 ///
-/// Deliberately not `aris-reader-render::TileCache`: that one is budgeted in bytes, and — the
-/// reason that matters more — the app never calls it. Measuring the crate's cache would
-/// describe a code path no user runs, so the bench reproduces the shell's policy (evict the
-/// least recently used tile once the count exceeds the limit) and keeps the pixels, so peak
-/// RSS covers what a real reader holds.
+/// Deliberately not `aris-reader-render::TileCache` — ADR 0007 puts the hot-path cache in the
+/// shell, and this is the *policy* model, not the production cache. What it must not do is
+/// describe a reader that no longer exists: the bench used to mirror the shell's
+/// `tileCacheLimit = 96` **tile count**, and a count is not a memory bound (measured: the shell
+/// held 110 tiles / 94 MiB at 400% zoom). So the budget is in bytes, spent from the real pixel
+/// buffers the bench keeps, and the tiles the current step shows are pinned.
+///
+/// `--cache-tiles N` remains as an extra count ceiling for reproducing pre-ADR numbers
+/// (`--cache-tiles 96`); `0` (the default) leaves the byte budget alone. The bench scrolls at
+/// one fixed LOD, so the shell's LOD-aware eviction order has nothing to choose between here.
 struct PixelCache {
-    limit: usize,
-    pixels: HashMap<TileKey, Vec<u8>>,
-    /// Least recently used first; at most `limit` entries, so the linear touch is cheap.
-    order: VecDeque<TileKey>,
+    budget_bytes: u64,
+    /// Optional count ceiling on top of the byte budget; `0` disables it.
+    count_limit: usize,
+    /// key → (pixels, last-used tick)
+    pixels: HashMap<TileKey, (Vec<u8>, u64)>,
+    tick: u64,
+    /// The tile inserted most recently, protected in the eviction pass that follows it.
+    newest: Option<TileKey>,
     hits: u64,
     misses: u64,
     evictions: u64,
+    evicted_bytes: u64,
+    peak_bytes: u64,
 }
 
 impl PixelCache {
-    fn new(limit: usize) -> Self {
+    fn new(budget_bytes: u64, count_limit: usize) -> Self {
         Self {
-            limit: limit.max(1),
+            budget_bytes,
+            count_limit,
             pixels: HashMap::new(),
-            order: VecDeque::new(),
+            tick: 0,
+            newest: None,
             hits: 0,
             misses: 0,
             evictions: 0,
+            evicted_bytes: 0,
+            peak_bytes: 0,
         }
     }
 
     /// Cache lookup; a hit refreshes the entry's position in the LRU order.
     fn get(&mut self, key: &TileKey) -> bool {
-        if !self.pixels.contains_key(key) {
-            return false;
+        self.tick += 1;
+        let tick = self.tick;
+        match self.pixels.get_mut(key) {
+            Some((_, last_used)) => {
+                *last_used = tick;
+                self.hits += 1;
+                true
+            }
+            None => false,
         }
-        self.order.retain(|entry| entry != key);
-        self.order.push_back(*key);
-        self.hits += 1;
-        true
     }
 
     fn record_miss(&mut self) {
@@ -711,15 +757,34 @@ impl PixelCache {
     }
 
     fn insert(&mut self, key: TileKey, pixels: Vec<u8>) {
-        if self.pixels.insert(key, pixels).is_some() {
-            self.order.retain(|entry| entry != &key);
-        }
-        self.order.push_back(key);
-        while self.pixels.len() > self.limit {
-            let Some(victim) = self.order.pop_front() else {
+        // Replacing a tile must not double-count its bytes: the old buffer is dropped here.
+        self.pixels.remove(&key);
+        self.tick += 1;
+        self.pixels.insert(key, (pixels, self.tick));
+        self.newest = Some(key);
+        self.peak_bytes = self.peak_bytes.max(self.used_bytes_inner());
+    }
+
+    /// Evicts until the budget and any count ceiling are met, skipping pinned tiles and the
+    /// newest insert. The caller passes the tiles the current step shows as `pinned`.
+    fn evict_to_fit(&mut self, pinned: &HashSet<TileKey>) {
+        while self.used_bytes_inner() > self.budget_bytes
+            || (self.count_limit > 0 && self.pixels.len() > self.count_limit)
+        {
+            let victim = self
+                .pixels
+                .iter()
+                .filter(|(key, _)| !pinned.contains(*key) && Some(**key) != self.newest)
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(key, _)| *key);
+            let Some(key) = victim else {
+                // Everything left is pinned (or is the newest insert): the budget yields rather
+                // than dropping something the reader is looking at.
                 break;
             };
-            self.pixels.remove(&victim);
+            if let Some((pixels, _)) = self.pixels.remove(&key) {
+                self.evicted_bytes += pixels.len() as u64;
+            }
             self.evictions += 1;
         }
     }
@@ -729,7 +794,26 @@ impl PixelCache {
     }
 
     fn used_bytes(&self) -> u64 {
-        self.pixels.values().map(|pixels| pixels.len() as u64).sum()
+        self.used_bytes_inner()
+    }
+
+    fn used_bytes_inner(&self) -> u64 {
+        self.pixels
+            .values()
+            .map(|(pixels, _)| pixels.len() as u64)
+            .sum()
+    }
+
+    fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes
     }
 
     fn hit_rate(&self) -> f64 {
@@ -798,8 +882,13 @@ fn print_header(plan: &Plan, backend: &PdfiumBackend) {
 /// both sides of the measurement. See docs/09 §9.
 fn print_stats_footer(plan: &Plan) {
     println!(
-        "stats: ARIS_READER_RENDER_STATS=1 · per-frame lines above are raster ms per scroll step · tile cache limit {} (tiles, mirroring the shell's tileCacheLimit) · the in-app HUD (Metal frame times, Swift tile cache) is not part of this CLI",
-        plan.cache_tiles
+        "stats: ARIS_READER_RENDER_STATS=1 · per-frame lines above are raster ms per scroll step · tile cache budget {} MiB{} (mirrors the shell's ADR 0007 policy) · the in-app HUD (Metal frame times, Swift tile cache) is not part of this CLI",
+        plan.cache_bytes / (1024 * 1024),
+        if plan.cache_tiles > 0 {
+            format!(" capped at {} tiles", plan.cache_tiles)
+        } else {
+            String::new()
+        },
     );
 }
 
@@ -1037,26 +1126,58 @@ mod tests {
 
     #[test]
     fn pixel_cache_frees_evicted_pixels() {
-        let mut cache = PixelCache::new(2);
-        cache.insert(
-            TileKey::new(DocId(1), PageIndex(0), Lod(1), 0, 0, 0),
-            vec![0u8; 4],
-        );
-        cache.insert(
-            TileKey::new(DocId(1), PageIndex(0), Lod(1), 1, 0, 0),
-            vec![0u8; 4],
-        );
+        let mut cache = PixelCache::new(8, 0);
+        let key = |x: u32| TileKey::new(DocId(1), PageIndex(0), Lod(1), x, 0, 0);
+        cache.insert(key(0), vec![0u8; 4]);
+        cache.insert(key(1), vec![0u8; 4]);
         assert_eq!(cache.len(), 2);
         // The third tile exceeds the 8-byte budget, so the oldest tile's pixels must go too.
-        cache.insert(
-            TileKey::new(DocId(1), PageIndex(0), Lod(1), 2, 0, 0),
-            vec![0u8; 4],
-        );
+        cache.insert(key(2), vec![0u8; 4]);
+        cache.evict_to_fit(&HashSet::new());
         assert!(cache.len() < 3);
         assert_eq!(cache.evictions, 1);
+        assert!(cache.used_bytes() <= cache.budget_bytes());
         assert_eq!(
             cache.used_bytes(),
-            cache.pixels.values().map(|p| p.len() as u64).sum::<u64>()
+            cache
+                .pixels
+                .values()
+                .map(|(pixels, _)| pixels.len() as u64)
+                .sum::<u64>()
         );
+    }
+
+    #[test]
+    fn pixel_cache_never_evicts_the_newest_or_a_pinned_tile() {
+        let mut cache = PixelCache::new(4, 0);
+        let key = |x: u32| TileKey::new(DocId(1), PageIndex(0), Lod(1), x, 0, 0);
+        cache.insert(key(0), vec![0u8; 4]);
+        cache.insert(key(1), vec![0u8; 4]);
+        // Both tiles are on screen: the budget yields instead of dropping visible content.
+        let pinned: HashSet<TileKey> = [key(0), key(1)].into_iter().collect();
+        cache.evict_to_fit(&pinned);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.evictions, 0);
+        assert!(cache.used_bytes() > cache.budget_bytes());
+
+        // One of them scrolls off: it becomes evictable, the visible one still does not.
+        let pinned: HashSet<TileKey> = [key(1)].into_iter().collect();
+        cache.evict_to_fit(&pinned);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.pixels.contains_key(&key(1)));
+    }
+
+    #[test]
+    fn pixel_cache_count_ceiling_reproduces_the_pre_adr_policy() {
+        // `--cache-tiles 96` is what the M1/M2 baseline was measured under; the ceiling still
+        // works alongside a byte budget that the tiny tiles here never reach.
+        let mut cache = PixelCache::new(1 << 30, 2);
+        let key = |x: u32| TileKey::new(DocId(1), PageIndex(0), Lod(1), x, 0, 0);
+        for x in 0..4 {
+            cache.insert(key(x), vec![0u8; 4]);
+            cache.evict_to_fit(&HashSet::new());
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.evictions, 2);
     }
 }
