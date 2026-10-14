@@ -1138,21 +1138,16 @@ fn reference_eval_precision_audit() {
                 percent(FALSE_POSITIVE_BUDGET)
             ));
         }
-        for (label, page, length) in &paper.prose_entries {
-            report.push_str(&format!(
-                "* entry-level: p{} `{}` is {} characters — too long or year-less for a reference entry\n",
-                page + 1,
-                label.replace('`', "'"),
-                length
-            ));
-        }
+        // The section header comes first: the entry-level lines below belong to *this* paper, and
+        // pushing them before the header filed them under the previous one.
         report.push_str(&format!(
-            "\n## `{}`\n\n{} entries, {} resolved, {} suspicious ({})\n\n",
+            "\n## `{}`\n\n{} entries, {} resolved, {} suspicious ({}), {} more for review\n\n",
             paper.id,
             paper.entries,
             paper.resolved,
-            paper.flags.len(),
-            percent(paper.flag_rate())
+            paper.gated_flags(),
+            percent(paper.flag_rate()),
+            paper.flags.len() - paper.gated_flags()
         ));
         for flag in &paper.flags {
             report.push_str(&format!(
@@ -1163,6 +1158,22 @@ fn reference_eval_precision_audit() {
                 flag.entry_page + 1,
                 flag.reason,
                 flag.excerpt.replace('`', "'")
+            ));
+        }
+        for miss in &paper.misses {
+            report.push_str(&format!(
+                "* unresolved p{}: `{}` labels [{}]\n",
+                miss.page + 1,
+                miss.text.replace('`', "'"),
+                miss.labels.replace('`', "'")
+            ));
+        }
+        for (label, page, length) in &paper.prose_entries {
+            report.push_str(&format!(
+                "* entry-level: p{} `{}` is {} characters — too long or year-less for a reference entry\n",
+                page + 1,
+                label.replace('`', "'"),
+                length
             ));
         }
     }
