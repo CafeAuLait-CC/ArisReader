@@ -55,10 +55,6 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
 /// build does not tolerate concurrent use across documents for anything that loads a handle.
 static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Serialises opening documents. Rendering may run in parallel across copies of a
-/// document; *loading* one must not (see the comment in [`PdfiumBackend::open`]).
-static LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Serialises the one-time load of the PDFium library.
 ///
 /// This is not paranoia: two threads opening their first document at the same time ran
@@ -208,14 +204,14 @@ pub fn destination_region_view_space(rect: Rect, page_height: f64) -> Rect {
 /// A document opened through PDFium.
 pub struct PdfiumBackend {
     /// Borrows from the process-wide [`Pdfium`], hence `'static`.
-    document: PdfDocument<'static>,
+    document: Option<PdfDocument<'static>>,
+    page_count: u32,
     path: PathBuf,
     /// Kept so [`PdfiumBackend::reopen`] can hand another thread its own copy.
     password: Option<String>,
     /// Whether the document was opened with a password (see `is_encrypted`).
     password_protected: bool,
-    /// Serialises rendering **on this document**. Different backends have different
-    /// locks, so per-thread copies render in parallel (T1.3).
+    /// Additional per-document guard; all PDFium operations also take PDFIUM_LOCK.
     raster_lock: std::sync::Mutex<()>,
 }
 
@@ -227,21 +223,17 @@ impl PdfiumBackend {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
         let pdfium = pdfium_instance()?;
 
-        // Loading is what has to be serialised, not rendering: two tests opening their
-        // first document at the same time crashed with SIGSEGV, while four threads
-        // rendering four *separate* documents in parallel is fine (see
-        // `reopened_copies_render_in_parallel`). Keeping the lock this narrow is what
-        // lets the raster pool be genuinely parallel.
-        let document = {
-            let _loading = LOAD_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pdfium.load_pdf_from_file(path, password)
-        };
+        // Loading, page operations and destruction share one transaction lock. The
+        // wrapper's per-call mutex does not protect a multi-call page operation.
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let document = pdfium.load_pdf_from_file(path, password);
 
         match document {
             Ok(document) => Ok(Self {
-                document,
+                page_count: document.pages().len().max(0) as u32,
+                document: Some(document),
                 path: path.to_path_buf(),
                 password: password.map(str::to_string),
                 password_protected: password.is_some(),
@@ -480,10 +472,15 @@ impl PdfiumBackend {
         // range check above guarantees the cast is lossless.
         let raw_index = index.get() as PdfPageIndex;
 
-        self.document.pages().get(raw_index).map_err(|error| {
-            ArisError::new(ErrorCode::RenderFailed, "could not load the page")
-                .with_detail(error.to_string())
-        })
+        self.document
+            .as_ref()
+            .expect("live document")
+            .pages()
+            .get(raw_index)
+            .map_err(|error| {
+                ArisError::new(ErrorCode::RenderFailed, "could not load the page")
+                    .with_detail(error.to_string())
+            })
     }
     /// Renders a sub-rectangle ("tile") of a page through PDFium's matrix path.
     ///
@@ -551,10 +548,21 @@ impl PdfiumBackend {
     }
 }
 
+impl Drop for PdfiumBackend {
+    fn drop(&mut self) {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Explicitly destroy the handle while the guard is alive. Automatic field
+        // destruction would run after this method releases the lock.
+        drop(self.document.take());
+    }
+}
+
 impl DocumentBackend for PdfiumBackend {
     fn page_count(&self) -> u32 {
-        // PDFium reports a signed count; it is never negative for a loaded document.
-        self.document.pages().len().max(0) as u32
+        // Immutable until page editing is implemented; no FFI call or nested lock.
+        self.page_count
     }
 
     fn page_info(&self, index: PageIndex) -> Result<PageInfo> {
@@ -596,7 +604,13 @@ impl DocumentBackend for PdfiumBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut nodes = Vec::new();
-        for bookmark in self.document.bookmarks().iter() {
+        for bookmark in self
+            .document
+            .as_ref()
+            .expect("live document")
+            .bookmarks()
+            .iter()
+        {
             // A bookmark without a resolvable page is still shown (its title is useful in
             // the sidebar) but cannot be navigated to.
             let page = bookmark
@@ -1035,7 +1049,7 @@ mod tests {
     /// The fixture is generated by `scripts/make-fixtures.py`; it draws a brown
     /// square (RGB 140,76,51) at PDF rect `360 480 120 120`.
     #[test]
-    fn reopened_copies_render_in_parallel() {
+    fn concurrent_workers_serialize_document_lifecycles() {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
         if !fixture.exists() || !crate::is_available() {
@@ -1044,14 +1058,19 @@ mod tests {
 
         let base = PdfiumBackend::open(&fixture, None).expect("open fixture");
 
-        // What the raster pool does: one document copy per worker, rendering at the same
-        // time. This crashed with SIGSEGV until the library load was serialised.
+        // Exercise opening and destruction while other workers read and rasterize.
+        // Workers overlap, but PDFium transactions must remain serialized.
         std::thread::scope(|scope| {
             for worker in 0..4u32 {
-                let copy = base.reopen().expect("reopen");
+                let base = &base;
                 scope.spawn(move || {
                     let scale = 2f64.powi(worker as i32);
                     for _ in 0..8 {
+                        let copy = base.reopen().expect("reopen while rendering");
+                        assert_eq!(copy.page_count(), 1);
+                        copy.raw_text_page(PageIndex(0)).expect("text");
+                        copy.link_targets(PageIndex(0)).expect("links");
+                        copy.outline().expect("outline");
                         let request =
                             RasterRequest::tile(PageIndex(0), scale, (0.0, 0.0), (64.0, 64.0));
                         let tile = copy.rasterize(&request).expect("concurrent tile");
