@@ -43,8 +43,9 @@ extension ReaderChecks {
         let tile = TileImage(page: 0, lod: 0, tileX: 0, tileY: 0, sizePx: 4,
                              bgra: Data((0..<64).map(UInt8.init)), generation: 99)
         let edge = tile.pageImage(pointSize: CGSize(width: 2, height: 3))
+        let expectedBytes: [UInt8] = [0,1,2,3,4,5,6,7,16,17,18,19,20,21,22,23,32,33,34,35,36,37,38,39]
         require(edge.pixelWidth == 2 && edge.pixelHeight == 3
-                && edge.bgra == Data(Array(0..<8).map(UInt8.init) + Array(16..<24).map(UInt8.init) + Array(32..<40).map(UInt8.init)),
+                && edge.bgra == Data(expectedBytes),
                 "edge tile crops rows without stretching or painting outside page")
         let state = AppState(engine: PreviewEngine())
         state.open(url: url)
