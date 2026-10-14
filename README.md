@@ -105,6 +105,20 @@ pdftoppm -r 144 -png tests/fixtures/text-page.pdf /tmp/poppler
 cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
 ```
 
+## Development workflow
+
+This repository is trunk-based. **Most changes go straight to `master`**; a push to `master` runs CI.
+A **pull request** is used when a gate before merging earns its ceremony:
+
+- anything produced by an automated agent, which a human reviews before it lands;
+- user-visible behaviour changes, multi-file work, or work that lands in pieces;
+- changes made **while someone else is working in the same repository** — the case that actually
+  needs it, because a pull request is checked against the **merge result**, and an integration
+  regression between two in-flight branches is invisible to either branch's own checks.
+
+Prefer a **merge commit** for a pull request whose individual commits carry meaning; squash only when
+the branch is a single commit or its history is noise.
+
 ## Documentation index
 
 The design documents live in `docs/` in the working copy (not committed yet — see the note above), so the links below
