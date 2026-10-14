@@ -558,15 +558,19 @@ impl ArisDocument {
         Ok(records)
     }
 
-    /// Resolves a citation's labels against the reference list.
+    /// Resolves every label of a citation against the reference list.
     ///
-    /// The shell calls this rather than matching labels itself, so the two conventions that
-    /// matter — exact label match, and position for a numeric citation against an unnumbered
-    /// list — live in one place.
-    pub fn resolve_citation(
+    /// A citation routinely names several works at once — `[1,2]`, `(He et al. 2024; Kim 2023)`
+    /// — and the reader expects all of them, so the plural form exists: the shell asks once for
+    /// the whole group instead of resolving label by label and re-implementing the matching
+    /// conventions (exact label match, then position for a numeric citation against an
+    /// unnumbered list) on the Swift side. Entries come back in label order and are
+    /// de-duplicated by `(label, page)`. An empty vector means nothing in the group could be
+    /// resolved, which is an ordinary outcome for the caller to report, not an error.
+    pub fn resolve_citations(
         &self,
         labels: Vec<String>,
-    ) -> Result<Option<ReferenceRecord>, ArisFfiError> {
+    ) -> Result<Vec<ReferenceRecord>, ArisFfiError> {
         let references = self.references()?;
         let parsed: Vec<aris_reader_text::ReferenceEntry> = references
             .iter()
@@ -579,14 +583,18 @@ impl ArisDocument {
             })
             .collect();
 
-        Ok(
-            aris_reader_text::resolve_reference(&labels, &parsed).and_then(|entry| {
+        Ok(aris_reader_text::resolve_references(&labels, &parsed)
+            .into_iter()
+            .filter_map(|entry| {
+                // Resolution ran against `parsed`, whose entries mirror `references` one to
+                // one; `(label, page)` is also the key the resolver de-duplicates by, so it
+                // identifies the record to hand back.
                 references
                     .iter()
-                    .find(|record| record.label == entry.label)
+                    .find(|record| record.label == entry.label && record.page == entry.page)
                     .cloned()
-            }),
-        )
+            })
+            .collect())
     }
 
     /// Links on `page`, in **view space** (points, top-left origin).
