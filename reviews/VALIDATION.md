@@ -5,12 +5,17 @@ M1 is independent. M2 → M3 → M4 are stacked to keep each review focused.
 
 ## Automated and native checks
 
-- Rust workspace unit/integration tests, formatting and strict Clippy.
+- Integrated Rust workspace: 142 unit/integration tests pass; formatting and
+  strict Clippy (`--workspace --all-targets -- -D warnings`) pass.
+- PDFium lifecycle stress: 50 rounds of four workers, eight cycles each (1,600
+  open/text/link/outline/render/drop cycles) pass with one process-wide lock.
+  All 11 PDFium tests pass, including a tile-background regression that failed
+  before the fix with transparent pixels outside the unscaled clear region.
 - Explicit opt-in corpus test across 12 local papers: all encoded coverage and
   identity assertions pass, 226/227 sampled citation spans resolve. This is the
   existing regression contract, not an independent precision/recall benchmark.
 - Native Swift build with regenerated Rust bindings and a CLT-compatible executable
-  regression harness. Checks cover normal open, thumbnails/search, stale searches,
+  regression harness: 32 checks pass. Checks cover normal open, thumbnails/search, stale searches,
   tab restoration/closure, failed opens, sidecar compatibility/failure/undo, and
   deliberately reordered preview responses, scroll bounds, group selection and
   preview close/document-switch/error paths.
@@ -19,6 +24,13 @@ M1 is independent. M2 → M3 → M4 are stacked to keep each review focused.
   reaches the bottom, and clicking `[1,11,19]` shows all three entries. Selecting
   entry 19 switches its preview while retaining the group. This caught a native
   wheel-direction bug that pure state tests did not expose.
+- The final integrated app also removes visible gray tile bands and clips edge
+  tiles to the page boundary. A clean Swift build links the Rust archive explicitly;
+  `otool -L` confirms the app no longer loads Rust from an absolute Cargo build path.
+
+These results use a local integration branch containing all four PRs. M1 is
+independent of the M2–M4 stack; both rendering fixes are needed for the final
+native result. No changes have been merged into master.
 
 ## Independent raster comparison
 
