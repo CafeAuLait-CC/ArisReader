@@ -579,10 +579,10 @@ fn first_surname(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A figure or table caption found in the text layer.
+/// A figure, table, or algorithm caption found in the text layer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Caption {
-    /// `Figure` or `Table`.
+    /// `Figure`, `Table`, or `Algorithm`.
     pub kind: String,
     /// The number as printed: `3`, `3a`, `IV`.
     pub label: String,
@@ -595,18 +595,17 @@ pub struct Caption {
     pub end: usize,
 }
 
-/// Finds `Figure N` / `Table N` captions.
+/// Finds `Figure N` / `Table N` / `Algorithm N` captions.
 ///
-/// A caption is the one structural element the text layer makes easy: papers label them
-/// consistently and the label sits at the start of a line. It is also the only handle we have on
-/// figures that are drawn as vector art, and on tables, which have no object type at all — the
-/// caption box plus the object nearest above it is a usable region even when the graphic itself
-/// is unidentifiable.
+/// A caption label must open a line and be followed by punctuation (`.`, `:`, en dash, or em dash)
+/// before its title. That separator keeps a line-start sentence such as `Figure 3 shows ...` in
+/// the mention stream. This text-layer cue is also our only handle on vector figures, tables, and
+/// algorithms that lack image objects.
 pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
     let chars: Vec<char> = text
         .chars
         .iter()
-        .filter_map(|character| char::from_u32(character.unicode))
+        .map(|character| char::from_u32(character.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect();
 
     let mut line_starts = vec![0usize];
@@ -624,29 +623,49 @@ pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
             .unwrap_or(chars.len());
         let line: String = chars[*start..end].iter().collect();
         let trimmed = line.trim_start();
-        let offset = line.len() - trimmed.len();
+        let offset = line.chars().count() - trimmed.chars().count();
 
         let lower = trimmed.to_ascii_lowercase();
         let kind = if lower.starts_with("figure") || lower.starts_with("fig.") {
             "Figure"
         } else if lower.starts_with("table") {
             "Table"
+        } else if lower.starts_with("algorithm") || lower.starts_with("alg.") {
+            "Algorithm"
         } else {
             continue;
         };
 
-        // After the word: an optional space, then a number or roman numeral, then `.`/`:` or space.
-        let after: String = trimmed
-            .chars()
-            .skip(if lower.starts_with("fig.") { 4 } else { 6 })
-            .collect();
+        // After the caption keyword comes a plain numeric label and a punctuation separator.
+        let label_start = if lower.starts_with("fig.") || lower.starts_with("alg.") {
+            4
+        } else if lower.starts_with("algorithm") {
+            9
+        } else if lower.starts_with("figure") {
+            6
+        } else {
+            5
+        };
+        let after: String = trimmed.chars().skip(label_start).collect();
         let after = after.trim_start();
-        let label: String = after
-            .chars()
-            .take_while(|character| character.is_ascii_digit() || *character == '.')
-            .collect();
-        let label = label.trim_end_matches('.').to_string();
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let label = digits;
         if label.is_empty() || !label.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        let suffix: String = after.chars().skip(label.chars().count()).collect();
+        let suffix = suffix.trim_start();
+        // A running sentence can begin with `Figure 3 shows ...`; captions conventionally
+        // separate their number from the title with punctuation. Requiring that separator
+        // prevents an ordinary line-start mention from stealing the caption record.
+        if suffix.starts_with(['.', ':', '\u{2013}', '\u{2014}']) {
+            // A dot immediately followed by another digit is a sub-number, not a separator.
+            if suffix.starts_with('.')
+                && suffix[1..].starts_with(|character: char| character.is_ascii_digit())
+            {
+                continue;
+            }
+        } else {
             continue;
         }
 
@@ -968,6 +987,31 @@ mod caption_tests {
     #[test]
     fn figure_without_a_number_is_ignored() {
         assert!(find_captions(&crate::test_page("Figure: a sketch\n")).is_empty());
+    }
+
+    #[test]
+    fn caption_indices_count_characters_after_unicode_indentation() {
+        let page = crate::test_page("\u{2003}Figure 4: overview\n");
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].start, 1);
+        assert_eq!(
+            captions[0].rect,
+            page.chars[1]
+                .rect
+                .union(page.chars[page.chars.len() - 1].rect)
+        );
+    }
+
+    #[test]
+    fn invalid_unicode_keeps_caption_ranges_aligned_with_raw_characters() {
+        let mut page = crate::test_page("Figure 4: overview\n");
+        let last = page.chars.len() - 2;
+        page.chars[last].unicode = 0x11_0000;
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].end, page.chars.len());
+        assert!(captions[0].text.contains(char::REPLACEMENT_CHARACTER));
     }
 }
 

@@ -68,6 +68,7 @@ public struct SidebarView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .onAppear { state.loadThumbnails(page: page) }
                     .padding(4)
                     .background(
                         RoundedRectangle(cornerRadius: 6)

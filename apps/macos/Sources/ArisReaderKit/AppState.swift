@@ -137,6 +137,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var colorIndex: Int
     public var note: String
     public var createdAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, page, start, end, colorIndex, note, createdAt
+    }
+
+    public init(
+        id: UUID,
+        kind: Kind = .highlight,
+        page: Int,
+        start: Int,
+        end: Int,
+        colorIndex: Int,
+        note: String,
+        createdAt: Date
+    ) {
+        self.id = id
+        self.kind = kind
+        self.page = page
+        self.start = start
+        self.end = end
+        self.colorIndex = colorIndex
+        self.note = note
+        self.createdAt = createdAt
+    }
+
+    /// Older sidecars predate `kind`; decode them as highlights while preserving all
+    /// explicitly stored kinds in newer sidecars.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        kind = try values.decodeIfPresent(Kind.self, forKey: .kind) ?? .highlight
+        page = try values.decode(Int.self, forKey: .page)
+        start = try values.decode(Int.self, forKey: .start)
+        end = try values.decode(Int.self, forKey: .end)
+        colorIndex = try values.decode(Int.self, forKey: .colorIndex)
+        note = try values.decode(String.self, forKey: .note)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+    }
 }
 
 /// A selection: a page and an inclusive character range in its text layer.
@@ -169,6 +207,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public struct CitationEntry: Equatable, Sendable {
         public let label: String
         public let text: String
+        public let page: Int?
+        public let region: CGRect?
+
+        public init(label: String, text: String, page: Int? = nil, region: CGRect? = nil) {
+            self.label = label
+            self.text = text
+            self.page = page
+            self.region = region
+        }
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -177,7 +224,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var referencePreviewZoom: CGFloat = 1
 
     /// Width the preview panel gives the page, in points.
-    private let referencePreviewWidthPt: CGFloat = 300
+    private var referencePreviewWidthPt: CGFloat = 480
+    private var referencePreviewHeightPt: CGFloat = 380
+    private var previewEpoch: UInt64 = 0
+    @Published public private(set) var referencePreviewScrollYPt: CGFloat = 0
+    @Published public private(set) var referencePreviewError: String?
+    @Published public private(set) var referencePreviewLoading = false
+
+    public func setReferencePreviewViewport(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        let widthChanged = abs(referencePreviewWidthPt - size.width) > 1
+        referencePreviewWidthPt = size.width
+        referencePreviewHeightPt = size.height
+        if widthChanged, let preview = referencePreview {
+            openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
+                                 region: preview.region, entries: preview.entries)
+        } else {
+            scrollReferencePreview(by: 0)
+        }
+    }
+
+    public func scrollReferencePreview(by delta: CGFloat) {
+        let height = referencePreviewPages.first?.placement.heightPt ?? 0
+        let visible = referencePreviewHeightPt / max(referencePreviewZoom, 0.01)
+        referencePreviewScrollYPt = min(max(0, referencePreviewScrollYPt + delta / max(referencePreviewZoom, 0.01)),
+                                       max(0, height - visible))
+    }
+
+    public func selectPreviewEntry(_ entry: CitationEntry) {
+        guard let preview = referencePreview, let page = entry.page else { return }
+        openReferencePreview(page: page, title: entry.label, from: preview.source,
+                             region: entry.region, entries: preview.entries)
+    }
+
+    public func showFullPreviewPage() {
+        guard let preview = referencePreview else { return }
+        openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
+                             entries: preview.entries)
+    }
 
     /// Opens a floating preview of `page`.
     ///
@@ -190,7 +274,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         region: CGRect? = nil,
         entries: [CitationEntry] = []
     ) {
-        guard document != nil, page >= 0 else { return }
+        guard let document, page >= 0, page < document.pageCount else { return }
+        if let region {
+            guard region.minX.isFinite, region.minY.isFinite, region.width.isFinite,
+                  region.height.isFinite, region.width > 0, region.height > 0 else { return }
+        }
+        previewEpoch &+= 1
+        let request = previewEpoch
+        referencePreviewPages = []
+        referencePreviewScrollYPt = 0
+        referencePreviewError = nil
+        referencePreviewLoading = true
         referencePreview = ReferencePreview(
             page: page,
             title: title,
@@ -210,9 +304,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         let widthPt = max(region?.width ?? engine.contentWidthPt(gapPt: pageGapPt), 1)
         let scale = referencePreviewWidthPt / widthPt * deviceScale
+        let epoch = documentEpoch
 
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, request == self.previewEpoch, epoch == self.documentEpoch else { return }
             let rasterized: PageImage?
             if let region {
                 rasterized = try? await self.engine.rasterizeRegion(
@@ -226,7 +321,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } else {
                 rasterized = try? await self.engine.renderPage(page, scale: scale)
             }
-            guard let image = rasterized else { return }
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            self.referencePreviewLoading = false
+            guard let image = rasterized else {
+                self.referencePreviewError = "This preview could not be rendered. Try opening the full page."
+                return
+            }
 
             self.referencePreviewPages = [
                 CanvasPage(
@@ -248,6 +348,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func closeReferencePreview() {
+        previewEpoch &+= 1
+        referencePreviewLoading = false
+        referencePreviewError = nil
+        referencePreviewScrollYPt = 0
         referencePreview = nil
         referencePreviewPages = []
     }
@@ -255,6 +359,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Highlights the reader added, and the file they are stored in.
     @Published public private(set) var annotations: [Annotation] = []
     private var annotationsURL: URL?
+    /// A failed read permanently blocks writes for this document, protecting its sidecar.
+    private var annotationWritesBlockedReason: String?
     /// Highlight colours offered in the toolbar (BGRA, translucent so text stays readable).
     public static let highlightPalette: [(name: String, bgra: [UInt8])] = [
         ("Yellow", [0x40, 0xD8, 0xFF, 0x66]),
@@ -289,7 +395,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var figures: [Figure] = []
     /// Bumped on every document open, so caption data that arrives afterwards is dropped
     /// instead of being attributed to the document now on screen (the `renderEpoch` idea).
-    private var figureEpoch: UInt64 = 0
+    private var documentEpoch: UInt64 = 0
 
     /// Links per page, fetched once and kept.
     private var linkCache: [Int: [DocumentLink]] = [:]
@@ -353,6 +459,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func invalidateTiles() {
         tileCache.removeAll()
         tileOrder.removeAll()
+        tilesInFlight.removeAll()
         renderEpoch &+= 1
     }
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
@@ -452,15 +559,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("aris-tabs: \(tabs.count) tab(s), active \(activeTabIndex.map(String.init) ?? "none")\n".utf8)
             )
 
-            if let opened = document?.url {
-                loadAnnotations(for: opened)
-            }
-            loadOutline()
-            loadThumbnails()
-            loadLinks()
-            loadCitations()
-            loadReferences()
-
             // Development aid: report the sidebar's data so it can be checked headlessly.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(1500))
@@ -557,10 +655,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return "\(currentPage) / \(document.pageCount)"
     }
 
-    public func open(url: URL) {
+    @discardableResult
+    public func open(url: URL) -> Bool {
         do {
             let loaded = try engine.openDocument(at: url)
+            resetDocumentState()
             document = loaded
+            lastError = nil
             currentPage = 1
             if loaded.pageCount > 0 {
                 statusMessage = String(
@@ -576,22 +677,56 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             invalidateTiles()
             scrollYPt = 0
 
-            // A figure/table index belongs to exactly one document, so the previous one is
-            // dropped before the new captions are fetched: a stale index would resolve a
-            // `Figure 3` click to the *previous* paper's artwork. Clearing before the layout
-            // pass also lets that pass start the new document's mention fetches. This is the
-            // only place the index is started, which keeps it to one scan per open — the Rust
-            // engine caches the result for the document's lifetime.
-            figures = []
-            captionMentionsByPage.removeAll()
-            captionMentionsInFlight.removeAll()
-            figureEpoch &+= 1
+            loadAnnotations(for: url)
             reloadVisiblePages()
+            restoreReadingPosition(for: url)
+            loadOutline()
+            loadThumbnails()
+            loadReferences()
             loadFigures()
+            return true
+
         } catch {
             lastError = String(describing: error)
             statusMessage = "Couldn't open the document"
+            return false
         }
+    }
+
+    private func resetDocumentState() {
+        documentEpoch &+= 1
+        searchEpoch &+= 1
+        positionSaveTask?.cancel()
+        closeReferencePreview()
+        invalidateTiles()
+        canvasPages = []
+        visiblePagePlacements = []
+        textPages = [:]
+        textPagesInFlight = []
+        linkCache = [:]
+        linksInFlight = []
+        citationsByPage = [:]
+        citationsInFlight = []
+        captionMentionsByPage = [:]
+        captionMentionsInFlight = []
+        figures = []
+        references = []
+        outline = []
+        thumbnails = [:]
+        thumbnailsInFlight = []
+        searchHits = []
+        currentHitIndex = nil
+        isSearching = false
+        selection = nil
+        selectionAnchor = nil
+        annotations = []
+        annotationsURL = nil
+        annotationWritesBlockedReason = nil
+        undoStack = []
+        redoStack = []
+        scrollYPt = 0
+        contentHeightPt = 0
+        contentWidthPt = 0
     }
 
     public func zoomIn() {
@@ -678,18 +813,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Runs a search over the whole document.
+    private var searchEpoch: UInt64 = 0
+
     public func runSearch() {
+        searchEpoch &+= 1
+        let request = searchEpoch
+        let epoch = documentEpoch
         let pattern = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard document != nil, !pattern.isEmpty else {
             searchHits = []
             currentHitIndex = nil
+            isSearching = false
             return
         }
 
         isSearching = true
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard epoch == self.documentEpoch, request == self.searchEpoch else { return }
             let hits = (try? await self.engine.search(pattern, limit: 500)) ?? []
+            guard epoch == self.documentEpoch, request == self.searchEpoch else { return }
             self.searchHits = hits
             self.isSearching = false
             self.currentHitIndex = hits.isEmpty ? nil : 0
@@ -730,6 +873,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         note: String = ""
     ) -> Bool {
         guard let selection, let url = document?.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
 
         let annotation = Annotation(
             id: UUID(),
@@ -741,12 +885,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             note: note,
             createdAt: Date()
         )
-
-        annotationsURL = Self.sidecarURL(for: url)
-        annotations.append(annotation)
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated) else { return false }
         undoStack.append(.added(annotation))
         redoStack.removeAll()
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = kind == .highlight
             ? "Highlighted \(selection.range.count) characters"
@@ -761,21 +904,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func removeAnnotation(_ id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
-        let removed = annotations.remove(at: index)
+        let removed = annotations[index]
+        var updated = annotations
+        updated.remove(at: index)
+        guard saveAnnotations(updated) else { return }
         undoStack.append(.removed(removed))
         redoStack.removeAll()
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Deleted annotation"
     }
 
     // MARK: - Undo / redo
 
-    /// One reversible change. A stack of these is what the shell offers today; the durable
-    /// transaction model belongs in `aris-reader-edit` (T3.1).
+    /// One reversible change. Note edits are represented as old/new values so an edit can
+    /// be undone and redone together with annotation creation and deletion.
     public enum UndoableAction: Sendable {
         case added(Annotation)
         case removed(Annotation)
+        case noteChanged(id: UUID, oldNote: String, newNote: String)
     }
 
     @Published public private(set) var undoStack: [UndoableAction] = []
@@ -785,37 +931,69 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canRedo: Bool { !redoStack.isEmpty }
 
     public func undo() {
-        guard let action = undoStack.popLast() else { return }
-        switch action {
-        case .added(let annotation):
-            annotations.removeAll { $0.id == annotation.id }
-        case .removed(let annotation):
-            annotations.append(annotation)
-        }
+        guard let action = undoStack.last else { return }
+        let updated = annotations(applying: action, undoing: true)
+        guard saveAnnotations(updated) else { return }
+        undoStack.removeLast()
         redoStack.append(action)
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Undo"
     }
 
     public func redo() {
-        guard let action = redoStack.popLast() else { return }
-        switch action {
-        case .added(let annotation):
-            annotations.append(annotation)
-        case .removed(let annotation):
-            annotations.removeAll { $0.id == annotation.id }
-        }
+        guard let action = redoStack.last else { return }
+        let updated = annotations(applying: action, undoing: false)
+        guard saveAnnotations(updated) else { return }
+        redoStack.removeLast()
         undoStack.append(action)
-        saveAnnotations()
         reloadVisiblePages()
         statusMessage = "Redo"
     }
 
+    private func annotations(applying action: UndoableAction, undoing: Bool) -> [Annotation] {
+        var updated = annotations
+        switch action {
+        case .added(let annotation):
+            if undoing {
+                updated.removeAll { $0.id == annotation.id }
+            } else if !updated.contains(where: { $0.id == annotation.id }) {
+                updated.append(annotation)
+            }
+        case .removed(let annotation):
+            if undoing {
+                if !updated.contains(where: { $0.id == annotation.id }) { updated.append(annotation) }
+            } else {
+                updated.removeAll { $0.id == annotation.id }
+            }
+        case .noteChanged(let id, let oldNote, let newNote):
+            if let index = updated.firstIndex(where: { $0.id == id }) {
+                updated[index].note = undoing ? oldNote : newNote
+            }
+        }
+        return updated
+    }
+
     public func updateNote(_ note: String, for id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
-        annotations[index].note = note
-        saveAnnotations()
+        let oldNote = annotations[index].note
+        guard oldNote != note else { return }
+        var updated = annotations
+        updated[index].note = note
+        guard saveAnnotations(updated) else { return }
+
+        // SwiftUI's TextField setter fires for each keystroke. Merge consecutive edits to
+        // the same note into one undo step while preserving the original value.
+        if let last = undoStack.last,
+           case .noteChanged(let lastID, let original, let previous) = last,
+           lastID == id, previous == oldNote {
+            undoStack.removeLast()
+            if original != note {
+                undoStack.append(.noteChanged(id: id, oldNote: original, newNote: note))
+            }
+        } else {
+            undoStack.append(.noteChanged(id: id, oldNote: oldNote, newNote: note))
+        }
+        redoStack.removeAll()
     }
 
     /// Shows an annotation: selects its range and scrolls it into view.
@@ -839,29 +1017,80 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func loadAnnotations(for url: URL) {
-        annotationsURL = Self.sidecarURL(for: url)
-        guard let annotationsURL,
-              let data = try? Data(contentsOf: annotationsURL),
-              let decoded = try? JSONDecoder().decode([Annotation].self, from: data)
-        else {
+        let sidecarURL = Self.sidecarURL(for: url)
+        annotationsURL = sidecarURL
+        annotationWritesBlockedReason = nil
+
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
+            let data = try Data(contentsOf: sidecarURL)
+            let decoded = try JSONDecoder().decode([Annotation].self, from: data)
+            guard decoded.allSatisfy({ $0.page >= 0 && $0.page < (document?.pageCount ?? 0)
+                && $0.start >= 0 && $0.end >= $0.start
+                && Self.highlightPalette.indices.contains($0.colorIndex) }),
+                Set(decoded.map(\.id)).count == decoded.count else {
+                throw NSError(domain: "ArisReader", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid annotation page, range, color or duplicate identity"])
+            }
+            annotations = decoded
+            undoStack.removeAll()
+            redoStack.removeAll()
+            FileHandle.standardError.write(
+                Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
+            )
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             annotations = []
-            return
+            undoStack.removeAll()
+            redoStack.removeAll()
+        } catch {
+            annotations = []
+            undoStack.removeAll()
+            redoStack.removeAll()
+            annotationWritesBlockedReason = error.localizedDescription
+            statusMessage = "Could not read annotations; the sidecar is protected from overwrite"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: read failed; writes blocked: \(error)\n".utf8)
+            )
         }
-        annotations = decoded
-        FileHandle.standardError.write(
-            Data("aris-annotate: loaded \(decoded.count) annotation(s)\n".utf8)
-        )
     }
 
-    private func saveAnnotations() {
-        guard let annotationsURL else { return }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(annotations) else { return }
-        try? data.write(to: annotationsURL, options: .atomic)
-        FileHandle.standardError.write(
-            Data("aris-annotate: saved \(annotations.count) annotation(s)\n".utf8)
-        )
+    /// Writes a candidate first and publishes it only after the atomic write succeeds.
+    /// Any unreadable/corrupt existing sidecar is protected from accidental replacement.
+    @discardableResult
+    private func saveAnnotations(_ candidate: [Annotation]) -> Bool {
+        guard let annotationsURL else {
+            statusMessage = "Could not save annotations: no document sidecar is selected"
+            lastError = statusMessage
+            return false
+        }
+        if let reason = annotationWritesBlockedReason {
+            statusMessage = "Could not save annotations because the sidecar could not be loaded; it was left untouched"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: write blocked: \(reason)\n".utf8)
+            )
+            return false
+        }
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(candidate)
+            try data.write(to: annotationsURL, options: .atomic)
+            annotations = candidate
+            FileHandle.standardError.write(
+                Data("aris-annotate: saved \(candidate.count) annotation(s)\n".utf8)
+            )
+            return true
+        } catch {
+            statusMessage = "Could not save annotations: \(error.localizedDescription)"
+            lastError = statusMessage
+            FileHandle.standardError.write(
+                Data("aris-annotate: save failed: \(error)\n".utf8)
+            )
+            return false
+        }
     }
 
     /// Public entry point for the sidebar's search results list.
@@ -912,10 +1141,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             linksInFlight.insert(placement.index)
 
             let page = placement.index
+            let epoch = documentEpoch
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                defer { self.linksInFlight.remove(page) }
+                guard epoch == self.documentEpoch else { return }
+                defer { if epoch == self.documentEpoch { self.linksInFlight.remove(page) } }
                 if let links = try? await self.engine.links(page) {
+                    guard epoch == self.documentEpoch else { return }
                     self.linkCache[page] = links
                 }
             }
@@ -926,6 +1158,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// ⌘C can copy it.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         guard wasClick else { return }
+        previewEpoch &+= 1
 
         // A click tries three things, in this order:
         //   1. a link annotation — the PDF's own target, and the only one that can leave the
@@ -955,12 +1188,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             captionMentionsInFlight.insert(placement.index)
 
             let page = placement.index
-            let epoch = figureEpoch
+            let epoch = documentEpoch
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                defer { self.captionMentionsInFlight.remove(page) }
+                guard epoch == self.documentEpoch else { return }
+                defer { if epoch == self.documentEpoch { self.captionMentionsInFlight.remove(page) } }
                 if let found = try? await self.engine.captionMentions(page: page) {
-                    guard epoch == self.figureEpoch else { return }
+                    guard epoch == self.documentEpoch else { return }
                     self.captionMentionsByPage[page] = found
                 }
             }
@@ -970,11 +1204,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Loads the figure/table caption index once per open document (see `open(url:)`).
     private func loadFigures() {
         guard figures.isEmpty else { return }
-        let epoch = figureEpoch
+        let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard epoch == self.documentEpoch else { return }
             let found = (try? await self.engine.figures()) ?? []
-            guard epoch == self.figureEpoch else { return }
+            guard epoch == self.documentEpoch else { return }
             self.figures = found
             FileHandle.standardError.write(
                 Data("aris-figures: \(self.figures.count) caption(s)\n".utf8)
@@ -989,10 +1224,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             citationsInFlight.insert(placement.index)
 
             let page = placement.index
+            let epoch = documentEpoch
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                defer { self.citationsInFlight.remove(page) }
+                guard epoch == self.documentEpoch else { return }
+                defer { if epoch == self.documentEpoch { self.citationsInFlight.remove(page) } }
                 if let found = try? await self.engine.citations(page) {
+                    guard epoch == self.documentEpoch else { return }
                     self.citationsByPage[page] = found
                 }
             }
@@ -1002,9 +1240,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Loads the reference list once (it never changes for an open document).
     private func loadReferences() {
         guard references.isEmpty else { return }
+        let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.references = (try? await self.engine.references()) ?? []
+            guard epoch == self.documentEpoch else { return }
+            let found = (try? await self.engine.references()) ?? []
+            guard epoch == self.documentEpoch else { return }
+            self.references = found
             FileHandle.standardError.write(
                 Data("aris-references: \(self.references.count) entries\n".utf8)
             )
@@ -1048,9 +1290,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 let written = citation.text
                     .split(whereSeparator: \.isWhitespace)
                     .joined(separator: " ")
+                let epoch = documentEpoch
+                let request = previewEpoch
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
                     let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
+                    guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
                     guard let first = resolved.first else {
                         self.statusMessage = "Citation \"\(written)\" has no matching entry"
                         return
@@ -1069,7 +1314,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             height: first.heightPt
                         ),
                         entries: resolved.map {
-                            CitationEntry(label: $0.label, text: $0.text)
+                            CitationEntry(label: $0.label, text: $0.text, page: $0.page,
+                                region: CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
                         }
                     )
                     if resolved.count == 1 {
@@ -1186,7 +1432,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// again here costs one extra scan only in the rare case where a click beats both loads,
     /// which is cheaper than keeping a second copy of the in-flight state.
     private func resolveFigureMention(on page: Int, at local: CGPoint) {
-        let epoch = figureEpoch
+        let epoch = documentEpoch
+        let request = previewEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
             let index = self.figures.isEmpty
@@ -1199,8 +1446,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 mentions = (try? await self.engine.captionMentions(page: page)) ?? []
             }
 
-            // A document switch while the answers were in flight: they describe another file.
-            guard epoch == self.figureEpoch else { return }
+            // A newer click or document switch supersedes this lookup.
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
             self.figures = index
             self.captionMentionsByPage[page] = mentions
 
@@ -1241,6 +1488,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     }
                 }
                 if let page = link.page {
+                    if openCitation(at: point) || openFigureMention(at: point) { return true }
                     // M4: show the target in a floating panel rather than jumping, so the
                     // citation can be read without losing the place in the text. When the
                     // destination names a region (/FitR), only that region is shown -- which
@@ -1266,40 +1514,38 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Opens a document in a new tab and switches to it.
     public func newTab(url: URL) {
         saveActiveTabPosition()
-        tabs.append(
-            OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent, scrollYPt: 0)
-        )
+        guard open(url: url) else { return }
+        tabs.append(OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
+                            scrollYPt: scrollYPt))
         activeTabIndex = tabs.count - 1
-        open(url: url)
-        restoreActiveTabPosition()
     }
 
-    /// Switches to a tab, reopening its document.
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
         saveActiveTabPosition()
+        guard open(url: tabs[index].url) else { return }
         activeTabIndex = index
-        let tab = tabs[index]
-        open(url: tab.url)
         restoreActiveTabPosition()
     }
 
-    /// Closes a tab and activates a neighbour.
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
-        tabs.remove(at: index)
-
-        guard !tabs.isEmpty else {
-            activeTabIndex = nil
-            document = nil
-            canvasPages = []
+        saveActiveTabPosition()
+        if index != activeTabIndex {
+            tabs.remove(at: index)
+            if let active = activeTabIndex, index < active { activeTabIndex = active - 1 }
             return
         }
-
+        tabs.remove(at: index)
+        activeTabIndex = nil
+        resetDocumentState()
+        document = nil
+        guard !tabs.isEmpty else { return }
         let next = min(index, tabs.count - 1)
-        activeTabIndex = next
-        open(url: tabs[next].url)
-        restoreActiveTabPosition()
+        if open(url: tabs[next].url) {
+            activeTabIndex = next
+            restoreActiveTabPosition()
+        }
     }
 
     private func saveActiveTabPosition() {
@@ -1310,7 +1556,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func restoreActiveTabPosition() {
         guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
         let saved = tabs[index].scrollYPt
-        guard saved > 0 else { return }
         scrollYPt = min(saved, max(0, contentHeightPt - viewportHeightContentPt))
         reloadVisiblePages()
     }
@@ -1321,28 +1566,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             outline = []
             return
         }
+        let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.outline = (try? await self.engine.outline()) ?? []
+            guard epoch == self.documentEpoch else { return }
+            let found = (try? await self.engine.outline()) ?? []
+            guard epoch == self.documentEpoch else { return }
+            self.outline = found
         }
     }
 
     /// Rasterizes the first pages at thumbnail size for the sidebar.
-    public func loadThumbnails() {
+    public func loadThumbnails(page requestedPage: Int? = nil) {
         guard let document, document.pageCount > 0 else {
             thumbnails = [:]
             return
         }
 
         let scale = thumbnailWidthPt / max(document.firstPageSize.width, 1)
-        for page in 0..<min(document.pageCount, thumbnailLimit) {
+        let pages = requestedPage.map { [$0] } ?? Array(0..<min(document.pageCount, thumbnailLimit))
+        for page in pages where page >= 0 && page < document.pageCount {
             guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page) else { continue }
             thumbnailsInFlight.insert(page)
 
+            let epoch = documentEpoch
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                defer { self.thumbnailsInFlight.remove(page) }
+                guard epoch == self.documentEpoch else { return }
+                defer { if epoch == self.documentEpoch { self.thumbnailsInFlight.remove(page) } }
                 if let image = try? await self.engine.renderPage(page, scale: scale) {
+                    guard epoch == self.documentEpoch else { return }
                     self.thumbnails[page] = image
                 }
             }
@@ -1478,8 +1731,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         index: tileIdentifier(key),
                         topPt: placement.topPt + CGFloat(ty) * tilePt,
                         leftPt: placement.leftPt + CGFloat(tx) * tilePt,
-                        widthPt: tilePt,
-                        heightPt: tilePt
+                        widthPt: min(tilePt, placement.widthPt - CGFloat(tx) * tilePt),
+                        heightPt: min(tilePt, placement.heightPt - CGFloat(ty) * tilePt)
                     )
 
                     if let cached = tileCache[key] {
@@ -1494,6 +1747,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         appendSelectionHighlights(to: &pages)
         prefetchTextLayers(for: visible)
         loadCaptionMentions()
+        loadLinks()
+        loadCitations()
         evictTiles(keeping: wanted)
         canvasPages = pages
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
@@ -1568,10 +1823,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             textPagesInFlight.insert(placement.index)
 
             let page = placement.index
+            let epoch = documentEpoch
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                defer { self.textPagesInFlight.remove(page) }
+                guard epoch == self.documentEpoch else { return }
+                defer { if epoch == self.documentEpoch { self.textPagesInFlight.remove(page) } }
                 if let extracted = try? await self.engine.textPage(page) {
+                    guard epoch == self.documentEpoch else { return }
                     self.textPages[page] = extracted
                     self.reloadVisiblePages()
                 }
@@ -1680,7 +1938,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let epoch = renderEpoch
         let tileSize = tileSizePx
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, epoch == self.renderEpoch else { return }
 
             do {
                 let tile = try await self.engine.rasterizeTile(
@@ -1690,26 +1948,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     tileY: key.y,
                     tileSize: tileSize
                 )
-                // Clear the in-flight mark first: a stale result must still lead to a
-                // re-request, otherwise the tile never appears at the new LOD.
+                guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
 
-                guard epoch == self.renderEpoch else {
-                    self.reloadVisiblePages()
-                    return
-                }
-
-                let image = PageImage(
-                    pixelWidth: tile.sizePx,
-                    pixelHeight: tile.sizePx,
-                    pointSize: CGSize(width: placement.widthPt, height: placement.heightPt),
-                    bgra: tile.bgra,
-                    generation: tile.generation
-                )
+                let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
                 self.tileCache[key] = CanvasPage(placement: placement, image: image)
                 self.tileOrder.append(key)
                 self.reloadVisiblePages()
             } catch {
+                guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
                 self.lastError = String(describing: error)
             }

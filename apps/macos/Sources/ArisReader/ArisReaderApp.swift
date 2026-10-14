@@ -42,6 +42,13 @@ struct ArisReaderApp: App {
                 Button("Next Page") { state.nextPage() }
                     .keyboardShortcut(.rightArrow, modifiers: .command)
 
+                Button("Next Search Match") { state.findNext() }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("Previous Search Match") { state.findPrevious() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                Button("Toggle Sidebar") { state.sidebarVisible.toggle() }
+                    .keyboardShortcut("s", modifiers: [.command, .option])
+
                 Divider()
 
                 Button("Zoom In") { state.zoomIn() }

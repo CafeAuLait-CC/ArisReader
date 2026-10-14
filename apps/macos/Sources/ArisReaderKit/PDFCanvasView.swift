@@ -51,7 +51,10 @@ public final class MetalCanvasView: NSView {
     /// Pages to draw; new bitmaps are uploaded as textures and old ones released.
     public var pages: [CanvasPage] = [] {
         didSet {
-            guard pages.map(\.image.generation) != oldValue.map(\.image.generation) else { return }
+            let unchanged = pages.count == oldValue.count && zip(pages, oldValue).allSatisfy {
+                $0.placement == $1.placement && $0.image.generation == $1.image.generation
+            }
+            guard !unchanged else { return }
             syncTextures()
             markNeedsRender()
         }
@@ -155,7 +158,8 @@ public final class MetalCanvasView: NSView {
     public override func scrollWheel(with event: NSEvent) {
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
         guard delta != 0 else { return }
-        onScroll?(delta)
+        // AppKit reports wheel motion; content offsets increase in the opposite direction.
+        onScroll?(-delta)
     }
 
     public override var acceptsFirstResponder: Bool { true }
