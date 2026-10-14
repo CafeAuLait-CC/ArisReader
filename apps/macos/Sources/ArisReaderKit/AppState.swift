@@ -91,6 +91,15 @@ public final class AppState: ObservableObject {
     private var viewportSizePt: CGSize = .zero
     /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
     private let tileSizePx = 512
+
+    /// How many tile rasters may run at once.
+    ///
+    /// This is also the bound on what moving the viewport can leave behind: a raster that has
+    /// already started cannot be cancelled, but nothing else survives `reloadVisiblePages`'s
+    /// `pendingTiles = []`. The checks assert that bound against this configured number rather
+    /// than against how quickly the machine happens to schedule the raster tasks.
+    public static let maxConcurrentTileRasters = 2
+
     /// Highest pyramid level we build (matches `EngineConfig::max_lod`).
     private let maxLod: UInt8 = 4
 
@@ -2355,7 +2364,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func pumpTiles() {
-        while tilesInFlight.count < 2, !pendingTiles.isEmpty {
+        while tilesInFlight.count < Self.maxConcurrentTileRasters, !pendingTiles.isEmpty {
             let (key, placement) = pendingTiles.removeFirst()
             startTile(key, placement: placement)
         }

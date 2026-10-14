@@ -75,12 +75,27 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(160))
         require(state.canvasPages.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == 0 }.isEmpty,
                 "partial tile completion does not paint a checkerboard over the fallback")
+        // A raster that has already started cannot be cancelled, so moving the viewport may
+        // only leave the rasters that are running *at that moment* to finish: everything still
+        // queued for the old viewport is dropped. `active == maxConcurrentTileRasters` is the
+        // state where that is observable without depending on how fast this machine schedules
+        // raster tasks -- the engine counts `active` inside the call, so once every slot the
+        // scheduler may fill is occupied, no just-created raster can still be unrecorded.
+        // The next raster the scheduler starts must then be the new viewport's, on a loaded
+        // 3-vCPU runner exactly as on an idle workstation. (Asserting "within one request" of
+        // the count taken before the move instead made this a race between the 160 ms wait
+        // above and a tile completion waking up its replacement: red on CI, green locally.)
+        try await eventually("both raster slots are busy before the viewport moves", {
+            engine.active == AppState.maxConcurrentTileRasters
+        })
         state.scroll(toFraction: 1)
-        let oldRequestCount = engine.requests.count
+        let requestsBeforeNavigation = engine.requests.count
         try await eventually("fast navigation reprioritizes the new viewport", { engine.requests.contains(2) })
-        require(engine.requests.firstIndex(of: 2)! <= oldRequestCount + 1,
-                "offscreen work cannot leave an unbounded raster backlog")
-        require(engine.maxActive <= 2, "at most two tile requests are in flight")
+        let firstNewViewportRaster = engine.requests.firstIndex(of: 2)!
+        require(firstNewViewportRaster == requestsBeforeNavigation,
+                "offscreen work cannot leave an unbounded raster backlog (the new viewport's first raster was request #\(firstNewViewportRaster), \(requestsBeforeNavigation) were issued before the viewport moved; requests \(engine.requests))")
+        require(engine.maxActive <= AppState.maxConcurrentTileRasters,
+                "at most two tile requests are in flight")
         try await eventually("new viewport gets a full-page fallback", {
             state.canvasPages.contains { $0.image.generation == 502 }
         })
