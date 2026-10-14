@@ -158,7 +158,8 @@ public final class MetalCanvasView: NSView {
     public override func scrollWheel(with event: NSEvent) {
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
         guard delta != 0 else { return }
-        onScroll?(delta)
+        // AppKit reports wheel motion; content offsets increase in the opposite direction.
+        onScroll?(-delta)
     }
 
     public override var acceptsFirstResponder: Bool { true }

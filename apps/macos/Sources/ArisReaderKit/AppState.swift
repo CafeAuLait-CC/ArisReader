@@ -207,6 +207,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public struct CitationEntry: Equatable, Sendable {
         public let label: String
         public let text: String
+        public let page: Int?
+        public let region: CGRect?
+
+        public init(label: String, text: String, page: Int? = nil, region: CGRect? = nil) {
+            self.label = label
+            self.text = text
+            self.page = page
+            self.region = region
+        }
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -215,7 +224,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var referencePreviewZoom: CGFloat = 1
 
     /// Width the preview panel gives the page, in points.
-    private let referencePreviewWidthPt: CGFloat = 300
+    private var referencePreviewWidthPt: CGFloat = 480
+    private var referencePreviewHeightPt: CGFloat = 380
+    private var previewEpoch: UInt64 = 0
+    @Published public private(set) var referencePreviewScrollYPt: CGFloat = 0
+    @Published public private(set) var referencePreviewError: String?
+    @Published public private(set) var referencePreviewLoading = false
+
+    public func setReferencePreviewViewport(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        let widthChanged = abs(referencePreviewWidthPt - size.width) > 1
+        referencePreviewWidthPt = size.width
+        referencePreviewHeightPt = size.height
+        if widthChanged, let preview = referencePreview {
+            openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
+                                 region: preview.region, entries: preview.entries)
+        } else {
+            scrollReferencePreview(by: 0)
+        }
+    }
+
+    public func scrollReferencePreview(by delta: CGFloat) {
+        let height = referencePreviewPages.first?.placement.heightPt ?? 0
+        let visible = referencePreviewHeightPt / max(referencePreviewZoom, 0.01)
+        referencePreviewScrollYPt = min(max(0, referencePreviewScrollYPt + delta / max(referencePreviewZoom, 0.01)),
+                                       max(0, height - visible))
+    }
+
+    public func selectPreviewEntry(_ entry: CitationEntry) {
+        guard let preview = referencePreview, let page = entry.page else { return }
+        openReferencePreview(page: page, title: entry.label, from: preview.source,
+                             region: entry.region, entries: preview.entries)
+    }
+
+    public func showFullPreviewPage() {
+        guard let preview = referencePreview else { return }
+        openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
+                             entries: preview.entries)
+    }
 
     /// Opens a floating preview of `page`.
     ///
@@ -228,7 +274,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         region: CGRect? = nil,
         entries: [CitationEntry] = []
     ) {
-        guard document != nil, page >= 0 else { return }
+        guard let document, page >= 0, page < document.pageCount else { return }
+        if let region {
+            guard region.minX.isFinite, region.minY.isFinite, region.width.isFinite,
+                  region.height.isFinite, region.width > 0, region.height > 0 else { return }
+        }
+        previewEpoch &+= 1
+        let request = previewEpoch
+        referencePreviewPages = []
+        referencePreviewScrollYPt = 0
+        referencePreviewError = nil
+        referencePreviewLoading = true
         referencePreview = ReferencePreview(
             page: page,
             title: title,
@@ -251,7 +307,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let epoch = documentEpoch
 
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, request == self.previewEpoch, epoch == self.documentEpoch else { return }
             let rasterized: PageImage?
             if let region {
                 rasterized = try? await self.engine.rasterizeRegion(
@@ -265,7 +321,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } else {
                 rasterized = try? await self.engine.renderPage(page, scale: scale)
             }
-            guard epoch == self.documentEpoch, let image = rasterized else { return }
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            self.referencePreviewLoading = false
+            guard let image = rasterized else {
+                self.referencePreviewError = "This preview could not be rendered. Try opening the full page."
+                return
+            }
 
             self.referencePreviewPages = [
                 CanvasPage(
@@ -287,6 +348,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func closeReferencePreview() {
+        previewEpoch &+= 1
+        referencePreviewLoading = false
+        referencePreviewError = nil
+        referencePreviewScrollYPt = 0
         referencePreview = nil
         referencePreviewPages = []
     }
@@ -1093,6 +1158,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// ⌘C can copy it.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         guard wasClick else { return }
+        previewEpoch &+= 1
 
         // A click tries three things, in this order:
         //   1. a link annotation — the PDF's own target, and the only one that can leave the
@@ -1225,10 +1291,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     .split(whereSeparator: \.isWhitespace)
                     .joined(separator: " ")
                 let epoch = documentEpoch
+                let request = previewEpoch
                 Task { @MainActor [weak self] in
-                    guard let self, epoch == self.documentEpoch else { return }
+                    guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
                     let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
-                    guard epoch == self.documentEpoch else { return }
+                    guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
                     guard let first = resolved.first else {
                         self.statusMessage = "Citation \"\(written)\" has no matching entry"
                         return
@@ -1247,7 +1314,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             height: first.heightPt
                         ),
                         entries: resolved.map {
-                            CitationEntry(label: $0.label, text: $0.text)
+                            CitationEntry(label: $0.label, text: $0.text, page: $0.page,
+                                region: CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
                         }
                     )
                     if resolved.count == 1 {
@@ -1365,6 +1433,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// which is cheaper than keeping a second copy of the in-flight state.
     private func resolveFigureMention(on page: Int, at local: CGPoint) {
         let epoch = documentEpoch
+        let request = previewEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
             let index = self.figures.isEmpty
@@ -1377,8 +1446,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 mentions = (try? await self.engine.captionMentions(page: page)) ?? []
             }
 
-            // A document switch while the answers were in flight: they describe another file.
-            guard epoch == self.documentEpoch else { return }
+            // A newer click or document switch supersedes this lookup.
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
             self.figures = index
             self.captionMentionsByPage[page] = mentions
 
@@ -1419,6 +1488,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     }
                 }
                 if let page = link.page {
+                    if openCitation(at: point) || openFigureMention(at: point) { return true }
                     // M4: show the target in a floating panel rather than jumping, so the
                     // citation can be read without losing the place in the text. When the
                     // destination names a region (/FitR), only that region is shown -- which
@@ -1661,8 +1731,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         index: tileIdentifier(key),
                         topPt: placement.topPt + CGFloat(ty) * tilePt,
                         leftPt: placement.leftPt + CGFloat(tx) * tilePt,
-                        widthPt: tilePt,
-                        heightPt: tilePt
+                        widthPt: min(tilePt, placement.widthPt - CGFloat(tx) * tilePt),
+                        heightPt: min(tilePt, placement.heightPt - CGFloat(ty) * tilePt)
                     )
 
                     if let cached = tileCache[key] {
@@ -1881,13 +1951,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
 
-                let image = PageImage(
-                    pixelWidth: tile.sizePx,
-                    pixelHeight: tile.sizePx,
-                    pointSize: CGSize(width: placement.widthPt, height: placement.heightPt),
-                    bgra: tile.bgra,
-                    generation: tile.generation
-                )
+                let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
                 self.tileCache[key] = CanvasPage(placement: placement, image: image)
                 self.tileOrder.append(key)
                 self.reloadVisiblePages()

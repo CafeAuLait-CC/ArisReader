@@ -224,6 +224,21 @@ public struct TileImage: Sendable {
         self.bgra = bgra
         self.generation = generation
     }
+    /// Edge tiles carry a square raster but must not paint past the PDF page bounds.
+    /// Crop pixels rather than squeezing the entire square into a narrower placement.
+    public func pageImage(pointSize: CGSize) -> PageImage {
+        let scale = CGFloat(1 << Int(lod))
+        let width = min(sizePx, max(1, Int(ceil(pointSize.width * scale))))
+        let height = min(sizePx, max(1, Int(ceil(pointSize.height * scale))))
+        var pixels = Data(capacity: width * height * 4)
+        for row in 0..<height {
+            let start = row * sizePx * 4
+            pixels.append(bgra[start..<(start + width * 4)])
+        }
+        return PageImage(pixelWidth: width, pixelHeight: height, pointSize: pointSize,
+                         bgra: pixels, generation: generation)
+    }
+
 }
 
 /// One page ready to be drawn: where it goes and the bitmap that goes there.

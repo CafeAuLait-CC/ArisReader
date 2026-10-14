@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
+    @State private var previewExpanded = false
 
     public init(state: AppState) {
         self.state = state
@@ -78,7 +79,6 @@ public struct ReaderWindow: View {
                     onRedo: { state.redo() }
             )
             HStack { Spacer(); ScrollIndicator(state: state) }
-            secondSurface
 
             if state.document == nil {
                 emptyState
@@ -89,6 +89,7 @@ public struct ReaderWindow: View {
                 pageHUD
                     .padding(.bottom, 16)
             }
+            secondSurface
         }
     }
 
@@ -116,88 +117,98 @@ public struct ReaderWindow: View {
     /// wgpu device, with its own surface id and frame loop, showing the referenced page while
     /// the reader keeps their place in the text.
     @ViewBuilder
-    private var referencePanel: some View {
+    private func referencePanel(available: CGSize) -> some View {
         if let preview = state.referencePreview {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text(preview.title)
-                        .font(.caption)
-                        .bold()
-                    Text("from \(preview.source)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 8)
-                    Button {
+            let width = min(previewExpanded ? 720.0 : 480.0, max(240, available.width - 32))
+            let entriesHeight = preview.entries.isEmpty ? 0.0 : min(160, available.height * 0.25)
+            let desiredHeight = preview.region.map { width * $0.height / max($0.width, 1) }
+                ?? state.referencePreviewPages.first.map { $0.placement.heightPt * state.referencePreviewZoom }
+                ?? 400
+            let imageHeight = min(max(80, desiredHeight), max(120, min(available.height - entriesHeight - 134, 600)))
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Text(preview.title).font(.headline).lineLimit(1)
+                    Spacer(minLength: 0)
+                    Button { previewExpanded.toggle() } label: {
+                        Image(systemName: previewExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    }.help("Resize preview")
+                    Button { state.closeReferencePreview() } label: {
+                        Image(systemName: "xmark")
+                    }.help("Close preview")
+                }.buttonStyle(.plain)
+                HStack {
+                    Text("From \(preview.source) · page \(preview.page + 1)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Full page") { state.showFullPreviewPage() }
+                    Button("Go to page") {
                         state.gotoPage(preview.page)
                         state.closeReferencePreview()
-                    } label: {
-                        Image(systemName: "arrow.up.forward.square")
                     }
-                    .buttonStyle(.plain)
-                    .help("Go to this page")
-
-                    Button {
-                        state.closeReferencePreview()
-                    } label: {
-                        Image(systemName: "xmark")
+                }.font(.caption)
+                ZStack {
+                    PDFCanvasView(
+                        pages: state.referencePreviewPages,
+                        scrollYPt: state.referencePreviewScrollYPt,
+                        zoom: state.referencePreviewZoom,
+                        contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
+                        onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
+                        onFailure: { message in state.reportGpuFailure(message) },
+                        onViewportSize: { size in state.setReferencePreviewViewport(size) },
+                        onScroll: { delta in state.scrollReferencePreview(by: delta) }
+                    )
+                    if state.referencePreviewLoading { ProgressView("Loading preview…") }
+                    if let error = state.referencePreviewError {
+                        Text(error).font(.callout).padding().background(.regularMaterial)
                     }
-                    .buttonStyle(.plain)
-                    .help("Close preview")
                 }
-
-                PDFCanvasView(
-                    pages: state.referencePreviewPages,
-                    zoom: state.referencePreviewZoom,
-                    contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
-                    onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
-                    onFailure: { message in state.reportGpuFailure(message) }
-                )
-                .frame(width: 300, height: 380)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .frame(width: width, height: imageHeight)
                 .background(Color.white)
-
-                // A grouped citation names several works: the image above shows the first,
-                // and this list gives every one of them a label and the beginning of its text.
+                .clipShape(RoundedRectangle(cornerRadius: 6))
                 if !preview.entries.isEmpty {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
+                        VStack(alignment: .leading, spacing: 12) {
                             ForEach(preview.entries.indices, id: \.self) { index in
                                 let entry = preview.entries[index]
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(entry.label)
-                                        .font(.caption2)
-                                        .bold()
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if entry.page != nil {
+                                        Button(entry.label) { state.selectPreviewEntry(entry) }
+                                            .buttonStyle(.link)
+                                    } else {
+                                        Text(entry.label).bold()
+                                    }
                                     Text(entry.text)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(3)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                        }
-                    }
-                    .frame(maxWidth: 300, maxHeight: 132)
+                        }.font(.callout)
+                    }.frame(height: entriesHeight)
                 }
+                Text("Scroll inside the preview to read more. Full page shows surrounding content.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
+            .frame(width: width)
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             .shadow(radius: 14)
+            .onExitCommand { state.closeReferencePreview() }
         }
     }
 
-    /// Hosts the reference preview panel in the corner of the reader window.
     @ViewBuilder
     private var secondSurface: some View {
-        // Visible for the reference preview, or forced on for the M0 multi-surface spike.
-        if state.showSecondSurface || state.referencePreview != nil {
-            VStack {
-                Spacer()
-                HStack {
-                    Spacer()
-                    referencePanel
-                }
+        if state.referencePreview != nil {
+            GeometryReader { geometry in
+                VStack {
+                    Spacer(minLength: 0)
+                    HStack {
+                        Spacer(minLength: 0)
+                        referencePanel(available: geometry.size)
+                    }
+                }.padding(12)
             }
-            .padding(16)
         }
     }
 
@@ -329,11 +340,12 @@ public struct ReaderWindow: View {
             .help("Zoom in (⌘+)")
 
             Button {
-                state.showSecondSurface.toggle()
+                state.closeReferencePreview()
             } label: {
                 Image(systemName: "rectangle.on.rectangle")
             }
-            .help("Show/hide the second render surface (multi-surface check)")
+            .disabled(state.referencePreview == nil)
+            .help("Close reference preview")
 
             Button {
                 state.sidebarVisible.toggle()

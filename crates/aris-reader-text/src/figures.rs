@@ -1,4 +1,4 @@
-//! Figure and table cross-references, and the page region a preview of one should show.
+//! Figure, table, and algorithm cross-references, and the page region a preview should show.
 //!
 //! Two different questions live here, and they are easy to conflate:
 //!
@@ -13,6 +13,7 @@
 //! `aris-reader-cli figures` are the regions the shell will actually show.
 
 use aris_reader_core::{RawTextPage, Rect};
+use std::collections::HashSet;
 
 use crate::{Caption, union_boxes, union_rect};
 
@@ -24,11 +25,8 @@ use crate::{Caption, union_boxes, union_rect};
 /// SMooDi paper received `Fig. 6`'s artwork, and `Figure 11` on page 18 of the Ye paper received a
 /// region covering the top two thirds of the page, figure above included. 60 pt keeps every
 /// measured true pair and drops those. The price is a figure whose raster insets sit further from
-/// its caption: it falls back to the caption-only region below.
+/// its caption: it falls back to the full visible page below.
 const MAX_IMAGE_DISTANCE_PT: f64 = 60.0;
-
-/// Padding added around a caption that has no image object to pair with.
-const CAPTION_PADDING_PT: f64 = 6.0;
 
 /// How close (points) another image object must be to join the figure being assembled.
 ///
@@ -39,13 +37,13 @@ const PANEL_GAP_PT: f64 = 24.0;
 /// Share of the narrower box that two boxes must overlap along an axis to count as related.
 const MIN_OVERLAP_SHARE: f64 = 0.5;
 
-/// A `Figure N` / `Fig. N` / `Table N` reference in the running text.
+/// A `Figure N` / `Fig. N` / `Table N` / `Algorithm N` reference in the running text.
 ///
 /// This is the click target, not the caption: see [`find_caption_mentions`] for exactly what is
 /// and is not reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptionMention {
-    /// `Figure` or `Table` (the normalised spelling, as in [`Caption::kind`]).
+    /// `Figure`, `Table`, or `Algorithm` (the normalised spelling, as in [`Caption::kind`]).
     pub kind: String,
     /// The number as printed: `3`, `12`.
     pub label: String,
@@ -56,23 +54,24 @@ pub struct CaptionMention {
     pub end: usize,
 }
 
-/// Finds `Figure N` / `Fig. N` / `Table N` references **anywhere** in a page's text.
+/// Finds `Figure N` / `Fig. N` / `Table N` / `Algorithm N` references **anywhere** in a page's text.
 ///
 /// This is the prose half of the figure index, and the counterpart of [`crate::find_captions`]:
-/// a caption is found by its *position* (the label opens a line), while a cross-reference in the
-/// body has no position at all — `as Figure 3 shows` and `(see Fig. 3)` must both be found.
+/// a caption is found by its position and punctuation after the label, while a cross-reference in
+/// the body has no such caption delimiter — `Figure 3 shows` and `(see Fig. 3)` must both be found.
 ///
 /// # What is reported, and what is left to `find_captions`
 ///
 /// The two scanners partition the same pattern instead of overlapping on it: an occurrence that
-/// opens a line **is** the caption, so it is not reported here. That is what makes the result
+/// opens a line and uses a caption delimiter **is** the caption, so it is not reported here. That is what makes the result
 /// directly usable as click targets — a reader clicking the caption printed under the figure is
 /// already looking at the figure. A caller that wants every occurrence can union the two results,
 /// because an occurrence is reported by exactly one of them. (An occurrence *inside* a caption
 /// line — `Figure 3: comparison with Figure 2` — is a mention of the other figure and is reported
 /// as such.)
 ///
-/// The vocabulary deliberately matches `find_captions` — `Figure`, `Fig.`, `Table`, then a plain
+/// The vocabulary deliberately matches `find_captions` — `Figure`, `Fig.`, `Table`, `Algorithm`,
+/// `Alg.`, then a plain
 /// number — so that a mention and a caption agree on what `Figure 3` names. Plural forms
 /// (`Figures 3 and 4`) and sub-numbers (`Fig. 3.1`) are not reported, because no caption carries
 /// those labels either; a `3` followed by a letter (`Figure 3a`) is reported as label `3`.
@@ -83,19 +82,19 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
         .map(|character| char::from_u32(character.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect();
 
+    let caption_starts: HashSet<usize> = crate::find_captions(text)
+        .into_iter()
+        .map(|caption| caption.start)
+        .collect();
     let mut mentions = Vec::new();
-    let mut line_start = 0usize;
 
     for (index, character) in chars.iter().enumerate() {
         if matches!(character, '\n' | '\r') {
-            line_start = index + 1;
             continue;
         }
-        // Whatever opens a line is a caption; see the doc comment.
-        if chars[line_start..index]
-            .iter()
-            .all(|character| character.is_whitespace())
-        {
+        // Only labels accepted as captions are suppressed; ordinary prose can begin a line with
+        // `Figure 3 shows ...` and should remain a clickable mention.
+        if caption_starts.contains(&index) {
             continue;
         }
         // `subfigure 3` and `config. 3` contain a keyword but do not start one.
@@ -107,6 +106,10 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
             ("Figure", index + 6)
         } else if matches_word(&chars, index, "table") {
             ("Table", index + 5)
+        } else if matches_word(&chars, index, "algorithm") {
+            ("Algorithm", index + 9)
+        } else if matches_word(&chars, index, "alg") && chars.get(index + 3) == Some(&'.') {
+            ("Algorithm", index + 4)
         } else if matches_word(&chars, index, "fig") && chars.get(index + 3) == Some(&'.') {
             ("Figure", index + 4)
         } else {
@@ -178,31 +181,31 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
 /// argument the caption itself uses. Growth is bounded by the candidate filters above, so it
 /// cannot escape to another figure: only objects already within reach of *this* caption qualify.
 ///
-/// The result is the union of the caption with everything found; with nothing found it is the
-/// caption's box padded by [`CAPTION_PADDING_PT`], so a preview is still a readable snippet
-/// rather than an empty rectangle.
+/// The result is the union of the caption with everything found. When the artwork is uncertain,
+/// the full visible page is returned instead of a misleading caption-only crop. This applies to
+/// tables and algorithms, which are not represented by image objects, and to vector figures.
 ///
 /// # Limits, stated plainly
 ///
-/// * **Vector figures and tables have no image object at all**, and the corpus contains plenty of
-///   both: for them the result is the padded caption box, so the preview shows the caption rather
-///   than the artwork. On the Ye paper, most figures are vector art and come back that way.
+/// * **Vector figures and tables have no image object at all.** Those previews use the full page,
+///   preserving the artwork or grid in context instead of claiming the caption is the preview.
+///   On the Ye paper, most figures are vector art.
 /// * **An image object's reported box is often a form's, not the picture's**, because PDFium
 ///   reports the enclosing form XObject's bounds (the core documents this in
 ///   `page_object_summary`). On page 18 of the Ye paper one such box spans two figures at once, so
-///   no threshold can pair it with the right caption — the region falls back to the caption.
-/// * **A table caption usually sits *above* its table**, the opposite of a figure caption, so the
-///   same "look up" rule finds nothing in that style and the fallback applies. Where something
-///   *does* sit just above such a caption it is the bottom of the figure above, and the table's
-///   preview is that much wrong; growing a region *downwards* into a rule grid is the separate
-///   table work.
+///   no threshold can pair it with the right caption — the full page is shown.
+/// * Tables often have captions above them, and algorithms are typeset text; neither can be
+///   reliably bounded from image objects, so they use the full page.
 /// * A caption that is itself an image (scanned pages) has no character boxes to begin with, so
 ///   it is never found here.
 ///
-/// `page_height` is the page's vertical extent in page space (the crop box height). The result is
-/// clamped to the page so that an image object reporting bounds larger than the page — form
+/// `page_bounds` is the visible crop box in page space. The result is clamped to it so that an
+/// image object reporting bounds larger than the page — form
 /// XObjects routinely do — cannot push the preview off it.
-pub fn caption_region(caption: &Caption, images: &[Rect], page_height: f64) -> Rect {
+pub fn caption_region(caption: &Caption, images: &[Rect], page_bounds: Rect) -> Rect {
+    if caption.kind != "Figure" {
+        return page_bounds;
+    }
     let candidates: Vec<Rect> = images
         .iter()
         .copied()
@@ -243,19 +246,14 @@ pub fn caption_region(caption: &Caption, images: &[Rect], page_height: f64) -> R
     }
 
     let region = if included.is_empty() {
-        Rect::new(
-            caption.rect.origin.x - CAPTION_PADDING_PT,
-            caption.rect.origin.y - CAPTION_PADDING_PT,
-            caption.rect.size.width + 2.0 * CAPTION_PADDING_PT,
-            caption.rect.size.height + 2.0 * CAPTION_PADDING_PT,
-        )
+        return page_bounds;
     } else {
         included
             .iter()
             .fold(caption.rect, |region, image| union_rect(region, *image))
     };
 
-    clamp_to_page(region, page_height)
+    clamp_to_page(region, page_bounds)
 }
 
 /// Whether `word` occurs at `at`, ignoring ASCII case.
@@ -306,16 +304,18 @@ fn area(rect: &Rect) -> f64 {
 }
 
 /// Keeps a region inside `0..page_height` vertically; a no-op when the height is unknown.
-fn clamp_to_page(region: Rect, page_height: f64) -> Rect {
-    if page_height.is_nan() || page_height <= 0.0 {
+fn clamp_to_page(region: Rect, page_bounds: Rect) -> Rect {
+    if page_bounds.size.height.is_nan() || page_bounds.size.height <= 0.0 {
         return region;
     }
-    let bottom = region.origin.y.max(0.0);
-    let top = region.max_y().min(page_height);
-    if top <= bottom {
+    let left = region.origin.x.max(page_bounds.origin.x);
+    let right = region.max_x().min(page_bounds.max_x());
+    let bottom = region.origin.y.max(page_bounds.origin.y);
+    let top = region.max_y().min(page_bounds.max_y());
+    if top <= bottom || right <= left {
         return region;
     }
-    Rect::new(region.origin.x, bottom, region.size.width, top - bottom)
+    Rect::new(left, bottom, right - left, top - bottom)
 }
 
 #[cfg(test)]
@@ -331,6 +331,10 @@ mod figure_tests {
             start: 0,
             end: 0,
         }
+    }
+
+    fn page_bounds() -> Rect {
+        Rect::new(0.0, 0.0, 612.0, 842.0)
     }
 
     /// The text the mention range selects, for asserting on what was matched.
@@ -370,6 +374,29 @@ mod figure_tests {
     }
 
     #[test]
+    fn a_line_starting_figure_reference_is_not_promoted_to_a_caption() {
+        let page = crate::test_page("Figure 3 shows the result in the next section.\n");
+        assert!(crate::find_captions(&page).is_empty());
+        let mentions = find_caption_mentions(&page);
+        assert_eq!(mentions.len(), 1, "{mentions:?}");
+        assert_eq!(
+            (mentions[0].kind.as_str(), mentions[0].label.as_str()),
+            ("Figure", "3")
+        );
+    }
+
+    #[test]
+    fn table_caption_without_space_keeps_its_label() {
+        let page = crate::test_page("Table2: Results\n");
+        let captions = crate::find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(
+            (captions[0].kind.as_str(), captions[0].label.as_str()),
+            ("Table", "2")
+        );
+    }
+
+    #[test]
     fn tables_abbreviations_and_sentence_ends_are_recognised() {
         let page = crate::test_page("We compare in Table 2 and in Fig. 4. See Figure 12 too.\n");
         let mentions = find_caption_mentions(&page);
@@ -388,6 +415,33 @@ mod figure_tests {
         );
         // The full stop after the label is not part of the click target.
         assert_eq!(mentioned_text(&page, &mentions[1]), "Fig. 4");
+    }
+
+    #[test]
+    fn algorithm_captions_and_mentions_are_recognised() {
+        let caption_page = crate::test_page("Algorithm 2: Greedy matching\nAlg. 3: Sampling\n");
+        let captions = crate::find_captions(&caption_page);
+        assert_eq!(captions.len(), 2, "{captions:?}");
+        assert_eq!(
+            (captions[0].kind.as_str(), captions[0].label.as_str()),
+            ("Algorithm", "2")
+        );
+        assert_eq!(
+            (captions[1].kind.as_str(), captions[1].label.as_str()),
+            ("Algorithm", "3")
+        );
+
+        let prose = crate::test_page("See Algorithm 2 and Alg. 3 for details.\n");
+        let mentions = find_caption_mentions(&prose);
+        assert_eq!(mentions.len(), 2, "{mentions:?}");
+        assert!(mentions.iter().all(|mention| mention.kind == "Algorithm"));
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|mention| mention.label.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "3"]
+        );
     }
 
     #[test]
@@ -410,7 +464,11 @@ mod figure_tests {
     fn the_region_is_the_caption_and_the_image_above_it() {
         let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
         // An image 38 pt above the caption and exactly as wide: this is its figure.
-        let region = caption_region(&caption, &[Rect::new(100.0, 150.0, 200.0, 300.0)], 842.0);
+        let region = caption_region(
+            &caption,
+            &[Rect::new(100.0, 150.0, 200.0, 300.0)],
+            page_bounds(),
+        );
         assert_eq!(region, Rect::new(100.0, 100.0, 200.0, 350.0));
     }
 
@@ -419,12 +477,20 @@ mod figure_tests {
         let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0)); // top edge at 112
         // 61 pt above that edge: outside the measured caption-to-artwork distance.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(100.0, 173.0, 200.0, 40.0)], 842.0),
-            Rect::new(94.0, 94.0, 212.0, 24.0)
+            caption_region(
+                &caption,
+                &[Rect::new(100.0, 173.0, 200.0, 40.0)],
+                page_bounds()
+            ),
+            page_bounds()
         );
         // Exactly at the limit, and the image is this caption's artwork.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(100.0, 172.0, 200.0, 40.0)], 842.0),
+            caption_region(
+                &caption,
+                &[Rect::new(100.0, 172.0, 200.0, 40.0)],
+                page_bounds()
+            ),
             Rect::new(100.0, 100.0, 200.0, 112.0)
         );
     }
@@ -438,7 +504,7 @@ mod figure_tests {
         let lower = Rect::new(100.0, 130.0, 200.0, 26.0);
         let upper = Rect::new(100.0, 164.0, 200.0, 26.0);
         assert_eq!(
-            caption_region(&caption, &[lower, upper], 842.0),
+            caption_region(&caption, &[lower, upper], page_bounds()),
             Rect::new(100.0, 100.0, 200.0, 90.0)
         );
     }
@@ -453,7 +519,7 @@ mod figure_tests {
             Rect::new(100.0, 170.0, 200.0, 5.0),
         ];
         assert_eq!(
-            caption_region(&caption, &images, 842.0),
+            caption_region(&caption, &images, page_bounds()),
             Rect::new(100.0, 100.0, 200.0, 20.0)
         );
     }
@@ -465,7 +531,7 @@ mod figure_tests {
         // Same height, but it does not overlap the caption at all, so it is never a candidate.
         let beside = Rect::new(330.0, 130.0, 200.0, 40.0);
         assert_eq!(
-            caption_region(&caption, &[anchor, beside], 842.0),
+            caption_region(&caption, &[anchor, beside], page_bounds()),
             Rect::new(100.0, 100.0, 200.0, 70.0)
         );
     }
@@ -473,37 +539,66 @@ mod figure_tests {
     #[test]
     fn a_far_or_sideways_image_is_not_the_figure() {
         let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
-        let padded = Rect::new(94.0, 94.0, 212.0, 24.0);
+        let padded = page_bounds();
 
         // 500 pt above: another figure's artwork, not this one's.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(100.0, 620.0, 200.0, 100.0)], 842.0),
+            caption_region(
+                &caption,
+                &[Rect::new(100.0, 620.0, 200.0, 100.0)],
+                page_bounds()
+            ),
             padded
         );
         // Directly above, but in the other column.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(400.0, 150.0, 200.0, 300.0)], 842.0),
+            caption_region(
+                &caption,
+                &[Rect::new(400.0, 150.0, 200.0, 300.0)],
+                page_bounds()
+            ),
             padded
         );
         // Above and just overlapping (50 pt of a 200 pt caption): not the same figure.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(250.0, 150.0, 200.0, 300.0)], 842.0),
+            caption_region(
+                &caption,
+                &[Rect::new(250.0, 150.0, 200.0, 300.0)],
+                page_bounds()
+            ),
             padded
         );
         // Degenerate boxes (whitespace glyphs, clipped objects) are not candidates either.
         assert_eq!(
-            caption_region(&caption, &[Rect::new(100.0, 150.0, 0.0, 300.0)], 842.0),
+            caption_region(
+                &caption,
+                &[Rect::new(100.0, 150.0, 0.0, 300.0)],
+                page_bounds()
+            ),
             padded
         );
     }
 
     #[test]
-    fn no_image_leaves_the_caption_padded_and_not_empty() {
+    fn no_image_uses_the_full_page_for_uncertain_vector_art() {
         let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
-        let region = caption_region(&caption, &[], 842.0);
-        assert_eq!(region, Rect::new(94.0, 94.0, 212.0, 24.0));
-        assert!(region.size.width > caption.rect.size.width);
-        assert!(region.size.height > caption.rect.size.height);
+        assert_eq!(caption_region(&caption, &[], page_bounds()), page_bounds());
+    }
+
+    #[test]
+    fn table_and_algorithm_regions_use_the_full_page_instead_of_a_nearby_image() {
+        let mut caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
+        caption.kind = "Table".to_string();
+        assert_eq!(
+            caption_region(
+                &caption,
+                &[Rect::new(100.0, 150.0, 200.0, 300.0)],
+                page_bounds()
+            ),
+            page_bounds()
+        );
+        caption.kind = "Algorithm".to_string();
+        assert_eq!(caption_region(&caption, &[], page_bounds()), page_bounds());
     }
 
     #[test]
@@ -511,13 +606,21 @@ mod figure_tests {
         // A form XObject can report bounds taller than the page; the preview must not follow
         // the object off the page.
         let caption = caption(Rect::new(100.0, 700.0, 200.0, 12.0));
-        let region = caption_region(&caption, &[Rect::new(100.0, 720.0, 200.0, 400.0)], 842.0);
+        let region = caption_region(
+            &caption,
+            &[Rect::new(100.0, 720.0, 200.0, 400.0)],
+            page_bounds(),
+        );
         assert_eq!(region.max_y(), 842.0);
         assert_eq!(region.origin.y, 700.0);
         assert_eq!(region.size.height, 142.0);
 
-        // Without a known page height the region is passed through untouched.
-        let unclamped = caption_region(&caption, &[Rect::new(100.0, 720.0, 200.0, 400.0)], 0.0);
+        // An invalid page bound leaves the object box untouched.
+        let unclamped = caption_region(
+            &caption,
+            &[Rect::new(100.0, 720.0, 200.0, 400.0)],
+            Rect::new(0.0, 0.0, 0.0, 0.0),
+        );
         assert_eq!(unclamped.max_y(), 1120.0);
     }
 }

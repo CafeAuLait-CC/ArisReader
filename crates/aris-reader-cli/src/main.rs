@@ -1117,23 +1117,21 @@ fn cmd_figures(args: &[String]) -> ExitCode {
         let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
             continue;
         };
-        // The same three inputs the FFI's `figures()` uses, read the same way.
+        // The same inputs the FFI's `figures()` uses, read the same way.
         let (images, _rule_count) = backend
             .page_object_summary(PageIndex(index))
             .unwrap_or_default();
-        let page_height = backend
+        let page_bounds = backend
             .page_info(PageIndex(index))
-            .map(|info| info.geometry.crop_box.size.height)
-            .unwrap_or(0.0);
+            .map(|info| info.geometry.crop_box)
+            .unwrap_or_default();
 
         for caption in aris_reader_text::find_captions(&text) {
             found += 1;
-            let region = aris_reader_text::caption_region(&caption, &images, page_height);
-            // Asking the same function for the region of a page with no objects gives the
-            // caption-only answer, so the difference is exactly "an image was paired with it".
-            // Whether that happened is the number that says how much of the index is real
-            // artwork rather than a caption box with padding.
-            if region != aris_reader_text::caption_region(&caption, &[], page_height) {
+            let region = aris_reader_text::caption_region(&caption, &images, page_bounds);
+            // Comparing with the no-object fallback counts figures whose raster artwork was
+            // confidently paired; vector figures, tables, and algorithms use the full page.
+            if region != aris_reader_text::caption_region(&caption, &[], page_bounds) {
                 with_image += 1;
             }
             println!(
@@ -1151,7 +1149,7 @@ fn cmd_figures(args: &[String]) -> ExitCode {
     }
 
     println!(
-        "  → {found} caption(s), {with_image} with an image object above them (the rest preview the caption box alone)"
+        "  → {found} caption(s), {with_image} with a confidently paired raster object (the rest preview the full page)"
     );
     ExitCode::SUCCESS
 }

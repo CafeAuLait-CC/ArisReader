@@ -323,7 +323,7 @@ impl ArisDocument {
         })
     }
 
-    /// Rasterizes an arbitrary rectangle of `page`.
+    /// Rasterizes an arbitrary rectangle of `page`, in **view space** (points, top-left origin).
     ///
     /// The tile path proves PDFium's matrix rendering is exact; this exposes the same
     /// capability for a rectangle the caller chooses, which is what a figure or table preview
@@ -342,26 +342,60 @@ impl ArisDocument {
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
-        if !(width_pt > 0.0 && height_pt > 0.0) {
+        if page >= self.backend.page_count() {
             return Err(ArisFfiError::InvalidArgument {
-                message: format!("region {width_pt}×{height_pt} must be positive"),
+                message: format!("page {page} is out of range"),
+            });
+        }
+        if !(x_pt.is_finite()
+            && y_pt.is_finite()
+            && width_pt.is_finite()
+            && height_pt.is_finite()
+            && width_pt > 0.0
+            && height_pt > 0.0
+            && (x_pt + width_pt).is_finite()
+            && (y_pt + height_pt).is_finite())
+        {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!(
+                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
+                ),
+            });
+        }
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let page_size = geometry.view_size(1.0);
+        let tolerance = 1e-6;
+        if x_pt < -tolerance
+            || y_pt < -tolerance
+            || x_pt + width_pt > page_size.width + tolerance
+            || y_pt + height_pt > page_size.height + tolerance
+        {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!(
+                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
+                    page_size.width, page_size.height
+                ),
             });
         }
 
-        // A region is rasterized at its own budget: it is small by construction, so the
-        // whole-page clamp does not apply.
+        // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
+        // whole-page bitmap before asking PDFium to allocate it.
+        let scale = clamp_scale((width_pt, height_pt), scale);
+        if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: "region dimensions exceed the renderer's supported range".to_string(),
+            });
+        }
         let request =
             RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
         let tile = self.backend.rasterize(&request)?;
-        let info = self.backend.page_info(PageIndex(page))?;
-        let view = info.geometry.view_size(1.0);
 
         Ok(PageBitmap {
             width_px: tile.size.width.round() as u32,
             height_px: tile.size.height.round() as u32,
             stride: tile.stride as u32,
-            width_pt: view.width,
-            height_pt: view.height,
+            width_pt,
+            height_pt,
             scale_used: scale,
             pixels: tile.pixels,
         })
@@ -472,8 +506,8 @@ impl ArisDocument {
             .collect())
     }
 
-    /// `Figure N` / `Fig. N` / `Table N` references in the body text of `page`, boxed in view
-    /// space.
+    /// `Figure N` / `Fig. N` / `Table N` / `Algorithm N` references in the body text of `page`,
+    /// boxed in view space.
     ///
     /// These are the click targets: `kind` + `label` are the key into
     /// [`ArisDocument::figures`], which carries the region to preview, and the box is where the
@@ -638,7 +672,7 @@ impl ArisDocument {
             .collect())
     }
 
-    /// Figure and table captions across the document, each with the region to preview.
+    /// Figure, table, and algorithm captions across the document, each with the region to preview.
     ///
     /// This is what makes a `Figure 3` in the body work **without** a link annotation: the shell
     /// resolves the mention's `kind` + `label` here and previews the record's own box. Cached
@@ -649,9 +683,10 @@ impl ArisDocument {
     /// the whole readable body, so the scan is a flat cap of the first 120 pages (the cap that
     /// `references` and the CLI already use for a 2000-page manual).
     ///
-    /// The box is the region `aris_reader_text::caption_region` derives — the caption plus the
-    /// image object it belongs to, or the padded caption when the page has none — converted to
-    /// **view space**, so it can be handed straight to [`ArisDocument::rasterize_region`].
+    /// The box is the region `aris_reader_text::caption_region` derives — the caption plus its
+    /// nearby image object for raster figures, or the full page when the artwork cannot be bounded
+    /// reliably (vector figures, tables, and algorithms) — converted to **view space**, so it can
+    /// be handed straight to [`ArisDocument::rasterize_region`].
     pub fn figures(&self) -> Result<Vec<FigureRecord>, ArisFfiError> {
         if let Ok(cache) = self.figures.lock()
             && let Some(cached) = cache.as_ref()
@@ -675,24 +710,22 @@ impl ArisDocument {
                 .backend
                 .page_object_summary(PageIndex(index))
                 .unwrap_or_default();
-            let transform = info.geometry.page_to_view(1.0);
-            // The region is derived from page-space boxes, so the clamp wants the *page-space*
-            // height (the crop box), not the view-space height, which swaps under /Rotate.
-            let page_height = info.geometry.crop_box.size.height;
+            // Regions are derived in page space and clamped to the full visible CropBox; its
+            // origin can be non-zero. Transforming all four corners below also handles /Rotate.
+            let page_bounds = info.geometry.crop_box;
 
             for caption in aris_reader_text::find_captions(&text) {
-                let region = aris_reader_text::caption_region(&caption, &images, page_height);
-                let top_left = Point::new(region.origin.x, region.max_y());
-                let view = transform.apply(top_left);
+                let region = aris_reader_text::caption_region(&caption, &images, page_bounds);
+                let view = page_region_to_view(region, info.geometry);
                 records.push(FigureRecord {
                     kind: caption.kind,
                     label: caption.label,
                     page: index,
                     caption_text: caption.text,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: region.size.width,
-                    height_pt: region.size.height,
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
                 });
             }
         }
@@ -708,44 +741,32 @@ impl ArisDocument {
     /// Only actionable links come back: a page to jump to, a URL to open, or both.
     pub fn links(&self, page: u32) -> Result<Vec<LinkRecord>, ArisFfiError> {
         let geometry = self.backend.page_info(PageIndex(page))?.geometry;
-        let transform = geometry.page_to_view(1.0);
 
         Ok(self
             .backend
             .link_targets(PageIndex(page))?
             .into_iter()
             .map(|link| {
-                // Page boxes use a bottom-left origin; the view-space y is the top edge.
-                let top_left = Point::new(
-                    link.rect.origin.x,
-                    link.rect.origin.y + link.rect.size.height,
-                );
-                let view = transform.apply(top_left);
-                // The destination region lives on the *target* page, so it needs that
-                // page's geometry to flip into view space.
+                let view = page_region_to_view(link.rect, geometry);
+                // The destination region lives on the *target* page, so it needs that page's
+                // full transform, including its rotation and CropBox origin.
                 let region = link.dest_rect.and_then(|rect| {
                     let target = link.page?;
-                    let target_height = self
-                        .backend
-                        .page_info(target)
-                        .ok()?
-                        .geometry
-                        .view_size(1.0)
-                        .height;
-                    let flipped = aris_reader_pdfium::destination_view_rect(rect, target_height);
+                    let target_geometry = self.backend.page_info(target).ok()?.geometry;
+                    let view = page_region_to_view(rect, target_geometry);
                     Some(LinkRegion {
-                        x_pt: flipped.origin.x,
-                        y_pt: flipped.origin.y,
-                        width_pt: flipped.size.width,
-                        height_pt: flipped.size.height,
+                        x_pt: view.origin.x,
+                        y_pt: view.origin.y,
+                        width_pt: view.size.width,
+                        height_pt: view.size.height,
                     })
                 });
 
                 LinkRecord {
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: link.rect.size.width,
-                    height_pt: link.rect.size.height,
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
                     uri: link.uri,
                     page: link.page.map(|page| page.get()),
                     region,
@@ -966,7 +987,7 @@ pub struct ReferenceRecord {
 /// A figure or table caption, with the region of its page a floating preview should show.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FigureRecord {
-    /// `Figure` or `Table`.
+    /// `Figure`, `Table`, or `Algorithm`.
     pub kind: String,
     /// The number as printed: `3`, `12`.
     pub label: String,
@@ -981,7 +1002,7 @@ pub struct FigureRecord {
     pub height_pt: f64,
 }
 
-/// A `Figure N` / `Fig. N` / `Table N` reference in the body text, boxed in **view space**.
+/// A `Figure N` / `Fig. N` / `Table N` / `Algorithm N` reference in the body text, boxed in **view space**.
 ///
 /// `kind` + `label` resolve against [`FigureRecord`]s; `start`/`end` address the page's text
 /// layer, the same range [`CitationRecord`] uses for a citation.
@@ -1031,6 +1052,14 @@ fn union_of_char_boxes(chars: &[aris_reader_core::RawCharBox]) -> Option<aris_re
                 }
             })
         })
+}
+
+/// Converts a page-space rectangle to its view-space bounding rectangle, including page rotation.
+fn page_region_to_view(
+    region: aris_reader_core::Rect,
+    geometry: aris_reader_core::PageGeometry,
+) -> aris_reader_core::Rect {
+    geometry.page_to_view(1.0).apply_rect(region)
 }
 
 /// The page text **rebuilt from the character sequence**, so indices address the same
@@ -1112,6 +1141,23 @@ impl ArisEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn figure_region_bounds_are_transformed_with_rotation_and_crop_origin() {
+        let geometry = aris_reader_core::PageGeometry::new(
+            aris_reader_core::Rect::new(0.0, 0.0, 500.0, 700.0),
+            aris_reader_core::Rect::new(100.0, 200.0, 200.0, 300.0),
+            aris_reader_core::Rotation::Clockwise90,
+            1.0,
+        );
+        let region = aris_reader_core::Rect::new(120.0, 240.0, 30.0, 20.0);
+        let view = page_region_to_view(region, geometry);
+        assert!((view.size.width - 20.0).abs() < 1e-9);
+        assert!((view.size.height - 30.0).abs() < 1e-9);
+        assert!(view.origin.x >= 0.0 && view.origin.y >= 0.0);
+        let page = geometry.view_size(1.0);
+        assert!(view.max_x() <= page.width && view.max_y() <= page.height);
+    }
 
     #[test]
     fn engine_reports_version_and_backend() {
@@ -1409,6 +1455,30 @@ mod tests {
             pixels <= budget + budget / 100,
             "clamped page is {pixels} px"
         );
+
+        let region = document
+            .rasterize_region(0, 1000.0, 0.0, 0.0, 595.0, 842.0)
+            .expect("rasterize bounded region");
+        assert!(region.scale_used < 1000.0);
+        assert_eq!((region.width_pt, region.height_pt), (595.0, 842.0));
+        let region_pixels = u64::from(region.width_px) * u64::from(region.height_px);
+        assert!(
+            region_pixels <= budget + budget / 100,
+            "clamped region is {region_pixels} px"
+        );
+
+        assert!(matches!(
+            document.rasterize_region(0, 1.0, f64::NAN, 0.0, 10.0, 10.0),
+            Err(ArisFfiError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            document.rasterize_region(0, 1.0, 0.0, 0.0, f64::INFINITY, 10.0),
+            Err(ArisFfiError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            document.rasterize_region(0, 1.0, 0.0, 0.0, 10_000.0, 10.0),
+            Err(ArisFfiError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

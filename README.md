@@ -8,13 +8,12 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 > `ARIS_READER_*`, Swift targets `ArisReaderKit` / `ArisReaderFFI`). Suite-level shared modules will claim the `aris-*`
 > prefix later, to avoid ambiguity.
 
-Current status: **M1 in progress — the reader opens real PDFs**. M0 is complete (GPU interop verified on device, PDFium
-rasterization cross-checked against poppler, UniFFI control plane generated into Swift). The first M1 slice works end to
-end: open a document, rasterize pages through PDFium on a background queue, upload them as GPU textures, scroll
-continuously, turn pages and zoom — with a pixel budget that keeps a single page texture inside 32 MB even at deep zoom.
-Still missing: tiles with an LOD pyramid and a raster thread pool (so very large pages render progressively), the text
-layer (selection, search, citations), and annotations. Every crate carries `TODO(Tx.y)` anchors pointing at the
-[task list](docs/08-tasks.md).
+Current status: **M1–M4 have working core paths and remain under active development**. The reader
+opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
+tabs, sidecar highlights/underlines/notes, and citation/figure/table/algorithm previews.
+Milestone acceptance criteria are not all met: see the [review reports](reviews/) for concrete
+fixes, validation evidence and outstanding work. PDFium remains serialized within a process;
+background execution does not imply parallel PDFium rendering.
 
 ---
 
@@ -112,10 +111,10 @@ resolve locally.
 | Milestone | Theme | Status |
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
-| M1 | Minimum readable loop: open / page turn / zoom / continuous scroll / tile cache | ✅ Complete — pages render as 512 px tiles at a discrete LOD chosen from the zoom, continuous scrolling and the overlay scroll indicator work, deep zoom stays sharp while memory stays bounded by what is visible (400% needs 140 tiles for the page and touches 45), and rasterization runs off the main thread under a memory budget. Region rasterization is verified pixel-for-pixel against whole-page renders |
-| M2 | Full reading experience: outline, thumbnails, search, text selection, links, tabs, reading position | ✅ Complete — text layer with drag-selection and ⌘C, cross-page search, thumbnail strip, outline list, clickable search results, link following (URLs open in the system browser, internal links jump), tab strip with per-tab position, and reading-position restore |
-| M3 | Annotation and editing: highlight/underline/ink/sticky notes, page operations, undo/redo | 🚧 In progress — highlights and underlines from a selection, editable notes, sidebar list with jump and delete, ⌘Z/⇧⌘Z undo/redo, all persisted to a sidecar JSON (round trip verified). Ink, page operations and PDF write-back remain |
-| M4 | Advanced reading: citation/figure floating windows, bibliography, notes, multi-document | 🟡 **Core delivered.** Clicking a citation opens the matching bibliography entry in a floating preview on a second render surface — including citations with **no** link annotation. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries). Reference lists are selected from independent numeric and author-year candidate runs and scored at document level; across 12 real papers, six resolve 100% of their citations and the rest 96–100% except one at 96% (`(NeurIPS 2024)` has no matching entry). Clicking a `Figure 3` / `Table 2` reference in the body opens a floating preview of that figure: captions are detected in every sample paper and paired with the artwork above them where the artwork is a raster image. **Not done:** tables stay weak (a table has no image object and its caption usually sits above it, so the region falls back to the caption box), formulas are not detectable with the current signals, and the entry-fragment representation that multi-column or cross-page previews need is deliberately deferred |
+| M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: [M1](reviews/M1-rendering.md) |
+| M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Cross-page selection, incremental search, history, split/facing views and full session restoration remain. [M2](reviews/M2-reading.md) |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. PDF annotation import/write-back, ink, page operations and export remain. [M3](reviews/M3-annotations.md) |
+| M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. Unlinked equations, cross-page bibliography fragments, precise table/vector segmentation, pinning and index persistence remain. [M4](reviews/M4-previews.md) |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
 | M7 | Polish: performance, accessibility, internationalization, auto-update, notarized distribution | ⬜ |
