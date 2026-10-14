@@ -39,21 +39,30 @@
 //! # What is measured
 //!
 //! `cargo test -p aris-reader-cli --test entry_fragments_corpus -- --ignored --nocapture`,
-//! on the twelve sample papers (2026-10-14): **769 entries, 789 fragments, 20 of them
-//! multi-fragment — no column split at all, 20 page continuations — and 0 fragment boxes
+//! on the twelve sample papers (2026-10-14): **769 entries, 790 fragments, 21 of them
+//! multi-fragment — no column split at all, 21 page continuations — and 18 fragment boxes
 //! crossing a gutter.**
 //!
-//! That zero is honest but weak, and the test says so out loud: these samples are single-column
-//! layouts, and the gutter test finds no boundary on **any** of their 298 pages, so the corpus
-//! offers nothing for the column rule to refuse. The layout is covered instead by
-//! `an_entry_split_across_two_columns_becomes_two_fragments` below and, through PDFium, by
-//! `entry_fragments_fixture.rs` in the CLI crate, which reads a generated two-column page.
+//! The 18 are the model's fallback, not a cut gone wrong. When one of an entry's paragraphs
+//! crosses the boundary there is no tick between the columns to cut at — the paragraph is in both
+//! columns at once — so [`PageGeometry::split`] refuses the cut for that entry and returns the
+//! union of the entry's own glyphs, which is the box `page`/`start`/`end` described before
+//! fragments existed. Those boxes are unchanged from the version of this code that detected no
+//! gutters at all (checked by diffing the corpus report against `master`): what changed on
+//! 2026-10-14 is that the detector reads 52 of the corpus' 298 pages as two-column, so the
+//! comparison can now be made. The one geometry that did move is a single extra page
+//! continuation, `Leader`'s entry 47 — the page's own line spacing and the stricter
+//! same-column test admit it.
 //!
-//! Of the 20 page continuations, 17 are the entry's own words and 3 are page furniture the
+//! Of the 21 page continuations, 17 are the entry's own words and 4 are page furniture the
 //! geometric guard cannot tell from prose (`Dvorožňák 2017`, whose second fragment is a running
-//! head and a figure caption, and `SMooDi` twice, running heads). The guard does throw away the
-//! two `manuscript_0925` cases (margin line numbers and the running head) and one in `Leader`
-//! (a running head sharing the next label's line), which is why it is there.
+//! head and a figure caption, and `SMooDi` twice and `Leader` once, running heads). The guard does
+//! throw away the two `manuscript_0925` cases (margin line numbers and the running head) and one
+//! in `Leader` (a running head sharing the next label's line), which is why it is there.
+//!
+//! The layout that needs no damaged text layer to exercise the column rule is
+//! `an_entry_split_across_two_columns_becomes_two_fragments` below and, through PDFium,
+//! `entry_fragments_fixture.rs` in the CLI crate, which reads a generated two-column page.
 
 use crate::tables::column_gutter;
 use crate::{EntryFragment, ReferenceEntry, TextLine, blocks_from, lines_from};
