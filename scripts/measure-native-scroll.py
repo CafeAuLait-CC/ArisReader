@@ -4,6 +4,8 @@
 Build first: ./scripts/build-rust.sh && (cd apps/macos && swift build -c release)
 This calls the wheel handler's model method; it bypasses NSEvent delivery and its immediate canvas draw.
 Each run gets a fresh temporary document copy so saved positions/annotations cannot leak in.
+A trace whose presentation callbacks carry no positive timestamp at all is reported as
+`presentation_measurement: "unavailable"` with a reason, never as `presented_fps: 0.0`.
 """
 import argparse
 import hashlib
@@ -64,9 +66,15 @@ def presentation_summary(records, submitted, start, end):
 
     Use Metal's host timestamp, not callback arrival (which may be delayed/reordered).
     Count frames over the entire requested window, retaining stalls at both edges.
+    When no callback carries a positive timestamp the machine did not report presentation at
+    all (every presentedTime zero), so the frame-rate fields are reported as unavailable
+    instead of as 0 fps with status "complete" — the app may have presented hundreds of frames.
+    Zero timestamps have been observed while the display was asleep or the window occluded,
+    which is a statement about that session, not about the machine.
     """
     if any('sequence' not in r for r in submitted):
-        return {'presentation_measurement': 'unavailable (legacy submission-only trace)'}
+        return {'presentation_measurement': 'unavailable',
+                'presentation_measurement_reason': 'legacy submission-only trace has no drawable sequence numbers'}
     expected = {(r['surface'], r['sequence']) for r in submitted}
     callbacks = {}
     for record in records:
@@ -78,29 +86,39 @@ def presentation_summary(records, submitted, start, end):
             raise ValueError('invalid Metal presentation timestamp')
         callbacks[key] = record
     missing = len(expected - callbacks.keys())
+    zero = sum(r['time'] == 0 for r in callbacks.values())
     positive = [r for r in callbacks.values() if r['time'] > 0]
     presented = sorted((r for r in positive if start <= r['time'] <= end), key=lambda r:r['time'])
+    # A zero timestamp only means "dropped" when other callbacks in the same trace carry real
+    # host times. All-zero cannot distinguish unavailable timing from every frame being dropped
+    # (some Metal/driver combinations return zero for every drawable, including a minimal
+    # continuously visible probe), so every value derived from timestamps stays null instead of
+    # becoming a 0-FPS claim, and the reason names the session state that does it.
+    unavailable = bool(callbacks) and not positive
+    if unavailable:
+        reason = (f'all {len(callbacks)} presentation callbacks reported a zero Metal timestamp '
+                  '(display asleep or window occluded)')
+    elif missing:
+        reason = f'{missing} of {len(expected)} presentation callbacks never arrived'
+    else:
+        reason = None
     result = {
-        'presentation_measurement': 'complete' if not missing else 'incomplete',
+        'presentation_measurement': 'unavailable' if unavailable else ('incomplete' if missing else 'complete'),
+        'presentation_measurement_reason': reason,
         'presentation_callbacks': len(callbacks), 'presentation_callbacks_missing': missing,
-        'presentation_zero_timestamps': sum(r['time'] == 0 for r in callbacks.values()),
-        'presentation_drops_reported': sum(r['time'] == 0 for r in callbacks.values()),
+        # Raw evidence first: how many callbacks carried a zero timestamp at all.
+        'presentation_zero_timestamps': zero,
+        # Only an interpretation when the machine reports usable times elsewhere in the trace.
+        'presentation_drops_reported': None if unavailable else zero,
         'presentations_outside_window': len(positive) - len(presented),
-        'presented_frames': len(presented),
-        # FPS/tails are unavailable if any callback is missing; silently lower counts
-        # could otherwise turn missing evidence into a false regression.
+        # FPS/tails/counts are unavailable if no timestamp is usable or any callback is missing;
+        # silently lower counts could otherwise turn missing evidence into a false regression.
+        'presented_frames': None if unavailable else len(presented),
         'presented_fps': None, 'presentation_gap_p95_ms': None,
         'presentation_gap_max_ms': None, 'presentation_gaps_over_33ms': None,
         'motion_presented_frames': None,
     }
-    # Some Metal/driver combinations return zero for every drawable, including
-    # a minimal continuously visible probe. That cannot distinguish unavailable
-    # timing from all frames being dropped; never turn it into a 0-FPS claim.
-    if callbacks and not positive:
-        result.update(presentation_measurement='unavailable (all presentation timestamps are zero)',
-                      presentation_drops_reported=None, presented_frames=None)
-        return result
-    if missing: return result
+    if unavailable or missing: return result
     result['presented_fps'] = len(presented) / (end - start)
     result['motion_presented_frames'] = sum(i == 0 or r['y'] != presented[i-1]['y']
                                              for i,r in enumerate(presented))
@@ -139,7 +157,7 @@ def main():
         'pdfium_sha256': hashlib.sha256(args.pdfium.read_bytes()).hexdigest(),
         'app': str(args.app.resolve()), 'seconds': args.seconds, 'speed_screen_pt_s': args.speed,
         'zoom_percent': args.zoom, 'cache_mib': 48,
-        'method': 'wall-time paced model scroll calls (no NSEvent/immediate wheel draw); Metal drawable presentedTime plus CPU submission timestamps; not GPU duration or physical scanout',
+        'method': 'wall-time paced model scroll calls (no NSEvent/immediate wheel draw); Metal drawable presentedTime plus CPU submission timestamps; not GPU duration or physical scanout; a trace with no positive presentedTime is reported unavailable, never as 0 fps',
         'scheduling_diagnostics': args.scheduling_diagnostics,
     }
     results = []

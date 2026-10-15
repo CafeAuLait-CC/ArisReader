@@ -231,8 +231,17 @@ jobs:
             echo "::notice title=Reference eval NOT run::No evaluation corpus is present in $CORPUS_DIR, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
           fi
 
+      # Archiving diagnostics is not a gate. A run whose check.sh, ArisReaderChecks and
+      # reference-eval steps were all green once went red here, at the very last step, with
+      # `Failed to CreateArtifact: Unable to make request: ENOTFOUND` — a runner DNS flake.
+      # A green gate reported as a failure is a false negative that trains people to ignore red,
+      # so this upload is deliberately `continue-on-error`. The step below keeps the flake visible
+      # instead of hiding it. Every step that runs tests or checks stays fatal: nothing above this
+      # line is non-fatal.
       - name: Preserve native and evaluation diagnostics
+        id: diagnostics_upload
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: macos-check-logs
@@ -241,3 +250,12 @@ jobs:
             ${{ runner.temp }}/reader-checks.log
             ${{ runner.temp }}/reference-eval.log
           if-no-files-found: ignore
+
+      # `continue-on-error` records the failed outcome (`steps.<id>.outcome`) while keeping the
+      # step's conclusion, and therefore the job, successful. This turns a lost artifact into an
+      # announced loss: the log says the upload failed and that the gate results above still stand.
+      # No other step reads this upload's outcome, so the non-fatality reaches nothing else.
+      - name: Announce a failed diagnostic upload
+        if: always() && steps.diagnostics_upload.outcome == 'failure'
+        run: |
+          echo "::warning title=Diagnostic upload failed::actions/upload-artifact could not store the macos-check-logs artifact (runner or network failure, e.g. DNS). No check was affected: the step outcomes above stand. The check and evaluation logs for this run were NOT archived."

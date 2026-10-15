@@ -1,4 +1,8 @@
-"""Checks that measurement summaries reject incomplete or vacuous traces."""
+"""Checks that measurement summaries reject incomplete or vacuous traces.
+
+Includes the unmeasurable-presentation case: a trace whose callbacks all carry a zero Metal
+timestamp must report `unavailable`, never `presented_fps: 0.0` with status "complete".
+"""
 import importlib.util
 from pathlib import Path
 import unittest
@@ -57,6 +61,8 @@ class SummaryTests(unittest.TestCase):
 
     def test_missing_callback_is_unknown_and_never_claims_fps_or_drop(self):
         result = measurement.summarize(self.presentation_trace()[:-1])
+        self.assertEqual(result['presentation_measurement'], 'incomplete')
+        self.assertIn('1 of 2', result['presentation_measurement_reason'])
         self.assertEqual(result['presentation_callbacks_missing'], 1)
         self.assertEqual(result['presentation_drops_reported'], 0)
         self.assertIsNone(result['presented_fps'])
@@ -67,20 +73,41 @@ class SummaryTests(unittest.TestCase):
         trace[-1]['time'] = 0
         result = measurement.summarize(trace)
         self.assertEqual(result['presentation_drops_reported'], 1)
+        self.assertEqual(result['presentation_zero_timestamps'], 1)
         self.assertEqual(result['presented_frames'], 1)
         self.assertEqual(result['presented_fps'], 1)
         self.assertEqual(result['presentation_gap_max_ms'], 950)
 
     def test_all_zero_timestamps_are_unavailable_not_zero_fps_or_all_drops(self):
+        # The machine that produced this defect reported all 436 callbacks as zero:
+        # `presented_fps: 0.0` with status "complete" reads as "rendered nothing".
         trace = self.presentation_trace()
         trace[-1]['time'] = trace[-2]['time'] = 0
         result = measurement.summarize(trace)
-        self.assertIn('unavailable', result['presentation_measurement'])
+        self.assertEqual(result['presentation_measurement'], 'unavailable')
+        self.assertIn('2 presentation callbacks reported a zero Metal timestamp',
+                      result['presentation_measurement_reason'])
+        self.assertIn('display asleep or window occluded',
+                      result['presentation_measurement_reason'])
         self.assertEqual(result['presentation_zero_timestamps'], 2)
-        self.assertIsNone(result['presentation_drops_reported'])
-        self.assertIsNone(result['presented_frames'])
+        for key in ('presentation_drops_reported', 'presented_frames', 'presented_fps',
+                    'presentation_gap_p95_ms', 'presentation_gap_max_ms',
+                    'presentation_gaps_over_33ms', 'motion_presented_frames'):
+            self.assertIsNone(result[key], key)
+        # Raw counts stay real, and so do the submission and draw-CPU figures.
+        self.assertEqual(result['presentation_callbacks'], 2)
+        self.assertEqual(result['presentation_callbacks_missing'], 0)
+        self.assertEqual(result['submissions'], 2)
+        self.assertEqual(result['submission_gap_max_ms'], 700)
+        self.assertEqual(result['draw_cpu_p95_ms'], 2)
+
+    def test_all_zero_timestamps_do_not_hide_missing_callbacks(self):
+        trace = self.presentation_trace()[:-1]
+        trace[-1]['time'] = 0
+        result = measurement.summarize(trace)
+        self.assertEqual(result['presentation_measurement'], 'unavailable')
+        self.assertEqual(result['presentation_callbacks_missing'], 1)
         self.assertIsNone(result['presented_fps'])
-        self.assertIsNone(result['presentation_gap_max_ms'])
 
     def test_duplicate_callback_rejected_and_wrong_surface_ignored(self):
         trace = self.presentation_trace()
@@ -99,7 +126,8 @@ class SummaryTests(unittest.TestCase):
 
     def test_submission_only_trace_never_claims_actual_fps(self):
         result = measurement.summarize(self.trace())
-        self.assertIn('unavailable', result['presentation_measurement'])
+        self.assertEqual(result['presentation_measurement'], 'unavailable')
+        self.assertIn('legacy', result['presentation_measurement_reason'])
         self.assertNotIn('presented_fps', result)
 
 

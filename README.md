@@ -143,7 +143,9 @@ awake the harness measures real presented frames (46.81 and 43.11 fps on a real 
 scroll); with the display asleep or the window occluded every drawable's Metal `presentedTime` comes back
 as zero (436 of 436 in the harness, 297 of 297 in a minimal `CAMetalLayer`
 probe), so a trace reporting `presented_fps: 0.0` is not evidence of a frame-pacing problem — and not
-evidence of anything else either. Treat an all-zero presentation trace as "not measured", never as 0 fps.
+evidence of anything else either. Treat an all-zero presentation trace as "not measured", never as 0 fps:
+the harness reports it as `presentation_measurement: "unavailable"` with a `presentation_measurement_reason`
+and `presented_fps: null`, never as an fps together with a status of `"complete"`.
 The application-side harness also drives the scroll model on a 16.67 ms cadence rather than delivering
 real wheel or trackpad events, and reaches about 53 inputs per second, so it cannot demonstrate 60 fps
 even where timestamps work. The project's "stable 60 fps" criterion therefore remains **unproven**, not
@@ -216,14 +218,23 @@ The window is brought forward for measurement. Partial occlusion is reported exp
 With tracing enabled, a diagnostic `CAMetalLayer` observes the same drawable wgpu acquires
 and registers a Metal presentation handler. FPS uses the drawable's `presentedTime` host
 timestamp, as documented by [Apple](https://developer.apple.com/documentation/metal/mtldrawable/presentedtime),
-not the handler's arrival time or the CPU submission timestamp. Zero timestamps are reported
-drops. Missing callbacks make FPS and presentation tails unavailable; they never count as
+not the handler's arrival time or the CPU submission timestamp. A zero timestamp counts as a reported
+drop only when other callbacks in the same trace carry a real host time. When no callback carries a
+positive timestamp, `presentation_measurement` is `"unavailable"` with a `presentation_measurement_reason`
+and `presented_fps`, the presentation gap tails, `presented_frames` and `motion_presented_frames` are all
+`null`: the session reported no presentation time (a sleeping display or an occluded window), so the trace
+never claims 0 fps and never claims `"complete"`. The raw evidence stays: `presentation_callbacks`,
+`presentation_callbacks_missing`, `presentation_zero_timestamps` and `presentations_outside_window` are
+counts.
+Missing callbacks make FPS and presentation tails unavailable; they never count as
 confirmed drops. Frames presented after the scrolling window are reported separately.
 `presented_fps` counts frames over the full scrolling interval; frame gaps include both edges,
 and `motion_presented_frames` separates frames whose scroll position changed. This records
 system-reported drawable presentation, not physical scanout, display refresh rate or GPU
 execution time. Scripted input is not a physical trackpad trace, and a finite run alone does
 not certify the 60 fps criterion. Legacy logs remain readable but cannot supply presented FPS.
+Peak RSS (`wait4`), CPU submission pacing (`submission_gap_*`, `input_gap_*`) and draw-CPU
+timings (`draw_cpu_p95_ms`) are unaffected by presentation availability and stay real.
 `--scheduling-diagnostics` additionally records frame-loop/model timing and adds logging overhead.
 
 Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 387.3 MiB
