@@ -25,7 +25,7 @@ def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)] if values else None
 
 
-def summarize(records):
+def summarize(records, expected_distance=None):
     starts = [r['time'] for r in records if r['kind'] == 'start']
     ends = [r['time'] for r in records if r['kind'] == 'end']
     if len(starts) != 1 or len(ends) != 1 or ends[0] <= starts[0]:
@@ -38,6 +38,8 @@ def summarize(records):
         raise ValueError(f'expected one canvas surface, got {len(surfaces)}')
     if len(ticks) < 2 or ticks[-1]['y'] <= ticks[0]['y']:
         raise ValueError('document did not scroll; use a longer document')
+    if expected_distance is not None and ticks[-1]['y'] < .95 * expected_distance:
+        raise ValueError('scroll reached the document end early; use a longer PDF or shorter interval')
     submitted = [r for r in frames if r['presented'] == 1]
     if len(submitted) < 2:
         raise ValueError('fewer than two submissions; window may be occluded')
@@ -115,7 +117,7 @@ def main():
             records = [json.loads(line[len(PREFIX):]) for line in log.read_text().splitlines() if line.startswith(PREFIX)]
             result = dict(run=run+1, peak_rss_bytes=usage.ru_maxrss,
                           peak_rss_mb=usage.ru_maxrss / 1e6, peak_rss_mib=usage.ru_maxrss / 2**20,
-                          **summarize(records))
+                          **summarize(records, args.speed * args.seconds / (args.zoom / 100)))
             results.append(result)
             (args.output / 'results.json').write_text(json.dumps(dict(identity=identity, runs=results), indent=2)+'\n')
             print(json.dumps(result), flush=True)

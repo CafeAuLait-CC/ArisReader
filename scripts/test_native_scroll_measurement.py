@@ -31,6 +31,9 @@ class SummaryTests(unittest.TestCase):
         trace[3]['y'] = 10
         with self.assertRaises(ValueError): measurement.summarize(trace)
 
+    def test_reaching_the_end_early_does_not_measure_idle_time_as_scrolling(self):
+        with self.assertRaises(ValueError): measurement.summarize(self.trace(), expected_distance=1000)
+
     def test_occlusion_cannot_be_counted_as_presented(self):
         trace = self.trace()
         trace[2]['presented'] = 0
