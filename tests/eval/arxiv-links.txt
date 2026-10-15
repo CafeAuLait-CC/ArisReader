@@ -88,10 +88,11 @@
 # heading sharing its line with an entry    | 1512.03385 1408.5882 (heading at the top of the left column, an entry at the top of the right)
 # list split across pages                   | 1602.05629 1912.01703 1807.06209 1710.05833 2104.08886 2005.14165
 # one numbering printed in two runs        | 1710.05463 (1-33 after the main text, 34-68 after the methods; T4.20)
+# two independently numbered lists        | 2303.08774 (the report's own references on p18-23 and the system card appendix's own on p71-78, both from [1]; T4.41)
 # list repeated under a running head        | 1710.05833 ("References" on 13 pages)
 # appendices after the bibliography         | 1810.04805 2303.08774 1512.03385
 # appendices before the bibliography        | 2005.14165 (appendices in the middle, the list last)
-# list starting late in a long document     | 2005.14165 (p70/75) 1807.06209 (p62/73) 2303.08774 (p71/100)
+# list starting late in a long document     | 2005.14165 (p70/75) 1807.06209 (p62/73) 2303.08774 (p71/100, its second list; T4.41)
 # link annotations present                  | 1512.03385 1706.03762 1810.04805 2005.14165 2303.08774 2103.00020 1905.11946 1912.01703 1301.3781 1602.05629 2010.11929 1807.06209 1710.05833 1712.01815 1909.05722 2104.08886 2110.12477 2403.04370
 # no link annotations                       | 1408.5882 1710.05463
 # short paper (6 pages)                    | 1408.5882
