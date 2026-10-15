@@ -84,6 +84,7 @@ struct FsQuadPointsF {
 // `FPDF_ANNOTATION_SUBTYPE` values (fpdf_annot.h). Named because the numbers are meaningless at
 // the call site, and because a wrong one would silently mislabel every annotation in a document.
 const ANNOT_TEXT: c_ulong = 1;
+const ANNOT_LINK: c_ulong = 2;
 const ANNOT_FREETEXT: c_ulong = 3;
 const ANNOT_LINE: c_ulong = 4;
 const ANNOT_SQUARE: c_ulong = 5;
@@ -290,7 +291,10 @@ impl AnnotationReader {
         Ok(Self { api, document })
     }
 
-    /// Every annotation on `page`, in the order the document stores them.
+    /// Every content annotation on `page`, in the order the document stores them.
+    ///
+    /// Structural annotations (links, widgets, popups, page furniture) are left out — see
+    /// [`is_content_annotation`] for what that means and why, with the measurement behind it.
     ///
     /// Annotations this build cannot load (a damaged one, or a page that will not open) are
     /// skipped rather than failing the whole page: a reader must not refuse to show the other
@@ -334,8 +338,14 @@ impl AnnotationReader {
         Ok(annotations)
     }
 
-    /// Reads one annotation, or `None` when even its `/Rect` is unreadable.
+    /// Reads one annotation, or `None` when it is not content or its `/Rect` is unreadable.
     fn read(&self, handle: FpdfAnnotation, page: PageIndex) -> Option<RawAnnotation> {
+        // SAFETY: `handle` is a live annotation for the duration of `read`.
+        let subtype = unsafe { (self.api.get_subtype)(handle) };
+        if !is_content_annotation(subtype) {
+            return None;
+        }
+
         let mut raw_rect = FsRectF::default();
         // SAFETY: `handle` is a live annotation; `raw_rect` is a valid out-pointer.
         if unsafe { (self.api.get_rect)(handle, &mut raw_rect) } == 0 {
@@ -348,8 +358,6 @@ impl AnnotationReader {
             f64::from(raw_rect.top - raw_rect.bottom),
         );
 
-        // SAFETY: `handle` is a live annotation for the duration of `read`.
-        let subtype = unsafe { (self.api.get_subtype)(handle) };
         let kind = subtype_kind(subtype);
         let quads = self.quad_points(handle);
         let color = self.color(handle);
@@ -509,6 +517,36 @@ impl Drop for AnnotationReader {
     }
 }
 
+/// Whether an annotation of this subtype is something a reader would show or list.
+///
+/// Not everything PDFium counts as an annotation is one in the reader's sense. Measured on the
+/// local twelve-paper corpus (2026-10-15): 2767 annotations in seven documents, of which **2751
+/// are `/Link`** — navigation, which this backend already answers through
+/// [`crate::backend::PdfiumBackend::link_targets`], and which a sidebar must not list 1950 times.
+/// `/Popup` is a markup annotation's own popup window, `/Widget` and `/XFAWidget` are form fields,
+/// and `/Screen`, `/PrinterMark`, `/TrapNet` and `/Watermark` are page furniture. None of them is
+/// something somebody drew to be read, so the reader skips them and reports the rest — including
+/// subtypes it cannot draw (`Ink`, `Stamp`, …), because those *are* content.
+fn is_content_annotation(subtype: c_ulong) -> bool {
+    !matches!(
+        subtype,
+        ANNOT_LINK
+            | ANNOT_POPUP
+            | ANNOT_WIDGET
+            | ANNOT_XFAWIDGET
+            | ANNOT_SCREEN
+            | ANNOT_PRINTERMARK
+            | ANNOT_TRAPNET
+            | ANNOT_WATERMARK
+            | ANNOT_FILEATTACHMENT
+            | ANNOT_SOUND
+            | ANNOT_MOVIE
+            | ANNOT_THREED
+            | ANNOT_RICHMEDIA
+            | ANNOT_REDACT
+    )
+}
+
 /// Maps `FPDF_ANNOTATION_SUBTYPE` to what the reader can act on.
 ///
 /// Subtypes outside the four text-markup kinds, sticky notes and free text keep their PDF name:
@@ -522,6 +560,9 @@ fn subtype_kind(subtype: c_ulong) -> RawAnnotationKind {
         ANNOT_SQUIGGLY => RawAnnotationKind::Squiggly,
         ANNOT_TEXT => RawAnnotationKind::Text,
         ANNOT_FREETEXT => RawAnnotationKind::FreeText,
+        // The subtypes `is_content_annotation` skips are still named, so a future caller that
+        // wants them (a form editor, a link inspector) gets a name rather than a number.
+        ANNOT_LINK => RawAnnotationKind::Other("Link".to_string()),
         // PDFium reports 0 for a `/Subtype` name it does not recognise, which is also the right
         // answer for us: the annotation stays readable (rect, contents, author) but unclassified.
         0 => RawAnnotationKind::Other("Unknown".to_string()),
@@ -575,6 +616,20 @@ mod tests {
             AnnotationBlend::Other("Screen".to_string())
         );
         assert_eq!(AnnotationBlend::Multiply.as_str(), "multiply");
+    }
+
+    #[test]
+    fn structural_annotations_are_not_content() {
+        // Links are the measured case: 2751 of the corpus's 2767 annotations.
+        assert!(!is_content_annotation(ANNOT_LINK));
+        assert!(!is_content_annotation(ANNOT_WIDGET));
+        assert!(!is_content_annotation(ANNOT_POPUP));
+        // Everything somebody drew is content, including subtypes this build cannot draw.
+        assert!(is_content_annotation(ANNOT_HIGHLIGHT));
+        assert!(is_content_annotation(ANNOT_TEXT));
+        assert!(is_content_annotation(ANNOT_FREETEXT));
+        assert!(is_content_annotation(ANNOT_INK));
+        assert!(is_content_annotation(ANNOT_STAMP));
     }
 
     #[test]

@@ -198,6 +198,8 @@ def annotated_page_fixture() -> dict[int, list[bytes]]:
       user's actual question: does somebody else's colour come through?);
     * a sticky note with **no** `/C` at all, which PDFium reports as black unless the
       reader checks `HasKey("C")` first;
+    * a `/Link`, which the reader has to leave out of the annotation list while the link
+      path still reports it;
     * a free-text annotation;
     * a highlight with no `/QuadPoints`, whose `/Rect` is the only geometry it has.
     """
@@ -249,6 +251,15 @@ def annotated_page_fixture() -> dict[int, list[bytes]]:
                 contents="Free text annotation body.",
                 author="Reviewer E",
                 modified="D:20240102030405Z",
+            ),
+            # A link is *not* content: it is navigation, and this backend already answers it
+            # through the link path. It is here so the boundary is tested — a real paper can
+            # carry thousands of these (2751 of the 2767 annotations in the local corpus), and
+            # none of them belongs in a list of a reader's highlights.
+            annotation(
+                "Link",
+                body_line_box(4, 460),
+                extra="/A << /S /URI /URI (https://example.org/annotated) >> /Border [0 0 0]",
             ),
         ],
         1: [

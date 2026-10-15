@@ -479,14 +479,25 @@ impl PdfiumBackend {
 
             // A link that leads nowhere is not worth handing to the shell.
             if uri.is_some() || target.is_some() {
-                links.push(RawLink {
+                let candidate = RawLink {
                     rect,
                     uri,
                     page: target,
                     dest_rect,
                     dest_top_y,
                     dest_left_x,
-                });
+                };
+                // Exactly-once, because `pdfium-render`'s `PdfPageLinks` treats PDFium's
+                // enumeration *cursor* as a link index: `FPDFLink_Enumerate` advances a position
+                // in the page's annotation array ("start_pos … is updated with the next start
+                // position on return", fpdf_doc.h), so a link that is not the page's first
+                // annotation is handed back once per preceding annotation. Measured on
+                // `tests/fixtures/annotated.pdf`: one `/Link` behind five markup annotations
+                // came back six times. The accessor is not ours to fix, and a caller that draws
+                // a clickable box or collects destination landings wants each link once.
+                if !links.iter().any(|existing| existing == &candidate) {
+                    links.push(candidate);
+                }
             }
         }
 
@@ -1332,7 +1343,24 @@ mod tests {
         assert_eq!(
             kinds,
             vec!["highlight", "underline", "strikeout", "text", "freeText"],
-            "the fixture's five annotations, in document order"
+            "the fixture's five content annotations, in document order"
+        );
+
+        // The sixth annotation on that page is a `/Link`: navigation, not something to draw or
+        // list. It has to be invisible here and visible through the link path, in the same file.
+        let links = backend.link_targets(PageIndex(0)).expect("links");
+        assert_eq!(
+            links.len(),
+            1,
+            "the fixture's link is reported by the link path"
+        );
+        assert_eq!(
+            links[0].uri.as_deref(),
+            Some("https://example.org/annotated")
+        );
+        assert!(
+            !kinds.contains(&"Link") && !kinds.iter().any(|kind| kind.starts_with("Subtype")),
+            "a link annotation must not be reported as an annotation"
         );
 
         let highlight = &first_page[0];

@@ -10,7 +10,7 @@ endobj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
 endobj
 4 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R] >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R] >>
 endobj
 5 0 obj
 << /Length 1033 >>
@@ -52,7 +52,7 @@ ET
 endstream
 endobj
 6 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R /Annots [13 0 R 14 0 R] >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R /Annots [14 0 R 15 0 R] >>
 endobj
 7 0 obj
 << /Length 999 >>
@@ -109,30 +109,34 @@ endobj
 << /Type /Annot /Subtype /FreeText /Rect [72 620 320 660] /DA (/Helv 10 Tf 0 g) /C [1 0 0] /Contents (Free text annotation body.) /T (Reviewer E) /M (D:20240102030405Z) /F 4 >>
 endobj
 13 0 obj
-<< /Type /Annot /Subtype /Squiggly /Rect [72 686 460 701] /QuadPoints [72 686 460 686 460 701 72 701] /C [0.5 0.2 0.8] /CA 0.75 /BM /Multiply /Contents (Squiggly contents.) /T (Reviewer F) /M (D:20240102030405Z) /F 4 >>
+<< /Type /Annot /Subtype /Link /Rect [72 626 460 641] /A << /S /URI /URI (https://example.org/annotated) >> /Border [0 0 0] /F 4 >>
 endobj
 14 0 obj
+<< /Type /Annot /Subtype /Squiggly /Rect [72 686 460 701] /QuadPoints [72 686 460 686 460 701 72 701] /C [0.5 0.2 0.8] /CA 0.75 /BM /Multiply /Contents (Squiggly contents.) /T (Reviewer F) /M (D:20240102030405Z) /F 4 >>
+endobj
+15 0 obj
 << /Type /Annot /Subtype /Highlight /Rect [72 656 300 671] /C [0.2 0.6 1] /Contents (Highlight without quad points.) /T (Reviewer G) /M (D:20240102030405Z) /F 4 >>
 endobj
 xref
-0 15
+0 16
 0000000000 65535 f 
 0000000015 00000 n 
 0000000064 00000 n 
 0000000127 00000 n 
 0000000224 00000 n 
-0000000393 00000 n 
-0000001478 00000 n 
-0000001628 00000 n 
-0000002678 00000 n 
-0000002961 00000 n 
-0000003181 00000 n 
-0000003396 00000 n 
-0000003561 00000 n 
-0000003754 00000 n 
-0000003990 00000 n 
+0000000400 00000 n 
+0000001485 00000 n 
+0000001635 00000 n 
+0000002685 00000 n 
+0000002968 00000 n 
+0000003188 00000 n 
+0000003403 00000 n 
+0000003568 00000 n 
+0000003761 00000 n 
+0000003909 00000 n 
+0000004145 00000 n 
 trailer
-<< /Size 15 /Root 1 0 R >>
+<< /Size 16 /Root 1 0 R >>
 startxref
-4170
+4325
 %%EOF
