@@ -6,9 +6,8 @@
 # harness says the evaluation did not run instead of passing quietly.
 #
 # These twenty papers are deliberately different from the twelve in pdf-samples/, which is the
-# corpus the parser was tuned on and which therefore flatters it. That corpus is almost entirely
-# one shape — single-column, numeric, similar publishers — so this set exists to reach the shapes
-# it never met: two-column reference lists, superscript citations, alphanumeric labels,
+# corpus the parser was tuned on and which therefore flatters it. That corpus includes both single- and two-column papers; this set adds
+# different typography and citation styles: superscript citations, alphanumeric labels,
 # author-year lists of several hundred entries, romanized non-Latin names.
 #
 # Line format (the fetch script reads the first field as the arXiv id):
@@ -17,7 +16,7 @@
 #               bib=<reference-list typography> | head=<heading and list structure> |
 #               doc=<measured document facts> | why=<what this paper is here to catch>
 #
-# `bib` is the property the twelve-paper corpus has none of: a reference list set in two columns.
+# `bib` records the reference-list layout, independently of the body layout.
 # Every property below was checked against the fetched PDF (pdftotext layout/heading probes plus
 # the harness's own link-annotation count), not inferred from the venue — the arXiv version of a
 # CVPR paper is not always the CVPR layout, and 1512.03385 is exactly that trap.
@@ -25,7 +24,7 @@
 1512.03385  family=CVPR | cite=numeric [n], grouped [n, m] | bib=two-column reference list, run-in entries, entries carry arXiv ids | head="References" heads the left column and shares its baseline with the top of the right column | doc=12 pages, 288 link annotations, 2015 | why=two-column bibliography, and a heading that shares a line with an entry
 1706.03762  family=NeurIPS | body=single column | cite=numeric [n], grouped | bib=single-column reference list, run-in entries, full-width lines | head="References" mid-page | doc=15 pages, 113 link annotations, 2017 | why=the most-cited numeric layout of the last decade; grouped labels [n, m] everywhere
 1810.04805  family=ACL/NAACL | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, author-year entry text ("Akbik et al. 2018") | head="References" mid-column; content follows the list | doc=16 pages, 290 link annotations, 2018 | why=two-column ACL list whose entries read author-year while the citations are numeric
-2005.14165  family=NeurIPS | body=single column | cite=alphanumeric labels, grouped: [MCCD13, PSM14], [VSP+ 17] | bib=single-column, small type, 55+ distinct alphanumeric labels over five pages (the parser groups them into 6 entries) | head="References" at the very end of the report (p68/75); the appendices precede it | doc=75 pages, 398 link annotations, 2020 | why=alphanumeric citation labels — a style the detector has no path for at all
+2005.14165  family=NeurIPS | body=single column | cite=alphanumeric labels, grouped: [MCCD13, PSM14], [VSP+ 17] | bib=single-column, small type, 144 alphanumeric entries (T4.16; previously collapsed into 6 entries) | head="References" at the very end of the report (p68/75); the appendices precede it | doc=75 pages, 398 link annotations, 2020 | why=alphanumeric citation labels and grouped keys — 203 detected body spans since T4.16
 2303.08774  family=plain arXiv article | body=single column | cite=numeric [n], grouped [n, m] | bib=single-column, run-in entries, references in the middle of a 100-page report | head="References" starts on its own page, appendices follow | doc=100 pages, 164 link annotations, 2023 | why=a bibliography nowhere near the end of the file
 2103.00020  family=ICML | body=two columns | cite=numeric [n], grouped | bib=two-column reference list, run-in, 204 parsed entries (100+) | head="References" mid-page | doc=48 pages, 795 link annotations, 2021 | why=label matching at scale: >100 entries, heavy "et al." trimming
 1905.11946  family=ICML | body=two columns | cite=numeric [n] | bib=two-column reference list, run-in | head="References" mid-page | doc=11 pages, 328 link annotations, romanized Chinese/Korean author names, 2019 | why=non-Latin (romanized CJK) author names on every entry

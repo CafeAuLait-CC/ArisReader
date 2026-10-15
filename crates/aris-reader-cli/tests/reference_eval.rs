@@ -14,7 +14,7 @@
 //! cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture
 //! ```
 //!
-//! Two modes:
+//! Two corpus reports and an independent gold-page check:
 //!
 //! * [`reference_eval_recall`] — one row per paper (entries, spans, resolved, unresolved,
 //!   recall) printed to stdout and, when the local-only `docs/` directory exists, written to
@@ -24,7 +24,10 @@
 //!   harness can produce on its own: a resolved match is only a false positive if a human says
 //!   so. The audit makes the candidates visible instead of inventing a score.
 //!
-//! Both modes skip cleanly when the corpus is absent and, on CI, emit a `::notice::` saying the
+//! `gpt3_alphanumeric_gold_pages` checks the full inventory and every resolved label on
+//! three independently annotated pages; unlike exploratory reports it requires that PDF.
+//!
+//! Both report modes skip cleanly when the corpus is absent and, on CI, emit a `::notice::` saying the
 //! evaluation did NOT run: a silent pass here would be indistinguishable from a real one.
 //! Set `ARIS_READER_REQUIRE_FULL_EVAL=1` to require every listed PDF (used by manual CI).
 //! Both modes fail on document-open or page-text errors; partial extraction is not a score.
@@ -128,13 +131,10 @@ const FLOORS: &[Floor] = &[
         id: "2403.04370",
         recall: 0.90,
     }, // measured 100% (13/13)
-    // Papers whose citation style the detector has no path for. The floor is 0.00 because the
-    // measurement is vacuous, NOT because the parser is fine: the table's probe columns are what
-    // expose them.
     Floor {
         id: "2005.14165",
-        recall: 0.00,
-    }, // alphanumeric labels: 224 in the body, 0 spans detected
+        recall: 0.95,
+    }, // T4.16: 203/203 spans resolve in locked v4; previously 0 spans / 6 collapsed entries.
     Floor {
         id: "1712.01815",
         recall: 0.00,
@@ -418,7 +418,9 @@ fn measure(id: &str, path: &Path) -> Paper {
             citations.push((*page, citation));
         }
         let (alnum, paren) = unmodelled_shapes(&text.text);
-        paper.unmodelled_alnum += alnum;
+        if !style.uses_alphanumeric_labels() {
+            paper.unmodelled_alnum += alnum;
+        }
         paper.unmodelled_paren += paren;
     }
     paper.body_pages = pages.iter().filter(|(page, _)| *page < body_end).count() as u32;
@@ -992,6 +994,17 @@ fn reference_eval_recall() {
     }
 
     let (papers, dir) = measure_corpus();
+    if let Some(gpt3) = papers
+        .iter()
+        .find(|p| p.id == "2005.14165" && matches!(p.state, State::Measured))
+    {
+        assert!(
+            gpt3.spans >= 190 && gpt3.entries >= 140,
+            "GPT-3 detection/bibliography coverage regressed: {} spans, {} entries",
+            gpt3.spans,
+            gpt3.entries
+        );
+    }
     let table = render_table(&papers);
     println!();
     println!(
@@ -1266,4 +1279,81 @@ fn unreadable_paper_cannot_pass_quality_gate() {
     });
     paper.state = State::Unreadable("text extraction failed".into());
     assert_readable(&[paper]);
+}
+
+/// Independent full-page gold inventory: catches both missing groups and extra detections,
+/// and verifies every label's bibliography identity rather than "at least one resolved".
+#[test]
+#[ignore = "needs the locked arXiv corpus and PDFium"]
+fn gpt3_alphanumeric_gold_pages() {
+    let root = repo_root();
+    let path = corpus_dir(&root).join("2005.14165.pdf");
+    let backend = PdfiumBackend::open(&path, None).expect("locked GPT-3 PDF must be readable");
+    let pages: Vec<_> = (0..backend.page_count())
+        .map(|p| {
+            (
+                p,
+                backend
+                    .raw_text_page(PageIndex(p))
+                    .expect("extract gold document"),
+            )
+        })
+        .collect();
+    let references = find_references(pages.iter().map(|(p, t)| (*p, t)), MAX_ENTRIES);
+    let style = CitationStyle::for_document(&pages, &references);
+    assert!(style.uses_alphanumeric_labels());
+    type GoldGroup<'a> = (Vec<&'a str>, Vec<&'a str>);
+    let mut expected: BTreeMap<u32, Vec<GoldGroup<'_>>> = BTreeMap::new();
+    for line in include_str!("../../../tests/eval/gpt3-alpha-gold.tsv")
+        .lines()
+        .filter(|s| !s.starts_with('#') && !s.is_empty())
+    {
+        let cols: Vec<_> = line.split('\t').collect();
+        assert_eq!(cols.len(), 3);
+        let page = cols[0].parse().unwrap();
+        let groups = expected.entry(page).or_default();
+        if cols[1] != "-" {
+            groups.push((cols[1].split(',').collect(), cols[2].split(',').collect()));
+        }
+    }
+    let mut labels_checked = 0;
+    for (page, groups) in &expected {
+        let raw = &pages[*page as usize].1;
+        let found = find_citations_with(raw, &style);
+        assert_eq!(
+            found.len(),
+            groups.len(),
+            "gold page {}: unexpected/missing citation",
+            page + 1
+        );
+        for (citation, (labels, authors)) in found.iter().zip(groups) {
+            assert_eq!(&citation.labels, labels, "gold page {}", page + 1);
+            assert_eq!(labels.len(), authors.len());
+            let entries = resolve_references(&citation.labels, &references);
+            assert_eq!(entries.len(), labels.len(), "every label must resolve");
+            for ((entry, label), author) in entries.iter().zip(labels).zip(authors) {
+                assert_eq!(&entry.label, label);
+                assert!(
+                    entry.text.contains(author),
+                    "{label} must identify {author}, got {}",
+                    entry.text
+                );
+                assert!(!entry.fragments.is_empty(), "preview geometry for {label}");
+                labels_checked += 1;
+            }
+            let source: String = raw.chars[citation.start..citation.end]
+                .iter()
+                .map(|c| char::from_u32(c.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect();
+            assert_eq!(
+                citation.text, source,
+                "character offsets preserve the source span"
+            );
+        }
+    }
+    println!(
+        "GPT-3 gold: {} complete pages, 8/8 spans, {labels_checked}/18 labels with checked identities",
+        expected.len()
+    );
+    assert_eq!(labels_checked, 18);
 }

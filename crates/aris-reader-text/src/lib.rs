@@ -14,6 +14,7 @@
 //! 2. Otherwise geometric clustering: split columns by column boundaries (x histogram) → sort by y
 //!    within a column → sort by x within a line.
 
+mod alphanumeric;
 mod bibliography;
 #[cfg(test)]
 mod bibliography_tests;
@@ -834,6 +835,11 @@ pub fn entry_label(text: &str) -> String {
     let trimmed = text.trim_start();
 
     if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((key, _)) = rest.split_once(']')
+            && let Some(label) = alphanumeric::label(key)
+        {
+            return label;
+        }
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         if !digits.is_empty() && rest[digits.len()..].starts_with(']') {
             return digits;
@@ -955,12 +961,13 @@ pub fn resolve_reference<'a>(
     // Positional fallback, but only when the list itself is unnumbered: if the entries carry
     // labels, a numeric miss means "no such reference", not "the Nth one".
     let list_is_unnumbered = references.iter().all(|entry| {
-        !entry
-            .label
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
+        alphanumeric::label(&entry.label).is_none()
+            && !entry
+                .label
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
     });
     if !list_is_unnumbered {
         return None;
@@ -1405,6 +1412,9 @@ pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
 pub fn find_citations_with(text: &RawTextPage, style: &CitationStyle) -> Vec<Citation> {
     let mut found = find_bracketed_citations(text);
     found.extend(superscript::find(text, style));
+    if style.uses_alphanumeric_labels() {
+        found.extend(alphanumeric::citations(text));
+    }
     // Two detectors, one reading order: the CLI prints the spans in the order they appear, and a
     // superscript run inside a bracket group is impossible, so only the order needs merging.
     found.sort_by_key(|citation| (citation.start, citation.end));
