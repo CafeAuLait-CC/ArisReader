@@ -491,8 +491,9 @@ fn a_numbered_list_that_restarts_its_own_numbering_is_not_a_bibliography() {
     // The other half of the rule: this list *is* cited by the body — twice — but its numbering
     // restarts at 1 instead of continuing, so it cannot be adjacent to the bibliography's range
     // and is a different list (an appendix's steps, a questionnaire), not the bibliography's
-    // tail. The corpus's live case is `2303.08774`, whose report carries seventeen numbered
-    // lists of its own; the longest is cited 85 times.
+    // tail. The corpus's live case is `2303.08774`, whose report carries seventeen short numbered
+    // lists of its own; the two lists in that paper that *are* bibliographies are the pair T4.41's
+    // tests below cover.
     let body = test_page("See [1] and [2] for the background.\n");
     let list = test_page("[1] One 2020.\n[2] Two 2021.\n[3] Three 2022.\n");
     let appendix = test_page("[1] First step.\n[2] Second step.\n");
@@ -526,5 +527,131 @@ fn the_first_runs_last_entry_stops_where_a_smaller_section_begins() {
     assert!(
         !entry.text.contains("not part of the reference"),
         "{entry:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.41 — two bibliographies under independent numberings
+// ---------------------------------------------------------------------------
+
+/// The document's own list, an appendix, and the appendix's own list — both numbered from 1.
+///
+/// This is the shape `2303.08774` prints: the report's references on pages 18–23 (85 entries,
+/// `[1]` Tom Brown, `[13]` Kojima), then the system card appendix, whose own references start
+/// again at `[1]` on page 71 (105 entries, `[1]` Tamkin, `[13]` Christiano). The later list is
+/// longer *and* headed, so it is the run the layout score picks; the earlier one is shorter and
+/// unheaded. Entries are worded apart on purpose, so a test that pins the wrong list fails on the
+/// text and not only on the page number.
+fn two_bibliography_pages(body: &str) -> [RawTextPage; 4] {
+    [
+        test_page(body),
+        test_page(
+            "[1] One 2019. Report work one.\n[2] Two 2020. Report work two.\n\
+             [3] Three 2021. Report work three.\n[4] Four 2022. Report work four.\n\
+             [5] Five 2023. Report work five.\n[6] Six 2024. Report work six.\n",
+        ),
+        test_page("Appendix A\nThe system card follows.\n"),
+        test_page(
+            "References\n[1] Alpha 2017. Card work one.\n[2] Beta 2017. Card work two.\n\
+             [3] Gamma 2017. Card work three.\n[4] Delta 2017. Card work four.\n\
+             [5] Epsilon 2017. Card work five.\n[6] Zeta 2017. Card work six.\n\
+             [7] Eta 2017. Card work seven.\n[8] Theta 2017. Card work eight.\n\
+             [9] Iota 2017. Card work nine.\n[10] Kappa 2017. Card work ten.\n\
+             [11] Lambda 2017. Card work eleven.\n[12] Mu 2017. Card work twelve.\n",
+        ),
+    ]
+}
+
+/// The four pages, in reading order, with the body's citations as page 0.
+fn two_bibliography_references(body: &str) -> Vec<ReferenceEntry> {
+    let pages = two_bibliography_pages(body);
+    find_references(
+        [
+            (0, &pages[0]),
+            (1, &pages[1]),
+            (3, &pages[2]),
+            (4, &pages[3]),
+        ],
+        100,
+    )
+}
+
+#[test]
+fn the_bibliography_the_main_text_cites_wins_over_a_later_one() {
+    // Both lists are real reference lists. What makes one of them *this document's* bibliography
+    // is that the report's own text cites it: the body cites [1]–[6], which is the earlier list's
+    // label range, while the later list merely scores higher. Before T4.41 the score alone
+    // decided, and every citation in the main text resolved into the appendix's list.
+    let entries =
+        two_bibliography_references("Related work is surveyed in [1], [2], [3], [4], [5], [6].\n");
+    assert_eq!(
+        labels(&entries),
+        ["1", "2", "3", "4", "5", "6"],
+        "the appendix's list won: {entries:?}"
+    );
+    assert!(entries.iter().all(|entry| entry.page == 1), "{entries:?}");
+}
+
+#[test]
+fn a_citation_resolves_into_the_list_its_own_text_cites() {
+    // The label-level half of the test above, kept separate because page numbers alone cannot
+    // see this defect: a wrong-but-internally-consistent list resolves every label happily. Both
+    // lists here number from 1, so `[3]` has two candidate entries and the one it must reach is
+    // the third reference of the list the citing text belongs to.
+    let entries =
+        two_bibliography_references("Related work is surveyed in [1], [2], [3], [4], [5], [6].\n");
+    let entry = resolve_reference(&["3".to_string()], &entries).expect("[3]");
+    assert!(entry.text.contains("Report work three"), "{entry:?}");
+    assert!(
+        !entry.text.contains("Card work three"),
+        "[3] resolved into the appendix's list: {entry:?}"
+    );
+    // And the grouped span itself: every label it carries must land on the report's list, not on
+    // the card's — the shape the resolver is asked for on every page of the main text.
+    for label in ["1", "2", "4", "5", "6"] {
+        let entry = resolve_reference(&[label.to_string()], &entries).expect(label);
+        assert_eq!(entry.page, 1, "[{label}] resolved off the report's list");
+    }
+}
+
+#[test]
+fn a_couple_of_matching_numerals_do_not_move_the_bibliography() {
+    // The guard on the rule above, and the reason it is a floor and not "any cited label": a
+    // numbered paragraph inside the body shares a numeral or two with any list. Measured on the
+    // two corpora, the most any list that is not a bibliography of its own reaches is two cited
+    // labels, while every genuine competing bibliography reaches 33 or more.
+    let entries = two_bibliography_references("Related work is surveyed in [2] and [3].\n");
+    assert_eq!(
+        labels(&entries),
+        [
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"
+        ],
+        "two matching numerals moved the selection: {entries:?}"
+    );
+    assert!(entries.iter().all(|entry| entry.page == 4), "{entries:?}");
+}
+
+#[test]
+fn two_pieces_of_one_numbering_are_joined_whichever_the_score_picks() {
+    // `1710.05463`'s shape: one numbering printed in two runs, 1–6 after the main text and 7–14
+    // after the methods. The later run wins the score, the earlier one is the run the body cites,
+    // and the rule above must *not* re-pick between them: they are one bibliography, the join in
+    // `extra_corroborated_runs` returns both, and re-picking would move the page the body window
+    // starts at and drop the second run's labels with it.
+    let body = test_page("The main text cites [1], [2], [3], [4], [5] and [6].\n");
+    let first = test_page(
+        "[1] One 2019.\n[2] Two 2020.\n[3] Three 2021.\n[4] Four 2022.\n[5] Five 2023.\n[6] Six 2024.\n",
+    );
+    let second = test_page(
+        "[7] Seven 2025.\n[8] Eight 2026.\n[9] Nine 2027.\n[10] Ten 2028.\n\
+         [11] Eleven 2029.\n[12] Twelve 2030.\n[13] Thirteen 2031.\n[14] Fourteen 2032.\n",
+    );
+    let entries = find_references([(0, &body), (1, &first), (3, &second)], 100);
+    assert_eq!(
+        labels(&entries),
+        [
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"
+        ],
+        "the two runs of one numbering were not joined: {entries:?}"
     );
 }

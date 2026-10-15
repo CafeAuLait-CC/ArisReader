@@ -12,6 +12,13 @@
 //! under two conditions a second numbered list in a paper — an appendix, a figure list, a table
 //! of contents, numbered equations — does not meet: the run must continue the selected numbering
 //! exactly, and the body must cite its labels.
+//!
+//! A document can also carry two reference lists that number *independently*, and there the score
+//! is the wrong instrument: `2303.08774` prints the report's own references (85 entries, pages
+//! 18–23) and the system card appendix's own references (105 entries, pages 71–78), each starting
+//! at `[1]`, and the longer one wins on every layout measure while being the wrong list for the
+//! report's main text. Both are real lists, so [`cited_run`] decides between them on evidence the
+//! score does not read: which of them the text that precedes it cites.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -53,14 +60,29 @@ impl Run {
             + ordered as f64
             + if self.headed { 8.0 } else { 0.0 }
     }
+}
 
-    /// Offers this run to `best`; reports whether it won, and clears the loser.
-    fn finish(&mut self, best: &mut Run) -> bool {
-        if self.score() > best.score() {
-            *best = std::mem::take(self);
+/// The incumbent: the run the layout score chose, and where it sits in `candidates`.
+///
+/// The index is kept because the body's own citations get to overrule the score ([`cited_run`]),
+/// and that comparison is between candidates, not between a candidate and a bare `Run`.
+#[derive(Default)]
+struct Best {
+    run: Run,
+    numbered: bool,
+    index: Option<usize>,
+}
+
+impl Best {
+    /// Offers `run` to the incumbent; reports whether it won, and clears the loser.
+    fn finish(&mut self, run: &mut Run, numbered: bool, index: Option<usize>) -> bool {
+        if run.score() > self.run.score() {
+            self.run = std::mem::take(run);
+            self.numbered = numbered;
+            self.index = index;
             true
         } else {
-            *self = Self::default();
+            *run = Run::default();
             false
         }
     }
@@ -73,22 +95,15 @@ struct Candidate {
 }
 
 /// Closes `run`: records it as a candidate and lets it compete for the incumbent.
-fn close(
-    run: &mut Run,
-    numbered: bool,
-    best: &mut Run,
-    best_numbered: &mut bool,
-    candidates: &mut Vec<Candidate>,
-) {
-    if !run.entries.is_empty() {
+fn close(run: &mut Run, numbered: bool, best: &mut Best, candidates: &mut Vec<Candidate>) {
+    let index = (!run.entries.is_empty()).then(|| {
         candidates.push(Candidate {
             run: run.clone(),
             numbered,
         });
-    }
-    if run.finish(best) {
-        *best_numbered = numbered;
-    }
+        candidates.len() - 1
+    });
+    best.finish(run, numbered, index);
 }
 
 pub(super) fn select_reference_run<'a>(
@@ -102,8 +117,7 @@ pub(super) fn select_reference_run<'a>(
     let mut numeric = Run::default();
     let mut alpha = Run::default();
     let mut author_year = Run::default();
-    let mut best = Run::default();
-    let mut best_numbered = false;
+    let mut best = Best::default();
     // Every run the walk closes. The winner is still the winner; the losers are what T4.20's
     // second chance is for.
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -149,24 +163,12 @@ pub(super) fn select_reference_run<'a>(
             // Theses often repeat "Bibliography" as a running page header.
             // Continue an established, coherent list through those headers.
             if !consecutive_page || !consecutive_label || (heading.is_some() && !run.headed) {
-                close(
-                    run,
-                    numbered,
-                    &mut best,
-                    &mut best_numbered,
-                    &mut candidates,
-                );
+                close(run, numbered, &mut best, &mut candidates);
             }
             // An isolated author-like line in prose must not bridge two runs.
             let viable = entries.len() >= 2 || (!run.entries.is_empty() && entries.len() == 1);
             if !viable {
-                close(
-                    run,
-                    numbered,
-                    &mut best,
-                    &mut best_numbered,
-                    &mut candidates,
-                );
+                close(run, numbered, &mut best, &mut candidates);
                 continue;
             }
             run.headed |= heading.is_some();
@@ -174,29 +176,23 @@ pub(super) fn select_reference_run<'a>(
             run.entries.extend(entries);
         }
     }
-    close(
-        &mut numeric,
-        true,
-        &mut best,
-        &mut best_numbered,
-        &mut candidates,
-    );
-    close(
-        &mut alpha,
-        false,
-        &mut best,
-        &mut best_numbered,
-        &mut candidates,
-    );
-    close(
-        &mut author_year,
-        false,
-        &mut best,
-        &mut best_numbered,
-        &mut candidates,
-    );
-    let mut entries = std::mem::take(&mut best.entries);
-    if best_numbered {
+    close(&mut numeric, true, &mut best, &mut candidates);
+    close(&mut alpha, false, &mut best, &mut candidates);
+    close(&mut author_year, false, &mut best, &mut candidates);
+    // The layout score picks the run that reads most like a bibliography. When the document
+    // prints two of them under independent numberings, that is not enough; see `cited_run`.
+    let chosen = if best.numbered {
+        cited_run(&candidates, best.index, &pages).or(best.index)
+    } else {
+        best.index
+    };
+    let mut entries = match chosen {
+        Some(index) => candidates[index].run.entries.clone(),
+        None => std::mem::take(&mut best.run.entries),
+    };
+    // `cited_run` only ever returns a numbered candidate, and `Best` records the winner's own
+    // flag, so the selection and this flag agree: the pass below is for a numbered selection.
+    if best.numbered {
         entries.extend(extra_corroborated_runs(&candidates, &entries, &pages));
         entries.sort_by_key(|entry| (entry.page, entry.start));
     }
@@ -210,7 +206,8 @@ pub(super) fn select_reference_run<'a>(
 
 /// The other numbered runs the body's own citations corroborate, in document order.
 ///
-/// `incumbent` is the run the score chose, and it is always kept: this function only adds. Two
+/// `incumbent` is the run the selection settled on — the score's choice, unless [`cited_run`]
+/// overruled it — and it is always kept: this function only adds. Two
 /// conditions admit a run, and neither is a threshold on how bibliographic a run looks:
 ///
 /// * **The numbering continues.** The run's labels are a complete, consecutive integer range and
@@ -352,30 +349,43 @@ fn consecutive_range(entries: &[ReferenceEntry]) -> Option<Vec<u32>> {
 /// document-level guard [`CitationStyle::for_document`] already applies, for the reason recorded
 /// there: in a bracketing paper the raised numerals are footnote markers, units and exponents.
 fn cited_numerals(pages: &[(u32, &RawTextPage)], body_end: u32) -> BTreeSet<u32> {
-    let body: Vec<&RawTextPage> = pages
+    let body: Vec<(u32, &RawTextPage)> = pages
         .iter()
+        .copied()
         .filter(|(page, _)| *page < body_end)
-        .map(|(_, text)| *text)
         .collect();
-    // One detector pass per page, not two: whether the body brackets its citations is read off
-    // the same citations the loop below harvests labels from.
-    let on_page: Vec<Vec<Citation>> = body
+    page_numerals(&body)
+        .into_iter()
+        .flat_map(|(_, labels)| labels)
+        .collect()
+}
+
+/// The numerals each page carries, in reading order, with the page they sit on.
+///
+/// One detector pass per page, and one decision per document about whether its numbers are
+/// bracketed at all — the two callers ([`cited_numerals`] and [`cited_run`]) read the same list,
+/// so a paper cannot be bracketed for one of them and superscript for the other.
+fn page_numerals(pages: &[(u32, &RawTextPage)]) -> Vec<(u32, BTreeSet<u32>)> {
+    // Whether the text brackets its citations is read off the same citations the loop below
+    // harvests labels from, not from a second detector run.
+    let on_page: Vec<Vec<Citation>> = pages
         .iter()
-        .map(|text| find_bracketed_citations(text))
+        .map(|(_, text)| find_bracketed_citations(text))
         .collect();
     let bracketed = on_page
         .iter()
         .flatten()
         .any(|citation| citation.text.starts_with('['));
-    let mut cited = BTreeSet::new();
-    for (text, citations) in body.iter().zip(&on_page) {
+    let mut numerals = Vec::new();
+    for ((page, text), citations) in pages.iter().zip(&on_page) {
+        let mut labels = BTreeSet::new();
         for citation in citations {
             if !citation.text.starts_with('[') {
                 continue;
             }
             for label in &citation.labels {
                 if let Ok(number) = label.parse::<u32>() {
-                    cited.insert(number);
+                    labels.insert(number);
                 }
             }
         }
@@ -383,13 +393,130 @@ fn cited_numerals(pages: &[(u32, &RawTextPage)], body_end: u32) -> BTreeSet<u32>
             for run in superscript::raised_runs(text) {
                 for label in &run.labels {
                     if let Ok(number) = label.parse::<u32>() {
-                        cited.insert(number);
+                        labels.insert(number);
                     }
                 }
             }
         }
+        if !labels.is_empty() {
+            numerals.push((*page, labels));
+        }
     }
-    cited
+    numerals
+}
+
+// ---------------------------------------------------------------------------
+// Which of several numbered runs the citing text refers to
+// ---------------------------------------------------------------------------
+
+/// How many of a run's labels the text before it must cite before that run may be taken as the
+/// document's bibliography over the run the layout score chose.
+///
+/// The score cannot separate two bibliographies: a 105-entry list with a heading scores higher
+/// than an 85-entry list with a heading, and `2303.08774` prints exactly that pair — the report's
+/// own references (pages 18–23) and the system card appendix's own, independently numbered
+/// references (pages 71–78). Both are real lists, so no layout evidence makes one of them wrong;
+/// what makes one of them *this document's* bibliography is that the report's own text cites it.
+///
+/// The floor is measured, on the thirty-two papers of the two corpora (2026-10-15), over the
+/// quantity the rule compares — distinct labels of the run that the text before the run cites.
+/// Every numbered list in those papers that is *not* a bibliography of its own reaches at most
+/// **2** such labels (a two-entry numbered paragraph in `Zhang 2025`, two of whose labels the
+/// introduction cites; `1807.06209`'s page-43 pair, likewise 2), while every genuine competing
+/// bibliography reaches **33 or more** (`1710.05463`'s first run 33, `Zhang 2025`'s list 60,
+/// `2303.08774`'s report list 68, its appendix list 97). Five sits two and a half times above
+/// the largest coincidence and six times below the smallest real list: high enough that a
+/// numbered paragraph cannot claim a document, low enough that a bibliography cited only in part
+/// still can.
+const CITED_LABELS_FLOOR: usize = 5;
+
+/// The earliest numbered run that the text before it cites like a bibliography, when that is not
+/// the run the layout score chose — the run this document's main text actually refers to.
+///
+/// Why "earliest" and not "most cited": in `2303.08774` the body cites the report's list at 68
+/// labels and the appendix cites the system card's list at 97, so the *most* cited list is the
+/// appendix's. Volume favours the appendix because the appendix is long; order favours the
+/// report because its main text comes first, and a reader clicking a citation in the main text is
+/// the case that must work. The document's own bibliography is the one its main text — the text
+/// that precedes every appendix — cites.
+///
+/// Why a run that merely *continues* the winner is left alone: two runs of one numbering are one
+/// bibliography printed in two pieces (`1710.05463`, tied at 33 cited labels each), the join in
+/// [`extra_corroborated_runs`] already returns both, and re-picking between them would only move
+/// the page the body window starts at. The rule is for two lists that number *independently*.
+///
+/// One limitation, stated rather than papered over: a document can genuinely carry two
+/// bibliographies, and the parser returns one list. Here the appendix's own citations then
+/// resolve into the report's list — the entries the reader of the *main text* needs, not the
+/// ones the appendix's author cited. Without section structure there is no evidence that tells
+/// the two citing regions apart beyond this rule, so the parser serves the main text and says so.
+fn cited_run(
+    candidates: &[Candidate],
+    winner: Option<usize>,
+    pages: &[(u32, &RawTextPage)],
+) -> Option<usize> {
+    let winner = winner?;
+    let plausible: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.numbered && candidate.run.score() > 0.0)
+        .map(|(index, _)| index)
+        .collect();
+    if plausible.len() < 2 {
+        return None;
+    }
+    // Bibliography pages are not body: a numeral inside a reference must not count as the text
+    // citing the list that carries it. The same exclusion `extra_corroborated_runs` applies.
+    let run_pages: BTreeSet<u32> = candidates
+        .iter()
+        .flat_map(|candidate| candidate.run.entries.iter().map(|entry| entry.page))
+        .collect();
+    let citing: Vec<(u32, &RawTextPage)> = pages
+        .iter()
+        .copied()
+        .filter(|(page, _)| !run_pages.contains(page))
+        .collect();
+    let numerals = page_numerals(&citing);
+    for index in plausible {
+        let run = &candidates[index].run;
+        let Some(first) = run.entries.iter().map(|entry| entry.page).min() else {
+            continue;
+        };
+        let cited = run
+            .entries
+            .iter()
+            .filter_map(|entry| entry.label.parse::<u32>().ok())
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .filter(|number| {
+                numerals
+                    .iter()
+                    .any(|(page, labels)| *page < first && labels.contains(number))
+            })
+            .count();
+        if cited < CITED_LABELS_FLOOR {
+            continue;
+        }
+        if index == winner {
+            // The score already chose the run the text cites; nothing to overrule.
+            return None;
+        }
+        if continues(&run.entries, &candidates[winner].run.entries) {
+            return None;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// Whether two runs are two pieces of one numbering: each a complete consecutive range, and
+/// adjacent — one's last label immediately below the other's first.
+fn continues(run: &[ReferenceEntry], other: &[ReferenceEntry]) -> bool {
+    let (Some(run), Some(other)) = (consecutive_range(run), consecutive_range(other)) else {
+        return false;
+    };
+    run[run.len() - 1].checked_add(1) == Some(other[0])
+        || other[other.len() - 1].checked_add(1) == Some(run[0])
 }
 
 // ---------------------------------------------------------------------------

@@ -85,7 +85,11 @@ const FLOORS: &[Floor] = &[
     Floor {
         id: "2303.08774",
         recall: 0.90,
-    }, // measured 99.2% (245/247); 100 pages, 105 entries
+    }, // T4.41: measured 100% (54/54) over the report's own body (pages 1–17) and its own list
+    // (85 entries on pages 18–23). It measured 99.2% (245/247) over 105 entries while the
+    // selection was the system card appendix's independently numbered list: the body window
+    // ran to page 70 and the appendix cites its own list there, so both the window and the
+    // recall figure changed with the selection. The floor is unchanged.
     Floor {
         id: "2103.00020",
         recall: 0.85,
@@ -219,8 +223,11 @@ const ENTRY_LENGTH_CEILINGS: &[(&str, usize, usize)] = &[
     ("2103.00020", 1000, 0), // measured max 648
     ("2104.08886", 1400, 0), // measured max 932
     ("2110.12477", 400, 0),  // measured max 257
-    ("2303.08774", 2050, 0), // measured max 1366: one reference, ~100 authors
-    ("2403.04370", 750, 0),  // measured max 469
+    ("2303.08774", 2050, 0), // the report's own list (T4.41) peaks at 960; the bound stays at the
+    // T4.17 scan's 2050, which the appendix list's 1366-character entry
+    // (one reference, ~100 authors) derived, so both of this paper's
+    // lists fit under it
+    ("2403.04370", 750, 0), // measured max 469
 ];
 
 /// Pages extracted per paper. The reader caps its own index at 120 pages (T4.13), so a longer
@@ -1722,4 +1729,161 @@ fn gpt3_alphanumeric_gold_pages() {
     assert_eq!(labels_checked, 18);
     assert!(years_checked > 0, "no citation key encoded a year");
     assert!(first_page.is_some(), "no gold page produced a citation");
+}
+
+// ---------------------------------------------------------------------------
+// T4.41 — two bibliographies under independent numberings
+// ---------------------------------------------------------------------------
+
+/// The one PDF the two-bibliography check needs; it is also in the evaluation corpus, so
+/// `ARIS_READER_EVAL_PAPERS` (or `eval-papers/`) locates it.
+const TWO_BIBLIOGRAPHY_PDF: &str = "2303.08774.pdf";
+
+/// The skip message, the same shape as the gold check's: an absent PDF is announced, not a
+/// failure, and CI is told the check did not run.
+fn announce_two_bibliography_skip(path: &Path) {
+    println!(
+        "skipping the GPT-4 two-bibliography check: {} is not present",
+        path.display()
+    );
+    println!("  this check needs that one locked PDF (2303.08774v6), not the whole corpus");
+    println!(
+        "  fetch it with ./scripts/fetch-eval-papers.sh (or point ARIS_READER_EVAL_PAPERS at it)"
+    );
+    if std::env::var_os("CI").is_some() {
+        println!(
+            "::notice title=GPT-4 two-bibliography check NOT run::{} is not present, so the check that the report's main text resolves into its own reference list — not into the system card appendix's independently numbered list — was NOT run. The PDFs are never committed; ./scripts/fetch-eval-papers.sh downloads the corpus that holds it. A green test run says nothing about this paper.",
+            path.display()
+        );
+    }
+}
+
+/// `2303.08774` prints **two** reference lists, each numbered from `[1]`: the report's own
+/// (pages 18–23, 85 entries) and the system card appendix's (pages 71–78, 105 entries). The
+/// appendix's list is longer and headed, so the layout score alone picks it, and every citation
+/// in the report's main text then resolves into it: the main text's `[13]` (Kojima, zero-shot
+/// reasoners) previews the appendix's `[13]` (Christiano, deep reinforcement learning from human
+/// preferences) instead. Both lists are real lists, so no layout test can call one of them wrong;
+/// what the parser has to read is which one the citing text refers to.
+///
+/// This check is label-level on purpose. The paper's recall was 99.2% while the defect was live —
+/// a wrong-but-internally-consistent list resolves every label — so a page number or a hit rate
+/// cannot see it. What is asserted here is the identity of the entry a label reaches: the report's
+/// `[13]` must be the Kojima entry, the report's `[1]` the Brown "Language Models are Few-Shot
+/// Learners" entry, and every numeric citation in the main text must land on a page of the
+/// report's own list (18–23), never on the appendix's (71–78).
+#[test]
+#[ignore = "needs the locked arXiv corpus and PDFium"]
+fn gpt4_main_text_resolves_into_the_reports_own_bibliography() {
+    let root = repo_root();
+    let path = corpus_dir(&root).join(TWO_BIBLIOGRAPHY_PDF);
+    if !path.is_file() {
+        announce_two_bibliography_skip(&path);
+        return;
+    }
+    let backend = PdfiumBackend::open(&path, None).expect("locked GPT-4 PDF must be readable");
+    let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count().min(MAX_PAGES))
+        .map(|page| {
+            (
+                page,
+                backend
+                    .raw_text_page(PageIndex(page))
+                    .expect("extract locked document"),
+            )
+        })
+        .collect();
+    // The app's own two passes: find the list, collect the link landings that point into it,
+    // rebuild with that geometry (crates/aris-reader-cli/src/main.rs).
+    let provisional = find_references(pages.iter().map(|(page, text)| (*page, text)), MAX_ENTRIES);
+    let first = provisional
+        .iter()
+        .map(|entry| entry.page)
+        .min()
+        .expect("bibliography");
+    let mut landings: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+    for page in 0..first {
+        for link in backend.link_targets(PageIndex(page)).expect("links") {
+            if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
+                && target.get() >= first
+            {
+                landings.entry(target.get()).or_default().push(top);
+            }
+        }
+    }
+    let references = find_references_with_landings(&pages, &landings, MAX_ENTRIES);
+    assert_eq!(
+        (
+            references.iter().map(|entry| entry.page).min(),
+            references.iter().map(|entry| entry.page).max(),
+            references.len()
+        ),
+        (Some(17), Some(22), 85),
+        "the selected bibliography is not the report's own list (pages 18–23, 85 entries)"
+    );
+
+    let entry = |label: &str| {
+        resolve_reference(&[label.to_string()], &references)
+            .unwrap_or_else(|| panic!("[{label}] must resolve"))
+    };
+    let thirteen = entry("13");
+    assert!(
+        thirteen.text.contains("Kojima") && thirteen.text.contains("zero-shot reasoners"),
+        "[13] must be the report's Kojima entry: {:?}",
+        thirteen.text.chars().take(120).collect::<String>()
+    );
+    assert!(
+        !thirteen.text.contains("Christiano"),
+        "[13] resolved into the system card appendix's list: {:?}",
+        thirteen.text.chars().take(120).collect::<String>()
+    );
+    let one = entry("1");
+    assert!(
+        one.text.contains("Brown") && one.text.contains("few-shot learners"),
+        "[1] must be the report's Brown entry: {:?}",
+        one.text.chars().take(120).collect::<String>()
+    );
+
+    // The whole main text, not one label: every numeric label it cites must resolve onto the
+    // report's list. This is the user-visible claim — clicking a citation in the body previews an
+    // entry of the list that body cites — and it is what failed before T4.41, when all of them
+    // landed on pages 71–78.
+    let style = CitationStyle::for_document(&pages, &references);
+    let mut spans = 0usize;
+    let mut labels = 0usize;
+    let mut carried_thirteen = false;
+    for (page, text) in pages.iter().filter(|(page, _)| *page < first) {
+        for citation in find_citations_with(text, &style) {
+            if citation.labels.is_empty()
+                || !citation
+                    .labels
+                    .iter()
+                    .all(|label| label.chars().all(|c| c.is_ascii_digit()))
+            {
+                continue;
+            }
+            spans += 1;
+            for label in &citation.labels {
+                let resolved = resolve_reference(std::slice::from_ref(label), &references)
+                    .unwrap_or_else(|| panic!("page {}: [{label}] must resolve", page + 1));
+                assert!(
+                    (17..=22).contains(&resolved.page),
+                    "page {}: [{label}] resolved to page {}, outside the report's own list",
+                    page + 1,
+                    resolved.page + 1
+                );
+                carried_thirteen |= label == "13";
+                labels += 1;
+            }
+        }
+    }
+    assert!(spans > 0, "the main text detected no numeric citation");
+    assert!(
+        carried_thirteen,
+        "no main-text citation carries label 13, so the identity check above is the only evidence"
+    );
+    println!(
+        "GPT-4 two-bibliography check: {} entries on pages 18–23; [1] Brown, [13] Kojima; \
+         {labels} label(s) over {spans} main-text span(s), every one inside the report's list",
+        references.len()
+    );
 }
