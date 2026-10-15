@@ -148,4 +148,35 @@ extension ReaderChecks {
         require(!tiny.usesScreenPageRasters,
                 "the page-count ceiling cannot leave a visible page permanently without raster work")
     }
+
+    /// T4.37: a cache budget too small for one page raster must say so instead of silently
+    /// switching renderers. At 140% on a 2x display the 600x800 fixture page costs 14.4 MiB, so
+    /// a 16 MiB budget allows only 8.0 MiB per page and needs 28.7 MiB to qualify; the note has
+    /// to name those numbers, not just "off".
+    @MainActor static func screenPageDegradationChecks(url: URL) async throws {
+        let engine = ScreenPageEngine()
+        engine.finishAll()
+        let state = AppState(engine: engine, tileCacheBudgetBytes: 16 * 1024 * 1024,
+                             preferFullPageRasters: true)
+        state.zoomPercent = 140
+        state.setViewportSize(CGSize(width: 900, height: 700))
+        state.open(url: url)
+        state.gotoPage(0)
+        try await eventually("a 16 MiB budget falls back to the tile path", { engine.tileRequests > 0 })
+        require(!state.usesScreenPageRasters,
+                "a budget below one page raster cannot use the screen-resolution path")
+        let mib = 1024.0 * 1024.0
+        let pageMiB = String(format: "%.1f", 1680.0 * 2240.0 * 4 / mib)
+        let neededMiB = String(format: "%.1f", 1680.0 * 2240.0 * 8 / mib)
+        let note = state.screenPagePathNote ?? ""
+        require(note.contains(pageMiB) && note.contains("8.0 MiB") && note.contains(neededMiB),
+                "the reason names the page size, the per-page ceiling and the budget it needs; got: \(note)")
+        require(state.screenPagePathSummary == "off(page \(pageMiB)>8.0 MiB; budget <\(neededMiB) MiB)",
+                "the render-stats field names the threshold; got: \(state.screenPagePathSummary)")
+        state.applyCacheBudgetSetting(environment: ["ARIS_READER_CACHE_BUDGET_MB": "48"])
+        try await eventually("raising the budget restores the screen-resolution path",
+                             { state.usesScreenPageRasters })
+        require(state.screenPagePathNote == nil && state.screenPagePathSummary == "on",
+                "the degradation note clears once the path is available again")
+    }
 }

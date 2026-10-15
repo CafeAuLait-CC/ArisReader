@@ -190,6 +190,17 @@ not by a step's outcome, so a corpus that is already on the workspace is measure
 reported as absent. CI preserves check and evaluation logs as `macos-check-logs` artifacts,
 including on failure.
 
+**The screen-resolution page path is not always available, and says so when it is not.** It needs one
+page raster of at most `min(cache budget / 2, 32 MiB)`, at most 8192 px on the page's longest side, at
+most seven pages on screen, and the on-screen pages' rasters together inside the whole budget. A US
+Letter page at 140% on a 2x display is 1714x2218 px = 14.5 MiB, so a cache budget below 29.0 MiB
+(30 MiB as the first whole-MiB setting that fits) turns the path off and falls back to tiles. That is
+announced rather than silent: stderr gets one `aris-screen-page: off: ...` line per change naming the
+limit that failed and the budget it needs, `ARIS_READER_RENDER_STATS=1` carries
+`screenPages off(page 14.5>8.0 MiB; budget <29.0 MiB)` (or `on`, or `off(feature-off)` for
+`ARIS_READER_SHARP_PAGE_RASTERS=0`), and `AppState.screenPagePathNote` exposes the same reason to the
+UI. The four thresholds are stated in `screenPagePathDecision`.
+
 The evaluation's historical “recall” column is **resolution rate among detected spans**, not
 citation-detection recall: undetected styles never enter its denominator, and a grouped span
 counts as resolved if any label resolves (partial groups are reported separately). The table also
