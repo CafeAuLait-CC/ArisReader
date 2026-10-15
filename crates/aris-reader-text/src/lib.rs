@@ -24,7 +24,8 @@ mod superscript;
 pub mod tables;
 
 pub use figures::{
-    CaptionMention, PageEvidence, caption_region, caption_region_from, find_caption_mentions,
+    CaptionMention, PageEvidence, caption_region, caption_region_from,
+    caption_region_without_margin, find_caption_mentions,
 };
 pub use superscript::CitationStyle;
 pub use tables::table_region;
@@ -674,7 +675,247 @@ pub struct Caption {
     pub end: usize,
 }
 
-/// Finds `Figure N` / `Table N` / `Algorithm N` captions.
+/// The most white space allowed between a caption's ink and the ink of the line under it that
+/// continues the caption, as a share of the caption's own glyph height.
+///
+/// Caption lines are set solid: the white space between one line's ink and the next line's ink is
+/// what is left of the leading, a third of the type size or so. The line that ends the caption and
+/// the block that follows it are separated by a paragraph or float break, which is most of a line.
+/// Measured over every caption of the twelve sample papers and the twenty evaluation papers (429
+/// captions, 2026-10-15): a continuation line sits **0.10–0.39** glyph heights under the caption
+/// (`Table 2` of the ResNet paper at 3.0 pt against 8.0 pt type, `Fig. 13` of the Dvorožňák paper
+/// at 0.9 pt against 7.1 pt type), while the nearest line that does *not* continue a caption sits
+/// at **0.79** (`Table 6` of the Ye paper, whose table header follows the caption at 7.1 pt against
+/// 9.0 pt type). 0.6 is the middle of that empty band.
+const CAPTION_LINE_GAP_SHARE: f64 = 0.6;
+
+/// The widest gap *inside* a line that still reads as one line of a caption, as a share of the
+/// caption's glyph height.
+///
+/// A word space is a third of the type size; a table's column gutter is several times that. When a
+/// caption is set above its table the first rows follow at the caption's own leading and in its own
+/// type size, so neither the leading nor the size tells them apart — the gutter between their cells
+/// does. Measured on the same corpus: the widest gap inside a line that a caption really continues
+/// is 1.55 glyph heights (`Fig. 35` of the Planck paper), while the first table row that is *not*
+/// part of its caption measures 2.97 (`Table 4` of the Transformer paper, whose rows the caption
+/// used to take in). 2.0 is the middle of that empty band.
+const CAPTION_INK_GAP_SHARE: f64 = 2.0;
+
+/// How much *larger* than the caption's own type a following line may measure (points) and still
+/// belong to the caption. A line of a smaller size is never refused.
+///
+/// The asymmetry is what the corpus shows. Body text is set a size up from the caption on the
+/// papers that separate them at all (`Table 2` of the ResNet paper: caption 8.0 pt, body 8.9 pt;
+/// `Figure 6` of CLIP: 8.0 against 8.9), and that difference is the last guard behind
+/// [`CAPTION_LINE_GAP_SHARE`] when a paragraph follows a caption at the caption's own leading.
+/// Smaller lines are not neighbours but *parts* of a line: a subscript or superscript inside a
+/// caption arrives as a line of its own in the text layer, 1.4–3.1 pt under the size of the text it
+/// belongs to (`Fig. 5` of the Dvorožňák paper, `Fig. 44` of the Planck paper), and refusing those
+/// would cut the caption at the first formula it contains.
+const CAPTION_TYPE_TOLERANCE_PT: f64 = 0.75;
+
+/// One line of the text layer, as the caption scanner needs it.
+///
+/// The scanner works on the extraction order of the character array (lines split at `\n`), because
+/// that is the order the caption's own lines are printed in — a caption does not survive being
+/// regrouped by baseline, which merges the two columns of a two-column page into one "line".
+struct CaptionLine {
+    /// Half-open character range, without the line's terminating newline.
+    start: usize,
+    end: usize,
+    /// Box of the line's non-whitespace characters, in page space.
+    rect: Rect,
+    /// Median height of those characters: the crate's stand-in for the type size.
+    height: f64,
+    /// The line's characters with whitespace runs collapsed, for the caption's text.
+    compact: String,
+    /// The line as extracted, for the label grammar.
+    raw: String,
+    /// The widest gap between two runs of ink inside the line.
+    gap: f64,
+}
+
+/// Splits the page's characters into lines and measures each one.
+fn caption_lines(text: &RawTextPage, chars: &[char]) -> Vec<CaptionLine> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let end = chars[start..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|offset| start + offset)
+            .unwrap_or(chars.len());
+        let raw: String = chars[start..end].iter().collect();
+
+        let mut heights: Vec<f64> = Vec::new();
+        let mut rect: Option<Rect> = None;
+        for character in &text.chars[start.min(text.chars.len())..end.min(text.chars.len())] {
+            let visible = char::from_u32(character.unicode)
+                .map(|decoded| !decoded.is_whitespace())
+                .unwrap_or(false);
+            if !visible {
+                continue;
+            }
+            heights.push(character.rect.size.height);
+            rect = Some(match rect {
+                None => character.rect,
+                Some(current) => union_rect(current, character.rect),
+            });
+        }
+        let median = |values: &mut Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values.get(values.len() / 2).copied().unwrap_or(0.0)
+        };
+        let mut boxes: Vec<Rect> = text.chars
+            [start.min(text.chars.len())..end.min(text.chars.len())]
+            .iter()
+            .filter(|character| {
+                char::from_u32(character.unicode)
+                    .map(|decoded| !decoded.is_whitespace())
+                    .unwrap_or(false)
+            })
+            .map(|character| character.rect)
+            .collect();
+        boxes.sort_by(|left, right| left.origin.x.total_cmp(&right.origin.x));
+        let mut right = f64::MIN;
+        let mut gap: f64 = 0.0;
+        for box_rect in boxes {
+            if right > f64::MIN && box_rect.origin.x - right > gap {
+                gap = box_rect.origin.x - right;
+            }
+            right = right.max(box_rect.max_x());
+        }
+        lines.push(CaptionLine {
+            start,
+            end,
+            rect: rect.unwrap_or_default(),
+            height: median(&mut heights),
+            compact: raw.split_whitespace().collect::<Vec<_>>().join(" "),
+            raw,
+            gap,
+        });
+
+        if end >= chars.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    lines
+}
+
+/// The caption a line opens with: its kind and its numeric label.
+///
+/// A caption label must open a line and be followed by punctuation (`.`, `:`, en dash, or em dash)
+/// before its title. That separator keeps a line-start sentence such as `Figure 3 shows ...` in
+/// the mention stream.
+fn caption_label(line: &str) -> Option<(&'static str, String)> {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let kind = if lower.starts_with("figure") || lower.starts_with("fig.") {
+        "Figure"
+    } else if lower.starts_with("table") {
+        "Table"
+    } else if lower.starts_with("algorithm") || lower.starts_with("alg.") {
+        "Algorithm"
+    } else {
+        return None;
+    };
+
+    // After the caption keyword comes a plain numeric label and a punctuation separator.
+    let label_start = if lower.starts_with("fig.") || lower.starts_with("alg.") {
+        4
+    } else if lower.starts_with("algorithm") {
+        9
+    } else if lower.starts_with("figure") {
+        6
+    } else {
+        5
+    };
+    let after: String = trimmed.chars().skip(label_start).collect();
+    let after = after.trim_start();
+    let label: String = after.chars().take_while(char::is_ascii_digit).collect();
+    if label.is_empty() {
+        return None;
+    }
+    let suffix: String = after.chars().skip(label.chars().count()).collect();
+    let suffix = suffix.trim_start();
+    if suffix.starts_with(['.', ':', '\u{2013}', '\u{2014}']) {
+        // A dot immediately followed by another digit is a sub-number, not a separator.
+        if suffix.starts_with('.') && suffix[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    Some((kind, label))
+}
+
+/// The lines a caption covers: the line its label opens, and every line under it that repeats the
+/// caption's leading and its type size within the caption's own column.
+///
+/// This is what a caption *is* in a PDF text layer: the label line is the only line that can be
+/// recognised, and the rest of the caption is the run of lines that continues it typographically.
+/// Without the run, a caption that wraps — which is most of them, and every caption that reaches
+/// past the artwork it labels — was stored as its first line alone, and both its text and its
+/// region stopped there.
+///
+/// The walk stops at the first line that breaks the run, on any of:
+///
+/// * **another column** — a line that does not overlap the caption horizontally is the page's
+///   other column (a two-column content stream prints both columns of a row together), and the
+///   walk steps over it rather than treating it as the caption's end;
+/// * **a paragraph break** — a line further below than [`CAPTION_LEADING_SHARE`] of the caption's
+///   glyph height;
+/// * **a different type size** — more than [`CAPTION_TYPE_TOLERANCE_PT`] away from the label
+///   line's, which is what separates a caption from the body text or the table rows under it;
+/// * **another caption** — a line that opens a `Figure`/`Table`/`Algorithm` label of its own.
+fn caption_block(lines: &[CaptionLine], anchor: usize) -> (Vec<usize>, Rect) {
+    let mut included = vec![anchor];
+    let mut block = lines[anchor].rect;
+    let reference = lines[anchor].height;
+
+    loop {
+        let last = *included.last().expect("the anchor line");
+        // The first line after the block that shares its column. A line that does not overlap the
+        // block at all is the page's other column (a two-column content stream prints both columns
+        // of a row together) or a marginal note; it is stepped over rather than treated as the
+        // caption's end. The block is what the caption covers so far, so a hanging-indent
+        // continuation, and the sub- and superscripts that arrive as lines of their own, all line
+        // up with it.
+        let next = (last + 1..lines.len()).find(|index| {
+            let line = &lines[*index];
+            !line.compact.is_empty()
+                && line.rect.size.width > 0.0
+                && crate::figures::overlaps_horizontally(block, line.rect)
+        });
+        let Some(next) = next else { break };
+        let line = &lines[next];
+
+        // White space, not baseline distance: a line of the text layer is not always one printed
+        // line. PDFium merges a wrapped line into its neighbour when a word is hyphenated across
+        // the break (`Figure 2` of the Pan paper arrives as two printed lines under one `\n`), and
+        // it splits one printed line into several when a formula interrupts it. Both are measured
+        // from the block's lowest ink and the candidate's highest, which is the same quantity on
+        // every one of them.
+        let gap = block.origin.y - line.rect.max_y();
+        if gap > CAPTION_LINE_GAP_SHARE * reference
+            || line.height - reference > CAPTION_TYPE_TOLERANCE_PT
+            || line.gap > CAPTION_INK_GAP_SHARE * reference
+            || caption_label(&line.raw).is_some()
+        {
+            break;
+        }
+
+        included.push(next);
+        block = union_rect(block, line.rect);
+    }
+
+    (included, block)
+}
+
+/// Finds `Figure N` / `Table N` / `Algorithm N` captions, each with the **whole** run of lines it
+/// covers (see [`caption_block`]) rather than its label line alone.
 ///
 /// A caption label must open a line and be followed by punctuation (`.`, `:`, en dash, or em dash)
 /// before its title. That separator keeps a line-start sentence such as `Figure 3 shows ...` in
@@ -686,74 +927,37 @@ pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
         .iter()
         .map(|character| char::from_u32(character.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect();
-
-    let mut line_starts = vec![0usize];
-    for (index, character) in chars.iter().enumerate() {
-        if *character == '\n' {
-            line_starts.push(index + 1);
-        }
-    }
+    let lines = caption_lines(text, &chars);
 
     let mut captions = Vec::new();
-    for (position, start) in line_starts.iter().enumerate() {
-        let end = line_starts
-            .get(position + 1)
-            .copied()
-            .unwrap_or(chars.len());
-        let line: String = chars[*start..end].iter().collect();
-        let trimmed = line.trim_start();
-        let offset = line.chars().count() - trimmed.chars().count();
-
-        let lower = trimmed.to_ascii_lowercase();
-        let kind = if lower.starts_with("figure") || lower.starts_with("fig.") {
-            "Figure"
-        } else if lower.starts_with("table") {
-            "Table"
-        } else if lower.starts_with("algorithm") || lower.starts_with("alg.") {
-            "Algorithm"
-        } else {
+    for (position, line) in lines.iter().enumerate() {
+        let Some((kind, label)) = caption_label(&line.raw) else {
             continue;
         };
-
-        // After the caption keyword comes a plain numeric label and a punctuation separator.
-        let label_start = if lower.starts_with("fig.") || lower.starts_with("alg.") {
-            4
-        } else if lower.starts_with("algorithm") {
-            9
-        } else if lower.starts_with("figure") {
-            6
+        let trimmed = line.raw.trim_start();
+        let offset = line.raw.chars().count() - trimmed.chars().count();
+        let (block_lines, mut rect) = caption_block(&lines, position);
+        let caption_start = line.start + offset;
+        // The label line's box starts at its first printed character, not at its indentation, and
+        // it reaches past the line's last character to the newline that ends it — the shape this
+        // box has always had.
+        rect = union_rect(
+            rect,
+            union_boxes(
+                &text.chars[caption_start.min(text.chars.len())..line.end.min(text.chars.len())],
+            ),
+        );
+        // The range keeps the shape it has always had: it runs to the end of the last line's own
+        // characters, not past the newline that terminates them.
+        let last = *block_lines.last().expect("the caption's own line");
+        let caption_end = if lines[last].end < chars.len() {
+            lines[last].end + 1
         } else {
-            5
+            lines[last].end
         };
-        let after: String = trimmed.chars().skip(label_start).collect();
-        let after = after.trim_start();
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        let label = digits;
-        if label.is_empty() || !label.chars().all(|character| character.is_ascii_digit()) {
-            continue;
-        }
-        let suffix: String = after.chars().skip(label.chars().count()).collect();
-        let suffix = suffix.trim_start();
-        // A running sentence can begin with `Figure 3 shows ...`; captions conventionally
-        // separate their number from the title with punctuation. Requiring that separator
-        // prevents an ordinary line-start mention from stealing the caption record.
-        if suffix.starts_with(['.', ':', '\u{2013}', '\u{2014}']) {
-            // A dot immediately followed by another digit is a sub-number, not a separator.
-            if suffix.starts_with('.')
-                && suffix[1..].starts_with(|character: char| character.is_ascii_digit())
-            {
-                continue;
-            }
-        } else {
-            continue;
-        }
-
-        let caption_start = start + offset;
-        let caption_end = end.min(chars.len());
-        let body: String = chars[caption_start..caption_end]
+        let body = block_lines
             .iter()
-            .collect::<String>()
-            .split_whitespace()
+            .map(|index| lines[*index].compact.as_str())
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -764,9 +968,20 @@ pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
                 .trim_start_matches(|character: char| !character.is_whitespace())
                 .trim()
                 .to_string(),
-            rect: union_boxes(
-                &text.chars[caption_start.min(text.chars.len())..caption_end.min(text.chars.len())],
-            ),
+            // The caption's own lines, not the character range: in a two-column page the range can
+            // step over the other column's line, and the box must not follow it.
+            rect: block_lines
+                .iter()
+                .fold(rect, |_accumulated, _index| rect)
+                .union(if caption_start > line.start {
+                    // The label line's box is measured from its first non-space character.
+                    union_boxes(
+                        &text.chars
+                            [caption_start.min(text.chars.len())..line.end.min(text.chars.len())],
+                    )
+                } else {
+                    rect
+                }),
             start: caption_start,
             end: caption_end,
         });
@@ -1072,6 +1287,63 @@ pub fn find_references<'a>(
 mod caption_tests {
     use super::*;
 
+    /// A page of lines given as `(x, baseline, glyph height, text)`, each character 5 pt wide.
+    ///
+    /// `test_page` stacks every line on one baseline, which is enough for the label grammar but
+    /// says nothing about leading or type size — the two measurements a caption's continuation is
+    /// decided by.
+    fn page_of(lines: &[(f64, f64, f64, &str)]) -> RawTextPage {
+        use aris_reader_core::{PageIndex, Point, RawCharBox};
+        let mut chars = Vec::new();
+        for (line, (x, baseline, height, text)) in lines.iter().enumerate() {
+            if line > 0 {
+                // The text layer separates lines with a character of its own; on a real page its
+                // box is degenerate (4 of 10,020 newline boxes in the corpus measure above 0.01
+                // pt), so a zero-sized box at the end of the previous line is what it looks like.
+                let after = x + text.chars().count() as f64 * 5.0;
+                chars.push(RawCharBox {
+                    rect: Rect::new(after, *baseline + *height, 0.0, 0.0),
+                    origin: Point::new(after, *baseline),
+                    unicode: '\n' as u32,
+                    font_size: *height,
+                    angle: 0.0,
+                    font_name: "Body".to_string(),
+                });
+            }
+            for (column, character) in text.chars().enumerate() {
+                chars.push(RawCharBox {
+                    rect: Rect::new(x + column as f64 * 5.0, *baseline, 5.0, *height),
+                    origin: Point::new(x + column as f64 * 5.0, *baseline),
+                    unicode: character as u32,
+                    font_size: *height,
+                    angle: 0.0,
+                    font_name: "Body".to_string(),
+                });
+            }
+        }
+        RawTextPage {
+            page: PageIndex(0),
+            chars,
+            text: lines
+                .iter()
+                .map(|(_, _, _, text)| *text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_generated: false,
+            has_unicode_map_error: false,
+        }
+    }
+
+    /// A caption of one 8 pt line, its continuation, and body text 36 pt under it.
+    fn wrapped_caption_page() -> RawTextPage {
+        page_of(&[
+            (50.0, 700.0, 8.0, "Figure 3: Overview of the method."),
+            (50.0, 688.0, 8.0, "It wraps onto a second line"),
+            (50.0, 676.0, 8.0, "and a third."),
+            (50.0, 640.0, 9.0, "Body text resumes here."),
+        ])
+    }
+
     #[test]
     fn figure_and_table_captions_are_found_with_labels() {
         let text = "Body text here.\nFigure 3: Overview of the method.\nmore text\nTable 2. Results on the test set.\n";
@@ -1102,11 +1374,15 @@ mod caption_tests {
         let captions = find_captions(&page);
         assert_eq!(captions.len(), 1, "{captions:?}");
         assert_eq!(captions[0].start, 1);
+        // The box covers the caption's printed characters only. It used to reach one character
+        // further, to the newline that ends the line, because the range it was measured from ended
+        // there; a line break is not ink, and on the corpus only 4 of 10,020 newline boxes measure
+        // more than 0.01 pt across, so the crop moves by nothing measurable.
         assert_eq!(
             captions[0].rect,
             page.chars[1]
                 .rect
-                .union(page.chars[page.chars.len() - 1].rect)
+                .union(page.chars[page.chars.len() - 2].rect)
         );
     }
 
@@ -1119,6 +1395,86 @@ mod caption_tests {
         assert_eq!(captions.len(), 1, "{captions:?}");
         assert_eq!(captions[0].end, page.chars.len());
         assert!(captions[0].text.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    #[test]
+    fn a_caption_takes_the_lines_that_continue_it() {
+        let captions = find_captions(&wrapped_caption_page());
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(
+            captions[0].text,
+            "3: Overview of the method. It wraps onto a second line and a third."
+        );
+        // The range is the whole caption, not its first line: it ends past the last line's last
+        // character, and the box covers all three lines (700 down to 676 of baselines, 8 pt tall).
+        // 33 + 1 + 27 + 1 + 12 characters of the three lines, plus the newline that ends the
+        // last of them: the range covers the caption and stops there.
+        assert_eq!(captions[0].end, 75);
+        assert_eq!(captions[0].rect.origin.y, 676.0);
+        assert_eq!(captions[0].rect.max_y(), 708.0);
+        assert_eq!(
+            captions[0].rect.size.height, 32.0,
+            "the caption's own box, not one line of it"
+        );
+    }
+
+    #[test]
+    fn a_caption_stops_at_the_body_text_under_it() {
+        // The body line is 1 pt larger and 36 pt down: 4.5 glyph heights, well past the measured
+        // 1.42 that a continuation can sit at. It must not join the caption.
+        let captions = find_captions(&wrapped_caption_page());
+        assert!(!captions[0].text.contains("Body text resumes"));
+        // Same leading, but a line of a different size is the caption's neighbour, not its text.
+        let bigger = page_of(&[
+            (50.0, 700.0, 8.0, "Table 2: Results."),
+            (50.0, 688.0, 9.0, "Table rows do not belong to the caption."),
+        ]);
+        let captions = find_captions(&bigger);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].text, "2: Results.");
+    }
+
+    #[test]
+    fn a_caption_stops_at_the_next_caption() {
+        let page = page_of(&[
+            (50.0, 700.0, 8.0, "Figure 1: First."),
+            (50.0, 688.0, 8.0, "Figure 2: Second, on its own."),
+            (50.0, 676.0, 8.0, "Its own continuation."),
+        ]);
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 2, "{captions:?}");
+        assert_eq!(captions[0].text, "1: First.");
+        assert_eq!(
+            captions[1].text,
+            "2: Second, on its own. Its own continuation."
+        );
+        assert_eq!(captions[1].rect.origin.y, 676.0);
+    }
+
+    #[test]
+    fn the_other_column_of_a_two_column_page_is_not_the_caption() {
+        // A content stream prints both columns of a row together, so the line after a caption can
+        // be the other column's. It has to be stepped over, not treated as the caption's end —
+        // otherwise every caption in the left column of an interleaved page loses its tail.
+        let page = page_of(&[
+            (50.0, 700.0, 8.0, "Figure 3: Overview of the method."),
+            (320.0, 700.0, 8.0, "The other column sits here."),
+            (50.0, 688.0, 8.0, "The caption continues under it,"),
+            (50.0, 676.0, 8.0, "and ends here."),
+            (320.0, 688.0, 9.0, "More of the other column."),
+        ]);
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(
+            captions[0].text,
+            "3: Overview of the method. The caption continues under it, and ends here."
+        );
+        // The box must not grow to the other column's right edge.
+        assert!(
+            captions[0].rect.max_x() < 300.0,
+            "the box followed the other column: {:?}",
+            captions[0].rect
+        );
     }
 }
 
