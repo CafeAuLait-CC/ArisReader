@@ -79,6 +79,9 @@ jobs:
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Native measurement summary regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_native_scroll_measurement.py'
+
       - name: cargo test --workspace
         run: cargo test --workspace
 
