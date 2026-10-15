@@ -824,6 +824,9 @@ pub fn find_references_with_landings(
     // agree with them fragment for fragment; deriving both here keeps the two paths identical.
     let references: Vec<(u32, &RawTextPage)> =
         pages.iter().map(|(page, text)| (*page, text)).collect();
+    // A page rebuilt from bands ends its entries at the bands' own edges, but a page that kept
+    // its parsed entries still carries whatever the page printed after the list.
+    bibliography::trim_trailing_section(&mut rebuilt, &references);
     fragments::assign(&mut rebuilt, &references);
     rebuilt
 }
@@ -1055,6 +1058,10 @@ pub fn find_references<'a>(
         pages.iter().map(|(page, text)| (*page, *text)),
         max_entries,
     );
+    // The list's last entry ends where the page does, not where the reference does; see
+    // `trim_trailing_section`. It runs before the geometry, so the preview box it derives covers
+    // the entry's own glyphs and nothing after them.
+    bibliography::trim_trailing_section(&mut entries, &pages);
     // Geometry comes after selection: which run of entries is the bibliography must not depend
     // on where the columns fall.
     fragments::assign(&mut entries, &pages);

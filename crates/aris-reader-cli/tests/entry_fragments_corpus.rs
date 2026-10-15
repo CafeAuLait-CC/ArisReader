@@ -10,7 +10,9 @@
 //! of the fallback rather than of the detector: when a paragraph of an entry crosses the boundary
 //! the cut is refused for that entry, and the entry keeps the single box the old model gave it.
 //! Every one of the crossing boxes is that fallback box — measured against `master`, the boxes are
-//! identical, and the only geometry that moved is one extra page continuation.
+//! identical, and the only geometry that moved is one extra page continuation. The count fell from
+//! 18 to 13 on 2026-10-15: five entries used to straddle the gutter only because their tail was
+//! the page number, which is set inside the boundary, and T4.29 trimmed it (see the call site).
 //!
 //! Run with PDFium available and ARIS_READER_PDF_SAMPLES pointing at pdf-samples:
 //! cargo test -p aris-reader-cli --test entry_fragments_corpus -- --ignored --nocapture
@@ -249,13 +251,15 @@ fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
     // A fragment is a piece a preview can draw, and a preview rectangle that spans a column
     // gutter shows the wrong column — so every fragment a *cut* produced is on one side of the
     // gutter by construction, and the ones that are not are the entries the model refused to cut.
-    // `18` is that second number: entries holding a paragraph that crosses the boundary, which
+    // `13` is that second number: entries holding a paragraph that crosses the boundary, which
     // keeps its glyphs' union box (the box `page`/`start`/`end` always described) rather than a
     // cut the model cannot justify. Read it with the coverage numbers above: 52 of 298 pages now
     // show a gutter and 14 of them are bibliography pages, so the column rule has something to
-    // apply to.
+    // apply to. It was 18 until 2026-10-15, when T4.29 stopped five entries at a page number that
+    // sat inside the gutter (`Pan` 35, `Leader` 53, `Yin` 47, `Zhang` 90, `HumanML3D` 47): those
+    // boxes no longer straddle the boundary, and the other thirteen are unchanged.
     assert_eq!(
-        totals.crossings, 18,
+        totals.crossings, 13,
         "the number of fragments whose box spans a detected gutter changed"
     );
     assert_eq!(

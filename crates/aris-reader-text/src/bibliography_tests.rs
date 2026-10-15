@@ -314,3 +314,121 @@ fn sparse_links_cannot_drop_entries_or_add_an_appendix() {
     );
     assert!(find_references_with_landings(&pages, &landings, 0).is_empty());
 }
+
+/// A page built line by line: `(top, font size, text)`, each line starting at x = 60.
+///
+/// Unlike [`test_page`], which puts every character on one baseline, these lines carry the
+/// geometry a section boundary is read from: a top, a size, and a line break between them.
+fn page_of(lines: &[(f64, f64, &str)]) -> RawTextPage {
+    use aris_reader_core::{PageIndex, RawCharBox, RawTextPage, Rect};
+    let mut chars = Vec::new();
+    let mut text = String::new();
+    for (top, size, line) in lines {
+        let mut x = 60.0;
+        for character in line.chars().chain(std::iter::once('\n')) {
+            chars.push(RawCharBox {
+                rect: Rect::new(x, top - size, size * 0.5, *size),
+                origin: aris_reader_core::Point::new(x, top - size),
+                unicode: character as u32,
+                font_size: *size,
+                angle: 0.0,
+                font_name: "Body".to_string(),
+            });
+            x += size * 0.5;
+            text.push(character);
+        }
+    }
+    RawTextPage {
+        page: PageIndex(0),
+        chars,
+        text,
+        is_generated: false,
+        has_unicode_map_error: false,
+    }
+}
+
+#[test]
+fn the_last_entry_stops_where_a_larger_section_begins() {
+    // The shape T4.29 measured on four real papers: the list ends, and an appendix set in a
+    // larger type follows it on the same page, after a paragraph break.
+    let page = page_of(&[
+        (760.0, 10.0, "References"),
+        (748.0, 10.0, "[1] Alpha, A. 2019. First reference."),
+        (736.0, 10.0, "[2] Beta, B. 2020. Second reference that"),
+        (724.0, 10.0, "wraps onto a second line."),
+        (700.0, 12.0, "Appendix A: More results"),
+        (
+            688.0,
+            12.0,
+            "The appendix body is set larger than the list.",
+        ),
+        (676.0, 12.0, "It is not part of the reference above it."),
+    ]);
+    let entries = find_references([(0, &page)], 100);
+    assert_eq!(
+        entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+        ["1", "2"]
+    );
+    let last = entries.last().unwrap();
+    assert!(last.text.contains("wraps onto a second line."), "{last:?}");
+    assert!(!last.text.contains("Appendix A"), "{last:?}");
+    assert!(!last.text.contains("appendix body"), "{last:?}");
+    // The range and the box follow the text: the entry ends at the appendix heading's first
+    // character, not at the end of the page.
+    let heading = page
+        .text
+        .find("Appendix A")
+        .expect("the appendix heading is in the page");
+    assert_eq!(last.end, heading);
+}
+
+#[test]
+fn a_paragraph_gap_inside_an_entry_does_not_end_it() {
+    // The rejected fix — cut at the largest paragraph gap — truncated real references. This one
+    // resumes at the same size after twice the line spacing, and in an italic face below it.
+    let page = page_of(&[
+        (760.0, 10.0, "References"),
+        (748.0, 10.0, "[1] Alpha, A. 2019. First reference."),
+        (
+            736.0,
+            10.0,
+            "[2] Beta, B. 2020. A reference whose title runs",
+        ),
+        (712.0, 10.0, "on after a gap of two line spacings."),
+        (700.0, 9.0, "In Proceedings of the Conference, pages 1-9."),
+        (688.0, 10.0, "[3] Gamma, C. 2021. Third reference."),
+    ]);
+    let entries = find_references([(0, &page)], 100);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.label == "2")
+        .expect("entry 2");
+    assert!(entry.text.contains("on after a gap"), "{entry:?}");
+    assert!(entry.text.contains("In Proceedings"), "{entry:?}");
+    assert!(!entry.text.contains("Gamma"), "{entry:?}");
+}
+
+#[test]
+fn one_tall_glyph_on_a_wrapped_reference_line_does_not_end_it() {
+    // A reference line can carry a single glyph larger than its body — a delimiter, a math
+    // symbol. It is a full-width line, not a heading, so it does not end the entry.
+    let page = page_of(&[
+        (760.0, 10.0, "References"),
+        (748.0, 10.0, "[1] Alpha, A. 2019. First reference."),
+        (736.0, 10.0, "[2] Beta, B. 2020. A reference with a large"),
+        (
+            712.0,
+            12.0,
+            "delimiter spanning a wrapped line of its own here.",
+        ),
+        (700.0, 10.0, "In Proceedings of the Conference, pages 1-9."),
+        (688.0, 10.0, "[3] Gamma, C. 2021. Third reference."),
+    ]);
+    let entries = find_references([(0, &page)], 100);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.label == "2")
+        .expect("entry 2");
+    assert!(entry.text.contains("delimiter spanning"), "{entry:?}");
+    assert!(entry.text.contains("In Proceedings"), "{entry:?}");
+}

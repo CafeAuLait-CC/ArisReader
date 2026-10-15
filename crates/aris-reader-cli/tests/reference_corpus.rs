@@ -85,7 +85,10 @@ fn sample_citations_resolve_to_bibliography_entries() {
         // reference. It has a length signature, and that is what is checked — the same rule and
         // the same 1800-character bound as the evaluation harness
         // (crates/aris-reader-cli/tests/reference_eval.rs), where the derivation is written out.
-        // A sample paper may be pinned higher only with its measurement recorded here.
+        // `manuscript` used to be pinned higher (3950 characters, one over) because its last
+        // entry absorbed the appendix that follows the list on the same page; T4.29 cut that tail
+        // at the larger-set section, and the longest entry it prints is 849 characters, so it is
+        // measured against the shared bound like every other paper here.
         let longest = references
             .iter()
             .map(|entry| entry.text.chars().count())
@@ -95,16 +98,10 @@ fn sample_citations_resolve_to_bibliography_entries() {
             .iter()
             .filter(|entry| entry.text.chars().count() > PLAUSIBLE_ENTRY_CHARS)
             .count();
-        let (ceiling, allowed) = match prefix {
-            // Measured 2621 characters on 2026-10-15: the last entry absorbs the appendix that
-            // follows the list on the same page (T4.17's residual, diagnosed but not fixed).
-            "manuscript" => (3950, 1),
-            _ => (PLAUSIBLE_ENTRY_CHARS, 0),
-        };
         assert!(
-            longest <= ceiling && over <= allowed,
-            "{prefix}: longest entry {longest} characters (ceiling {ceiling}), {over} over \
-             {PLAUSIBLE_ENTRY_CHARS} (allowed {allowed}) — a collapsed bibliography"
+            longest <= PLAUSIBLE_ENTRY_CHARS && over == 0,
+            "{prefix}: longest entry {longest} characters, {over} over {PLAUSIBLE_ENTRY_CHARS} — \
+             a collapsed bibliography"
         );
         // The app's detector, style included: the corpus cites as `[n]` throughout, so the
         // superscript path stays off here — which is the point of measuring it, rather than
@@ -171,6 +168,34 @@ fn sample_citations_resolve_to_bibliography_entries() {
             );
             assert_eq!(references.first().unwrap().label, "1");
             assert_eq!(references.last().unwrap().label, "185");
+            // T4.29's regression cases, measured 2026-10-15. These entries span their own
+            // paragraph gaps — 54.6, 41.3 and 41.2 points against a 13.9-point line pitch — so the
+            // cut that ends an entry at a paragraph gap truncated them; the entry that ends the
+            // list is cut by a *style* change instead, and these texts are what the thesis prints.
+            for (label, length, tail) in [
+                ("26", 429, "\u{2192} pages 10 46"),
+                ("60", 461, "\u{2192} pages 14, 16 51"),
+                ("77", 458, "pdf. \u{2192} pages 15 54"),
+            ] {
+                let entry = references
+                    .iter()
+                    .find(|entry| entry.label == label)
+                    .unwrap_or_else(|| panic!("entry [{label}]"));
+                assert_eq!(
+                    entry.text.chars().count(),
+                    length,
+                    "[{label}] was truncated: {}",
+                    entry.text
+                );
+                // The extractor's line breaks sit inside a numeric entry's text; compare the
+                // words, which is what a truncation would remove.
+                let words = entry.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    words.ends_with(tail),
+                    "[{label}] lost its end: {}",
+                    entry.text
+                );
+            }
         }
         if prefix == "manuscript" {
             let entry = resolve_reference(&["Canales Cuba 2025".into()], &references).unwrap();
@@ -180,6 +205,28 @@ fn sample_citations_resolve_to_bibliography_entries() {
                     .unwrap()
                     .page,
                 9
+            );
+            // T4.29's regression case: the rejected paragraph-gap cut removed this entry's first
+            // line (a 21.7-point gap before it) and the fix must not. Measured 2026-10-15: 286
+            // characters, from the first author to the DOI, and no appendix after it.
+            let entry = resolve_reference(&["Zhang 2024".into()], &references).unwrap();
+            assert_eq!(entry.text.chars().count(), 286, "{}", entry.text);
+            assert!(
+                entry
+                    .text
+                    .starts_with("Mingyuan Zhang, Zhongang Cai, Liang Pan"),
+                "first line lost: {}",
+                entry.text
+            );
+            assert!(
+                entry.text.ends_with("doi: 10.1109/TPAMI.2024.3355414."),
+                "last line lost: {}",
+                entry.text
+            );
+            assert!(
+                !entry.text.contains("Common motion representation"),
+                "the appendix is inside the entry: {}",
+                entry.text
             );
         }
     }

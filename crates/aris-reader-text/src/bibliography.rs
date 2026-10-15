@@ -125,3 +125,212 @@ pub(super) fn select_reference_run<'a>(
     best.entries.truncate(max_entries);
     best.entries
 }
+
+// ---------------------------------------------------------------------------
+// Where the list stops
+// ---------------------------------------------------------------------------
+
+/// One line of an entry, as the text layer delivers it.
+///
+/// The lines here are the extractor's own: a run of characters between two line breaks. They are
+/// not [`TextLine`]s — on a two-column page geometry merges the two columns' lines, while the
+/// extractor emits one line per column, which is exactly the order an entry's own characters
+/// arrive in.
+struct EntryLine {
+    /// First character of the line inside the page.
+    start: usize,
+    /// Dominant glyph size: the size most of the line's visible glyphs are set at.
+    size: f64,
+    /// Largest glyph size on the line.
+    tallest: f64,
+    /// Top of the line in page space.
+    top: f64,
+    /// Visible characters on the line.
+    characters: usize,
+}
+
+/// How much taller than its body a block must be set to read as a section, not a reference.
+///
+/// Measured on the four papers that overrun, and on the 28 that do not (2026-10-15): the blocks
+/// that swallow a bibliography's tail start at 1.20× the entry's body size or more (1.20 Zhu 2015,
+/// 1.20 `Zhang 2024`, 1.25 `Zadrożny 2017`, 1.39 `Zumalacarregui 2014`), while the largest a
+/// *reference* line ever shifts by is 1.14 (`1807.06209`'s folio, `Candidacy`'s math arrows 1.09).
+const SECTION_SIZE_RATIO: f64 = 1.15;
+
+/// How far below the previous line a new block starts, in line spacings.
+///
+/// Wrapped lines follow each other at one spacing; every one of the four overruns begins after a
+/// real paragraph break (1.77 spacings in `1810.04805`, 2.76 in `manuscript_0925`, 3.70 in
+/// `1710.05833`, and a column jump in `1807.06209`).
+const SECTION_GAP_PITCHES: f64 = 1.5;
+
+/// A line whose *tallest* glyph is over [`SECTION_SIZE_RATIO`] must be this short to count.
+///
+/// A block set in small caps — `manuscript_0925`'s `D Additional Implementation Details` — has a
+/// dominant size at or below its body and only its initials larger, so the shift shows up in the
+/// tallest glyph alone. A reference line can carry one oversized glyph too (a delimiter, a math
+/// symbol), and those lines are full-width; the heading is 35 characters.
+const SECTION_HEADING_CHARS: usize = 60;
+
+/// Cuts the bibliography's last entry back to where its own text ends.
+///
+/// Why only the last entry: the parser ends every other entry where the next entry's label
+/// starts, and that label is evidence about the text between them. The last entry has no such
+/// evidence — its range runs to the end of the page because that is where the page stops — so a
+/// section that follows the list on the same page lands inside it (T4.29: four papers, 2209 to
+/// 3601 characters of appendix or author list inside one reference).
+///
+/// Why a size test and not the paragraph gap alone: a gap cannot tell a section from a wrapped
+/// line that resumes after a display or a wide interline, and the measured alternative — cutting
+/// at the largest gap — truncates real references (`Candidacy`'s entry `[60]` across its own
+/// 28.8 pt paragraph break, and `manuscript_0925`'s `Zhang 2024` across a 21.9 pt one; both
+/// resume at body size). A section that *follows* a bibliography is set in a larger type than the
+/// bibliography; a reference's own continuation is not.
+///
+/// Measured over the twenty evaluation papers and the twelve samples (2026-10-15), this shortens
+/// ten of 2680 entries: the four overruns it is for, and six more pieces of page furniture the
+/// list's last entry was also carrying — five folio numbers (`6859`, `1811`, `5067`, `1983`,
+/// `5161`) and `2104.08886`'s running footer. Every other entry keeps its text, range and box.
+pub(super) fn trim_trailing_section(entries: &mut [ReferenceEntry], pages: &[(u32, &RawTextPage)]) {
+    let Some(entry) = entries.last_mut() else {
+        return;
+    };
+    let Some(page) = pages
+        .iter()
+        .find(|(number, _)| *number == entry.page)
+        .map(|(_, text)| *text)
+    else {
+        return;
+    };
+    let end = entry.end.min(page.chars.len());
+    if entry.start >= end {
+        return;
+    }
+    let Some(stop) = reference_end(page, entry.start, end) else {
+        return;
+    };
+    // The entry's text and its range must keep describing the same glyphs, so both are shortened
+    // together; when the tail cannot be matched inside the stored text the entry is left exactly
+    // as it was rather than left half cut.
+    let tail: String = page.chars[stop..end]
+        .iter()
+        .filter_map(|character| char::from_u32(character.unicode))
+        .collect();
+    let collapsed = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(prefix) = entry
+        .text
+        .strip_suffix(&collapsed)
+        .or_else(|| entry.text.strip_suffix(tail.trim_end()))
+    else {
+        return;
+    };
+    entry.text = prefix.trim_end().to_string();
+    entry.end = stop;
+}
+
+/// Where the entry stops being a reference: the first line, after a paragraph break, that a
+/// section would be set in. `None` when the entry carries no such line.
+fn reference_end(page: &RawTextPage, start: usize, end: usize) -> Option<usize> {
+    let lines = entry_lines(page, start, end);
+    // Two lines cannot show a spacing, and one cannot show a break.
+    if lines.len() < 3 {
+        return None;
+    }
+    let body = lines[0].size;
+    if body <= 0.0 {
+        return None;
+    }
+    let pitch = line_pitch(&lines);
+    if pitch <= 0.0 {
+        return None;
+    }
+    for index in 1..lines.len() {
+        let line = &lines[index];
+        let gap = (lines[index - 1].top - line.top).abs();
+        if gap <= SECTION_GAP_PITCHES * pitch {
+            continue;
+        }
+        let larger = line.size >= SECTION_SIZE_RATIO * body;
+        let heading =
+            line.tallest >= SECTION_SIZE_RATIO * body && line.characters <= SECTION_HEADING_CHARS;
+        if larger || heading {
+            return Some(line.start);
+        }
+    }
+    None
+}
+
+/// Splits `start..end` into the extractor's own lines, with the style each is set in.
+fn entry_lines(page: &RawTextPage, start: usize, end: usize) -> Vec<EntryLine> {
+    let mut lines: Vec<EntryLine> = Vec::new();
+    let mut line_start = start;
+    let mut index = start;
+    while index <= end {
+        let is_break = index == end
+            || char::from_u32(page.chars[index].unicode)
+                .is_some_and(|character| character == '\n' || character == '\r');
+        if is_break {
+            if let Some(line) = measure_line(page, line_start, index) {
+                lines.push(line);
+            }
+            line_start = index + 1;
+        }
+        index += 1;
+    }
+    lines
+}
+
+/// The style of one line, or `None` when it holds no measured glyph.
+fn measure_line(page: &RawTextPage, start: usize, end: usize) -> Option<EntryLine> {
+    let mut sizes: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    let mut tallest = 0.0f64;
+    let mut top = f64::MIN;
+    let mut characters = 0usize;
+    for character in &page.chars[start.min(page.chars.len())..end.min(page.chars.len())] {
+        let Some(decoded) = char::from_u32(character.unicode) else {
+            continue;
+        };
+        if decoded.is_whitespace() || character.rect.size.height <= 0.0 {
+            continue;
+        }
+        *sizes
+            .entry((character.font_size * 10.0).round() as i64)
+            .or_default() += 1;
+        tallest = tallest.max(character.font_size);
+        top = top.max(character.rect.origin.y + character.rect.size.height);
+        characters += 1;
+    }
+    if characters == 0 {
+        return None;
+    }
+    let size = sizes
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(size, _)| *size as f64 / 10.0)
+        .unwrap_or(0.0);
+    Some(EntryLine {
+        start,
+        size,
+        tallest,
+        top,
+        characters,
+    })
+}
+
+/// The entry's own line spacing: the median distance between lines that carry words.
+///
+/// Lines that hold a fragment — a superscript, a math delimiter, a page number — are ignored: on
+/// a two-column page their spacing says nothing about the text's leading.
+fn line_pitch(lines: &[EntryLine]) -> f64 {
+    let mut gaps: Vec<f64> = lines
+        .windows(2)
+        .filter(|pair| pair[0].characters >= 8 && pair[1].characters >= 8)
+        .map(|pair| pair[0].top - pair[1].top)
+        .filter(|gap| *gap > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2]
+}
