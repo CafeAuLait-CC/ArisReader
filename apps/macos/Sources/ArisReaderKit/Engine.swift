@@ -141,11 +141,12 @@ public struct TextPage: Sendable {
 
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
-    public func characterIndex(at point: CGPoint) -> Int? {
+    public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
         func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
             max(low - value, value - high, 0)
         }
-        guard let line = selectionLines.min(by: { a, b in
+        guard let closest = selectionLines.enumerated().min(by: { lhs, rhs in
+            let a = lhs.element, b = rhs.element
             let ay = distance(point.y, a.bounds.minY, a.bounds.maxY)
             let by = distance(point.y, b.bounds.minY, b.bounds.maxY)
             if ay != by { return ay < by }
@@ -153,8 +154,26 @@ public struct TextPage: Sendable {
             let bx = distance(point.x, b.bounds.minX, b.bounds.maxX)
             if ax != bx { return ax < bx }
             return abs(a.bounds.midY - point.y) < abs(b.bounds.midY - point.y)
-        }), abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14)
-        else { return nil }
+        }) else { return nil }
+        let line = closest.element
+        if extendingSelection {
+            // Between adjacent lines, x must not move the endpoint back into either
+            // line's ink. Use their logical break for both upward and downward drags.
+            let upperIndex = point.y > line.bounds.maxY ? closest.offset : closest.offset - 1
+            let lowerIndex = upperIndex + 1
+            if selectionLines.indices.contains(upperIndex), selectionLines.indices.contains(lowerIndex) {
+                let upper = selectionLines[upperIndex], lower = selectionLines[lowerIndex]
+                let sameColumn = min(upper.bounds.maxX, lower.bounds.maxX)
+                    > max(upper.bounds.minX, lower.bounds.minX)
+                if sameColumn, point.y > upper.bounds.maxY, point.y < lower.bounds.minY,
+                   let last = upper.stops.last, let first = lower.stops.first {
+                    // Include CRLF/whitespace when present; inferred wraps have no
+                    // separator, so clamp to the last glyph of the preceding line.
+                    return max(last.index, first.index - 1)
+                }
+            }
+        }
+        guard abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14) else { return nil }
         return line.stops.min { a, b in
             let ad = distance(point.x, a.rect.minX, a.rect.maxX)
             let bd = distance(point.x, b.rect.minX, b.rect.maxX)

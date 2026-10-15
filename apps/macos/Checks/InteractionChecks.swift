@@ -2,7 +2,43 @@ import AppKit
 import ArisReaderKit
 
 extension ReaderChecks {
+    @MainActor static func lineGapHitChecks() {
+        func layer(lowerX: CGFloat = 0, separator: [UInt32] = [13, 10]) -> TextPage {
+            var chars: [TextChar] = (0..<4).map {
+                TextChar(unicode: UInt32(65 + $0), xPt: CGFloat($0 * 10), yPt: 0, widthPt: 8, heightPt: 10)
+            }
+            chars += separator.map { TextChar(unicode: $0, xPt: 0, yPt: 0, widthPt: 0, heightPt: 0) }
+            chars += (0..<2).map {
+                TextChar(unicode: UInt32(120 + $0), xPt: lowerX + CGFloat($0 * 10), yPt: 24, widthPt: 8, heightPt: 10)
+            }
+            return TextPage(page: 0, chars: chars, text: "", hasUnicodeMapError: false)
+        }
+        let text = layer()
+        for y: CGFloat in [10.25, 17, 23.75] {
+            for x in stride(from: CGFloat(0), through: 38, by: 0.25) {
+                requireGap(text.characterIndex(at: CGPoint(x: x, y: y), extendingSelection: true) == 5,
+                           "dragging through an interline gap stays at the CRLF boundary", x: x, y: y)
+            }
+        }
+        require(text.selectionRects(in: 0...5) == [CGRect(x: 0, y: 0, width: 38, height: 10)]
+                && text.selectionRects(in: 5...7) == [CGRect(x: 0, y: 24, width: 18, height: 10)],
+                "interline boundary gives stable overlays in either selection direction")
+        require(text.characterIndex(at: CGPoint(x: 10, y: 5)) == 1
+                && text.characterIndex(at: CGPoint(x: 10, y: 29)) == 7,
+                "normal glyph hit-testing stays precise")
+        require(layer(separator: []).characterIndex(at: CGPoint(x: 10, y: 17), extendingSelection: true) == 3,
+                "inferred line breaks without newline glyphs also have a stable boundary")
+        require(layer(lowerX: 300).characterIndex(at: CGPoint(x: 10, y: 17), extendingSelection: true) != 5,
+                "separate columns do not acquire an interline selection bridge")
+        print("PASS: horizontal sweeps across line gaps preserve one selection endpoint")
+    }
+
+    @MainActor private static func requireGap(_ condition: Bool, _ message: String, x: CGFloat, y: CGFloat) {
+        if !condition { fatalError("FAIL: \(message) (x=\(x), y=\(y))") }
+    }
+
     @MainActor static func interactionChecks(url: URL) async throws {
+        lineGapHitChecks()
         let characters: [TextChar] = [
             TextChar(unicode: 65, xPt: 0, yPt: 0, widthPt: 10, heightPt: 10),
             TextChar(unicode: 32, xPt: 0, yPt: 0, widthPt: 0, heightPt: 0),
@@ -131,6 +167,34 @@ extension ReaderChecks {
             }
         }
         print("PASS: dragging through spaces and varying glyph heights stays on the line and advances monotonically")
+        for (upper, lower) in zip(bodyRows, bodyRows.dropFirst()) {
+            func ink(_ row: [Int]) -> CGRect {
+                row.filter { text.chars[$0].widthPt > 0 && text.chars[$0].heightPt > 0 }.map {
+                    let c = text.chars[$0]
+                    return CGRect(x: c.xPt, y: c.yPt, width: c.widthPt, height: c.heightPt)
+                }.reduce(CGRect.null) { $0.union($1) }
+            }
+            let a = ink(upper), b = ink(lower)
+            guard b.minY > a.maxY else { continue }
+            let boundary = lower.first! - 1
+            for reverse in [false, true] {
+                let anchor = reverse ? lower.last! : upper.first!
+                view.mouseDown(with: event(.leftMouseDown, anchor))
+                for y in [a.maxY + 0.1, (a.maxY + b.minY) / 2, b.minY - 0.1] {
+                    for x in stride(from: min(a.minX, b.minX), through: max(a.maxX, b.maxX), by: 1) {
+                        let drag = NSEvent.mouseEvent(with: .leftMouseDragged,
+                            location: CGPoint(x: placement.leftPt + x, y: 500 - placement.topPt - y),
+                            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                            eventNumber: 0, clickCount: 1, pressure: 1)!
+                        view.mouseDragged(with: drag)
+                        requireGap(state.selection?.range == min(anchor, boundary)...max(anchor, boundary),
+                                   "native drag keeps the same selection while moving between lines", x: x, y: y)
+                    }
+                }
+            }
+        }
+        print("PASS: native mouse drags through real PDF line gaps stay stable in both directions")
+
         state.clearSelection()
         require(state.canvasPages.allSatisfy { $0.placement.index >= 0 },
                 "clearing selection preserves tiles and removes overlays")
