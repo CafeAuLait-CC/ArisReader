@@ -2400,7 +2400,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // oversized pyramid tiles and can be presented atomically. Larger pages
         // and deep zoom retain the bounded tile path.
         let screenScale = max(zoomFactor * deviceScale, 0.05)
+        let onScreen = band.filter {
+            let p = $0.placement
+            return CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt).intersects(viewport)
+        }
         usesScreenPageRasters = preferFullPageRasters && Self.maxPreviewPages > 0 && !band.isEmpty
+            && onScreen.count <= Self.maxPreviewPages
+            && onScreen.reduce(CGFloat(0), { $0 + screenPageBytes($1.placement, scale: screenScale) })
+                <= CGFloat(tileCache.budgetBytes)
             && band.allSatisfy { canRasterizeScreenPage($0.placement, scale: screenScale) }
         configurePagePreviews(visible: visible, band: band, viewport: viewport,
                               viewportHeight: viewportHeight, screenScale: screenScale)

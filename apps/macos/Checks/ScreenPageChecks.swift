@@ -7,24 +7,28 @@ import Foundation
     var pendingPages: Set<Int> { Set(waiting.keys) }
     var tileRequests = 0
     var undersized = false
+    var failingPages: Set<Int> = []
+    let pageHeight: CGFloat
+    init(pageHeight: CGFloat = 800) { self.pageHeight = pageHeight }
 
     override func openDocument(at url: URL) throws -> LoadedDocument {
         LoadedDocument(title: "Screen page fixture", pageCount: 8, url: url,
-                       firstPageSize: CGSize(width: 600, height: 800))
+                       firstPageSize: CGSize(width: 600, height: pageHeight))
     }
     override func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         // Sidebar supersampling is separate from the screen-resolution scheduler.
         if scale < 2 {
-            return PageImage(pixelWidth: 1, pixelHeight: 1, pointSize: CGSize(width: 600, height: 800),
+            return PageImage(pixelWidth: 1, pixelHeight: 1, pointSize: CGSize(width: 600, height: pageHeight),
                              bgra: Data([255, 255, 255, 255]), generation: UInt64(100 + page))
         }
+        if failingPages.contains(page) { throw NSError(domain: "ScreenPageChecks", code: 2) }
         if automatic { return image(page, scale: scale) }
         return try await withCheckedThrowingContinuation { waiting[page] = (scale, $0) }
     }
     private func image(_ page: Int, scale: CGFloat) -> PageImage {
         let width = undersized ? 1 : Int(ceil(600 * scale))
-        let height = undersized ? 1 : Int(ceil(800 * scale))
-        return PageImage(pixelWidth: width, pixelHeight: height, pointSize: CGSize(width: 600, height: 800),
+        let height = undersized ? 1 : Int(ceil(pageHeight * scale))
+        return PageImage(pixelWidth: width, pixelHeight: height, pointSize: CGSize(width: 600, height: pageHeight),
                          bgra: Data(repeating: 255, count: width * height * 4), generation: UInt64(200 + page))
     }
     func finish(_ page: Int) {
@@ -40,14 +44,14 @@ import Foundation
         throw NSError(domain: "ScreenPageChecks", code: 1)
     }
     override func contentWidthPt(gapPt: CGFloat) -> CGFloat { 600 }
-    override func contentHeightPt(gapPt: CGFloat) -> CGFloat { 6400 }
-    override func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat { CGFloat(index) * 800 }
-    override func pageIndex(atScrollYPt y: CGFloat, gapPt: CGFloat) -> Int { min(7, max(0, Int(y / 800))) }
+    override func contentHeightPt(gapPt: CGFloat) -> CGFloat { pageHeight * 8 }
+    override func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat { CGFloat(index) * pageHeight }
+    override func pageIndex(atScrollYPt y: CGFloat, gapPt: CGFloat) -> Int { min(7, max(0, Int(y / pageHeight))) }
     override func visiblePages(scrollYPt y: CGFloat, viewportHeightPt h: CGFloat,
                                gapPt: CGFloat, marginPt m: CGFloat) -> [PagePlacement] {
         (0..<8).compactMap { index in
-            let top = CGFloat(index) * 800
-            guard top + 800 >= y - m, top <= y + h + m else { return nil }
+            let top = CGFloat(index) * pageHeight
+            guard top + pageHeight >= y - m, top <= y + h + m else { return nil }
             return PagePlacement(index: index, topPt: top, leftPt: 0, widthPt: 600, heightPt: 800)
         }
     }
@@ -122,5 +126,26 @@ extension ReaderChecks {
         clamped.gotoPage(0)
         try await eventually("an undersized backend result falls back to tiles", { clampedEngine.tileRequests > 0 })
         require(!clamped.isScreenPageCached(0), "undersized images cannot count as sharp cache hits")
+
+        let failedEngine = ScreenPageEngine()
+        failedEngine.failingPages = [0]
+        failedEngine.finishAll()
+        let failed = AppState(engine: failedEngine, preferFullPageRasters: true)
+        failed.zoomPercent = 140
+        failed.setViewportSize(CGSize(width: 900, height: 700))
+        failed.open(url: url)
+        failed.gotoPage(0)
+        try await eventually("a failed screen-page request falls back to tile work", { failedEngine.tileRequests > 0 })
+
+        let tinyEngine = ScreenPageEngine(pageHeight: 40)
+        tinyEngine.finishAll()
+        let tiny = AppState(engine: tinyEngine, preferFullPageRasters: true)
+        tiny.zoomPercent = 140
+        tiny.setViewportSize(CGSize(width: 900, height: 700))
+        tiny.open(url: url)
+        tiny.gotoPage(0)
+        try await eventually("many short visible pages retain the tile fallback", { tinyEngine.tileRequests > 0 })
+        require(!tiny.usesScreenPageRasters,
+                "the page-count ceiling cannot leave a visible page permanently without raster work")
     }
 }
