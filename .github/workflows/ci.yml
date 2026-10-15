@@ -18,7 +18,7 @@
 #
 # What this workflow cannot cover, said out loud instead of hidden (see the annotated steps):
 #   * PDFium is a downloaded dynamic library and is not committed. If the download fails, the
-#     suites that need a real PDF engine are skipped, and the run says so.
+#     macOS gate fails: skipped native coverage cannot satisfy a required check.
 #   * `pdf-samples/` — the twelve-paper corpus, withheld for copyright — is not in the
 #     repository, so the corpus regressions (reference_corpus, table_corpus and the 226/227
 #     sampled citation spans) never run here, on either runner.
@@ -150,18 +150,11 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      # PDFium is a downloaded dynamic library, not a committed one. A failure here must not
-      # kill the job by itself — but it must also never be mistaken for a pass, so the next
-      # step names exactly which suites drop out.
+      # PDFium is required for the native gate. A download failure must fail this job,
+      # otherwise branch protection accepts a merge result whose Swift was never checked.
       - name: Fetch PDFium
         id: pdfium
-        continue-on-error: true
         run: ./scripts/fetch-pdfium.sh
-
-      - name: Name the suites a missing PDFium takes off the table
-        if: steps.pdfium.outcome != 'success'
-        run: |
-          echo "::warning title=PDFium unavailable::./scripts/fetch-pdfium.sh failed, so this run is SKIPPED for every suite that needs a real PDF engine: the aris-reader-pdfium crate tests, the aris-reader-ffi tests, and the ArisReaderChecks harness (it opens documents, so without the library it exits with no PASS lines). Nothing here is a pass for those suites. The pure-Rust crates are still checked."
 
       # ---------------------------------------------------------------- the Rust artifacts
       # apps/macos/.rust/lib/libaris_reader_ffi.a and Sources/ArisReaderBindings/ are build
@@ -187,11 +180,6 @@ jobs:
           set -o pipefail
           "$GITHUB_WORKSPACE/apps/macos/.build/debug/ArisReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
 
-      - name: Say it when the macOS gate did not run
-        if: steps.pdfium.outcome != 'success'
-        run: |
-          echo "::warning title=ArisReaderChecks NOT run::The Swift check harness was skipped because PDFium could not be downloaded. This run is NOT evidence that the harness passes; a failing merge result would look exactly the same."
-
       # Same statement as in rust-core: the corpus is not in the repository, so nothing above
       # covered it. Do not let a future reader assume otherwise.
       - name: Record that the corpus regression did not run
@@ -206,7 +194,6 @@ jobs:
       - name: Fetch the evaluation corpus (opt-in, manual dispatch only)
         id: eval_corpus
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.fetch_eval_papers == 'true'
-        continue-on-error: true
         run: ./scripts/fetch-eval-papers.sh
 
       # The step that cannot pass silently: either the harness runs and meets its floors (and
@@ -215,16 +202,24 @@ jobs:
       # because the per-paper table is the product here, not a test result line.
       - name: Evaluate the reference index, or say that it did not run
         shell: bash
+        env:
+          ARIS_READER_REQUIRE_FULL_EVAL: "1"
         run: |
           set -o pipefail
-          if [ -d eval-papers ] && ls eval-papers/*.pdf >/dev/null 2>&1; then
+          if [ "${{ steps.eval_corpus.outcome }}" = "success" ]; then
             cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/reference-eval.log"
           else
             echo "::notice title=Reference eval NOT run::No evaluation corpus (eval-papers/) is present, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
           fi
 
-      - name: Say it when the opt-in corpus download failed
-        if: steps.eval_corpus.outcome == 'failure'
-        run: |
-          echo "::warning title=Reference eval corpus download failed::./scripts/fetch-eval-papers.sh did not fetch every paper (arXiv rate limits or a withdrawn id), so the evaluation ran on a partial corpus or not at all. The step above names exactly what it did."
+      - name: Preserve native and evaluation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-check-logs
+          path: |
+            build/*.log
+            ${{ runner.temp }}/reader-checks.log
+            ${{ runner.temp }}/reference-eval.log
+          if-no-files-found: ignore

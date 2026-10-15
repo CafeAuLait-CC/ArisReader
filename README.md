@@ -126,6 +126,39 @@ branch's own checks.
 Prefer a **merge commit** for a pull request whose individual commits carry meaning; squash only when
 the branch is a single commit or its history is noise.
 
+## Reproducing measurements
+
+The CLI benchmark models CPU raster work and a settled prefetch band. It finishes every
+step's prefetch before advancing, so zero visible misses do **not** establish zero waiting
+under continuous scrolling. It does not measure GPU time or presented frame rate. The default
+48 MiB cache gives the prefetch band a 16 MiB target (one third, with an 8 MiB floor); the
+minimum ring can still exceed that target. Record the commit, PDFium version, input PDF,
+command, build profile and hardware with each result.
+
+```bash
+cargo run --release -p aris-reader-cli -- bench tests/fixtures/multipage.pdf
+./scripts/fetch-eval-papers.sh
+ARIS_READER_REQUIRE_FULL_EVAL=1 cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture
+```
+
+`ARIS_READER_EVAL_PAPERS` can point at an existing corpus. Without strict mode, local evaluation
+may use a partial corpus or explicitly skip an absent one. Both evaluation modes fail if a
+present PDF cannot be opened or a page's text cannot be extracted. Manual CI with
+`fetch_eval_papers=true` requires all listed PDFs; PDFium download failure fails the macOS gate.
+CI preserves check and evaluation logs as `macos-check-logs` artifacts, including on failure.
+
+The evaluation's historical “recall” column is **resolution rate among detected spans**, not
+citation-detection recall: undetected styles never enter its denominator, and a grouped span
+counts as resolved if any label resolves (partial groups are reported separately). The
+heuristic precision audit is review evidence, not a measured false-positive rate. Independent
+labelled examples are still needed for those acceptance criteria. arXiv IDs currently fetch
+the latest revision; freeze versions and file hashes before comparing scores across machines.
+
+Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 387.3 MiB
+median is about 406.1 MB and does not meet a decimal 400 MB limit; a median below a limit also
+does not prove that every run's peak is below it. The published debug-build measurements and
+CLI raster timings alone do not establish the full M1 memory/60 fps acceptance criteria.
+
 ## Documentation index
 
 The design documents live in `docs/` in the working copy (not committed yet — see the note above), so the links below
