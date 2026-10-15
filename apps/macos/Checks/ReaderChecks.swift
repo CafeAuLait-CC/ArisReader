@@ -31,6 +31,10 @@ struct ReaderChecks {
             try await measurePageRasters()
             return
         }
+        if CommandLine.arguments.contains("--measure-page-fallback") {
+            try await measurePageFallback()
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -105,6 +109,8 @@ struct ReaderChecks {
                 "closing last tab rejects pending work and clears document data")
         try await interactionChecks(url: a)
         try await screenPageChecks(url: b)
+        try await screenPageDegradationChecks(url: b)
+        try await defaultModeRenderChecks(url: b)
         try await scrollingQualityChecks(url: b)
         try await scrollingRenderChecks(url: b)
         try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))

@@ -72,7 +72,16 @@ import Foundation
 }
 
 extension ReaderChecks {
+    /// Runs in both raster modes: the thumbnail pipeline is independent of which path draws the
+    /// page, and before T4.38 the default (screen-resolution) configuration was never exercised
+    /// here at all.
     @MainActor static func thumbnailChecks(url: URL) async throws {
+        try await thumbnailChecks(url: url, preferFullPageRasters: false)
+        try await thumbnailChecks(url: url, preferFullPageRasters: true)
+    }
+
+    @MainActor private static func thumbnailChecks(url: URL, preferFullPageRasters: Bool) async throws {
+        let mode = preferFullPageRasters ? "default screen-page path" : "tile path"
         let engine = try RustEngine()
         _ = try engine.openDocument(at: url)
         let scale: CGFloat = 264.0 / 595.0
@@ -90,12 +99,12 @@ extension ReaderChecks {
             require(after > 0 && after < before * 0.8,
                     "supersampling preserves a thin PDF rule without making it an opaque pixel")
         }
-        let state = AppState(engine: engine, preferFullPageRasters: false)
+        let state = AppState(engine: engine, preferFullPageRasters: preferFullPageRasters)
         state.open(url: url)
-        try await eventually("Retina thumbnail ready", { state.thumbnails[0] != nil })
-        require(state.thumbnails[0]?.pixelWidth == 264, "thumbnail has native Retina resolution")
+        try await eventually("\(mode): Retina thumbnail ready", { state.thumbnails[0] != nil })
+        require(state.thumbnails[0]?.pixelWidth == 264, "\(mode): thumbnail has native Retina resolution")
         state.setDeviceScale(1)
-        try await eventually("thumbnail rebuilds for backing-scale change", { state.thumbnails[0]?.pixelWidth == 132 })
+        try await eventually("\(mode): thumbnail rebuilds for backing-scale change", { state.thumbnails[0]?.pixelWidth == 132 })
     }
 
     @MainActor static func scrollingQualityChecks(url: URL) async throws {

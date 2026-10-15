@@ -276,6 +276,15 @@ public final class AppState: ObservableObject {
     private var desiredPreviewScale: CGFloat = 1
     private let preferFullPageRasters: Bool
     public private(set) var usesScreenPageRasters = false
+    /// Why the screen-resolution page path is off, or nil when it is on. Set with every
+    /// viewport update (see `screenPagePathDecision`) and reported once per change to stderr
+    /// and in the `ARIS_READER_RENDER_STATS` line, so a degraded configuration is visible
+    /// rather than silent.
+    public private(set) var screenPagePathNote: String?
+    /// Compact form of the same reason, for the one-line stats field.
+    public private(set) var screenPagePathSummary = "pending"
+    private var lastScreenPagePathNote: String?
+    private var hasReportedScreenPagePath = false
     public var pageRasterCacheUsedBytes: Int { pagePreviews.values.reduce(0) { $0 + $1.bgra.count } }
     public var pageRasterCacheCount: Int { pagePreviews.count }
     public func isScreenPageCached(_ page: Int) -> Bool {
@@ -2351,9 +2360,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Large pages/deep zoom use tiles. Complete visible-width rows sharpen during scrolling;
     /// already sharp rows stay in place while newly exposed rows load.
     ///
+    /// A page with no raster yet falls back to the sidebar thumbnail for exactly as long as its
+    /// screen-resolution raster takes to render: measured with `--measure-page-fallback` on a
+    /// real 115-page paper (959x715 pt viewport, 2x backing scale, 48 MiB budget, medians of five
+    /// runs), 20.1 ms to a sharp 1224x1584 raster at 100% and 28.3 ms to 1714x2218 at 140%;
+    /// at 400% the tile path shows a 1x preview for 35-55 ms instead. Rendering a half-scale
+    /// raster first was measured and rejected (T4.36): it halves that window but adds a whole
+    /// extra render before the sharp one.
+    ///
     /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
-    /// tiles until all visible tiles on that page are ready, then replace them together.
-    /// This prevents the page from disappearing or sharpening in a visible diagonal sweep.
+    /// tiles until all visible tiles on that page are ready, then replace them together, so a
+    /// half-finished LOD cannot mix two sharpness levels in one frame.
+    ///
+    /// That mixing belongs to this tiled deep-zoom path, not to the base's ordinary zoom: the
+    /// verification of #37 found the base never had a 1x preview and pyramid tiles in the same
+    /// frame (0 of 230 canvas updates), and that its real defect was a blurry 1x raster held
+    /// for up to 26 consecutive canvas updates (84-88 ms per page jump). The comment here used
+    /// to promise this retention removed a "visible diagonal sweep" of preview plus tiles,
+    /// which overstates what the base did.
     public func reloadVisiblePages() {
         guard document != nil else {
             canvasPages = []
@@ -2404,11 +2428,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let p = $0.placement
             return CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt).intersects(viewport)
         }
-        usesScreenPageRasters = preferFullPageRasters && Self.maxPreviewPages > 0 && !band.isEmpty
-            && onScreen.count <= Self.maxPreviewPages
-            && onScreen.reduce(CGFloat(0), { $0 + screenPageBytes($1.placement, scale: screenScale) })
-                <= CGFloat(tileCache.budgetBytes)
-            && band.allSatisfy { canRasterizeScreenPage($0.placement, scale: screenScale) }
+        let screenPagePath = screenPagePathDecision(onScreen: onScreen, band: band, scale: screenScale)
+        usesScreenPageRasters = screenPagePath.enabled
+        screenPagePathNote = screenPagePath.note
+        screenPagePathSummary = screenPagePath.summary
+        reportScreenPagePath(scale: screenScale)
         configurePagePreviews(visible: visible, band: band, viewport: viewport,
                               viewportHeight: viewportHeight, screenScale: screenScale)
         schedulePagePreview()
@@ -2708,6 +2732,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// viewport update. Off by default and silent unless asked for; it changes no scheduling
     /// decision, it only counts and reports. The byte counters are what proves the ADR 0007
     /// budget actually bounds the cache.
+    ///
+    /// The number the budget bounds is *not* the tile figure alone: whole-page rasters are
+    /// reserved from the same budget (`TileCache.evictToFit(reservedBytes:)`), while sidebar
+    /// thumbnails and text layers are held outside it. The line therefore labels the tile
+    /// figure, prints the page rasters next to it, prints the two together against the budget
+    /// ("shared"), and ends with the total the reader actually holds. Reporting only
+    /// `cache X/48 MiB` made a 140% run look like 0 MiB while three 14.5 MiB page rasters were
+    /// resident (T4.39).
     private func reportTileCacheStats(
         wanted: Int,
         scheduled: Int,
@@ -2720,11 +2752,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard Self.renderStatsEnabled else { return }
         let stats = tileCache.stats
         let mib = 1024.0 * 1024.0
+        let pageRasterBytes = pagePreviews.values.reduce(0) { $0 + $1.bgra.count }
+        let thumbnailBytes = thumbnails.values.reduce(0) { $0 + $1.bgra.count }
+        let textBytes = textPages.values.reduce(0) { $0 + $1.chars.count * MemoryLayout<TextChar>.size }
+        let sharedBytes = tileCache.usedBytes + pageRasterBytes
+        let screenPages = screenPagePathSummary
         let line = String(
-            format: "aris-stats: cache %d tiles · %.1f/%.1f MiB · peak %.1f MiB · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
+            format: "aris-stats: cache %d tiles · tiles %.1f/%.1f MiB · pageRasters %.1f MiB · shared %.1f/%.1f MiB · peak tiles %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · rasters total %.1f MiB · screenPages %@ · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
             tileCache.count,
             Double(tileCache.usedBytes) / mib, Double(tileCache.budgetBytes) / mib,
+            Double(pageRasterBytes) / mib,
+            Double(sharedBytes) / mib, Double(tileCache.budgetBytes) / mib,
             Double(tileCache.peakBytes) / mib,
+            Double(thumbnailBytes) / mib, Double(textBytes) / mib,
+            Double(sharedBytes + thumbnailBytes + textBytes) / mib,
+            screenPages,
             wanted, scheduled, stats.hits, stats.misses, stats.hitRate * 100.0,
             stats.insertions, stats.evictions, Double(stats.evictedBytes) / mib
         )
@@ -2739,11 +2781,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             staleTiles += 1
             staleBytes += tileCache.bytes(for: key) ?? 0
         }
-        let previewBytes = pagePreviews.values.reduce(0) { $0 + $1.bgra.count }
-        let thumbnailBytes = thumbnails.values.reduce(0) { $0 + $1.bgra.count }
-        let textBytes = textPages.values.reduce(0) { $0 + $1.chars.count * MemoryLayout<TextChar>.size }
+        let previewBytes = pageRasterBytes
+        // The same three consumers the `aris-stats` line totals, split by band class here: a
+        // line that called the whole-page rasters "previews" is what made the two HUD lines
+        // disagree about what the 48 MiB budget covers (T4.39).
         let bandLine = String(
-            format: "aris-band: visible %d tiles (%.1f MiB) · ring %d (%.1f MiB) · offscreenCols %d (%.1f MiB) · stale %d (%.1f MiB) · previews %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · ringVh %.2f · visibleMiss %d · lod %d · tilePt %.0f · bandPages %d\n",
+            format: "aris-band: visible %d tiles (%.1f MiB) · ring %d (%.1f MiB) · offscreenCols %d (%.1f MiB) · stale %d (%.1f MiB) · pageRasters %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · ringVh %.2f · visibleMiss %d · lod %d · tilePt %.0f · bandPages %d\n",
             band.tiles(.visible), Double(band.bytes(.visible)) / mib,
             band.tiles(.ring), Double(band.bytes(.ring)) / mib,
             band.tiles(.offscreenColumn), Double(band.bytes(.offscreenColumn)) / mib,
@@ -2975,6 +3018,90 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // FFI's 8-Mpixel / 8192px whole-page clamp (which would silently blur it).
         return bytes <= CGFloat(min(tileCache.budgetBytes / 2, 8 * 1024 * 1024 * 4))
             && max(placement.widthPt, placement.heightPt) * scale <= 8192
+    }
+
+    /// Whether the visible band is rendered as one screen-resolution raster per page, and when
+    /// it is not, which limit turned it off.
+    ///
+    /// The exact thresholds, stated because a small cache used to disable this path silently
+    /// (T4.37) and a reader who lowers the cache setting got a different renderer with no
+    /// indication:
+    ///   * `ARIS_READER_SHARP_PAGE_RASTERS=0`, or `ARIS_READER_PREVIEW_PAGES=0`, disables it;
+    ///   * one page raster must be at most `min(budget / 2, 32 MiB)`. A US Letter page at 140%
+    ///     on a 2x display is 1714x2218 px = 14.5 MiB, so the cache budget must be at least
+    ///     29.0 MiB for the path to be available at all — 30 MiB as a whole-MiB setting — and
+    ///     the default 48 MiB leaves a page raster at half the budget;
+    ///   * a page's largest side must be at most 8192 px (the FFI's whole-page clamp would
+    ///     otherwise silently return a smaller bitmap);
+    ///   * at most 7 pages may be on screen at once (the prepared-neighbourhood ceiling);
+    ///   * the on-screen pages' rasters together must fit the whole budget.
+    private func screenPagePathDecision(onScreen: [BandSpan], band: [BandSpan],
+                                        scale: CGFloat) -> (enabled: Bool, note: String?, summary: String) {
+        let mib = 1024.0 * 1024.0
+        if !preferFullPageRasters {
+            return (false, "off: ARIS_READER_SHARP_PAGE_RASTERS=0 disables screen-resolution pages",
+                    "off(feature-off)")
+        }
+        if Self.maxPreviewPages == 0 {
+            return (false, "off: ARIS_READER_PREVIEW_PAGES=0 allows no whole-page raster",
+                    "off(preview-pages 0)")
+        }
+        if band.isEmpty {
+            return (false, "off: no page in the prefetch band", "off(no band)")
+        }
+        if onScreen.count > Self.maxPreviewPages {
+            return (false, "off: \(onScreen.count) pages on screen exceed the \(Self.maxPreviewPages)-page ceiling",
+                    "off(pages \(onScreen.count)>\(Self.maxPreviewPages))")
+        }
+        let onScreenBytes = onScreen.reduce(CGFloat(0)) { $0 + screenPageBytes($1.placement, scale: scale) }
+        if onScreenBytes > CGFloat(tileCache.budgetBytes) {
+            return (false, String(format: "off: on-screen page rasters %.1f MiB exceed the %.1f MiB cache budget",
+                                  Double(onScreenBytes) / mib, Double(tileCache.budgetBytes) / mib),
+                    String(format: "off(rasters %.1f>%.1f MiB)", Double(onScreenBytes) / mib,
+                           Double(tileCache.budgetBytes) / mib))
+        }
+        let perPageCeiling = min(tileCache.budgetBytes / 2, 32 * 1024 * 1024)
+        for span in band {
+            let bytes = screenPageBytes(span.placement, scale: scale)
+            let longestSide = max(span.placement.widthPt, span.placement.heightPt) * scale
+            if bytes > CGFloat(perPageCeiling) {
+                let pageMiB = Double(bytes) / mib
+                let ceilingMiB = Double(perPageCeiling) / mib
+                let budgetMiB = Double(tileCache.budgetBytes) / mib
+                let capIsBudget = tileCache.budgetBytes / 2 <= 32 * 1024 * 1024
+                return (false, String(
+                    format: "off: one page raster is %.1f MiB, above the %.1f MiB page ceiling (half of the %.1f MiB cache budget%@); needs a >= %.1f MiB budget",
+                    pageMiB, ceilingMiB, budgetMiB,
+                    capIsBudget ? "" : ", capped at 32 MiB", Double(bytes) * 2 / mib),
+                    capIsBudget
+                        ? String(format: "off(page %.1f>%.1f MiB; budget <%.1f MiB)", pageMiB, ceilingMiB, Double(bytes) * 2 / mib)
+                        : String(format: "off(page %.1f>%.1f MiB, 32 MiB cap)", pageMiB, ceilingMiB))
+            }
+            if longestSide > 8192 {
+                return (false, String(format: "off: a page needs %.0f px on its longest side, above the 8192 px whole-page clamp (scale %.2f)",
+                                      Double(longestSide), Double(scale)),
+                        String(format: "off(page %.0f>8192 px)", Double(longestSide)))
+            }
+        }
+        return (true, nil, "on")
+    }
+
+    /// Says *once per change* whether the screen-resolution path is on, and if not, why.
+    ///
+    /// A log line, not a silent fallback: lowering the cache setting below a page raster's cost
+    /// is a legitimate way to hit this, and it should be visible without reading the source.
+    private func reportScreenPagePath(scale: CGFloat) {
+        guard !hasReportedScreenPagePath || screenPagePathNote != lastScreenPagePathNote else { return }
+        hasReportedScreenPagePath = true
+        lastScreenPagePathNote = screenPagePathNote
+        let line: String
+        if let note = screenPagePathNote {
+            line = "aris-screen-page: \(note); using pyramid tiles\n"
+        } else {
+            line = String(format: "aris-screen-page: on · screen scale %.2f · %.1f MiB cache budget\n",
+                          Double(scale), Double(tileCache.budgetBytes) / (1024.0 * 1024.0))
+        }
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,

@@ -22,7 +22,12 @@ At ordinary zoom, the reader presents one page raster at the screen's actual res
 nearby pages on every scroll update. Page rasters and tiles share the configured byte budget, so lower
 zoom keeps more neighbors; larger pages and deep zoom use tiles. Already sharp tile rows stay sharp as
 new regions load. A cold page can still show a preview until its raster arrives; this does not promise
-zero-latency arbitrary jumps.
+zero-latency arbitrary jumps. What this replaced was measured rather than assumed: at 140% on a 2x
+display the base held a blurry 1x raster for up to 26 consecutive canvas updates and took 84-88 ms per
+page jump, and it never mixed a preview with pyramid tiles in one frame (0 mixed frames in 230 canvas
+updates). Mixed sharp and blurry frames belong to the deep-zoom tile path here, which deliberately
+paints complete sharp rows over a soft backdrop; that is the one present this reader still refines in
+place.
 Milestone acceptance criteria are not all met: the milestone table below names what is missing, and the
 full review record (findings, evidence and follow-ups) is kept with the project's design notes rather than in
 this repository. Concrete
@@ -158,6 +163,17 @@ a real-paper raster p95 of 13.7-14.5 ms likewise did not reproduce in either arm
 minimum ring can still exceed that target. Record the commit, PDFium version, input PDF,
 command, build profile and hardware with each result.
 
+**The cache figure names what it covers.** The 48 MiB budget is shared by tiles and whole-page rasters;
+sidebar thumbnails and text layers are held outside it. `aris-stats:` therefore prints
+`tiles X/Y MiB`, `pageRasters Z MiB` and `shared X+Z/Y MiB` — the number the budget actually bounds —
+followed by `thumbnails`, `text` and `rasters total` for what it does not, and `aris-band:` uses the
+same names. On the real 115-page paper at 140% the line used to read `cache 0 tiles · 0.0/48.0 MiB`
+while three 14.5 MiB page rasters were resident: 43.5 MiB of page rasters + 8.3 MiB of thumbnails +
+0.5 MiB of text = 52.3 MiB held, of which the budget covered the 43.5 MiB of page rasters and none of
+the rest. The verification's own accounting on its 140% run was 48 MiB of budgeted rasters + 7.2 MiB of
+thumbnails + 1.4 MiB of text = 52.1 MiB. Peak RSS is unaffected by the wording; it stayed in the same
+460-499 MiB band across three runs before and three runs after.
+
 ```bash
 cargo run --release -p aris-reader-cli -- bench tests/fixtures/multipage.pdf
 ./scripts/fetch-eval-papers.sh
@@ -173,6 +189,17 @@ the macOS gate. CI decides whether to evaluate by looking at whether `eval-paper
 not by a step's outcome, so a corpus that is already on the workspace is measured rather than
 reported as absent. CI preserves check and evaluation logs as `macos-check-logs` artifacts,
 including on failure.
+
+**The screen-resolution page path is not always available, and says so when it is not.** It needs one
+page raster of at most `min(cache budget / 2, 32 MiB)`, at most 8192 px on the page's longest side, at
+most seven pages on screen, and the on-screen pages' rasters together inside the whole budget. A US
+Letter page at 140% on a 2x display is 1714x2218 px = 14.5 MiB, so a cache budget below 29.0 MiB
+(30 MiB as the first whole-MiB setting that fits) turns the path off and falls back to tiles. That is
+announced rather than silent: stderr gets one `aris-screen-page: off: ...` line per change naming the
+limit that failed and the budget it needs, `ARIS_READER_RENDER_STATS=1` carries
+`screenPages off(page 14.5>8.0 MiB; budget <29.0 MiB)` (or `on`, or `off(feature-off)` for
+`ARIS_READER_SHARP_PAGE_RASTERS=0`), and `AppState.screenPagePathNote` exposes the same reason to the
+UI. The four thresholds are stated in `screenPagePathDecision`.
 
 The evaluation's historical “recall” column is **resolution rate among detected spans**, not
 citation-detection recall: undetected styles never enter its denominator, and a grouped span
@@ -255,6 +282,8 @@ ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -
   apps/macos/.build/release/ArisReaderChecks --measure-page-rasters /path/to/paper.pdf 2.8 3
 ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
   apps/macos/.build/release/ArisReaderChecks --measure-page-navigation /path/to/paper.pdf 140
+ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" \
+  apps/macos/.build/release/ArisReaderChecks --measure-page-fallback /path/to/paper.pdf 140
 ```
 
 `2.8` represents 140% on a 2x display. The first command totals actual BGRA bytes across all pages
@@ -264,6 +293,18 @@ readiness on cold, neighbor, return and distant jumps (PDFs longer than eight pa
 sharp updates and immediate sharp cache hits. It excludes GPU upload and presentation, so it is not FPS
 or end-to-end visual latency. `ARIS_READER_SHARP_PAGE_RASTERS=0` disables the screen-page path for a
 feature-off comparison under the same pixel budget. Deep zoom remains on tiles.
+
+What a cold page shows *before* its sharp raster is measured, not assumed. The third command records the
+canvas-update quality timeline for cold, neighbor, return and distant jumps; on a real 115-page paper
+(959×715pt viewport, 2x backing scale, 48 MiB budget, medians of five runs in one interleaved A/B) it
+shows: at 100% the 264×342 sidebar thumbnail for 20.1 ms, then a sharp 1224×1584 raster at 20.8 ms; at
+140% the same thumbnail for 28.3 ms, then 1714×2218 at 28.8 ms (the verification measured 39-51 ms on
+its machine); at 400%, where the tiled path is used, the thumbnail for 7-14 ms, then a 1x 612×792
+preview for 35-55 ms, then sharp tiles. A destination past the first 24 pages and outside the prepared
+neighborhood has no thumbnail at all and shows nothing for 16-28 ms instead. Rendering a half-scale
+raster first was measured and rejected: it halves the blurry window (28.3 → 13.7 ms at 140%, 20.1 →
+11.1 ms at 100%) but adds a whole extra render before the sharp one (28.8 → 49.6 ms and 20.8 → 59.4 ms
+to a sharp page), which is the property this path exists to protect.
 
 ## Documentation index
 

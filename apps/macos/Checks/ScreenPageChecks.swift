@@ -148,4 +148,95 @@ extension ReaderChecks {
         require(!tiny.usesScreenPageRasters,
                 "the page-count ceiling cannot leave a visible page permanently without raster work")
     }
+
+    /// T4.37: a cache budget too small for one page raster must say so instead of silently
+    /// switching renderers. At 140% on a 2x display the 600x800 fixture page costs 14.4 MiB, so
+    /// a 16 MiB budget allows only 8.0 MiB per page and needs 28.7 MiB to qualify; the note has
+    /// to name those numbers, not just "off".
+    @MainActor static func screenPageDegradationChecks(url: URL) async throws {
+        let engine = ScreenPageEngine()
+        engine.finishAll()
+        let state = AppState(engine: engine, tileCacheBudgetBytes: 16 * 1024 * 1024,
+                             preferFullPageRasters: true)
+        state.zoomPercent = 140
+        state.setViewportSize(CGSize(width: 900, height: 700))
+        state.open(url: url)
+        state.gotoPage(0)
+        try await eventually("a 16 MiB budget falls back to the tile path", { engine.tileRequests > 0 })
+        require(!state.usesScreenPageRasters,
+                "a budget below one page raster cannot use the screen-resolution path")
+        let mib = 1024.0 * 1024.0
+        let pageMiB = String(format: "%.1f", 1680.0 * 2240.0 * 4 / mib)
+        let neededMiB = String(format: "%.1f", 1680.0 * 2240.0 * 8 / mib)
+        let note = state.screenPagePathNote ?? ""
+        require(note.contains(pageMiB) && note.contains("8.0 MiB") && note.contains(neededMiB),
+                "the reason names the page size, the per-page ceiling and the budget it needs; got: \(note)")
+        require(state.screenPagePathSummary == "off(page \(pageMiB)>8.0 MiB; budget <\(neededMiB) MiB)",
+                "the render-stats field names the threshold; got: \(state.screenPagePathSummary)")
+        state.applyCacheBudgetSetting(environment: ["ARIS_READER_CACHE_BUDGET_MB": "48"])
+        try await eventually("raising the budget restores the screen-resolution path",
+                             { state.usesScreenPageRasters })
+        require(state.screenPagePathNote == nil && state.screenPagePathSummary == "on",
+                "the degradation note clears once the path is available again")
+    }
+
+    /// What the default configuration lost when the older render checks were pinned to the tile
+    /// path (`preferFullPageRasters: false`, T4.38).
+    ///
+    /// The legacy checks keep proving row-by-row promotion for tiles; these are the default-mode
+    /// equivalents of the reader-facing properties they cover: a cold destination is one raster
+    /// and never a fragment, a zoom replaces the whole page instead of mixing two scales, and
+    /// zooming back reuses the raster it already has. The engine is gated, so "not yet ready"
+    /// is a state the check creates rather than a race it hopes to win.
+    @MainActor static func defaultModeRenderChecks(url: URL) async throws {
+        let engine = ScreenPageEngine()
+        defer { engine.finishAll() }
+        let state = AppState(engine: engine, tileCacheBudgetBytes: 48 * 1024 * 1024)
+        state.zoomPercent = 140
+        state.setViewportSize(CGSize(width: 900, height: 700))
+        state.open(url: url)
+        state.gotoPage(0)
+        try await eventually("the default configuration requests the cold page at the screen scale",
+                             { engine.pendingPages == [0] })
+        require(state.usesScreenPageRasters && state.screenPagePathNote == nil,
+                "the default configuration keeps the screen-resolution path on")
+        engine.finish(0)
+        // A whole-page raster carries a negative placement index derived from its page, so the
+        // check can follow page 0's raster across zooms without matching its neighbours.
+        let pageZeroRaster = -3_000_000_000
+        func pageZeroWidth() -> Int? {
+            state.canvasPages.first { $0.placement.index == pageZeroRaster }?.image.pixelWidth
+        }
+        try await eventually("a cold destination arrives as one screen-resolution raster",
+                             { pageZeroWidth() == 1680 })
+        require(state.canvasPages.filter { $0.placement.index == pageZeroRaster }.count == 1,
+                "a cold destination is one page entry, not fragments of two rasters")
+        require(!state.canvasPages.contains { $0.placement.index >= 0 },
+                "a cold destination never shows partial tile fragments above its raster")
+        // Let the prepared neighbourhood settle first: the zoom below asserts on the *next*
+        // request, and a neighbour still queued from the jump would hide which one that is.
+        try await eventually("the prepared neighbourhood settles before the zoom test", {
+            for page in engine.pendingPages { engine.finish(page) }
+            return state.pageRasterCacheCount == 3 && engine.pendingPages.isEmpty
+        })
+
+        // 140% -> 150% stays inside the screen page's byte ceiling for this fixture.
+        state.zoomIn()
+        require(pageZeroWidth() == 1680,
+                "a zoom keeps the current page raster until the new scale is ready")
+        try await eventually("the zoom requests the destination at its new screen scale",
+                             { engine.pendingPages == [0] })
+        engine.finish(0)
+        try await eventually("the zoom swaps the whole page at once", {
+            pageZeroWidth() == 1800
+                && state.canvasPages.filter { $0.placement.index == pageZeroRaster }.count == 1
+        })
+        state.zoomOut()
+        require(pageZeroWidth() == 1800 && state.isScreenPageCached(0),
+                "zooming back keeps the raster it already has instead of dropping to the fallback")
+        try await Task.sleep(for: .milliseconds(200))
+        require(!engine.pendingPages.contains(0) && engine.tileRequests == 0,
+                "zooming back neither re-rasterizes page 0 nor falls back to tiles for it")
+        require(pageZeroWidth() == 1800, "the reused raster stays on screen after the zoom settles")
+    }
 }
