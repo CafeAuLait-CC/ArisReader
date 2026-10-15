@@ -30,6 +30,26 @@ extension ReaderChecks {
                 "inferred line breaks without newline glyphs also have a stable boundary")
         require(layer(lowerX: 300).characterIndex(at: CGPoint(x: 10, y: 17), extendingSelection: true) != 5,
                 "separate columns do not acquire an interline selection bridge")
+        // Review PDFs commonly draw the line-number gutter before the body text.
+        // Its loose glyph boxes can occupy a body's interline gap at a distant x.
+        var numberedChars = (0..<3).map {
+            TextChar(unicode: UInt32(49 + $0), xPt: -35 + CGFloat($0 * 3),
+                     yPt: 14, widthPt: 3, heightPt: 8)
+        }
+        numberedChars.append(TextChar(unicode: 10, xPt: 0, yPt: 0, widthPt: 0, heightPt: 0))
+        numberedChars += layer().chars.map {
+            TextChar(unicode: $0.unicode, xPt: $0.xPt, yPt: $0.yPt + 10,
+                     widthPt: $0.widthPt, heightPt: $0.heightPt)
+        }
+        let numbered = TextPage(page: 0, chars: numberedChars, text: "", hasUnicodeMapError: false)
+        for y in stride(from: CGFloat(20.1), through: 23.9, by: 0.1) {
+            for x in stride(from: CGFloat(0), through: 38, by: 0.5) {
+                requireGap(numbered.characterIndex(at: CGPoint(x: x, y: y), extendingSelection: true) == 9,
+                           "body line gap cannot jump to an earlier line-number gutter", x: x, y: y)
+            }
+        }
+        require(numbered.characterIndex(at: CGPoint(x: -30, y: 18)) == 1,
+                "line-number gutter remains directly selectable")
         print("PASS: horizontal sweeps across line gaps preserve one selection endpoint")
     }
 

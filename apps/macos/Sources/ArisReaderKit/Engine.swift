@@ -145,8 +145,21 @@ public struct TextPage: Sendable {
         func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
             max(low - value, value - high, 0)
         }
-        guard let closest = selectionLines.enumerated().min(by: { lhs, rhs in
-            let a = lhs.element, b = rhs.element
+        // Find the horizontal text column first. A loose box in a distant
+        // line-number gutter may extend into the body's interline gap; its exact
+        // y hit must not beat the body only a fraction of a point away.
+        guard let column = selectionLines.min(by: { a, b in
+            func squaredDistance(_ rect: CGRect) -> CGFloat {
+                let x = distance(point.x, rect.minX, rect.maxX)
+                let y = distance(point.y, rect.minY, rect.maxY)
+                return x * x + y * y
+            }
+            return squaredDistance(a.bounds) < squaredDistance(b.bounds)
+        }) else { return nil }
+        let columnLines = selectionLines.filter {
+            min($0.bounds.maxX, column.bounds.maxX) > max($0.bounds.minX, column.bounds.minX)
+        }
+        guard let line = columnLines.min(by: { a, b in
             let ay = distance(point.y, a.bounds.minY, a.bounds.maxY)
             let by = distance(point.y, b.bounds.minY, b.bounds.maxY)
             if ay != by { return ay < by }
@@ -155,22 +168,18 @@ public struct TextPage: Sendable {
             if ax != bx { return ax < bx }
             return abs(a.bounds.midY - point.y) < abs(b.bounds.midY - point.y)
         }) else { return nil }
-        let line = closest.element
-        if extendingSelection {
-            // Between adjacent lines, x must not move the endpoint back into either
-            // line's ink. Use their logical break for both upward and downward drags.
-            let upperIndex = point.y > line.bounds.maxY ? closest.offset : closest.offset - 1
-            let lowerIndex = upperIndex + 1
-            if selectionLines.indices.contains(upperIndex), selectionLines.indices.contains(lowerIndex) {
-                let upper = selectionLines[upperIndex], lower = selectionLines[lowerIndex]
-                let sameColumn = min(upper.bounds.maxX, lower.bounds.maxX)
-                    > max(upper.bounds.minX, lower.bounds.minX)
-                if sameColumn, point.y > upper.bounds.maxY, point.y < lower.bounds.minY,
-                   let last = upper.stops.last, let first = lower.stops.first {
-                    // Include CRLF/whitespace when present; inferred wraps have no
-                    // separator, so clamp to the last glyph of the preceding line.
-                    return max(last.index, first.index - 1)
-                }
+        if extendingSelection, point.y < line.bounds.minY || point.y > line.bounds.maxY {
+            // Use visual neighbors within the column, independent of the order in
+            // which the PDF producer emitted its text objects.
+            let upper = columnLines.filter { $0.bounds.maxY < point.y }
+                .max { $0.bounds.maxY < $1.bounds.maxY }
+            let lower = columnLines.filter { $0.bounds.minY > point.y }
+                .min { $0.bounds.minY < $1.bounds.minY }
+            if let upper, let lower,
+               min(upper.bounds.maxX, lower.bounds.maxX) > max(upper.bounds.minX, lower.bounds.minX),
+               let last = upper.stops.last, let first = lower.stops.first,
+               last.index < first.index {
+                return max(last.index, first.index - 1)
             }
         }
         guard abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14) else { return nil }
