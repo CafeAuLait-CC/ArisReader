@@ -141,11 +141,25 @@ public struct TextPage: Sendable {
 
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
-    public func characterIndex(at point: CGPoint) -> Int? {
+    public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
         func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
             max(low - value, value - high, 0)
         }
-        guard let line = selectionLines.min(by: { a, b in
+        // Find the horizontal text column first. A loose box in a distant
+        // line-number gutter may extend into the body's interline gap; its exact
+        // y hit must not beat the body only a fraction of a point away.
+        guard let column = selectionLines.min(by: { a, b in
+            func squaredDistance(_ rect: CGRect) -> CGFloat {
+                let x = distance(point.x, rect.minX, rect.maxX)
+                let y = distance(point.y, rect.minY, rect.maxY)
+                return x * x + y * y
+            }
+            return squaredDistance(a.bounds) < squaredDistance(b.bounds)
+        }) else { return nil }
+        let columnLines = selectionLines.filter {
+            min($0.bounds.maxX, column.bounds.maxX) > max($0.bounds.minX, column.bounds.minX)
+        }
+        guard let line = columnLines.min(by: { a, b in
             let ay = distance(point.y, a.bounds.minY, a.bounds.maxY)
             let by = distance(point.y, b.bounds.minY, b.bounds.maxY)
             if ay != by { return ay < by }
@@ -153,8 +167,22 @@ public struct TextPage: Sendable {
             let bx = distance(point.x, b.bounds.minX, b.bounds.maxX)
             if ax != bx { return ax < bx }
             return abs(a.bounds.midY - point.y) < abs(b.bounds.midY - point.y)
-        }), abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14)
-        else { return nil }
+        }) else { return nil }
+        if extendingSelection, point.y < line.bounds.minY || point.y > line.bounds.maxY {
+            // Use visual neighbors within the column, independent of the order in
+            // which the PDF producer emitted its text objects.
+            let upper = columnLines.filter { $0.bounds.maxY < point.y }
+                .max { $0.bounds.maxY < $1.bounds.maxY }
+            let lower = columnLines.filter { $0.bounds.minY > point.y }
+                .min { $0.bounds.minY < $1.bounds.minY }
+            if let upper, let lower,
+               min(upper.bounds.maxX, lower.bounds.maxX) > max(upper.bounds.minX, lower.bounds.minX),
+               let last = upper.stops.last, let first = lower.stops.first,
+               last.index < first.index {
+                return max(last.index, first.index - 1)
+            }
+        }
+        guard abs(line.bounds.midY - point.y) < max(line.bounds.height * 1.5, 14) else { return nil }
         return line.stops.min { a, b in
             let ad = distance(point.x, a.rect.minX, a.rect.maxX)
             let bd = distance(point.x, b.rect.minX, b.rect.maxX)

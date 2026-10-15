@@ -19,6 +19,10 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
+        if CommandLine.arguments.contains("--check-selection-path") {
+            try await checkSelectionPath()
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)

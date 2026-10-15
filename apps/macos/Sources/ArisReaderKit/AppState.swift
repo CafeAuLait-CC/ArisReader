@@ -2797,7 +2797,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func extendSelection(to point: CGPoint) {
         guard let anchor = selectionAnchor,
               let current = selection,
-              let hit = characterIndex(at: point),
+              let hit = characterIndex(at: point, extendingSelection: true),
               hit.page == current.page
         else { return }
 
@@ -2830,7 +2830,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Hit-test the nearest visual line, including inferred whitespace, before its characters.
-    private func characterIndex(at point: CGPoint) -> (page: Int, index: Int)? {
+    private func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> (page: Int, index: Int)? {
         for placement in visiblePagePlacements {
             let pageRect = CGRect(
                 x: placement.leftPt,
@@ -2846,7 +2846,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 x: point.x - placement.leftPt,
                 y: point.y - placement.topPt
             )
-            if let index = textPage.characterIndex(at: local) { return (placement.index, index) }
+            if let index = textPage.characterIndex(at: local, extendingSelection: extendingSelection) {
+                return (placement.index, index)
+            }
             return nil
         }
         return nil
