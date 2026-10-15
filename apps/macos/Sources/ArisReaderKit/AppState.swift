@@ -2333,7 +2333,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Makes sure the tiles covering the viewport exist, and hands the ready ones to the
-    /// canvas.
+    /// canvas. Complete visible-width rows sharpen as they arrive during scrolling;
+    /// already sharp rows stay in place while newly exposed rows load.
     ///
     /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
     /// tiles until all visible tiles on that page are ready, then replace them together.
@@ -2397,7 +2398,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         for span in band {
             let placement = span.placement
-            var ready: [CanvasPage] = []
+            var sharpRows: [CanvasPage] = []
             var complete = true
             let previous = canvasTiles.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == placement.index }
             let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
@@ -2405,6 +2406,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // outside the band may be re-rasterized, a visible one may not be dropped.
 
             for ty in span.rows {
+                var rowReady: [CanvasPage] = []
+                var rowComplete = true
                 for tx in span.columns {
                     let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
                     wanted.insert(key)
@@ -2423,29 +2426,46 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     )
 
                     if let cached = tileCache.image(for: key) {
-                        ready.append(CanvasPage(placement: tilePlacement, image: cached))
+                        rowReady.append(CanvasPage(placement: tilePlacement, image: cached))
                         bandReport.record(classOf, bytes: cached.bgra.count)
                     } else {
                         tileCache.recordMiss()
                         bandReport.record(classOf, bytes: 0)
-                        if tilePlacement.topPt < scrollYPt + viewportHeight,
-                           tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
+                        if tilePlacement.leftPt < viewport.maxX,
+                           tilePlacement.leftPt + tilePlacement.widthPt > viewport.minX {
+                            rowComplete = false
+                        }
+                        if classOf == .visible {
                             complete = false
-                            if classOf == .visible { bandReport.visibleMisses += 1 }
+                            bandReport.visibleMisses += 1
                         }
                         scheduleTile(key, placement: tilePlacement)
                     }
                 }
+                if rowComplete {
+                    sharpRows.append(contentsOf: rowReady)
+                } else {
+                    // A newly exposed row may be incomplete. Never blur tiles that were
+                    // already shown sharply, including after a viewport widens.
+                    sharpRows.append(contentsOf: previous.filter {
+                        ($0.placement.index >> 20) & 15 == Int(lod)
+                            && ($0.placement.index >> 10) & 1023 == ty
+                            && span.columns.contains($0.placement.index & 1023)
+                    })
+                }
             }
-            if changingLOD && !complete {
-                pages.append(contentsOf: previous)
-            } else if !complete, let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
-                // A complete, lower-resolution page replaces the checkerboard of arriving tiles.
+            if !complete, !changingLOD,
+               let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
+                // The preview is only a backdrop for uncovered rows, never a replacement
+                // for the sharp content the reader is already looking at.
                 pages.append(CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
                     topPt: placement.topPt, leftPt: placement.leftPt,
                     widthPt: placement.widthPt, heightPt: placement.heightPt), image: preview))
-            } else if complete {
-                pages.append(contentsOf: ready)
+            }
+            if changingLOD && !complete {
+                pages.append(contentsOf: previous)
+            } else {
+                pages.append(contentsOf: sharpRows)
             }
         }
         let viewportTop = scrollYPt

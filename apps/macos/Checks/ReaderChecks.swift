@@ -96,6 +96,7 @@ struct ReaderChecks {
                 && state.references.isEmpty && state.outline.isEmpty && state.annotations.isEmpty,
                 "closing last tab rejects pending work and clears document data")
         try await interactionChecks(url: a)
+        try await scrollingQualityChecks(url: b)
         try await scrollingRenderChecks(url: b)
         try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
         try await annotationChecks(a: a, b: b)

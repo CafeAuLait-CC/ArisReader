@@ -1,7 +1,7 @@
 import ArisReaderKit
 import Foundation
 
-@MainActor private final class SlowTileEngine: PreviewEngine {
+@MainActor private class SlowTileEngine: PreviewEngine {
     var requests: [Int] = []
     var active = 0
     var maxActive = 0
@@ -33,6 +33,42 @@ import Foundation
     }
 }
 
+/// Tiles complete only when a check releases them, so row-promotion assertions do not
+/// depend on a sleep winning a race with a raster or a loaded CI runner.
+@MainActor private final class GatedTileEngine: SlowTileEngine {
+    private var waiting: [TileKey: (Int, CheckedContinuation<TileImage, Never>)] = [:]
+    private var automatic = false
+    var pendingKeys: [TileKey] { Array(waiting.keys) }
+
+    override func rasterizeTile(page: Int, lod: UInt8, tileX: Int, tileY: Int, tileSize: Int) async throws -> TileImage {
+        let key = TileKey(page: page, lod: lod, x: tileX, y: tileY)
+        requests.append(page)
+        active += 1
+        maxActive = max(maxActive, active)
+        defer { active -= 1 }
+        if automatic { return image(key, size: tileSize) }
+        return await withCheckedContinuation { waiting[key] = (tileSize, $0) }
+    }
+
+    private func image(_ key: TileKey, size: Int) -> TileImage {
+        TileImage(page: key.page, lod: key.lod, tileX: key.x, tileY: key.y, sizePx: size,
+                  bgra: Data(repeating: 255, count: size * size * 4),
+                  generation: UInt64(10_000 + key.page * 10_000 + Int(key.lod) * 1000 + key.y * 10 + key.x))
+    }
+
+    func finish(where predicate: (TileKey) -> Bool) {
+        for key in pendingKeys.filter(predicate) {
+            let (size, continuation) = waiting.removeValue(forKey: key)!
+            continuation.resume(returning: image(key, size: size))
+        }
+    }
+
+    func finishAll() {
+        automatic = true
+        finish { _ in true }
+    }
+}
+
 extension ReaderChecks {
     @MainActor static func thumbnailChecks(url: URL) async throws {
         let engine = try RustEngine()
@@ -60,6 +96,85 @@ extension ReaderChecks {
         try await eventually("thumbnail rebuilds for backing-scale change", { state.thumbnails[0]?.pixelWidth == 132 })
     }
 
+    @MainActor static func scrollingQualityChecks(url: URL) async throws {
+        let engine = GatedTileEngine()
+        defer { engine.finishAll() }
+        let state = AppState(engine: engine)
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        state.open(url: url)
+        state.gotoPage(0)
+        func row(_ y: Int) -> [CanvasPage] {
+            state.canvasPages.filter {
+                $0.placement.index >= 0 && $0.placement.index >> 24 == 0
+                    && ($0.placement.index >> 10) & 1023 == y
+            }
+        }
+        func hasPreview() -> Bool { state.canvasPages.contains { $0.image.generation == 500 } }
+        try await eventually("preview covers rows that have no sharp tiles yet", hasPreview)
+        try await eventually("a completed row sharpens before the rest of the page", {
+            engine.finish { $0.page == 0 && $0.y == 0 }
+            return row(0).count == 3
+        })
+        require(hasPreview() && row(1).isEmpty, "only complete visible-width rows cover the preview")
+        let generations = Set(row(0).map(\.image.generation))
+        state.scroll(byScreenPoints: 48)
+        require(state.isScrolling && Set(row(0).map(\.image.generation)) == generations && hasPreview(),
+                "exposing an uncached row never blurs already sharp text")
+        try await eventually("next row has a controllable pending tile", {
+            engine.pendingKeys.contains { $0.page == 0 && $0.y == 1 }
+        })
+        let first = engine.pendingKeys.first { $0.page == 0 && $0.y == 1 }!
+        engine.finish { $0 == first }
+        try await eventually("one tile of the next row is cached", { state.isTileCached(first) })
+        require(row(1).isEmpty && Set(row(0).map(\.image.generation)) == generations,
+                "a partially completed new row does not create isolated sharp patches")
+        try await eventually("next sharp row appears during ongoing scrolling", {
+            state.scroll(byScreenPoints: 0.1)
+            engine.finish { $0.page == 0 && $0.y == 1 }
+            return row(1).count == 3
+        })
+        require(state.isScrolling && Set(row(0).map(\.image.generation)) == generations,
+                "sharp content stays stable while subsequent rows load without waiting for scroll idle")
+        let previewIndex = state.canvasPages.firstIndex { $0.image.generation == 500 }!
+        let sharpIndex = state.canvasPages.firstIndex { $0.placement.index >= 0 }!
+        require(previewIndex < sharpIndex, "low-resolution backdrop is drawn underneath sharp rows")
+        require(engine.maxActive <= AppState.maxConcurrentTileRasters, "progressive rows preserve the raster concurrency bound")
+        engine.finishAll()
+
+        let zoomEngine = GatedTileEngine()
+        defer { zoomEngine.finishAll() }
+        let zoomed = AppState(engine: zoomEngine)
+        zoomed.zoomPercent = 400
+        zoomed.setViewportSize(CGSize(width: 768, height: 500))
+        zoomed.open(url: url)
+        zoomed.gotoPage(0)
+        func zoomRow(_ y: Int) -> [CanvasPage] {
+            zoomed.canvasPages.filter {
+                $0.placement.index >= 0 && $0.placement.index >> 24 == 0
+                    && ($0.placement.index >> 10) & 1023 == y
+            }
+        }
+        try await eventually("400% visible rows sharpen without waiting for offscreen columns", {
+            zoomEngine.finish { $0.page == 0 && $0.x <= 2 && $0.y <= 1 }
+            return zoomRow(0).count == 3 && zoomRow(1).count == 3
+        })
+        require(zoomed.pinnedTiles.contains(TileKey(page: 0, lod: 3, x: 3, y: 0))
+                && !zoomed.isTileCached(TileKey(page: 0, lod: 3, x: 3, y: 0))
+                && !zoomed.canvasPages.contains { $0.image.generation == 500 },
+                "an offscreen prefetch miss cannot keep the visible page blurry")
+        let beforeResize = Set((zoomRow(0) + zoomRow(1)).map(\.image.generation))
+        zoomed.setViewportSize(CGSize(width: 1000, height: 500))
+        require(beforeResize.isSubset(of: Set(zoomed.canvasPages.map(\.image.generation))),
+                "widening the viewport preserves its existing sharp columns")
+        // At most two rasters from the old viewport may already be in flight.
+        zoomEngine.finish { _ in true }
+        try await eventually("newly exposed columns join the sharp rows", {
+            zoomEngine.finish { $0.page == 0 && $0.x <= 3 && $0.y <= 1 }
+            return zoomRow(0).count == 4 && zoomRow(1).count == 4
+        })
+        zoomEngine.finishAll()
+    }
+
     @MainActor static func scrollingRenderChecks(url: URL) async throws {
         let engine = SlowTileEngine()
         let state = AppState(engine: engine)
@@ -72,19 +187,13 @@ extension ReaderChecks {
         let fallback = state.canvasPages.first { $0.image.generation == 500 }!
         require(fallback.placement.widthPt == 600 && fallback.placement.heightPt == 1200,
                 "fallback covers the complete page instead of isolated tile patches")
-        try await Task.sleep(for: .milliseconds(160))
-        require(state.canvasPages.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == 0 }.isEmpty,
-                "partial tile completion does not paint a checkerboard over the fallback")
         // A raster that has already started cannot be cancelled, so moving the viewport may
         // only leave the rasters that are running *at that moment* to finish: everything still
         // queued for the old viewport is dropped. `active == maxConcurrentTileRasters` is the
         // state where that is observable without depending on how fast this machine schedules
         // raster tasks -- the engine counts `active` inside the call, so once every slot the
         // scheduler may fill is occupied, no just-created raster can still be unrecorded.
-        // The next raster the scheduler starts must then be the new viewport's, on a loaded
-        // 3-vCPU runner exactly as on an idle workstation. (Asserting "within one request" of
-        // the count taken before the move instead made this a race between the 160 ms wait
-        // above and a tile completion waking up its replacement: red on CI, green locally.)
+        // The next raster must then be the new viewport's, independent of runner load.
         try await eventually("both raster slots are busy before the viewport moves", {
             engine.active == AppState.maxConcurrentTileRasters
         })

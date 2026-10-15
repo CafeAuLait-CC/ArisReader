@@ -18,6 +18,9 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 Current status: **M1–M4 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
 tabs, sidecar highlights/underlines/notes, and citation/figure/table/algorithm previews.
+Dragging across the gap between text lines keeps a stable selection boundary. During scrolling,
+already sharp content stays sharp; newly exposed rows refine as they become ready, with a
+low-resolution backdrop only for missing regions. Zoom changes still replace a visible LOD together.
 Milestone acceptance criteria are not all met: the milestone table below names what is missing, and the
 full review record (findings, evidence and follow-ups) is kept with the project's design notes rather than in
 this repository. Concrete
