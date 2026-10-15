@@ -294,6 +294,76 @@ public struct Figure: Sendable {
     public var title: String { "\(kind) \(label)" }
 }
 
+/// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
+///
+/// The counterpart of `AppState.Annotation`: that one is what this reader wrote and keeps in a
+/// sidecar, this one is what the file itself carries — a highlight made in Preview, a colleague's
+/// sticky note. `quads` is what markup annotations are really drawn from; `xPt`/`yPt`/`widthPt`/
+/// `heightPt` is the `/Rect` and the fallback when a file has no quad points.
+public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
+    /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype
+    /// name for anything this build does not model (`Ink`, `Stamp`, …).
+    public let kind: String
+    public let page: Int
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+    public let quads: [AnnotationQuadBox]
+    /// `nil` when the file carries no `/C` (sticky notes usually do not).
+    public let color: AnnotationColor?
+    /// `/CA`; `nil` means the file did not state one, which reads as opaque.
+    public let opacity: Double?
+    /// `/BM`: `normal`, `multiply`, or the blend mode's own PDF name.
+    public let blend: String
+    public let contents: String?
+    public let author: String?
+    public let modified: String?
+    /// False when the file marks the annotation hidden/invisible/`/NoView`.
+    public let visible: Bool
+
+    /// Stable identity for `ForEach` and selection: the file gives no id, so page + kind + box.
+    public var id: String {
+        "\(page)-\(kind)-\(xPt)-\(yPt)-\(widthPt)-\(heightPt)"
+    }
+
+    /// True when this is one of the four text-markup kinds, i.e. something to draw on the page.
+    public var isMarkup: Bool {
+        ["highlight", "underline", "strikeout", "squiggly"].contains(kind)
+    }
+
+    /// True when the annotation is a note rather than markup: something to *read*, listed in the
+    /// sidebar. `/Text` (a sticky note) and `/FreeText` are the two kinds whose `/Contents` is
+    /// the whole point of the annotation.
+    public var isNote: Bool {
+        kind == "text" || kind == "freeText"
+    }
+
+    /// What the annotation is composited with — the file's `/BM`, not a guess.
+    public var quadBlend: QuadBlend { blend == "multiply" ? .multiply : .normal }
+
+    /// The boxes to draw: the quad points when the file has them, its `/Rect` otherwise.
+    public var boxes: [AnnotationQuadBox] {
+        quads.isEmpty ? [AnnotationQuadBox(xPt: xPt, yPt: yPt, widthPt: widthPt, heightPt: heightPt)]
+            : quads
+    }
+}
+
+/// One box of an annotation in view space (a `/QuadPoints` quadrilateral, or its `/Rect`).
+public struct AnnotationQuadBox: Sendable, Equatable {
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+
+    public init(xPt: CGFloat, yPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat) {
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+    }
+}
+
 /// A `Figure 3` / `Table 2` reference in a page's body text, boxed in view space.
 public struct CaptionMention: Sendable {
     public let page: Int
@@ -376,14 +446,27 @@ public struct TileImage: Sendable {
 
 }
 
+/// How a quad is composited with what is already in the frame.
+///
+/// Mirrors Rust's `QuadBlend` and the `ARIS_BLEND_*` constants in the C ABI. A page is painted
+/// over the background; a PDF highlight is normally stored with `/BM /Multiply` and has to be
+/// multiplied into the page under it, or the same colour looks different from Preview.
+public enum QuadBlend: UInt8, Sendable {
+    case normal = 0
+    case multiply = 1
+}
+
 /// One page ready to be drawn: where it goes and the bitmap that goes there.
 public struct CanvasPage: Sendable {
     public let placement: PagePlacement
     public let image: PageImage
+    /// How this quad composites with what is already in the frame.
+    public let blend: QuadBlend
 
-    public init(placement: PagePlacement, image: PageImage) {
+    public init(placement: PagePlacement, image: PageImage, blend: QuadBlend = .normal) {
         self.placement = placement
         self.image = image
+        self.blend = blend
     }
 }
 
@@ -420,6 +503,9 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> PageImage
     /// Links on a page, in view space (empty when the page has none).
     func links(_ page: Int) async throws -> [DocumentLink]
+    /// Annotations the document **already carries** (highlights, notes, free text), from every
+    /// page, in view space. Document-wide, so implementations cache it.
+    func annotations() async throws -> [DocumentAnnotation]
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
     /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
@@ -772,6 +858,71 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func annotations() async throws -> [DocumentAnnotation] {
+        // Document-wide and cached in Rust for the lifetime of the open document, so the shell
+        // fetches it once per document and only converts it here.
+        guard let document else { return [] }
+
+        let records: [AnnotationRecord] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.annotations())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        return records.map(Self.documentAnnotation(from:))
+    }
+
+    /// One FFI record, as the shell models it.
+    ///
+    /// Split out of the mapping above because a single closure with this many conversions makes
+    /// the Swift type checker give up ("unable to type-check this expression in reasonable time").
+    private static func documentAnnotation(from record: AnnotationRecord) -> DocumentAnnotation {
+        let quads = record.quads.map { quad in
+            AnnotationQuadBox(
+                xPt: CGFloat(quad.xPt),
+                yPt: CGFloat(quad.yPt),
+                widthPt: CGFloat(quad.widthPt),
+                heightPt: CGFloat(quad.heightPt)
+            )
+        }
+
+        // The FFI reports "no colour" as an absent record, and the shell keeps that distinction:
+        // black is a colour somebody may have chosen, and a sticky note carries no colour at all.
+        var color: AnnotationColor?
+        if let channels = record.color {
+            // `/CA` is the annotation's opacity (0…1 by definition; clamped anyway so a malformed
+            // file cannot trap here), and an absent `/CA` reads as opaque.
+            let alpha = min(max(((record.opacity ?? 1.0) * 255.0).rounded(), 0), 255)
+            color = AnnotationColor(
+                red: channels.red,
+                green: channels.green,
+                blue: channels.blue,
+                alpha: UInt8(alpha)
+            )
+        }
+
+        return DocumentAnnotation(
+            kind: record.kind,
+            page: Int(record.page),
+            xPt: CGFloat(record.xPt),
+            yPt: CGFloat(record.yPt),
+            widthPt: CGFloat(record.widthPt),
+            heightPt: CGFloat(record.heightPt),
+            quads: quads,
+            color: color,
+            opacity: record.opacity,
+            blend: record.blend,
+            contents: record.contents,
+            author: record.author,
+            modified: record.modified,
+            visible: record.visible
+        )
+    }
+
     public func figures() async throws -> [Figure] {
         // The index is document-wide and the Rust call walks up to 120 pages, so a second
         // click must not pay for the scan again.
@@ -1019,6 +1170,8 @@ public final class MockEngine: PDFEngine {
 
     public func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
 
+    public func annotations() async throws -> [DocumentAnnotation] { [] }
+
     public func figures() async throws -> [Figure] { [] }
 
     public func references() async throws -> [Reference] { [] }
@@ -1044,6 +1197,24 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
+    /// The character range whose glyphs a box on the page covers — the inverse of
+    /// [`selectionRects(in:)`], used to select the text under an annotation the PDF carries.
+    ///
+    /// Returns `nil` when no glyph overlaps, which is the honest answer for a box over a figure
+    /// or over a page whose text layer could not be read.
+    public func characterRange(in rect: CGRect) -> ClosedRange<Int>? {
+        var first: Int?
+        var last: Int?
+        for line in selectionLines {
+            for stop in line.stops where stop.rect.intersects(rect) {
+                first = first ?? stop.index
+                last = stop.index
+            }
+        }
+        guard let first, let last, first <= last else { return nil }
+        return first...last
+    }
+
     public func selectionRects(in range: ClosedRange<Int>) -> [CGRect] {
         var result: [CGRect] = []
         for line in selectionLines {

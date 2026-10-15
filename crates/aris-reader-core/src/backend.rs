@@ -143,6 +143,118 @@ pub struct RawTextPage {
     pub has_unicode_map_error: bool,
 }
 
+/// What an annotation found inside a PDF is, reduced to what a reader can act on.
+///
+/// The four markup kinds carry quad points, which is what makes them drawable as
+/// highlights; `Text` is a sticky note (an icon with a popup and no geometry of its own) and
+/// `FreeText` is a note drawn directly on the page. Everything else is reported but not drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawAnnotationKind {
+    Highlight,
+    Underline,
+    Strikeout,
+    Squiggly,
+    /// `/Text`: a sticky note.
+    Text,
+    /// `/FreeText`: text placed on the page.
+    FreeText,
+    /// A subtype this build does not model; the PDF's own `/Subtype` name is carried with it.
+    Other(String),
+}
+
+impl RawAnnotationKind {
+    /// Stable lower-case name, used as-is across the FFI boundary.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Highlight => "highlight",
+            Self::Underline => "underline",
+            Self::Strikeout => "strikeout",
+            Self::Squiggly => "squiggly",
+            Self::Text => "text",
+            Self::FreeText => "freeText",
+            Self::Other(name) => name,
+        }
+    }
+}
+
+/// How an annotation is composited with the page (`/BM`, the blend mode).
+///
+/// This is not decoration: highlights are normally stored as `/BM /Multiply`, and drawing one
+/// with plain alpha-over produces a visibly different colour from what Preview shows for the
+/// same file. The values this build can render are [`AnnotationBlend::Normal`] and
+/// [`AnnotationBlend::Multiply`]; anything else is reported verbatim so the caller can say what
+/// the file asked for instead of pretending it was normal.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum AnnotationBlend {
+    #[default]
+    Normal,
+    Multiply,
+    Other(String),
+}
+
+impl AnnotationBlend {
+    /// Parses a `/BM` name (`/Multiply`, `/Screen`, …).
+    pub fn from_pdf_name(name: &str) -> Self {
+        match name {
+            "Normal" | "Compatible" => Self::Normal,
+            "Multiply" => Self::Multiply,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Stable name for the FFI and for diagnostics.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Normal => "normal",
+            Self::Multiply => "multiply",
+            Self::Other(name) => name,
+        }
+    }
+}
+
+/// An annotation colour as an 8-bit sRGB triple (`/C`, `/IC`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawAnnotationColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+/// One annotation that already exists inside the PDF.
+///
+/// Geometry is in **page space** (bottom-left origin), exactly like [`RawCharBox`]; the single
+/// Y-flip into view space happens in the FFI layer through `PageGeometry::page_to_view`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawAnnotation {
+    pub page: PageIndex,
+    pub kind: RawAnnotationKind,
+    /// The annotation's `/Rect` — the icon box for a sticky note, the text box for free text.
+    pub rect: Rect,
+    /// `/QuadPoints`, one rectangle per quadrilateral, when the subtype carries them.
+    ///
+    /// Empty when the file has none. Consumers should fall back to `rect`: a highlight without
+    /// `/QuadPoints` is malformed but does occur, and its `/Rect` is still the right box.
+    pub quads: Vec<Rect>,
+    /// `/C` — `None` when the file carries no colour at all (common for sticky notes, whose
+    /// colour is the icon's, not the file's).
+    pub color: Option<RawAnnotationColor>,
+    /// `/CA`, the constant opacity, when the file states one.
+    ///
+    /// `None` means "the file did not say", which a reader should treat as opaque rather than
+    /// as transparent.
+    pub opacity: Option<f64>,
+    pub blend: AnnotationBlend,
+    /// `/Contents` — what the annotation says.
+    pub contents: Option<String>,
+    /// `/T` — who wrote it.
+    pub author: Option<String>,
+    /// `/M` — modification date, as the PDF writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
+    pub modified: Option<String>,
+    /// False when the file marks the annotation `/Hidden`, `/Invisible` or `/NoView`, i.e. when
+    /// drawing it would contradict the file.
+    pub visible: bool,
+}
+
 /// PDF engine interface. See `aris-reader-pdfium` for an implementation (the first backend); a pure Rust backend may follow.
 ///
 /// **Threading rules**: implementations must be `Send + Sync`, but PDFium itself is not thread-safe —
@@ -160,6 +272,12 @@ pub trait DocumentBackend: Send + Sync {
 
     /// Link annotations of a page.
     fn links(&self, page: PageIndex) -> Result<Vec<LinkInfo>>;
+
+    /// Annotations **already stored in the document** (highlights, notes, free text, …).
+    ///
+    /// Read-only and page-scoped like [`DocumentBackend::links`]: this is what someone else's
+    /// PDF carries, not what this application wrote (that lives in the sidecar).
+    fn annotations(&self, page: PageIndex) -> Result<Vec<RawAnnotation>>;
 
     /// Raw text layer (built lazily and cached by the upper layer).
     fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage>;

@@ -52,6 +52,101 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
 ///
 /// The skeleton phase uses `ObservableObject` (rather than the newer `@Observable`) to maximize
 /// toolchain compatibility; see the "Negatives / costs" section of `docs/adr/0006`.
+/// A colour an annotation is drawn in: 8-bit sRGB channels plus opacity.
+///
+/// The alpha channel exists because a PDF annotation carries its opacity separately from its
+/// colour (`/C` and `/CA`), and because a highlight is *meant* to be translucent: 0x66 is the
+/// alpha every preset below uses, so the text under a highlight stays readable.
+///
+/// Encoded as a single `#RRGGBBAA` string in the sidecar: one key, and impossible to misread the
+/// channel order of.
+public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
+    public var red: UInt8
+    public var green: UInt8
+    public var blue: UInt8
+    /// 255 = fully opaque.
+    public var alpha: UInt8
+
+    public init(red: UInt8, green: UInt8, blue: UInt8, alpha: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.alpha = alpha
+    }
+
+    /// `#RRGGBBAA`, upper case, the same shape `to_hex_with_alpha` uses on the Rust side.
+    public var hex: String {
+        String(format: "#%02X%02X%02X%02X", red, green, blue, alpha)
+    }
+
+    /// Parses `#RRGGBBAA` (or `#RRGGBB`, taken as opaque). Anything else is rejected rather than
+    /// guessed at: a sidecar is a file the reader must be able to trust.
+    public init?(hex: String) {
+        var digits = hex
+        guard digits.hasPrefix("#") else { return nil }
+        digits.removeFirst()
+        guard digits.count == 6 || digits.count == 8,
+              digits.allSatisfy({ $0.isHexDigit }),
+              let value = UInt32(digits, radix: 16)
+        else { return nil }
+        if digits.count == 6 {
+            self.init(
+                red: UInt8((value >> 16) & 0xFF),
+                green: UInt8((value >> 8) & 0xFF),
+                blue: UInt8(value & 0xFF),
+                alpha: 255
+            )
+        } else {
+            self.init(
+                red: UInt8((value >> 24) & 0xFF),
+                green: UInt8((value >> 16) & 0xFF),
+                blue: UInt8((value >> 8) & 0xFF),
+                alpha: UInt8(value & 0xFF)
+            )
+        }
+    }
+
+    /// BGRA — the byte order every texture in this engine is uploaded in.
+    public var bgra: [UInt8] { [blue, green, red, alpha] }
+
+    public init(bgra: [UInt8]) {
+        self.init(red: bgra[2], green: bgra[1], blue: bgra[0], alpha: bgra[3])
+    }
+
+    /// Blends this colour towards white by `opacity`, in the stored (gamma-encoded) space.
+    ///
+    /// This is what a `/BM /Multiply` highlight needs before it is uploaded: PDF composites a
+    /// multiply annotation as `page × (a·colour + (1 − a))`, and the GPU multiplies in linear
+    /// light, so the opacity has to be folded into the colour here or a translucent highlight
+    /// comes out visibly brighter than the file says (measured 23/255 on a mid tone at `/CA 0.5`).
+    public func baked(opacity: Double) -> AnnotationColor {
+        let a = min(max(opacity, 0.0), 1.0)
+        let opaque: Double = 1.0 - a
+        func mix(_ channel: UInt8) -> UInt8 {
+            let value: Double = a * Double(channel) + opaque * 255.0
+            return UInt8(min(max(value.rounded(), 0.0), 255.0))
+        }
+        return AnnotationColor(red: mix(red), green: mix(green), blue: mix(blue), alpha: 255)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(hex)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let text = try container.decode(String.self)
+        guard let color = AnnotationColor(hex: text) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "expected #RRGGBB or #RRGGBBAA, got \(text)"
+            )
+        }
+        self = color
+    }
+}
+
 @MainActor
 public final class AppState: ObservableObject {
     @Published public var document: LoadedDocument?
@@ -328,13 +423,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Inclusive character range in the page's text layer.
     public var start: Int
     public var end: Int
-    /// Index into `AppState.highlightPalette`.
-    public var colorIndex: Int
+    /// The colour to draw, as it will be drawn.
+    ///
+    /// This used to be `colorIndex`, an index into a four-entry palette, which made every colour
+    /// outside that palette unrepresentable — including every colour already inside a PDF
+    /// somebody else had annotated. A stored colour is what the annotation *is*; the palette is
+    /// only a list of presets offered when creating one.
+    public var color: AnnotationColor
     public var note: String
     public var createdAt: Date
 
     private enum CodingKeys: String, CodingKey {
-        case id, kind, page, start, end, colorIndex, note, createdAt
+        case id, kind, page, start, end, color, colorIndex, note, createdAt
     }
 
     public init(
@@ -343,7 +443,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         page: Int,
         start: Int,
         end: Int,
-        colorIndex: Int,
+        color: AnnotationColor,
         note: String,
         createdAt: Date
     ) {
@@ -352,13 +452,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         self.page = page
         self.start = start
         self.end = end
-        self.colorIndex = colorIndex
+        self.color = color
         self.note = note
         self.createdAt = createdAt
     }
 
     /// Older sidecars predate `kind`; decode them as highlights while preserving all
     /// explicitly stored kinds in newer sidecars.
+    ///
+    /// Colour has two shapes in the wild, and the order matters: `color` is this version's
+    /// (any RGB value), `colorIndex` is the older build's index into `AppState.highlightPalette`.
+    /// An index outside the palette is not decodable — `AnnotationSidecar` classifies such an
+    /// entry as one this version cannot interpret and keeps it verbatim instead of guessing.
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
@@ -366,9 +471,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         page = try values.decode(Int.self, forKey: .page)
         start = try values.decode(Int.self, forKey: .start)
         end = try values.decode(Int.self, forKey: .end)
-        colorIndex = try values.decode(Int.self, forKey: .colorIndex)
+        if let stored = try values.decodeIfPresent(AnnotationColor.self, forKey: .color) {
+            color = stored
+        } else {
+            let index = try values.decode(Int.self, forKey: .colorIndex)
+            guard AppState.highlightPalette.indices.contains(index) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .colorIndex,
+                    in: values,
+                    debugDescription: "colour index \(index) is outside the \(AppState.highlightPalette.count)-colour palette"
+                )
+            }
+            color = AppState.highlightPalette[index].color
+        }
         note = try values.decode(String.self, forKey: .note)
         createdAt = try values.decode(Date.self, forKey: .createdAt)
+    }
+
+    /// Writes a palette colour as `colorIndex` and anything else as `color`.
+    ///
+    /// The asymmetry is deliberate and is the whole backward-compatibility story (see
+    /// `AnnotationSidecar`): a colour that *is* one of the presets is written exactly as the
+    /// older build wrote it, with no new key, so an older build both reads and draws it. Only a
+    /// colour the old model cannot express needs the new key — and for that one the older build
+    /// preserves the entry verbatim instead of misreading it.
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(page, forKey: .page)
+        try values.encode(start, forKey: .start)
+        try values.encode(end, forKey: .end)
+        if let index = AppState.highlightPalette.firstIndex(where: { $0.color == color }) {
+            try values.encode(index, forKey: .colorIndex)
+        } else {
+            try values.encode(color, forKey: .color)
+        }
+        try values.encode(note, forKey: .note)
+        try values.encode(createdAt, forKey: .createdAt)
     }
 }
 
@@ -596,6 +736,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         referencePreviewPages = []
     }
 
+    /// Annotations the **PDF itself carries**, in view space — highlights and notes somebody
+    /// else made (or the reader made in another viewer).
+    ///
+    /// A different thing from `annotations` below: that is what this reader wrote to its sidecar,
+    /// this is what the file says. The two are shown together on the canvas and listed separately
+    /// in the sidebar, because only one of them can be edited here.
+    @Published public private(set) var documentAnnotations: [DocumentAnnotation] = []
+    /// True while the document's own annotations are being read (the sidebar shows it).
+    @Published public private(set) var documentAnnotationsLoading = false
+    /// Why the document's annotations could not be read, if they could not.
+    @Published public private(set) var documentAnnotationsError: String?
+
+    /// The document's own annotations that are notes rather than markup — what the sidebar lists.
+    ///
+    /// Sticky notes and free text have no geometry worth drawing, so a list is the only way they
+    /// are discoverable at all; this is also the only place their text can be read.
+    public var documentNotes: [DocumentAnnotation] {
+        documentAnnotations.filter { $0.visible && $0.isNote }
+    }
+
     /// Highlights the reader added, and the file they are stored in.
     ///
     /// This is the array this version can *render and edit*. Entries a newer version wrote in
@@ -627,22 +787,64 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// How long a note edit may stay in memory only. At most one sidecar write per window
     /// while typing, plus immediate writes on commit, blur, undo, redo and flush points.
     private static let noteCoalescingWindow = Duration.milliseconds(500)
-    /// Highlight colours offered in the toolbar (BGRA, translucent so text stays readable).
-    public static let highlightPalette: [(name: String, bgra: [UInt8])] = [
-        ("Yellow", [0x40, 0xD8, 0xFF, 0x66]),
-        ("Green", [0x60, 0xD0, 0x70, 0x66]),
-        ("Blue", [0xF0, 0xA0, 0x60, 0x66]),
-        ("Pink", [0xB0, 0x70, 0xE0, 0x66]),
+    /// Highlight colours offered when **creating** an annotation (translucent, so the text under
+    /// a highlight stays readable).
+    ///
+    /// The first four entries are the palette this application has always had, in the same order
+    /// and with the same bytes: a sidecar written by an older build stores `colorIndex` 0…3, and
+    /// those indices must keep meaning exactly what they meant. The rest were added because four
+    /// colours is not a palette a reader can work in; a loaded annotation is not limited to these
+    /// at all (see `AnnotationColor`).
+    /// `nonisolated` because `Codable` conformances are not main-actor isolated: an annotation
+    /// decodes its legacy `colorIndex` against this table from any thread. It is a `let` of
+    /// `Sendable` values, so sharing it is safe.
+    public nonisolated static let highlightPalette: [(name: String, color: AnnotationColor)] = [
+        ("Yellow", AnnotationColor(red: 0xFF, green: 0xD8, blue: 0x40, alpha: 0x66)),
+        ("Green", AnnotationColor(red: 0x70, green: 0xD0, blue: 0x60, alpha: 0x66)),
+        ("Blue", AnnotationColor(red: 0x60, green: 0xA0, blue: 0xF0, alpha: 0x66)),
+        ("Pink", AnnotationColor(red: 0xE0, green: 0x70, blue: 0xB0, alpha: 0x66)),
+        ("Orange", AnnotationColor(red: 0xFF, green: 0xA0, blue: 0x40, alpha: 0x66)),
+        ("Purple", AnnotationColor(red: 0xA0, green: 0x80, blue: 0xF0, alpha: 0x66)),
+        ("Teal", AnnotationColor(red: 0x40, green: 0xC0, blue: 0xC0, alpha: 0x66)),
+        ("Grey", AnnotationColor(red: 0x90, green: 0x98, blue: 0xA0, alpha: 0x66)),
     ]
-    private lazy var highlightTextures: [PageImage] = Self.highlightPalette.enumerated().map {
-        index, colour in
-        PageImage(
+
+    /// Textures for this document's annotations, keyed by the colour they are drawn in.
+    ///
+    /// One 1x1 texture per distinct colour rather than one per palette entry: a loaded PDF can
+    /// carry any colour, and a multiply draw needs its opacity baked into the texture (see
+    /// `AnnotationColor.baked(opacity:)`), so the key has to include the blend.
+    private var annotationTextures: [AnnotationTextureKey: PageImage] = [:]
+    private var nextAnnotationTextureGeneration: UInt64 = 1_000
+
+    /// A 1x1 texture in `color`, uploaded straight or with `opacity` baked in for multiply.
+    ///
+    /// The colour already carries the annotation's opacity in its alpha channel (the engine sets
+    /// it from `/CA`), which is exactly what alpha-over needs. Multiply is the case that needs the
+    /// opacity folded into the channels instead: the GPU mixes in linear light where PDF mixes in
+    /// the stored colour space, so an unbaked translucent highlight comes out visibly brighter
+    /// than the file says (see `AnnotationColor.baked(opacity:)`).
+    private func annotationTexture(for color: AnnotationColor, opacity: Double, blend: QuadBlend) -> PageImage {
+        let drawn = blend == .multiply ? color.baked(opacity: opacity) : color
+        let key = AnnotationTextureKey(color: drawn, blend: blend)
+        if let cached = annotationTextures[key] { return cached }
+        nextAnnotationTextureGeneration += 1
+        let image = PageImage(
             pixelWidth: 1,
             pixelHeight: 1,
             pointSize: .zero,
-            bgra: Data(colour.bgra),
-            generation: UInt64(2 + index)
+            bgra: Data(key.color.bgra),
+            generation: nextAnnotationTextureGeneration
         )
+        annotationTextures[key] = image
+        return image
+    }
+
+    /// Identity of a tint texture: the exact bytes drawn, so two annotations that differ only in
+    /// opacity do not share one.
+    private struct AnnotationTextureKey: Hashable {
+        let color: AnnotationColor
+        let blend: QuadBlend
     }
 
     /// Citations per page and the document's reference list.
@@ -1159,6 +1361,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadThumbnails()
             loadReferences()
             loadFigures()
+            loadDocumentAnnotations()
             return true
 
         } catch {
@@ -1193,6 +1396,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         captionMentionsInFlight = []
         figures = []
         references = []
+        documentAnnotations = []
+        documentAnnotationsLoading = false
+        documentAnnotationsError = nil
+        annotationTextures = [:]
         outline = []
         thumbnails = [:]
         thumbnailsInFlight = []
@@ -1519,7 +1726,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func addAnnotationFromSelection(
         kind: Annotation.Kind = .highlight,
-        colorIndex: Int = 0,
+        color: AnnotationColor = AppState.highlightPalette[0].color,
         note: String = ""
     ) -> Bool {
         guard let selection, let url = document?.url else { return false }
@@ -1531,7 +1738,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             page: selection.page,
             start: selection.range.lowerBound,
             end: selection.range.upperBound,
-            colorIndex: min(max(colorIndex, 0), Self.highlightPalette.count - 1),
+            color: color,
             note: note,
             createdAt: Date()
         )
@@ -1548,8 +1755,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     @discardableResult
-    public func addHighlightFromSelection(colorIndex: Int = 0) -> Bool {
-        addAnnotationFromSelection(kind: .highlight, colorIndex: colorIndex)
+    public func addHighlightFromSelection(
+        color: AnnotationColor = AppState.highlightPalette[0].color
+    ) -> Bool {
+        addAnnotationFromSelection(kind: .highlight, color: color)
     }
 
     public func removeAnnotation(_ id: UUID) {
@@ -1754,6 +1963,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt = top
         }
         reloadVisiblePages()
+    }
+
+    /// Scrolls a page into view and highlights an annotation **the PDF carries**.
+    ///
+    /// A loaded annotation has no character range here (the text layer is not what it marks), so
+    /// the only thing to show is where it is: scroll so its box is on screen, and select the
+    /// text under the box when the page's text layer can tell us which characters those are —
+    /// which is what makes a note in the sidebar feel like it points at something.
+    public func jump(toDocumentAnnotation annotation: DocumentAnnotation) {
+        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt)
+        let box = annotation.boxes.first
+        // Put the annotation a third of the way down the viewport rather than at its very top:
+        // a highlight is easier to recognise with the text above it visible.
+        let target = top + (box?.yPt ?? 0) - viewportHeightContentPt / 3
+        scrollYPt = max(0, min(target, max(0, contentHeightPt - viewportHeightContentPt)))
+
+        selection = nil
+        selectionAnchor = nil
+        if !selectText(under: annotation) {
+            // The page was off-screen, so its text layer may not be loaded yet; fetch it and
+            // select afterwards. Without this, jumping to a note from the sidebar would land on
+            // the right page with nothing marked.
+            let page = annotation.page
+            let epoch = documentEpoch
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let extracted = try? await self.engine.textPage(page) else { return }
+                guard epoch == self.documentEpoch, self.selection == nil else { return }
+                self.textPages[page] = extracted
+                _ = self.selectText(under: annotation)
+                self.reloadVisiblePages()
+            }
+        }
+        reloadVisiblePages()
+    }
+
+    /// Selects the text an annotation's box covers, when its page's text layer is available.
+    ///
+    /// Returns false when it is not (yet), which the caller uses to decide whether to fetch it.
+    @discardableResult
+    private func selectText(under annotation: DocumentAnnotation) -> Bool {
+        guard let box = annotation.boxes.first,
+              let textPage = textPages[annotation.page] else { return false }
+        // A sticky note's /Rect is the icon, which may sit in the margin next to the text it
+        // comments on; the other kinds box the text itself.
+        let range = textPage.characterRange(in: CGRect(
+            x: box.xPt,
+            y: box.yPt,
+            width: box.widthPt,
+            height: box.heightPt
+        ))
+        guard let range else { return false }
+        selection = Selection(page: annotation.page, range: range)
+        return true
     }
 
     /// `document.pdf` → `document.pdf.aris-annotations.json`.
@@ -2061,6 +2324,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(
                 Data("aris-figures: \(self.figures.count) caption(s)\n".utf8)
             )
+        }
+    }
+
+    /// Loads the annotations the document itself carries (once per open document).
+    ///
+    /// Document-wide: the Rust side scans every page and caches the result for as long as the
+    /// file is open, and the sidebar wants the notes from the whole document, not just the page
+    /// on screen. A failure is reported rather than swallowed — "the file has no annotations" and
+    /// "the annotations could not be read" look identical on an empty canvas otherwise.
+    private func loadDocumentAnnotations() {
+        guard documentAnnotations.isEmpty, !documentAnnotationsLoading else { return }
+        documentAnnotationsLoading = true
+        documentAnnotationsError = nil
+        let epoch = documentEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard epoch == self.documentEpoch else { return }
+            defer { if epoch == self.documentEpoch { self.documentAnnotationsLoading = false } }
+            do {
+                let found = try await self.engine.annotations()
+                guard epoch == self.documentEpoch else { return }
+                self.documentAnnotations = found
+                self.reloadVisiblePages()
+                FileHandle.standardError.write(
+                    Data("aris-pdf-annotations: \(found.count) in the file, \(self.documentNotes.count) note(s)\n".utf8)
+                )
+            } catch {
+                guard epoch == self.documentEpoch else { return }
+                self.documentAnnotationsError = String(describing: error)
+                self.statusMessage = "Could not read the annotations in this PDF"
+                FileHandle.standardError.write(
+                    Data("aris-pdf-annotations: read failed: \(error)\n".utf8)
+                )
+            }
         }
     }
 
@@ -3087,11 +3384,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         for (annotationIndex, annotation) in annotations.enumerated() {
-            guard highlightTextures.indices.contains(annotation.colorIndex) else { continue }
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
-                image: highlightTextures[annotation.colorIndex],
+                // Our own annotations are drawn alpha-over: the sidecar colour already carries
+                // the opacity the reader chose, and it was chosen against a white page.
+                image: annotationTexture(for: annotation.color, opacity: 1.0, blend: .normal),
                 // Distinct ids keep the canvas from reusing a texture it already has.
                 idBase: -2_000_000_000 + annotationIndex * 4_096,
                 // An underline is a thin bar on the baseline instead of a filled box.
@@ -3099,6 +3397,59 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
                 to: &pages
             )
+        }
+
+        appendDocumentAnnotations(to: &pages)
+    }
+
+    /// Draws the annotations the PDF itself carries.
+    ///
+    /// Only the four markup kinds have geometry worth drawing, and each `/QuadPoints` entry is
+    /// drawn as its own box. The blend mode comes from the file's `/BM`: highlighting a line in
+    /// Preview stores `/Multiply`, and drawing that alpha-over would replace the page colour
+    /// under the highlight instead of multiplying into it — a different picture for the same
+    /// file. `/CA` is baked into the colour for multiply (see `AnnotationColor.baked`), because
+    /// PDF mixes opacity in the stored colour space and the GPU mixes in linear light.
+    ///
+    /// Sticky notes and free text are not drawn here: a note is an icon with a popup, and this
+    /// canvas has no popup. They are listed in the sidebar instead, which is also where their
+    /// text can actually be read.
+    private func appendDocumentAnnotations(to pages: inout [CanvasPage]) {
+        for (annotationIndex, annotation) in documentAnnotations.enumerated() {
+            guard annotation.visible, annotation.isMarkup else { continue }
+            guard let placement = visiblePagePlacements.first(where: { $0.index == annotation.page })
+            else { continue }
+
+            // A missing /C is not black: it is "the file did not say", and a highlight without a
+            // colour is drawn in a neutral grey so it is still visible without inventing a hue.
+            let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: 0xFF)
+            let blend = annotation.quadBlend
+            let image = annotationTexture(
+                for: color,
+                opacity: annotation.opacity ?? 1.0,
+                blend: blend
+            )
+
+            for (boxIndex, box) in annotation.boxes.enumerated() {
+                // Underline, strikeout and squiggly are lines through or under the text, not
+                // filled boxes: the same thin-bar trick our own annotations use, with the bar
+                // placed at the bottom (underline, squiggly) or the middle (strikeout).
+                let isLine = annotation.kind != "highlight"
+                let scale: CGFloat = isLine ? 0.12 : 1.0
+                let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
+
+                pages.append(CanvasPage(
+                    placement: PagePlacement(
+                        index: -3_000_000_000 + annotationIndex * 16 + boxIndex,
+                        topPt: placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0),
+                        leftPt: placement.leftPt + box.xPt,
+                        widthPt: box.widthPt,
+                        heightPt: max(box.heightPt * scale, 1)
+                    ),
+                    image: image,
+                    blend: blend
+                ))
+            }
         }
     }
 

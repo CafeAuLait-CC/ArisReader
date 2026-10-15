@@ -120,6 +120,9 @@ struct ReaderChecks {
         try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
         try await annotationChecks(a: a, b: b)
         try await annotationRecoveryChecks(a: a, b: b)
+        try await annotationColourChecks(a: a)
+        try await annotationReadingChecks(
+            url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await previewChecks(url: b)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()

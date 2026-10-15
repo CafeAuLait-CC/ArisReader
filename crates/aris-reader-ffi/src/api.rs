@@ -182,6 +182,8 @@ pub struct ArisDocument {
     references: Mutex<Option<ReferenceCache>>,
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
+    /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
+    annotations: Mutex<Option<Vec<AnnotationRecord>>>,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -277,6 +279,7 @@ impl ArisDocument {
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
+            annotations: Mutex::new(None),
         }))
     }
 
@@ -743,6 +746,88 @@ impl ArisDocument {
         Ok(entries)
     }
 
+    /// Annotations the document **already carries**, from every page, in **view space**.
+    ///
+    /// This is the other half of this application's annotation story: the sidecar holds what the
+    /// reader wrote, and this reads what is in the file — a PDF marked up in Preview, or one
+    /// somebody else annotated. Every page is scanned: a cap like the reference index's 120 pages
+    /// would silently hide notes in the back matter, and an annotation-free page costs one page
+    /// load and one count (measured 2026-10-15 on the generated 300-page fixture through
+    /// `FPDF_LoadPage` + `FPDFPage_GetAnnotCount`: 6.7 ms for all 300, 22 µs per page — a one-off
+    /// cost on the open path, cached below).
+    ///
+    /// Cached for the lifetime of the open document, like [`ArisDocument::figures`]: a PDF cannot
+    /// change under us while it is open, and the canvas would otherwise re-scan on every rebuild.
+    ///
+    /// A page whose annotations cannot be read fails the whole call rather than quietly
+    /// disappearing from the answer — "the file has no annotations" and "we could not read them"
+    /// are different things, and the shell says so.
+    pub fn annotations(&self) -> Result<Vec<AnnotationRecord>, ArisFfiError> {
+        if let Ok(cache) = self.annotations.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        let mut records = Vec::new();
+        let mut geometries: std::collections::HashMap<u32, aris_reader_core::PageGeometry> =
+            std::collections::HashMap::new();
+
+        for page in 0..self.backend.page_count() {
+            let geometry = match geometries.get(&page) {
+                Some(geometry) => *geometry,
+                None => {
+                    let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+                    geometries.insert(page, geometry);
+                    geometry
+                }
+            };
+
+            for annotation in self.backend.annotations(PageIndex(page))? {
+                let view = page_region_to_view(annotation.rect, geometry);
+                let quads = annotation
+                    .quads
+                    .into_iter()
+                    .map(|quad| {
+                        let view = page_region_to_view(quad, geometry);
+                        AnnotationQuad {
+                            x_pt: view.origin.x,
+                            y_pt: view.origin.y,
+                            width_pt: view.size.width,
+                            height_pt: view.size.height,
+                        }
+                    })
+                    .collect();
+
+                records.push(AnnotationRecord {
+                    page,
+                    kind: annotation.kind.as_str().to_string(),
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
+                    quads,
+                    color: annotation.color.map(|color| AnnotationColorRecord {
+                        red: color.red,
+                        green: color.green,
+                        blue: color.blue,
+                    }),
+                    opacity: annotation.opacity,
+                    blend: annotation.blend.as_str().to_string(),
+                    contents: annotation.contents,
+                    author: annotation.author,
+                    modified: annotation.modified,
+                    visible: annotation.visible,
+                });
+            }
+        }
+
+        if let Ok(mut cache) = self.annotations.lock() {
+            *cache = Some(records.clone());
+        }
+        Ok(records)
+    }
+
     /// Total height of the scrolling content for the given page gap.
     pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
         self.layout(gap_pt).content_height_pt()
@@ -1021,6 +1106,66 @@ pub struct LinkRegion {
     pub height_pt: f64,
 }
 
+/// One annotation that was already inside the PDF, boxed in **view space**.
+///
+/// `kind` is what this reader can act on: `highlight`, `underline`, `strikeout`, `squiggly`,
+/// `text` (a sticky note) and `freeText`, or — for a subtype this build does not model — the
+/// PDF's own `/Subtype` name (`Ink`, `Stamp`, …), so the shell can still list it.
+///
+/// The rectangle and the quads are in view space (points, top-left origin), the same convention
+/// as [`LinkRecord`] and [`ReferenceFragment`]; `/QuadPoints` is what markup annotations are
+/// really drawn from, so prefer `quads` and fall back to `x_pt`/`y_pt`/`width_pt`/`height_pt`
+/// when it is empty.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnnotationRecord {
+    /// Page the annotation is on (0-based).
+    pub page: u32,
+    /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype.
+    pub kind: String,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// `/QuadPoints`, one box per quadrilateral; empty when the file has none.
+    pub quads: Vec<AnnotationQuad>,
+    /// `/C` as 8-bit sRGB; `None` when the file carries no colour (sticky notes usually do not).
+    pub color: Option<AnnotationColorRecord>,
+    /// `/CA` constant opacity in `0.0..=1.0`; `None` when the file does not state one, which
+    /// means opaque.
+    pub opacity: Option<f64>,
+    /// `/BM`: `normal`, `multiply`, or the blend mode's PDF name.
+    ///
+    /// Highlights are normally stored as `multiply`, and a highlight drawn with plain alpha-over
+    /// does **not** look like the same highlight in Preview — the canvas answers that with
+    /// `QuadBlend::Multiply`.
+    pub blend: String,
+    /// `/Contents`.
+    pub contents: Option<String>,
+    /// `/T`.
+    pub author: Option<String>,
+    /// `/M`, as the file writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
+    pub modified: Option<String>,
+    /// False when the file marks the annotation hidden/invisible/`/NoView`.
+    pub visible: bool,
+}
+
+/// One quadrilateral of an annotation's `/QuadPoints`, in view space.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct AnnotationQuad {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// An annotation colour, 8-bit sRGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct AnnotationColorRecord {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
 /// One outline entry.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct OutlineEntry {
@@ -1279,6 +1424,7 @@ impl ArisEngine {
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
+            annotations: Mutex::new(None),
         }))
     }
 }
@@ -1482,6 +1628,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn annotations_already_in_the_pdf_cross_the_ffi_intact() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: annotated fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+        let records = document.annotations().expect("annotations");
+
+        assert_eq!(records.len(), 7, "five on page 1, two on page 2");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "highlight",
+                "underline",
+                "strikeout",
+                "text",
+                "freeText",
+                "squiggly",
+                "highlight"
+            ]
+        );
+
+        let highlight = &records[0];
+        assert_eq!(highlight.page, 0);
+        // View space, top-left origin: `/Rect [72 671 460 701]` on an 842 pt page has its top edge
+        // 842 - 701 = 141 pt below the top, and keeps its width and height.
+        assert_eq!(highlight.x_pt, 72.0);
+        assert_eq!(highlight.y_pt, 842.0 - 701.0);
+        assert_eq!(highlight.width_pt, 388.0);
+        assert_eq!(highlight.height_pt, 30.0);
+        assert_eq!(highlight.quads.len(), 2, "the highlight spans two lines");
+        assert_eq!(highlight.quads[1].x_pt, 72.0);
+        assert_eq!(highlight.quads[1].y_pt, 842.0 - 686.0);
+        assert_eq!(highlight.quads[1].width_pt, 288.0);
+        assert_eq!(highlight.quads[1].height_pt, 15.0);
+
+        // The colour the file carries, not a palette index: `/C [0.2 0.6 1]`.
+        let color = highlight.color.expect("the highlight has a colour");
+        assert_eq!((color.red, color.green, color.blue), (51, 153, 255));
+        assert_eq!(highlight.opacity, Some(0.5));
+        // The blend mode has to arrive with it: it is what makes the colour look the same here
+        // as in the viewer that wrote the file.
+        assert_eq!(highlight.blend, "multiply");
+        assert_eq!(
+            highlight.contents.as_deref(),
+            Some("Highlight contents for the round trip.")
+        );
+        assert_eq!(highlight.author.as_deref(), Some("Reviewer A"));
+        assert_eq!(highlight.modified.as_deref(), Some("D:20240102030405Z"));
+        assert!(highlight.visible);
+
+        // A sticky note keeps its text and reports no colour rather than inventing black.
+        let sticky = &records[3];
+        assert_eq!(sticky.kind, "text");
+        assert_eq!(sticky.color, None);
+        assert_eq!(sticky.contents.as_deref(), Some("A sticky note body."));
+        assert_eq!(sticky.author.as_deref(), Some("Reviewer D"));
+
+        // Every record has to be inside its own page: a Y flip that quietly dropped the crop
+        // origin would put one of these outside the box.
+        let height = document.page_size_pt(0).expect("page size").height_pt;
+        for record in &records {
+            assert!(
+                record.x_pt >= -1.0 && record.x_pt + record.width_pt <= 595.0 + 1.0,
+                "{record:?} is outside the page horizontally"
+            );
+            assert!(
+                record.y_pt >= -1.0 && record.y_pt + record.height_pt <= height + 1.0,
+                "{record:?} is outside the page vertically"
+            );
+        }
+    }
+
+    /// The user's question at the FFI boundary: somebody else's colour is reported as it is.
+    #[test]
+    fn a_colour_outside_the_palette_survives_the_ffi() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: annotated fixture or PDFium unavailable");
+            return;
+        }
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+        let records = document.annotations().expect("annotations");
+
+        // The four colours `AppState.highlightPalette` used to be limited to, as RGB.
+        let old_palette = [
+            (255, 216, 64),
+            (112, 208, 96),
+            (96, 160, 240),
+            (224, 112, 176),
+        ];
+        let blue = records[0].color.expect("colour");
+        assert_eq!((blue.red, blue.green, blue.blue), (51, 153, 255));
+        assert!(
+            !old_palette.contains(&(blue.red, blue.green, blue.blue)),
+            "the fixture's blue is deliberately outside the old palette"
+        );
+        // …and the same file's other annotations keep their own colours, not this one.
+        let red = records[1].color.expect("underline colour");
+        assert_eq!((red.red, red.green, red.blue), (229, 25, 25));
     }
 
     #[test]

@@ -39,13 +39,29 @@ def escape_pdf_string(text: str) -> str:
     return text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
 
-def build_pdf(pages: list[tuple[str, int]]) -> bytes:
-    """Assemble a PDF from (content_stream, rotation_degrees) pairs."""
+def build_pdf(
+    pages: list[tuple[str, int]], annotations: dict[int, list[bytes]] | None = None
+) -> bytes:
+    """Assemble a PDF from (content_stream, rotation_degrees) pairs.
+
+    `annotations` maps a page index to the annotation dictionaries to attach to it.
+    Annotation objects are numbered after every page, so a file with no annotations is
+    byte-for-byte what this generator has always written.
+    """
+    annotations = annotations or {}
     objects: list[bytes] = []
 
     # Object numbering: 1 = catalog, 2 = page tree, 3 = font, then per page
-    # (page object, content stream).
+    # (page object, content stream), then the annotations page by page.
     page_object_ids = [4 + 2 * i for i in range(len(pages))]
+    first_annot_id = 4 + 2 * len(pages)
+    annot_ids: dict[int, list[int]] = {}
+    next_annot_id = first_annot_id
+    for index in range(len(pages)):
+        ids = list(range(next_annot_id, next_annot_id + len(annotations.get(index, []))))
+        annot_ids[index] = ids
+        next_annot_id += len(ids)
+
     objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
     kids = " ".join(f"{pid} 0 R" for pid in page_object_ids)
     objects.append(
@@ -59,12 +75,16 @@ def build_pdf(pages: list[tuple[str, int]]) -> bytes:
     for index, (content, rotation) in enumerate(pages):
         content_id = page_object_ids[index] + 1
         rotate = f" /Rotate {rotation}" if rotation else ""
+        annots = ""
+        if annot_ids[index]:
+            refs = " ".join(f"{aid} 0 R" for aid in annot_ids[index])
+            annots = f" /Annots [{refs}]"
         objects.append(
             (
                 f"<< /Type /Page /Parent 2 0 R "
                 f"/MediaBox [0 0 {A4_WIDTH} {A4_HEIGHT}] "
                 f"/Resources << /Font << /F1 3 0 R >> >> "
-                f"/Contents {content_id} 0 R{rotate} >>"
+                f"/Contents {content_id} 0 R{rotate}{annots} >>"
             ).encode("ascii")
         )
         stream = content.encode("cp1252")
@@ -73,6 +93,9 @@ def build_pdf(pages: list[tuple[str, int]]) -> bytes:
             + stream
             + b"\nendstream"
         )
+
+    for index in range(len(pages)):
+        objects.extend(annotations.get(index, []))
 
     # Serialize with a correct cross-reference table: every offset is measured
     # from the start of the file, so build the body first and then measure.
@@ -92,6 +115,175 @@ def build_pdf(pages: list[tuple[str, int]]) -> bytes:
         f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
     ).encode("ascii")
     return bytes(out)
+
+
+def quad_points(rects: list[tuple[float, float, float, float]]) -> str:
+    """The `/QuadPoints` array for a list of (left, bottom, right, top) rectangles.
+
+    Order matters and is easy to get wrong: PDF 32000-1 table 179 wants each
+    quadrilateral's four vertices in counterclockwise order, which is the order
+    `pdfium-render` itself writes when it builds quads from a rectangle
+    (lower-left, lower-right, upper-right, upper-left).
+    """
+    parts: list[str] = []
+    for left, bottom, right, top in rects:
+        parts += [
+            f"{left:g}",
+            f"{bottom:g}",
+            f"{right:g}",
+            f"{bottom:g}",
+            f"{right:g}",
+            f"{top:g}",
+            f"{left:g}",
+            f"{top:g}",
+        ]
+    return "[" + " ".join(parts) + "]"
+
+
+def annotation(
+    subtype: str,
+    rect: tuple[float, float, float, float],
+    *,
+    extra: str = "",
+    contents: str | None = None,
+    author: str | None = None,
+    modified: str | None = None,
+) -> bytes:
+    """One annotation dictionary. `/F 4` is the Print flag, the value every producer writes."""
+    left, bottom, right, top = rect
+    body = f"<< /Type /Annot /Subtype /{subtype} /Rect [{left:g} {bottom:g} {right:g} {top:g}]"
+    if extra:
+        body += f" {extra}"
+    if contents is not None:
+        body += f" /Contents ({escape_pdf_string(contents)})"
+    if author is not None:
+        body += f" /T ({escape_pdf_string(author)})"
+    if modified is not None:
+        body += f" /M ({modified})"
+    body += " /F 4 >>"
+    return body.encode("cp1252")
+
+
+def body_line_box(index: int, right: float) -> tuple[float, float, float, float]:
+    """The box of body line `index` on a `text_page`, in PDF user space.
+
+    `text_page` sets the first body line 690 pt up with 15 pt leading and an 11 pt face, so a
+    line's box is `y - 4 … y + 11`. Deriving the annotation geometry from that (instead of
+    picking round numbers that happen to sit nowhere near the text) is what makes the fixture a
+    realistic "somebody highlighted this line" file: the markup really does cover the glyphs,
+    which is also what lets a reader select the text under a loaded highlight.
+    """
+    y = 690 - 15 * index
+    return (72, y - 4, right, y + 11)
+
+
+def highlight_box() -> tuple[float, float, float, float]:
+    """The union of the two body-line boxes the fixture's highlight covers."""
+    first = body_line_box(0, 460)
+    second = body_line_box(1, 360)
+    return (first[0], second[1], first[2], first[3])
+
+
+def annotated_page_fixture() -> dict[int, list[bytes]]:
+    """Annotations attached to the two pages of `annotated.pdf`.
+
+    The file has to stay license-clean and hand-written like every other fixture, so the
+    annotations are written straight into the page's `/Annots` array. Between them they
+    cover what a reader has to survive in the wild:
+
+    * all four text-markup subtypes, each with quad points;
+    * `/BM /Multiply` with `/CA 0.5` on the highlight, i.e. the pair that decides how a
+      highlight has to be composited, and a markup annotation with neither key;
+    * a colour (`/C [0.2 0.6 1]` — a blue no Lyra palette entry matches, which is the
+      user's actual question: does somebody else's colour come through?);
+    * a sticky note with **no** `/C` at all, which PDFium reports as black unless the
+      reader checks `HasKey("C")` first;
+    * a `/Link`, which the reader has to leave out of the annotation list while the link
+      path still reports it;
+    * a free-text annotation;
+    * a highlight with no `/QuadPoints`, whose `/Rect` is the only geometry it has.
+    """
+    return {
+        0: [
+            # The one that carries everything: colour, opacity, blend mode, author, date.
+            annotation(
+                "Highlight",
+                # Two consecutive body lines, so the reader has to keep both quads; the /Rect is
+                # their union, as a producer would write it.
+                highlight_box(),
+                extra=f"/QuadPoints {quad_points([body_line_box(0, 460), body_line_box(1, 360)])} "
+                f"/C [0.2 0.6 1] /CA 0.5 /BM /Multiply",
+                contents="Highlight contents for the round trip.",
+                author="Reviewer A",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Underline",
+                body_line_box(2, 460),
+                extra=f"/QuadPoints {quad_points([body_line_box(2, 460)])} /C [0.9 0.1 0.1] /CA 1",
+                contents="Underline contents.",
+                author="Reviewer B",
+                modified="D:20240102030405Z",
+            ),
+            # The PDF name is `/StrikeOut` (capital O, PDF 32000-1 table 170); PDFium
+            # matches it exactly and reports an unknown subtype for any other spelling.
+            annotation(
+                "StrikeOut",
+                body_line_box(3, 400),
+                extra=f"/QuadPoints {quad_points([body_line_box(3, 400)])} /C [0.1 0.6 0.2]",
+                contents="Strikeout contents.",
+                author="Reviewer C",
+                modified="D:20240102030405Z",
+            ),
+            # No /C anywhere: the colour key is absent, not black.
+            annotation(
+                "Text",
+                (500, 700, 520, 720),
+                extra="/Name /Comment",
+                contents="A sticky note body.",
+                author="Reviewer D",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "FreeText",
+                (72, 620, 320, 660),
+                extra="/DA (/Helv 10 Tf 0 g) /C [1 0 0]",
+                contents="Free text annotation body.",
+                author="Reviewer E",
+                modified="D:20240102030405Z",
+            ),
+            # A link is *not* content: it is navigation, and this backend already answers it
+            # through the link path. It is here so the boundary is tested — a real paper can
+            # carry thousands of these (2751 of the 2767 annotations in the local corpus), and
+            # none of them belongs in a list of a reader's highlights.
+            annotation(
+                "Link",
+                body_line_box(4, 460),
+                extra="/A << /S /URI /URI (https://example.org/annotated) >> /Border [0 0 0]",
+            ),
+        ],
+        1: [
+            annotation(
+                "Squiggly",
+                body_line_box(0, 460),
+                extra=f"/QuadPoints {quad_points([body_line_box(0, 460)])} "
+                f"/C [0.5 0.2 0.8] /CA 0.75 /BM /Multiply",
+                contents="Squiggly contents.",
+                author="Reviewer F",
+                modified="D:20240102030405Z",
+            ),
+            # Malformed but real: markup geometry is the /Rect alone.
+            annotation(
+                "Highlight",
+                body_line_box(2, 300),
+                extra="/C [0.2 0.6 1]",
+                contents="Highlight without quad points.",
+                author="Reviewer G",
+                modified="D:20240102030405Z",
+            ),
+        ],
+    }
+
 
 
 def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
@@ -273,6 +465,32 @@ def main() -> int:
         path = out_dir / name
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
+
+    # 5) Annotations written into the file: the reader has to find them without this
+    #    application ever having written them. Kept as its own entry because it is the only
+    #    fixture with an `/Annots` array, and because the widths above are what the existing
+    #    corpus pins depend on.
+    annotated_pages = [
+        (
+            text_page(
+                "Annotated page 1",
+                "someone else's highlights, notes and free text",
+                [f"Line {number}: marked up by another viewer." for number in range(1, 9)],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "Annotated page 2",
+                "annotations on a second page",
+                [f"Line {number}: a different page's markup." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    path = out_dir / "annotated.pdf"
+    path.write_bytes(build_pdf(annotated_pages, annotated_page_fixture()))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(annotated_pages)} page(s))")
 
     if long_pages > 0:
         pages = long_document(long_pages)

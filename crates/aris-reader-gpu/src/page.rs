@@ -82,15 +82,87 @@ fn vs_page(@builtin(vertex_index) index: u32) -> VertexOutput {
 fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(page_texture, page_sampler, in.uv);
 }
+
+// `/BM /Multiply`, the blend mode a PDF highlight is normally stored with.
+//
+// The tint texture holds the annotation colour C gamma-encoded (sRGB) and its opacity a,
+// straight rather than premultiplied. The pipeline's blend state is
+// `src * dst + dst * (1 - a)`, so emitting `C * a` yields `dst * (a * C + 1 - a)`, which is
+// PDF's multiply with constant opacity (PDF 32000-1 §11.3.5) for an opaque backdrop.
+//
+// Why a linear-space GPU multiply comes out as PDF's gamma-space multiply: the sampler
+// decodes C from sRGB to linear and the sRGB render target encodes the result back, and
+// `encode(decode(p) * decode(c)) == p * c` for the same transfer function. Doing the
+// arithmetic in linear light *without* that round trip would darken every highlight.
+@fragment
+fn fs_page_multiply(in: VertexOutput) -> @location(0) vec4<f32> {
+    let colour = textureSample(page_texture, page_sampler, in.uv);
+    return vec4<f32>(colour.rgb * colour.a, colour.a);
+}
 "#;
 
-/// Page-pipeline state: shader, one pipeline per target format, sampler, uniform buffer
-/// and the uploaded textures.
+/// How a textured quad is composited with what is already in the frame.
+///
+/// This is not cosmetic. A highlight is drawn as a tint quad over the page, and PDF stores
+/// highlights with `/BM /Multiply`: drawing one with plain alpha-over paints the stored colour
+/// *over* the glyphs instead of multiplying into them, so the same file shows a different
+/// colour here than in Preview. [`QuadBlend::Multiply`] is that missing half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QuadBlend {
+    /// Straight alpha-over: pages, selection, and any overlay that should cover what is below.
+    Normal,
+    /// The PDF `/BM /Multiply` blend mode.
+    ///
+    /// Callers that have a constant opacity to apply should **bake it into the tint colour
+    /// first**: upload `c' = a·c + (1 − a)` at alpha 255 rather than `c` at alpha `a`. PDF mixes
+    /// the opacity in the stored (gamma-encoded) colour space while the hardware mixes in linear
+    /// light, and the two are not the same picture: measured on a 0xE0 page with a 0x50 channel at
+    /// `/CA 0.5`, the unbaked path lands 23/255 (about 9%) brighter than the file. Baking costs
+    /// one rounding step at upload and makes the drawn colour exactly the file's — see the
+    /// `multiply_with_baked_opacity_matches_pdf` test.
+    Multiply,
+}
+
+impl QuadBlend {
+    /// The fragment entry point and blend state that implement this mode.
+    fn fragment_entry(self) -> &'static str {
+        match self {
+            Self::Normal => "fs_page",
+            Self::Multiply => "fs_page_multiply",
+        }
+    }
+
+    /// The blend state paired with [`QuadBlend::fragment_entry`].
+    ///
+    /// `Multiply` reads the destination as the source factor, which is what makes the shader's
+    /// `C * a` multiply the page colour; the alpha channel keeps the usual
+    /// over-operator so a translucent highlight still ends up with a sane alpha.
+    fn blend_state(self) -> wgpu::BlendState {
+        match self {
+            Self::Normal => wgpu::BlendState::ALPHA_BLENDING,
+            Self::Multiply => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+        }
+    }
+}
+
+/// Page-pipeline state: shader, one pipeline per (target format, blend mode), sampler, uniform
+/// buffer and the uploaded textures.
 pub struct PageState {
     shader: wgpu::ShaderModule,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pipelines: HashMap<(wgpu::TextureFormat, QuadBlend), wgpu::RenderPipeline>,
     textures: HashMap<TextureId, wgpu::TextureView>,
     next_texture_id: u64,
 }
@@ -157,9 +229,14 @@ impl PageState {
         }
     }
 
-    /// Creates (once per target format) the textured-quad pipeline.
-    pub(crate) fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        if self.pipelines.contains_key(&format) {
+    /// Creates, once per (target format, blend mode), the textured-quad pipeline.
+    pub(crate) fn ensure_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        blend: QuadBlend,
+    ) {
+        if self.pipelines.contains_key(&(format, blend)) {
             return;
         }
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -179,10 +256,10 @@ impl PageState {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.shader,
-                entry_point: Some("fs_page"),
+                entry_point: Some(blend.fragment_entry()),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(blend.blend_state()),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -193,7 +270,16 @@ impl PageState {
             multiview_mask: None,
             cache: None,
         });
-        self.pipelines.insert(format, pipeline);
+        self.pipelines.insert((format, blend), pipeline);
+    }
+
+    /// The pipeline for `format`/`blend`; the caller must have called [`Self::ensure_pipeline`].
+    fn pipeline(
+        &self,
+        format: wgpu::TextureFormat,
+        blend: QuadBlend,
+    ) -> Option<&wgpu::RenderPipeline> {
+        self.pipelines.get(&(format, blend))
     }
 
     fn texture_count(&self) -> usize {
@@ -300,7 +386,11 @@ impl GpuContext {
         destination: [f32; 4],
         clear: [f64; 4],
     ) -> Result<FrameReport> {
-        self.render_pages(surface_id, &[(texture_id, destination)], clear)
+        self.render_pages(
+            surface_id,
+            &[(texture_id, destination, QuadBlend::Normal)],
+            clear,
+        )
     }
 
     /// Draws several textured quads into one frame and presents it.
@@ -309,10 +399,14 @@ impl GpuContext {
     /// tile) goes into a single frame. Each quad gets its own small uniform buffer,
     /// because `Queue::write_buffer` is ordered against submissions, not against draws
     /// inside one encoder — sharing a buffer would make every quad use the last values.
+    ///
+    /// Each draw carries its own [`QuadBlend`]: a page is painted over the background, while a
+    /// PDF highlight loaded from the file is multiplied into the page under it (see
+    /// [`QuadBlend::Multiply`]). Draws are composited in the order given.
     pub fn render_pages(
         &mut self,
         surface_id: SurfaceId,
-        draws: &[(TextureId, [f32; 4])],
+        draws: &[(TextureId, [f32; 4], QuadBlend)],
         clear: [f64; 4],
     ) -> Result<FrameReport> {
         let started = std::time::Instant::now();
@@ -362,14 +456,17 @@ impl GpuContext {
             )
         };
 
-        self.page.ensure_pipeline(&self.device, format);
+        // One pipeline per blend mode in use, created before the shared borrows below.
+        for (_, _, blend) in draws {
+            self.page.ensure_pipeline(&self.device, format, *blend);
+        }
 
         // Per-quad uniform buffers and bind groups. Each quad needs its own buffer because
         // `Queue::write_buffer` is ordered against submissions, not against the draws
         // inside a single encoder; the buffers stay alive until after the submit below.
         let mut bind_groups = Vec::with_capacity(draws.len());
         let mut uniform_buffers = Vec::with_capacity(draws.len());
-        for (texture_id, rect) in draws {
+        for (texture_id, rect, _) in draws {
             let uniforms: [f32; 8] = [
                 rect[0],
                 rect[1],
@@ -416,11 +513,15 @@ impl GpuContext {
             uniform_buffers.push(buffer);
         }
 
-        let pipeline = self
-            .page
-            .pipelines
-            .get(&format)
-            .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))?;
+        // Resolve one pipeline per draw, in draw order.
+        let pipelines = draws
+            .iter()
+            .map(|(_, _, blend)| {
+                self.page
+                    .pipeline(format, *blend)
+                    .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let target = frame
             .texture
@@ -440,7 +541,7 @@ impl GpuContext {
                 &target,
                 clear,
                 index == 0,
-                Some((pipeline, bind_group)),
+                Some((pipelines[index], bind_group)),
             );
         }
         if bind_groups.is_empty() {
@@ -474,13 +575,36 @@ impl GpuContext {
     /// Renders `texture` 1:1 into an offscreen texture and reads the pixels back.
     ///
     /// This is the window-less verification path for the page pipeline: same upload,
-    /// same shader, same sampler, no `CAMetalLayer` required.
+    /// same shader, same sampler, no `CAMetalLayer` required. One quad, alpha-over, on black.
     pub fn offscreen_probe_textured(
         &mut self,
         texture_id: TextureId,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
+        let rect = [0.0, 0.0, width as f32, height as f32];
+        self.offscreen_probe_layers(&[(texture_id, rect, QuadBlend::Normal)], width, height)
+    }
+
+    /// Renders a stack of textured quads offscreen, in order, and reads the pixels back.
+    ///
+    /// The window-less verification path for anything that depends on how quads composite:
+    /// the first draw clears (so a page paints its own background), every later draw blends
+    /// into what is already there with its own [`QuadBlend`]. Returns tightly packed RGBA8
+    /// rows — no 256-byte padding, unlike the readback buffer itself.
+    pub fn offscreen_probe_layers(
+        &mut self,
+        draws: &[(TextureId, [f32; 4], QuadBlend)],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>> {
+        if width == 0 || height == 0 {
+            return Err(ArisError::new(
+                ErrorCode::InvalidArgument,
+                "an offscreen probe needs a non-zero size",
+            ));
+        }
+
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("page-probe-target"),
@@ -507,33 +631,35 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let uniforms: [f32; 8] = [
-            0.0,
-            0.0,
-            width as f32,
-            height as f32,
-            width as f32,
-            height as f32,
-            0.0,
-            0.0,
-        ];
-        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("page-probe-uniforms"),
-            size: UNIFORM_BYTES,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue
-            .write_buffer(&uniform_buffer, 0, &f32s_to_bytes(&uniforms));
+        let mut uniform_buffers = Vec::with_capacity(draws.len());
+        let mut bind_groups = Vec::with_capacity(draws.len());
+        for (texture_id, rect, _) in draws {
+            let uniforms: [f32; 8] = [
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                width as f32,
+                height as f32,
+                0.0,
+                0.0,
+            ];
+            let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("page-probe-uniforms"),
+                size: UNIFORM_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&uniform_buffer, 0, &f32s_to_bytes(&uniforms));
 
-        let bind_group = {
-            let texture_view = self.page.textures.get(&texture_id).ok_or_else(|| {
+            let texture_view = self.page.textures.get(texture_id).ok_or_else(|| {
                 ArisError::new(
                     ErrorCode::InvalidArgument,
                     format!("texture {} is not uploaded", texture_id.0),
                 )
             })?;
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("page-probe-bind-group"),
                 layout: &self.page.bind_group_layout,
                 entries: &[
@@ -550,15 +676,21 @@ impl GpuContext {
                         resource: wgpu::BindingResource::Sampler(&self.page.sampler),
                     },
                 ],
-            })
-        };
+            }));
+            uniform_buffers.push(uniform_buffer);
+        }
 
-        self.page.ensure_pipeline(&self.device, format);
-        let pipeline = self
-            .page
-            .pipelines
-            .get(&format)
-            .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))?;
+        for (_, _, blend) in draws {
+            self.page.ensure_pipeline(&self.device, format, *blend);
+        }
+        let pipelines = draws
+            .iter()
+            .map(|(_, _, blend)| {
+                self.page
+                    .pipeline(format, *blend)
+                    .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let mut encoder = self
             .device
@@ -583,9 +715,11 @@ impl GpuContext {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..6, 0..1);
+            for (index, bind_group) in bind_groups.iter().enumerate() {
+                pass.set_pipeline(pipelines[index]);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -741,5 +875,269 @@ mod tests {
 
         context.release_texture(texture).expect("release");
         assert_eq!(context.texture_count(), 0);
+    }
+
+    /// A 1×1 straight-alpha tint texture in the colour the annotation carries.
+    ///
+    /// The bytes are the sRGB-encoded channels, not premultiplied: the multiply pipeline
+    /// premultiplies in its fragment shader (see [`QuadBlend::Multiply`]).
+    fn tint(red: u8, green: u8, blue: u8, alpha: u8) -> Vec<u8> {
+        // BGRA — the order every texture in this engine is uploaded in.
+        vec![blue, green, red, alpha]
+    }
+
+    /// A solid page texture, `value` in every channel, opaque.
+    fn solid_page(value: u8) -> Vec<u8> {
+        vec![value, value, value, 255]
+    }
+
+    /// The gamma-space product PDF's multiply blend is defined as, `page × colour / 255`.
+    fn gamma_product(page: u8, channel: u8) -> u8 {
+        ((u32::from(page) * u32::from(channel) + 127) / 255) as u8
+    }
+
+    /// `/BM /Multiply` must *multiply* the page, not cover it.
+    ///
+    /// The number to check against is the one PDF defines: `page × colour` on the stored
+    /// (gamma-encoded) values, which is what Preview shows. An alpha-over draw of the same
+    /// colour would land on the stored colour instead.
+    #[test]
+    fn multiply_blend_darkens_a_light_page() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+
+        // Light grey paper and a mid-tone highlight colour, deliberately far apart so a
+        // normal-blend mistake cannot land inside the tolerance.
+        let page_value = 0xE0u8;
+        let (red, green, blue) = (0xB4u8, 0x8Au8, 0x50u8);
+        let page = context
+            .upload_page_texture(1, 1, &solid_page(page_value))
+            .expect("upload page");
+        let highlight = context
+            .upload_page_texture(1, 1, &tint(red, green, blue, 0xFF))
+            .expect("upload highlight");
+
+        let full = [0.0, 0.0, 1.0, 1.0];
+        let pixels = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (highlight, full, QuadBlend::Multiply),
+                ],
+                1,
+                1,
+            )
+            .expect("layered probe");
+
+        // ±2 per channel: 8-bit quantisation on both sides of the sRGB transfer function.
+        let tolerance = 2i32;
+        for (index, expected_channel) in [red, green, blue].into_iter().enumerate() {
+            let expected = gamma_product(page_value, expected_channel);
+            let actual = pixels[index];
+            assert!(
+                (i32::from(actual) - i32::from(expected)).abs() <= tolerance,
+                "channel {index}: expected about {expected} (page × colour), got {actual}"
+            );
+            assert!(
+                actual < page_value,
+                "multiply must darken the page, got {actual} on a {page_value} page"
+            );
+        }
+    }
+
+    /// The regression this feature exists for: multiply and alpha-over are not the same picture.
+    #[test]
+    fn multiply_and_normal_produce_different_pixels() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+
+        let page_value = 0xE0u8;
+        let page = context
+            .upload_page_texture(1, 1, &solid_page(page_value))
+            .expect("upload page");
+        let highlight = context
+            .upload_page_texture(1, 1, &tint(0xB4, 0x8A, 0x50, 0xFF))
+            .expect("upload highlight");
+
+        let full = [0.0, 0.0, 1.0, 1.0];
+        let multiplied = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (highlight, full, QuadBlend::Multiply),
+                ],
+                1,
+                1,
+            )
+            .expect("multiply probe");
+        let over = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (highlight, full, QuadBlend::Normal),
+                ],
+                1,
+                1,
+            )
+            .expect("normal probe");
+
+        // Alpha-over at 255 must land exactly on the stored colour, i.e. the drawn colour must
+        // *not* simply be the stored colour in the multiply case.
+        assert_eq!(
+            &over[0..3],
+            &[0xB4, 0x8A, 0x50],
+            "opaque over = stored colour"
+        );
+        let largest = (0..3)
+            .map(|index| (i32::from(multiplied[index]) - i32::from(over[index])).abs())
+            .max()
+            .expect("three channels");
+        assert!(
+            largest >= 12,
+            "multiply and normal must differ visibly, largest channel gap was {largest}: \
+             multiply {multiplied:?}, over {over:?}"
+        );
+    }
+
+    /// The recipe the canvas uses for `/CA`: bake the opacity into the colour, then multiply.
+    ///
+    /// PDF composites a highlight as `page × (a·colour + (1 − a))` with every value in the stored
+    /// (gamma-encoded) space. Baking `a·colour + (1 − a)` into an opaque tint texture before the
+    /// multiply reproduces that exactly — and it is the reason the tint texture is uploaded with
+    /// alpha 255 rather than with the file's `/CA`.
+    #[test]
+    fn multiply_with_baked_opacity_matches_pdf() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+
+        let page_value = 0xE0u8;
+        let (red, green, blue) = (0xB4u8, 0x8Au8, 0x50u8);
+        let a = f64::from(0x80u8) / 255.0;
+        let bake = |channel: u8| (a * f64::from(channel) + (1.0 - a) * 255.0).round() as u8;
+
+        let page = context
+            .upload_page_texture(1, 1, &solid_page(page_value))
+            .expect("upload page");
+        let baked = context
+            .upload_page_texture(1, 1, &tint(bake(red), bake(green), bake(blue), 0xFF))
+            .expect("upload baked highlight");
+
+        let full = [0.0, 0.0, 1.0, 1.0];
+        let pixels = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (baked, full, QuadBlend::Multiply),
+                ],
+                1,
+                1,
+            )
+            .expect("layered probe");
+
+        let tolerance = 2i32;
+        for (index, channel) in [red, green, blue].into_iter().enumerate() {
+            let expected = gamma_product(page_value, bake(channel));
+            let actual = pixels[index];
+            assert!(
+                (i32::from(actual) - i32::from(expected)).abs() <= tolerance,
+                "channel {index}: expected about {expected} for /CA {a}, got {actual}"
+            );
+            assert!(
+                actual < page_value,
+                "a highlight must still darken the page, got {actual} on a {page_value} page"
+            );
+        }
+    }
+
+    /// A translucent multiply tint (opacity left in the alpha channel) still mixes sensibly.
+    ///
+    /// This is the fallback path for a caller that does not bake `/CA`: the shader premultiplies
+    /// by alpha, so the result sits strictly between the untouched page and the fully opaque
+    /// multiply. It is *approximately* PDF's value rather than exactly it — the mix happens in
+    /// linear light — which is why the canvas bakes instead; the measured gap is asserted only as
+    /// a bound so a future pipeline change cannot silently turn "slightly off" into "wrong".
+    #[test]
+    fn multiply_alpha_mixes_towards_the_page() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+
+        let page_value = 0xE0u8;
+        let (red, green, blue) = (0xB4u8, 0x8Au8, 0x50u8);
+        let page = context
+            .upload_page_texture(1, 1, &solid_page(page_value))
+            .expect("upload page");
+        let opaque = context
+            .upload_page_texture(1, 1, &tint(red, green, blue, 0xFF))
+            .expect("upload opaque highlight");
+        let translucent = context
+            .upload_page_texture(1, 1, &tint(red, green, blue, 0x80))
+            .expect("upload translucent highlight");
+
+        let full = [0.0, 0.0, 1.0, 1.0];
+        let opaque_pixels = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (opaque, full, QuadBlend::Multiply),
+                ],
+                1,
+                1,
+            )
+            .expect("opaque probe");
+        let translucent_pixels = context
+            .offscreen_probe_layers(
+                &[
+                    (page, full, QuadBlend::Normal),
+                    (translucent, full, QuadBlend::Multiply),
+                ],
+                1,
+                1,
+            )
+            .expect("translucent probe");
+
+        // PDF's gamma-space value, for the record: `page × (a·colour + (1 − a))`.
+        let a = 128.0 / 255.0;
+        let mut worst = 0i32;
+        for (index, channel) in [red, green, blue].into_iter().enumerate() {
+            let ideal =
+                f64::from(page_value) * (a * f64::from(channel) + (1.0 - a) * 255.0) / 255.0;
+            worst = worst.max((f64::from(translucent_pixels[index]) - ideal).abs().round() as i32);
+            assert!(
+                translucent_pixels[index] > opaque_pixels[index]
+                    && translucent_pixels[index] < page_value,
+                "channel {index}: {} must sit between the opaque result {} and the page {page_value}",
+                translucent_pixels[index],
+                opaque_pixels[index]
+            );
+        }
+        // Measured: 23/255 on the blue channel of this pair (page 0xE0, colour 0x50, /CA 0.5) —
+        // i.e. an unbaked translucent highlight is about 9% brighter than the file says. The bound
+        // is the measurement plus a small margin, and it exists to keep the gap *documented*: the
+        // canvas bakes, so this path is only a safety net for a caller that forgets.
+        assert!(
+            worst <= 25,
+            "an unbaked translucent multiply deviates from PDF's gamma-space value; \
+             worst channel gap {worst}/255 (23 was measured for page 0xE0, colour 0x50, /CA 0.5)"
+        );
     }
 }

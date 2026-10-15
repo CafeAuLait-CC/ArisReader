@@ -8,8 +8,15 @@
 //! | T1.3 | tile/region rasterization, per-thread document copies, failure placeholders | pending |
 //! | T2.1 | text page (per-character boxes, structure tree) | pending |
 //! | T2.4 | outline / bookmarks | pending |
-//! | T3.2 | annotation read/write, forms, incremental save | pending |
+//! | T3.2 | annotation **read** (see `annotations.rs`); write, forms, incremental save | partial |
 //! | T4.1 | link enumeration and destinations | pending |
+//!
+//! # Reading annotations
+//!
+//! [`annotations::AnnotationReader`] reads the annotations a document already contains. It owns a
+//! second `FPDF_DOCUMENT` handle because the `/BM` (blend mode) and `/CA` (opacity) keys that
+//! decide how a highlight must be drawn are not reachable through `pdfium-render`'s annotation
+//! wrappers; the module docs say exactly which accessor is used for which field.
 //!
 //! # Threading
 //!
@@ -35,10 +42,14 @@
 //!    rpath (`@executable_path/../Frameworks`) when running from `ArisReader.app`.
 
 #[cfg(feature = "pdfium")]
+mod annotations;
+#[cfg(feature = "pdfium")]
 mod backend;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 
+#[cfg(feature = "pdfium")]
+pub use annotations::AnnotationReader;
 #[cfg(feature = "pdfium")]
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,

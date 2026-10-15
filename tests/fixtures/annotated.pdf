@@ -1,0 +1,142 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R] >>
+endobj
+5 0 obj
+<< /Length 1033 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated page 1) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (someone else's highlights, notes and free text) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: marked up by another viewer.) Tj T*
+(Line 2: marked up by another viewer.) Tj T*
+(Line 3: marked up by another viewer.) Tj T*
+(Line 4: marked up by another viewer.) Tj T*
+(Line 5: marked up by another viewer.) Tj T*
+(Line 6: marked up by another viewer.) Tj T*
+(Line 7: marked up by another viewer.) Tj T*
+(Line 8: marked up by another viewer.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R /Annots [14 0 R 15 0 R] >>
+endobj
+7 0 obj
+<< /Length 999 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated page 2) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (annotations on a second page) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: a different page's markup.) Tj T*
+(Line 2: a different page's markup.) Tj T*
+(Line 3: a different page's markup.) Tj T*
+(Line 4: a different page's markup.) Tj T*
+(Line 5: a different page's markup.) Tj T*
+(Line 6: a different page's markup.) Tj T*
+(Line 7: a different page's markup.) Tj T*
+(Line 8: a different page's markup.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 671 460 701] /QuadPoints [72 686 460 686 460 701 72 701 72 671 360 671 360 686 72 686] /C [0.2 0.6 1] /CA 0.5 /BM /Multiply /Contents (Highlight contents for the round trip.) /T (Reviewer A) /M (D:20240102030405Z) /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Underline /Rect [72 656 460 671] /QuadPoints [72 656 460 656 460 671 72 671] /C [0.9 0.1 0.1] /CA 1 /Contents (Underline contents.) /T (Reviewer B) /M (D:20240102030405Z) /F 4 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /StrikeOut /Rect [72 641 400 656] /QuadPoints [72 641 400 641 400 656 72 656] /C [0.1 0.6 0.2] /Contents (Strikeout contents.) /T (Reviewer C) /M (D:20240102030405Z) /F 4 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 700 520 720] /Name /Comment /Contents (A sticky note body.) /T (Reviewer D) /M (D:20240102030405Z) /F 4 >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [72 620 320 660] /DA (/Helv 10 Tf 0 g) /C [1 0 0] /Contents (Free text annotation body.) /T (Reviewer E) /M (D:20240102030405Z) /F 4 >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 626 460 641] /A << /S /URI /URI (https://example.org/annotated) >> /Border [0 0 0] /F 4 >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Squiggly /Rect [72 686 460 701] /QuadPoints [72 686 460 686 460 701 72 701] /C [0.5 0.2 0.8] /CA 0.75 /BM /Multiply /Contents (Squiggly contents.) /T (Reviewer F) /M (D:20240102030405Z) /F 4 >>
+endobj
+15 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 656 300 671] /C [0.2 0.6 1] /Contents (Highlight without quad points.) /T (Reviewer G) /M (D:20240102030405Z) /F 4 >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000400 00000 n 
+0000001485 00000 n 
+0000001635 00000 n 
+0000002685 00000 n 
+0000002968 00000 n 
+0000003188 00000 n 
+0000003403 00000 n 
+0000003568 00000 n 
+0000003761 00000 n 
+0000003909 00000 n 
+0000004145 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+4325
+%%EOF

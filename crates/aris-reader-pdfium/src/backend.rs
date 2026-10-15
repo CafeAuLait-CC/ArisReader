@@ -3,10 +3,11 @@
 //! See the crate-level docs for the task map, threading rules and library search
 //! order. Everything in this module is compiled only with `feature = "pdfium"`.
 
+use crate::annotations::AnnotationReader;
 use aris_reader_core::{
     ArisError, DocumentBackend, ErrorCode, LineSegment, LinkInfo, OutlineNode, PageGeometry,
-    PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawCharBox, RawTextPage,
-    Rect, Result, Rotation, Size,
+    PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawAnnotation, RawCharBox,
+    RawTextPage, Rect, Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,7 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
 /// crash disappeared once every page-handle path (rendering, `page_info`, text extraction,
 /// link and outline reads) took this one lock, which is the honest conclusion: this PDFium
 /// build does not tolerate concurrent use across documents for anything that loads a handle.
-static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serialises the one-time load of the PDFium library.
 ///
@@ -213,6 +214,12 @@ pub struct PdfiumBackend {
     password_protected: bool,
     /// Additional per-document guard; all PDFium operations also take PDFIUM_LOCK.
     raster_lock: std::sync::Mutex<()>,
+    /// Second document handle, used for annotation reads only (`FPDFAnnot_*`).
+    ///
+    /// Opened on the first annotation query, so a document nobody asks about pays nothing; the
+    /// failure is cached too, because it cannot change while the file is open. See
+    /// [`crate::annotations`] for why the annotation API needs its own handle.
+    annotation_reader: std::sync::OnceLock<std::result::Result<AnnotationReader, String>>,
 }
 
 impl PdfiumBackend {
@@ -238,6 +245,7 @@ impl PdfiumBackend {
                 password: password.map(str::to_string),
                 password_protected: password.is_some(),
                 raster_lock: std::sync::Mutex::new(()),
+                annotation_reader: std::sync::OnceLock::new(),
             }),
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(
@@ -471,18 +479,69 @@ impl PdfiumBackend {
 
             // A link that leads nowhere is not worth handing to the shell.
             if uri.is_some() || target.is_some() {
-                links.push(RawLink {
+                let candidate = RawLink {
                     rect,
                     uri,
                     page: target,
                     dest_rect,
                     dest_top_y,
                     dest_left_x,
-                });
+                };
+                // Exactly-once, because `pdfium-render`'s `PdfPageLinks` treats PDFium's
+                // enumeration *cursor* as a link index: `FPDFLink_Enumerate` advances a position
+                // in the page's annotation array ("start_pos … is updated with the next start
+                // position on return", fpdf_doc.h), so a link that is not the page's first
+                // annotation is handed back once per preceding annotation. Measured on
+                // `tests/fixtures/annotated.pdf`: one `/Link` behind five markup annotations
+                // came back six times. The accessor is not ours to fix, and a caller that draws
+                // a clickable box or collects destination landings wants each link once.
+                if !links.iter().any(|existing| existing == &candidate) {
+                    links.push(candidate);
+                }
             }
         }
 
         Ok(links)
+    }
+
+    /// Annotations the document already carries on `page`, in page space.
+    ///
+    /// Reads through [`crate::annotations::AnnotationReader`], which owns a second document
+    /// handle: PDFium's annotation dictionary accessors (`/BM`, `/CA`) are not reachable through
+    /// the `pdfium-render` facade, and the facade does not hand out its own handle.
+    ///
+    /// The reader is opened on the first call, under the process-wide lock, and its failure is
+    /// cached — a document whose annotations cannot be read reports the same error every time
+    /// instead of retrying a file that is not going to change.
+    pub fn annotation_page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if page.get() >= self.page_count() {
+            return Err(ArisError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "page {} is out of range (document has {} pages)",
+                    page.get(),
+                    self.page_count()
+                ),
+            ));
+        }
+
+        let reader = self.annotation_reader.get_or_init(|| {
+            AnnotationReader::open(&self.path, self.password.as_deref())
+                .map_err(|error| format!("{error:?}"))
+        });
+
+        match reader {
+            Ok(reader) => reader.page(page),
+            Err(detail) => Err(ArisError::new(
+                ErrorCode::BackendUnavailable,
+                "could not read the document's annotations",
+            )
+            .with_detail(detail.clone())),
+        }
     }
 
     pub fn reopen(&self) -> Result<Self> {
@@ -698,6 +757,10 @@ impl DocumentBackend for PdfiumBackend {
 
     fn links(&self, _page: PageIndex) -> Result<Vec<LinkInfo>> {
         Err(ArisError::not_implemented("PdfiumBackend::links (T4.1)"))
+    }
+
+    fn annotations(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        self.annotation_page(page)
     }
 
     fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage> {
@@ -1142,6 +1205,7 @@ fn rotation_from_pdf(rotation: PdfPageRenderRotation) -> Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aris_reader_core::{AnnotationBlend, RawAnnotationColor, RawAnnotationKind};
 
     #[test]
     fn library_candidates_are_ordered_and_non_empty() {
@@ -1243,6 +1307,182 @@ mod tests {
         // A region at the very top of the page stays at the top.
         let top = destination_region_view_space(Rect::new(0.0, 792.0, 595.0, 50.0), 842.0);
         assert_eq!(top.origin.y, 0.0);
+    }
+
+    /// Opens the committed annotated fixture, or `None` when the machine cannot run PDFium.
+    ///
+    /// The fixture is generated by `scripts/make-fixtures.py` — a hand-written PDF, so no real
+    /// (copyrighted) document has to be committed to test reading someone else's markup.
+    fn annotated_fixture() -> Option<PdfiumBackend> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/annotated.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: annotated fixture or PDFium unavailable");
+            return None;
+        }
+        Some(PdfiumBackend::open(&fixture, None).expect("open annotated fixture"))
+    }
+
+    /// Every field the reader promises, against the values the fixture was written with.
+    ///
+    /// The expected bytes are the ones PDFium produced for `/C [0.2 0.6 1]` when this test was
+    /// written (measured with a ctypes harness against the same library). PDFium truncates
+    /// `channel × 255` in `f32`, so the values are asserted exactly: a silent change in that
+    /// conversion is something this project wants to hear about, not a tolerance to hide behind.
+    #[test]
+    fn annotations_in_the_fixture_survive_the_read() {
+        let Some(backend) = annotated_fixture() else {
+            return;
+        };
+
+        let first_page = backend.annotations(PageIndex(0)).expect("annotations");
+        let kinds: Vec<&str> = first_page
+            .iter()
+            .map(|annotation| annotation.kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["highlight", "underline", "strikeout", "text", "freeText"],
+            "the fixture's five content annotations, in document order"
+        );
+
+        // The sixth annotation on that page is a `/Link`: navigation, not something to draw or
+        // list. It has to be invisible here and visible through the link path, in the same file.
+        let links = backend.link_targets(PageIndex(0)).expect("links");
+        assert_eq!(
+            links.len(),
+            1,
+            "the fixture's link is reported by the link path"
+        );
+        assert_eq!(
+            links[0].uri.as_deref(),
+            Some("https://example.org/annotated")
+        );
+        assert!(
+            !kinds.contains(&"Link") && !kinds.iter().any(|kind| kind.starts_with("Subtype")),
+            "a link annotation must not be reported as an annotation"
+        );
+
+        let highlight = &first_page[0];
+        assert_eq!(highlight.page, PageIndex(0));
+        // Page space: bottom-left origin, exactly how the generator writes it: `/Rect` is the
+        // union of two 15 pt body-line boxes, `671 … 701` up from the page bottom.
+        assert_eq!(highlight.rect, Rect::new(72.0, 671.0, 388.0, 30.0));
+        assert_eq!(
+            highlight.quads,
+            vec![
+                Rect::new(72.0, 686.0, 388.0, 15.0),
+                Rect::new(72.0, 671.0, 288.0, 15.0),
+            ],
+            "one rectangle per /QuadPoints entry, in file order"
+        );
+        assert_eq!(
+            highlight.color,
+            Some(RawAnnotationColor {
+                red: 51,
+                green: 153,
+                blue: 255,
+            }),
+            "/C [0.2 0.6 1] as 8-bit sRGB"
+        );
+        assert_eq!(highlight.opacity, Some(0.5), "/CA 0.5");
+        assert_eq!(highlight.blend, AnnotationBlend::Multiply, "/BM /Multiply");
+        assert_eq!(
+            highlight.contents.as_deref(),
+            Some("Highlight contents for the round trip.")
+        );
+        assert_eq!(highlight.author.as_deref(), Some("Reviewer A"));
+        assert_eq!(highlight.modified.as_deref(), Some("D:20240102030405Z"));
+        assert!(highlight.visible);
+
+        // The sticky note carries no /C, and PDFium answers black for it unless the key is
+        // checked first; reporting "black" here would invent a colour the file never had.
+        let sticky = &first_page[3];
+        assert_eq!(sticky.kind, RawAnnotationKind::Text);
+        assert_eq!(sticky.color, None, "a note without /C has no colour");
+        assert_eq!(sticky.opacity, None);
+        assert_eq!(sticky.blend, AnnotationBlend::Normal);
+        assert_eq!(sticky.contents.as_deref(), Some("A sticky note body."));
+        assert!(sticky.quads.is_empty(), "a sticky note has no quad points");
+
+        // A second page keeps its own annotations: the page is part of the answer.
+        let second_page = backend.annotations(PageIndex(1)).expect("annotations");
+        assert_eq!(second_page.len(), 2);
+        assert_eq!(second_page[0].kind, RawAnnotationKind::Squiggly);
+        assert_eq!(second_page[0].page, PageIndex(1));
+        assert_eq!(second_page[0].opacity, Some(0.75));
+        assert_eq!(second_page[0].blend, AnnotationBlend::Multiply);
+
+        // Markup without /QuadPoints still has its /Rect, which is the only geometry it has.
+        let without_quads = &second_page[1];
+        assert_eq!(without_quads.kind, RawAnnotationKind::Highlight);
+        assert!(without_quads.quads.is_empty());
+        assert_eq!(without_quads.rect, Rect::new(72.0, 656.0, 228.0, 15.0));
+    }
+
+    /// The user's question, as a test: a colour that is not one of ours comes through unchanged.
+    ///
+    /// `/C [0.2 0.6 1]` is a blue that matches no entry of `AppState.highlightPalette`. The old
+    /// model could only name four colours, so a file like this was unreadable by construction;
+    /// the reader now reports the channel values the file carries.
+    #[test]
+    fn a_colour_outside_our_palette_is_reported_faithfully() {
+        let Some(backend) = annotated_fixture() else {
+            return;
+        };
+        let annotations = backend.annotations(PageIndex(0)).expect("annotations");
+        let color = annotations[0]
+            .color
+            .expect("the fixture's highlight has a /C entry");
+        assert_eq!((color.red, color.green, color.blue), (51, 153, 255));
+
+        // The four colours this application once could express, as they appear in
+        // `AppState.highlightPalette` (BGRA there, RGB here): none of them is this blue.
+        let old_palette = [
+            (255, 216, 64),
+            (112, 208, 96),
+            (96, 160, 240),
+            (224, 112, 176),
+        ];
+        assert!(
+            !old_palette.contains(&(color.red, color.green, color.blue)),
+            "the fixture colour must not be one of the old palette's"
+        );
+    }
+
+    /// `/BM` is the difference between "looks like Preview" and "looks like a different colour".
+    #[test]
+    fn blend_mode_is_read_from_the_file_not_assumed() {
+        let Some(backend) = annotated_fixture() else {
+            return;
+        };
+        let annotations = backend.annotations(PageIndex(0)).expect("annotations");
+        assert_eq!(annotations[0].blend, AnnotationBlend::Multiply);
+        // The underline in the same file has no /BM at all, and must not inherit its
+        // neighbour's blend mode.
+        assert_eq!(annotations[1].blend, AnnotationBlend::Normal);
+    }
+
+    /// A page with no annotations is an empty answer, not an error and not a stale one.
+    #[test]
+    fn a_page_without_annotations_reports_nothing() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+        let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
+        assert!(
+            backend
+                .annotations(PageIndex(0))
+                .expect("annotations")
+                .is_empty()
+        );
+        assert!(matches!(
+            backend.annotations(PageIndex(7)),
+            Err(error) if error.code == ErrorCode::InvalidArgument
+        ));
     }
 
     #[test]

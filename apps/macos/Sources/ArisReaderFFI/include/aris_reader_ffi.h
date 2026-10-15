@@ -115,12 +115,28 @@ int32_t aris_reader_surface_draw_page(uint64_t surface_id,
                                       ArisFrameStats *stats);
 
 /*
+ * How a quad is composited with what is already in the frame. A page is painted over the
+ * background; a highlight loaded from a PDF is normally stored with `/BM /Multiply` and has
+ * to be multiplied into the page under it, or the same colour looks different from Preview.
+ * (The constant names mirror Rust's `aris_reader_ffi::blend`.)
+ */
+#define ARIS_BLEND_NORMAL 0
+#define ARIS_BLEND_MULTIPLY 1
+
+/*
  * Draws several uploaded textures into ONE frame at device-pixel rectangles
- * (rects holds count * 4 floats: x, y, width, height). `stats` may be NULL.
+ * (rects holds count * 4 floats: x, y, width, height; blend_modes holds count bytes,
+ * one ARIS_BLEND_* each). `stats` may be NULL.
+ *
+ * A draw with ARIS_BLEND_MULTIPLY must use a tint texture whose colour already has the
+ * annotation's /CA opacity baked in at alpha 255: PDF mixes opacity in the stored
+ * (gamma-encoded) colour space and the GPU mixes in linear light, which is visibly
+ * different (measured 23/255 on a mid tone at /CA 0.5).
  */
 int32_t aris_reader_surface_draw_pages(uint64_t surface_id,
                                        const uint64_t *texture_ids,
                                        const float *rects,
+                                       const uint8_t *blend_modes,
                                        size_t count,
                                        ArisFrameStats *stats);
 

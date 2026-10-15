@@ -201,56 +201,22 @@ public struct SidebarView: View {
 
     // MARK: - Annotations
 
+    /// Everything annotation-shaped about this document, in one list.
+    ///
+    /// Two sources, deliberately kept apart: the notes and highlights **inside the PDF** (read
+    /// from the file, not editable here) and the reader's **own** highlights (kept in the sidecar).
+    /// Sticky notes are why this list exists at all — a `/Text` annotation has no geometry worth
+    /// drawing on the canvas, so without a list it stays invisible and the reader never learns
+    /// that somebody left a comment on the page.
     private var annotationList: some View {
         Group {
-            if state.annotations.isEmpty {
+            if state.annotations.isEmpty && state.documentAnnotations.isEmpty
+                && !state.documentAnnotationsLoading {
                 emptyState("No highlights yet", "highlighter", task: "T3.6")
             } else {
                 List {
-                    ForEach(state.annotations) { annotation in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(Color.accentColor.opacity(0.5))
-                                .frame(width: 8, height: 8)
-
-                            Button {
-                                state.jump(to: annotation)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    TextField(
-                                        "Note",
-                                        text: Binding(
-                                            get: { annotation.note },
-                                            set: { state.updateNote($0, for: annotation.id) }
-                                        )
-                                    )
-                                    .textFieldStyle(.plain)
-                                    .font(.caption)
-                                    .focused($focusedNote, equals: annotation.id)
-                                    .onSubmit { state.commitNoteEdits() }
-
-                                    Text(
-                                        "Page \(annotation.page + 1) · \(annotation.kind.rawValue) · "
-                                            + "\(annotation.end - annotation.start + 1) characters"
-                                    )
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            Button {
-                                state.removeAnnotation(annotation.id)
-                            } label: {
-                                Image(systemName: "trash")
-                                    .font(.caption)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Delete highlight")
-                        }
-                    }
+                    documentAnnotationSection
+                    ownAnnotationSection
                 }
                 .listStyle(.sidebar)
                 .onChange(of: focusedNote) { previous, current in
@@ -259,6 +225,142 @@ public struct SidebarView: View {
                 }
             }
         }
+    }
+
+    /// The annotations the file itself carries.
+    @ViewBuilder
+    private var documentAnnotationSection: some View {
+        if state.documentAnnotationsLoading {
+            Section("In this PDF") {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading annotations…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        } else if let failure = state.documentAnnotationsError {
+            Section("In this PDF") {
+                Label(failure, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else if !state.documentAnnotations.isEmpty {
+            Section("In this PDF") {
+                ForEach(state.documentAnnotations.filter { $0.visible }) { annotation in
+                    Button {
+                        state.jump(toDocumentAnnotation: annotation)
+                    } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            // The annotation's own colour, so a list entry is recognisable as the
+                            // mark the reader can see on the page.
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(color(of: annotation))
+                                .frame(width: 8, height: 8)
+                                .padding(.top, 3)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(documentAnnotationTitle(annotation))
+                                    .font(.caption)
+                                    .lineLimit(3)
+                                Text(documentAnnotationSubtitle(annotation))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    /// The highlights this reader added, with their editable notes.
+    @ViewBuilder
+    private var ownAnnotationSection: some View {
+        if !state.annotations.isEmpty {
+            Section("My highlights") {
+                ForEach(state.annotations) { annotation in
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(Color(
+                                red: Double(annotation.color.red) / 255,
+                                green: Double(annotation.color.green) / 255,
+                                blue: Double(annotation.color.blue) / 255
+                            ))
+                            .frame(width: 8, height: 8)
+
+                        Button {
+                            state.jump(to: annotation)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                TextField(
+                                    "Note",
+                                    text: Binding(
+                                        get: { annotation.note },
+                                        set: { state.updateNote($0, for: annotation.id) }
+                                    )
+                                )
+                                .textFieldStyle(.plain)
+                                .font(.caption)
+                                .focused($focusedNote, equals: annotation.id)
+                                .onSubmit { state.commitNoteEdits() }
+
+                                Text(
+                                    "Page \(annotation.page + 1) · \(annotation.kind.rawValue) · "
+                                        + "\(annotation.end - annotation.start + 1) characters"
+                                )
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            state.removeAnnotation(annotation.id)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Delete highlight")
+                    }
+                }
+            }
+        }
+    }
+
+    /// What an annotation found in the PDF is called in the list.
+    private func documentAnnotationTitle(_ annotation: DocumentAnnotation) -> String {
+        if let contents = annotation.contents, !contents.isEmpty { return contents }
+        switch annotation.kind {
+        case "highlight": return "Highlight"
+        case "underline": return "Underline"
+        case "strikeout": return "Strikeout"
+        case "squiggly": return "Squiggly underline"
+        case "text": return "Sticky note (no text)"
+        case "freeText": return "Free text (no text)"
+        default: return "\(annotation.kind) annotation"
+        }
+    }
+
+    private func documentAnnotationSubtitle(_ annotation: DocumentAnnotation) -> String {
+        var parts = ["Page \(annotation.page + 1)"]
+        if let author = annotation.author, !author.isEmpty { parts.append(author) }
+        if annotation.blend == "multiply" { parts.append("multiplied") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// A loaded annotation's colour, or a neutral grey when the file states none.
+    private func color(of annotation: DocumentAnnotation) -> Color {
+        let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: 0xFF)
+        return Color(
+            red: Double(color.red) / 255,
+            green: Double(color.green) / 255,
+            blue: Double(color.blue) / 255
+        )
     }
 
     private func emptyState(_ title: String, _ symbol: String, task: String) -> some View {
