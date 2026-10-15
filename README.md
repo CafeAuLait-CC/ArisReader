@@ -169,11 +169,21 @@ python3 scripts/measure-native-scroll.py eval-papers/2005.14165.pdf --runs 3 --z
 Each run opens a temporary PDF copy, starts at the top, uses a 48 MiB cache, warms for two
 seconds, then drives the actual wheel-scroll path for eight seconds at 600 screen points/s.
 It never waits for raster completion between inputs. Raw logs and `results.json` retain every
-run's peak RSS in bytes, MB and MiB, input/submission interval tails, queue depth, platform,
-commit and PDF/engine/executable hashes. Missing, stationary or wholly occluded traces fail.
+run's peak RSS in bytes, MB and MiB, input/submission/presentation interval tails, queue depth,
+platform, commit and PDF/engine/executable hashes. Missing, stationary or wholly occluded traces fail.
 The window is brought forward for measurement. Partial occlusion is reported explicitly.
-These are CPU submission timestamps, **not** display scanout or GPU timings, and scripted
-input is not a physical trackpad trace. The script does not certify the 60 fps criterion.
+With tracing enabled, a diagnostic `CAMetalLayer` observes the same drawable wgpu acquires
+and registers a Metal presentation handler. FPS uses the drawable's `presentedTime` host
+timestamp, as documented by [Apple](https://developer.apple.com/documentation/metal/mtldrawable/presentedtime),
+not the handler's arrival time or the CPU submission timestamp. Zero timestamps are reported
+drops. Missing callbacks make FPS and presentation tails unavailable; they never count as
+confirmed drops. Frames presented after the scrolling window are reported separately.
+`presented_fps` counts frames over the full scrolling interval; frame gaps include both edges,
+and `motion_presented_frames` separates frames whose scroll position changed. This records
+system-reported drawable presentation, not physical scanout, display refresh rate or GPU
+execution time. Scripted input is not a physical trackpad trace, and a finite run alone does
+not certify the 60 fps criterion. Legacy logs remain readable but cannot supply presented FPS.
+`--scheduling-diagnostics` additionally records frame-loop/model timing and adds logging overhead.
 
 Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 387.3 MiB
 median is about 406.1 MB and does not meet a decimal 400 MB limit; a median below a limit also

@@ -39,5 +39,57 @@ class SummaryTests(unittest.TestCase):
         trace[2]['presented'] = 0
         with self.assertRaises(ValueError): measurement.summarize(trace)
 
+    def presentation_trace(self):
+        trace = self.trace()
+        trace[2].update(sequence=1, y=10)
+        trace[4].update(sequence=2, y=90)
+        # Callback arrival order differs from presentation order.
+        trace.extend([dict(kind='presentation', time=.95, callback_time=1.2, surface=1, sequence=2, y=90),
+                      dict(kind='presentation', time=.25, callback_time=1.3, surface=1, sequence=1, y=10)])
+        return trace
+
+    def test_actual_presentation_uses_host_times_and_full_window(self):
+        result = measurement.summarize(self.presentation_trace())
+        self.assertEqual(result['presented_fps'], 2)
+        self.assertEqual(result['presentation_gap_max_ms'], 700)
+        self.assertEqual(result['motion_presented_frames'], 2)
+        self.assertEqual(result['presentation_measurement'], 'complete')
+
+    def test_missing_callback_is_unknown_and_never_claims_fps_or_drop(self):
+        result = measurement.summarize(self.presentation_trace()[:-1])
+        self.assertEqual(result['presentation_callbacks_missing'], 1)
+        self.assertEqual(result['presentation_drops_reported'], 0)
+        self.assertIsNone(result['presented_fps'])
+        self.assertIsNone(result['presentation_gap_max_ms'])
+
+    def test_zero_timestamp_is_reported_drop_not_presentation(self):
+        trace = self.presentation_trace()
+        trace[-1]['time'] = 0
+        result = measurement.summarize(trace)
+        self.assertEqual(result['presentation_drops_reported'], 1)
+        self.assertEqual(result['presented_frames'], 1)
+        self.assertEqual(result['presented_fps'], 1)
+        self.assertEqual(result['presentation_gap_max_ms'], 950)
+
+    def test_duplicate_callback_rejected_and_wrong_surface_ignored(self):
+        trace = self.presentation_trace()
+        trace.append(dict(trace[-1], surface=2))
+        self.assertEqual(measurement.summarize(trace)['presented_frames'], 2)
+        trace.append(dict(trace[-2]))
+        with self.assertRaises(ValueError): measurement.summarize(trace)
+
+    def test_late_presentation_is_covered_but_not_counted_in_window(self):
+        trace = self.presentation_trace()
+        trace[-2]['time'] = 1.05
+        result = measurement.summarize(trace)
+        self.assertEqual(result['presentation_measurement'], 'complete')
+        self.assertEqual(result['presentations_outside_window'], 1)
+        self.assertEqual(result['presented_fps'], 1)
+
+    def test_submission_only_trace_never_claims_actual_fps(self):
+        result = measurement.summarize(self.trace())
+        self.assertIn('unavailable', result['presentation_measurement'])
+        self.assertNotIn('presented_fps', result)
+
 
 if __name__ == '__main__': unittest.main()

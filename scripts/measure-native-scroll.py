@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Measure paced native scrolling, CPU submission intervals and per-process peak RSS.
+"""Measure paced native scrolling, Metal presentation times and per-process peak RSS.
 
 Build first: ./scripts/build-rust.sh && (cd apps/macos && swift build -c release)
-This is scripted wheel-path input, not a physical trackpad/scanout or GPU-time measurement.
+This is scripted wheel-path input, not a physical trackpad or GPU-time measurement.
 Each run gets a fresh temporary document copy so saved positions/annotations cannot leak in.
 """
 import argparse
@@ -55,7 +55,53 @@ def summarize(records, expected_distance=None):
         'input_gap_p95_ms': percentile(tick_gaps, .95),
         'draw_cpu_p95_ms': percentile([r['cpu_us'] / 1000 for r in submitted], .95),
         'pending_tiles_max': max(r['pending'] for r in ticks),
+        **presentation_summary(records, submitted, starts[0], ends[0]),
     }
+
+
+def presentation_summary(records, submitted, start, end):
+    """Match callbacks to acquired drawables; a missing callback is never a dropped frame.
+
+    Use Metal's host timestamp, not callback arrival (which may be delayed/reordered).
+    Count frames over the entire requested window, retaining stalls at both edges.
+    """
+    if any('sequence' not in r for r in submitted):
+        return {'presentation_measurement': 'unavailable (legacy submission-only trace)'}
+    expected = {(r['surface'], r['sequence']) for r in submitted}
+    callbacks = {}
+    for record in records:
+        if record['kind'] != 'presentation': continue
+        key = (record['surface'], record['sequence'])
+        if key not in expected: continue
+        if key in callbacks: raise ValueError('duplicate presentation callback for one drawable')
+        if not math.isfinite(record['time']) or record['time'] < 0:
+            raise ValueError('invalid Metal presentation timestamp')
+        callbacks[key] = record
+    missing = len(expected - callbacks.keys())
+    positive = [r for r in callbacks.values() if r['time'] > 0]
+    presented = sorted((r for r in positive if start <= r['time'] <= end), key=lambda r:r['time'])
+    result = {
+        'presentation_measurement': 'complete' if not missing else 'incomplete',
+        'presentation_callbacks': len(callbacks), 'presentation_callbacks_missing': missing,
+        'presentation_drops_reported': sum(r['time'] == 0 for r in callbacks.values()),
+        'presentations_outside_window': len(positive) - len(presented),
+        'presented_frames': len(presented),
+        # FPS/tails are unavailable if any callback is missing; silently lower counts
+        # could otherwise turn missing evidence into a false regression.
+        'presented_fps': None, 'presentation_gap_p95_ms': None,
+        'presentation_gap_max_ms': None, 'presentation_gaps_over_33ms': None,
+        'motion_presented_frames': None,
+    }
+    if missing: return result
+    result['presented_fps'] = len(presented) / (end - start)
+    result['motion_presented_frames'] = sum(i == 0 or r['y'] != presented[i-1]['y']
+                                             for i,r in enumerate(presented))
+    times = [start] + [r['time'] for r in presented] + [end]
+    gaps = [(b-a)*1000 for a,b in zip(times,times[1:])]
+    result.update(presentation_gap_p95_ms=percentile(gaps,.95),
+                  presentation_gap_max_ms=max(gaps),
+                  presentation_gaps_over_33ms=sum(g>33.34 for g in gaps))
+    return result
 
 
 def main():
@@ -67,6 +113,7 @@ def main():
     p.add_argument('--seconds', type=float, default=8)
     p.add_argument('--speed', type=float, default=600, help='screen points per second')
     p.add_argument('--zoom', type=int, choices=[100, 200, 400], default=100)
+    p.add_argument('--scheduling-diagnostics', action='store_true', help='log frame-loop/model correlation (adds overhead)')
     p.add_argument('--output', type=Path, default=ROOT / 'build/native-scroll')
     args = p.parse_args()
     if platform.system() != 'Darwin': p.error('native macOS measurement only')
@@ -84,7 +131,8 @@ def main():
         'pdfium_sha256': hashlib.sha256(args.pdfium.read_bytes()).hexdigest(),
         'app': str(args.app.resolve()), 'seconds': args.seconds, 'speed_screen_pt_s': args.speed,
         'zoom_percent': args.zoom, 'cache_mib': 48,
-        'method': 'wall-time paced native wheel-path calls; CPU submission timestamps, not display scanout or GPU time',
+        'method': 'wall-time paced native wheel-path calls; Metal drawable presentedTime plus CPU submission timestamps; not GPU duration or physical scanout',
+        'scheduling_diagnostics': args.scheduling_diagnostics,
     }
     results = []
     for run in range(args.runs):
@@ -97,6 +145,7 @@ def main():
                        ARIS_READER_SPIKE_FORCE_FRONT='1', ARIS_READER_SCROLL_TRACE_SECONDS=str(args.seconds),
                        ARIS_READER_SCROLL_TRACE_SPEED=str(args.speed),
                        ARIS_READER_QUIT_AFTER=str(math.ceil((args.seconds + 4) * 1000)))
+            if args.scheduling_diagnostics: env['ARIS_READER_SCROLL_TRACE_SCHEDULING'] = '1'
             log = args.output / f'run-{run + 1}.log'
             with log.open('w') as output:
                 proc = subprocess.Popen([str(args.app.resolve())], env=env, stdout=output, stderr=subprocess.STDOUT)

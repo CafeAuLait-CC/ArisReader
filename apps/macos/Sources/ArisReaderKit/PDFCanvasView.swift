@@ -4,6 +4,27 @@ import Metal
 import QuartzCore
 import SwiftUI
 
+/// Diagnostic layer: observe the drawable wgpu acquires without acquiring another one.
+/// Metal reports its actual presentation host time asynchronously, including zero for drops.
+final class PresentationTraceLayer: CAMetalLayer {
+    var traceSurface: UInt64 = 0
+    var traceY: Double = 0
+    private(set) var traceSequence: UInt64 = 0
+
+    override func nextDrawable() -> (any CAMetalDrawable)? {
+        guard let drawable = super.nextDrawable() else { return nil }
+        traceSequence += 1
+        let sequence = traceSequence
+        let surface = traceSurface
+        let y = traceY
+        drawable.addPresentedHandler { drawable in
+            let line = "aris-scroll-trace: {\"kind\":\"presentation\",\"time\":\(drawable.presentedTime),\"callback_time\":\(CACurrentMediaTime()),\"surface\":\(surface),\"sequence\":\(sequence),\"y\":\(y)}\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        return drawable
+    }
+}
+
 /// Mirrors the C return codes declared in `aris_reader_ffi.h`.
 ///
 /// Spelled out in Swift instead of relying on how Swift imports the anonymous C enum,
@@ -124,11 +145,12 @@ public final class MetalCanvasView: NSView {
     private var needsRender = true
     private var framesRendered: UInt64 = 0
     private let traceFrames = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"] != nil
+    private let traceScheduling = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SCHEDULING"] == "1"
     /// Set while the window server is skipping our frames (window hidden or covered).
     private var wasOccluded = false
 
     public override func makeBackingLayer() -> CALayer {
-        let metalLayer = CAMetalLayer()
+        let metalLayer = traceFrames ? PresentationTraceLayer() : CAMetalLayer()
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.isOpaque = true
@@ -405,6 +427,10 @@ public final class MetalCanvasView: NSView {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 tick += 1
+                if self.traceScheduling, let snapshot = self.interactionSnapshot?() {
+                    let line = "aris-scroll-trace: {\"kind\":\"timer\",\"time\":\(ProcessInfo.processInfo.systemUptime),\"y\":\(self.scrollYPt),\"model_y\":\(snapshot.1),\"needs_render\":\(self.needsRender)}\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
                 if self.needsRender || (self.wasOccluded && tick % 16 == 0) {
                     self.needsRender = false
                     self.renderFrame()
@@ -441,6 +467,10 @@ public final class MetalCanvasView: NSView {
 
         guard !textureIds.isEmpty else { return }
 
+        if let traceLayer = layer as? PresentationTraceLayer {
+            traceLayer.traceSurface = surfaceId
+            traceLayer.traceY = Double(scrollYPt)
+        }
         var stats = ArisFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
@@ -460,7 +490,8 @@ public final class MetalCanvasView: NSView {
 
         if traceFrames {
             let now = ProcessInfo.processInfo.systemUptime
-            let line = "aris-scroll-trace: {\"kind\":\"frame\",\"time\":\(now),\"surface\":\(surfaceId),\"presented\":\(stats.presented),\"cpu_us\":\(stats.elapsed_us),\"y\":\(scrollYPt)}\n"
+            let sequence = (layer as? PresentationTraceLayer)?.traceSequence ?? 0
+            let line = "aris-scroll-trace: {\"kind\":\"frame\",\"time\":\(now),\"surface\":\(surfaceId),\"sequence\":\(sequence),\"presented\":\(stats.presented),\"cpu_us\":\(stats.elapsed_us),\"y\":\(scrollYPt)}\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
 
