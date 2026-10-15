@@ -131,7 +131,20 @@ the branch is a single commit or its history is noise.
 Any requested benchmark phase failure returns a nonzero exit status, including with
 `--skip-baseline`. The CLI benchmark models CPU raster work and a settled prefetch band. It finishes every
 step's prefetch before advancing, so zero visible misses do **not** establish zero waiting
-under continuous scrolling. It does not measure GPU time or presented frame rate. The default
+under continuous scrolling. It does not measure GPU time or presented frame rate.
+
+**Presentation timestamps are unavailable on at least one machine tested here**: every drawable's Metal
+`presentedTime` came back as zero (436 of 436 in the harness, 297 of 297 in a minimal `CAMetalLayer`
+probe), so a trace reporting `presented_fps: 0.0` is not evidence of a frame-pacing problem — and not
+evidence of anything else either. Treat an all-zero presentation trace as "not measured", never as 0 fps.
+The application-side harness also drives the scroll model on a 16.67 ms cadence rather than delivering
+real wheel or trackpad events, and reaches about 53 inputs per second, so it cannot demonstrate 60 fps
+even where timestamps work. The project's "stable 60 fps" criterion therefore remains **unproven**, not
+failed.
+
+**Record the surface size and scale with any memory or frame figure**: earlier medians were taken on a
+1918x1430 scale-2.0 surface and later runs on a 959x715 scale-1.0 one, and the two are not comparable;
+a real-paper raster p95 of 13.7-14.5 ms likewise did not reproduce in either arm of a later A/B (20-40 ms). The default
 48 MiB cache gives the prefetch band a 16 MiB target (one third, with an 8 MiB floor); the
 minimum ring can still exceed that target. Record the commit, PDFium version, input PDF,
 command, build profile and hardware with each result.
