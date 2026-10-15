@@ -133,8 +133,10 @@ Any requested benchmark phase failure returns a nonzero exit status, including w
 step's prefetch before advancing, so zero visible misses do **not** establish zero waiting
 under continuous scrolling. It does not measure GPU time or presented frame rate.
 
-**Presentation timestamps are unavailable on at least one machine tested here**: every drawable's Metal
-`presentedTime` came back as zero (436 of 436 in the harness, 297 of 297 in a minimal `CAMetalLayer`
+**Presentation timestamps depend on the display being awake and the window unoccluded.** With the display
+awake the harness measures real presented frames (46.81 and 43.11 fps on a real paper during a scripted
+scroll); with the display asleep or the window occluded every drawable's Metal `presentedTime` comes back
+as zero (436 of 436 in the harness, 297 of 297 in a minimal `CAMetalLayer`
 probe), so a trace reporting `presented_fps: 0.0` is not evidence of a frame-pacing problem — and not
 evidence of anything else either. Treat an all-zero presentation trace as "not measured", never as 0 fps.
 The application-side harness also drives the scroll model on a 16.67 ms cadence rather than delivering
