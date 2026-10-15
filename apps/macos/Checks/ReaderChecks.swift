@@ -99,6 +99,7 @@ struct ReaderChecks {
         try await previewChecks(url: b)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
+        try await frameSchedulingChecks()
         print("All reader regression checks passed")
     }
 }
