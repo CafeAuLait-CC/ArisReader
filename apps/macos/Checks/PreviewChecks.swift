@@ -26,6 +26,7 @@ import Foundation
     func links(_ page: Int) async throws -> [DocumentLink] { [] }
     func citations(_ page: Int) async throws -> [Citation] { [] }
     func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
+    func annotations() async throws -> [DocumentAnnotation] { [] }
     func figures() async throws -> [Figure] { [] }
     func references() async throws -> [Reference] { [] }
     func resolveCitations(labels: [String]) async throws -> [Reference] { [] }

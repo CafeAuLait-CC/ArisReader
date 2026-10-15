@@ -19,7 +19,8 @@ pub mod error;
 pub mod geometry;
 
 pub use backend::{
-    DocumentBackend, RasterFlags, RasterFormat, RasterRequest, RasterTile, RawCharBox, RawTextPage,
+    AnnotationBlend, DocumentBackend, RasterFlags, RasterFormat, RasterRequest, RasterTile,
+    RawAnnotation, RawAnnotationColor, RawAnnotationKind, RawCharBox, RawTextPage,
 };
 pub use config::{CacheBudget, EngineConfig};
 pub use document::{

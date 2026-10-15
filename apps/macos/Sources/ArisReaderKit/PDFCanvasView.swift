@@ -533,6 +533,7 @@ public final class MetalCanvasView: NSView {
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
+        var blends: [UInt8] = []
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
             textureIds.append(texture.id)
@@ -540,6 +541,9 @@ public final class MetalCanvasView: NSView {
             rects.append(Float((page.placement.topPt - scrollYPt) * zoom * scale))
             rects.append(Float(page.placement.widthPt * zoom * scale))
             rects.append(Float(page.placement.heightPt * zoom * scale))
+            // A page is painted over the background; a highlight loaded from a PDF is usually
+            // stored `/BM /Multiply` and has to multiply into the page under it.
+            blends.append(page.blend.rawValue)
         }
 
         guard !textureIds.isEmpty else { return }
@@ -551,13 +555,16 @@ public final class MetalCanvasView: NSView {
         var stats = ArisFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
-                aris_reader_surface_draw_pages(
-                    surfaceId,
-                    ids.baseAddress,
-                    rectangles.baseAddress,
-                    textureIds.count,
-                    &stats
-                )
+                blends.withUnsafeBufferPointer { modes in
+                    aris_reader_surface_draw_pages(
+                        surfaceId,
+                        ids.baseAddress,
+                        rectangles.baseAddress,
+                        modes.baseAddress,
+                        textureIds.count,
+                        &stats
+                    )
+                }
             }
         }
         guard code == ArisStatus.ok.rawValue else {

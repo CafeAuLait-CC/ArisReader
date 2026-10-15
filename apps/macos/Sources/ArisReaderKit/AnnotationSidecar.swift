@@ -5,11 +5,27 @@ import Foundation
 /// The sidecar is a JSON array of `AppState.Annotation`. Two properties shape this code:
 ///
 /// * **Forward compatibility.** A sidecar written by a newer Lyra can hold entries this
-///   version cannot draw: an `ink` kind, a colour outside `AppState.highlightPalette`, a
-///   field that did not exist yet. Treating those as "the file is invalid" would make an
-///   older version refuse the file and, if the reader forced a reset, destroy entries the
+///   version cannot draw: an `ink` kind, a `color` value in a shape this version does not
+///   know, a field that did not exist yet. Treating those as "the file is invalid" would make
+///   an older version refuse the file and, if the reader forced a reset, destroy entries the
 ///   newer version still needs. Instead the *raw text* of such an entry is kept and written
 ///   back untouched, so the file round-trips through this version unchanged.
+/// * **Colour, and why the two encodings exist.** An annotation's colour used to be an index
+///   into a four-entry palette (`colorIndex`); it is now an `AnnotationColor` written as
+///   `"color": "#RRGGBBAA"`, because a PDF annotated by somebody else carries colours no
+///   four-entry palette can express. Both keys are read. Only one is written, and which one is
+///   decided by the colour itself (see `AppState.Annotation.encode(to:)`):
+///
+///   | sidecar | this build | the build that only knows `colorIndex` |
+///   | --- | --- | --- |
+///   | `colorIndex: 2` | reads it as palette colour 2 — exactly as before | reads it as before |
+///   | `color` = a palette colour | writes `colorIndex`, no `color` key | reads and draws it normally |
+///   | `color` = any other colour | writes `color`, no `colorIndex` | keeps the entry verbatim |
+///
+///   The last row is the honest limit: a colour outside that palette cannot be *drawn* by a
+///   build whose model has no way to name it. What such a build must not do is lose it or
+///   reinterpret it, and it does not — the entry comes back out of an older build unchanged,
+///   while its own annotations keep working.
 /// * **Fail closed, precisely.** Structural damage — not JSON at all, not an array, an entry
 ///   without id/page/range, a page outside the document, a duplicate id — is still an error.
 ///   The caller blocks writes rather than replacing a file it does not understand; the UI
@@ -49,7 +65,7 @@ enum AnnotationSidecar {
     /// Keys this version knows how to interpret. An entry carrying anything else is preserved
     /// rather than parsed: guessing at a newer schema risks writing back a half-understood entry.
     private static let knownKeys: Set<String> = [
-        "id", "kind", "page", "start", "end", "colorIndex", "note", "createdAt",
+        "id", "kind", "page", "start", "end", "color", "colorIndex", "note", "createdAt",
     ]
 
     // MARK: - Loading
@@ -74,8 +90,12 @@ enum AnnotationSidecar {
             let kindText = object["kind"] as? String
             let kindUnderstood = kindText == nil
                 || AppState.Annotation.Kind(rawValue: kindText ?? "") != nil
-            let colorUnderstood = (object["colorIndex"] as? Int)
-                .map { $0 >= 0 && $0 < paletteCount } ?? false
+            // Either colour shape counts as understood: this version's `color`, or the older
+            // `colorIndex` when it names a palette entry. An entry with neither, or with an
+            // index outside the palette, is preserved rather than guessed at.
+            let colorUnderstood = (object["color"] as? String).map { AnnotationColor(hex: $0) != nil }
+                ?? (object["colorIndex"] as? Int).map { $0 >= 0 && $0 < paletteCount }
+                ?? false
 
             guard unknownKeys.isEmpty, kindUnderstood, colorUnderstood else {
                 slots.append(.opaque(element))

@@ -30,7 +30,7 @@
 // its Safety contract.
 #![allow(unsafe_code)]
 
-use aris_reader_gpu::{GpuContext, SurfaceConfig, SurfaceId, SurfaceTarget};
+use aris_reader_gpu::{GpuContext, QuadBlend, SurfaceConfig, SurfaceId, SurfaceTarget};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -42,7 +42,22 @@ pub mod api;
 pub use api::{ArisEngine, ArisFfiError, DocumentSummary};
 
 /// ABI version. **Must be bumped whenever the signature or semantics of any exported function changes**.
-pub const ABI_VERSION: u32 = 1;
+///
+/// 2 added the `blend_modes` array to [`aris_reader_surface_draw_pages`]: a page quad and a
+/// PDF highlight quad are composited differently (see [`QuadBlend`]), so the call needed to say
+/// which is which. Version 1 callers would have every quad drawn alpha-over — the shell and the
+/// library ship together, and `aris_reader_abi_version` is checked at startup.
+pub const ABI_VERSION: u32 = 2;
+
+/// Blend mode values in the `blend_modes` array of [`aris_reader_surface_draw_pages`].
+///
+/// Kept as plain `u8`s so the C side can build the array without knowing a Rust enum.
+pub mod blend {
+    /// Straight alpha-over (a page, a selection, an ordinary overlay).
+    pub const NORMAL: u8 = 0;
+    /// `/BM /Multiply` (a highlight loaded from a PDF; see `QuadBlend`).
+    pub const MULTIPLY: u8 = 1;
+}
 
 /// C ABI return codes (0 = success, kept separate from Rust's `Result` so the C side can check them).
 pub mod code {
@@ -372,34 +387,45 @@ pub unsafe extern "C" fn aris_reader_surface_draw_page(
 /// Draws several uploaded textures into **one frame** at device-pixel rectangles.
 ///
 /// Continuous scrolling needs this: every visible page goes into a single frame instead
-/// of one acquire/present per page.
+/// of one acquire/present per page. Each quad carries its own blend mode, because a page and a
+/// highlight loaded from a PDF composite differently (`/BM /Multiply`).
 ///
 /// # Safety
 ///
 /// `texture_ids` must point to `count` readable `u64`s, `rects` to `count * 4` readable
-/// `f32`s (`[x, y, width, height]` each) and `stats` must be null or writable.
+/// `f32`s (`[x, y, width, height]` each), `blend_modes` to `count` readable `u8`s (see
+/// [`blend`]) and `stats` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn aris_reader_surface_draw_pages(
     surface_id: u64,
     texture_ids: *const u64,
     rects: *const f32,
+    blend_modes: *const u8,
     count: usize,
     stats: *mut ArisFrameStats,
 ) -> i32 {
-    if count == 0 || texture_ids.is_null() || rects.is_null() {
+    if count == 0 || texture_ids.is_null() || rects.is_null() || blend_modes.is_null() {
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    // SAFETY: the caller guarantees both arrays cover `count` elements (documented above).
+    // SAFETY: the caller guarantees all three arrays cover `count` elements (documented above).
     let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
     let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
+    let modes = unsafe { std::slice::from_raw_parts(blend_modes, count) };
 
     let mut draws = Vec::with_capacity(count);
     for (index, id) in ids.iter().enumerate() {
         let rect = &coordinates[index * 4..index * 4 + 4];
+        let blend = match modes[index] {
+            blend::MULTIPLY => QuadBlend::Multiply,
+            // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
+            // harmless reading, and the alternative (failing the whole frame) would blank the page.
+            _ => QuadBlend::Normal,
+        };
         draws.push((
             aris_reader_gpu::TextureId(*id),
             [rect[0], rect[1], rect[2], rect[3]],
+            blend,
         ));
     }
 
@@ -422,7 +448,7 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
         {
             let summary: Vec<String> = draws
                 .iter()
-                .map(|(_, rect)| {
+                .map(|(_, rect, _)| {
                     format!(
                         "({:.0},{:.0} {:.0}×{:.0})",
                         rect[0], rect[1], rect[2], rect[3]

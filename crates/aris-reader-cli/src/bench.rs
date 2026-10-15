@@ -1548,6 +1548,9 @@ mod phase_failure_tests {
         fn links(&self, _: PageIndex) -> aris_reader_core::Result<Vec<LinkInfo>> {
             Ok(vec![])
         }
+        fn annotations(&self, _: PageIndex) -> aris_reader_core::Result<Vec<RawAnnotation>> {
+            Ok(vec![])
+        }
         fn raw_text_page(&self, _: PageIndex) -> aris_reader_core::Result<RawTextPage> {
             Err(ArisError::not_implemented("injected text"))
         }

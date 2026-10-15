@@ -12,6 +12,7 @@
 //! offscreen texture and reads the pixels back, so the GPU path can be tested
 //! without a window (and therefore in CI).
 
+use crate::page::QuadBlend;
 use crate::{
     ColorSpace, CompositorCommand, SurfaceConfig, SurfaceId, SurfaceTarget, TextureArrayPlan,
 };
@@ -205,9 +206,13 @@ impl GpuContext {
         // Built before the struct literal: the literal moves `device`.
         let mut page = crate::page::PageState::new(&device);
         // Prewarm the shader: Metal compiles the WGSL at pipeline creation, and paying for
-        // it on the first *page* frame showed up as ~400 ms of jank on open.
-        page.ensure_pipeline(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
-        page.ensure_pipeline(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        // it on the first *page* frame showed up as ~400 ms of jank on open. Both blend
+        // modes are warmed because a page with one loaded highlight needs the multiply
+        // pipeline, and compiling it mid-scroll would be the same jank again.
+        for blend in [QuadBlend::Normal, QuadBlend::Multiply] {
+            page.ensure_pipeline(&device, wgpu::TextureFormat::Bgra8UnormSrgb, blend);
+            page.ensure_pipeline(&device, wgpu::TextureFormat::Rgba8UnormSrgb, blend);
+        }
 
         Ok(Self {
             instance,

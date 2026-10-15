@@ -6,7 +6,7 @@
 
 use aris_reader_core::{
     ArisError, DocumentBackend, ErrorCode, LinkInfo, OutlineNode, PageIndex, PageInfo,
-    RasterRequest, RasterTile, RawTextPage, Result,
+    RasterRequest, RasterTile, RawAnnotation, RawTextPage, Result,
 };
 use std::path::Path;
 
@@ -57,6 +57,12 @@ impl DocumentBackend for PdfiumBackend {
     fn rasterize(&self, _request: &RasterRequest) -> Result<RasterTile> {
         Err(ArisError::not_implemented(
             "PdfiumBackend::rasterize (T1.3)",
+        ))
+    }
+
+    fn annotations(&self, _page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        Err(ArisError::not_implemented(
+            "PdfiumBackend::annotations (T3.2)",
         ))
     }
 

@@ -22,9 +22,15 @@ aris-reader-core = { workspace = true }
 # the engine deals in raw BGRA buffers and `aris-reader-cli` owns PNG encoding.
 pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["pdfium_latest", "thread_safe"] }
 
+# Dynamic loading of the same library, for the annotation dictionary accessors that
+# `pdfium-render` does not expose (`/BM`, `/CA`) — see `src/annotations.rs`. Pinned to the
+# same 0.8 line the wrapper uses so the process keeps one copy of the crate. Only compiled
+# with the `pdfium` feature.
+libloading = { version = "0.8", optional = true }
+
 [features]
 default = ["pdfium"]
 # Enables the real PDFium implementation. With `--no-default-features` only the stub
 # is built, which keeps `cargo check --target x86_64-unknown-linux-gnu` (and any
 # machine without PDFium) working.
-pdfium = ["dep:pdfium-render"]
+pdfium = ["dep:pdfium-render", "dep:libloading"]

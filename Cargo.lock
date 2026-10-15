@@ -84,6 +84,7 @@ name = "aris-reader-pdfium"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+ "libloading 0.8.9",
  "pdfium-render",
 ]
 
