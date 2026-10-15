@@ -188,14 +188,16 @@ const PLAUSIBLE_ENTRY_CHARS: usize = 1800;
 ///
 /// The ceiling is that paper's measured maximum plus half again, rounded up to 50, from the
 /// T4.17 scan of 2026-10-15 (the FLOORS above were measured the day before); the measurement is
-/// in the comment. Three papers here get `over: 1` — a fourth, `manuscript_0925`, is pinned in
-/// `reference_corpus.rs`: their list ends with an entry that absorbs the section following it on
-/// the same page (an appendix, or `1710.05833`'s author list). That defect is diagnosed but not
-/// fixed: the obvious cut — end an entry at a paragraph gap — was simulated over both corpora
-/// and truncates legitimate wrapped lines (three entries in `Candidacy Report`, and the first
-/// line of `manuscript_0925`'s own last reference), so those numbers are pinned instead. The
-/// pins still catch a collapse: it would grow a paper past its ceiling, and the count would
-/// exceed `over` even if every new entry stayed under the ceiling.
+/// in the comment. Three papers used to get `over: 1` — a fourth, `manuscript_0925`, was pinned in
+/// `reference_corpus.rs`: their list ends with an entry that absorbed the section following it on
+/// the same page (an appendix, or `1710.05833`'s author list, 2209–3601 characters). T4.29 cut
+/// that tail where the section it swallowed is set in a larger type than the entry's own body
+/// (`trim_trailing_section`, `crates/aris-reader-text/src/bibliography.rs`), which took all four
+/// to `over: 0` and left their longest *reference* at 443 (`1710.05833`), 462 (`1810.04805`) and
+/// 935 (`1807.06209`) characters — so the pins below are re-measured against the entry the paper
+/// really prints, with the same half-again margin, and the fourth paper needs no pin of its own. The pins still catch a collapse: it
+/// would grow a paper past its ceiling, and the count would exceed `over` even if every new entry
+/// stayed under the ceiling.
 const ENTRY_LENGTH_CEILINGS: &[(&str, usize, usize)] = &[
     ("1301.3781", 400, 0),   // measured max 253
     ("1408.5882", 450, 0),   // measured max 288
@@ -203,10 +205,10 @@ const ENTRY_LENGTH_CEILINGS: &[(&str, usize, usize)] = &[
     ("1602.05629", 500, 0),  // measured max 328
     ("1706.03762", 450, 0),  // measured max 286
     ("1710.05463", 400, 0),  // measured max 245
-    ("1710.05833", 5150, 1), // measured max 3428 + 1 over: last entry absorbs the author list
+    ("1710.05833", 700, 0),  // measured max 443; 3428 before T4.29 (LIGO author list)
     ("1712.01815", 700, 0),  // measured max 455
-    ("1807.06209", 5450, 1), // measured max 3601 + 1 over: last entry absorbs Appendix A
-    ("1810.04805", 3350, 1), // measured max 2209 + 1 over: last entry absorbs the BERT appendix
+    ("1807.06209", 1450, 0), // measured max 935; 3601 before T4.29 (Appendix A)
+    ("1810.04805", 700, 0),  // measured max 462; 2209 before T4.29 (the BERT appendix)
     ("1905.11946", 550, 0),  // measured max 354
     ("1909.05722", 350, 0),  // measured max 223
     ("1912.01703", 1100, 0), // measured max 723

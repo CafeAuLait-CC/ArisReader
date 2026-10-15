@@ -54,6 +54,13 @@
 //! continuation, `Leader`'s entry 47 — the page's own line spacing and the stricter
 //! same-column test admit it.
 //!
+//! On 2026-10-15 the crossing count is **13**, and the fallback explains it. T4.29 trims the
+//! list's last entry where the page printed a section after it; five of the entries that used to
+//! cross were carrying a page number that is set inside the gutter (`Pan` 35, `Leader` 53, `Yin`
+//! 47, `Zhang` 90, `HumanML3D` 47), so their boxes no longer straddle the boundary — the
+//! glyph that put them there is gone. The other thirteen are the fallback described above,
+//! unchanged.
+//!
 //! Of the 21 page continuations, 17 are the entry's own words and 4 are page furniture the
 //! geometric guard cannot tell from prose (`Dvorožňák 2017`, whose second fragment is a running
 //! head and a figure caption, and `SMooDi` twice and `Leader` once, running heads). The guard does
