@@ -163,6 +163,17 @@ a real-paper raster p95 of 13.7-14.5 ms likewise did not reproduce in either arm
 minimum ring can still exceed that target. Record the commit, PDFium version, input PDF,
 command, build profile and hardware with each result.
 
+**The cache figure names what it covers.** The 48 MiB budget is shared by tiles and whole-page rasters;
+sidebar thumbnails and text layers are held outside it. `aris-stats:` therefore prints
+`tiles X/Y MiB`, `pageRasters Z MiB` and `shared X+Z/Y MiB` — the number the budget actually bounds —
+followed by `thumbnails`, `text` and `rasters total` for what it does not, and `aris-band:` uses the
+same names. On the real 115-page paper at 140% the line used to read `cache 0 tiles · 0.0/48.0 MiB`
+while three 14.5 MiB page rasters were resident: 43.5 MiB of page rasters + 8.3 MiB of thumbnails +
+0.5 MiB of text = 52.3 MiB held, of which the budget covered the 43.5 MiB of page rasters and none of
+the rest. The verification's own accounting on its 140% run was 48 MiB of budgeted rasters + 7.2 MiB of
+thumbnails + 1.4 MiB of text = 52.1 MiB. Peak RSS is unaffected by the wording; it stayed in the same
+460-499 MiB band across three runs before and three runs after.
+
 ```bash
 cargo run --release -p aris-reader-cli -- bench tests/fixtures/multipage.pdf
 ./scripts/fetch-eval-papers.sh

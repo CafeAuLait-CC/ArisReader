@@ -2723,6 +2723,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// viewport update. Off by default and silent unless asked for; it changes no scheduling
     /// decision, it only counts and reports. The byte counters are what proves the ADR 0007
     /// budget actually bounds the cache.
+    ///
+    /// The number the budget bounds is *not* the tile figure alone: whole-page rasters are
+    /// reserved from the same budget (`TileCache.evictToFit(reservedBytes:)`), while sidebar
+    /// thumbnails and text layers are held outside it. The line therefore labels the tile
+    /// figure, prints the page rasters next to it, prints the two together against the budget
+    /// ("shared"), and ends with the total the reader actually holds. Reporting only
+    /// `cache X/48 MiB` made a 140% run look like 0 MiB while three 14.5 MiB page rasters were
+    /// resident (T4.39).
     private func reportTileCacheStats(
         wanted: Int,
         scheduled: Int,
@@ -2735,11 +2743,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard Self.renderStatsEnabled else { return }
         let stats = tileCache.stats
         let mib = 1024.0 * 1024.0
+        let pageRasterBytes = pagePreviews.values.reduce(0) { $0 + $1.bgra.count }
+        let thumbnailBytes = thumbnails.values.reduce(0) { $0 + $1.bgra.count }
+        let textBytes = textPages.values.reduce(0) { $0 + $1.chars.count * MemoryLayout<TextChar>.size }
+        let sharedBytes = tileCache.usedBytes + pageRasterBytes
         let line = String(
-            format: "aris-stats: cache %d tiles · %.1f/%.1f MiB · peak %.1f MiB · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
+            format: "aris-stats: cache %d tiles · tiles %.1f/%.1f MiB · pageRasters %.1f MiB · shared %.1f/%.1f MiB · peak tiles %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · rasters total %.1f MiB · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
             tileCache.count,
             Double(tileCache.usedBytes) / mib, Double(tileCache.budgetBytes) / mib,
+            Double(pageRasterBytes) / mib,
+            Double(sharedBytes) / mib, Double(tileCache.budgetBytes) / mib,
             Double(tileCache.peakBytes) / mib,
+            Double(thumbnailBytes) / mib, Double(textBytes) / mib,
+            Double(sharedBytes + thumbnailBytes + textBytes) / mib,
             wanted, scheduled, stats.hits, stats.misses, stats.hitRate * 100.0,
             stats.insertions, stats.evictions, Double(stats.evictedBytes) / mib
         )
@@ -2754,11 +2770,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             staleTiles += 1
             staleBytes += tileCache.bytes(for: key) ?? 0
         }
-        let previewBytes = pagePreviews.values.reduce(0) { $0 + $1.bgra.count }
-        let thumbnailBytes = thumbnails.values.reduce(0) { $0 + $1.bgra.count }
-        let textBytes = textPages.values.reduce(0) { $0 + $1.chars.count * MemoryLayout<TextChar>.size }
+        let previewBytes = pageRasterBytes
+        // The same three consumers the `aris-stats` line totals, split by band class here: a
+        // line that called the whole-page rasters "previews" is what made the two HUD lines
+        // disagree about what the 48 MiB budget covers (T4.39).
         let bandLine = String(
-            format: "aris-band: visible %d tiles (%.1f MiB) · ring %d (%.1f MiB) · offscreenCols %d (%.1f MiB) · stale %d (%.1f MiB) · previews %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · ringVh %.2f · visibleMiss %d · lod %d · tilePt %.0f · bandPages %d\n",
+            format: "aris-band: visible %d tiles (%.1f MiB) · ring %d (%.1f MiB) · offscreenCols %d (%.1f MiB) · stale %d (%.1f MiB) · pageRasters %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · ringVh %.2f · visibleMiss %d · lod %d · tilePt %.0f · bandPages %d\n",
             band.tiles(.visible), Double(band.bytes(.visible)) / mib,
             band.tiles(.ring), Double(band.bytes(.ring)) / mib,
             band.tiles(.offscreenColumn), Double(band.bytes(.offscreenColumn)) / mib,
