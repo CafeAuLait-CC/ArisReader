@@ -90,7 +90,21 @@ public final class MetalCanvasView: NSView {
     }
 
     /// Scroll gestures, reported as deltas in screen points.
+    ///
+    /// This is the *continuous* path: a trackpad's precise deltas, and its momentum, arrive here
+    /// already animated by the system and are applied one to one.
     public var onScroll: ((CGFloat) -> Void)?
+    /// Stepped scroll input — a classic wheel notch, a keyboard page — reported as the distance
+    /// the step is worth in screen points. The shell glides toward it rather than jumping.
+    public var onScrollStep: ((CGFloat) -> Void)?
+    /// Scroll gestures that carry a zoom modifier (Ctrl or ⌘), reported as the same screen-point
+    /// delta the plain path would have scrolled by, plus the pointer's view-space Y (top-left
+    /// origin) so the shell can keep the point under the pointer still.
+    public var onZoomScroll: ((CGFloat, CGFloat) -> Void)?
+    /// Trackpad pinch, reported as `NSEvent.magnification` (0.1 = +10%) and the pointer's
+    /// view-space Y. Pinch is the one zoom gesture the Accessibility zoom setting cannot take
+    /// away from us, because it is not a scroll gesture.
+    public var onMagnify: ((CGFloat, CGFloat) -> Void)?
     /// Pointer events, reported in **content points** (the shell's layout space).
     public var onPointerDown: ((CGPoint) -> Void)?
     public var onPointerDragged: ((CGPoint) -> Void)?
@@ -128,13 +142,17 @@ public final class MetalCanvasView: NSView {
     private var pendingFrame: DispatchWorkItem?
     private var frameEpoch: UInt64 = 0
     private var wheelMotion = WheelMotion()
-    /// Reads the just-updated model during AppKit event tracking, before SwiftUI commits.
-    public var interactionSnapshot: (() -> ([CanvasPage], CGFloat))?
+    /// Whether the scroll gesture in flight is a zoom (a modifier was down when it began).
+    private var gestureIsZoom = false
+    /// Reads the just-updated model during AppKit event tracking, before SwiftUI commits:
+    /// pages, scroll offset in content points, and zoom factor.
+    public var interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
 
     private func syncInteraction() {
         if let snapshot = interactionSnapshot?() {
             pages = snapshot.0
             scrollYPt = snapshot.1
+            zoom = snapshot.2
         }
         if needsRender {
             needsRender = false
@@ -147,6 +165,9 @@ public final class MetalCanvasView: NSView {
     private var framesRendered: UInt64 = 0
     /// Native regression checks observe successful submissions without the HUD's throttle.
     package var submittedFrameCount: UInt64 { framesRendered }
+    /// Whether this view's layer is attached to an engine surface. Checks use it where they
+    /// cannot ask for a presented frame (an occluded window never presents).
+    package var hasAttachedSurface: Bool { surfaceId != 0 }
     private let traceFrames = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"] != nil
     private let traceScheduling = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SCHEDULING"] == "1"
 
@@ -193,6 +214,12 @@ public final class MetalCanvasView: NSView {
     /// Self-managed scrolling (decision T1.4): `NSScrollView` would size its document view
     /// to the whole document, and a `CAMetalLayer` cannot be hundreds of thousands of
     /// pixels tall. AppKit still delivers the trackpad's momentum as scroll events.
+    ///
+    /// A scroll carrying Ctrl or ⌘ zooms instead (the *whole* gesture: see `gestureIsZoom`).
+    /// The two actions stay mutually exclusive, so holding a modifier can never scroll *and*
+    /// zoom on the same event. Known system-level conflict: Accessibility ▸ Zoom ▸ "Use scroll
+    /// gesture with modifier keys to zoom" makes the system swallow the configured modifier
+    /// before AppKit sees the event at all — see `AppState.zoomByScroll` for what still works.
     public override func scrollWheel(with event: NSEvent) {
         // NSEvent already applies the user's natural-scrolling preference. Convert
         // content motion to a top-origin offset exactly once; never invert by device.
@@ -202,8 +229,50 @@ public final class MetalCanvasView: NSView {
             timestamp: event.timestamp
         )
         guard delta != 0 else { return }
-        onScroll?(delta)
+
+        let modifierZoom = event.modifierFlags.contains(.control)
+            || event.modifierFlags.contains(.command)
+        // Momentum events are synthesised by the trackpad driver and are not guaranteed to carry
+        // the modifier that started the gesture. Zooming the finger-driven half of a flick and
+        // scrolling its momentum half would be worse than either, so the whole gesture keeps the
+        // decision its first event made.
+        if event.phase == .began { gestureIsZoom = modifierZoom }
+        if event.phase == .cancelled || event.momentumPhase == .ended { gestureIsZoom = false }
+        let zooming = modifierZoom || (event.momentumPhase != [] && gestureIsZoom)
+
+        if zooming {
+            onZoomScroll?(delta, pointerViewY(for: event))
+        } else if event.hasPreciseScrollingDeltas || event.momentumPhase != [] {
+            // A trackpad (and a Magic Mouse) reports the distance the fingers travelled, already
+            // animated, including the momentum the system synthesises after they lift. Applying
+            // it 1:1 is what keeps the content under the fingers; gliding it here would be the
+            // same gesture applied twice.
+            onScroll?(delta)
+        } else {
+            // A classic wheel reports "one notch", which is not a distance: the shell turns it
+            // into a short glide so the page moves instead of jumping a grid line at a time.
+            onScrollStep?(delta)
+        }
         syncInteraction()
+    }
+
+    /// Pinch to zoom, anchored at the pointer like the scroll form (`docs/04-ui-ux.md` §3).
+    ///
+    /// A canvas without a handler (the preview panel's) forwards the gesture instead of
+    /// swallowing it.
+    public override func magnify(with event: NSEvent) {
+        guard event.magnification != 0, let onMagnify else {
+            super.magnify(with: event)
+            return
+        }
+        onMagnify(event.magnification, pointerViewY(for: event))
+        syncInteraction()
+    }
+
+    /// The pointer in view space (top-left origin), the frame the zoom anchor is expressed in.
+    private func pointerViewY(for event: NSEvent) -> CGFloat {
+        let point = convert(event.locationInWindow, from: nil)
+        return bounds.height - point.y
     }
 
     public override var acceptsFirstResponder: Bool { true }
@@ -267,15 +336,16 @@ public final class MetalCanvasView: NSView {
         let page = bounds.height * 0.9
         switch event.charactersIgnoringModifiers {
         case " ":
-            onScroll?(event.modifierFlags.contains(.shift) ? -page : page)
+            // A page is a step like a wheel notch, so it glides to its destination too.
+            onScrollStep?(event.modifierFlags.contains(.shift) ? -page : page)
         case "\u{F72D}": // page down
-            onScroll?(page)
+            onScrollStep?(page)
         case "\u{F72C}": // page up
-            onScroll?(-page)
+            onScrollStep?(-page)
         case "\u{F701}": // down arrow
-            onScroll?(40)
+            onScrollStep?(40)
         case "\u{F700}": // up arrow
-            onScroll?(-40)
+            onScrollStep?(-40)
         default:
             super.keyDown(with: event)
         }
@@ -554,13 +624,16 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onDeviceScale: (CGFloat) -> Void
     private let onViewportSize: (CGSize) -> Void
     private let onScroll: (CGFloat) -> Void
+    private let onScrollStep: (CGFloat) -> Void
+    private let onZoomScroll: (CGFloat, CGFloat) -> Void
+    private let onMagnify: (CGFloat, CGFloat) -> Void
     private let onPointerDown: (CGPoint) -> Void
     private let onPointerDragged: (CGPoint) -> Void
     private let onPointerUp: (CGPoint, Bool) -> Void
     private let onCopy: () -> Void
     private let onUndo: () -> Void
     private let onRedo: () -> Void
-    private let interactionSnapshot: (() -> ([CanvasPage], CGFloat))?
+    private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
 
     public init(
         pages: [CanvasPage] = [],
@@ -572,13 +645,16 @@ public struct PDFCanvasView: NSViewRepresentable {
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
         onScroll: @escaping (CGFloat) -> Void = { _ in },
+        onScrollStep: @escaping (CGFloat) -> Void = { _ in },
+        onZoomScroll: @escaping (CGFloat, CGFloat) -> Void = { _, _ in },
+        onMagnify: @escaping (CGFloat, CGFloat) -> Void = { _, _ in },
         onPointerDown: @escaping (CGPoint) -> Void = { _ in },
         onPointerDragged: @escaping (CGPoint) -> Void = { _ in },
         onPointerUp: @escaping (CGPoint, Bool) -> Void = { _, _ in },
         onCopy: @escaping () -> Void = {},
         onUndo: @escaping () -> Void = {},
         onRedo: @escaping () -> Void = {},
-        interactionSnapshot: (() -> ([CanvasPage], CGFloat))? = nil
+        interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -589,6 +665,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onDeviceScale = onDeviceScale
         self.onViewportSize = onViewportSize
         self.onScroll = onScroll
+        self.onScrollStep = onScrollStep
+        self.onZoomScroll = onZoomScroll
+        self.onMagnify = onMagnify
         self.onPointerDown = onPointerDown
         self.onPointerDragged = onPointerDragged
         self.onPointerUp = onPointerUp
@@ -615,6 +694,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onDeviceScale = onDeviceScale
         view.onViewportSize = onViewportSize
         view.onScroll = onScroll
+        view.onScrollStep = onScrollStep
+        view.onZoomScroll = onZoomScroll
+        view.onMagnify = onMagnify
         view.onPointerDown = onPointerDown
         view.onPointerDragged = onPointerDragged
         view.onPointerUp = onPointerUp

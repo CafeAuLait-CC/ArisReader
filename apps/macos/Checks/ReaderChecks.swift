@@ -35,6 +35,10 @@ struct ReaderChecks {
             try await measurePageFallback()
             return
         }
+        if CommandLine.arguments.contains("--measure-scroll-trace") {
+            try await measureScrollTrace()
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -117,6 +121,12 @@ struct ReaderChecks {
         try await annotationChecks(a: a, b: b)
         try await annotationRecoveryChecks(a: a, b: b)
         try await previewChecks(url: b)
+        try await pointerZoomChecks(url: b)
+        try previewPanelChecks()
+        try await previewPanelSessionChecks(url: b)
+        try referenceEntryTextChecks()
+        try await smoothScrollChecks(url: b)
+        try scrollGlideChecks()
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
         try await frameSchedulingChecks()

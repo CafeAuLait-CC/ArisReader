@@ -10,7 +10,6 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
-    @State private var previewExpanded = false
 
     public init(state: AppState) {
         self.state = state
@@ -82,7 +81,21 @@ public struct ReaderWindow: View {
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
                 onViewportSize: { size in state.setViewportSize(size) },
+                // Two scroll paths, split by what the device reports: a trackpad's precise
+                // deltas are applied 1:1 (they are already animated, momentum included), while a
+                // classic wheel's notch is glided to so the page moves instead of stepping.
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
+                onScrollStep: { delta in state.scrollByWheelStep(delta) },
+                // Ctrl+scroll and ⌘+scroll zoom instead of scrolling (docs/04-ui-ux.md §3). Ctrl
+                // is the binding the request asked for; ⌘ is the documented convention and the
+                // fallback when macOS Accessibility zoom has taken Ctrl over. Pinch works in
+                // either case because it is not a scroll gesture at all.
+                onZoomScroll: { delta, anchorViewY in
+                    state.zoomByScroll(delta: delta, anchorViewY: anchorViewY)
+                },
+                onMagnify: { magnification, anchorViewY in
+                    state.zoomByPinch(magnification, anchorViewY: anchorViewY)
+                },
                 onPointerDown: { point in state.beginSelection(at: point) },
                 onPointerDragged: { point in state.extendSelection(to: point) },
                 onPointerUp: { point, wasClick in
@@ -91,8 +104,9 @@ public struct ReaderWindow: View {
                 onCopy: { state.copySelection() },
                 onUndo: { state.undo() },
                 onRedo: { state.redo() },
-                interactionSnapshot: { (state.canvasPages, state.scrollYPt) }
+                interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
             )
+            .background(ReferencePreviewHost(state: state))
             HStack { Spacer(); ScrollIndicator(state: state) }
 
             if state.document == nil {
@@ -104,7 +118,6 @@ public struct ReaderWindow: View {
                 pageHUD
                     .padding(.bottom, 16)
             }
-            secondSurface
         }
     }
 
@@ -126,107 +139,9 @@ public struct ReaderWindow: View {
         .padding(40)
     }
 
-    /// The reference preview card (M4): page image, provenance, and the explicit jump.
-    ///
-    /// This is the T0.5 multi-surface proof put to work: a second `CAMetalLayer` on the same
-    /// wgpu device, with its own surface id and frame loop, showing the referenced page while
-    /// the reader keeps their place in the text.
-    @ViewBuilder
-    private func referencePanel(available: CGSize) -> some View {
-        if let preview = state.referencePreview {
-            let width = min(previewExpanded ? 720.0 : 480.0, max(240, available.width - 32))
-            let entriesHeight = preview.entries.isEmpty ? 0.0 : min(160, available.height * 0.25)
-            let desiredHeight = preview.region.map { width * $0.height / max($0.width, 1) }
-                ?? state.referencePreviewPages.first.map { $0.placement.heightPt * state.referencePreviewZoom }
-                ?? 400
-            let imageHeight = min(max(80, desiredHeight), max(120, min(available.height - entriesHeight - 134, 600)))
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Text(preview.title).font(.headline).lineLimit(1)
-                    Spacer(minLength: 0)
-                    Button { previewExpanded.toggle() } label: {
-                        Image(systemName: previewExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                    }.help("Resize preview")
-                    Button { state.closeReferencePreview() } label: {
-                        Image(systemName: "xmark")
-                    }.help("Close preview")
-                }.buttonStyle(.plain)
-                HStack {
-                    Text("From \(preview.source) · page \(preview.page + 1)")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Full page") { state.showFullPreviewPage() }
-                    Button("Go to page") {
-                        state.gotoPage(preview.page)
-                        state.closeReferencePreview()
-                    }
-                }.font(.caption)
-                ZStack {
-                    PDFCanvasView(
-                        pages: state.referencePreviewPages,
-                        scrollYPt: state.referencePreviewScrollYPt,
-                        zoom: state.referencePreviewZoom,
-                        contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
-                        onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
-                        onFailure: { message in state.reportGpuFailure(message) },
-                        onViewportSize: { size in state.setReferencePreviewViewport(size) },
-                        onScroll: { delta in state.scrollReferencePreview(by: delta) },
-                        interactionSnapshot: { (state.referencePreviewPages, state.referencePreviewScrollYPt) }
-                    )
-                    if state.referencePreviewLoading { ProgressView("Loading preview…") }
-                    if let error = state.referencePreviewError {
-                        Text(error).font(.callout).padding().background(.regularMaterial)
-                    }
-                }
-                .frame(width: width, height: imageHeight)
-                .background(Color.white)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                if !preview.entries.isEmpty {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(preview.entries.indices, id: \.self) { index in
-                                let entry = preview.entries[index]
-                                VStack(alignment: .leading, spacing: 4) {
-                                    if entry.page != nil {
-                                        Button(entry.label) { state.selectPreviewEntry(entry) }
-                                            .buttonStyle(.link)
-                                    } else {
-                                        Text(entry.label).bold()
-                                    }
-                                    Text(entry.text)
-                                        .textSelection(.enabled)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }.font(.callout)
-                    }.frame(height: entriesHeight)
-                }
-                Text("Scroll inside the preview to read more. Full page shows surrounding content.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            .frame(width: width)
-            .padding(10)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .shadow(radius: 14)
-            .onExitCommand { state.closeReferencePreview() }
-        }
-    }
-
-    @ViewBuilder
-    private var secondSurface: some View {
-        if state.referencePreview != nil {
-            GeometryReader { geometry in
-                VStack {
-                    Spacer(minLength: 0)
-                    HStack {
-                        Spacer(minLength: 0)
-                        referencePanel(available: geometry.size)
-                    }
-                }.padding(12)
-            }
-        }
-    }
+    /// The floating preview lives in its own panel (`ReferencePreviewPanelController`): it has to
+    /// be movable and resizable independently of this window, which an overlay cannot be. The
+    /// zero-size host below only tells the controller where the canvas is.
 
     private var pageHUD: some View {
         Text(state.pageLabel)
