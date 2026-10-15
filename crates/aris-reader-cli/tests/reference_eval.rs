@@ -26,6 +26,8 @@
 //!
 //! Both modes skip cleanly when the corpus is absent and, on CI, emit a `::notice::` saying the
 //! evaluation did NOT run: a silent pass here would be indistinguishable from a real one.
+//! Set `ARIS_READER_REQUIRE_FULL_EVAL=1` to require every listed PDF (used by manual CI).
+//! Both modes fail on document-open or page-text errors; partial extraction is not a score.
 
 use aris_reader_core::{DocumentBackend, PageIndex, RawTextPage};
 use aris_reader_pdfium::PdfiumBackend;
@@ -354,7 +356,13 @@ fn measure(id: &str, path: &Path) -> Paper {
     for index in 0..scan_end {
         match backend.raw_text_page(PageIndex(index)) {
             Ok(text) => pages.push((text.page.get(), text)),
-            Err(error) => eprintln!("  ! {id} page {}: {error}", index + 1),
+            Err(error) => {
+                paper.state = State::Unreadable(format!(
+                    "page {} text extraction failed: {error}",
+                    index + 1
+                ));
+                return paper;
+            }
         }
     }
 
@@ -968,7 +976,17 @@ fn reference_eval_recall() {
     let root = repo_root();
     let list = corpus_list(&root);
     let dir = corpus_dir(&root);
-    if present_papers(&dir, &list).is_empty() {
+    let present = present_papers(&dir, &list);
+    if std::env::var("ARIS_READER_REQUIRE_FULL_EVAL").as_deref() == Ok("1") {
+        assert_eq!(
+            present.len(),
+            list.len(),
+            "complete evaluation requested, but some corpus PDFs are absent in {}",
+            dir.display()
+        );
+        assert!(!list.is_empty(), "evaluation corpus list is empty");
+    }
+    if present.is_empty() {
         announce_skip(&dir, &list);
         return;
     }
@@ -1043,18 +1061,7 @@ fn reference_eval_recall() {
             )
         })
         .collect();
-    let unreadable: Vec<String> = papers
-        .iter()
-        .filter_map(|paper| match &paper.state {
-            State::Unreadable(error) => Some(format!("{}: {error}", paper.id)),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        unreadable.is_empty(),
-        "the corpus is present but these papers could not be read (is PDFium available?):\n  {}",
-        unreadable.join("\n  ")
-    );
+    assert_readable(&papers);
     assert!(
         failures.is_empty(),
         "recall floor(s) not met:\n  {}",
@@ -1072,12 +1079,23 @@ fn reference_eval_precision_audit() {
     let root = repo_root();
     let list = corpus_list(&root);
     let dir = corpus_dir(&root);
-    if present_papers(&dir, &list).is_empty() {
+    let present = present_papers(&dir, &list);
+    if std::env::var("ARIS_READER_REQUIRE_FULL_EVAL").as_deref() == Ok("1") {
+        assert_eq!(
+            present.len(),
+            list.len(),
+            "complete evaluation requested, but some corpus PDFs are absent in {}",
+            dir.display()
+        );
+        assert!(!list.is_empty(), "evaluation corpus list is empty");
+    }
+    if present.is_empty() {
         announce_skip(&dir, &list);
         return;
     }
 
     let (papers, dir) = measure_corpus();
+    assert_readable(&papers);
     println!();
     println!("precision audit — every match the heuristics find suspicious, with its evidence");
     println!("PDFs: {}", dir.display());
@@ -1221,4 +1239,31 @@ fn reference_eval_precision_audit() {
         "suspicious-match budget exceeded:\n  {}",
         over_budget.join("\n  ")
     );
+}
+
+/// Neither mode may turn an engine/extraction failure into a passing quality score.
+fn assert_readable(papers: &[Paper]) {
+    let unreadable: Vec<_> = papers
+        .iter()
+        .filter_map(|paper| match &paper.state {
+            State::Unreadable(error) => Some(format!("{}: {error}", paper.id)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        unreadable.is_empty(),
+        "corpus papers could not be measured:\n  {}",
+        unreadable.join("\n  ")
+    );
+}
+
+#[test]
+#[should_panic(expected = "corpus papers could not be measured")]
+fn unreadable_paper_cannot_pass_quality_gate() {
+    let mut paper = absent(&CorpusEntry {
+        id: "broken".into(),
+        note: String::new(),
+    });
+    paper.state = State::Unreadable("text extraction failed".into());
+    assert_readable(&[paper]);
 }

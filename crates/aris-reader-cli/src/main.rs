@@ -148,6 +148,7 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--skip-scroll"
                 | "--skip-search"
                 | "--skip-baseline"
+                | "--prefetch-all-columns"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;

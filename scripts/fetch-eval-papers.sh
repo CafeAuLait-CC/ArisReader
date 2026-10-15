@@ -27,6 +27,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 LIST="$ROOT/tests/eval/arxiv-links.txt"
+LOCK="$ROOT/tests/eval/arxiv-lock.tsv"
 DEST="$ROOT/eval-papers"
 FORCE=0
 DELAY=3
@@ -83,30 +84,35 @@ SKIPPED=0
 FAILED=0
 PRESENT=0
 MISSING=0
+REQUESTED=0
 
 for id in $(ids); do
   is_wanted "$id" || continue
   target="$DEST/$id.pdf"
   note="$(note_for "$id")"
+  revision="$(awk -v id="$id" '$1 == id {print $2}' "$LOCK")"
+  checksum="$(awk -v id="$id" '$1 == id {print $3}' "$LOCK")"
+  [ -n "$revision" ] && [ -n "$checksum" ] || { echo "missing lock for $id" >&2; exit 1; }
 
-  # A file that is not a PDF is a broken earlier attempt: remove it so the retry is honest.
-  if [ -f "$target" ] && ! is_pdf "$target"; then
-    echo "  ! $id.pdf exists but is not a PDF (partial download?) — removing it"
-    rm -f "$target"
-  fi
 
   if [ "$LIST_ONLY" = "1" ]; then
-    if is_pdf "$target"; then
-      printf '  + %-10s present  %s\n' "$id" "$note"
+    if is_pdf "$target" && [ "$(shasum -a 256 "$target" | awk '{print $1}')" = "$checksum" ]; then
+      printf '  + %-10s verified %s\n' "$id" "$note"
       PRESENT=$((PRESENT + 1))
     else
-      printf '  - %-10s missing  %s\n' "$id" "$note"
+      printf '  - %-10s missing or hash mismatch %s\n' "$id" "$note"
       MISSING=$((MISSING + 1))
     fi
     continue
   fi
 
   if is_pdf "$target" && [ "$FORCE" != "1" ]; then
+    actual="$(shasum -a 256 "$target" | awk '{print $1}')"
+    if [ "$actual" != "$checksum" ]; then
+      echo "  x $id: checksum differs from locked $revision; use --force to replace" >&2
+      FAILED=$((FAILED + 1))
+      continue
+    fi
     printf '  = %-10s skipped (already a PDF, %s)  %s\n' "$id" "$(du -h "$target" | cut -f1)" "$note"
     SKIPPED=$((SKIPPED + 1))
     continue
@@ -114,10 +120,13 @@ for id in $(ids); do
 
   tmp="$target.part"
   rm -f "$tmp"
+  # Delay between requests, including after a failed request.
+  if [ "$REQUESTED" -gt 0 ] && [ "$DELAY" != "0" ]; then sleep "$DELAY"; fi
+  REQUESTED=$((REQUESTED + 1))
   printf '  > %-10s fetching  %s\n' "$id" "$note"
   if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
         -A "ArisReader-eval-fetch/1.0 (local citation-index evaluation; +https://github.com/CafeAuLait-CC/ArisReader)" \
-        -o "$tmp" "https://arxiv.org/pdf/$id"; then
+        -o "$tmp" "https://arxiv.org/pdf/$revision"; then
     echo "  x $id: download failed" >&2
     rm -f "$tmp"
     FAILED=$((FAILED + 1))
@@ -129,14 +138,18 @@ for id in $(ids); do
     FAILED=$((FAILED + 1))
     continue
   fi
+  actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+  if [ "$actual" != "$checksum" ]; then
+    echo "  x $id: downloaded $revision does not match locked SHA-256" >&2
+    rm -f "$tmp"
+    FAILED=$((FAILED + 1))
+    continue
+  fi
   mv "$tmp" "$target"
   printf '  + %-10s fetched (%s)\n' "$id" "$(du -h "$target" | cut -f1)"
   FETCHED=$((FETCHED + 1))
 
-  # arXiv is a shared service: do not hammer it, and never sleep after the last request.
-  if [ "$DELAY" != "0" ]; then
-    sleep "$DELAY"
-  fi
+
 done
 
 echo
