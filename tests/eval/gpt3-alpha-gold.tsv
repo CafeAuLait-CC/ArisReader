@@ -1,0 +1,16 @@
+# 2005.14165v4; SHA-256 in arxiv-lock.tsv. Pages are physical, zero-based.
+# Complete citation inventory on pages 0,1,2, independently read from Poppler-rendered
+# pages on 2026-10-14 (not generated from the detector). '-' means no citations.
+# Columns: page<TAB>ordered keys in one span<TAB>first-author surnames in the same order.
+# Bibliography identities checked against the PDF reference text with pdftotext.
+# This is a small regression gold set, not a corpus-wide precision/recall estimate.
+0	-	-
+1	-	-
+2	MCCD13,PSM14	Mikolov,Pennington
+2	DL15,MBXS17,PNZtY18	Dai,McCann,Peters
+2	VSP+17	Vaswani
+2	RNSS18,DCLT18,HR18	Radford,Devlin,Howard
+2	RSR+19,LOG+19,YDY+19,LCG+19	Raffel,Liu,Yang,Lan
+2	HLW+20	Hendrycks
+2	YdC+19,MPL19	Yogatama,McCoy
+2	GSL+18,NK19	Gururangan,Niven

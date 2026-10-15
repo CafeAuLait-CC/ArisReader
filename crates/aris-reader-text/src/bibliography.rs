@@ -61,6 +61,7 @@ pub(super) fn select_reference_run<'a>(
         return Vec::new();
     }
     let mut numeric = Run::default();
+    let mut alpha = Run::default();
     let mut author_year = Run::default();
     let mut best = Run::default();
     for (page, text) in pages {
@@ -80,6 +81,7 @@ pub(super) fn select_reference_run<'a>(
             });
         for (run, mut entries, numbered) in [
             (&mut numeric, parse_numeric_references(page, text), true),
+            (&mut alpha, alphanumeric::references(page, text), false),
             (
                 &mut author_year,
                 parse_author_year_references(page, text),
@@ -118,6 +120,7 @@ pub(super) fn select_reference_run<'a>(
         }
     }
     numeric.finish(&mut best);
+    alpha.finish(&mut best);
     author_year.finish(&mut best);
     best.entries.truncate(max_entries);
     best.entries

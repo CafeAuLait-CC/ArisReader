@@ -117,6 +117,7 @@ pub struct CitationStyle {
     numbered: bool,
     /// Whether the body brackets its numeric citations.
     bracketed: bool,
+    alphanumeric: bool,
 }
 
 impl CitationStyle {
@@ -149,6 +150,11 @@ impl CitationStyle {
             .iter()
             .filter_map(|entry| entry.label.trim().parse::<u32>().ok())
             .collect();
+        let alpha_count = references
+            .iter()
+            .filter(|e| crate::alphanumeric::label(&e.label).is_some())
+            .count();
+        let alphanumeric = alpha_count >= 2 && alpha_count * 2 >= references.len();
         let numbered = labels.len() >= 2 && labels.len() * 2 >= references.len();
         let body_end = references
             .iter()
@@ -167,7 +173,14 @@ impl CitationStyle {
             labels,
             numbered,
             bracketed,
+            alphanumeric,
         }
+    }
+
+    /// Explicit alpha-style bibliography, allowing bracketed keys without treating codes
+    /// in an unrelated document as citations.
+    pub fn uses_alphanumeric_labels(&self) -> bool {
+        self.alphanumeric
     }
 
     /// Whether this document cites by number at all.
@@ -514,6 +527,7 @@ mod tests {
             labels: labels.collect(),
             numbered: true,
             bracketed: false,
+            alphanumeric: false,
         }
     }
 
