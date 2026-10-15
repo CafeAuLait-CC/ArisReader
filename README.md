@@ -229,6 +229,10 @@ median is about 406.1 MB and does not meet a decimal 400 MB limit; a median belo
 does not prove that every run's peak is below it. The published debug-build measurements and
 CLI raster timings alone do not establish the full M1 memory/60 fps acceptance criteria.
 
+All-zero Metal presentation timestamps are reported as unavailable, with FPS and drop counts left
+unset; they are not evidence of 0 FPS. The native scroll harness also accepts `--zoom 140` for the
+ordinary-zoom page-cache path.
+
 ### Page cache and navigation measurements
 
 After a release build, the native checks executable can measure CPU raster retention for any local PDF:

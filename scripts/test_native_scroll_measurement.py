@@ -71,6 +71,17 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result['presented_fps'], 1)
         self.assertEqual(result['presentation_gap_max_ms'], 950)
 
+    def test_all_zero_timestamps_are_unavailable_not_zero_fps_or_all_drops(self):
+        trace = self.presentation_trace()
+        trace[-1]['time'] = trace[-2]['time'] = 0
+        result = measurement.summarize(trace)
+        self.assertIn('unavailable', result['presentation_measurement'])
+        self.assertEqual(result['presentation_zero_timestamps'], 2)
+        self.assertIsNone(result['presentation_drops_reported'])
+        self.assertIsNone(result['presented_frames'])
+        self.assertIsNone(result['presented_fps'])
+        self.assertIsNone(result['presentation_gap_max_ms'])
+
     def test_duplicate_callback_rejected_and_wrong_surface_ignored(self):
         trace = self.presentation_trace()
         trace.append(dict(trace[-1], surface=2))
