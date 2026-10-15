@@ -2352,8 +2352,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// already sharp rows stay in place while newly exposed rows load.
     ///
     /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
-    /// tiles until all visible tiles on that page are ready, then replace them together.
-    /// This prevents the page from disappearing or sharpening in a visible diagonal sweep.
+    /// tiles until all visible tiles on that page are ready, then replace them together, so a
+    /// half-finished LOD cannot mix two sharpness levels in one frame.
+    ///
+    /// That mixing belongs to this tiled deep-zoom path, not to the base's ordinary zoom: the
+    /// verification of #37 found the base never had a 1x preview and pyramid tiles in the same
+    /// frame (0 of 230 canvas updates), and that its real defect was a blurry 1x raster held
+    /// for up to 26 consecutive canvas updates (84-88 ms per page jump). The comment here used
+    /// to promise this retention removed a "visible diagonal sweep" of preview plus tiles,
+    /// which overstates what the base did.
     public func reloadVisiblePages() {
         guard document != nil else {
             canvasPages = []

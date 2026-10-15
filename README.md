@@ -22,7 +22,12 @@ At ordinary zoom, the reader presents one page raster at the screen's actual res
 nearby pages on every scroll update. Page rasters and tiles share the configured byte budget, so lower
 zoom keeps more neighbors; larger pages and deep zoom use tiles. Already sharp tile rows stay sharp as
 new regions load. A cold page can still show a preview until its raster arrives; this does not promise
-zero-latency arbitrary jumps.
+zero-latency arbitrary jumps. What this replaced was measured rather than assumed: at 140% on a 2x
+display the base held a blurry 1x raster for up to 26 consecutive canvas updates and took 84-88 ms per
+page jump, and it never mixed a preview with pyramid tiles in one frame (0 mixed frames in 230 canvas
+updates). Mixed sharp and blurry frames belong to the deep-zoom tile path here, which deliberately
+paints complete sharp rows over a soft backdrop; that is the one present this reader still refines in
+place.
 Milestone acceptance criteria are not all met: the milestone table below names what is missing, and the
 full review record (findings, evidence and follow-ups) is kept with the project's design notes rather than in
 this repository. Concrete
