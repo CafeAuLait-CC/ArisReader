@@ -31,6 +31,10 @@ struct ReaderChecks {
             try await measurePageRasters()
             return
         }
+        if CommandLine.arguments.contains("--measure-page-fallback") {
+            try await measurePageFallback()
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)

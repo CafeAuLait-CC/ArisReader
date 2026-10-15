@@ -260,6 +260,8 @@ ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -
   apps/macos/.build/release/ArisReaderChecks --measure-page-rasters /path/to/paper.pdf 2.8 3
 ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
   apps/macos/.build/release/ArisReaderChecks --measure-page-navigation /path/to/paper.pdf 140
+ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" \
+  apps/macos/.build/release/ArisReaderChecks --measure-page-fallback /path/to/paper.pdf 140
 ```
 
 `2.8` represents 140% on a 2x display. The first command totals actual BGRA bytes across all pages
@@ -269,6 +271,18 @@ readiness on cold, neighbor, return and distant jumps (PDFs longer than eight pa
 sharp updates and immediate sharp cache hits. It excludes GPU upload and presentation, so it is not FPS
 or end-to-end visual latency. `ARIS_READER_SHARP_PAGE_RASTERS=0` disables the screen-page path for a
 feature-off comparison under the same pixel budget. Deep zoom remains on tiles.
+
+What a cold page shows *before* its sharp raster is measured, not assumed. The third command records the
+canvas-update quality timeline for cold, neighbor, return and distant jumps; on a real 115-page paper
+(959×715pt viewport, 2x backing scale, 48 MiB budget, medians of five runs in one interleaved A/B) it
+shows: at 100% the 264×342 sidebar thumbnail for 20.1 ms, then a sharp 1224×1584 raster at 20.8 ms; at
+140% the same thumbnail for 28.3 ms, then 1714×2218 at 28.8 ms (the verification measured 39-51 ms on
+its machine); at 400%, where the tiled path is used, the thumbnail for 7-14 ms, then a 1x 612×792
+preview for 35-55 ms, then sharp tiles. A destination past the first 24 pages and outside the prepared
+neighborhood has no thumbnail at all and shows nothing for 16-28 ms instead. Rendering a half-scale
+raster first was measured and rejected: it halves the blurry window (28.3 → 13.7 ms at 140%, 20.1 →
+11.1 ms at 100%) but adds a whole extra render before the sharp one (28.8 → 49.6 ms and 20.8 → 59.4 ms
+to a sharp page), which is the property this path exists to protect.
 
 ## Documentation index
 

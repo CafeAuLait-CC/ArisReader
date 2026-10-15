@@ -2351,6 +2351,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Large pages/deep zoom use tiles. Complete visible-width rows sharpen during scrolling;
     /// already sharp rows stay in place while newly exposed rows load.
     ///
+    /// A page with no raster yet falls back to the sidebar thumbnail for exactly as long as its
+    /// screen-resolution raster takes to render: measured with `--measure-page-fallback` on a
+    /// real 115-page paper (959x715 pt viewport, 2x backing scale, 48 MiB budget, medians of five
+    /// runs), 20.1 ms to a sharp 1224x1584 raster at 100% and 28.3 ms to 1714x2218 at 140%;
+    /// at 400% the tile path shows a 1x preview for 35-55 ms instead. Rendering a half-scale
+    /// raster first was measured and rejected (T4.36): it halves that window but adds a whole
+    /// extra render before the sharp one.
+    ///
     /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
     /// tiles until all visible tiles on that page are ready, then replace them together, so a
     /// half-finished LOD cannot mix two sharpness levels in one frame.
