@@ -32,8 +32,8 @@
 name: CI
 
 on:
+  # Include stacked PRs targeting a feature branch; checkout still tests the merge result.
   pull_request:
-    branches: [master]
   push:
     branches: [master]
   workflow_dispatch:
