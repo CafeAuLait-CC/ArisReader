@@ -57,7 +57,7 @@
 //! this module accepts, so that class stays visible instead of being assumed away.
 
 use crate::{Citation, ReferenceEntry, numeric_labels, union_boxes};
-use aris_reader_core::{RawCharBox, RawTextPage};
+use aris_reader_core::{RawCharBox, RawTextPage, Rect};
 use std::collections::BTreeSet;
 
 /// Largest multiple of its line's median glyph height a superscript glyph may have.
@@ -385,6 +385,43 @@ pub(crate) fn find(text: &RawTextPage, style: &CitationStyle) -> Vec<Citation> {
         return Vec::new();
     }
 
+    raised_runs(text)
+        .into_iter()
+        .filter(|run| style.corroborates(&run.labels))
+        .map(|run| Citation {
+            text: run.text,
+            labels: run.labels,
+            rect: run.rect,
+            start: run.start,
+            end: run.end,
+        })
+        .collect()
+}
+
+/// One raised numeral run, as drawn, with the labels it names.
+///
+/// The geometry of [`find`], without its bibliography. [`raised_runs`] returns runs whose labels
+/// need not exist in any list; [`find`] keeps the subset the document's bibliography corroborates.
+pub(crate) struct RaisedRun {
+    pub(crate) text: String,
+    pub(crate) labels: Vec<String>,
+    pub(crate) rect: Rect,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+/// Every raised numeral run on the page that passes the geometric guards.
+///
+/// This is [`find`] before its last guard. The label guard is deliberately absent because the
+/// caller may be asking the opposite question: *which* numerals does the body cite, when the
+/// bibliography that would name them has not been chosen yet. T4.20's second numbered list is
+/// exactly that case — its labels are dropped by the label guard, so a rule that only reads
+/// corroborated runs can never learn that the body cites them.
+///
+/// The other guards stay: a run must be smaller and raised relative to its line, drawn in a text
+/// face, attached to a word of at least [`WORD_MIN`] letters, close on the right, and no longer
+/// than [`MAX_RUN`] characters.
+pub(crate) fn raised_runs(text: &RawTextPage) -> Vec<RaisedRun> {
     let mut found = Vec::new();
     for line in lines(text) {
         let touch = line.median_height * TOUCH_RATIO;
@@ -456,13 +493,10 @@ pub(crate) fn find(text: &RawTextPage, style: &CitationStyle) -> Vec<Citation> {
             }
 
             let labels = numeric_labels(&run_text);
-            if !style.corroborates(&labels) {
-                continue;
-            }
 
             let boxes: Vec<RawCharBox> =
                 run.iter().map(|index| text.chars[*index].clone()).collect();
-            found.push(Citation {
+            found.push(RaisedRun {
                 text: run_text.trim().to_string(),
                 labels,
                 rect: union_boxes(&boxes),
@@ -472,7 +506,7 @@ pub(crate) fn find(text: &RawTextPage, style: &CitationStyle) -> Vec<Citation> {
         }
     }
 
-    found.sort_by_key(|citation| (citation.start, citation.end));
+    found.sort_by_key(|run| (run.start, run.end));
     found
 }
 
