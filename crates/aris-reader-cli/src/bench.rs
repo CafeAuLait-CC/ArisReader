@@ -175,20 +175,10 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
     print_header(&plan, &backend);
 
-    if !plan.skip_first_frame {
-        phase_first_frame(&plan, &backend, open_ms);
+    if let Err(error) = run_phases(&plan, &backend, open_ms) {
+        eprintln!("error: {error}");
+        return ExitCode::FAILURE;
     }
-    if !plan.skip_scroll {
-        phase_scroll(&plan, &backend);
-    }
-    if !plan.skip_search {
-        phase_search(&plan, &backend);
-    }
-    let baseline_ok = if plan.skip_baseline {
-        true
-    } else {
-        phase_baseline(&plan, &backend)
-    };
 
     println!(
         "rss-peak: {:.1} MiB (getrusage ru_maxrss, whole process, covers every phase above)",
@@ -198,11 +188,23 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         print_stats_footer(&plan);
     }
 
-    if baseline_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+    ExitCode::SUCCESS
+}
+
+fn run_phases(plan: &Plan, backend: &impl DocumentBackend, open_ms: f64) -> Result<(), String> {
+    if !plan.skip_first_frame {
+        phase_first_frame(plan, backend, open_ms)?;
     }
+    if !plan.skip_scroll {
+        phase_scroll(plan, backend)?;
+    }
+    if !plan.skip_search {
+        phase_search(plan, backend)?;
+    }
+    if !plan.skip_baseline && !phase_baseline(plan, backend) {
+        return Err("baseline failed".into());
+    }
+    Ok(())
 }
 
 // ── The phases ────────────────────────────────────────────────────────────────
@@ -213,7 +215,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 /// and read the file header); the remaining runs re-rasterize the same tiles and are the warm
 /// case. A cold *process* (no OS file cache) is measured by invoking the command twice — see
 /// the module docs.
-fn phase_first_frame(plan: &Plan, backend: &PdfiumBackend, open_ms: f64) {
+fn phase_first_frame(
+    plan: &Plan,
+    backend: &impl DocumentBackend,
+    open_ms: f64,
+) -> Result<(), String> {
     let config = EngineConfig::default();
     let scale = plan.first_frame_scale;
     let lod = Lod::for_scale(scale).min(Lod(config.max_lod));
@@ -222,8 +228,7 @@ fn phase_first_frame(plan: &Plan, backend: &PdfiumBackend, open_ms: f64) {
     let info = match backend.page_info(PageIndex(0)) {
         Ok(info) => info,
         Err(error) => {
-            eprintln!("error: first-frame page info failed: {error}");
-            return;
+            return Err(format!("first-frame page info failed: {error}"));
         }
     };
     let info_ms = ms(info_started.elapsed());
@@ -266,8 +271,7 @@ fn phase_first_frame(plan: &Plan, backend: &PdfiumBackend, open_ms: f64) {
                     rastered_mp += tile.size.width * tile.size.height / 1e6;
                 }
                 Err(error) => {
-                    eprintln!("error: first-frame tile ({col},{row}) failed: {error}");
-                    return;
+                    return Err(format!("first-frame tile ({col},{row}) failed: {error}"));
                 }
             }
         }
@@ -288,6 +292,7 @@ fn phase_first_frame(plan: &Plan, backend: &PdfiumBackend, open_ms: f64) {
     println!(
         "  note: open covers loading the PDFium dylib and the document; GPU upload/composite/present is not measured (the CLI has no surface)"
     );
+    Ok(())
 }
 
 /// One tile the band wants, with everything the raster loop and the ordering need.
@@ -471,7 +476,7 @@ fn choose_prefetch_ring(
 }
 
 /// Scroll: per step, rasterize exactly the tiles that step newly needs.
-fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
+fn phase_scroll(plan: &Plan, backend: &impl DocumentBackend) -> Result<(), String> {
     let config = EngineConfig::default();
     // The shell rasterizes at LOD 1 for 100% zoom on a 2x display (`ceil(log2(zoom * scale))`),
     // which is the case the M1/M2 criteria are about; the header prints the resulting scale.
@@ -488,7 +493,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
     for index in 0..page_count {
         let info = match backend.page_info(PageIndex(index)) {
             Ok(info) => info,
-            Err(_) => break,
+            Err(error) => return Err(format!("scroll page {index} info failed: {error}")),
         };
         let view = info.geometry.view_size(1.0);
         layouts.push((index, content_height, view.width, view.height));
@@ -625,8 +630,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
                     cache.insert(tile.key, rasterized.pixels);
                 }
                 Err(error) => {
-                    eprintln!("error: scroll tile failed: {error}");
-                    return;
+                    return Err(format!("scroll tile failed: {error}"));
                 }
             }
         }
@@ -647,7 +651,7 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
 
     if frames_ms.is_empty() {
         println!("  no step fitted in the document; nothing measured");
-        return;
+        return Ok(());
     }
     let mut sorted = frames_ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -713,13 +717,14 @@ fn phase_scroll(plan: &Plan, backend: &PdfiumBackend) {
     println!(
         "  note: these are raster times, not presented frames - no GPU upload/composite/present happens in the CLI"
     );
+    Ok(())
 }
 
 /// First search results: the FFI's own loop, timed.
-fn phase_search(plan: &Plan, backend: &PdfiumBackend) {
+fn phase_search(plan: &Plan, backend: &impl DocumentBackend) -> Result<(), String> {
     if plan.search.trim().is_empty() {
         println!("\nsearch: skipped (empty term)");
-        return;
+        return Ok(());
     }
 
     println!();
@@ -737,8 +742,7 @@ fn phase_search(plan: &Plan, backend: &PdfiumBackend) {
         let raw = match backend.raw_text_page(PageIndex(page)) {
             Ok(raw) => raw,
             Err(error) => {
-                eprintln!("  page {page}: text layer failed: {error}");
-                continue;
+                return Err(format!("search page {page}: text layer failed: {error}"));
             }
         };
         pages_scanned += 1;
@@ -770,10 +774,11 @@ fn phase_search(plan: &Plan, backend: &PdfiumBackend) {
     println!(
         "  note: this is the engine path only; the shell's UI work on top of it is not measured here"
     );
+    Ok(())
 }
 
 /// The per-page render checksum baseline; returns false when a `--check-baseline` fails.
-fn phase_baseline(plan: &Plan, backend: &PdfiumBackend) -> bool {
+fn phase_baseline(plan: &Plan, backend: &impl DocumentBackend) -> bool {
     let scale = plan.dpi as f64 / 72.0;
     let page_count = backend.page_count().min(plan.pages as u32);
 
@@ -1507,5 +1512,69 @@ mod review_tests {
         std::fs::write(&path, format!("{page0}{page1}")).unwrap();
         assert!(!check_baseline(&path, &records).unwrap().is_empty());
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase_failure_tests {
+    use super::*;
+    use aris_reader_core::*;
+
+    struct FailingBackend {
+        info: bool,
+    }
+    impl DocumentBackend for FailingBackend {
+        fn page_count(&self) -> u32 {
+            1
+        }
+        fn page_info(&self, page: PageIndex) -> aris_reader_core::Result<PageInfo> {
+            if self.info {
+                return Err(ArisError::not_implemented("injected page info"));
+            }
+            Ok(PageInfo {
+                index: page,
+                geometry: PageGeometry::new(
+                    Rect::new(0.0, 0.0, 612.0, 792.0),
+                    Rect::new(0.0, 0.0, 612.0, 792.0),
+                    Rotation::default(),
+                    1.0,
+                ),
+                label: None,
+            })
+        }
+        fn outline(&self) -> aris_reader_core::Result<Vec<OutlineNode>> {
+            Ok(vec![])
+        }
+        fn links(&self, _: PageIndex) -> aris_reader_core::Result<Vec<LinkInfo>> {
+            Ok(vec![])
+        }
+        fn raw_text_page(&self, _: PageIndex) -> aris_reader_core::Result<RawTextPage> {
+            Err(ArisError::not_implemented("injected text"))
+        }
+        fn rasterize(&self, _: &RasterRequest) -> aris_reader_core::Result<RasterTile> {
+            Err(ArisError::not_implemented("injected raster"))
+        }
+        fn is_encrypted(&self) -> bool {
+            false
+        }
+        fn is_tagged(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn any_requested_phase_failure_fails_the_run_even_without_baseline() {
+        for phase in ["first-frame", "scroll", "search"] {
+            let mut plan =
+                Plan::from_args(&["unused.pdf".into()]).unwrap_or_else(|_| panic!("plan"));
+            plan.skip_baseline = true;
+            plan.skip_first_frame = phase != "first-frame";
+            plan.skip_scroll = phase != "scroll";
+            plan.skip_search = phase != "search";
+            for info in [true, false] {
+                let error = run_phases(&plan, &FailingBackend { info }, 0.0).unwrap_err();
+                assert!(error.contains(phase), "{error}");
+            }
+        }
     }
 }

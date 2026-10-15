@@ -128,7 +128,8 @@ the branch is a single commit or its history is noise.
 
 ## Reproducing measurements
 
-The CLI benchmark models CPU raster work and a settled prefetch band. It finishes every
+Any requested benchmark phase failure returns a nonzero exit status, including with
+`--skip-baseline`. The CLI benchmark models CPU raster work and a settled prefetch band. It finishes every
 step's prefetch before advancing, so zero visible misses do **not** establish zero waiting
 under continuous scrolling. It does not measure GPU time or presented frame rate. The default
 48 MiB cache gives the prefetch band a 16 MiB target (one third, with an 8 MiB floor); the
@@ -151,8 +152,10 @@ The evaluation's historical “recall” column is **resolution rate among detec
 citation-detection recall: undetected styles never enter its denominator, and a grouped span
 counts as resolved if any label resolves (partial groups are reported separately). The
 heuristic precision audit is review evidence, not a measured false-positive rate. Independent
-labelled examples are still needed for those acceptance criteria. arXiv IDs currently fetch
-the latest revision; freeze versions and file hashes before comparing scores across machines.
+labelled examples are still needed for those acceptance criteria. The arXiv revisions and SHA-256 hashes are locked in `tests/eval/arxiv-lock.tsv`;
+`python3 scripts/verify-eval-papers.py /path/to/corpus` checks existing files. Downloads verify
+the lock before replacing files. PDFium defaults to `chromium/8100` with published archive
+checksums; `--tag` explicitly opts into a different engine baseline.
 
 Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 387.3 MiB
 median is about 406.1 MB and does not meet a decimal 400 MB limit; a median below a limit also

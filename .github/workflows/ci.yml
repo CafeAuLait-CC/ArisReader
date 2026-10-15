@@ -207,6 +207,7 @@ jobs:
         run: |
           set -o pipefail
           if [ "${{ steps.eval_corpus.outcome }}" = "success" ]; then
+            python3 scripts/verify-eval-papers.py || exit 1
             cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/reference-eval.log"
           else

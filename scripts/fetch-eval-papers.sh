@@ -27,6 +27,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 LIST="$ROOT/tests/eval/arxiv-links.txt"
+LOCK="$ROOT/tests/eval/arxiv-lock.tsv"
 DEST="$ROOT/eval-papers"
 FORCE=0
 DELAY=3
@@ -88,12 +89,10 @@ for id in $(ids); do
   is_wanted "$id" || continue
   target="$DEST/$id.pdf"
   note="$(note_for "$id")"
+  revision="$(awk -v id="$id" '$1 == id {print $2}' "$LOCK")"
+  checksum="$(awk -v id="$id" '$1 == id {print $3}' "$LOCK")"
+  [ -n "$revision" ] && [ -n "$checksum" ] || { echo "missing lock for $id" >&2; exit 1; }
 
-  # A file that is not a PDF is a broken earlier attempt: remove it so the retry is honest.
-  if [ -f "$target" ] && ! is_pdf "$target"; then
-    echo "  ! $id.pdf exists but is not a PDF (partial download?) — removing it"
-    rm -f "$target"
-  fi
 
   if [ "$LIST_ONLY" = "1" ]; then
     if is_pdf "$target"; then
@@ -107,6 +106,12 @@ for id in $(ids); do
   fi
 
   if is_pdf "$target" && [ "$FORCE" != "1" ]; then
+    actual="$(shasum -a 256 "$target" | awk '{print $1}')"
+    if [ "$actual" != "$checksum" ]; then
+      echo "  x $id: checksum differs from locked $revision; use --force to replace" >&2
+      FAILED=$((FAILED + 1))
+      continue
+    fi
     printf '  = %-10s skipped (already a PDF, %s)  %s\n' "$id" "$(du -h "$target" | cut -f1)" "$note"
     SKIPPED=$((SKIPPED + 1))
     continue
@@ -117,7 +122,7 @@ for id in $(ids); do
   printf '  > %-10s fetching  %s\n' "$id" "$note"
   if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
         -A "ArisReader-eval-fetch/1.0 (local citation-index evaluation; +https://github.com/CafeAuLait-CC/ArisReader)" \
-        -o "$tmp" "https://arxiv.org/pdf/$id"; then
+        -o "$tmp" "https://arxiv.org/pdf/$revision"; then
     echo "  x $id: download failed" >&2
     rm -f "$tmp"
     FAILED=$((FAILED + 1))
@@ -125,6 +130,13 @@ for id in $(ids); do
   fi
   if ! is_pdf "$tmp"; then
     echo "  x $id: the response is not a PDF (arXiv error page, or a redirect to HTML)" >&2
+    rm -f "$tmp"
+    FAILED=$((FAILED + 1))
+    continue
+  fi
+  actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+  if [ "$actual" != "$checksum" ]; then
+    echo "  x $id: downloaded $revision does not match locked SHA-256" >&2
     rm -f "$tmp"
     FAILED=$((FAILED + 1))
     continue

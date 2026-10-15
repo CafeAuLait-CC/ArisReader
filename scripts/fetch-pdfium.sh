@@ -14,13 +14,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-TAG="latest"
+TAG="chromium/8100"
 UNIVERSAL=0
-for arg in "$@"; do
-  case "$arg" in
-    --universal) UNIVERSAL=1 ;;
-    --tag) shift; TAG="${1:-latest}" ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --universal) UNIVERSAL=1; shift ;;
+    --tag) TAG="${2:?--tag requires a release tag}"; shift 2 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -47,6 +48,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "==> Downloading ${ASSET} (${TAG})"
 curl -fL --retry 3 --connect-timeout 15 -o "$TMP/$ASSET" "$URL"
+
+if [ "$TAG" = "chromium/8100" ]; then
+  expected="$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$ROOT/scripts/pdfium-sha256.txt")"
+  actual="$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')"
+  [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "PDFium checksum mismatch" >&2; exit 1; }
+else
+  echo "WARNING: explicit non-baseline PDFium tag $TAG; no committed checksum" >&2
+fi
 
 echo "==> Unpacking into $DEST"
 rm -rf "$DEST"
