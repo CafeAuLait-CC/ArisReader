@@ -25,12 +25,16 @@
 //!   so. The audit makes the candidates visible instead of inventing a score.
 //!
 //! `gpt3_alphanumeric_gold_pages` checks the full inventory and every resolved label on
-//! three independently annotated pages; unlike exploratory reports it requires that PDF.
+//! three independently annotated pages. It needs one specific locked PDF (2005.14165), not the
+//! whole corpus, so it announces its own skip when that PDF is absent — the same
+//! "absence is announced, never a failure" rule the two report modes follow. It used to panic
+//! there, which made `cargo test -- --ignored` red on a machine without the corpus while the
+//! reports passed.
 //!
-//! Both report modes skip cleanly when the corpus is absent and, on CI, emit a `::notice::` saying the
+//! All three modes skip cleanly when their PDFs are absent and, on CI, emit a `::notice::` saying the
 //! evaluation did NOT run: a silent pass here would be indistinguishable from a real one.
 //! Set `ARIS_READER_REQUIRE_FULL_EVAL=1` to require every listed PDF (used by manual CI).
-//! Both modes fail on document-open or page-text errors; partial extraction is not a score.
+//! Every mode fails on document-open or page-text errors; partial extraction is not a score.
 
 use aris_reader_core::{DocumentBackend, PageIndex, RawTextPage};
 use aris_reader_pdfium::PdfiumBackend;
@@ -802,30 +806,45 @@ fn percent(value: f64) -> String {
     format!("{:.1}%", value * 100.0)
 }
 
+/// The body-page window a paper was measured over: `1–67` for the pages a citation is counted
+/// on, `—` when no page was measured.
+///
+/// It is in the table because the window is *not* stable between runs. Recall is resolved spans
+/// divided by *detected* spans, and the body ends where the bibliography parser says the
+/// reference list starts, so selecting the bibliography differently moves the window and changes
+/// the denominator: GPT-3's body window went from 69 pages to 67 when its bibliography was found
+/// earlier, and the two runs' recall figures are not comparable without saying so.
+fn body_window(paper: &Paper) -> String {
+    match paper.state {
+        State::Measured if paper.body_pages > 0 => format!("1–{}", paper.body_pages),
+        _ => "—".to_string(),
+    }
+}
+
 /// The per-paper table. One renderer, so stdout and docs/eval-latest.md cannot drift apart.
 ///
-/// `bib` is the measured column count of the reference list, `links` the link annotations on the
-/// scanned pages, and the last two columns count citation shapes the detector does not model
-/// (`[HR18]` alphanumeric labels, `(12)` short parenthesised numerals). A line with `spans 0`
-/// next to a large `[Xx12]` or `(12)` is a style the detector cannot see, not a paper without
-/// citations.
+/// `body` is the body-page window recall was measured over (see [`body_window`]), `links` the
+/// link annotations on the scanned pages, and `[Xx12]`/`(12)` count citation shapes the detector
+/// does not model (`[HR18]` alphanumeric labels, `(12)` short parenthesised numerals). A line
+/// with `spans 0` next to a large `[Xx12]` or `(12)` is a style the detector cannot see, not a
+/// paper without citations.
 fn render_table(papers: &[Paper]) -> String {
     let mut out = String::new();
-    out.push_str("| paper | pages | entries | links | spans | resolved | unresolved | recall | [Xx12] | (12) | floor | status |\n");
+    out.push_str("| paper | pages | body | entries | links | spans | resolved | unresolved | recall | [Xx12] | (12) | floor | status |\n");
     out.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
     );
     for paper in papers {
         match &paper.state {
             State::Absent => {
                 out.push_str(&format!(
-                    "| `{}` | — | — | — | — | — | — | — | — | — | — | not fetched |\n",
+                    "| `{}` | — | — | — | — | — | — | — | — | — | — | — | not fetched |\n",
                     paper.id
                 ));
             }
             State::Unreadable(error) => {
                 out.push_str(&format!(
-                    "| `{}` | {} | — | — | — | — | — | — | — | — | — | unreadable: {} |\n",
+                    "| `{}` | {} | — | — | — | — | — | — | — | — | — | — | unreadable: {} |\n",
                     paper.id,
                     paper.pages,
                     error.replace('|', "/")
@@ -839,9 +858,10 @@ fn render_table(papers: &[Paper]) -> String {
                     "ok"
                 };
                 out.push_str(&format!(
-                    "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                     paper.id,
                     paper.pages,
+                    body_window(paper),
                     paper.entries,
                     paper.links,
                     paper.spans,
@@ -1027,6 +1047,13 @@ fn reference_eval_recall() {
         percent(FALSE_POSITIVE_BUDGET)
     );
 
+    println!();
+    println!(
+        "`body` is the window recall was measured over (page 1 through the page before the \
+         bibliography). It moves when the bibliography parser selects the list differently, and \
+         recall is a ratio over that window, so compare two runs only when their windows match."
+    );
+
     let mut report = String::new();
     report.push_str("# Citation/reference index evaluation (T4.10)\n\n");
     report.push_str(
@@ -1036,8 +1063,13 @@ fn reference_eval_recall() {
     );
     report.push_str("## Per paper\n\n");
     report.push_str(&table);
-    report
-        .push_str("\n`recall` = resolved spans / detected citation spans over the body pages.\n\n");
+    report.push_str(
+        "\n`recall` = resolved spans / detected citation spans over the body pages. `body` is the \
+         window recall was\nmeasured over (page 1 through the page before the bibliography). That \
+         window moves when the\nbibliography parser selects the list differently — GPT-3's went \
+         from 69 pages to 67 when its bibliography\nwas found earlier — and recall is a ratio over \
+         it, so two runs are comparable only when their\nwindows match.\n\n",
+    );
     report.push_str("## Thresholds\n\n");
     for floor in FLOORS {
         report.push_str(&format!(
@@ -1281,13 +1313,170 @@ fn unreadable_paper_cannot_pass_quality_gate() {
     assert_readable(&[paper]);
 }
 
-/// Independent full-page gold inventory: catches both missing groups and extra detections,
-/// and verifies every label's bibliography identity rather than "at least one resolved".
+/// The one PDF the gold check needs; it also belongs to the evaluation corpus, so
+/// `ARIS_READER_EVAL_PAPERS` (or `eval-papers/`) locates it.
+const GOLD_PDF: &str = "2005.14165.pdf";
+
+/// How many words from the start of an entry an expected first-author surname may occupy.
+///
+/// The resolver matches on the label alone, so the gold check's job is to prove the entry it
+/// returned is the work the hand-read annotation names. Requiring the surname to be one of the
+/// entry's *opening* words is the reader's own, measurable assumption about a reference entry —
+/// the first author is in the author list, which opens the entry — and it is deliberately not a
+/// window tuned to this data: six words cover the deepest first-author surname here (three
+/// given-name words before it), and the binding is asserted against the whole bibliography
+/// below, so a wrong window is reported rather than compensated for.
+const OPENING_WORDS: usize = 6;
+
+/// The gold check's skip message, the same shape as [`announce_skip`]: a machine without the
+/// corpus is *announced*, and the check passes, because an absent PDF is not a parser
+/// regression. It is not silent — a silent pass is indistinguishable from a real one — and the
+/// other failure direction is preserved: a PDF that is present but unreadable still fails.
+fn announce_gold_skip(path: &Path) {
+    println!(
+        "skipping the GPT-3 gold inventory check: {} is not present",
+        path.display()
+    );
+    println!("  this check needs that one locked PDF, not the whole corpus");
+    println!(
+        "  fetch it with ./scripts/fetch-eval-papers.sh (or point ARIS_READER_EVAL_PAPERS at it)"
+    );
+    if std::env::var_os("CI").is_some() {
+        println!(
+            "::notice title=GPT-3 gold inventory NOT checked::{} is not present, so the independently annotated GPT-3 gold inventory (3 pages, 8 citation spans, 18 labels) was NOT checked in this run. The PDFs are never committed; ./scripts/fetch-eval-papers.sh downloads the corpus that holds it. A green test run says nothing about the gold pages.",
+            path.display()
+        );
+    }
+}
+
+/// The gold TSV: the committed annotation by default, or the file named by
+/// `ARIS_READER_GPT3_GOLD`. The override exists so the identity predicate can be mutation-tested
+/// against a scratch copy of the file; CI never sets it, and the default is the committed file.
+fn gold_source() -> String {
+    match std::env::var_os("ARIS_READER_GPT3_GOLD") {
+        Some(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", Path::new(&path).display())),
+        None => include_str!("../../../tests/eval/gpt3-alpha-gold.tsv").to_string(),
+    }
+}
+
+/// `(citation spans per annotated page, label -> expected first-author surname)`.
+///
+/// The page map counts citation *spans* — one per gold row, however many labels that span groups —
+/// so a page's `find_citations_with` output can be compared span by span. A page annotated as
+/// carrying no citations stays in the map with a count of zero: that is an assertion too.
+fn gold_inventory(source: &str) -> (BTreeMap<u32, usize>, BTreeMap<String, String>) {
+    let mut spans_per_page: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut authors: BTreeMap<String, String> = BTreeMap::new();
+    for line in source
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+    {
+        let columns: Vec<&str> = line.split('\t').collect();
+        assert_eq!(columns.len(), 3, "gold line {line:?}");
+        let page: u32 = columns[0].parse().expect("gold page number");
+        spans_per_page.entry(page).or_default();
+        if columns[1] == "-" {
+            continue;
+        }
+        let labels: Vec<&str> = columns[1].split(',').collect();
+        let surnames: Vec<&str> = columns[2].split(',').collect();
+        assert_eq!(
+            labels.len(),
+            surnames.len(),
+            "gold page {}: {} labels but {} surnames",
+            page + 1,
+            labels.len(),
+            surnames.len()
+        );
+        *spans_per_page.entry(page).or_default() += 1;
+        for (label, surname) in labels.into_iter().zip(surnames) {
+            assert!(
+                authors
+                    .insert(label.to_string(), surname.to_string())
+                    .is_none(),
+                "gold label {label} is listed twice"
+            );
+        }
+    }
+    (spans_per_page, authors)
+}
+
+/// The publication year a citation key encodes, if it encodes one: four digits anywhere in the
+/// key (`NK19` -> 2019, `PNZtY18` -> 2018), else its last two digits read as a 21st-century year.
+/// The keys of this bibliography are `surname initial(s) + two-digit year`, so the year is
+/// derived from the *citation*, never copied out of the entry text it is checked against.
+fn label_identity_year(label: &str) -> Option<String> {
+    let digits: String = label.chars().filter(char::is_ascii_digit).collect();
+    let mut found: Option<String> = None;
+    for start in 0..digits.len().saturating_sub(3) {
+        let candidate = &digits[start..start + 4];
+        if candidate.starts_with("19") || candidate.starts_with("20") {
+            found = Some(candidate.to_string());
+        }
+    }
+    if found.is_none() && digits.len() >= 2 {
+        found = Some(format!("20{}", &digits[digits.len() - 2..]));
+    }
+    found
+}
+
+/// Whether `surname` is one of the first `opening_words` words of `text`, compared whole-word.
+///
+/// Substring containment anywhere in the entry is what made the old predicate weak. Measured over
+/// this bibliography's 144 entries, the 18 gold identities matched 105 entries by containment
+/// (`Lan` alone matched 49 — it is inside "language" — and `Liu` 19, `Radford` 7, `Yang` 7), and
+/// 37 by this opening window. The resolved entry is the *only* match for 15 of the 18; the
+/// remaining three (`DL15`/Dai, `RSR+19`/Raffel, `LOG+19`/Liu) share a surname with another
+/// first author here, and for those the year check below is what separates them — measured, not
+/// assumed: with the year, each of the three narrows to one entry.
+fn opening_names(text: &str, surname: &str, opening_words: usize) -> bool {
+    let wanted = surname.to_lowercase();
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(opening_words)
+        .any(|word| word.to_lowercase() == wanted)
+}
+
+/// Where `year` appears in `text` as a whole number, in characters from the start.
+///
+/// Whole-number matching is the point: `1301` inside `arXiv:1301.3781` is not a year, and digits
+/// inside a longer run are not either.
+fn year_position(text: &str, year: &str) -> Option<usize> {
+    let padded = format!(" {} ", text.to_lowercase());
+    let mut from = 0usize;
+    while let Some(offset) = padded[from..].find(year) {
+        let at = from + offset;
+        let before = padded[..at].chars().next_back();
+        let after = padded[at + year.len()..].chars().next();
+        let bounded = |character: Option<char>| character.is_none_or(|c| !c.is_alphanumeric());
+        if bounded(before) && bounded(after) {
+            return Some(padded[..at].chars().count());
+        }
+        from = at + year.len();
+    }
+    None
+}
+
+/// Independent full-page gold inventory: catches both missing groups and extra detections, and
+/// proves that every label resolves to the entry the hand-read annotation names.
+///
+/// The identity predicate is two facts the resolver does not use, both read off the entry itself:
+/// the expected first-author surname is one of the entry's opening words ([`OPENING_WORDS`]), and
+/// the year the citation key encodes labels that same entry. It used to be
+/// `entry.text.contains(author)` — containment anywhere — which most of the gold labels could not
+/// falsify even if the resolver returned the wrong entry. The old predicate never failed on a
+/// *correct* resolution, so this one is strictly sharper; every expectation was read from a
+/// rendered page and never generated from the detector.
 #[test]
 #[ignore = "needs the locked arXiv corpus and PDFium"]
 fn gpt3_alphanumeric_gold_pages() {
     let root = repo_root();
-    let path = corpus_dir(&root).join("2005.14165.pdf");
+    let path = corpus_dir(&root).join(GOLD_PDF);
+    if !path.is_file() {
+        announce_gold_skip(&path);
+        return;
+    }
     let backend = PdfiumBackend::open(&path, None).expect("locked GPT-3 PDF must be readable");
     let pages: Vec<_> = (0..backend.page_count())
         .map(|p| {
@@ -1302,42 +1491,63 @@ fn gpt3_alphanumeric_gold_pages() {
     let references = find_references(pages.iter().map(|(p, t)| (*p, t)), MAX_ENTRIES);
     let style = CitationStyle::for_document(&pages, &references);
     assert!(style.uses_alphanumeric_labels());
-    type GoldGroup<'a> = (Vec<&'a str>, Vec<&'a str>);
-    let mut expected: BTreeMap<u32, Vec<GoldGroup<'_>>> = BTreeMap::new();
-    for line in include_str!("../../../tests/eval/gpt3-alpha-gold.tsv")
-        .lines()
-        .filter(|s| !s.starts_with('#') && !s.is_empty())
-    {
-        let cols: Vec<_> = line.split('\t').collect();
-        assert_eq!(cols.len(), 3);
-        let page = cols[0].parse().unwrap();
-        let groups = expected.entry(page).or_default();
-        if cols[1] != "-" {
-            groups.push((cols[1].split(',').collect(), cols[2].split(',').collect()));
-        }
-    }
+    let (spans_per_page, authors) = gold_inventory(&gold_source());
+
     let mut labels_checked = 0;
-    for (page, groups) in &expected {
+    let mut years_checked = 0;
+    let mut late_years = 0usize;
+    let mut first_page: Option<u32> = None;
+    for (page, spans) in &spans_per_page {
         let raw = &pages[*page as usize].1;
         let found = find_citations_with(raw, &style);
         assert_eq!(
             found.len(),
-            groups.len(),
+            *spans,
             "gold page {}: unexpected/missing citation",
             page + 1
         );
-        for (citation, (labels, authors)) in found.iter().zip(groups) {
-            assert_eq!(&citation.labels, labels, "gold page {}", page + 1);
-            assert_eq!(labels.len(), authors.len());
+        if !found.is_empty() {
+            first_page.get_or_insert(*page);
+        }
+        for citation in &found {
             let entries = resolve_references(&citation.labels, &references);
-            assert_eq!(entries.len(), labels.len(), "every label must resolve");
-            for ((entry, label), author) in entries.iter().zip(labels).zip(authors) {
-                assert_eq!(&entry.label, label);
-                assert!(
-                    entry.text.contains(author),
-                    "{label} must identify {author}, got {}",
-                    entry.text
+            assert_eq!(
+                entries.len(),
+                citation.labels.len(),
+                "gold page {}: every label must resolve",
+                page + 1
+            );
+            for (entry, label) in entries.iter().zip(&citation.labels) {
+                let author = &authors[label];
+                assert_eq!(
+                    &entry.label,
+                    label,
+                    "gold page {}: entry label does not match the resolved label",
+                    page + 1
                 );
+                assert!(
+                    opening_names(&entry.text, author, OPENING_WORDS),
+                    "{label} must resolve to the {author} entry: {author} is not one of its first \
+                     {OPENING_WORDS} words (entry on page {}, opening: {:?})",
+                    entry.page + 1,
+                    entry.text.chars().take(90).collect::<String>()
+                );
+                // Every key in this gold set encodes a year; a future row whose key does not would
+                // fall back to the hand-read surname alone.
+                if let Some(year) = label_identity_year(label) {
+                    match year_position(&entry.text, &year) {
+                        Some(at) => {
+                            years_checked += 1;
+                            // A long author list puts the year far down the entry. Say so rather
+                            // than let a reader take "contains the year" for a tight check.
+                            late_years += usize::from(at > 200);
+                        }
+                        None => panic!(
+                            "{label} ({year}) resolves to an entry that names {year} nowhere: {:?}",
+                            entry.text.chars().take(140).collect::<String>()
+                        ),
+                    }
+                }
                 assert!(!entry.fragments.is_empty(), "preview geometry for {label}");
                 labels_checked += 1;
             }
@@ -1351,9 +1561,18 @@ fn gpt3_alphanumeric_gold_pages() {
             );
         }
     }
+    let cited_pages = spans_per_page.values().filter(|spans| **spans > 0).count();
+    let cited_spans = spans_per_page.values().sum::<usize>();
     println!(
-        "GPT-3 gold: {} complete pages, 8/8 spans, {labels_checked}/18 labels with checked identities",
-        expected.len()
+        "GPT-3 gold: {} annotated pages ({} of them carry the {cited_spans} citation spans; the \
+         others must detect nothing), {labels_checked}/18 labels with checked identities; the \
+         year in the citation key also labelled the entry for {years_checked} of those keys \
+         ({late_years} of the {years_checked} years sit past character 200, i.e. behind a long \
+         author list; a key that encoded no year would be checked by surname alone)",
+        spans_per_page.len(),
+        cited_pages,
     );
     assert_eq!(labels_checked, 18);
+    assert!(years_checked > 0, "no citation key encoded a year");
+    assert!(first_page.is_some(), "no gold page produced a citation");
 }

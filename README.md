@@ -156,16 +156,29 @@ ARIS_READER_REQUIRE_FULL_EVAL=1 cargo test -p aris-reader-cli --test reference_e
 ```
 
 `ARIS_READER_EVAL_PAPERS` can point at an existing corpus. Without strict mode, local evaluation
-may use a partial corpus or explicitly skip an absent one. Both evaluation modes fail if a
-present PDF cannot be opened or a page's text cannot be extracted. Manual CI with
-`fetch_eval_papers=true` requires all listed PDFs; PDFium download failure fails the macOS gate.
-CI preserves check and evaluation logs as `macos-check-logs` artifacts, including on failure.
+may use a partial corpus or explicitly skip an absent one; so does the GPT-3 gold check, which
+needs one PDF rather than the corpus and announces its own absence with a `::notice::` instead of
+failing. Every mode fails if a present PDF cannot be opened or a page's text cannot be extracted.
+Manual CI with `fetch_eval_papers=true` requires all listed PDFs; PDFium download failure fails
+the macOS gate. CI decides whether to evaluate by looking at whether `eval-papers/*.pdf` exists,
+not by a step's outcome, so a corpus that is already on the workspace is measured rather than
+reported as absent. CI preserves check and evaluation logs as `macos-check-logs` artifacts,
+including on failure.
 
 The evaluation's historical “recall” column is **resolution rate among detected spans**, not
 citation-detection recall: undetected styles never enter its denominator, and a grouped span
-counts as resolved if any label resolves (partial groups are reported separately). The
-heuristic precision audit is review evidence, not a measured false-positive rate. A small independently annotated GPT-3 gold set now checks complete detection and every label
-on three full pages; corpus-wide labelled examples are still needed for the acceptance criteria. The arXiv revisions and SHA-256 hashes are locked in `tests/eval/arxiv-lock.tsv`;
+counts as resolved if any label resolves (partial groups are reported separately). The table also
+prints the body-page window each paper was measured over, because that window moves when the
+bibliography parser selects the list differently — GPT-3's went from 69 pages to 67 — and recall is
+a ratio over it, so two runs are comparable only when their windows match. The
+heuristic precision audit is review evidence, not a measured false-positive rate. A small
+independently annotated GPT-3 gold set checks complete detection on three full pages and proves
+each of the 18 labels resolves to the entry that names the annotated first author: the surname must
+be one of the entry's opening words, and the year encoded in the citation key must label the same
+entry. Both are checks the resolver cannot satisfy by construction, and the predicate is
+mutation-tested (set `ARIS_READER_GPT3_GOLD` to a scratch copy of the TSV to try it);
+corpus-wide labelled examples are still needed for the acceptance criteria. The arXiv revisions
+and SHA-256 hashes are locked in `tests/eval/arxiv-lock.tsv`;
 `python3 scripts/verify-eval-papers.py /path/to/corpus` checks existing files. Downloads verify
 the lock before replacing files. PDFium defaults to `chromium/8100` with published archive
 checksums; `--tag` explicitly opts into a different engine baseline.

@@ -24,9 +24,10 @@
 #     sampled citation spans) never run here, on either runner.
 #   * `eval-papers/` — the twenty-paper evaluation corpus for the reference index (T4.10),
 #     fetched from the committed list of links in tests/eval/arxiv-links.txt — is not in the
-#     repository either, so `cargo test --workspace` says nothing about recall. A manual
-#     workflow_dispatch run with `fetch_eval_papers` downloads it and measures; every other run
-#     prints a ::notice:: saying the evaluation did NOT run.
+#     repository either, so `cargo test --workspace` says nothing about recall. The eval step
+#     decides by looking at the filesystem: if the corpus is there it measures, and a manual
+#     workflow_dispatch with `fetch_eval_papers` downloads it first; only when no corpus is
+#     present does the step print a ::notice:: saying the evaluation did NOT run.
 
 name: CI
 
@@ -190,17 +191,22 @@ jobs:
           echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need ARIS_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
 
       # ---------------------------------------------------------- the reference-index evaluation
-      # Opt-in on purpose: the twenty-paper evaluation corpus (tests/eval/arxiv-links.txt) is
-      # third-party material and is never committed, so the default behaviour of this job is to
-      # say that the evaluation did not run. Dispatch the workflow with `fetch_eval_papers` to
-      # download the corpus here and measure it for real.
-      - name: Fetch the evaluation corpus (opt-in, manual dispatch only)
-        id: eval_corpus
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.fetch_eval_papers == 'true'
-        run: ./scripts/fetch-eval-papers.sh
-
-      # The step that cannot pass silently: either the harness runs and meets its floors (and
-      # fails the job when it does not), or the log carries a ::notice:: saying it did not run.
+      # One step, because "should the evaluation run?" is a question about the *filesystem*, not
+      # about a step's outcome. This step used to branch on `steps.eval_corpus.outcome`; with the
+      # corpus already present the fetch step is skipped (no outcome) and the branch then printed
+      # "No evaluation corpus is present" over a workspace that had one — a false statement, and
+      # exactly the kind of quiet untruth the rest of this harness exists to prevent. Checking
+      # `eval-papers/*.pdf` is true wherever the corpus came from: fetched by the opt-in call
+      # inside this step, restored from a cache, or already on the workspace.
+      #
+      # The harness itself is the authority on a *partial* corpus: ARIS_READER_REQUIRE_FULL_EVAL=1
+      # makes reference_eval fail when any listed PDF is missing, so a present-but-incomplete
+      # corpus fails loudly here rather than being reported as "not run". The verification script
+      # is deliberately not run before it: it reports a missing paper as a mismatch, and naming
+      # the absent papers is the harness's job.
+      #
+      # The step cannot pass silently: either the harness runs and meets its floors (and fails the
+      # job when it does not), or the log carries a ::notice:: saying it did not run.
       # `--ignored` because both modes are #[ignore]d like every other corpus test; `--nocapture`
       # because the per-paper table is the product here, not a test result line.
       - name: Evaluate the reference index, or say that it did not run
@@ -209,12 +215,20 @@ jobs:
           ARIS_READER_REQUIRE_FULL_EVAL: "1"
         run: |
           set -o pipefail
-          if [ "${{ steps.eval_corpus.outcome }}" = "success" ]; then
-            python3 scripts/verify-eval-papers.py || exit 1
+          # The opt-in fetch: manual dispatch with fetch_eval_papers=true downloads the corpus.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+            && [ "${{ github.event.inputs.fetch_eval_papers }}" = "true" ]; then
+            ./scripts/fetch-eval-papers.sh
+          fi
+          # Symmetric glob: eval-papers/ (the default) or $ARIS_READER_EVAL_PAPERS. `compgen` is a
+          # bash builtin, so it needs no `shopt -s nullglob` and no subshell.
+          CORPUS_DIR="${ARIS_READER_EVAL_PAPERS:-eval-papers}"
+          if compgen -G "$CORPUS_DIR/*.pdf" > /dev/null; then
+            echo "evaluation corpus present in $CORPUS_DIR; measuring the reference index"
             cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/reference-eval.log"
           else
-            echo "::notice title=Reference eval NOT run::No evaluation corpus (eval-papers/) is present, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
+            echo "::notice title=Reference eval NOT run::No evaluation corpus is present in $CORPUS_DIR, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
           fi
 
       - name: Preserve native and evaluation diagnostics
