@@ -170,7 +170,14 @@ citation-detection recall: undetected styles never enter its denominator, and a 
 counts as resolved if any label resolves (partial groups are reported separately). The table also
 prints the body-page window each paper was measured over, because that window moves when the
 bibliography parser selects the list differently — GPT-3's went from 69 pages to 67 — and recall is
-a ratio over it, so two runs are comparable only when their windows match. The
+a ratio over it, so two runs are comparable only when their windows match. It also prints the
+longest bibliography entry each paper parsed and how many entries exceed a plausibility bound of
+1800 characters, and fails a paper that goes past its pinned ceiling: that is the shape T4.17 had,
+when GPT-3 parsed as six entries of 3000–7831 characters instead of 144, so a collapse comes back
+as a failing evaluation rather than as a number that merely looks odd. The four measured entries
+above the bound are pinned at their measured lengths instead of being cut, because they are the
+last reference of a list absorbing the section printed after it on the same page, and the obvious
+repair — ending an entry at a paragraph gap — truncates legitimate wrapped lines. The
 heuristic precision audit is review evidence, not a measured false-positive rate. A small
 independently annotated GPT-3 gold set checks complete detection on three full pages and proves
 each of the 18 labels resolves to the entry that names the annotated first author: the surname must

@@ -17,8 +17,11 @@
 //! Two corpus reports and an independent gold-page check:
 //!
 //! * [`reference_eval_recall`] — one row per paper (entries, spans, resolved, unresolved,
-//!   recall) printed to stdout and, when the local-only `docs/` directory exists, written to
-//!   `docs/eval-latest.md`. It fails a paper whose recall is below its floor.
+//!   recall, longest entry) printed to stdout and, when the local-only `docs/` directory
+//!   exists, written to `docs/eval-latest.md`. It fails a paper whose recall is below its floor
+//!   and a paper whose bibliography has the shape of a collapse: an entry longer than its
+//!   ceiling, or more over-long entries than its pin allows (T4.17: 2005.14165 used to parse as
+//!   six entries of 3000–7831 characters, one per column, instead of 144).
 //! * [`reference_eval_precision_audit`] — the same measurement, but it prints the individual
 //!   matches that *look* wrong so a human can judge them. Precision is not a number this
 //!   harness can produce on its own: a resolved match is only a false positive if a human says
@@ -167,6 +170,55 @@ const DEFAULT_RECALL_FLOOR: f64 = 0.50;
 /// — which is exactly why the audit prints every flag with its evidence.
 const FALSE_POSITIVE_BUDGET: f64 = 0.02;
 
+/// Longest a bibliography entry can plausibly be, in characters, before it reads as a collapsed
+/// list rather than a reference.
+///
+/// Measured, not invented (T4.17 scan, 2026-10-15, the twelve sample papers and the twenty
+/// evaluation papers): the longest entry that is genuinely *one* reference is 1366 characters —
+/// `2303.08774`'s "On the Opportunities and Risks of Foundation Models" citation, whose author
+/// list runs to about a hundred names — and the next longest are 1035 and 932. The collapsed
+/// bibliography of `2005.14165` produced entries of 3000–7831 characters, one per column. 1800
+/// sits 32% above the longest honest entry and 40% below the shortest collapsed one, so it
+/// separates the two shapes with margin on both sides; it is a *plausibility* bound, not a
+/// measurement of what a reference looks like.
+const PLAUSIBLE_ENTRY_CHARS: usize = 1800;
+
+/// Per-paper ceiling on the longest entry, and how many entries may exceed
+/// [`PLAUSIBLE_ENTRY_CHARS`]: `(id, ceiling in characters, over-long entries allowed)`.
+///
+/// The ceiling is that paper's measured maximum plus half again, rounded up to 50, from the
+/// T4.17 scan of 2026-10-15 (the FLOORS above were measured the day before); the measurement is
+/// in the comment. Three papers here get `over: 1` — a fourth, `manuscript_0925`, is pinned in
+/// `reference_corpus.rs`: their list ends with an entry that absorbs the section following it on
+/// the same page (an appendix, or `1710.05833`'s author list). That defect is diagnosed but not
+/// fixed: the obvious cut — end an entry at a paragraph gap — was simulated over both corpora
+/// and truncates legitimate wrapped lines (three entries in `Candidacy Report`, and the first
+/// line of `manuscript_0925`'s own last reference), so those numbers are pinned instead. The
+/// pins still catch a collapse: it would grow a paper past its ceiling, and the count would
+/// exceed `over` even if every new entry stayed under the ceiling.
+const ENTRY_LENGTH_CEILINGS: &[(&str, usize, usize)] = &[
+    ("1301.3781", 400, 0),   // measured max 253
+    ("1408.5882", 450, 0),   // measured max 288
+    ("1512.03385", 350, 0),  // measured max 212
+    ("1602.05629", 500, 0),  // measured max 328
+    ("1706.03762", 450, 0),  // measured max 286
+    ("1710.05463", 400, 0),  // measured max 245
+    ("1710.05833", 5150, 1), // measured max 3428 + 1 over: last entry absorbs the author list
+    ("1712.01815", 700, 0),  // measured max 455
+    ("1807.06209", 5450, 1), // measured max 3601 + 1 over: last entry absorbs Appendix A
+    ("1810.04805", 3350, 1), // measured max 2209 + 1 over: last entry absorbs the BERT appendix
+    ("1905.11946", 550, 0),  // measured max 354
+    ("1909.05722", 350, 0),  // measured max 223
+    ("1912.01703", 1100, 0), // measured max 723
+    ("2005.14165", 650, 0),  // measured max 427; 3000–7831 when T4.17's collapse was live
+    ("2010.11929", 800, 0),  // measured max 528
+    ("2103.00020", 1000, 0), // measured max 648
+    ("2104.08886", 1400, 0), // measured max 932
+    ("2110.12477", 400, 0),  // measured max 257
+    ("2303.08774", 2050, 0), // measured max 1366: one reference, ~100 authors
+    ("2403.04370", 750, 0),  // measured max 469
+];
+
 /// Pages extracted per paper. The reader caps its own index at 120 pages (T4.13), so a longer
 /// document is measured exactly as the app would see it.
 const MAX_PAGES: u32 = 120;
@@ -284,6 +336,11 @@ struct Paper {
     /// Entries too long or too year-less to be a reference entry: the signature of a bibliography
     /// the parser collapsed (one "entry" per column). Capped for the printout.
     prose_entries: Vec<(String, u32, usize)>,
+    /// Longest entry, in characters, and how many entries exceed [`PLAUSIBLE_ENTRY_CHARS`]. The
+    /// collapse T4.17 describes shows up here as a max of thousands; see
+    /// [`ENTRY_LENGTH_CEILINGS`] for what each paper is allowed.
+    max_entry_chars: usize,
+    long_entries: usize,
     /// Shapes of citation the detector does not model, counted in the body text: alphanumeric
     /// bracket labels (`[HR18]`) and short parenthesised numerals (`(12)`, `(2, 14)`).
     ///
@@ -341,6 +398,8 @@ fn measure(id: &str, path: &Path) -> Paper {
         misses: Vec::new(),
         flags: Vec::new(),
         prose_entries: Vec::new(),
+        max_entry_chars: 0,
+        long_entries: 0,
         unmodelled_alnum: 0,
         unmodelled_paren: 0,
     };
@@ -392,6 +451,15 @@ fn measure(id: &str, path: &Path) -> Paper {
     let references = find_references_with_landings(&pages, &landings, MAX_ENTRIES);
     paper.entries = references.len();
     paper.first_entry_page = first_entry_page;
+    paper.max_entry_chars = references
+        .iter()
+        .map(|entry| entry.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    paper.long_entries = references
+        .iter()
+        .filter(|entry| entry.text.chars().count() > PLAUSIBLE_ENTRY_CHARS)
+        .count();
     paper.prose_entries = references
         .iter()
         .filter(|entry| looks_like_prose(&entry.text))
@@ -802,6 +870,42 @@ fn floor_for(id: &str) -> f64 {
         .unwrap_or(DEFAULT_RECALL_FLOOR)
 }
 
+/// What a paper may do with entry length: `(longest entry allowed, over-long entries allowed)`.
+///
+/// A paper with no row in [`ENTRY_LENGTH_CEILINGS`] gets the plausibility bound itself and no
+/// over-long entries at all — so adding a paper to the corpus puts it under the strict rule, not
+/// outside every rule.
+fn entry_length_budget(id: &str) -> (usize, usize) {
+    ENTRY_LENGTH_CEILINGS
+        .iter()
+        .find(|(paper, _, _)| *paper == id)
+        .map(|(_, ceiling, over)| (*ceiling, *over))
+        .unwrap_or((PLAUSIBLE_ENTRY_CHARS, 0))
+}
+
+/// Papers whose bibliography has the shape of a collapse: an entry past its ceiling, or more
+/// over-long entries than its pin allows. Empty on a healthy corpus.
+fn entry_length_failures(papers: &[&Paper]) -> Vec<String> {
+    papers
+        .iter()
+        .filter_map(|paper| {
+            let (ceiling, allowed) = entry_length_budget(&paper.id);
+            if paper.max_entry_chars <= ceiling && paper.long_entries <= allowed {
+                return None;
+            }
+            Some(format!(
+                "{}: longest entry {} characters (ceiling {}), {} entries over {} (allowed {})",
+                paper.id,
+                paper.max_entry_chars,
+                ceiling,
+                paper.long_entries,
+                PLAUSIBLE_ENTRY_CHARS,
+                allowed
+            ))
+        })
+        .collect()
+}
+
 fn percent(value: f64) -> String {
     format!("{:.1}%", value * 100.0)
 }
@@ -827,24 +931,26 @@ fn body_window(paper: &Paper) -> String {
 /// link annotations on the scanned pages, and `[Xx12]`/`(12)` count citation shapes the detector
 /// does not model (`[HR18]` alphanumeric labels, `(12)` short parenthesised numerals). A line
 /// with `spans 0` next to a large `[Xx12]` or `(12)` is a style the detector cannot see, not a
-/// paper without citations.
+/// paper without citations. `max entry` is the longest bibliography entry in characters and
+/// `>1800` how many entries exceed [`PLAUSIBLE_ENTRY_CHARS`] — the two numbers that make a
+/// collapse visible instead of merely "few entries".
 fn render_table(papers: &[Paper]) -> String {
     let mut out = String::new();
-    out.push_str("| paper | pages | body | entries | links | spans | resolved | unresolved | recall | [Xx12] | (12) | floor | status |\n");
+    out.push_str("| paper | pages | body | entries | links | spans | resolved | unresolved | recall | [Xx12] | (12) | max entry | >1800 | floor | status |\n");
     out.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
     );
     for paper in papers {
         match &paper.state {
             State::Absent => {
                 out.push_str(&format!(
-                    "| `{}` | — | — | — | — | — | — | — | — | — | — | — | not fetched |\n",
+                    "| `{}` | — | — | — | — | — | — | — | — | — | — | — | — | — | not fetched |\n",
                     paper.id
                 ));
             }
             State::Unreadable(error) => {
                 out.push_str(&format!(
-                    "| `{}` | {} | — | — | — | — | — | — | — | — | — | — | unreadable: {} |\n",
+                    "| `{}` | {} | — | — | — | — | — | — | — | — | — | — | — | — | unreadable: {} |\n",
                     paper.id,
                     paper.pages,
                     error.replace('|', "/")
@@ -858,7 +964,7 @@ fn render_table(papers: &[Paper]) -> String {
                     "ok"
                 };
                 out.push_str(&format!(
-                    "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                     paper.id,
                     paper.pages,
                     body_window(paper),
@@ -870,6 +976,8 @@ fn render_table(papers: &[Paper]) -> String {
                     percent(paper.recall()),
                     paper.unmodelled_alnum,
                     paper.unmodelled_paren,
+                    paper.max_entry_chars,
+                    paper.long_entries,
                     percent(floor),
                     status
                 ));
@@ -983,6 +1091,8 @@ fn absent(entry: &CorpusEntry) -> Paper {
         misses: Vec::new(),
         flags: Vec::new(),
         prose_entries: Vec::new(),
+        max_entry_chars: 0,
+        long_entries: 0,
         unmodelled_alnum: 0,
         unmodelled_paren: 0,
     }
@@ -1046,6 +1156,11 @@ fn reference_eval_recall() {
         percent(DEFAULT_RECALL_FLOOR),
         percent(FALSE_POSITIVE_BUDGET)
     );
+    println!(
+        "  longest entry: {} characters by default; pinned higher only where a known tail is \
+         measured (see ENTRY_LENGTH_CEILINGS), and every over-long entry must be one of those pins",
+        PLAUSIBLE_ENTRY_CHARS
+    );
 
     println!();
     println!(
@@ -1086,6 +1201,10 @@ fn reference_eval_recall() {
         "* false-positive budget: at most {} of resolved spans may be flagged as suspicious\n",
         percent(FALSE_POSITIVE_BUDGET)
     ));
+    report.push_str(&format!(
+        "* longest bibliography entry: {} characters (`PLAUSIBLE_ENTRY_CHARS`), plus a per-paper\n  ceiling and over-long count pinned in `ENTRY_LENGTH_CEILINGS` — a collapsed bibliography\n  shows up as a handful of entries of thousands of characters\n",
+        PLAUSIBLE_ENTRY_CHARS
+    ));
     report.push_str(
         "\nThe floors were picked from a real run over this corpus (each one below the measured\n\
          value), not invented before it; see the constants in `crates/aris-reader-cli/tests/reference_eval.rs`.\n",
@@ -1111,6 +1230,13 @@ fn reference_eval_recall() {
         failures.is_empty(),
         "recall floor(s) not met:\n  {}",
         failures.join("\n  ")
+    );
+    let collapsed = entry_length_failures(&measured(&papers));
+    assert!(
+        collapsed.is_empty(),
+        "bibliography entries longer than a reference plausibly is — the shape of the T4.17 \
+         collapse (one entry per column instead of one per reference):\n  {}",
+        collapsed.join("\n  ")
     );
 }
 
