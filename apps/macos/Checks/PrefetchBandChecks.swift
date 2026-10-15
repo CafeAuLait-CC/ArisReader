@@ -58,7 +58,7 @@ extension ReaderChecks {
     @MainActor static func prefetchBandChecks(url: URL) async throws {
         let viewport = CGSize(width: 700, height: 500)
         let engine = BandTileEngine()
-        let state = AppState(engine: engine)
+        let state = AppState(engine: engine, preferFullPageRasters: false)
         state.setViewportSize(viewport)
         require(state.open(url: url), "band fixture opens")
         state.gotoPage(0)
@@ -150,7 +150,7 @@ extension ReaderChecks {
         // fresh engine, because the checks above already warmed both LODs — reusing *those*
         // tiles would prove nothing about a reader who zooms for the first time.
         let zoomEngine = BandTileEngine()
-        let zoomState = AppState(engine: zoomEngine)
+        let zoomState = AppState(engine: zoomEngine, preferFullPageRasters: false)
         zoomState.setViewportSize(viewport)
         require(zoomState.open(url: url), "band fixture opens for the zoom sequence")
         zoomState.gotoPage(0)

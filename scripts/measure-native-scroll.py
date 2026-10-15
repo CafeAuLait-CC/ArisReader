@@ -83,6 +83,7 @@ def presentation_summary(records, submitted, start, end):
     result = {
         'presentation_measurement': 'complete' if not missing else 'incomplete',
         'presentation_callbacks': len(callbacks), 'presentation_callbacks_missing': missing,
+        'presentation_zero_timestamps': sum(r['time'] == 0 for r in callbacks.values()),
         'presentation_drops_reported': sum(r['time'] == 0 for r in callbacks.values()),
         'presentations_outside_window': len(positive) - len(presented),
         'presented_frames': len(presented),
@@ -92,6 +93,13 @@ def presentation_summary(records, submitted, start, end):
         'presentation_gap_max_ms': None, 'presentation_gaps_over_33ms': None,
         'motion_presented_frames': None,
     }
+    # Some Metal/driver combinations return zero for every drawable, including
+    # a minimal continuously visible probe. That cannot distinguish unavailable
+    # timing from all frames being dropped; never turn it into a 0-FPS claim.
+    if callbacks and not positive:
+        result.update(presentation_measurement='unavailable (all presentation timestamps are zero)',
+                      presentation_drops_reported=None, presented_frames=None)
+        return result
     if missing: return result
     result['presented_fps'] = len(presented) / (end - start)
     result['motion_presented_frames'] = sum(i == 0 or r['y'] != presented[i-1]['y']
@@ -112,7 +120,7 @@ def main():
     p.add_argument('--runs', type=int, default=3)
     p.add_argument('--seconds', type=float, default=8)
     p.add_argument('--speed', type=float, default=600, help='screen points per second')
-    p.add_argument('--zoom', type=int, choices=[100, 200, 400], default=100)
+    p.add_argument('--zoom', type=int, choices=[100, 140, 200, 400], default=100)
     p.add_argument('--scheduling-diagnostics', action='store_true', help='log frame-loop/model correlation (adds overhead)')
     p.add_argument('--output', type=Path, default=ROOT / 'build/native-scroll')
     args = p.parse_args()

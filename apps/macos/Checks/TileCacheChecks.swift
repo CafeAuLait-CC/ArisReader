@@ -69,6 +69,13 @@ extension ReaderChecks {
         require(cache.contains(key(0, 0)) && cache.contains(key(0, 3)),
                 "the touched tile and the newest insert survive")
 
+        cache = TileCache(budgetBytes: 300)
+        cache.insert(image(100), for: key(0, 0))
+        cache.insert(image(100), for: key(0, 1))
+        cache.evictToFit(pinned: [], currentLod: 1, reservedBytes: 200)
+        require(cache.usedBytes == 100,
+                "page-raster bytes reserve space in the same cache budget")
+
         // pinned_entries_survive_eviction
         cache = TileCache(budgetBytes: 200)
         cache.insert(image(100), for: key(0, 0))
@@ -154,7 +161,7 @@ extension ReaderChecks {
                     == 1024 * 1024,
                 "a zero/garbage budget is clamped instead of disabling the cache")
 
-        let state = AppState(engine: BudgetTileEngine(), tileCacheBudgetBytes: 16 * 1024 * 1024)
+        let state = AppState(engine: BudgetTileEngine(), tileCacheBudgetBytes: 16 * 1024 * 1024, preferFullPageRasters: false)
         state.setViewportSize(CGSize(width: 700, height: 500))
         state.setDeviceScale(1) // LOD 0: 512 px tiles cover each 600×1200 pt page in 2×3
         state.open(url: url)

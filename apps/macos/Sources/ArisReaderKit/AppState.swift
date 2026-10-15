@@ -203,9 +203,9 @@ public final class AppState: ObservableObject {
     /// actually moves through. A resize rasterizes the new column on demand, behind the
     /// whole-page preview that is already there for exactly this case.
     static let prefetchColumnsToTheRight = 0
-    /// Ceiling on the whole-page previews kept ready (they are bounded by the band as well).
+    /// Ceiling on nearby whole-page rasters; the shared byte budget usually limits this first.
     /// `ARIS_READER_PREVIEW_PAGES=<n>` overrides it for measurement.
-    static let defaultMaxPreviewPages = 4
+    static let defaultMaxPreviewPages = 7
     private static let maxPreviewPages = ProcessInfo.processInfo.environment["ARIS_READER_PREVIEW_PAGES"]
         .flatMap(Int.init).map { min(max($0, 0), 32) } ?? defaultMaxPreviewPages
 
@@ -272,6 +272,17 @@ public final class AppState: ObservableObject {
         ProcessInfo.processInfo.environment["ARIS_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
     private var pagePreviews: [Int: PageImage] = [:]
+    private var pagePreviewScales: [Int: CGFloat] = [:]
+    private var desiredPreviewScale: CGFloat = 1
+    private let preferFullPageRasters: Bool
+    public private(set) var usesScreenPageRasters = false
+    public var pageRasterCacheUsedBytes: Int { pagePreviews.values.reduce(0) { $0 + $1.bgra.count } }
+    public var pageRasterCacheCount: Int { pagePreviews.count }
+    public func isScreenPageCached(_ page: Int) -> Bool {
+        guard let image = pagePreviews[page] else { return false }
+        return image.pixelWidth >= Int(floor(image.pointSize.width * zoomFactor * deviceScale))
+            && image.pixelHeight >= Int(floor(image.pointSize.height * zoomFactor * deviceScale))
+    }
     private var pagePreviewInFlight: Int?
     private var desiredPreviewPages: [Int] = []
     private var failedPreviewPages: Set<Int> = []
@@ -665,6 +676,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pendingTiles = []
         failedTiles = []
         pagePreviews = [:]
+        pagePreviewScales = [:]
         pagePreviewInFlight = nil
         desiredPreviewPages = []
         failedPreviewPages = []
@@ -684,7 +696,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let bytes = Self.configuredTileCacheBudgetBytes(environment: environment, defaults: defaults)
         guard bytes != tileCache.budgetBytes else { return }
         tileCache.setBudget(bytes)
-        evictTiles()
+        reloadVisiblePages()
     }
 
     /// Tile-cache occupancy, for `ARIS_READER_RENDER_STATS=1` and the budget checks: bytes in
@@ -743,7 +755,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `tileCacheBudgetBytes` pins the tile-cache budget instead of resolving it from the
     /// environment and the `cacheBudgetMB` setting; the checks use it so their arithmetic does
     /// not depend on how the machine running them is configured.
-    public init(engine: PDFEngine? = nil, tileCacheBudgetBytes: Int? = nil) {
+    public init(engine: PDFEngine? = nil, tileCacheBudgetBytes: Int? = nil,
+                preferFullPageRasters: Bool? = nil) {
+        self.preferFullPageRasters = preferFullPageRasters
+            ?? (ProcessInfo.processInfo.environment["ARIS_READER_SHARP_PAGE_RASTERS"] != "0")
         // Prefer the real engine; fall back to the mock so the window still works when
         // the Rust backend cannot start (docs/02-architecture.md §8).
         if let engine {
@@ -2332,8 +2347,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         max(viewportSizePt.height / max(zoomFactor, 0.01), 1)
     }
 
-    /// Makes sure the tiles covering the viewport exist, and hands the ready ones to the
-    /// canvas.
+    /// Ordinary zoom uses an atomic screen-resolution page plus a byte-bounded neighborhood.
+    /// Large pages/deep zoom use tiles. Complete visible-width rows sharpen during scrolling;
+    /// already sharp rows stay in place while newly exposed rows load.
     ///
     /// Zoom reuses the existing raster immediately. On a LOD change, retain the previous
     /// tiles until all visible tiles on that page are ready, then replace them together.
@@ -2380,16 +2396,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles.removeAll()
 
         pendingTiles = []
-        // Whole-page previews are the fallback an incomplete page is drawn from, so they only
-        // need to cover the pages the band reaches — that is the set whose tiles can be missing
-        // while the reader is looking at them — and they are prepared ahead of the scroll
-        // direction. Bounding them by the band instead of by a fixed eight pages is worth
-        // 3.7 MiB on a real paper at 100% zoom (9.2 -> 5.5 MiB, band HUD measurement).
-        let bandPages = Set(band.map(\.placement.index))
-        desiredPreviewPages = visible
-            .filter { bandPages.contains($0.index) }
-            .sorted { abs($0.topPt - scrollYPt) < abs($1.topPt - scrollYPt) }
-            .prefix(Self.maxPreviewPages).map(\.index)
+        // At ordinary zoom, one screen-resolution raster is cheaper than many
+        // oversized pyramid tiles and can be presented atomically. Larger pages
+        // and deep zoom retain the bounded tile path.
+        let screenScale = max(zoomFactor * deviceScale, 0.05)
+        let onScreen = band.filter {
+            let p = $0.placement
+            return CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt).intersects(viewport)
+        }
+        usesScreenPageRasters = preferFullPageRasters && Self.maxPreviewPages > 0 && !band.isEmpty
+            && onScreen.count <= Self.maxPreviewPages
+            && onScreen.reduce(CGFloat(0), { $0 + screenPageBytes($1.placement, scale: screenScale) })
+                <= CGFloat(tileCache.budgetBytes)
+            && band.allSatisfy { canRasterizeScreenPage($0.placement, scale: screenScale) }
+        configurePagePreviews(visible: visible, band: band, viewport: viewport,
+                              viewportHeight: viewportHeight, screenScale: screenScale)
         schedulePagePreview()
         var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
@@ -2397,14 +2418,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         for span in band {
             let placement = span.placement
-            var ready: [CanvasPage] = []
+            var sharpRows: [CanvasPage] = []
             var complete = true
             let previous = canvasTiles.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == placement.index }
             let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
+            if usesScreenPageRasters, !failedPreviewPages.contains(placement.index) {
+                let preview = pagePreviews[placement.index]
+                let attempted = (pagePreviewScales[placement.index] ?? 0) >= screenScale
+                // A backend-clamped/invalid page raster must fall back to tiles,
+                // rather than treating an undersized image as screen-resolution.
+                if !attempted || isScreenPageCached(placement.index) {
+                    if let preview, isScreenPageCached(placement.index) || previous.isEmpty {
+                        pages.append(canvasPageRaster(preview, placement: placement))
+                    } else if !previous.isEmpty {
+                        pages.append(contentsOf: previous)
+                    } else if let thumbnail = thumbnails[placement.index] {
+                        pages.append(canvasPageRaster(thumbnail, placement: placement))
+                    }
+                    continue
+                }
+            }
             // The pinned set is the *shown* band plus the ring the byte budget allows: a tile
             // outside the band may be re-rasterized, a visible one may not be dropped.
 
             for ty in span.rows {
+                var rowReady: [CanvasPage] = []
+                var rowComplete = true
                 for tx in span.columns {
                     let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
                     wanted.insert(key)
@@ -2423,38 +2462,59 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     )
 
                     if let cached = tileCache.image(for: key) {
-                        ready.append(CanvasPage(placement: tilePlacement, image: cached))
+                        rowReady.append(CanvasPage(placement: tilePlacement, image: cached))
                         bandReport.record(classOf, bytes: cached.bgra.count)
                     } else {
                         tileCache.recordMiss()
                         bandReport.record(classOf, bytes: 0)
-                        if tilePlacement.topPt < scrollYPt + viewportHeight,
-                           tilePlacement.topPt + tilePlacement.heightPt > scrollYPt {
+                        if tilePlacement.leftPt < viewport.maxX,
+                           tilePlacement.leftPt + tilePlacement.widthPt > viewport.minX {
+                            rowComplete = false
+                        }
+                        if classOf == .visible {
                             complete = false
-                            if classOf == .visible { bandReport.visibleMisses += 1 }
+                            bandReport.visibleMisses += 1
                         }
                         scheduleTile(key, placement: tilePlacement)
                     }
                 }
+                if rowComplete {
+                    sharpRows.append(contentsOf: rowReady)
+                } else {
+                    // A newly exposed row may be incomplete. Never blur tiles that were
+                    // already shown sharply, including after a viewport widens.
+                    sharpRows.append(contentsOf: previous.filter {
+                        ($0.placement.index >> 20) & 15 == Int(lod)
+                            && ($0.placement.index >> 10) & 1023 == ty
+                            && span.columns.contains($0.placement.index & 1023)
+                    })
+                }
             }
-            if changingLOD && !complete {
-                pages.append(contentsOf: previous)
-            } else if !complete, let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
-                // A complete, lower-resolution page replaces the checkerboard of arriving tiles.
+            if !complete, !changingLOD,
+               let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
+                // The preview is only a backdrop for uncovered rows, never a replacement
+                // for the sharp content the reader is already looking at.
                 pages.append(CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
                     topPt: placement.topPt, leftPt: placement.leftPt,
                     widthPt: placement.widthPt, heightPt: placement.heightPt), image: preview))
-            } else if complete {
-                pages.append(contentsOf: ready)
+            }
+            if changingLOD && !complete {
+                pages.append(contentsOf: previous)
+            } else {
+                pages.append(contentsOf: sharpRows)
             }
         }
         let viewportTop = scrollYPt
         pendingTiles.sort { a, b in
-            func priority(_ item: (TileKey, PagePlacement)) -> CGFloat {
+            func priority(_ item: (TileKey, PagePlacement)) -> (Int, CGFloat) {
                 let rect = item.1
+                let visible = CGRect(x: rect.leftPt, y: rect.topPt,
+                                     width: rect.widthPt, height: rect.heightPt).intersects(viewport)
                 let distance = max(viewportTop - rect.topPt - rect.heightPt,
                     rect.topPt - viewportTop - viewportHeight, 0)
-                return distance
+                // An offscreen neighbor touching the viewport also has distance zero.
+                // A page jump must fill its destination before that prefetch work.
+                return (visible ? 0 : 1, distance)
             }
             return priority(a) < priority(b)
         }
@@ -2899,22 +2959,96 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Only one preview is queued at a time, so fast scrolling can change the next
-    /// destination without leaving an entire document's raster work ahead of it.
-    private func schedulePagePreview() {
+    private func canvasPageRaster(_ image: PageImage, placement: PagePlacement) -> CanvasPage {
+        CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
+            topPt: placement.topPt, leftPt: placement.leftPt,
+            widthPt: placement.widthPt, heightPt: placement.heightPt), image: image)
+    }
+
+    private func screenPageBytes(_ placement: PagePlacement, scale: CGFloat) -> CGFloat {
+        ceil(placement.widthPt * scale) * ceil(placement.heightPt * scale) * 4
+    }
+
+    private func canRasterizeScreenPage(_ placement: PagePlacement, scale: CGFloat) -> Bool {
+        let bytes = screenPageBytes(placement, scale: scale)
+        // Leave room for at least two visible/adjacent pages, and stay below the
+        // FFI's 8-Mpixel / 8192px whole-page clamp (which would silently blur it).
+        return bytes <= CGFloat(min(tileCache.budgetBytes / 2, 8 * 1024 * 1024 * 4))
+            && max(placement.widthPt, placement.heightPt) * scale <= 8192
+    }
+
+    private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
+                                       viewportHeight: CGFloat, screenScale: CGFloat) {
+        desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
+        let current = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt)
+        let bandPages = Set(band.map(\.placement.index))
+        let candidates: [PagePlacement]
+        let budget: Int
+        if usesScreenPageRasters {
+            candidates = engine.visiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
+                gapPt: pageGapPt, marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3))
+                .filter { abs($0.index - current) <= 3 && canRasterizeScreenPage($0, scale: screenScale) }
+            budget = tileCache.budgetBytes
+        } else {
+            candidates = visible.filter { bandPages.contains($0.index) }
+            // Previews and tiles share one pixel budget, including their different
+            // resolutions. The unavoidable visible/pinned set may exceed it.
+            let tileBytes = band.reduce(0) { total, span in
+                total + span.rows.reduce(0) { rowTotal, y in
+                    rowTotal + span.columns.reduce(0) { columnTotal, x in
+                        columnTotal + (tileCache.bytes(for: TileKey(page: span.placement.index,
+                            lod: rasterLod, x: x, y: y)) ?? tileSizePx * tileSizePx * 4)
+                    }
+                }
+            }
+            budget = max(0, tileCache.budgetBytes - tileBytes)
+        }
+        func onScreen(_ p: PagePlacement) -> Bool {
+            CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt).intersects(viewport)
+        }
+        let ordered = candidates.sorted { a, b in
+            if onScreen(a) != onScreen(b) { return onScreen(a) }
+            let ad = abs(a.index - current), bd = abs(b.index - current)
+            if ad != bd { return ad < bd }
+            return scrollDirection > 0 ? a.index > b.index : a.index < b.index
+        }
+        var bytes = 0
+        desiredPreviewPages = []
+        for p in ordered {
+            guard desiredPreviewPages.count < (usesScreenPageRasters ? Self.maxPreviewPages : min(4, Self.maxPreviewPages))
+            else { break }
+            let cost = max(pagePreviews[p.index]?.bgra.count ?? 0,
+                           Int(screenPageBytes(p, scale: desiredPreviewScale)))
+            // A page currently on screen is the same exception as a pinned tile.
+            if bytes + cost <= budget || onScreen(p) {
+                desiredPreviewPages.append(p.index)
+                bytes += cost
+            }
+        }
         let keeping = Set(desiredPreviewPages)
         pagePreviews = pagePreviews.filter { keeping.contains($0.key) }
+        pagePreviewScales = pagePreviewScales.filter { keeping.contains($0.key) }
+    }
+
+    /// One page request at a time: each wheel event updates the neighborhood and
+    /// direction immediately, without waiting for scroll idle or queueing old pages.
+    private func schedulePagePreview() {
         guard pagePreviewInFlight == nil,
-              let page = desiredPreviewPages.first(where: { pagePreviews[$0] == nil && !failedPreviewPages.contains($0) })
-        else { return }
+              let page = desiredPreviewPages.first(where: {
+                  (pagePreviewScales[$0] ?? 0) < desiredPreviewScale && !failedPreviewPages.contains($0)
+              }) else { return }
         pagePreviewInFlight = page
+        let scale = desiredPreviewScale
         let epoch = renderEpoch
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
             do {
-                let image = try await self.engine.renderPage(page, scale: 1)
+                let image = try await self.engine.renderPage(page, scale: scale)
                 guard epoch == self.renderEpoch else { return }
-                if self.desiredPreviewPages.contains(page) { self.pagePreviews[page] = image }
+                if self.desiredPreviewPages.contains(page), scale >= (self.pagePreviewScales[page] ?? 0) {
+                    self.pagePreviews[page] = image
+                    self.pagePreviewScales[page] = scale
+                }
             } catch {
                 guard epoch == self.renderEpoch else { return }
                 self.failedPreviewPages.insert(page)
@@ -2936,7 +3070,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// scheduler is about to ask for again trades a bounded number of bytes for an unbounded
     /// number of re-rasterizations, and the measurement says that trade is a loss.
     private func evictTiles() {
-        guard tileCache.usedBytes > tileCache.budgetBytes else { return }
-        tileCache.evictToFit(pinned: wantedTiles.union(tilesInFlight), currentLod: rasterLod)
+        guard tileCache.usedBytes + pageRasterCacheUsedBytes > tileCache.budgetBytes else { return }
+        tileCache.evictToFit(pinned: wantedTiles.union(tilesInFlight), currentLod: rasterLod,
+                            reservedBytes: pageRasterCacheUsedBytes)
     }
 }

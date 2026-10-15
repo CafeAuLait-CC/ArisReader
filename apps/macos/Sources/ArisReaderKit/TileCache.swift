@@ -144,9 +144,9 @@ public struct TileCache {
     ///
     /// Returns the evicted keys (the caller may want to release GPU textures for them).
     @discardableResult
-    public mutating func evictToFit(pinned: Set<TileKey>, currentLod: UInt8) -> [TileKey] {
+    public mutating func evictToFit(pinned: Set<TileKey>, currentLod: UInt8, reservedBytes: Int = 0) -> [TileKey] {
         var evicted: [TileKey] = []
-        while usedBytes > budgetBytes {
+        while usedBytes > max(0, budgetBytes - reservedBytes) {
             guard let victim = victim(pinned: pinned, currentLod: currentLod) else { break }
             remove(victim)
             evicted.append(victim)
