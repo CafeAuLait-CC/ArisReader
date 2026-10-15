@@ -36,7 +36,7 @@
 1807.06209  family=A&A (EDP Sciences) | body=single column | cite=author-year, parenthetical and narrative | bib=single-column, hanging indent, 366 parsed entries, DOIs and URLs | head="References" mid-page; the list spans 20+ pages | doc=73 pages, 2198 link annotations, collaboration author lists, diacritics, 2018 | why=the largest author-year list in the set: 257 spans against 366 entries
 1710.05833  family=ApJL (AAS) | body=two columns | cite=author-year, parenthetical and narrative | bib=two-column reference list, hanging indent, 382 parsed entries | head="References" repeated as a running head on 13 pages | doc=59 pages, 5915 link annotations, collaboration-sized author lists, 2017 | why=two-column *and* author-year, with institution-sized author lists
 1712.01815  family=Science | body=single column | cite=superscript numerals, rendered parenthesised in the text layer: (9), (2, 14) | bib=single-column numbered list "1. ", "2. " | head="References" mid-page, list heading "References" with Notes | doc=19 pages, 13 link annotations, 2017 | why=superscript citations: 20 parenthesised numerals in the body, 0 spans detected
-1710.05463  family=Nature | body=single column | cite=superscript numerals attached to words: "winds5,6,23-26", "r-process1-3,10" | bib=single-column numbered list "34. ", "35. ", ~68 entries | head=no "References" heading in the text layer at all; the numbered list follows "Code availability" | doc=29 pages, no link annotations, 2017 | why=superscripts with no delimiter, plus a numbered list the heading heuristics cannot key on
+1710.05463  family=Nature | body=single column | cite=superscript numerals attached to words: "winds5,6,23-26", "r-process1-3,10" | bib=single-column numbered list printed in two runs: "1. "-"33. " after the main text (p7-10) and "34. "-"68. " after the methods (p24-27) | head=no "References" heading in the text layer at all; each numbered run simply follows the previous section | doc=29 pages, no link annotations, 2017 | why=superscripts with no delimiter, a numbered list the heading heuristics cannot key on, and one bibliography split into two runs (T4.20)
 1909.05722  family=IEEE (RA-L) | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, DOI-bearing entries | head="R EFERENCES" (IEEEtran caps, extracted with a space) | doc=8 pages, 167 link annotations, 2019 | why=IEEEtran: uppercase heading, DOI entries, and equation numbers "(12)" that look like citations
 2104.08886  family=Elsevier (elsarticle) | body=two columns | cite=numeric [n], grouped | bib=two-column reference list, 144 parsed entries | head="References" mid-page; the list spans 5 pages | doc=17 pages, 460 link annotations, 2021 | why=an Elsevier review: two-column layout with a five-page numeric list
 2110.12477  family=ACM (acmart) | body=two columns | cite=numeric [n] | bib=two-column reference list, hanging indent, DOIs | head="REFERENCES" heads the right column of a body page, entries continue on the next page | doc=9 pages, 147 link annotations, 2021 | why=ACM two-column layout whose reference list starts inside a body page's column
@@ -52,7 +52,10 @@
 # numeric with punctuation "12."            | 1712.01815 1710.05463 2403.04370 (list labels; 1710.05463 cites
 #                                            | them as superscripts, 1712.01815 as round numerals)
 # superscript numerals                      | 1710.05463 (attached to words: "winds5,6,23-26"; detected since the
-#                                            | superscript path landed: 18 of its 18 body spans resolve)
+#                                            | superscript path landed. 38 of its 38 body spans resolve over the
+#                                            | harness's body window since T4.20 joined its two runs — 18 of 18
+#                                            | before, because the label guard refused the main text's labels 1-33,
+#                                            | which the selected run 34-68 did not carry)
 #                                            | 1712.01815 is NOT covered here: measured 2026-10-14, its arXiv
 #                                            | text layer draws "(9)" and "(2, 14)" at body size on the baseline
 #                                            | (height ratio 0.97, rise +0.27 pt against a 10.69 pt body), so it
@@ -84,6 +87,7 @@
 # heading mid-page or mid-column            | 1706.03762 1810.04805 1602.05629 2010.11929 1807.06209 1712.01815 2104.08886 2110.12477 2403.04370 1905.11946 1912.01703 2103.00020
 # heading sharing its line with an entry    | 1512.03385 1408.5882 (heading at the top of the left column, an entry at the top of the right)
 # list split across pages                   | 1602.05629 1912.01703 1807.06209 1710.05833 2104.08886 2005.14165
+# one numbering printed in two runs        | 1710.05463 (1-33 after the main text, 34-68 after the methods; T4.20)
 # list repeated under a running head        | 1710.05833 ("References" on 13 pages)
 # appendices after the bibliography         | 1810.04805 2303.08774 1512.03385
 # appendices before the bibliography        | 2005.14165 (appendices in the middle, the list last)

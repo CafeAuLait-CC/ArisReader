@@ -151,10 +151,12 @@ const FLOORS: &[Floor] = &[
     Floor {
         id: "1710.05463",
         recall: 0.90,
-    }, // measured 100% (18/18) once superscript numerals were detected; the floor is new, and it
-       // is 0.90 rather than 1.00 because only the part of the list the bibliography parser
-       // selects (entries 34-68) can corroborate a label: its main-text citations, labels 1-33,
-       // are dropped by the label guard instead of being guessed at
+    }, // measured 100% (18/18) once superscript numerals were detected, and 100% (38/38) with
+       // T4.20's joined runs; the floor stays at 0.90 because the measurement did not move it —
+       // it was 0.90 rather than 1.00 while only the part of the list the parser selected
+       // (entries 34-68) could corroborate a label, because its main-text citations, labels 1-33,
+       // were dropped by the label guard instead of being guessed at. The runs are joined now, so
+       // that reason is gone and the floor is only the usual slack under a measured 100%
 ];
 
 /// Floor for a paper in the corpus that has no row above. Deliberately low: the explicit rows
@@ -1135,6 +1137,23 @@ fn reference_eval_recall() {
             "GPT-3 detection/bibliography coverage regressed: {} spans, {} entries",
             gpt3.spans,
             gpt3.entries
+        );
+    }
+    // T4.20: `1710.05463` prints one numbering in two runs — 1–33 after the main text, 34–68
+    // after the methods. Until the runs were joined the parser returned only the second, and the
+    // label guard then dropped every main-text citation: 35 entries and 18 spans, and the body
+    // window (which starts where the bibliography does) was 23 pages wide. The pins are the
+    // shape, not the exact count: fixing this moved three numbers at once, and a regression would
+    // move all three back.
+    if let Some(nature) = papers
+        .iter()
+        .find(|p| p.id == "1710.05463" && matches!(p.state, State::Measured))
+    {
+        assert!(
+            nature.entries >= 60 && nature.spans >= 30,
+            "`1710.05463`'s two bibliography runs are not joined: {} entries, {} spans",
+            nature.entries,
+            nature.spans
         );
     }
     let table = render_table(&papers);

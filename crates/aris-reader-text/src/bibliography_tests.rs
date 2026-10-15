@@ -432,3 +432,99 @@ fn one_tall_glyph_on_a_wrapped_reference_line_does_not_end_it() {
     assert!(entry.text.contains("delimiter spanning"), "{entry:?}");
     assert!(entry.text.contains("In Proceedings"), "{entry:?}");
 }
+
+// ---------------------------------------------------------------------------
+// T4.20 — one numbering printed in two runs
+// ---------------------------------------------------------------------------
+
+/// The labels of a resolved entry list, in order.
+fn labels(entries: &[ReferenceEntry]) -> Vec<&str> {
+    entries.iter().map(|entry| entry.label.as_str()).collect()
+}
+
+/// Three pages: a body that cites what `body` says, a first list, and a later second list.
+///
+/// The second list continues the first's numbering, which is the shape `1710.05463` prints: the
+/// main text's references 1–33 on pages 7–10, the methods' 34–68 on pages 24–27. Page 2 is left
+/// empty so the two lists cannot join into one run by page continuity, and the second list is the
+/// longer one, so it is the run the score picks and the first list is the one that has to be
+/// justified — the same way round as the paper.
+fn two_run_pages(body: &str) -> [RawTextPage; 3] {
+    [
+        test_page(body),
+        test_page("[1] One 2020.\n[2] Two 2021.\n[3] Three 2022.\n"),
+        test_page(
+            "[4] Four 2023.\n[5] Five 2024.\n[6] Six 2025.\n[7] Seven 2026.\n[8] Eight 2027.\n",
+        ),
+    ]
+}
+
+#[test]
+fn a_second_run_of_the_same_numbering_joins_when_the_body_cites_it() {
+    // The body cites the *first* list — the main text's references in `1710.05463` — while the
+    // later, longer list is the run the score picks. Before T4.20 the first list was discarded
+    // and every one of its labels was then refused by the label guard, because the selected run
+    // did not carry it. Both runs' labels must come back.
+    let pages = two_run_pages("See [1] and [2] for the background.\n");
+    let entries = find_references([(0, &pages[0]), (1, &pages[1]), (3, &pages[2])], 100);
+    assert_eq!(labels(&entries), ["1", "2", "3", "4", "5", "6", "7", "8"]);
+    assert_eq!(entries.first().unwrap().page, 1, "{entries:?}");
+}
+
+#[test]
+fn a_numbered_list_the_body_never_cites_is_not_a_bibliography() {
+    // The same pages, with the body citing the later list only. Two conditions must hold for a
+    // run to join — the numbering continues, and the body cites it — and the first list here
+    // meets the first and fails the second. This is what refuses an appendix, a figure list or a
+    // table of contents numbered where the bibliography stopped.
+    let pages = two_run_pages("See [4] and [5] for the background.\n");
+    let entries = find_references([(0, &pages[0]), (1, &pages[1]), (3, &pages[2])], 100);
+    assert_eq!(
+        labels(&entries),
+        ["4", "5", "6", "7", "8"],
+        "an uncited second list joined the bibliography: {entries:?}"
+    );
+}
+
+#[test]
+fn a_numbered_list_that_restarts_its_own_numbering_is_not_a_bibliography() {
+    // The other half of the rule: this list *is* cited by the body — twice — but its numbering
+    // restarts at 1 instead of continuing, so it cannot be adjacent to the bibliography's range
+    // and is a different list (an appendix's steps, a questionnaire), not the bibliography's
+    // tail. The corpus's live case is `2303.08774`, whose report carries seventeen numbered
+    // lists of its own; the longest is cited 85 times.
+    let body = test_page("See [1] and [2] for the background.\n");
+    let list = test_page("[1] One 2020.\n[2] Two 2021.\n[3] Three 2022.\n");
+    let appendix = test_page("[1] First step.\n[2] Second step.\n");
+    let entries = find_references([(0, &body), (1, &list), (3, &appendix)], 100);
+    assert_eq!(labels(&entries), ["1", "2", "3"]);
+}
+
+#[test]
+fn the_first_runs_last_entry_stops_where_a_smaller_section_begins() {
+    // `1710.05463` sets its references larger than the Acknowledgements that follow the list, so
+    // the size test T4.29 uses for the selection's last entry has to recognise a *smaller* block
+    // too — otherwise the joined list's first run carries the section, which is exactly what the
+    // evaluation's entry-length ceiling caught (473 characters for a 245-character reference).
+    let body = test_page("See [1] and [2].\n");
+    let first = page_of(&[
+        (760.0, 13.0, "1. Alpha, A. 2019. First reference."),
+        (740.0, 13.0, "2. Beta, B. 2020. Second reference whose"),
+        (720.0, 13.0, "title wraps onto a third line here."),
+        (660.0, 10.0, "Acknowledgements We thank the referee."),
+        (644.0, 10.0, "This section is not part of the reference"),
+        (628.0, 10.0, "above it, and is set smaller than it."),
+    ]);
+    let second = test_page("3. Gamma, C. 2021. Third reference.\n4. Delta, D. 2022. Fourth one.\n");
+    let entries = find_references([(0, &body), (1, &first), (3, &second)], 100);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.label == "2")
+        .expect("entry 2");
+    assert!(entry.text.contains("wraps onto a third line"), "{entry:?}");
+    assert!(!entry.text.contains("Acknowledgements"), "{entry:?}");
+    assert!(
+        !entry.text.contains("not part of the reference"),
+        "{entry:?}"
+    );
+}
