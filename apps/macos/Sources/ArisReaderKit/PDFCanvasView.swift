@@ -123,6 +123,7 @@ public final class MetalCanvasView: NSView {
     private var reportedDeviceScale: CGFloat = 0
     private var needsRender = true
     private var framesRendered: UInt64 = 0
+    private let traceFrames = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"] != nil
     /// Set while the window server is skipping our frames (window hidden or covered).
     private var wasOccluded = false
 
@@ -455,6 +456,12 @@ public final class MetalCanvasView: NSView {
         guard code == ArisStatus.ok.rawValue else {
             report("aris_reader_surface_draw_pages failed (\(ArisStatus.describe(code)))")
             return
+        }
+
+        if traceFrames {
+            let now = ProcessInfo.processInfo.systemUptime
+            let line = "aris-scroll-trace: {\"kind\":\"frame\",\"time\":\(now),\"surface\":\(surfaceId),\"presented\":\(stats.presented),\"cpu_us\":\(stats.elapsed_us),\"y\":\(scrollYPt)}\n"
+            FileHandle.standardError.write(Data(line.utf8))
         }
 
         if stats.presented == 0 {

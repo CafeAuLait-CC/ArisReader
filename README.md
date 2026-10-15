@@ -157,6 +157,24 @@ labelled examples are still needed for those acceptance criteria. The arXiv revi
 the lock before replacing files. PDFium defaults to `chromium/8100` with published archive
 checksums; `--tag` explicitly opts into a different engine baseline.
 
+To measure the native release app with continuous scripted input:
+
+```bash
+./scripts/build-rust.sh
+(cd apps/macos && swift build -c release)
+python3 scripts/measure-native-scroll.py eval-papers/2005.14165.pdf --runs 3 --zoom 100 --output build/scroll-100
+python3 scripts/measure-native-scroll.py eval-papers/2005.14165.pdf --runs 3 --zoom 400 --output build/scroll-400
+```
+
+Each run opens a temporary PDF copy, starts at the top, uses a 48 MiB cache, warms for two
+seconds, then drives the actual wheel-scroll path for eight seconds at 600 screen points/s.
+It never waits for raster completion between inputs. Raw logs and `results.json` retain every
+run's peak RSS in bytes, MB and MiB, input/submission interval tails, queue depth, platform,
+commit and PDF/engine/executable hashes. Missing, stationary or wholly occluded traces fail.
+The window is brought forward for measurement. Partial occlusion is reported explicitly.
+These are CPU submission timestamps, **not** display scanout or GPU timings, and scripted
+input is not a physical trackpad trace. The script does not certify the 60 fps criterion.
+
 Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 387.3 MiB
 median is about 406.1 MB and does not meet a decimal 400 MB limit; a median below a limit also
 does not prove that every run's peak is below it. The published debug-build measurements and

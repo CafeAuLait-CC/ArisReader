@@ -885,6 +885,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
+            // Measurement-only continuous input: same scroll path as wheel events, paced by
+            // wall time, never waiting for raster completion between updates.
+            if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"],
+               let seconds = Double(raw), seconds.isFinite, seconds > 0, seconds <= 120 {
+                let speed = Double(ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SPEED"] ?? "") ?? 600
+                if speed.isFinite && speed > 0 && speed <= 10000 {
+                    let epoch = documentEpoch
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .seconds(2))
+                        guard let self, epoch == self.documentEpoch else { return }
+                        self.scroll(toFraction: 0)
+                        let start = ProcessInfo.processInfo.systemUptime
+                        var previous = start
+                        FileHandle.standardError.write(Data("aris-scroll-trace: {\"kind\":\"start\",\"time\":\(start)}\n".utf8))
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .milliseconds(1000.0 / 60.0))
+                            guard epoch == self.documentEpoch, self.document != nil else { return }
+                            let now = ProcessInfo.processInfo.systemUptime
+                            let end = min(now, start + seconds)
+                            self.scroll(byScreenPoints: CGFloat((end - previous) * speed))
+                            previous = end
+                            let line = "aris-scroll-trace: {\"kind\":\"tick\",\"time\":\(now),\"y\":\(self.scrollYPt),\"pending\":\(self.pendingTiles.count),\"in_flight\":\(self.tilesInFlight.count)}\n"
+                            FileHandle.standardError.write(Data(line.utf8))
+                            if now >= start + seconds { break }
+                        }
+                        let end = ProcessInfo.processInfo.systemUptime
+                        FileHandle.standardError.write(Data("aris-scroll-trace: {\"kind\":\"end\",\"time\":\(end)}\n".utf8))
+                    }
+                }
+            }
+
             // Development aid: ARIS_READER_ZOOM_SEQUENCE="100,400,100" applies each zoom level
             // in turn, ARIS_READER_ZOOM_STEP_MS apart (default 1200 ms), so the raster cost of
             // a zoom-in → zoom-out → zoom-in sequence is measurable headlessly: every step logs
