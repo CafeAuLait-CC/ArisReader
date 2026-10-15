@@ -10,6 +10,14 @@ use aris_reader_text::{
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// Longest a bibliography entry can plausibly be, in characters, before it reads as a collapsed
+/// list rather than a reference: 1035 is the longest entry on these twelve samples apart from
+/// the one paper pinned below, and the T4.17 collapse produced 3000–7831-character entries, one
+/// per column. The bound and its derivation live with the evaluation harness
+/// (`crates/aris-reader-cli/tests/reference_eval.rs`, `PLAUSIBLE_ENTRY_CHARS`); this harness
+/// repeats it so a collapse in a sample paper fails here too.
+const PLAUSIBLE_ENTRY_CHARS: usize = 1800;
+
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
 fn sample_citations_resolve_to_bibliography_entries() {
@@ -73,6 +81,31 @@ fn sample_citations_resolve_to_bibliography_entries() {
                 "{prefix}: {entry:?}"
             );
         }
+        // The collapse shape: a bibliography parsed as one entry per column instead of one per
+        // reference. It has a length signature, and that is what is checked — the same rule and
+        // the same 1800-character bound as the evaluation harness
+        // (crates/aris-reader-cli/tests/reference_eval.rs), where the derivation is written out.
+        // A sample paper may be pinned higher only with its measurement recorded here.
+        let longest = references
+            .iter()
+            .map(|entry| entry.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        let over = references
+            .iter()
+            .filter(|entry| entry.text.chars().count() > PLAUSIBLE_ENTRY_CHARS)
+            .count();
+        let (ceiling, allowed) = match prefix {
+            // Measured 2621 characters on 2026-10-15: the last entry absorbs the appendix that
+            // follows the list on the same page (T4.17's residual, diagnosed but not fixed).
+            "manuscript" => (3950, 1),
+            _ => (PLAUSIBLE_ENTRY_CHARS, 0),
+        };
+        assert!(
+            longest <= ceiling && over <= allowed,
+            "{prefix}: longest entry {longest} characters (ceiling {ceiling}), {over} over \
+             {PLAUSIBLE_ENTRY_CHARS} (allowed {allowed}) — a collapsed bibliography"
+        );
         // The app's detector, style included: the corpus cites as `[n]` throughout, so the
         // superscript path stays off here — which is the point of measuring it, rather than
         // assuming it.
