@@ -78,7 +78,7 @@ extension ReaderChecks {
         require(synthetic.selectionRects(in: 0...1) == [CGRect(x: 0, y: 0, width: 30, height: 10)],
                 "selection includes a zero-box trailing space at a stable line height")
         let engine = try RustEngine()
-        let state = AppState(engine: engine)
+        let state = AppState(engine: engine, preferFullPageRasters: false)
         state.setViewportSize(CGSize(width: 700, height: 500))
         require(state.open(url: url), "interaction fixture opens")
         state.gotoPage(0)

@@ -392,12 +392,11 @@ public struct SettingsView: View {
                 Text("Engine: \(state.engine.version)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Stepper("Tile cache budget: \(cacheBudgetMB) MB",
+                Stepper("Page cache budget: \(cacheBudgetMB) MB",
                         value: $cacheBudgetMB, in: 16...1024, step: 16)
                     .onChange(of: cacheBudgetMB) { _, _ in state.applyCacheBudgetSetting() }
-                Text("Rasterized tiles are cached up to this many bytes; tiles the current view still "
-                     + "needs are never evicted. The tile size is fixed at 512 px. Budgets below ~40 MB "
-                     + "make zooming back re-rasterize instead of reusing cached tiles.")
+                Text("Keeps nearby pages ready for scrolling. A larger budget retains more clear pages. "
+                     + "Content currently on screen is preserved even if it exceeds this budget.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

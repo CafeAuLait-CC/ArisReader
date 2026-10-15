@@ -18,9 +18,11 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 Current status: **M1–M4 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
 tabs, sidecar highlights/underlines/notes, and citation/figure/table/algorithm previews.
-Dragging across the gap between text lines keeps a stable selection boundary. During scrolling,
-already sharp content stays sharp; newly exposed rows refine as they become ready, with a
-low-resolution backdrop only for missing regions. Zoom changes still replace a visible LOD together.
+At ordinary zoom, the reader presents one page raster at the screen's actual resolution and prepares
+nearby pages on every scroll update. Page rasters and tiles share the configured byte budget, so lower
+zoom keeps more neighbors; larger pages and deep zoom use tiles. Already sharp tile rows stay sharp as
+new regions load. A cold page can still show a preview until its raster arrives; this does not promise
+zero-latency arbitrary jumps.
 Milestone acceptance criteria are not all met: the milestone table below names what is missing, and the
 full review record (findings, evidence and follow-ups) is kept with the project's design notes rather than in
 this repository. Concrete
@@ -226,6 +228,25 @@ Keep memory units and the aggregation rule explicit: **400 MB = 381.47 MiB**. A 
 median is about 406.1 MB and does not meet a decimal 400 MB limit; a median below a limit also
 does not prove that every run's peak is below it. The published debug-build measurements and
 CLI raster timings alone do not establish the full M1 memory/60 fps acceptance criteria.
+
+### Page cache and navigation measurements
+
+After a release build, the native checks executable can measure CPU raster retention for any local PDF:
+
+```bash
+ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
+  apps/macos/.build/release/ArisReaderChecks --measure-page-rasters /path/to/paper.pdf 2.8 3
+ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
+  apps/macos/.build/release/ArisReaderChecks --measure-page-navigation /path/to/paper.pdf 140
+```
+
+`2.8` represents 140% on a 2x display. The first command totals actual BGRA bytes across all pages
+while retaining at most three; it reports raster median/p95 and `/usr/bin/time` reports process peak RSS.
+The second uses a temporary document copy, a 959×715pt viewport at 2x, and measures model raster
+readiness on cold, neighbor, return and distant jumps (PDFs longer than eight pages). It reports partial
+sharp updates and immediate sharp cache hits. It excludes GPU upload and presentation, so it is not FPS
+or end-to-end visual latency. `ARIS_READER_SHARP_PAGE_RASTERS=0` disables the screen-page path for a
+feature-off comparison under the same pixel budget. Deep zoom remains on tiles.
 
 ## Documentation index
 

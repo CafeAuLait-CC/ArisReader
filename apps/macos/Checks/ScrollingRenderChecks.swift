@@ -90,7 +90,7 @@ extension ReaderChecks {
             require(after > 0 && after < before * 0.8,
                     "supersampling preserves a thin PDF rule without making it an opaque pixel")
         }
-        let state = AppState(engine: engine)
+        let state = AppState(engine: engine, preferFullPageRasters: false)
         state.open(url: url)
         try await eventually("Retina thumbnail ready", { state.thumbnails[0] != nil })
         require(state.thumbnails[0]?.pixelWidth == 264, "thumbnail has native Retina resolution")
@@ -101,7 +101,7 @@ extension ReaderChecks {
     @MainActor static func scrollingQualityChecks(url: URL) async throws {
         let engine = GatedTileEngine()
         defer { engine.finishAll() }
-        let state = AppState(engine: engine)
+        let state = AppState(engine: engine, preferFullPageRasters: false)
         state.setViewportSize(CGSize(width: 700, height: 500))
         state.open(url: url)
         state.gotoPage(0)
@@ -145,7 +145,7 @@ extension ReaderChecks {
 
         let zoomEngine = GatedTileEngine()
         defer { zoomEngine.finishAll() }
-        let zoomed = AppState(engine: zoomEngine)
+        let zoomed = AppState(engine: zoomEngine, preferFullPageRasters: false)
         zoomed.zoomPercent = 400
         zoomed.setViewportSize(CGSize(width: 768, height: 500))
         zoomed.open(url: url)
@@ -218,7 +218,7 @@ extension ReaderChecks {
 
     @MainActor static func scrollingRenderChecks(url: URL) async throws {
         let engine = SlowTileEngine()
-        let state = AppState(engine: engine)
+        let state = AppState(engine: engine, preferFullPageRasters: false)
         state.setViewportSize(CGSize(width: 700, height: 500))
         state.open(url: url)
         state.gotoPage(0)
