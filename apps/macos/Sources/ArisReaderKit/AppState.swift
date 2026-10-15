@@ -380,6 +380,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @Published public private(set) var selection: Selection?
 
+    /// What a floating preview is *for*. It decides what the panel's body shows, because the
+    /// three cases genuinely want three different things.
+    public enum ReferencePreviewKind: Equatable, Sendable {
+        /// A bibliography entry a citation resolved to: the panel shows the entry **as text**.
+        /// The reader wants to read the reference, and a crop of a two-column bibliography page
+        /// makes that harder, not easier.
+        case reference
+        /// A figure or table caption: the panel shows the rendered region. A picture of a figure
+        /// is the point.
+        case figure
+        /// A plain link destination — a page, or a `/FitR` region with no entry behind it: the
+        /// panel shows the page image, which is the only thing there is to show.
+        case page
+    }
+
     /// The citation/figure preview (M4): what the floating panel is showing, if anything.
     ///
     /// Following an internal link opens this instead of jumping, so the reader keeps their
@@ -389,6 +404,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         public let title: String
         /// Where the link was found, shown in the panel for context.
         public let source: String
+        /// What the preview is for; decides between the entry text and the page image.
+        public let kind: ReferencePreviewKind
+        /// The clicked rectangle — the citation, the `Figure 3` mention, the link box — in the
+        /// canvas's view space (top-left origin). It is what the floating panel opens next to:
+        /// the target of a citation is usually on a bibliography page the reader is nowhere
+        /// near, while the thing they clicked is by definition under the pointer.
+        public let anchor: CGRect?
         /// Region of the target page to show, when the citation points at a figure or table
         /// rather than at the top of a page (view space, points).
         public let region: CGRect?
@@ -433,6 +455,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         referencePreviewHeightPt = size.height
         if widthChanged, let preview = referencePreview {
             openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
+                                 kind: preview.kind, anchor: preview.anchor,
                                  region: preview.region, entries: preview.entries)
         } else {
             scrollReferencePreview(by: 0)
@@ -449,23 +472,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func selectPreviewEntry(_ entry: CitationEntry) {
         guard let preview = referencePreview, let page = entry.page else { return }
         openReferencePreview(page: page, title: entry.label, from: preview.source,
+                             kind: preview.kind, anchor: preview.anchor,
                              region: entry.region, entries: preview.entries)
     }
 
     public func showFullPreviewPage() {
         guard let preview = referencePreview else { return }
+        // The page image is exactly what "Full page" is for, so the kind changes with the view.
         openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
-                             entries: preview.entries)
+                             kind: .page, anchor: preview.anchor, entries: preview.entries)
     }
 
     /// Opens a floating preview of `page`.
     ///
     /// `entries` is the citation's whole group of resolved works; `page`, `title` and `region`
-    /// describe the **first** of them, which is what the panel's page image shows.
+    /// describe the **first** of them, which is what a `.page` or `.figure` preview's image
+    /// shows. `kind` decides which of the two bodies the panel builds, and `anchor` — the
+    /// rectangle the reader clicked, in canvas view space — is where it opens.
+    ///
+    /// A `.reference` preview never rasterizes anything: the entry text *is* the body, so the
+    /// panel opens immediately and no page, tile or prefetch work is started for it.
     public func openReferencePreview(
         page: Int,
         title: String,
         from source: String,
+        kind: ReferencePreviewKind,
+        anchor: CGRect? = nil,
         region: CGRect? = nil,
         entries: [CitationEntry] = []
     ) {
@@ -484,6 +516,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             page: page,
             title: title,
             source: source,
+            kind: kind,
+            anchor: anchor,
             region: region,
             entries: entries
         )
@@ -495,6 +529,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(
                 Data("aris-preview: \"\(title)\" lists \(entries.count) entries: \(labels)\n".utf8)
             )
+        }
+
+        if kind == .reference {
+            // Nothing to rasterize: the panel's body is the entry text, which the shell already
+            // has. Reporting "loading" here would be a lie and leaving it set would keep the
+            // panel's spinner up forever.
+            referencePreviewLoading = false
+            FileHandle.standardError.write(
+                Data("aris-preview: entry text for \"\(title)\" (\(entries.count) entries, \(entries.reduce(0) { $0 + $1.text.count }) characters)\n".utf8)
+            )
+            return
         }
 
         let widthPt = max(region?.width ?? engine.contentWidthPt(gapPt: pageGapPt), 1)
@@ -874,6 +919,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     page: page - 1,
                     title: region == nil ? "Page \(page)" : "Figure on page \(page)",
                     from: "ARIS_READER_PREVIEW",
+                    kind: region == nil ? .page : .figure,
                     region: region
                 )
             }
@@ -1126,6 +1172,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // Pending writes describe the document being replaced or closed, so they have to land
         // before the state that carries them (sidecar URL, scroll offset) is cleared.
         flushPendingWrites()
+        // A glide belongs to the document that was scrolling; the next one starts still.
+        cancelScrollGlide()
         documentEpoch &+= 1
         searchEpoch &+= 1
         positionSaveTask?.cancel()
@@ -1170,13 +1218,105 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func zoomIn() {
-        zoomPercent = min(400, zoomPercent + 10)
+        zoomPercent = min(Self.maximumZoomPercent, zoomPercent + 10)
         reloadVisiblePages()
     }
 
     public func zoomOut() {
-        zoomPercent = max(25, zoomPercent - 10)
+        zoomPercent = max(Self.minimumZoomPercent, zoomPercent - 10)
         reloadVisiblePages()
+    }
+
+    /// The zoom range the toolbar buttons and the pointer gestures share.
+    public static let minimumZoomPercent = 25
+    public static let maximumZoomPercent = 400
+
+    /// How much zoom one screen point of a Ctrl/⌘+scroll asks for, in percent.
+    ///
+    /// `WheelMotion` reports a discrete wheel notch as 32 points and a precise trackpad delta as
+    /// itself, so one notch is 16% and a 100-point two-finger swipe is 50%: both are one visible
+    /// step, not a jump. The sign follows the browser convention — the gesture that scrolls the
+    /// document forward (Ctrl+wheel *down*, the content moving up) zooms out, and the one that
+    /// pulls it back zooms in.
+    static let zoomPercentPerScrollPoint: CGFloat = -0.5
+
+    /// Ctrl+scroll (and ⌘+scroll) zoom, anchored so the content point under the pointer stays
+    /// under it.
+    ///
+    /// `delta` is the same screen-point delta `scroll(byScreenPoints:)` takes, and `anchorViewY`
+    /// is the pointer in the canvas's view space (top-left origin). The anchor is applied
+    /// vertically only: the canvas has no horizontal scroll offset to solve for
+    /// (`CanvasGeometry.contentOffsetX`), so a point on the right of a wide page moves with the
+    /// centring. Everything else is the ordinary zoom path — the same `zoomPercent` the toolbar
+    /// writes, the same `reloadVisiblePages()`, the same debounced position save — so the
+    /// sharp-tile and prefetch machinery sees a zoom it already knows how to handle.
+    ///
+    /// Returns whether the zoom actually moved.
+    @discardableResult
+    public func zoomByScroll(delta: CGFloat, anchorViewY: CGFloat) -> Bool {
+        applyPointerZoom(delta * Self.zoomPercentPerScrollPoint, anchorViewY: anchorViewY)
+    }
+
+    /// Trackpad pinch, anchored at the pointer.
+    ///
+    /// `magnification` is `NSEvent.magnification`, a fraction (0.1 = +10%), which is already
+    /// proportional to the gesture, so it needs no per-point scaling. This is also the zoom
+    /// gesture the Accessibility "scroll gesture with modifier keys" setting cannot intercept.
+    @discardableResult
+    public func zoomByPinch(_ magnification: CGFloat, anchorViewY: CGFloat) -> Bool {
+        applyPointerZoom(magnification * 100, anchorViewY: anchorViewY)
+    }
+
+    /// Fraction of a zoom percent a pointer gesture has asked for but not yet been given: the
+    /// zoom itself is an integer percent, and dropping every sub-percent delta would make a slow
+    /// trackpad gesture do nothing at all.
+    private var pointerZoomRemainder: CGFloat = 0
+
+    @discardableResult
+    private func applyPointerZoom(_ percentDelta: CGFloat, anchorViewY: CGFloat) -> Bool {
+        guard document != nil, percentDelta.isFinite, percentDelta != 0 else { return false }
+        // Reversing direction drops the remainder: a half-percent of zoom-in must not pay for the
+        // first half-percent of zoom-out.
+        if percentDelta * pointerZoomRemainder < 0 { pointerZoomRemainder = 0 }
+        pointerZoomRemainder += percentDelta
+        let whole = pointerZoomRemainder.rounded(.towardZero)
+        guard whole != 0 else { return false }
+        pointerZoomRemainder -= whole
+
+        let target = min(Self.maximumZoomPercent,
+                         max(Self.minimumZoomPercent, zoomPercent + Int(whole)))
+        guard target != zoomPercent else {
+            // At a limit the remainder must not pile up, or the first step back would jump.
+            pointerZoomRemainder = 0
+            return false
+        }
+
+        let oldZoom = zoomFactor
+        let previousScrollYPt = scrollYPt
+        let anchorContentY = CanvasGeometry.contentY(
+            viewY: anchorViewY, scrollYPt: scrollYPt, zoom: oldZoom
+        )
+        zoomPercent = target
+        // The anchored offset replaces the old one outright; a glide still in flight would pull
+        // it back toward where the wheel was heading before the zoom.
+        cancelScrollGlide()
+        // Solve the offset against the new zoom and clamp with the new viewport height, then let
+        // the ordinary zoom path rebuild the band for it. Content height is in content points and
+        // does not depend on the zoom, so the clamp is already using the right numbers.
+        let anchored = CanvasGeometry.scrollYPt(
+            keepingContentY: anchorContentY, atViewY: anchorViewY, zoom: zoomFactor
+        )
+        scrollYPt = clampedScrollOffset(anchored)
+        reloadVisiblePages()
+        // The anchored zoom is a scroll too: it moves the reading position, so it owes the same
+        // debounced save every other scroll owes.
+        if abs(scrollYPt - previousScrollYPt) > 0.01 { schedulePositionSave() }
+        return true
+    }
+
+    /// The scroll offset clamped to the document (shared by every path that sets it).
+    private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
+        min(max(0, value), max(0, contentHeightPt - viewportHeightContentPt))
     }
 
     public func zoomActual() {
@@ -1213,15 +1353,86 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Scrolls by a delta measured in **screen points** (what `scrollWheel` reports).
     public func scroll(byScreenPoints delta: CGFloat) {
         guard document != nil else { return }
+        cancelScrollGlide()
         let contentDelta = delta / max(zoomFactor, 0.01)
         if delta != 0 { scrollDirection = delta > 0 ? 1 : -1 }
-        let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
-        let next = min(max(0, scrollYPt + contentDelta), maxOffset)
+        let next = clampedScrollOffset(scrollYPt + contentDelta)
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
         reloadVisiblePages()
         schedulePositionSave()
+    }
+
+    /// Scrolls by a **stepped** delta measured in screen points: one wheel notch, one keyboard
+    /// page. The offset glides toward the destination instead of jumping to it, which is what
+    /// makes a classic wheel read as motion rather than as a series of grid lines.
+    ///
+    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting.
+    public func scrollByWheelStep(_ delta: CGFloat) {
+        guard document != nil, delta != 0 else { return }
+        scrollDirection = delta > 0 ? 1 : -1
+        let contentDelta = delta / max(zoomFactor, 0.01)
+        // Chaining off the *destination* keeps a burst honest: every notch adds its own distance
+        // even when the previous one has not been drawn yet. The speed ceiling is a screen speed,
+        // so it is converted through the zoom like every other screen-point input.
+        glide.aim(
+            at: clampedScrollOffset((glide.destination ?? scrollYPt) + contentDelta),
+            maximumSpeed: ScrollGlide.defaultMaximumSpeed / max(zoomFactor, 0.01)
+        )
+        beginScrollActivity()
+        startGlideDriver()
+    }
+
+    /// Where a glide in flight is heading, or nil when the offset is not animating. Read-only:
+    /// it exists for the HUD and for the scroll measurement, not as a second source of truth.
+    public var scrollDestinationYPt: CGFloat? { glide.destination }
+
+    /// The glide in flight, if any.
+    private var glide = ScrollGlide()
+    private var glideDriver: Task<Void, Never>?
+    /// Tick length of the driver: short enough to look continuous at 120 Hz, long enough that the
+    /// per-tick band update stays cheap. The glide's arithmetic is time-based, so a late tick
+    /// covers more ground instead of slowing the motion down.
+    private static let glideTick = Duration.milliseconds(8)
+
+    private func startGlideDriver() {
+        guard glideDriver == nil else { return }
+        glideDriver = Task { @MainActor [weak self] in
+            var previous = ProcessInfo.processInfo.systemUptime
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.glideTick)
+                // A cancelled driver wakes up from its sleep immediately; it must not take one
+                // last step, or it would land on a destination a newer gesture has replaced.
+                guard !Task.isCancelled, let self else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                let finished = self.advanceScrollGlide(elapsed: now - previous)
+                previous = now
+                if finished { break }
+            }
+            self?.glideDriver = nil
+        }
+    }
+
+    /// One glide tick; returns whether the glide is over. Visible to the checks so they can drive
+    /// the exact code the driver runs, without depending on how fast the machine is.
+    @discardableResult
+    package func advanceScrollGlide(elapsed: TimeInterval) -> Bool {
+        let (offset, finished) = glide.step(from: scrollYPt, elapsed: elapsed)
+        if abs(offset - scrollYPt) > 0.0001 {
+            scrollYPt = offset
+            reloadVisiblePages()
+            schedulePositionSave()
+        }
+        if finished { glide.cancel() }
+        return finished
+    }
+
+    /// Drops a glide in flight (continuous input arriving, a document change, a page jump).
+    private func cancelScrollGlide() {
+        glide.cancel()
+        glideDriver?.cancel()
+        glideDriver = nil
     }
 
     /// Selects between two content-space points and copies the result (development aid).
@@ -1928,6 +2139,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     .joined(separator: " ")
                 let epoch = documentEpoch
                 let request = previewEpoch
+                // Read the anchor before the await: resolution can take a moment, and the reader
+                // may have scrolled by the time it lands, but the panel belongs where they clicked.
+                let anchor = viewRect(local: box, on: placement)
                 Task { @MainActor [weak self] in
                     guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
                     let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
@@ -1943,6 +2157,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         // is recognisable at a glance.
                         title: written,
                         from: "page \(placement.index + 1)",
+                        kind: .reference,
+                        anchor: anchor,
                         region: CGRect(
                             x: first.xPt,
                             y: first.yPt,
@@ -2001,9 +2217,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 return false
             }
             guard let mention = mention(at: local, in: mentions) else { continue }
-            return openFigure(mention, from: placement.index)
+            return openFigure(mention, from: placement.index,
+                              anchor: anchor(of: mention, on: placement))
         }
         return false
+    }
+
+    /// A caption mention's box in canvas view space, which is what the panel opens next to.
+    private func anchor(of mention: CaptionMention, on placement: PagePlacement) -> CGRect {
+        viewRect(local: CGRect(x: mention.xPt, y: mention.yPt,
+                               width: mention.widthPt, height: mention.heightPt),
+                 on: placement)
     }
 
     /// The mention whose box contains a view-space point, if any.
@@ -2020,7 +2244,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Opens the preview for the caption `mention` names (the tail both click paths share).
     @discardableResult
-    private func openFigure(_ mention: CaptionMention, from page: Int) -> Bool {
+    private func openFigure(_ mention: CaptionMention, from page: Int, anchor mentionAnchor: CGRect?) -> Bool {
         guard let figure = figures.first(where: {
             $0.kind == mention.kind && $0.label == mention.label
         }) else {
@@ -2047,6 +2271,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             page: figure.page,
             title: title,
             from: "page \(page + 1)",
+            kind: .figure,
+            anchor: mentionAnchor,
             region: CGRect(
                 x: figure.xPt,
                 y: figure.yPt,
@@ -2088,7 +2314,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             self.captionMentionsByPage[page] = mentions
 
             guard let mention = self.mention(at: local, in: mentions) else { return }
-            self.openFigure(mention, from: page)
+            guard let placement = self.visiblePagePlacements.first(where: { $0.index == page })
+            else { return }
+            self.openFigure(mention, from: page, anchor: self.anchor(of: mention, on: placement))
         }
     }
 
@@ -2135,6 +2363,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             ? "Page \(page + 1)"
                             : "Figure on page \(page + 1)",
                         from: "page \(placement.index + 1)",
+                        kind: link.region == nil ? .page : .figure,
+                        anchor: viewRect(local: box, on: placement),
                         region: link.region
                     )
                     statusMessage = "Previewing page \(page + 1)"
@@ -2260,6 +2490,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Saved per document path, debounced while scrolling, and clamped to the content so a
     /// window resize between sessions cannot put the reader past the end.
     private func restoreReadingPosition(for url: URL) {
+        cancelScrollGlide()
         guard let saved = UserDefaults.standard.object(forKey: Self.positionKey(for: url)) as? Double
         else { return }
 
@@ -2316,6 +2547,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func scroll(toFraction fraction: Double) {
         guard document != nil else { return }
+        cancelScrollGlide()
         let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
         let next = CGFloat(min(max(fraction, 0), 1)) * scrollable
         beginScrollActivity()
@@ -2342,6 +2574,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Jumps so that `page` (0-based) sits at the top of the viewport.
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
+        cancelScrollGlide()
         scrollYPt = engine.pageTopPt(max(0, page), gapPt: pageGapPt)
         reloadVisiblePages()
         schedulePositionSave()
@@ -2617,6 +2850,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             y: scrollYPt,
             width: max(1, viewportSizePt.width) / zoom,
             height: viewportHeight
+        )
+    }
+
+    /// Where a page region sits in the **canvas's** view space (top-left origin), or nil when
+    /// that page is not in the band the shell has placements for.
+    ///
+    /// The floating preview uses this to open next to the thing that was clicked rather than in a
+    /// corner: the anchor is the entry's or figure's own rectangle, transformed exactly the way
+    /// the canvas transforms it when drawing.
+    public func anchorViewRect(page: Int, region: CGRect?) -> CGRect? {
+        guard let placement = visiblePagePlacements.first(where: { $0.index == page }) else {
+            return nil
+        }
+        let local = region ?? CGRect(x: 0, y: 0,
+                                     width: placement.widthPt, height: placement.heightPt)
+        return viewRect(local: local, on: placement)
+    }
+
+    /// A page-local rectangle in the canvas's view space (top-left origin).
+    ///
+    /// The click paths use this to hand the floating panel the rectangle the reader actually
+    /// clicked, transformed exactly the way the canvas transforms it while drawing.
+    public func viewRect(local region: CGRect, on placement: PagePlacement) -> CGRect {
+        CanvasGeometry.viewRect(
+            pageTopPt: placement.topPt,
+            pageLeftPt: placement.leftPt,
+            region: region,
+            scrollYPt: scrollYPt,
+            zoom: zoomFactor,
+            contentOffsetX: CanvasGeometry.contentOffsetX(
+                viewportWidthPt: viewportSizePt.width,
+                contentWidthPt: contentWidthPt,
+                zoom: zoomFactor
+            )
         )
     }
 

@@ -49,9 +49,9 @@ extension ReaderChecks {
                 "edge tile crops rows without stretching or painting outside page")
         let state = AppState(engine: PreviewEngine())
         state.open(url: url)
-        state.openReferencePreview(page: 0, title: "slow", from: "test")
+        state.openReferencePreview(page: 0, title: "slow", from: "test", kind: .page)
         try await Task.sleep(for: .milliseconds(25))
-        state.openReferencePreview(page: 1, title: "latest", from: "test")
+        state.openReferencePreview(page: 1, title: "latest", from: "test", kind: .page)
         try await Task.sleep(for: .milliseconds(220))
         require(state.referencePreview?.title == "latest"
                 && state.referencePreviewPages.first?.image.generation == 11,
@@ -62,7 +62,7 @@ extension ReaderChecks {
         state.scrollReferencePreview(by: -10000)
         require(state.referencePreviewScrollYPt == 0, "preview scrolling clamps at top")
         let entry = AppState.CitationEntry(label: "second work", text: "Complete reference text", page: 0)
-        state.openReferencePreview(page: 1, title: "group", from: "test", entries: [entry])
+        state.openReferencePreview(page: 1, title: "group", from: "test", kind: .page, entries: [entry])
         state.selectPreviewEntry(entry)
         require(state.referencePreview?.page == 0 && state.referencePreview?.entries.count == 1,
                 "grouped entry selects its own page and keeps group")
@@ -70,10 +70,10 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(220))
         require(state.referencePreview == nil && state.referencePreviewPages.isEmpty,
                 "closing preview rejects in-flight raster")
-        state.openReferencePreview(page: 2, title: "failure", from: "test")
+        state.openReferencePreview(page: 2, title: "failure", from: "test", kind: .page)
         try await eventually("render failure is visible", { state.referencePreviewError != nil && !state.referencePreviewLoading })
         require(state.referencePreviewPages.isEmpty, "failed preview does not retain previous image")
-        state.openReferencePreview(page: 0, title: "before switch", from: "test")
+        state.openReferencePreview(page: 0, title: "before switch", from: "test", kind: .page)
         state.open(url: url)
         try await Task.sleep(for: .milliseconds(220))
         require(state.referencePreview == nil && state.referencePreviewPages.isEmpty,

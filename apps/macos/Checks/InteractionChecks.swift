@@ -117,7 +117,7 @@ extension ReaderChecks {
         let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
         view.onPointerDown = { state.beginSelection(at: $0) }
         view.onPointerDragged = { state.extendSelection(to: $0) }
-        view.interactionSnapshot = { (state.canvasPages, state.scrollYPt) }
+        view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
         func event(_ type: NSEvent.EventType, _ index: Int) -> NSEvent {
             let position = point(index)
             return NSEvent.mouseEvent(with: type,
