@@ -62,6 +62,28 @@ const PANEL_GAP_PT: f64 = 24.0;
 /// Share of the narrower box that two boxes must overlap along an axis to count as related.
 const MIN_OVERLAP_SHARE: f64 = 0.5;
 
+/// White space left around a preview region, as a share of the region's shorter side.
+///
+/// A crop taken exactly along the detected border reads as a cut-off figure; the reader asked for
+/// a little white around it. The share is what keeps the margin proportionate: measured over the
+/// 185 regions of the corpus that are not the full-page fallback (2026-10-15), the median region is
+/// 396 × 175 pt and the ninetieth percentile 504 × 328 pt, so 2 % of the shorter side is 3.5 pt
+/// there and 6.6 pt on a full-column figure.
+const PREVIEW_MARGIN_SHARE: f64 = 0.02;
+
+/// The smallest margin worth leaving (points): [`PREVIEW_MARGIN_SHARE`] of a small region.
+///
+/// The captions of this corpus leave 0.9–3.5 pt of white between their own lines; a preview edge
+/// narrower than that reads as a rounding error rather than as an edge, so the margin never drops
+/// below it.
+const PREVIEW_MARGIN_MIN_PT: f64 = 4.0;
+
+/// The largest margin (points): [`PREVIEW_MARGIN_SHARE`] of a tall region.
+///
+/// One line of body text is 10.9–14.4 pt from baseline to baseline on this corpus; a white edge
+/// wider than a line would show as much empty page as figure.
+const PREVIEW_MARGIN_MAX_PT: f64 = 12.0;
+
 /// A `Figure N` / `Fig. N` / `Table N` / `Algorithm N` reference in the running text.
 ///
 /// This is the click target, not the caption: see [`find_caption_mentions`] for exactly what is
@@ -259,6 +281,25 @@ pub fn caption_region_from(
     evidence: PageEvidence<'_>,
     page_bounds: Rect,
 ) -> Rect {
+    let region = caption_region_without_margin(caption, evidence, page_bounds);
+    with_preview_margin(region, evidence, page_bounds)
+}
+
+/// [`caption_region_from`] without the white edge: the region the page's own geometry gives.
+///
+/// The full-page fallback comes back as the page, and [`with_preview_margin`] then has nothing to
+/// grow — which is what keeps "the shell shows the whole page" true for vector figures and for
+/// tables whose grid the page does not draw.
+///
+/// The two steps are separate because they are decided differently: the geometry is measured
+/// against what the page draws, and the edge is a presentation choice that is then held back by
+/// that geometry. A caller that wants to know which part of a preview is the figure and which part
+/// is the white around it asks here; the shell previews [`caption_region_from`].
+pub fn caption_region_without_margin(
+    caption: &Caption,
+    evidence: PageEvidence<'_>,
+    page_bounds: Rect,
+) -> Rect {
     if caption.kind == "Table"
         && let Some(region) = table_region(caption, evidence.rules, evidence.lines, page_bounds)
     {
@@ -318,6 +359,73 @@ pub fn caption_region_from(
     clamp_to_page(region, page_bounds)
 }
 
+/// Grows `region` by the preview's white edge, stopping short of the page's other content.
+///
+/// The margin is [`PREVIEW_MARGIN_SHARE`] of the region's shorter side, held between
+/// [`PREVIEW_MARGIN_MIN_PT`] and [`PREVIEW_MARGIN_MAX_PT`], and each side is then cut back to the
+/// nearest text line or image object that lies beyond it. That cut is what the corpus asks for
+/// rather than a safety net bolted on: on the same 185 regions — measured before any margin was
+/// applied — the nearest other content sits 1.2 pt away at the fifth percentile, 1.9 pt at the
+/// tenth and 6.6 pt at the twenty-fifth, so between a tenth and a quarter of the regions have less
+/// room around them than the edge asks for. The region itself is what stays inside the page: the
+/// grown rectangle is clamped to `page_bounds` afterwards, which leaves a full-page fallback
+/// exactly as it was.
+fn with_preview_margin(region: Rect, evidence: PageEvidence<'_>, page_bounds: Rect) -> Rect {
+    if region.size.width <= 0.0 || region.size.height <= 0.0 {
+        return region;
+    }
+    let requested = (PREVIEW_MARGIN_SHARE * region.size.width.min(region.size.height))
+        .clamp(PREVIEW_MARGIN_MIN_PT, PREVIEW_MARGIN_MAX_PT);
+    let mut left = region.origin.x - requested;
+    let mut right = region.max_x() + requested;
+    let mut bottom = region.origin.y - requested;
+    let mut top = region.max_y() + requested;
+
+    for blocker in evidence
+        .lines
+        .iter()
+        .map(|line| line.rect)
+        .chain(evidence.images.iter().copied())
+    {
+        if blocker.size.width <= 0.0 || blocker.size.height <= 0.0 {
+            continue;
+        }
+        // What the region already covers is part of the preview: the caption and the artwork are
+        // inside it by construction. A box that covers the *region* is the artwork too — a form
+        // XObject's bounds routinely take in the caption under it.
+        let (inside, outside) = (contains(region, blocker), contains(blocker, region));
+        if inside || outside {
+            continue;
+        }
+        // Every other box is a neighbour, and it holds the edge back from whichever side it
+        // reaches over. A box that straddles an edge cancels that side's margin outright
+        // (`origin.y.max(region.max_y())` is the edge itself): a text line whose measured box
+        // crosses the border — the rotated labels of a figure, or a line the extractor merged
+        // out of two — is closer than the margin, whatever its box says.
+        let side_by_side = blocker.origin.x < region.max_x() && region.origin.x < blocker.max_x();
+        let stacked = blocker.origin.y < region.max_y() && region.origin.y < blocker.max_y();
+        if side_by_side {
+            if blocker.max_y() > region.max_y() {
+                top = top.min(blocker.origin.y.max(region.max_y()));
+            }
+            if blocker.origin.y < region.origin.y {
+                bottom = bottom.max(blocker.max_y().min(region.origin.y));
+            }
+        }
+        if stacked {
+            if blocker.max_x() > region.max_x() {
+                right = right.min(blocker.origin.x.max(region.max_x()));
+            }
+            if blocker.origin.x < region.origin.x {
+                left = left.max(blocker.max_x().min(region.origin.x));
+            }
+        }
+    }
+
+    let grown = Rect::new(left, bottom, right - left, top - bottom);
+    clamp_to_page(grown, page_bounds)
+}
+
 /// Whether `word` occurs at `at`, ignoring ASCII case.
 fn matches_word(chars: &[char], at: usize, word: &str) -> bool {
     word.chars().enumerate().all(|(offset, expected)| {
@@ -328,7 +436,10 @@ fn matches_word(chars: &[char], at: usize, word: &str) -> bool {
 }
 
 /// Whether the boxes overlap horizontally by at least [`MIN_OVERLAP_SHARE`] of the narrower.
-fn overlaps_horizontally(a: Rect, b: Rect) -> bool {
+///
+/// Shared with the caption scanner, which asks the same question of a caption's line and the line
+/// under it.
+pub(crate) fn overlaps_horizontally(a: Rect, b: Rect) -> bool {
     overlaps(
         a.max_x().min(b.max_x()) - a.origin.x.max(b.origin.x),
         a.size.width,
@@ -361,6 +472,14 @@ fn touches(image: Rect, region: Rect) -> bool {
         || (vertical_gap <= PANEL_GAP_PT && overlaps_horizontally(image, region))
 }
 
+/// Whether `inner` lies inside `outer`, edges included.
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.origin.x >= outer.origin.x - 0.01
+        && inner.max_x() <= outer.max_x() + 0.01
+        && inner.origin.y >= outer.origin.y - 0.01
+        && inner.max_y() <= outer.max_y() + 0.01
+}
+
 fn area(rect: &Rect) -> f64 {
     rect.size.width * rect.size.height
 }
@@ -384,6 +503,10 @@ fn clamp_to_page(region: Rect, page_bounds: Rect) -> Rect {
 mod figure_tests {
     use super::*;
 
+    /// Every region below carries the preview's white edge: on these 200 × 112 pt regions
+    /// [`PREVIEW_MARGIN_SHARE`] would ask for 2.2 pt, so [`PREVIEW_MARGIN_MIN_PT`] gives 4 pt on
+    /// each side. The numbers are written out rather than computed so that a change to either
+    /// constant shows up as a failing assertion.
     fn caption(rect: Rect) -> Caption {
         Caption {
             kind: "Figure".to_string(),
@@ -531,7 +654,7 @@ mod figure_tests {
             &[Rect::new(100.0, 150.0, 200.0, 300.0)],
             page_bounds(),
         );
-        assert_eq!(region, Rect::new(100.0, 100.0, 200.0, 350.0));
+        assert_eq!(region, Rect::new(96.0, 96.0, 208.0, 358.0));
     }
 
     #[test]
@@ -546,14 +669,16 @@ mod figure_tests {
             ),
             page_bounds()
         );
-        // Exactly at the limit, and the image is this caption's artwork.
+        // Exactly at the limit, and the image is this caption's artwork. The white edge stops at
+        // that image's bottom edge: 4 pt below the caption would be 96, the image starts at 172
+        // and the caption's own top is 112, so the region's top is the image's, 212, plus 4.
         assert_eq!(
             caption_region(
                 &caption,
                 &[Rect::new(100.0, 172.0, 200.0, 40.0)],
                 page_bounds()
             ),
-            Rect::new(100.0, 100.0, 200.0, 112.0)
+            Rect::new(96.0, 96.0, 208.0, 120.0)
         );
     }
 
@@ -567,7 +692,7 @@ mod figure_tests {
         let upper = Rect::new(100.0, 164.0, 200.0, 26.0);
         assert_eq!(
             caption_region(&caption, &[lower, upper], page_bounds()),
-            Rect::new(100.0, 100.0, 200.0, 90.0)
+            Rect::new(96.0, 96.0, 208.0, 98.0)
         );
     }
 
@@ -582,7 +707,7 @@ mod figure_tests {
         ];
         assert_eq!(
             caption_region(&caption, &images, page_bounds()),
-            Rect::new(100.0, 100.0, 200.0, 20.0)
+            Rect::new(96.0, 96.0, 208.0, 28.0)
         );
     }
 
@@ -594,7 +719,7 @@ mod figure_tests {
         let beside = Rect::new(330.0, 130.0, 200.0, 40.0);
         assert_eq!(
             caption_region(&caption, &[anchor, beside], page_bounds()),
-            Rect::new(100.0, 100.0, 200.0, 70.0)
+            Rect::new(96.0, 96.0, 208.0, 78.0)
         );
     }
 
@@ -674,15 +799,92 @@ mod figure_tests {
             page_bounds(),
         );
         assert_eq!(region.max_y(), 842.0);
-        assert_eq!(region.origin.y, 700.0);
-        assert_eq!(region.size.height, 142.0);
+        assert_eq!(region.origin.y, 696.0);
+        assert_eq!(region.size.height, 146.0);
 
-        // An invalid page bound leaves the object box untouched.
+        // An invalid page bound leaves the object box untouched, white edge included.
         let unclamped = caption_region(
             &caption,
             &[Rect::new(100.0, 720.0, 200.0, 400.0)],
             Rect::new(0.0, 0.0, 0.0, 0.0),
         );
-        assert_eq!(unclamped.max_y(), 1120.0);
+        assert_eq!(unclamped.max_y(), 1124.0);
+    }
+
+    #[test]
+    fn the_white_edge_stops_at_the_text_next_to_the_region() {
+        fn line(rect: Rect) -> TextLine {
+            TextLine {
+                rect,
+                range: 0..0,
+                text: String::new(),
+                ink: Vec::new(),
+            }
+        }
+
+        let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
+        let images = [Rect::new(100.0, 150.0, 200.0, 300.0)];
+        // A body-text line 2 pt above the artwork: the 4 pt edge has to stop at it.
+        let above = [line(Rect::new(100.0, 452.0, 200.0, 10.0))];
+        let region = caption_region_from(
+            &caption,
+            PageEvidence {
+                images: &images,
+                lines: &above,
+                ..PageEvidence::default()
+            },
+            page_bounds(),
+        );
+        assert_eq!(
+            region.max_y(),
+            452.0,
+            "the edge crossed a neighbouring line"
+        );
+        assert_eq!(region.origin.y, 96.0);
+
+        // The same line inside the region does not hold it back: it is part of the figure.
+        let inside = [line(Rect::new(100.0, 300.0, 200.0, 10.0))];
+        let region = caption_region_from(
+            &caption,
+            PageEvidence {
+                images: &images,
+                lines: &inside,
+                ..PageEvidence::default()
+            },
+            page_bounds(),
+        );
+        assert_eq!(region.max_y(), 454.0);
+    }
+
+    #[test]
+    fn the_white_edge_grows_with_the_region_and_stops_at_the_cap() {
+        let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
+        // 400 × 500: 2 % of the shorter side is 8 pt.
+        let big = [Rect::new(100.0, 150.0, 400.0, 450.0)];
+        let region = caption_region(&caption, &big, page_bounds());
+        assert_eq!(region.origin.x, 92.0);
+        assert_eq!(region.origin.y, 92.0);
+        // 600 × 720: 2 % of the shorter side is 12 pt, which is the cap.
+        let huge = [Rect::new(6.0, 120.0, 600.0, 700.0)];
+        let region = caption_region(&caption, &huge, page_bounds());
+        assert_eq!(region.origin.y, 88.0);
+        assert_eq!(region.max_y(), 832.0);
+        assert_eq!(
+            region.origin.x, 0.0,
+            "the page's left edge holds the edge back"
+        );
+        // A full-page fallback has nothing to grow into.
+        assert_eq!(caption_region(&caption, &[], page_bounds()), page_bounds());
+    }
+
+    #[test]
+    fn the_white_edge_does_not_take_in_the_figure_beside_it() {
+        let caption = caption(Rect::new(100.0, 100.0, 200.0, 12.0));
+        let anchor = Rect::new(100.0, 150.0, 200.0, 300.0);
+        // Another figure 3 pt to the right: the edge stops at its left border.
+        let beside = Rect::new(303.0, 150.0, 200.0, 300.0);
+        let region = caption_region(&caption, &[anchor, beside], page_bounds());
+        assert_eq!(region.max_x(), 303.0);
+        assert_eq!(region.origin.x, 96.0);
     }
 }
