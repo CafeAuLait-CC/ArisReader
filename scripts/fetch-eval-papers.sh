@@ -84,6 +84,7 @@ SKIPPED=0
 FAILED=0
 PRESENT=0
 MISSING=0
+REQUESTED=0
 
 for id in $(ids); do
   is_wanted "$id" || continue
@@ -95,11 +96,11 @@ for id in $(ids); do
 
 
   if [ "$LIST_ONLY" = "1" ]; then
-    if is_pdf "$target"; then
-      printf '  + %-10s present  %s\n' "$id" "$note"
+    if is_pdf "$target" && [ "$(shasum -a 256 "$target" | awk '{print $1}')" = "$checksum" ]; then
+      printf '  + %-10s verified %s\n' "$id" "$note"
       PRESENT=$((PRESENT + 1))
     else
-      printf '  - %-10s missing  %s\n' "$id" "$note"
+      printf '  - %-10s missing or hash mismatch %s\n' "$id" "$note"
       MISSING=$((MISSING + 1))
     fi
     continue
@@ -119,6 +120,9 @@ for id in $(ids); do
 
   tmp="$target.part"
   rm -f "$tmp"
+  # Delay between requests, including after a failed request.
+  if [ "$REQUESTED" -gt 0 ] && [ "$DELAY" != "0" ]; then sleep "$DELAY"; fi
+  REQUESTED=$((REQUESTED + 1))
   printf '  > %-10s fetching  %s\n' "$id" "$note"
   if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
         -A "ArisReader-eval-fetch/1.0 (local citation-index evaluation; +https://github.com/CafeAuLait-CC/ArisReader)" \
@@ -145,10 +149,7 @@ for id in $(ids); do
   printf '  + %-10s fetched (%s)\n' "$id" "$(du -h "$target" | cut -f1)"
   FETCHED=$((FETCHED + 1))
 
-  # arXiv is a shared service: do not hammer it, and never sleep after the last request.
-  if [ "$DELAY" != "0" ]; then
-    sleep "$DELAY"
-  fi
+
 done
 
 echo
