@@ -885,8 +885,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
-            // Measurement-only continuous input: same scroll path as wheel events, paced by
-            // wall time, never waiting for raster completion between updates.
+            // Measurement-only input calls the model method used by wheel events, paced
+            // by wall time without waiting for rasters. It bypasses scrollWheel's immediate
+            // canvas draw, exercising the queued redraw path rather than NSEvent delivery.
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"],
                let seconds = Double(raw), seconds.isFinite, seconds > 0, seconds <= 120 {
                 let speed = Double(ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SPEED"] ?? "") ?? 600

@@ -2,7 +2,7 @@
 """Measure paced native scrolling, Metal presentation times and per-process peak RSS.
 
 Build first: ./scripts/build-rust.sh && (cd apps/macos && swift build -c release)
-This is scripted wheel-path input, not a physical trackpad or GPU-time measurement.
+This calls the wheel handler's model method; it bypasses NSEvent delivery and its immediate canvas draw.
 Each run gets a fresh temporary document copy so saved positions/annotations cannot leak in.
 """
 import argparse
@@ -131,7 +131,7 @@ def main():
         'pdfium_sha256': hashlib.sha256(args.pdfium.read_bytes()).hexdigest(),
         'app': str(args.app.resolve()), 'seconds': args.seconds, 'speed_screen_pt_s': args.speed,
         'zoom_percent': args.zoom, 'cache_mib': 48,
-        'method': 'wall-time paced native wheel-path calls; Metal drawable presentedTime plus CPU submission timestamps; not GPU duration or physical scanout',
+        'method': 'wall-time paced model scroll calls (no NSEvent/immediate wheel draw); Metal drawable presentedTime plus CPU submission timestamps; not GPU duration or physical scanout',
         'scheduling_diagnostics': args.scheduling_diagnostics,
     }
     results = []

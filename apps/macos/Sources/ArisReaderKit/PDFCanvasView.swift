@@ -125,7 +125,8 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
-    private var frameTimer: Timer?
+    private var pendingFrame: DispatchWorkItem?
+    private var frameEpoch: UInt64 = 0
     private var wheelMotion = WheelMotion()
     /// Reads the just-updated model during AppKit event tracking, before SwiftUI commits.
     public var interactionSnapshot: (() -> ([CanvasPage], CGFloat))?
@@ -144,10 +145,10 @@ public final class MetalCanvasView: NSView {
     private var reportedDeviceScale: CGFloat = 0
     private var needsRender = true
     private var framesRendered: UInt64 = 0
+    /// Native regression checks observe successful submissions without the HUD's throttle.
+    package var submittedFrameCount: UInt64 { framesRendered }
     private let traceFrames = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SECONDS"] != nil
     private let traceScheduling = ProcessInfo.processInfo.environment["ARIS_READER_SCROLL_TRACE_SCHEDULING"] == "1"
-    /// Set while the window server is skipping our frames (window hidden or covered).
-    private var wasOccluded = false
 
     public override func makeBackingLayer() -> CALayer {
         let metalLayer = traceFrames ? PresentationTraceLayer() : CAMetalLayer()
@@ -169,7 +170,7 @@ public final class MetalCanvasView: NSView {
     }
 
     isolated deinit {
-        frameTimer?.invalidate()
+        pendingFrame?.cancel()
     }
 
     public override func viewDidMoveToWindow() {
@@ -326,7 +327,6 @@ public final class MetalCanvasView: NSView {
 
         syncTextures()
         markNeedsRender()
-        startFrameLoop()
 
         // Verification aid for headless runs: macOS reports a window covered by another
         // app as occluded, and wgpu then skips drawing (correct behaviour, but it makes
@@ -350,8 +350,9 @@ public final class MetalCanvasView: NSView {
     }
 
     private func detachSurface() {
-        frameTimer?.invalidate()
-        frameTimer = nil
+        pendingFrame?.cancel()
+        pendingFrame = nil
+        frameEpoch &+= 1
         releaseAllTextures()
         guard surfaceId != 0 else { return }
         _ = aris_reader_surface_detach(surfaceId)
@@ -417,28 +418,34 @@ public final class MetalCanvasView: NSView {
 
     private func markNeedsRender() {
         needsRender = true
+        scheduleFrame()
     }
 
-    private func startFrameLoop() {
-        frameTimer?.invalidate()
-        // Common run-loop modes continue to deliver frames while AppKit tracks a drag.
-        var tick: UInt64 = 0
-        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+    /// Coalesce model/texture updates into one main-queue job. Run-loop timers can
+    /// stall while main-actor input continues, leaving a dirty canvas undisplayed.
+    /// Metal's FIFO surface still controls actual presentation; idle views enqueue nothing.
+    private func scheduleFrame(after delay: TimeInterval = 0) {
+        guard surfaceId != 0, pendingFrame == nil else { return }
+        let epoch = frameEpoch
+        let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                tick += 1
+                guard let self, self.frameEpoch == epoch else { return }
+                self.pendingFrame = nil
+                guard self.needsRender, self.surfaceId != 0 else { return }
                 if self.traceScheduling, let snapshot = self.interactionSnapshot?() {
-                    let line = "aris-scroll-trace: {\"kind\":\"timer\",\"time\":\(ProcessInfo.processInfo.systemUptime),\"y\":\(self.scrollYPt),\"model_y\":\(snapshot.1),\"needs_render\":\(self.needsRender)}\n"
+                    let line = "aris-scroll-trace: {\"kind\":\"frame_job\",\"time\":\(ProcessInfo.processInfo.systemUptime),\"y\":\(self.scrollYPt),\"model_y\":\(snapshot.1)}\n"
                     FileHandle.standardError.write(Data(line.utf8))
                 }
-                if self.needsRender || (self.wasOccluded && tick % 16 == 0) {
-                    self.needsRender = false
-                    self.renderFrame()
-                }
+                self.needsRender = false
+                self.renderFrame()
             }
         }
-        frameTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        pendingFrame = work
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
 
     private func renderFrame() {
@@ -498,10 +505,10 @@ public final class MetalCanvasView: NSView {
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
             // deliberately skips the draw. The frame loop retries at a low rate.
-            wasOccluded = true
+            needsRender = true
+            scheduleFrame(after: 0.133)
             return
         }
-        wasOccluded = false
 
         framesRendered += 1
         if framesRendered == 1 || framesRendered % 15 == 0 {

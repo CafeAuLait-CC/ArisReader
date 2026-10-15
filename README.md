@@ -167,8 +167,9 @@ python3 scripts/measure-native-scroll.py eval-papers/2005.14165.pdf --runs 3 --z
 ```
 
 Each run opens a temporary PDF copy, starts at the top, uses a 48 MiB cache, warms for two
-seconds, then drives the actual wheel-scroll path for eight seconds at 600 screen points/s.
-It never waits for raster completion between inputs. Raw logs and `results.json` retain every
+seconds, then calls the wheel handler's model scroll method for eight seconds at 600 screen points/s.
+It never waits for raster completion between inputs. It bypasses `NSEvent` delivery and the
+canvas wheel handler's immediate draw, exercising queued redraws. Raw logs and `results.json` retain every
 run's peak RSS in bytes, MB and MiB, input/submission/presentation interval tails, queue depth,
 platform, commit and PDF/engine/executable hashes. Missing, stationary or wholly occluded traces fail.
 The window is brought forward for measurement. Partial occlusion is reported explicitly.
