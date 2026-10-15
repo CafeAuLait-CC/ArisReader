@@ -2470,11 +2470,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         let viewportTop = scrollYPt
         pendingTiles.sort { a, b in
-            func priority(_ item: (TileKey, PagePlacement)) -> CGFloat {
+            func priority(_ item: (TileKey, PagePlacement)) -> (Int, CGFloat) {
                 let rect = item.1
+                let visible = CGRect(x: rect.leftPt, y: rect.topPt,
+                                     width: rect.widthPt, height: rect.heightPt).intersects(viewport)
                 let distance = max(viewportTop - rect.topPt - rect.heightPt,
                     rect.topPt - viewportTop - viewportHeight, 0)
-                return distance
+                // An offscreen neighbor touching the viewport also has distance zero.
+                // A page jump must fill its destination before that prefetch work.
+                return (visible ? 0 : 1, distance)
             }
             return priority(a) < priority(b)
         }

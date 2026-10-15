@@ -63,6 +63,8 @@ import Foundation
         }
     }
 
+    func holdFutureTiles() { automatic = false }
+
     func finishAll() {
         automatic = true
         finish { _ in true }
@@ -173,6 +175,45 @@ extension ReaderChecks {
             return zoomRow(0).count == 4 && zoomRow(1).count == 4
         })
         zoomEngine.finishAll()
+
+        // A jump is different from slow scrolling: the destination may have no cached
+        // rasters at all, whereas returning to the source should need no preview.
+        try await eventually("source-page prefetch settles before the jump test", {
+            state.pinnedTiles.allSatisfy { state.isTileCached($0) } && engine.active == 0
+        })
+        let sourceGenerations = Set((row(0) + row(1)).map(\.image.generation))
+        engine.holdFutureTiles()
+        state.gotoPage(2)
+        try await eventually("jump to a cold page gets its own fallback", {
+            state.canvasPages.contains { $0.image.generation == 502 }
+        })
+        try await eventually("destination raster slots are occupied", {
+            engine.pendingKeys.count == AppState.maxConcurrentTileRasters
+        })
+        require(engine.pendingKeys.allSatisfy { $0.page == 2 && $0.y == 0 },
+                "direct page jumps prioritize visible destination tiles (pending: \(engine.pendingKeys))")
+        require(!state.canvasPages.contains { $0.placement.index >= 0 && $0.placement.index >> 24 == 0 },
+                "a distant page jump cannot retain the source page's sharp tiles")
+        try await eventually("a cold destination sharpens before all its visible rows finish", {
+            engine.finish { $0.page == 2 && $0.y == 0 }
+            return state.canvasPages.filter {
+                $0.placement.index >= 0 && $0.placement.index >> 24 == 2
+                    && ($0.placement.index >> 10) & 1023 == 0
+            }.count == 3
+        })
+        try await eventually("destination rasters are in flight before returning", {
+            engine.pendingKeys.filter { $0.page == 2 }.count == AppState.maxConcurrentTileRasters
+        })
+        state.gotoPage(0)
+        require(sourceGenerations.isSubset(of: Set(state.canvasPages.map(\.image.generation)))
+                && !state.canvasPages.contains { $0.image.generation == 500 },
+                "returning to a cached page is immediately sharp without a preview downgrade")
+        engine.finish { $0.page == 2 }
+        try await eventually("old destination rasters finish after the return jump", { engine.active == 0 })
+        require(sourceGenerations.isSubset(of: Set(state.canvasPages.map(\.image.generation)))
+                && !state.canvasPages.contains { $0.placement.index >= 0 && $0.placement.index >> 24 == 2 },
+                "late rasters from the abandoned destination do not flash over the cached page")
+        engine.finishAll()
     }
 
     @MainActor static func scrollingRenderChecks(url: URL) async throws {
