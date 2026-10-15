@@ -795,9 +795,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// those indices must keep meaning exactly what they meant. The rest were added because four
     /// colours is not a palette a reader can work in; a loaded annotation is not limited to these
     /// at all (see `AnnotationColor`).
-    /// `nonisolated(unsafe)` because a `Codable` conformance is not main-actor isolated and the
-    /// palette is a read-only table of value types: nothing ever writes it after initialisation.
-    public nonisolated(unsafe) static let highlightPalette: [(name: String, color: AnnotationColor)] = [
+    /// `nonisolated` because `Codable` conformances are not main-actor isolated: an annotation
+    /// decodes its legacy `colorIndex` against this table from any thread. It is a `let` of
+    /// `Sendable` values, so sharing it is safe.
+    public nonisolated static let highlightPalette: [(name: String, color: AnnotationColor)] = [
         ("Yellow", AnnotationColor(red: 0xFF, green: 0xD8, blue: 0x40, alpha: 0x66)),
         ("Green", AnnotationColor(red: 0x70, green: 0xD0, blue: 0x60, alpha: 0x66)),
         ("Blue", AnnotationColor(red: 0x60, green: 0xA0, blue: 0xF0, alpha: 0x66)),
@@ -817,11 +818,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var nextAnnotationTextureGeneration: UInt64 = 1_000
 
     /// A 1x1 texture in `color`, uploaded straight or with `opacity` baked in for multiply.
+    ///
+    /// The colour already carries the annotation's opacity in its alpha channel (the engine sets
+    /// it from `/CA`), which is exactly what alpha-over needs. Multiply is the case that needs the
+    /// opacity folded into the channels instead: the GPU mixes in linear light where PDF mixes in
+    /// the stored colour space, so an unbaked translucent highlight comes out visibly brighter
+    /// than the file says (see `AnnotationColor.baked(opacity:)`).
     private func annotationTexture(for color: AnnotationColor, opacity: Double, blend: QuadBlend) -> PageImage {
-        let key = AnnotationTextureKey(
-            color: blend == .multiply ? color.baked(opacity: opacity) : color,
-            blend: blend
-        )
+        let drawn = blend == .multiply ? color.baked(opacity: opacity) : color
+        let key = AnnotationTextureKey(color: drawn, blend: blend)
         if let cached = annotationTextures[key] { return cached }
         nextAnnotationTextureGeneration += 1
         let image = PageImage(

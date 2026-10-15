@@ -173,6 +173,8 @@ unsafe fn resolve(library: Library) -> Option<Api> {
         unsafe { library.get::<T>(name).ok().map(|symbol| *symbol) }
     }
 
+    // SAFETY (every `symbol` call below): each name is the exported PDFium symbol for the
+    // `extern "C" fn` type declared next to it in `Api`, transcribed from `fpdf_annot.h`.
     let api = Api {
         load_document: unsafe { symbol(&library, b"FPDF_LoadDocument\0")? },
         close_document: unsafe { symbol(&library, b"FPDF_CloseDocument\0")? },
@@ -346,6 +348,7 @@ impl AnnotationReader {
             f64::from(raw_rect.top - raw_rect.bottom),
         );
 
+        // SAFETY: `handle` is a live annotation for the duration of `read`.
         let subtype = unsafe { (self.api.get_subtype)(handle) };
         let kind = subtype_kind(subtype);
         let quads = self.quad_points(handle);
@@ -356,6 +359,7 @@ impl AnnotationReader {
             .map_or(AnnotationBlend::Normal, |name| {
                 AnnotationBlend::from_pdf_name(&name)
             });
+        // SAFETY: `handle` is live; the call reads one integer flag set.
         let flags = unsafe { (self.api.get_flags)(handle) };
         let hidden = flags & (FLAG_INVISIBLE | FLAG_HIDDEN | FLAG_NOVIEW) != 0;
 
