@@ -39,6 +39,17 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        // The scroll-tail fix on its own, while it is being worked on
+        // (`ArisReaderChecks --check-scroll-tail .`).
+        if CommandLine.arguments.contains("--check-scroll-tail") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            scrollGlideTailChecks()
+            try await scrollTailDriverChecks(
+                url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Scroll-tail checks passed")
+            return
+        }
         // Lets the document-opening checks be run on their own while they are being worked on.
         if CommandLine.arguments.contains("--check-document-opening") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
@@ -146,6 +157,8 @@ struct ReaderChecks {
         try referenceEntryTextChecks()
         try await smoothScrollChecks(url: b)
         try scrollGlideChecks()
+        scrollGlideTailChecks()
+        try await scrollTailDriverChecks(url: b)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
         // Registered before the frame-scheduling checks: those need a presentable surface and

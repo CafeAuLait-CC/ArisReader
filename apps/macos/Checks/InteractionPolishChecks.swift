@@ -467,8 +467,11 @@ extension ReaderChecks {
         offsets.append(state.scrollYPt)
         let increments = zip(offsets, offsets.dropFirst()).map { $1 - $0 }
         let ceiling = Double(ScrollGlide.defaultMaximumSpeed) * 0.008 + 1e-6
-        require(increments.count > 8,
-                "the notch is covered in many small increments, not one (\(increments.count) ticks)")
+        require(increments.count >= 6,
+                "the notch is covered in small increments, not one (\(increments.count) ticks)")
+        require(increments.allSatisfy { abs($0) <= 32 * ScrollGlide.maximumTickFraction + 1e-6 },
+                "no increment swallows more than a quarter of the notch "
+                + "(largest \(increments.map { abs($0) }.max() ?? 0) pt of 32)")
         require(increments.allSatisfy { $0 < 0 },
                 "every increment moves toward the destination")
         require(increments.allSatisfy { abs($0) <= ceiling },
@@ -493,14 +496,20 @@ extension ReaderChecks {
         require(abs(burstDestination - (burstStart + step * 3)) < 1e-9,
                 "three notches aim three notches away, not one")
         var burstOffsets: [CGFloat] = []
+        var burstTicks = 0
         for _ in 0..<400 {
+            burstTicks += 1
             if state.advanceScrollGlide(elapsed: 0.008) { break }
             burstOffsets.append(state.scrollYPt)
         }
-        require(burstOffsets.count > offsets.count,
-                "a longer distance takes more ticks (\(burstOffsets.count) vs \(offsets.count))")
         require(abs(state.scrollYPt - burstDestination) < 1e-9,
                 "the burst converges on the accumulated destination")
+        // A longer distance is not a longer *tail*: the glide delivers at the speed ceiling once
+        // the notches stop, so three notches take the same handful of ticks as one, not three
+        // times as many.
+        require(burstTicks <= offsets.count + 2,
+                "three notches are delivered in \(burstTicks) ticks against the one notch's "
+                + "\(offsets.count): distance does not become drift")
 
         // ── Momentum is not applied twice: precise input takes over and ends the glide ────
         state.scroll(toFraction: 0.35)
@@ -591,21 +600,28 @@ extension ReaderChecks {
                 "the first tick of a long glide is speed-limited (\(first) pt)")
         let (idle, _) = glide.step(from: 0, elapsed: 0)
         require(idle == 0, "a zero-length tick moves nothing")
-        // A tick that arrives ten seconds late must not swallow the glide: it moves at most its
-        // share of what is left, and the rest arrives on the following ticks.
-        let (huge, hugeDone) = glide.step(from: 0, elapsed: 10)
-        require(!hugeDone
-                    && abs(huge) <= 1000 * ScrollGlide.maximumTickFraction + 1e-6,
+        // A tick that arrives late while the notches are still coming must not swallow the glide:
+        // it moves at most its share of what is left, and the rest arrives on later ticks.
+        glide.aim(at: -1000, maximumSpeed: 1_000_000)
+        let (stalled, stalledDone) = glide.step(from: 0, elapsed: 0.04)
+        require(!stalledDone && abs(stalled) <= 1000 * ScrollGlide.maximumTickFraction + 1e-6,
                 "a stalled tick moves at most \(ScrollGlide.maximumTickFraction) of the distance "
-                + "(\(huge) pt of 1000)")
-        var stalled = huge
+                + "(\(stalled) pt of 1000)")
+        var catchingUp = stalled
         for _ in 0..<200 {
-            let (next, finished) = glide.step(from: stalled, elapsed: 10)
-            stalled = next
+            let (next, finished) = glide.step(from: catchingUp, elapsed: 0.04)
+            catchingUp = next
             if finished { break }
         }
-        require(stalled == -1000, "and the glide still lands on its destination")
+        require(catchingUp == -1000, "and the glide still lands on its destination")
         glide.cancel()
+
+        // Once the wheel has stopped, the same late tick finishes the distance instead of easing
+        // into it - that is what removes the tail the reader reported.
+        glide.aim(at: -1000)
+        let (finished, done) = glide.step(from: -300, elapsed: 10)
+        require(done && finished == -1000,
+                "a tick after the wheel stopped finishes what is owed and ends the glide")
 
         // The ceiling is per aim, so a zoomed-in canvas glides at screen speed, not content speed.
         glide.aim(at: 100, maximumSpeed: 500)

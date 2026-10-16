@@ -1583,7 +1583,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// page. The offset glides toward the destination instead of jumping to it, which is what
     /// makes a classic wheel read as motion rather than as a series of grid lines.
     ///
-    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting.
+    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting. The
+    /// glide stops when the notches do: see `ScrollGlide.idleWindow` — the reader asked for the
+    /// tail after the last notch to be gone, so the glide finishes the distance it still owes
+    /// instead of letting it decay.
     public func scrollByWheelStep(_ delta: CGFloat) {
         guard document != nil, delta != 0 else { return }
         scrollDirection = delta > 0 ? 1 : -1
@@ -1608,7 +1611,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var glideDriver: Task<Void, Never>?
     /// Tick length of the driver: short enough to look continuous at 120 Hz, long enough that the
     /// per-tick band update stays cheap. The glide's arithmetic is time-based, so a late tick
-    /// covers more ground instead of slowing the motion down.
+    /// covers more ground instead of slowing the motion down — and because the driver keeps
+    /// ticking after the last notch too, it is also what detects that the wheel has stopped and
+    /// delivers the rest of the distance (`ScrollGlide.idleWindow`).
     private static let glideTick = Duration.milliseconds(8)
 
     private func startGlideDriver() {
