@@ -39,6 +39,23 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        // The two interaction fixes, on their own, while they are being worked on
+        // (`ArisReaderChecks --check-click-intent .`).
+        if CommandLine.arguments.contains("--check-click-intent")
+            || CommandLine.arguments.contains("--check-scroll-tail") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            if CommandLine.arguments.contains("--check-click-intent") {
+                try await clickIntentChecks(
+                    url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
+            } else {
+                scrollGlideTailChecks()
+                try await scrollTailDriverChecks(
+                    url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            }
+            print("Interaction checks passed")
+            return
+        }
         // Lets the document-opening checks be run on their own while they are being worked on.
         if CommandLine.arguments.contains("--check-document-opening") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
@@ -128,6 +145,8 @@ struct ReaderChecks {
                 && state.references.isEmpty && state.outline.isEmpty && state.annotations.isEmpty,
                 "closing last tab rejects pending work and clears document data")
         try await interactionChecks(url: a)
+        try await clickIntentChecks(
+            url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
         try await screenPageChecks(url: b)
         try await screenPageDegradationChecks(url: b)
         try await defaultModeRenderChecks(url: b)
@@ -148,6 +167,8 @@ struct ReaderChecks {
         try referenceEntryTextChecks()
         try await smoothScrollChecks(url: b)
         try scrollGlideChecks()
+        scrollGlideTailChecks()
+        try await scrollTailDriverChecks(url: b)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
         // Registered before the frame-scheduling checks: those need a presentable surface and

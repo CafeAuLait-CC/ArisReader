@@ -467,8 +467,11 @@ extension ReaderChecks {
         offsets.append(state.scrollYPt)
         let increments = zip(offsets, offsets.dropFirst()).map { $1 - $0 }
         let ceiling = Double(ScrollGlide.defaultMaximumSpeed) * 0.008 + 1e-6
-        require(increments.count > 8,
-                "the notch is covered in many small increments, not one (\(increments.count) ticks)")
+        require(increments.count >= 6,
+                "the notch is covered in small increments, not one (\(increments.count) ticks)")
+        require(increments.allSatisfy { abs($0) <= 32 * ScrollGlide.maximumTickFraction + 1e-6 },
+                "no increment swallows more than a quarter of the notch "
+                + "(largest \(increments.map { abs($0) }.max() ?? 0) pt of 32)")
         require(increments.allSatisfy { $0 < 0 },
                 "every increment moves toward the destination")
         require(increments.allSatisfy { abs($0) <= ceiling },
@@ -493,14 +496,20 @@ extension ReaderChecks {
         require(abs(burstDestination - (burstStart + step * 3)) < 1e-9,
                 "three notches aim three notches away, not one")
         var burstOffsets: [CGFloat] = []
+        var burstTicks = 0
         for _ in 0..<400 {
+            burstTicks += 1
             if state.advanceScrollGlide(elapsed: 0.008) { break }
             burstOffsets.append(state.scrollYPt)
         }
-        require(burstOffsets.count > offsets.count,
-                "a longer distance takes more ticks (\(burstOffsets.count) vs \(offsets.count))")
         require(abs(state.scrollYPt - burstDestination) < 1e-9,
                 "the burst converges on the accumulated destination")
+        // A longer distance is not a longer *tail*: the glide delivers at the speed ceiling once
+        // the notches stop, so three notches take the same handful of ticks as one, not three
+        // times as many.
+        require(burstTicks <= offsets.count + 2,
+                "three notches are delivered in \(burstTicks) ticks against the one notch's "
+                + "\(offsets.count): distance does not become drift")
 
         // ── Momentum is not applied twice: precise input takes over and ends the glide ────
         state.scroll(toFraction: 0.35)
@@ -517,7 +526,7 @@ extension ReaderChecks {
         require(state.scrollYPt == afterMomentum,
                 "nothing keeps moving after the glide was dropped (no double inertia)")
 
-        // ── The real driver reaches the destination through many offsets ──────────────────
+        // ── The real driver reaches the destination along the way ─────────────────────────
         state.scroll(toFraction: 0.35)
         let driverStart = state.scrollYPt
         var observed: [CGFloat] = []
@@ -529,13 +538,19 @@ extension ReaderChecks {
         })
         observer.cancel()
         observed.append(state.scrollYPt)
+        // How many offsets a *timer-driven* glide publishes is a property of the machine, not of
+        // the glide: a loaded runner hands the driver two 40 ms slots where an idle one hands it
+        // ten 8 ms ones, and this assertion used to demand four offsets and fail on CI for it. What
+        // does not depend on tick density is asserted here - the offset only ever moves toward the
+        // destination, and the motion is stepped rather than one jump - and the deterministic tick
+        // loop above is what pins the increments and their count (ScrollTailChecks pins them for a
+        // stalled tick too).
         let distinct = Set(observed.map { ($0 * 100).rounded() }).count
-        // How many offsets a timer-driven glide publishes depends on how often the main thread
-        // gets to tick - this machine may hand the driver a 40 ms slot where CI hands it an 8 ms
-        // one - so this asserts that the motion is *stepped through* rather than one jump, and the
-        // deterministic tick loop above is what pins the increments themselves.
-        require(distinct >= 4,
-                "the driver publishes intermediate offsets on the way, not one jump (\(distinct))")
+        require(distinct >= 2,
+                "the driver publishes the glide, not one jump (\(distinct) offsets)")
+        let monotonic = zip(observed, observed.dropFirst()).allSatisfy { $1 <= $0 + 1e-9 }
+        require(monotonic,
+                "every offset the driver published is between the start and the destination")
         require(observed.allSatisfy { $0 <= driverStart + 1e-9 && $0 >= driverStart - 96 - 1e-9 },
                 "the driver never leaves the interval it was aimed at")
         print("PASS: the glide driver moved \(driverStart) → \(state.scrollYPt) through "
@@ -591,21 +606,43 @@ extension ReaderChecks {
                 "the first tick of a long glide is speed-limited (\(first) pt)")
         let (idle, _) = glide.step(from: 0, elapsed: 0)
         require(idle == 0, "a zero-length tick moves nothing")
-        // A tick that arrives ten seconds late must not swallow the glide: it moves at most its
-        // share of what is left, and the rest arrives on the following ticks.
-        let (huge, hugeDone) = glide.step(from: 0, elapsed: 10)
-        require(!hugeDone
-                    && abs(huge) <= 1000 * ScrollGlide.maximumTickFraction + 1e-6,
+        // A tick that arrives late while the notches are still coming must not swallow the glide:
+        // it moves at most its share of what is left, and the rest arrives on later ticks.
+        glide.aim(at: -1000, maximumSpeed: 1_000_000)
+        let (stalled, stalledDone) = glide.step(from: 0, elapsed: 0.04)
+        require(!stalledDone && abs(stalled) <= 1000 * ScrollGlide.maximumTickFraction + 1e-6,
                 "a stalled tick moves at most \(ScrollGlide.maximumTickFraction) of the distance "
-                + "(\(huge) pt of 1000)")
-        var stalled = huge
+                + "(\(stalled) pt of 1000)")
+        var catchingUp = stalled
         for _ in 0..<200 {
-            let (next, finished) = glide.step(from: stalled, elapsed: 10)
-            stalled = next
+            let (next, finished) = glide.step(from: catchingUp, elapsed: 0.04)
+            catchingUp = next
             if finished { break }
         }
-        require(stalled == -1000, "and the glide still lands on its destination")
+        require(catchingUp == -1000, "and the glide still lands on its destination")
         glide.cancel()
+
+        // Once the wheel has stopped, the distance still owed is finished rather than eased into -
+        // that is what removes the tail the reader reported - but still one frame of the speed
+        // ceiling at a time, so even a 10 s tick lengthens the finish instead of jumping it. A CI
+        // runner ran the driver's 8 ms ticks 40 ms late and published a 96 pt glide as three
+        // offsets; `ScrollTailChecks` pins that case on a simulated clock.
+        glide.aim(at: -1000)
+        var finishing: CGFloat = -300
+        var largestFinishStep: CGFloat = 0
+        var finishTicks = 0
+        while finishTicks < 500 {
+            let (next, done) = glide.step(from: finishing, elapsed: 10)
+            largestFinishStep = max(largestFinishStep, abs(next - finishing))
+            finishing = next
+            finishTicks += 1
+            if done { break }
+        }
+        require(finishing == -1000, "a glide whose wheel has stopped still lands exactly")
+        let frame = ScrollGlide.defaultMaximumSpeed * CGFloat(ScrollGlide.maximumStepTime)
+        require(largestFinishStep <= frame + 1e-6,
+                "and a 10 s tick moves one frame of the speed ceiling, not the whole 700 pt "
+                + "(\(largestFinishStep) pt of \(frame) pt per tick, \(finishTicks) ticks)")
 
         // The ceiling is per aim, so a zoomed-in canvas glides at screen speed, not content speed.
         glide.aim(at: 100, maximumSpeed: 500)

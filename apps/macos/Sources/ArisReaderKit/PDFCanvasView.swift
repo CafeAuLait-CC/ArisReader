@@ -106,10 +106,24 @@ public final class MetalCanvasView: NSView {
     /// away from us, because it is not a scroll gesture.
     public var onMagnify: ((CGFloat, CGFloat) -> Void)?
     /// Pointer events, reported in **content points** (the shell's layout space).
+    ///
+    /// `onPointerDown` is not delivered the moment the button goes down: a press that is released
+    /// without moving is a **click** — it follows a reference — and must not start a selection.
+    /// See `clickSlopPt`.
     public var onPointerDown: ((CGPoint) -> Void)?
     public var onPointerDragged: ((CGPoint) -> Void)?
+    /// The release point and whether the gesture stayed inside the click slop.
     public var onPointerUp: ((CGPoint, Bool) -> Void)?
-    /// Whether the pointer moved since mouseDown (a click follows links; a drag selects).
+    /// How far the pointer may travel between press and release and still count as a click, in
+    /// view points.
+    ///
+    /// 3 pt is the drag slop macOS itself uses to tell the two apart (AppKit/WebKit hysteresis is
+    /// 3-4 pt): small enough that a reader who means to drag crosses it on the way to the first
+    /// character they want, large enough to absorb the point or two a hand moves during a click.
+    public static let clickSlopPt: CGFloat = 3
+    /// Where the press landed, in view coordinates, while a gesture is in flight.
+    private var pressLocation: CGPoint?
+    /// Whether the pointer left the click slop: a click follows a reference, a drag selects.
     private var pointerMoved = false
     /// ⌘C.
     public var onCopy: (() -> Void)?
@@ -377,8 +391,13 @@ public final class MetalCanvasView: NSView {
     /// Converts an event location into content points (origin at the first page's top-left,
     /// one unit per PDF point at 100% zoom), which is the space the shell thinks in.
     private func contentPoint(for event: NSEvent) -> CGPoint {
-        let view = convert(event.locationInWindow, from: nil)
-        let fromTop = CGPoint(x: view.x, y: bounds.height - view.y)
+        contentPoint(forViewPoint: convert(event.locationInWindow, from: nil))
+    }
+
+    /// The same conversion for a point already in view coordinates (bottom-left origin), which is
+    /// what the press location is stored as.
+    private func contentPoint(forViewPoint point: CGPoint) -> CGPoint {
+        let fromTop = CGPoint(x: point.x, y: bounds.height - point.y)
         return CGPoint(
             x: (fromTop.x - contentOffsetX) / max(zoom, 0.01),
             y: fromTop.y / max(zoom, 0.01) + scrollYPt
@@ -388,19 +407,40 @@ public final class MetalCanvasView: NSView {
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         wheelMotion.reset()
+        // Selection waits: see `clickSlopPt`. Nothing about the model changes until the pointer
+        // has moved far enough to mean a drag.
+        pressLocation = convert(event.locationInWindow, from: nil)
         pointerMoved = false
-        onPointerDown?(contentPoint(for: event))
         syncInteraction()
     }
 
     public override func mouseDragged(with event: NSEvent) {
-        pointerMoved = true
+        let location = convert(event.locationInWindow, from: nil)
+        guard pointerMoved
+            || hypot(location.x - (pressLocation?.x ?? location.x),
+                     location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt
+        else {
+            // Still a click as far as anyone can tell: leave the selection alone and wait.
+            syncInteraction()
+            return
+        }
+        if !pointerMoved {
+            pointerMoved = true
+            // The anchor is where the press landed, not where the threshold was crossed: the
+            // reader aims at the character they pressed on.
+            if let press = pressLocation {
+                onPointerDown?(contentPoint(forViewPoint: press))
+            }
+        }
         onPointerDragged?(contentPoint(for: event))
         syncInteraction()
     }
 
     public override func mouseUp(with event: NSEvent) {
+        // A press that never left the slop is a click even if the release lands a little off it.
         onPointerUp?(contentPoint(for: event), !pointerMoved)
+        pressLocation = nil
+        pointerMoved = false
         syncInteraction()
     }
 

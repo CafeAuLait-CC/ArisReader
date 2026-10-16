@@ -56,16 +56,32 @@ extension ReaderChecks {
         /// Feeds `count` events and reports the offset around each one, then samples the offsets
         /// that follow — for a classic wheel that is the glide, and it is where the difference
         /// between a jump and a slide lives.
+        ///
+        /// `realTimeStrideMilliseconds` is what makes the tail honest: a physical wheel delivers
+        /// its notches that far apart in wall-clock time, so the glide gets to work between them.
+        /// Feeding the same events back to back (the default) measures the worst case instead —
+        /// the whole burst still owed when the last event lands.
         func trace(_ label: String, wheel: Int32, precise: Bool, count: Int,
                    stride nanoseconds: CGEventTimestamp,
-                   settleMilliseconds: Int) async -> [String: Any] {
+                   settleMilliseconds: Int,
+                   realTimeStrideMilliseconds: Int = 0) async -> [String: Any] {
             state.scroll(toFraction: 0.35)
             let start = state.scrollYPt
             var records: [[String: Any]] = []
+            var lastEventUptime: Double = 0
             for index in 0..<count {
-                let event = event(wheel: wheel, precise: precise,
-                                  timestamp: CGEventTimestamp(index) * nanoseconds)
+                if index > 0, realTimeStrideMilliseconds > 0 {
+                    try? await Task.sleep(for: .milliseconds(realTimeStrideMilliseconds))
+                }
+                // A real burst carries the wall clock in the event: `WheelMotion` reads the
+                // timestamp to decide how fast the wheel is spinning.
+                let timestamp = realTimeStrideMilliseconds > 0
+                    ? CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1_000_000_000)
+                    : CGEventTimestamp(index) * nanoseconds
+                let event = event(wheel: wheel, precise: precise, timestamp: timestamp)
                 let before = state.scrollYPt
+                lastEventUptime = ProcessInfo.processInfo.systemUptime
+                let destinationBefore = state.scrollDestinationYPt ?? before
                 view.scrollWheel(with: event)
                 records.append([
                     "index": index,
@@ -73,28 +89,46 @@ extension ReaderChecks {
                     "precise": event.hasPreciseScrollingDeltas,
                     "phase": event.phase.rawValue,
                     "momentum_phase": event.momentumPhase.rawValue,
+                    "uptime": lastEventUptime,
                     "offset_before": before,
                     "offset_immediately_after": state.scrollYPt,
                     "immediate_step": state.scrollYPt - before,
+                    "owed_before_event": destinationBefore - before,
                     "destination": state.scrollDestinationYPt ?? state.scrollYPt,
                 ])
             }
+            let offsetAtLastEvent = state.scrollYPt
+            let destinationAtLastEvent = state.scrollDestinationYPt ?? offsetAtLastEvent
             var sampled: [Double] = []
+            var sampleUptimes: [Double] = []
             let interval = max(1, settleMilliseconds / 60)
             let samples = settleMilliseconds > 0 ? 60 : 0
             for _ in 0..<samples {
                 sampled.append(Double(state.scrollYPt))
+                sampleUptimes.append(ProcessInfo.processInfo.systemUptime)
                 try? await Task.sleep(for: .milliseconds(interval))
             }
             sampled.append(Double(state.scrollYPt))
+            sampleUptimes.append(ProcessInfo.processInfo.systemUptime)
             let steps = zip(sampled, sampled.dropFirst()).map { $1 - $0 }
+            // The tail: everything the offset still does after the last wheel event. Distance is
+            // measured from the offset the last event left behind, duration from that event to the
+            // last sample that was still moving.
+            let settled = sampled.last ?? Double(state.scrollYPt)
+            let lastMoving = sampled.indices.last { abs(sampled[$0] - settled) > 0.001 }
+            let tailDuration = lastMoving.map { (sampleUptimes[$0] - lastEventUptime) * 1000 } ?? 0
             return [
                 "kind": label,
                 "start": start,
                 "events": records,
                 "destination_after_events": state.scrollDestinationYPt ?? state.scrollYPt,
+                "offset_at_last_event": offsetAtLastEvent,
+                "owed_at_last_event": destinationAtLastEvent - offsetAtLastEvent,
                 "settled": state.scrollYPt,
+                "tail_pt": settled - offsetAtLastEvent,
+                "tail_ms": tailDuration,
                 "sample_ms": interval,
+                "sample_uptimes": sampleUptimes,
                 "samples": sampled,
                 "distinct_offsets": Set(sampled.map { ($0 * 1000).rounded() / 1000 }).count,
                 "largest_sample_step": steps.map { abs($0) }.max() ?? 0,
@@ -104,6 +138,16 @@ extension ReaderChecks {
         // A classic wheel: one line per notch, no precise deltas, no phases.
         let wheel = await trace("wheel-line", wheel: 1, precise: false, count: 6,
                                 stride: 50_000_000, settleMilliseconds: 400)
+        // The same notches, delivered the way a hand delivers them: 50 ms apart in wall clock,
+        // so the glide is allowed to work between events. This is the tail the reader feels.
+        let burst50 = await trace("wheel-burst-50ms", wheel: 1, precise: false, count: 6,
+                                  stride: 50_000_000, settleMilliseconds: 500,
+                                  realTimeStrideMilliseconds: 50)
+        let burst25 = await trace("wheel-burst-25ms", wheel: 1, precise: false, count: 8,
+                                  stride: 25_000_000, settleMilliseconds: 500,
+                                  realTimeStrideMilliseconds: 25)
+        let single = await trace("wheel-single-notch", wheel: 1, precise: false, count: 1,
+                                 stride: 50_000_000, settleMilliseconds: 500)
         // A trackpad: precise deltas a few points wide, as the system delivers them.
         let trackpad = await trace("trackpad-precise", wheel: 7, precise: true, count: 8,
                                    stride: 16_000_000, settleMilliseconds: 0)
@@ -145,6 +189,15 @@ extension ReaderChecks {
             "scope": "model offsets from the real scrollWheel(with:) path; no display, no GPU timing",
             "zoom_percent": state.zoomPercent,
             "wheel_line": wheel,
+            "wheel_burst_50ms": burst50,
+            "wheel_burst_25ms": burst25,
+            "wheel_single_notch": single,
+            "glide": [
+                "time_constant_ms": ScrollGlide.timeConstant * 1000,
+                "settle_distance_pt": ScrollGlide.settleDistance,
+                "maximum_tick_fraction": ScrollGlide.maximumTickFraction,
+                "maximum_speed_pt_s": ScrollGlide.defaultMaximumSpeed,
+            ],
             "trackpad_precise": trackpad,
             "quantisation_probe": quantisation,
             "wheel_motion_profile": profile,
