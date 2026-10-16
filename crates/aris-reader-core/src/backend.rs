@@ -175,6 +175,54 @@ impl RawAnnotationKind {
             Self::Other(name) => name,
         }
     }
+
+    /// Whether this is one of the four text-markup kinds the canvas draws geometry for.
+    ///
+    /// `Text` and `FreeText` are notes (listed, not drawn as markup on the page), and everything
+    /// else is reported without a drawing rule. The shell has the same predicate
+    /// (`DocumentAnnotation.isMarkup` in `apps/macos`); it is stated once here so the CLI dump and
+    /// the canvas cannot disagree about which annotations are supposed to be drawn.
+    pub fn is_markup(&self) -> bool {
+        matches!(
+            self,
+            Self::Highlight | Self::Underline | Self::Strikeout | Self::Squiggly
+        )
+    }
+
+    /// The blend mode this kind is composited with when the file states no `/BM`.
+    ///
+    /// PDF 32000-1 table 164 gives `/Normal` as the dictionary default, but for the text-markup
+    /// kinds that default is not what any viewer draws, and taking it literally is visible: a
+    /// yellow highlight at `/CA 0.97` painted alpha-over turns the glyphs yellow and *erases*
+    /// them, where a multiplied one leaves them black and only tints the paper.
+    ///
+    /// Measured 2026-10-15 against the vendored PDFium 157 (`FPDF_RenderPageBitmap` with
+    /// `FPDF_ANNOT`, no `/BM` and no `/AP`, a black bar under a `/C [1 1 0] /CA 0.5` annotation):
+    ///
+    /// | `/Subtype`  | pixels over the black bar | PDFium's compositing |
+    /// |-------------|---------------------------|----------------------|
+    /// | `Highlight` | 0 of 3000 changed         | multiply             |
+    /// | `Underline` | 300 changed, 0 yellow     | multiply             |
+    /// | `StrikeOut` | 300 changed, 0 yellow     | multiply             |
+    /// | `Squiggly`  | 375 changed, 150 yellow   | alpha-over           |
+    /// | `Square`    | 318 changed, 318 yellow   | alpha-over           |
+    ///
+    /// (Multiply leaves a black backdrop black; alpha-over paints `a·c` over it, which for a
+    /// yellow at half opacity is 128,128,0 — the "yellow" column.) Every `/Highlight`,
+    /// `/Underline` and `/StrikeOut` in the local review corpus whose appearance stream is a
+    /// plain object uses `/BM /Multiply` in its `ExtGState` for the same reason, so the default
+    /// here agrees with both the file and the renderer.
+    pub fn default_blend(&self) -> AnnotationBlend {
+        match self {
+            Self::Highlight | Self::Underline | Self::Strikeout => AnnotationBlend::Multiply,
+            // A squiggly is drawn as a wave *beside* the text rather than through it, and PDFium
+            // composites it alpha-over; `Text`, `FreeText` and everything unmodelled have no
+            // markup drawing rule at all.
+            Self::Squiggly | Self::Text | Self::FreeText | Self::Other(_) => {
+                AnnotationBlend::Normal
+            }
+        }
+    }
 }
 
 /// How an annotation is composited with the page (`/BM`, the blend mode).

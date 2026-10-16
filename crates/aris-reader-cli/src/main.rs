@@ -10,6 +10,7 @@
 //! aris-reader-cli render <file.pdf> [--page N] [--dpi D] [-o out.png]
 //! aris-reader-cli compare <a.png> <b.png> [--max-mae F]
 //! aris-reader-cli text <file.pdf> [--page N]
+//! aris-reader-cli annotations <file.pdf>... [--pages N] [--all]
 //! aris-reader-cli bench <file.pdf> [--pages N] [--dpi D] [--search TERM]
 //! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
 //! aris-reader-cli analyze <file.pdf> [--pages N]
@@ -46,6 +47,9 @@ Usage:
   aris-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
                  [--max-mae F]                   exit non-zero when MAE exceeds F
   aris-reader-cli text <file.pdf> [--page N]     export the text of one page
+  aris-reader-cli annotations <file.pdf>...      dump what the annotation reader found, per page:
+                 [--page N] [--pages N] [--all]  subtype, /Rect, /C, /CA, /BM, quad count,
+                                                 /Contents, and the draw the canvas would make
   aris-reader-cli bench <file.pdf>               measure the engine: first frame, scroll raster
                  [--pages N] [--dpi D]           times, RSS peak, first search results and a
                  [--viewport WxH]                per-page render checksum baseline
@@ -112,6 +116,7 @@ fn main() -> ExitCode {
         Some("render") => cmd_render(rest(&args)),
         Some("compare") => cmd_compare(rest(&args)),
         Some("text") => cmd_text(rest(&args)),
+        Some("annotations") => cmd_annotations(rest(&args)),
         Some("bench") => cmd_bench(rest(&args)),
         Some("corpus") => cmd_corpus(rest(&args)),
         Some("analyze") => cmd_analyze(rest(&args)),
@@ -233,6 +238,178 @@ fn cmd_info(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Dumps what the annotation reader found, page by page, plus the draw the canvas would make.
+///
+/// This is the measuring instrument for "a highlight from another viewer looks wrong here":
+/// every input the canvas uses (`/Subtype`, `/Rect`, `/QuadPoints`, `/C`, `/CA`, `/BM`,
+/// visibility) is printed next to the decision it drives, so a wrong picture can be attributed
+/// to the read or to the draw instead of guessed at.
+///
+/// `/BM` is the **effective** blend: the annotation's own when the file states one, and otherwise
+/// the mode that kind is composited with (a highlight, underline or strikeout is multiplied by
+/// every viewer, including PDFium; see `RawAnnotationKind::default_blend`). Files written by
+/// Preview state no `/BM` at all — the multiply lives in the appearance stream — so a dump that
+/// printed only the dictionary would say `normal` for a highlight that is drawn multiplied.
+///
+/// The last line of each annotation is the **effective draw**, in the same terms the shell uses:
+///
+/// * `multiply` — the tint is `a·c + (1 − a)` over white with alpha 255, which mirrors
+///   `AnnotationColor.baked(opacity:)` in `apps/macos` and the GPU's
+///   `multiply_with_baked_opacity_matches_pdf` test. PDF composites a `/BM /Multiply`
+///   annotation as `page × (a·c + 1 − a)`.
+/// * `alpha-over` — the tint carries `c` with the annotation's alpha, which is what
+///   `QuadBlend::Normal` blends.
+///
+/// `--page N` prints one page; `--pages N` caps the scan; `--all` also lists pages with nothing
+/// on them (and annotations the reader drops as structural).
+fn cmd_annotations(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    if positional.is_empty() {
+        eprintln!(
+            "usage: aris-reader-cli annotations <file.pdf>... [--page N] [--pages N] [--all]"
+        );
+        return ExitCode::from(64);
+    }
+    let only_page = opt(&options, &["--page"]).and_then(|value| value.parse::<u32>().ok());
+    let page_cap = opt_usize(&options, &["--pages"], 2000) as u32;
+    let show_all = options.iter().any(|(key, _)| key == "--all");
+
+    for path in &positional {
+        let backend = match open_document(path) {
+            Ok(backend) => backend,
+            Err(code) => return code,
+        };
+        let total = backend.page_count();
+        let scan_end = match only_page {
+            Some(page) => (page + 1).min(total),
+            None => total.min(page_cap),
+        };
+        let scan_start = only_page.unwrap_or(0);
+        if only_page.is_some_and(|page| page >= total) {
+            eprintln!("{path}: no page {}", only_page.unwrap_or(0));
+            return ExitCode::FAILURE;
+        }
+
+        println!("{path}: {total} page(s)");
+        let mut markup_total = 0usize;
+        for index in scan_start..scan_end {
+            let annotations = match backend.annotations(PageIndex(index)) {
+                Ok(annotations) => annotations,
+                Err(error) => {
+                    // A page that cannot be read is reported, never silently empty: this dump
+                    // exists to tell "nothing there" from "we could not look".
+                    println!("  page {}: read failed: {error}", index + 1);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if annotations.is_empty() && !show_all {
+                continue;
+            }
+            println!(
+                "  page {}: {} content annotation(s)",
+                index + 1,
+                annotations.len()
+            );
+            for (slot, annotation) in annotations.iter().enumerate() {
+                if annotation.kind.is_markup() {
+                    markup_total += 1;
+                }
+                let rect = annotation.rect;
+                println!(
+                    "    [{slot}] {:<9} /Rect ({:.1},{:.1} {:.1}×{:.1})  quads={}  /C={}  /CA={}  \
+                     /BM={}{}",
+                    annotation.kind.as_str(),
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                    annotation.quads.len(),
+                    annotation.color.map_or_else(
+                        || "none".to_string(),
+                        |c| format!("#{:02X}{:02X}{:02X}", c.red, c.green, c.blue)
+                    ),
+                    annotation
+                        .opacity
+                        .map_or_else(|| "absent".to_string(), |value| format!("{value:.3}")),
+                    annotation.blend.as_str(),
+                    if annotation.visible { "" } else { "  HIDDEN" },
+                );
+                if let Some(contents) = &annotation.contents {
+                    println!("         /Contents: {}", preview(contents, 96));
+                }
+                if let Some(author) = &annotation.author {
+                    println!("         /T: {}", preview(author, 48));
+                }
+                println!("         draw: {}", describe_draw(annotation));
+            }
+        }
+        println!("  → {markup_total} markup annotation(s) to draw");
+    }
+    ExitCode::SUCCESS
+}
+
+/// The draw the shell would make for one annotation, in the shell's own terms.
+fn describe_draw(annotation: &aris_reader_core::RawAnnotation) -> String {
+    if !annotation.kind.is_markup() {
+        return format!(
+            "not drawn (the canvas draws the four text-markup kinds; this is {})",
+            annotation.kind.as_str()
+        );
+    }
+    if !annotation.visible {
+        return "not drawn (the file marks it hidden/invisible/NoView)".to_string();
+    }
+    // A missing `/C` is not black: the shell substitutes a neutral grey so the mark is still
+    // visible (see `appendDocumentAnnotations` in `apps/macos`).
+    let (red, green, blue) = annotation
+        .color
+        .map_or((0x80, 0x80, 0x80), |c| (c.red, c.green, c.blue));
+    let opacity = annotation.opacity.unwrap_or(1.0);
+    match &annotation.blend {
+        aris_reader_core::AnnotationBlend::Multiply => {
+            let bake = |channel: u8| {
+                (opacity * f64::from(channel) + (1.0 - opacity) * 255.0).round() as u8
+            };
+            format!(
+                "multiply, /CA {opacity:.3} baked into tint #{:02X}{:02X}{:02X} at alpha 255 \
+                 (PDF: page × (a·c + 1 − a))",
+                bake(red),
+                bake(green),
+                bake(blue)
+            )
+        }
+        aris_reader_core::AnnotationBlend::Normal => {
+            let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+            format!(
+                "alpha-over, tint #{red:02X}{green:02X}{blue:02X} at alpha {alpha} ({opacity:.3}){}",
+                if annotation.opacity.is_none() {
+                    " — the file states no /CA, so this is fully opaque"
+                } else {
+                    ""
+                }
+            )
+        }
+        aris_reader_core::AnnotationBlend::Other(name) => format!(
+            "alpha-over (the canvas does not implement /BM /{name}), tint #{red:02X}{green:02X}{blue:02X} at alpha {}",
+            (opacity * 255.0).round().clamp(0.0, 255.0) as u8
+        ),
+    }
+}
+
+/// One line's worth of a `/Contents` string: newlines folded, long text ellipsised.
+fn preview(text: &str, limit: usize) -> String {
+    let folded: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = folded.trim();
+    if trimmed.chars().count() <= limit {
+        return format!("\"{trimmed}\"");
+    }
+    let head: String = trimmed.chars().take(limit).collect();
+    format!("\"{head}…\"")
 }
 
 fn cmd_render(args: &[String]) -> ExitCode {

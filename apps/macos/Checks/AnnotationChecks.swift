@@ -441,13 +441,16 @@ extension ReaderChecks {
             }
         })
 
-        // An underline in the same file carries no /BM, so it must not inherit its neighbour's.
+        // An underline in the same file carries no /BM at all. Every viewer multiplies an
+        // underline, so that is what the reader reports here; the appearance-stream fixture below
+        // is where "no /BM at all" is checked case by case.
         let underline = state.documentAnnotations[1]
-        require(underline.blend == "normal" && underline.quadBlend == .normal,
-                "an annotation without /BM is composited normally")
-        try await eventually("the underline is drawn with normal blending", {
+        require(underline.blend == "multiply" && underline.quadBlend == .multiply,
+                "an underline with no /BM is still composited with the multiply pipeline")
+        let underlineQuad = underline.color!.baked(opacity: underline.opacity ?? 1.0)
+        try await eventually("the underline is drawn multiplied", {
             state.canvasPages.contains { page in
-                page.blend == .normal && page.image.bgra == Data(underline.color!.bgra)
+                page.blend == .multiply && page.image.bgra == Data(underlineQuad.bgra)
             }
         })
 
@@ -473,8 +476,84 @@ extension ReaderChecks {
         })
     }
 
-    // MARK: - Colour: anything the file carries, and a sidecar that keeps working either way
+    /// The shape Preview writes: every annotation carries an appearance stream, and no annotation
+    /// states `/BM`.
+    ///
+    /// This is the check that would have caught the reported defect end to end. `Preview` puts the
+    /// colour behind `/AP` — PDFium's `FPDFAnnot_GetColor` refuses an annotation with an appearance
+    /// stream, so the reader used to report no colour at all — and the multiply lives in that
+    /// stream's `ExtGState`, so the annotation dictionary says nothing about the blend. Both had to
+    /// be answered before a highlight from another viewer stopped painting over the text:
+    ///
+    /// * the yellow highlight arrives as `#FFFF00` with `/CA 0.968627`, and is drawn **multiplied**
+    ///   with the opacity baked into the tint (`0.968627·c + 0.031373·white` → `#FFFF08`);
+    /// * a highlight with no `/C` at all keeps the file's `/CA` in a neutral grey instead of the
+    ///   opaque grey that used to cover the page;
+    /// * a squiggly with no `/BM` stays alpha-over, because that is how a squiggly is drawn.
+    @MainActor static func annotationAppearanceChecks(url: URL) async throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            print("INFO: skipping appearance-stream annotation checks (no fixture at \(url.path))")
+            return
+        }
 
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        state.open(url: url)
+        try await eventually("the file's annotations are read through their appearance streams", {
+            !state.documentAnnotations.isEmpty || state.documentAnnotationsError != nil
+        })
+        require(state.documentAnnotationsError == nil,
+                "reading annotations that carry /AP does not fail")
+        require(state.documentAnnotations.count == 4,
+                "all four markup annotations are read (\(state.documentAnnotations.count))")
+
+        let highlight = state.documentAnnotations[0]
+        require(highlight.color == AnnotationColor(red: 255, green: 255, blue: 0, alpha: 247),
+                "the colour behind /AP is read, with /CA 0.968627 as its alpha, got "
+                + "\(String(describing: highlight.color))")
+        require(highlight.blend == "multiply",
+                "a highlight with no /BM is still multiplied, got \(highlight.blend)")
+        let bakedHighlight = highlight.color!.baked(opacity: highlight.opacity ?? 1.0)
+        require(bakedHighlight == AnnotationColor(red: 255, green: 255, blue: 8, alpha: 255),
+                "the opacity is baked into the tint before the multiply draw, got \(bakedHighlight)")
+        try await eventually("the loaded highlight is drawn multiplied", {
+            state.canvasPages.contains { page in
+                page.blend == .multiply && page.image.bgra == Data(bakedHighlight.bgra)
+            }
+        })
+
+        // No /C anywhere: the mark is a neutral grey, but the file's opacity still applies. An
+        // opaque grey here is exactly what covered the text of the review PDFs.
+        let colourless = state.documentAnnotations[2]
+        require(colourless.color == nil, "a highlight with no /C reports no colour")
+        require(colourless.opacity != nil && abs(colourless.opacity! - 0.35) < 1e-6,
+                "…but its /CA is still the file's")
+        let neutral = UInt8((colourless.opacity! * 255).rounded())
+        let neutralColour = AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: neutral)
+        require(neutralColour.alpha == 89 && neutralColour.alpha != 255,
+                "the neutral tint carries /CA rather than being opaque")
+        let bakedNeutral = neutralColour.baked(opacity: colourless.opacity!)
+        try await eventually("the colourless highlight is drawn translucent, not opaque", {
+            state.canvasPages.contains { page in
+                page.blend == .multiply && page.image.bgra == Data(bakedNeutral.bgra)
+            }
+        })
+
+        // A squiggly drawn beside the text is not multiplied, even with an appearance stream.
+        let squiggly = state.documentAnnotations[3]
+        require(squiggly.kind == "squiggly" && squiggly.blend == "normal"
+                && squiggly.quadBlend == .normal,
+                "a squiggly with no /BM stays alpha-over, got \(squiggly.blend)")
+        let squigglyColour = squiggly.color!
+        require(squigglyColour.alpha == 191, "/CA 0.75 arrives as alpha 191")
+        try await eventually("the squiggly is drawn alpha-over", {
+            state.canvasPages.contains { page in
+                page.blend == .normal && page.image.bgra == Data(squigglyColour.bgra)
+            }
+        })
+    }
+
+    // MARK: - Colour: anything the file carries, and a sidecar that keeps working either way
     /// The colour model, checked against both directions of the sidecar's compatibility story.
     ///
     /// The user-visible regression this pins down is the one that started the work: a colour the

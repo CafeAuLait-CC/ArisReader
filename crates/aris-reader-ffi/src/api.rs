@@ -1133,11 +1133,15 @@ pub struct AnnotationRecord {
     /// `/CA` constant opacity in `0.0..=1.0`; `None` when the file does not state one, which
     /// means opaque.
     pub opacity: Option<f64>,
-    /// `/BM`: `normal`, `multiply`, or the blend mode's PDF name.
+    /// The blend mode the annotation is composited with: the file's `/BM` when it states one
+    /// (`normal`, `multiply`, …), otherwise the mode that kind is drawn with by every renderer.
     ///
     /// Highlights are normally stored as `multiply`, and a highlight drawn with plain alpha-over
     /// does **not** look like the same highlight in Preview — the canvas answers that with
-    /// `QuadBlend::Multiply`.
+    /// `QuadBlend::Multiply`. Most producers (Preview among them) do not put `/BM` on the
+    /// annotation at all: they composite through the appearance stream's `ExtGState`, which
+    /// PDFium's C API does not expose, so a markup annotation with no `/BM` is reported with the
+    /// blend it is drawn with (`aris-reader-pdfium` measures and documents that table).
     pub blend: String,
     /// `/Contents`.
     pub contents: Option<String>,
@@ -1744,6 +1748,52 @@ mod tests {
         // …and the same file's other annotations keep their own colours, not this one.
         let red = records[1].color.expect("underline colour");
         assert_eq!((red.red, red.green, red.blue), (229, 25, 25));
+    }
+
+    /// The shape Preview writes, at the boundary the shell reads: colour behind an appearance
+    /// stream, and a blend mode the annotation dictionary never states.
+    ///
+    /// Before this was fixed, `FPDFAnnot_GetColor` refused every annotation in
+    /// `annotated-appearance.pdf`, `AnnotationRecord::color` came through as `None`, and the
+    /// canvas substituted an opaque grey — the highlight covered the text it was meant to tint.
+    #[test]
+    fn an_appearance_stream_annotation_arrives_with_its_colour_and_blend() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated-appearance.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: appearance-stream fixture or PDFium unavailable");
+            return;
+        }
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+        let records = document.annotations().expect("annotations");
+        assert_eq!(records.len(), 4);
+
+        let highlight = &records[0];
+        let color = highlight.color.expect("the highlight's /C is readable");
+        assert_eq!((color.red, color.green, color.blue), (255, 255, 0));
+        let opacity = highlight.opacity.expect("/CA 0.968627");
+        assert!(
+            (opacity - 0.968627).abs() < 1e-6,
+            "/CA arrives exactly: {opacity}"
+        );
+        assert_eq!(
+            highlight.blend, "multiply",
+            "the shell draws through the multiply pipeline, not over the glyphs"
+        );
+
+        // A highlight whose colour the file never states: no colour, but the opacity is still
+        // the file's, and the shell draws a neutral tint with it rather than an opaque bar.
+        let colourless = &records[2];
+        assert_eq!(colourless.color, None);
+        assert_eq!(colourless.blend, "multiply");
+        let opacity = colourless.opacity.expect("/CA 0.35");
+        assert!(
+            (opacity - 0.35).abs() < 1e-6,
+            "/CA arrives exactly: {opacity}"
+        );
     }
 
     #[test]

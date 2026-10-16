@@ -3444,11 +3444,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Draws the annotations the PDF itself carries.
     ///
     /// Only the four markup kinds have geometry worth drawing, and each `/QuadPoints` entry is
-    /// drawn as its own box. The blend mode comes from the file's `/BM`: highlighting a line in
-    /// Preview stores `/Multiply`, and drawing that alpha-over would replace the page colour
-    /// under the highlight instead of multiplying into it — a different picture for the same
-    /// file. `/CA` is baked into the colour for multiply (see `AnnotationColor.baked`), because
-    /// PDF mixes opacity in the stored colour space and the GPU mixes in linear light.
+    /// drawn as its own box. The blend mode comes from the reader: the file's `/BM` when it states
+    /// one, and otherwise the mode that kind is composited with — highlighting a line in Preview
+    /// stores `/Multiply` inside the appearance stream rather than on the annotation, and drawing
+    /// that alpha-over replaces the page colour under the highlight instead of multiplying into
+    /// it, which turns the glyphs the colour of the highlight. `/CA` is baked into the colour for
+    /// multiply (see `AnnotationColor.baked`), because PDF mixes opacity in the stored colour
+    /// space and the GPU mixes in linear light.
+    ///
+    /// A markup annotation with no `/C` is drawn in a neutral grey that carries its `/CA`, so an
+    /// unreadable colour costs the hue and nothing else.
     ///
     /// Sticky notes and free text are not drawn here: a note is an icon with a popup, and this
     /// canvas has no popup. They are listed in the sidebar instead, which is also where their
@@ -3461,13 +3466,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
             // A missing /C is not black: it is "the file did not say", and a highlight without a
             // colour is drawn in a neutral grey so it is still visible without inventing a hue.
-            let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: 0xFF)
+            // The grey takes the annotation's own opacity: `/CA` is the file's statement about
+            // how much of the page shows through, and it holds whether or not `/C` could be read.
+            // A hard-coded opaque grey here is what covered the text of every highlight whose
+            // colour the reader could not report.
+            let opacity = annotation.opacity ?? 1.0
+            let neutral = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
+            let color = annotation.color
+                ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: neutral)
             let blend = annotation.quadBlend
-            let image = annotationTexture(
-                for: color,
-                opacity: annotation.opacity ?? 1.0,
-                blend: blend
-            )
+            let image = annotationTexture(for: color, opacity: opacity, blend: blend)
 
             for (boxIndex, box) in annotation.boxes.enumerated() {
                 // Underline, strikeout and squiggly are lines through or under the text, not

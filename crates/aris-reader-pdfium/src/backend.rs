@@ -1323,6 +1323,22 @@ mod tests {
         Some(PdfiumBackend::open(&fixture, None).expect("open annotated fixture"))
     }
 
+    /// The same, for the fixture whose annotations carry appearance streams.
+    ///
+    /// `annotated-appearance.pdf` is the shape Preview writes: every annotation has an `/AP`, the
+    /// blend mode lives in that stream's `/ExtGState`, and `FPDFAnnot_GetColor` refuses all of
+    /// them. The seven review PDFs in `pdf-samples/with_annotations/` are all of this shape (242
+    /// markup annotations, none of which had a readable colour before this was fixed).
+    fn annotated_appearance_fixture() -> Option<PdfiumBackend> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated-appearance.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: appearance-stream fixture or PDFium unavailable");
+            return None;
+        }
+        Some(PdfiumBackend::open(&fixture, None).expect("open appearance fixture"))
+    }
+
     /// Every field the reader promises, against the values the fixture was written with.
     ///
     /// The expected bytes are the ones PDFium produced for `/C [0.2 0.6 1]` when this test was
@@ -1458,9 +1474,225 @@ mod tests {
         };
         let annotations = backend.annotations(PageIndex(0)).expect("annotations");
         assert_eq!(annotations[0].blend, AnnotationBlend::Multiply);
-        // The underline in the same file has no /BM at all, and must not inherit its
-        // neighbour's blend mode.
-        assert_eq!(annotations[1].blend, AnnotationBlend::Normal);
+        // The underline in the same file has no /BM at all. It is still multiplied — that is what
+        // every renderer does with an underline, and what `default_blend` documents — but it must
+        // not simply inherit its neighbour's *stated* mode: a squiggly, which PDFium composites
+        // alpha-over, keeps Normal.
+        assert_eq!(annotations[1].blend, AnnotationBlend::Multiply);
+        let squiggly = &backend.annotations(PageIndex(1)).expect("second page")[0];
+        assert_eq!(squiggly.kind, RawAnnotationKind::Squiggly);
+        assert_eq!(
+            squiggly.blend,
+            AnnotationBlend::Multiply,
+            "/BM is on this one"
+        );
+        let without_quads = &backend.annotations(PageIndex(1)).expect("second page")[1];
+        assert_eq!(
+            without_quads.blend,
+            AnnotationBlend::Multiply,
+            "a highlight with no /BM is multiplied, because that is how a highlight is drawn"
+        );
+    }
+
+    /// The user's actual files: an annotation whose only colour lives behind an appearance stream.
+    ///
+    /// `annotated-appearance.pdf` is Preview's shape — `/AP` on every annotation, `/BM` on none of
+    /// them. Before this was fixed, `FPDFAnnot_GetColor` refused all four (measured: it refuses
+    /// *any* annotation with an appearance stream), so the reader reported "no colour" and the
+    /// canvas painted an opaque grey bar over the text.
+    #[test]
+    fn colour_is_read_through_the_appearance_stream() {
+        let Some(backend) = annotated_appearance_fixture() else {
+            return;
+        };
+        let annotations = backend.annotations(PageIndex(0)).expect("annotations");
+        assert_eq!(
+            annotations.len(),
+            4,
+            "the fixture's four markup annotations"
+        );
+
+        let highlight = &annotations[0];
+        assert_eq!(highlight.kind, RawAnnotationKind::Highlight);
+        assert_eq!(
+            highlight.color,
+            Some(RawAnnotationColor {
+                red: 255,
+                green: 255,
+                blue: 0,
+            }),
+            "/C [1 1 0] read through the /AP, not reported as absent"
+        );
+        assert!(
+            (highlight.opacity.expect("/CA 0.968627") - 0.968627).abs() < 1e-6,
+            "/CA 0.968627 is the file's own number, not a rounded byte: {:?}",
+            highlight.opacity
+        );
+        assert_eq!(
+            highlight.blend,
+            AnnotationBlend::Multiply,
+            "/BM /Multiply lives in the appearance stream's ExtGState; with no /BM on the \
+             annotation, the highlight is still multiplied"
+        );
+
+        // The underline's dictionary states no /CA (its appearance paints at 40%, which PDFium's
+        // C ABI does not expose) — the reader reports what the file states, and the kind default.
+        let underline = &annotations[1];
+        assert_eq!(
+            underline.color.map(|c| (c.red, c.green, c.blue)),
+            Some((229, 25, 25))
+        );
+        assert_eq!(underline.opacity, None);
+        assert_eq!(underline.blend, AnnotationBlend::Multiply);
+
+        // No /C at all: "the file did not say", which is not the same answer as black.
+        let colourless = &annotations[2];
+        assert_eq!(colourless.kind, RawAnnotationKind::Highlight);
+        assert_eq!(colourless.color, None);
+        assert!(
+            (colourless.opacity.expect("/CA 0.35") - 0.35).abs() < 1e-6,
+            "/CA is still read for an annotation with no /C: {:?}",
+            colourless.opacity
+        );
+        assert_eq!(colourless.blend, AnnotationBlend::Multiply);
+
+        // A squiggly with an appearance stream and no /BM keeps the alpha-over PDFium uses.
+        let squiggly = &annotations[3];
+        assert_eq!(squiggly.kind, RawAnnotationKind::Squiggly);
+        assert_eq!(squiggly.blend, AnnotationBlend::Normal);
+        assert!((squiggly.opacity.expect("/CA 0.75") - 0.75).abs() < 1e-6);
+
+        // Reading is repeatable: the colour comes from the same place on a second call, and
+        // clearing the appearance stream is confined to this reader's own document handle.
+        let again = backend
+            .annotations(PageIndex(0))
+            .expect("annotations again");
+        assert_eq!(again[0].color, highlight.color);
+        assert_eq!(again[0].blend, highlight.blend);
+    }
+
+    /// The pixel-level half: what the canvas draws reproduces the file's own rendering.
+    ///
+    /// PDFium renders this fixture's annotations with `FPDF_ANNOT` — appearance streams, blend
+    /// modes and all — which is the picture Preview shows. Our canvas draws a tint quad instead,
+    /// so the test predicts the pixel it would produce from the *read* values
+    /// (`page × (a·c + 1 − a)` for a multiplied highlight, in the stored colour space) and compares
+    /// it with what PDFium drew. The alpha-over prediction is asserted at the same time: it is the
+    /// bug this fix removed, and on dark glyph pixels it differs by far more than the tolerance.
+    #[test]
+    fn a_multiplied_highlight_draws_the_pixel_the_file_renders() {
+        let Some(backend) = annotated_appearance_fixture() else {
+            return;
+        };
+        let Some(highlight) = backend
+            .annotations(PageIndex(0))
+            .expect("annotations")
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let Some(color) = highlight.color else {
+            panic!("the fixture's highlight carries /C");
+        };
+        let opacity = highlight.opacity.expect("/CA 0.968627");
+        assert_eq!(highlight.blend, AnnotationBlend::Multiply);
+
+        // A whole page at 2x, so a point sample lands on a real glyph pixel rather than between
+        // them. `scale` is in PDF points, `RasterTile::pixels` is BGRA with a top-left origin.
+        let scale = 2.0;
+        let plain = backend
+            .rasterize(&RasterRequest::full_page(PageIndex(0), scale))
+            .expect("page without annotations");
+        let burned = backend
+            .rasterize(&{
+                let mut request = RasterRequest::full_page(PageIndex(0), scale);
+                request.flags.annotations = true;
+                request
+            })
+            .expect("page with annotations");
+
+        let sample = |tile: &RasterTile, x_pt: f64, y_pt: f64| -> [f64; 3] {
+            let x = (x_pt * scale).round() as usize;
+            let y = (y_pt * scale).round() as usize;
+            let offset = y * tile.stride + x * 4;
+            // BGRA, and the tile's origin is the page's top-left corner.
+            [
+                f64::from(tile.pixels[offset + 2]),
+                f64::from(tile.pixels[offset + 1]),
+                f64::from(tile.pixels[offset]),
+            ]
+        };
+
+        let rect = highlight.rect;
+        let canvas = [
+            f64::from(color.red),
+            f64::from(color.green),
+            f64::from(color.blue),
+        ];
+        let mut compared = 0usize;
+        let mut multiply_matches = 0usize;
+        let mut alpha_over_matches = 0usize;
+        let mut worst_multiply = 0.0f64;
+        for step in 0..40 {
+            // Interior samples only: 4 pt inside the quad, spread across its width, on the two
+            // rows a body line's glyphs occupy.
+            let x = rect.origin.x + 4.0 + (rect.size.width - 8.0) * f64::from(step) / 39.0;
+            for y in [
+                rect.origin.y + rect.size.height * 0.35,
+                rect.origin.y + rect.size.height * 0.5,
+            ] {
+                // Page space is bottom-left; the tile is top-left.
+                let view_y = 842.0 - y;
+                let page_pixel = sample(&plain, x, view_y);
+                let drawn = sample(&burned, x, view_y);
+                let multiply: [f64; 3] = std::array::from_fn(|channel| {
+                    page_pixel[channel] * (opacity * canvas[channel] + (1.0 - opacity) * 255.0)
+                        / 255.0
+                });
+                let alpha_over: [f64; 3] = std::array::from_fn(|channel| {
+                    opacity * canvas[channel] + (1.0 - opacity) * page_pixel[channel]
+                });
+                let multiply_deviation = (0..3)
+                    .map(|c| (drawn[c] - multiply[c]).abs())
+                    .fold(0.0, f64::max);
+                let alpha_over_deviation = (0..3)
+                    .map(|c| (drawn[c] - alpha_over[c]).abs())
+                    .fold(0.0, f64::max);
+                // Only the pixels where the two disagree: over white paper they are the same
+                // number and the sample says nothing about the blend mode.
+                if (multiply[0] - alpha_over[0]).abs() < 8.0
+                    && (multiply[1] - alpha_over[1]).abs() < 8.0
+                    && (multiply[2] - alpha_over[2]).abs() < 8.0
+                {
+                    continue;
+                }
+                compared += 1;
+                worst_multiply = worst_multiply.max(multiply_deviation);
+                if multiply_deviation <= 4.0 {
+                    multiply_matches += 1;
+                }
+                if alpha_over_deviation <= 4.0 {
+                    alpha_over_matches += 1;
+                }
+            }
+        }
+
+        assert!(
+            compared >= 8,
+            "the fixture's highlight must cover glyph pixels to discriminate the two blends \
+             (compared {compared})"
+        );
+        assert_eq!(
+            multiply_matches, compared,
+            "every discriminating pixel must match PDF's gamma-space multiply \
+             (worst deviation {worst_multiply:.1}/255 over {compared} samples)"
+        );
+        assert!(
+            alpha_over_matches * 2 < compared,
+            "painting the same highlight alpha-over must *not* reproduce the file: \
+             {alpha_over_matches} of {compared} samples matched it"
+        );
     }
 
     /// A page with no annotations is an empty answer, not an error and not a stale one.

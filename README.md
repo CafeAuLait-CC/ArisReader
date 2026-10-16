@@ -113,6 +113,10 @@ cargo run -p aris-reader-cli -- info tests/fixtures/text-page.pdf
 cargo run -p aris-reader-cli -- render tests/fixtures/text-page.pdf --dpi 144 -o /tmp/page.png
 pdftoppm -r 144 -png tests/fixtures/text-page.pdf /tmp/poppler
 cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
+
+# 7) See what a PDF somebody else annotated carries, page by page: subtype, /Rect, /QuadPoints
+#    count, /C, /CA, the blend mode it is drawn with, /Contents, and the tint the canvas uploads
+cargo run -p aris-reader-cli -- annotations tests/fixtures/annotated-appearance.pdf
 ```
 
 ## Development workflow
