@@ -817,6 +817,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var annotationTextures: [AnnotationTextureKey: PageImage] = [:]
     private var nextAnnotationTextureGeneration: UInt64 = 1_000
 
+    /// Whether to print the annotations handed to the canvas (`ARIS_READER_CANVAS_DUMP=1`).
+    ///
+    /// The canvas prints its own half of the same frame under that variable (`MetalCanvasView`),
+    /// keyed by the same placement index, so "what we asked for" and "what was composited" can be
+    /// read side by side. It exists because a wrong picture can come from either half, and the
+    /// raster-level tests in the Rust crates can see neither.
+    private let annotationDumpEnabled =
+        ProcessInfo.processInfo.environment["ARIS_READER_CANVAS_DUMP"] == "1"
+
+    private func annotationDump(_ message: String) {
+        FileHandle.standardError.write(Data("aris-annot: \(message)\n".utf8))
+    }
+
+    /// `#RRGGBBAA` of a `PageImage`'s BGRA bytes.
+    private static func hex(_ bgra: Data) -> String {
+        guard bgra.count >= 4 else { return "?" }
+        return String(format: "#%02X%02X%02X%02X", bgra[2], bgra[1], bgra[0], bgra[3])
+    }
+
+    private static func round(_ value: CGFloat) -> String {
+        String(format: "%.1f", Double(value))
+    }
+
     /// A 1x1 texture in `color`, uploaded straight or with `opacity` baked in for multiply.
     ///
     /// The colour already carries the annotation's opacity in its alpha channel (the engine sets
@@ -3099,7 +3122,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
                 // The preview is only a backdrop for uncovered rows, never a replacement
                 // for the sharp content the reader is already looking at.
-                pages.append(CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
+                pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
                     topPt: placement.topPt, leftPt: placement.leftPt,
                     widthPt: placement.widthPt, heightPt: placement.heightPt), image: preview))
             }
@@ -3429,7 +3452,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 page: selection.page,
                 range: selection.range,
                 image: selectionImage,
-                idBase: -1_000_000_000,
+                idBase: PlacementIndex.selection(0),
                 to: &pages
             )
         }
@@ -3441,8 +3464,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // Our own annotations are drawn alpha-over: the sidecar colour already carries
                 // the opacity the reader chose, and it was chosen against a white page.
                 image: annotationTexture(for: annotation.color, opacity: 1.0, blend: .normal),
-                // Distinct ids keep the canvas from reusing a texture it already has.
-                idBase: -2_000_000_000 + annotationIndex * 4_096,
+                // Its own index block, one slot per line: the index is the key the canvas caches
+                // this quad's texture under, so it must not collide with a page raster or with a
+                // loaded annotation (see `PlacementIndex`).
+                idBase: PlacementIndex.ownAnnotation(annotationIndex),
                 // An underline is a thin bar on the baseline instead of a filled box.
                 verticalScale: annotation.kind == .underline ? 0.1 : 1.0,
                 verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
@@ -3496,11 +3521,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 let isLine = annotation.kind != "highlight"
                 let scale: CGFloat = isLine ? 0.12 : 1.0
                 let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
+                let index = PlacementIndex.documentAnnotation(annotationIndex, box: boxIndex)
+                let topPt = placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0)
 
                 pages.append(CanvasPage(
                     placement: PagePlacement(
-                        index: -3_000_000_000 + annotationIndex * 16 + boxIndex,
-                        topPt: placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0),
+                        index: index,
+                        topPt: topPt,
                         leftPt: placement.leftPt + box.xPt,
                         widthPt: box.widthPt,
                         heightPt: max(box.heightPt * scale, 1)
@@ -3508,6 +3535,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     image: image,
                     blend: blend
                 ))
+
+                if annotationDumpEnabled {
+                    // What the canvas is handed, before it uploads anything: the model's half of
+                    // the answer to "is the picture wrong because of what we were asked to draw,
+                    // or because of how it was composited?" (the canvas prints its half under the
+                    // same variable; both lines carry the same placement index).
+                    annotationDump(
+                        "annot page=\(annotation.page) box=\(boxIndex)/\(annotation.boxes.count) "
+                            + "idx=\(index) view=(\(Self.round(box.xPt)),\(Self.round(box.yPt)) "
+                            + "\(Self.round(box.widthPt))x\(Self.round(box.heightPt)))pt "
+                            + "drawn=(\(Self.round(topPt - placement.topPt)) "
+                            + "\(Self.round(max(box.heightPt * scale, 1))))pt "
+                            + "tint=\(image.bgra.count >= 4 ? Self.hex(image.bgra) : "?") "
+                            + "blend=\(annotation.blend) kind=\(annotation.kind) "
+                            + "/C=\(annotation.color.map { $0.hex } ?? "none") "
+                            + "/CA=\(annotation.opacity.map { String(format: "%.3f", $0) } ?? "absent")")
+                }
             }
         }
     }
@@ -3680,7 +3724,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func canvasPageRaster(_ image: PageImage, placement: PagePlacement) -> CanvasPage {
-        CanvasPage(placement: PagePlacement(index: -3_000_000_000 - placement.index,
+        CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
             topPt: placement.topPt, leftPt: placement.leftPt,
             widthPt: placement.widthPt, heightPt: placement.heightPt), image: image)
     }
