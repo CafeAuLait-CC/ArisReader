@@ -68,3 +68,47 @@ public enum CanvasGeometry {
         )
     }
 }
+
+/// The index blocks a `CanvasPage.placement.index` is partitioned into.
+///
+/// The index is not a label: `MetalCanvasView` caches each quad's GPU texture under it, so **two
+/// quads in one frame must never share one** — the second upload replaces the first, and the
+/// earlier quad is then drawn with the other one's bitmap. Measured 2026-10-15 on a review PDF:
+/// a page raster and the first loaded highlight both landed on `-3_000_000_000`, so the
+/// page-sized quad was painted with the highlight's 1x1 tint through the alpha-over pipeline — a
+/// full-page wash of the highlight's colour with the text under it gone (the highlight itself was
+/// composited correctly; the *page* had been handed the highlight's texture).
+///
+/// The blocks below cannot overlap for any document this reader can open: page rasters grow
+/// *downwards* from their base, every overlay grows *upwards* inside its own block, and the blocks
+/// are `block` indices apart. `placementIndexChecks` in the native suite asserts the partition,
+/// capacity ends included.
+///
+/// Only the main reader canvas is partitioned here: the preview panel draws into its own
+/// `MetalCanvasView`, which has its own texture cache, so its indices (`PreviewPanel`,
+/// `referencePreviewPages`) cannot collide with these.
+public enum PlacementIndex {
+    /// Indices per block: 2^28. Page tiles and page rasters own everything above `-block`, so the
+    /// overlays below cannot collide with them however a document is scrolled or zoomed.
+    public static let block = 1 << 28
+
+    /// A whole-page raster or preview backdrop: one per page, downwards from `-3·block`.
+    /// Capacity: 2^28 pages.
+    public static func pageRaster(_ page: Int) -> Int { -3 * block - page }
+
+    /// The selection overlay: one box per selected line. Capacity: 2^28 boxes.
+    public static func selection(_ index: Int) -> Int { -1 * block + index }
+
+    /// An annotation this reader wrote and keeps in its sidecar. Capacity: 2^16 annotations.
+    public static func ownAnnotation(_ index: Int) -> Int { -2 * block + index * 4_096 }
+
+    /// A markup annotation loaded from the PDF: its position in `documentAnnotations` and which of
+    /// its `/QuadPoints` boxes. Capacity: 2^18 annotations of 2^10 boxes each.
+    ///
+    /// Its own block, below the page rasters. The base it used to share with them (`-3·10⁹`) is
+    /// the collision this type exists to prevent, and the 1024-index stride replaces a 16-index
+    /// one that ran a 17-quad annotation into the next annotation's slot.
+    public static func documentAnnotation(_ annotation: Int, box: Int) -> Int {
+        -5 * block + annotation * 1_024 + box
+    }
+}

@@ -167,6 +167,21 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
+    /// Whether to print what this view submits (`ARIS_READER_CANVAS_DUMP=1`).
+    ///
+    /// A quad's `placement.index` is the key its texture is cached under, so **two quads sharing
+    /// one index in a single frame is always a bug**: the later upload replaces the earlier
+    /// bitmap, and the first quad is then drawn with the other one's pixels. That is how a
+    /// page-sized preview backdrop once came out as a full-page wash of the first highlight's
+    /// colour, so the dump prints — per submitted quad — the index, the device rectangle, the
+    /// texture and generation it resolved to, the bitmap behind it and the blend it is drawn
+    /// with, plus any index claimed twice in one frame. Off unless the variable is set, and
+    /// bounded to the frames whose quad list differs from the last one dumped.
+    private let canvasDumpEnabled =
+        ProcessInfo.processInfo.environment["ARIS_READER_CANVAS_DUMP"] == "1"
+    private var dumpedQuadLists = 0
+    private var lastDumpedQuadList = ""
+    private var reportedIndexCollisions: Set<Int> = []
     private var pendingFrame: DispatchWorkItem?
     private var frameEpoch: UInt64 = 0
     private var wheelMotion = WheelMotion()
@@ -570,8 +585,17 @@ public final class MetalCanvasView: NSView {
         guard surfaceId != 0 else { return }
 
         var wanted = Set<Int>()
+        var claimed: [Int: UInt64] = [:]
         for page in pages {
             let index = page.placement.index
+            if let firstGeneration = claimed[index], firstGeneration != page.image.generation,
+               reportedIndexCollisions.insert(index).inserted {
+                canvasDump(
+                    "index \(index) is claimed by two quads in one frame (generations "
+                        + "\(firstGeneration) and \(page.image.generation)); the texture cache is "
+                        + "keyed by this index, so one quad draws the other's bitmap")
+            }
+            claimed[index] = page.image.generation
             wanted.insert(index)
             if textures[index]?.generation == page.image.generation { continue }
             if let stale = textures.removeValue(forKey: index) {
@@ -669,16 +693,47 @@ public final class MetalCanvasView: NSView {
         var textureIds: [UInt64] = []
         var rects: [Float] = []
         var blends: [UInt8] = []
+        var submitted: [String] = []
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
+            let x = offsetX + page.placement.leftPt * zoom * scale
+            let y = (page.placement.topPt - scrollYPt) * zoom * scale
+            let width = page.placement.widthPt * zoom * scale
+            let height = page.placement.heightPt * zoom * scale
             textureIds.append(texture.id)
-            rects.append(Float(offsetX + page.placement.leftPt * zoom * scale))
-            rects.append(Float((page.placement.topPt - scrollYPt) * zoom * scale))
-            rects.append(Float(page.placement.widthPt * zoom * scale))
-            rects.append(Float(page.placement.heightPt * zoom * scale))
+            rects.append(Float(x))
+            rects.append(Float(y))
+            rects.append(Float(width))
+            rects.append(Float(height))
             // A page is painted over the background; a highlight loaded from a PDF is usually
             // stored `/BM /Multiply` and has to multiply into the page under it.
             blends.append(page.blend.rawValue)
+            if canvasDumpEnabled {
+                // The 1x1 tints are the ones whose bytes say what colour a highlight is drawn in;
+                // a real bitmap is reported by its size instead.
+                let pixels = page.image.pixelWidth == 1 && page.image.pixelHeight == 1
+                    ? " tint=\(Self.hex(page.image.bgra))"
+                    : ""
+                submitted.append(
+                    "idx=\(page.placement.index) tex=\(texture.id) gen=\(texture.generation) "
+                        + "rect=(\(Int(x.rounded())),\(Int(y.rounded())) "
+                        + "\(Int(width.rounded()))x\(Int(height.rounded())))px "
+                        + "bitmap=\(page.image.pixelWidth)x\(page.image.pixelHeight)"
+                        + "\(pixels) blend=\(page.blend)")
+            }
+        }
+
+        if canvasDumpEnabled, !submitted.isEmpty, dumpedQuadLists < 20 {
+            let signature = submitted.joined(separator: "|")
+            if signature != lastDumpedQuadList {
+                lastDumpedQuadList = signature
+                dumpedQuadLists += 1
+                canvasDump(
+                    "frame \(dumpedQuadLists): \(submitted.count) quad(s) submitted "
+                        + "(scroll \(Int(scrollYPt))pt, zoom \(Int((zoom * 100).rounded()))%, "
+                        + "scale \(scale))")
+                for line in submitted { canvasDump("  \(line)") }
+            }
         }
 
         guard !textureIds.isEmpty else { return }
@@ -752,6 +807,18 @@ public final class MetalCanvasView: NSView {
     private func report(_ message: String) {
         NSLog("ArisReader canvas: %@", message)
         onFailure?(message)
+    }
+
+    /// A diagnostic line for `ARIS_READER_CANVAS_DUMP=1`, on stderr like every other `aris-…`
+    /// line, so it can be captured without a debugger attached.
+    private func canvasDump(_ message: String) {
+        FileHandle.standardError.write(Data("aris-canvas: \(message)\n".utf8))
+    }
+
+    /// `#RRGGBBAA` of one BGRA pixel, as `AnnotationColor.bgra` stores it.
+    private static func hex(_ bgra: Data) -> String {
+        guard bgra.count >= 4 else { return "?" }
+        return String(format: "#%02X%02X%02X%02X", bgra[2], bgra[1], bgra[0], bgra[3])
     }
 }
 

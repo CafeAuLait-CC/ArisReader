@@ -553,6 +553,122 @@ extension ReaderChecks {
         })
     }
 
+    /// What the canvas is handed for a page that carries both a page raster and loaded highlights.
+    ///
+    /// The defect this check exists for is not in the renderer and not in the reader: it is in the
+    /// **handover**. A quad's `placement.index` is the key `MetalCanvasView` caches its GPU texture
+    /// under, so two quads sharing one index means one of them draws the other's bitmap. With the
+    /// two full-page raster indices (`-3·10⁹ - page`) and the loaded-annotation indices sharing a
+    /// base, page 0's raster and the *first* loaded highlight box were the same index: the
+    /// page-sized quad was drawn with the highlight's 1x1 tint through the alpha-over pipeline, so
+    /// the whole page came out as a wash of the highlight's colour and the text under it vanished.
+    /// The Rust rasterisers cannot see this — they never build a `CanvasPage` — and the Swift
+    /// checks that only look at the annotation quads cannot see it either, because the annotation
+    /// quads are drawn correctly. What is asserted here is the handover itself: the indices in one
+    /// frame are unique, the page-sized quad is a page-sized bitmap, and the highlight boxes are
+    /// 1x1 tints.
+    @MainActor static func annotationCanvasChecks(url: URL) async throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            print("INFO: skipping the canvas handover check (no annotated fixture at \(url.path))")
+            return
+        }
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 900, height: 700))
+        state.open(url: url)
+        // Wait for the frame that carries both halves: the page's own raster (a bitmap far wider
+        // than a 1x1 tint) and at least one loaded highlight box.
+        try await eventually("page 1's raster and its loaded highlights are in one frame", {
+            let rasters = state.canvasPages.filter {
+                $0.placement.index < 0 && $0.image.pixelWidth > 64
+            }
+            let tints = state.canvasPages.filter {
+                $0.image.pixelWidth == 1 && $0.image.pixelHeight == 1
+            }
+            return !rasters.isEmpty && !tints.isEmpty
+        })
+
+        // An index is the key the canvas caches a quad's texture under, so what matters is that
+        // each one names exactly one quad. The failure message names the offenders: an index
+        // shared by a page-sized bitmap and a 1x1 tint is the wash this check exists for.
+        var owners: [Int: [String]] = [:]
+        for page in state.canvasPages {
+            let what = page.image.pixelWidth == 1
+                ? "a 1x1 tint"
+                : "a \(page.image.pixelWidth)x\(page.image.pixelHeight) bitmap"
+            owners[page.placement.index, default: []].append(what)
+        }
+        let shared = owners.filter { $0.value.count > 1 }
+        require(shared.isEmpty,
+                "no two quads in one frame share a placement index (the canvas keys each quad's "
+                    + "texture by it, so a shared index draws one quad with the other's bitmap); "
+                    + "shared: "
+                    + shared.sorted { $0.key < $1.key }.prefix(3)
+                        .map { "\($0.key) by \($0.value.joined(separator: " and "))" }
+                        .joined(separator: ", "))
+
+        // The page-sized quad really is a page: at the 900x700-point viewport the page raster is
+        // the whole page at the backing scale, and it must not have been replaced by a 1x1 tint.
+        let pageRasters = state.canvasPages.filter {
+            $0.placement.index < 0 && $0.image.pixelWidth > 64
+        }
+        require(pageRasters.allSatisfy { $0.image.pixelWidth > 64 && $0.image.pixelHeight > 64 },
+                "every page-sized quad still carries a page-sized bitmap")
+        let tints = state.canvasPages.filter { $0.image.pixelWidth == 1 }
+        require(tints.allSatisfy { $0.blend == .multiply },
+                "every loaded highlight box is handed to the canvas as a multiplied quad "
+                    + "(\(tints.filter { $0.blend != .multiply }.count) of \(tints.count) are not)")
+    }
+
+    /// The placement-index blocks the shell draws from must stay disjoint.
+    ///
+    /// This is the invariant behind the check above, stated once for all four blocks: `pageRaster`
+    /// grows downwards from its base, `selection`, `ownAnnotation` and `documentAnnotation` grow
+    /// upwards in their own, and the ranges cannot meet. It fails the moment someone reuses a base
+    /// — which is exactly what had happened, with page 0's raster and the first loaded highlight
+    /// box on the same index.
+    @MainActor static func placementIndexChecks() {
+        var owner: [Int: String] = [:]
+        func claim(_ index: Int, _ what: String) {
+            if let previous = owner[index] {
+                fatalError("FAIL: \(what) and \(previous) share placement index \(index) — the "
+                    + "canvas caches a quad's texture under this index, so one quad would be drawn "
+                    + "with the other's bitmap")
+            }
+            owner[index] = what
+        }
+
+        // Enough of each block to cover any real document: 4096 pages, 4096 selection boxes,
+        // 4096 sidecar annotations, and 4096 loaded annotations with up to 64 quad boxes each.
+        for page in 0..<4_096 { claim(PlacementIndex.pageRaster(page), "page \(page)'s raster") }
+        for index in 0..<4_096 { claim(PlacementIndex.selection(index), "selection box \(index)") }
+        for index in 0..<4_096 {
+            claim(PlacementIndex.ownAnnotation(index), "sidecar annotation \(index)")
+        }
+        for annotation in 0..<4_096 {
+            for box in 0..<64 {
+                claim(PlacementIndex.documentAnnotation(annotation, box: box),
+                      "loaded annotation \(annotation) box \(box)")
+            }
+        }
+
+        // …and the ends of every block, which is where two blocks would meet if a capacity grew
+        // past what the layout allows: the last page raster, the last selection box, the last
+        // sidecar annotation, and the last loaded annotation's last box. The capacities are the
+        // ones `PlacementIndex` documents (2^28 pages, boxes and sidecar slots; 2^18 loaded
+        // annotations of 2^10 boxes each).
+        claim(PlacementIndex.pageRaster(PlacementIndex.block - 1), "the last page's raster")
+        claim(PlacementIndex.selection(PlacementIndex.block - 1), "the last selection box")
+        claim(PlacementIndex.ownAnnotation(65_535), "the last sidecar annotation")
+        claim(PlacementIndex.documentAnnotation(262_143, box: 1_023),
+              "the last loaded annotation's last box")
+
+        require(owner.count == 4_096 + 4_096 + 4_096 + 4_096 * 64 + 4,
+                "page rasters, the selection, this reader's annotations and loaded annotations "
+                    + "never share a placement index (\(owner.count) distinct indices, including "
+                    + "the ends of each block)")
+    }
+
     // MARK: - Colour: anything the file carries, and a sidecar that keeps working either way
     /// The colour model, checked against both directions of the sidecar's compatibility story.
     ///

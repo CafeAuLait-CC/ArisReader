@@ -203,7 +203,7 @@ extension ReaderChecks {
         engine.finish(0)
         // A whole-page raster carries a negative placement index derived from its page, so the
         // check can follow page 0's raster across zooms without matching its neighbours.
-        let pageZeroRaster = -3_000_000_000
+        let pageZeroRaster = PlacementIndex.pageRaster(0)
         func pageZeroWidth() -> Int? {
             state.canvasPages.first { $0.placement.index == pageZeroRaster }?.image.pixelWidth
         }
