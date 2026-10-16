@@ -199,6 +199,8 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
         try await annotationCanvasChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
+        try await annotationNoteChecks(
+            url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         placementIndexChecks()
         try await previewChecks(url: b)
         try await pointerZoomChecks(url: b)

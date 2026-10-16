@@ -270,6 +270,14 @@ public struct SidebarView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    // A note clicked on the page lands here (see `openDocumentNote`): the row is
+                    // the one place the whole of its text is readable, so a drawn note has to be
+                    // able to put the reader in front of it.
+                    .listRowBackground(
+                        state.selectedDocumentAnnotationID == annotation.id
+                            ? Color.accentColor.opacity(0.22)
+                            : Color.clear
+                    )
                 }
             }
         }

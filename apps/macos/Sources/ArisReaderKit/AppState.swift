@@ -109,6 +109,20 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     /// BGRA — the byte order every texture in this engine is uploaded in.
     public var bgra: [UInt8] { [blue, green, red, alpha] }
 
+    /// The colour a sticky note is drawn in when the file states none of its own.
+    ///
+    /// The file's `/C` always wins. This is only the "the file did not say" case, and it is a
+    /// note yellow rather than the neutral grey the markup path substitutes: a note's icon is a
+    /// *glyph* that says "there is a comment here", and every viewer draws it in the colour people
+    /// read as one. (The sticky note in `tests/fixtures/annotated.pdf` has no `/C` at all, so this
+    /// is what that page shows.)
+    public static let defaultNote = AnnotationColor(
+        red: 0xFF,
+        green: 0xCC,
+        blue: 0x33,
+        alpha: 0xFF
+    )
+
     public init(bgra: [UInt8]) {
         self.init(red: bgra[2], green: bgra[1], blue: bgra[0], alpha: bgra[3])
     }
@@ -748,10 +762,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Why the document's annotations could not be read, if they could not.
     @Published public private(set) var documentAnnotationsError: String?
 
+    /// The note the reader last clicked on the page, highlighted in the sidebar so its text is
+    /// where the click put it. `nil` until a note is clicked or a document is opened.
+    @Published public private(set) var selectedDocumentAnnotationID: String?
+
     /// The document's own annotations that are notes rather than markup — what the sidebar lists.
     ///
-    /// Sticky notes and free text have no geometry worth drawing, so a list is the only way they
-    /// are discoverable at all; this is also the only place their text can be read.
+    /// Sticky notes and free text are the two kinds whose `/Contents` is the point of them, and
+    /// the sidebar is where that text can be read (and edited, for this reader's own annotations);
+    /// it is also what a click on a note icon on the page brings up.
     public var documentNotes: [DocumentAnnotation] {
         documentAnnotations.filter { $0.visible && $0.isNote }
     }
@@ -816,6 +835,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `AnnotationColor.baked(opacity:)`), so the key has to include the blend.
     private var annotationTextures: [AnnotationTextureKey: PageImage] = [:]
     private var nextAnnotationTextureGeneration: UInt64 = 1_000
+
+    /// Textures for the notes this document carries: one sticky-note icon or free-text raster per
+    /// annotation, at the scale the canvas is currently drawing it at. Cleared with the rest of
+    /// the annotation textures when the document changes.
+    private var noteGlyphTextures: [NoteGlyphKey: PageImage] = [:]
 
     /// Whether to print the annotations handed to the canvas (`ARIS_READER_CANVAS_DUMP=1`).
     ///
@@ -1495,6 +1519,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         noteFlushTask = nil
         undoStack = []
         redoStack = []
+        selectedDocumentAnnotationID = nil
+        noteGlyphTextures = [:]
         scrollYPt = 0
         contentHeightPt = 0
         contentWidthPt = 0
@@ -2072,6 +2098,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// text under the box when the page's text layer can tell us which characters those are —
     /// which is what makes a note in the sidebar feel like it points at something.
     public func jump(toDocumentAnnotation annotation: DocumentAnnotation) {
+        // Both directions of "which annotation is the reader looking at" go through this: the
+        // sidebar highlights the row it was asked to show, and a click on the annotation's own
+        // glyph on the page comes here too.
+        selectedDocumentAnnotationID = annotation.id
         let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt)
         let box = annotation.boxes.first
         // Put the annotation a third of the way down the viewport rather than at its very top:
@@ -2380,21 +2410,89 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         clearSelection()
         previewEpoch &+= 1
 
-        // A click tries three things, in this order:
+        // A click tries four things, in this order:
         //   1. a link annotation — the PDF's own target, and the only one that can leave the
         //      document (a URI), so it always wins;
         //   2. an in-text citation — `[12]`, `(Kim 2023)`;
-        //   3. a `Figure 3` / `Table 2` mention.
+        //   3. a `Figure 3` / `Table 2` mention;
+        //   4. a note drawn on the page — a sticky note's icon or a free-text annotation, which
+        //      is the only way a note's contents can be reached from the page it is on.
         // Citation before mention because the two can overlap at one point (a citation group
         // inside a sentence that also names a figure), and the citation is the narrower,
         // more specific match; a mention never resolves to something a citation resolves to,
-        // so nothing is lost by the order. Each step returns false when it has nothing — either
-        // because the point is not on a target or because its page's data is still being fetched,
-        // in which case the step has queued the click — so the chain falls through cleanly.
+        // so nothing is lost by the order. A note is last because it is drawn *over* the text,
+        // and a link or a citation under the same point is the more specific target. Each step
+        // returns false when it has nothing — either because the point is not on a target or
+        // because its page's data is still being fetched, in which case the step has queued the
+        // click — so the chain falls through cleanly. What the chain returns no longer decides
+        // anything: the selection was already cleared above, wherever the click landed.
         _ = followLink(at: point)
             || openCitation(at: point)
             || openFigureMention(at: point)
+            || openDocumentNote(at: point)
     }
+
+    /// Shows the note whose drawn glyph is under `point`, if one is there.
+    ///
+    /// A note used to have no marker on the page at all, so there was nothing to click; now that
+    /// its icon is drawn, clicking it has to do what clicking it in the sidebar does — put its
+    /// text where the reader can read it. Both halves exist already and are reused rather than
+    /// reinvented: the click selects the annotation in the "In this PDF" list (revealing the
+    /// sidebar and switching to it if the reader had them closed) and the status line repeats the
+    /// first line of the note, which is what is visible if the list is scrolled away from the row.
+    ///
+    /// True means a note was found. Deliberately does **not** scroll: the reader clicked something
+    /// they can already see, and moving the page under the pointer is the one thing a click on a
+    /// visible mark must not do (the sidebar's own jump does scroll, which is right there and
+    /// wrong here).
+    @discardableResult
+    public func openDocumentNote(at point: CGPoint) -> Bool {
+        for placement in visiblePagePlacements {
+            let pageRect = CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            )
+            guard pageRect.contains(point) else { continue }
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+
+            // Backwards, so the note drawn last — the one the reader can see on top — wins.
+            for annotation in documentAnnotations.reversed()
+            where annotation.page == placement.index && annotation.visible {
+                guard annotation.drawing == .noteIcon || annotation.drawing == .freeText,
+                      let box = annotation.boxes.first
+                else { continue }
+                // A note's `/Rect` is its icon (20-26 pt in the review corpus), and a pointer is
+                // worth a point or two of slack on each side: the alternative is a mark that is
+                // drawn but cannot be hit.
+                let hit = CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
+                    .insetBy(dx: -Self.noteClickSlackPt, dy: -Self.noteClickSlackPt)
+                guard hit.contains(local) else { continue }
+
+                selectedDocumentAnnotationID = annotation.id
+                sidebarVisible = true
+                sidebarTab = .annotations
+                let text = (annotation.contents ?? "").split(whereSeparator: \.isNewline)
+                    .first.map(String.init) ?? ""
+                statusMessage = text.isEmpty
+                    ? "Page \(annotation.page + 1): a note with no text — see the sidebar"
+                    : "Page \(annotation.page + 1): \(text.prefix(120))"
+                FileHandle.standardError.write(
+                    Data("aris-annot: opened note \(annotation.id) (\(annotation.drawing.rawValue)) on page \(annotation.page + 1)\n".utf8)
+                )
+                return true
+            }
+        }
+        return false
+    }
+
+    /// How far outside a note's own box a click still counts as hitting it, in points.
+    ///
+    /// The same 3 pt the canvas uses to tell a click from a drag (`MetalCanvasView.clickSlopPt`),
+    /// for the same reason: a pointer is not a pixel, and the smallest note icon in the review
+    /// corpus is 20 pt across.
+    static let noteClickSlackPt: CGFloat = 3
 
     /// Fetches the figure/table mentions of every visible page, so a click resolves immediately.
     ///
@@ -3603,80 +3701,227 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Draws the annotations the PDF itself carries.
     ///
-    /// Only the four markup kinds have geometry worth drawing, and each `/QuadPoints` entry is
-    /// drawn as its own box. The blend mode comes from the reader: the file's `/BM` when it states
-    /// one, and otherwise the mode that kind is composited with — highlighting a line in Preview
-    /// stores `/Multiply` inside the appearance stream rather than on the annotation, and drawing
-    /// that alpha-over replaces the page colour under the highlight instead of multiplying into
-    /// it, which turns the glyphs the colour of the highlight. `/CA` is baked into the colour for
+    /// Every one of them is drawn from the classification the **reader** made
+    /// (`DocumentAnnotation.drawing`), not from a predicate re-derived here: a markup kind is one
+    /// tinted box per `/QuadPoints` entry, a sticky note is its icon filling `/Rect`, a free text
+    /// is its own text laid out in `/Rect`, and `skipped` is nothing — with the reason recorded by
+    /// the reader, so the same annotation is never drawn here and called undrawable by the dump.
+    ///
+    /// The blend mode comes from the reader too: the file's `/BM` when it states one, and
+    /// otherwise the mode that kind is composited with — highlighting a line in Preview stores
+    /// `/Multiply` inside the appearance stream rather than on the annotation, and drawing that
+    /// alpha-over replaces the page colour under the highlight instead of multiplying into it,
+    /// which turns the glyphs the colour of the highlight. `/CA` is baked into the colour for
     /// multiply (see `AnnotationColor.baked`), because PDF mixes opacity in the stored colour
     /// space and the GPU mixes in linear light.
     ///
-    /// A markup annotation with no `/C` is drawn in a neutral grey that carries its `/CA`, so an
-    /// unreadable colour costs the hue and nothing else.
+    /// An annotation with no `/C` is not black, it is "the file did not say": markup is drawn in a
+    /// neutral grey that carries its `/CA`, a sticky note in the default note colour (an icon is a
+    /// glyph, and every viewer draws it in the colour people read as "comment"), and free text in
+    /// the same neutral grey the markup path uses.
     ///
-    /// Sticky notes and free text are not drawn here: a note is an icon with a popup, and this
-    /// canvas has no popup. They are listed in the sidebar instead, which is also where their
-    /// text can actually be read.
+    /// Notes were the 122 of the review corpus's 242 content annotations that used to be listed in
+    /// the sidebar and nowhere else; `review_tang_0905.pdf` is nothing but notes, so it opened as
+    /// a page with no sign it had ever been annotated.
     private func appendDocumentAnnotations(to pages: inout [CanvasPage]) {
         for (annotationIndex, annotation) in documentAnnotations.enumerated() {
-            guard annotation.visible, annotation.isMarkup else { continue }
+            guard annotation.visible else { continue }
             guard let placement = visiblePagePlacements.first(where: { $0.index == annotation.page })
             else { continue }
 
-            // A missing /C is not black: it is "the file did not say", and a highlight without a
-            // colour is drawn in a neutral grey so it is still visible without inventing a hue.
-            // The grey takes the annotation's own opacity: `/CA` is the file's statement about
-            // how much of the page shows through, and it holds whether or not `/C` could be read.
-            // A hard-coded opaque grey here is what covered the text of every highlight whose
-            // colour the reader could not report.
+            // A missing /C is not black: it is "the file did not say", and the mark is drawn in a
+            // neutral grey so it is still visible without inventing a hue. The grey takes the
+            // annotation's own opacity: `/CA` is the file's statement about how much of the page
+            // shows through, and it holds whether or not `/C` could be read. A hard-coded opaque
+            // grey here is what covered the text of every highlight whose colour the reader could
+            // not report.
             let opacity = annotation.opacity ?? 1.0
             let neutral = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
-            let color = annotation.color
-                ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: neutral)
-            let blend = annotation.quadBlend
-            let image = annotationTexture(for: color, opacity: opacity, blend: blend)
+            let neutralColor = AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: neutral)
 
-            for (boxIndex, box) in annotation.boxes.enumerated() {
-                // Underline, strikeout and squiggly are lines through or under the text, not
-                // filled boxes: the same thin-bar trick our own annotations use, with the bar
-                // placed at the bottom (underline, squiggly) or the middle (strikeout).
-                let isLine = annotation.kind != "highlight"
-                let scale: CGFloat = isLine ? 0.12 : 1.0
-                let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
-                let index = PlacementIndex.documentAnnotation(annotationIndex, box: boxIndex)
-                let topPt = placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0)
+            switch annotation.drawing {
+            case .skipped:
+                // Nothing to draw, and the reader has already said why (the sidebar lists it).
+                continue
 
-                pages.append(CanvasPage(
-                    placement: PagePlacement(
-                        index: index,
-                        topPt: topPt,
-                        leftPt: placement.leftPt + box.xPt,
-                        widthPt: box.widthPt,
-                        heightPt: max(box.heightPt * scale, 1)
-                    ),
-                    image: image,
-                    blend: blend
-                ))
+            case .noteIcon:
+                guard let box = annotation.boxes.first,
+                      let image = noteGlyphTexture(
+                          for: annotation,
+                          index: annotationIndex,
+                          color: annotation.color ?? .defaultNote,
+                          boxPt: CGSize(width: box.widthPt, height: box.heightPt)
+                      )
+                else { continue }
+                appendNoteGlyph(
+                    image,
+                    index: PlacementIndex.documentNote(annotationIndex),
+                    box: box,
+                    placement: placement,
+                    annotation: annotation,
+                    to: &pages
+                )
 
-                if annotationDumpEnabled {
-                    // What the canvas is handed, before it uploads anything: the model's half of
-                    // the answer to "is the picture wrong because of what we were asked to draw,
-                    // or because of how it was composited?" (the canvas prints its half under the
-                    // same variable; both lines carry the same placement index).
-                    annotationDump(
-                        "annot page=\(annotation.page) box=\(boxIndex)/\(annotation.boxes.count) "
-                            + "idx=\(index) view=(\(Self.round(box.xPt)),\(Self.round(box.yPt)) "
-                            + "\(Self.round(box.widthPt))x\(Self.round(box.heightPt)))pt "
-                            + "drawn=(\(Self.round(topPt - placement.topPt)) "
-                            + "\(Self.round(max(box.heightPt * scale, 1))))pt "
-                            + "tint=\(image.bgra.count >= 4 ? Self.hex(image.bgra) : "?") "
-                            + "blend=\(annotation.blend) kind=\(annotation.kind) "
-                            + "/C=\(annotation.color.map { $0.hex } ?? "none") "
-                            + "/CA=\(annotation.opacity.map { String(format: "%.3f", $0) } ?? "absent")")
+            case .freeText:
+                guard let box = annotation.boxes.first,
+                      let image = noteGlyphTexture(
+                          for: annotation,
+                          index: annotationIndex,
+                          color: annotation.color ?? neutralColor,
+                          boxPt: CGSize(width: box.widthPt, height: box.heightPt)
+                      )
+                else { continue }
+                appendNoteGlyph(
+                    image,
+                    index: PlacementIndex.documentNote(annotationIndex),
+                    box: box,
+                    placement: placement,
+                    annotation: annotation,
+                    to: &pages
+                )
+
+            case .markup:
+                let color = annotation.color ?? neutralColor
+                let blend = annotation.quadBlend
+                let image = annotationTexture(for: color, opacity: opacity, blend: blend)
+
+                for (boxIndex, box) in annotation.boxes.enumerated() {
+                    // Underline, strikeout and squiggly are lines through or under the text, not
+                    // filled boxes: the same thin-bar trick our own annotations use, with the bar
+                    // placed at the bottom (underline, squiggly) or the middle (strikeout).
+                    let isLine = annotation.kind != "highlight"
+                    let scale: CGFloat = isLine ? 0.12 : 1.0
+                    let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
+                    let index = PlacementIndex.documentAnnotation(annotationIndex, box: boxIndex)
+                    let topPt = placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0)
+
+                    pages.append(CanvasPage(
+                        placement: PagePlacement(
+                            index: index,
+                            topPt: topPt,
+                            leftPt: placement.leftPt + box.xPt,
+                            widthPt: box.widthPt,
+                            heightPt: max(box.heightPt * scale, 1)
+                        ),
+                        image: image,
+                        blend: blend
+                    ))
+
+                    if annotationDumpEnabled {
+                        // What the canvas is handed, before it uploads anything: the model's half
+                        // of the answer to "is the picture wrong because of what we were asked to
+                        // draw, or because of how it was composited?" (the canvas prints its half
+                        // under the same variable; both lines carry the same placement index).
+                        annotationDump(
+                            "annot page=\(annotation.page) box=\(boxIndex)/\(annotation.boxes.count) "
+                                + "idx=\(index) view=(\(Self.round(box.xPt)),\(Self.round(box.yPt)) "
+                                + "\(Self.round(box.widthPt))x\(Self.round(box.heightPt)))pt "
+                                + "drawn=(\(Self.round(topPt - placement.topPt)) "
+                                + "\(Self.round(max(box.heightPt * scale, 1))))pt "
+                                + "tint=\(image.bgra.count >= 4 ? Self.hex(image.bgra) : "?") "
+                                + "blend=\(annotation.blend) kind=\(annotation.kind) "
+                                + "/C=\(annotation.color.map { $0.hex } ?? "none") "
+                                + "/CA=\(annotation.opacity.map { String(format: "%.3f", $0) } ?? "absent")")
+                    }
                 }
             }
         }
+    }
+
+    /// Hands one note glyph — an icon or a rasterized free text — to the canvas.
+    ///
+    /// Both are a bitmap drawn into the annotation's `/Rect`, alpha-over: a note is an opaque
+    /// glyph sitting on the page, not a tint multiplied into it. The index comes from
+    /// `PlacementIndex.documentNote`, a block of its own (see there for why it is not one more
+    /// `documentAnnotation` box).
+    private func appendNoteGlyph(
+        _ image: PageImage,
+        index: Int,
+        box: AnnotationQuadBox,
+        placement: PagePlacement,
+        annotation: DocumentAnnotation,
+        to pages: inout [CanvasPage]
+    ) {
+        pages.append(CanvasPage(
+            placement: PagePlacement(
+                index: index,
+                topPt: placement.topPt + box.yPt,
+                leftPt: placement.leftPt + box.xPt,
+                widthPt: box.widthPt,
+                heightPt: box.heightPt
+            ),
+            image: image,
+            blend: .normal
+        ))
+
+        if annotationDumpEnabled {
+            annotationDump(
+                "note page=\(annotation.page) idx=\(index) kind=\(annotation.kind) "
+                    + "drawing=\(annotation.drawing.rawValue) "
+                    + "view=(\(Self.round(box.xPt)),\(Self.round(box.yPt)) "
+                    + "\(Self.round(box.widthPt))x\(Self.round(box.heightPt)))pt "
+                    + "bitmap=\(image.pixelWidth)x\(image.pixelHeight) "
+                    + "tint=\(annotation.color.map { $0.hex } ?? "none")"
+                    + "\(annotation.drawing == .freeText ? " text=\"\(annotation.contents ?? "")\" size=\(annotation.fontSizePt.map { Self.round($0) } ?? "default") /Q=\(annotation.alignment)" : "")")
+        }
+    }
+
+    /// The bitmap for one note annotation, from the cache or freshly rendered.
+    ///
+    /// Keyed by everything that changes the pixels — the kind, the colour, the text and its layout,
+    /// the `/Rect` and the rasterization scale — so scrolling past the same note reuses its
+    /// texture and zooming re-renders once per scale step (see `NoteGlyph.scale`).
+    private func noteGlyphTexture(
+        for annotation: DocumentAnnotation,
+        index: Int,
+        color: AnnotationColor,
+        boxPt: CGSize
+    ) -> PageImage? {
+        let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let key = NoteGlyphKey(
+            index: index,
+            drawing: annotation.drawing,
+            color: color,
+            contents: annotation.contents ?? "",
+            fontSizePt: annotation.fontSizePt ?? NoteGlyph.defaultFreeTextSizePt,
+            alignment: annotation.alignment,
+            boxPt: boxPt,
+            scale: scale
+        )
+        if let cached = noteGlyphTextures[key] { return cached }
+
+        nextAnnotationTextureGeneration += 1
+        let generation = nextAnnotationTextureGeneration
+        let image: PageImage? = switch annotation.drawing {
+        case .noteIcon:
+            NoteGlyph.noteIcon(color: color, boxPt: boxPt, scale: scale, generation: generation)
+        case .freeText:
+            NoteGlyph.freeText(
+                annotation.contents ?? "",
+                color: color,
+                fontSizePt: annotation.fontSizePt ?? NoteGlyph.defaultFreeTextSizePt,
+                alignment: annotation.alignment,
+                boxPt: boxPt,
+                scale: scale,
+                generation: generation
+            )
+        case .markup, .skipped:
+            nil
+        }
+        if let image { noteGlyphTextures[key] = image }
+        return image
+    }
+
+    /// Identity of one note glyph texture: every input that changes a pixel of it.
+    private struct NoteGlyphKey: Hashable {
+        let index: Int
+        let drawing: AnnotationDrawing
+        let color: AnnotationColor
+        let contents: String
+        let fontSizePt: CGFloat
+        let alignment: String
+        let boxPt: CGSize
+        let scale: CGFloat
     }
 
     private func appendHighlight(
