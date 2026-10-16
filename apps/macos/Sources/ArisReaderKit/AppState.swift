@@ -1332,8 +1332,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return "\(currentPage) / \(document.pageCount)"
     }
 
+    /// How many open requests this state has served, whether they succeeded or not.
+    ///
+    /// One counter for the only loading path in the shell. The checks use it to show that the
+    /// Dock, Finder, `open -a` and drop entry points all arrive here instead of at some parallel
+    /// loader that would skip the rest of `open(url:)`.
+    public private(set) var openRequestCount = 0
+
     @discardableResult
     public func open(url: URL) -> Bool {
+        openRequestCount += 1
         do {
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
@@ -2675,12 +2683,43 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // MARK: - Tabs
 
     /// Opens a document in a new tab and switches to it.
-    public func newTab(url: URL) {
+    ///
+    /// The tab is only added when the document actually opens, so a failure leaves the tabs and
+    /// the document on screen exactly as they were.
+    @discardableResult
+    public func newTab(url: URL) -> Bool {
+        openDocumentInTab(url)
+    }
+
+    /// Opens `url` as a new tab, makes it the active one, and reports whether it opened.
+    ///
+    /// This is the entry point for documents the app did not ask for itself: a PDF dropped on the
+    /// Dock icon, Finder's “Open With”, `open -a Lyra …`, or a file dropped on the canvas. Failure
+    /// is reported by returning `false` *after* `open(url:)` has set `lastError`, so the window can
+    /// show the reader what happened.
+    @discardableResult
+    public func openDocumentInTab(_ url: URL) -> Bool {
         saveActiveTabPosition()
-        guard open(url: url) else { return }
+        guard open(url: url) else { return false }
         tabs.append(OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
                             scrollYPt: scrollYPt))
         activeTabIndex = tabs.count - 1
+        return true
+    }
+
+    /// Opens several documents at once — one tab each — and returns how many of them opened.
+    ///
+    /// This is the shell's multi-document policy: every document the system delivers is kept as
+    /// its own tab, in arrival order, with the last one on screen. There is one engine and one
+    /// window scene, so a window per document is not something the shell can support, and keeping
+    /// only the last would silently discard the rest. See `DocumentOpenCoordinator`.
+    @discardableResult
+    public func openDocuments(_ urls: [URL]) -> Int {
+        var opened = 0
+        for url in urls {
+            if openDocumentInTab(url) { opened += 1 }
+        }
+        return opened
     }
 
     public func selectTab(_ index: Int) {

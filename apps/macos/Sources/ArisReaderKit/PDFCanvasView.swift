@@ -120,6 +120,20 @@ public final class MetalCanvasView: NSView {
     private var contentOffsetX: CGFloat = 0
     /// Viewport size in screen points, so the shell can compute what is visible.
     public var onViewportSize: ((CGSize) -> Void)?
+
+    /// File drag and drop. The view owns no policy — the shell decides what the dragged URLs mean
+    /// (`DocumentOpenCoordinator`), so a drop and the Dock icon end up at the same entry point.
+    ///
+    /// While a drag is over the view, `onFileDragEntered`/`onFileDragExited` drive the hover
+    /// highlight; `onFileDrop` runs when the reader lets go and reports whether anything opened.
+    /// With no `onFileDrop` the view is not a drop target at all.
+    public var onFileDragEntered: (([URL]) -> FileDropPreview?)?
+    public var onFileDragExited: (() -> Void)?
+    public var onFileDrop: (([URL]) -> Bool)?
+    /// Whether the drag now over the view carries files this view will handle (see
+    /// `draggingEntered`).
+    private var dragCarriesFiles = false
+
     /// Width of the widest page in points; used to centre narrow documents.
     public var contentWidthPt: CGFloat = 0 {
         didSet {
@@ -183,6 +197,8 @@ public final class MetalCanvasView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .duringViewResize
+        // Files dragged in from Finder, the Dock or a browser download shelf (T2.12).
+        registerForDraggedTypes(Self.fileDropTypes)
     }
 
     @available(*, unavailable)
@@ -207,6 +223,85 @@ public final class MetalCanvasView: NSView {
         super.layout()
         resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
+    }
+
+    // MARK: - File drag and drop (T2.12)
+
+    /// The pasteboard types this view accepts as an open request.
+    ///
+    /// `public.file-url` is what Finder and the Dock hand over; the legacy
+    /// `NSFilenamesPboardType` array is still sent by older drag sources, and costs one entry (the
+    /// constant is written out rather than referenced, so the build stays free of a deprecation
+    /// warning for an API that is still the only way to read those senders).
+    public static let fileDropTypes: [NSPasteboard.PasteboardType] = [
+        .fileURL,
+        NSPasteboard.PasteboardType("NSFilenamesPboardType"),
+    ]
+
+    /// The file URLs a drag is carrying, in pasteboard order, with duplicates removed.
+    public static func fileURLs(from pasteboard: NSPasteboard) -> [URL] {
+        var urls: [URL] = []
+        for item in pasteboard.pasteboardItems ?? [] {
+            if let raw = item.string(forType: .fileURL), let url = URL(string: raw) {
+                urls.append(url)
+            }
+        }
+        if urls.isEmpty,
+           let paths = pasteboard.propertyList(
+               forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")
+           ) as? [String] {
+            urls = paths.map { URL(fileURLWithPath: $0) }
+        }
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
+    /// A drag entered the canvas carrying files. Accepted whenever it carries at least one file
+    /// URL — including files that will be *refused* on drop, because a refusal the reader cannot
+    /// see is the failure mode this replaces: the shell gets to say why, and the cursor shows the
+    /// refusal is coming. A drag with no file behind it (text, an image promise) is not our
+    /// business and returns `[]`.
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let urls = Self.fileURLs(from: sender.draggingPasteboard)
+        dragCarriesFiles = !urls.isEmpty && onFileDrop != nil
+        guard dragCarriesFiles else { return [] }
+        // Once per drag: the shell's preview stats the files, and a pasteboard cannot change
+        // while the drag is in flight.
+        _ = onFileDragEntered?(urls)
+        return .copy
+    }
+
+    /// AppKit calls this on every pointer move inside the view, so it answers from the decision
+    /// `draggingEntered` already made instead of probing the files again.
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        dragCarriesFiles ? .copy : []
+    }
+
+    /// The drag left the canvas (or was cancelled): drop the highlight with it.
+    public override func draggingExited(_ sender: NSDraggingInfo?) {
+        dragCarriesFiles = false
+        onFileDragExited?()
+    }
+
+    public override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        dragCarriesFiles
+    }
+
+    /// The reader let go: hand the URLs to the shell, which opens what it can and reports what it
+    /// cannot. Returning `false` means nothing was opened; the shell has already said so.
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = Self.fileURLs(from: sender.draggingPasteboard)
+        dragCarriesFiles = false
+        onFileDragExited?()
+        guard !urls.isEmpty else { return false }
+        return onFileDrop?(urls) ?? false
+    }
+
+    /// AppKit's final callback, whether or not the drop was accepted; clearing here as well means
+    /// the highlight cannot survive a drag that ends in an unexpected way.
+    public override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        dragCarriesFiles = false
+        onFileDragExited?()
     }
 
     // MARK: - Scrolling and keyboard
@@ -641,6 +736,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onUndo: () -> Void
     private let onRedo: () -> Void
     private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
+    /// Documents dropped on the canvas: the shell's open funnel (see `DocumentOpenCoordinator`).
+    private let fileDrop: DocumentOpenCoordinator?
 
     public init(
         pages: [CanvasPage] = [],
@@ -661,7 +758,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         onCopy: @escaping () -> Void = {},
         onUndo: @escaping () -> Void = {},
         onRedo: @escaping () -> Void = {},
-        interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil
+        interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
+        fileDrop: DocumentOpenCoordinator? = nil
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -682,6 +780,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onUndo = onUndo
         self.onRedo = onRedo
         self.interactionSnapshot = interactionSnapshot
+        self.fileDrop = fileDrop
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -714,6 +813,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
         view.pages = pages
+        // Drag & drop is rewired on every update: `connect` only assigns closures, and the
+        // coordinator is the one long-lived object (it also serves the Dock and Finder paths).
+        if let fileDrop { fileDrop.connect(view) }
     }
 }
 
