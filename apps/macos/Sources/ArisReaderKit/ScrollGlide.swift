@@ -26,6 +26,20 @@ import Foundation
 /// own clock: once `idleWindow` has passed with no new aim, the input has stopped, and what is
 /// still owed is delivered at `maximumSpeed` instead of exponentially - a few ticks at the very
 /// most, and then the glide is over.
+///
+/// What the reader gets, in numbers. After the last wheel event the document still moves by
+/// whatever the notches asked for and the glide had not yet delivered, and it moves at
+/// `maximumSpeed` (2000 screen pt/s) one 120 Hz frame at a time, never as a decay. An idle machine
+/// owes one notch at most when the wheel stops, so the tail is ~44 ms of drawing; a machine whose
+/// main thread is stalled owes whatever it could not publish, and that distance then takes
+/// `owed / 2000` seconds of drawing time (140 ms for a whole 282 pt burst) instead of the quarter
+/// of a second the old 55 ms constant spent on it. Anything longer than that is the machine's
+/// frame rate, not this arithmetic.
+///
+/// The backlog is deliberately **not** dropped when it grows: a notch the wheel reported is
+/// distance the reader asked for, and discarding it would show up as the page falling short of the
+/// wheel. It is bounded by what a wheel can ask for (`WheelMotion` caps a notch at 96 pt) and by
+/// the document's end, where `clampedScrollOffset` drops the rest.
 public struct ScrollGlide {
     /// Time constant of the approach: the offset covers ~63% of what is left in this long.
     ///
@@ -104,8 +118,13 @@ public struct ScrollGlide {
     /// a large distance in one go - and that is the jump this type exists to remove, arriving at
     /// the end of the gesture instead of at the start of it. The same CI machine showed it: with
     /// the finish phase bounded only by the ceiling, a 96-point glide was published as three
-    /// offsets. Holding the finish to one frame at a time makes a stall lengthen it instead of
-    /// coarsening it, exactly like `maximumTickFraction` does for the approach.
+    /// offsets, one of them 72 pt. Holding the finish to one frame at a time makes a stall lengthen
+    /// it instead of coarsening it, exactly like `maximumTickFraction` does for the approach.
+    ///
+    /// The trade, stated: a machine whose ticks are longer than this catches its backlog up at the
+    /// frame rate rather than at the ceiling rate, so 282 pt owed takes 18 ticks instead of 4. That
+    /// is the right way round - those ticks are long precisely because no frames were drawn, and
+    /// the alternative is one 80 pt jump in the first frame that does get drawn.
     public static let maximumStepTime: TimeInterval = 0.008
 
     /// The next offset toward the destination after `elapsed` seconds, and whether the glide is
