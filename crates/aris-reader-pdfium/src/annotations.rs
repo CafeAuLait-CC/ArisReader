@@ -29,6 +29,41 @@
 //!   highlight comes back as 127), so the colour and the opacity agree. `/CA` is still read on
 //!   its own, because the caller wants the file's own number, not a rounded byte.
 //!
+//! # Annotations that carry an appearance stream
+//!
+//! Both of those hold only for an annotation **without** `/AP`. `fpdf_annot.h` says of
+//! `FPDFAnnot_GetColor`: *"Fails when called on annotations with appearance streams already
+//! defined; instead use `FPDFPageObj_Get{Stroke|Fill}Color()`"*, and that is what a review PDF
+//! looks like in practice: measured on the seven annotated review PDFs the user supplied
+//! (`pdf-samples/with_annotations/`, 2026-10-15), **every one of the 242 text-markup annotations
+//! has an `/AP`**, and `FPDFAnnot_GetColor` returned `FALSE` for every single one of them. The
+//! reader reported "no colour", the canvas substituted an opaque grey, and a page of highlights
+//! came out as a page of grey bars covering the text.
+//!
+//! [`AnnotationReader::color`] therefore clears the appearance dictionary on **its own**
+//! `FPDF_DOCUMENT` handle (`FPDFAnnot_SetAP(annot, NORMAL, nullptr)`, a documented call: "If
+//! `value` is nullptr, the AP is cleared for that mode") and reads the colour again. The
+//! dictionary's `/C` then comes back unchanged — measured on the corpus, the colour read this way
+//! is within one unit of the colour the appearance stream paints, because the appearance *is*
+//! generated from `/C` — and the handle is private to this reader: it is never rasterised, never
+//! saved, and dropped when the document closes, so nothing the user sees or writes is affected.
+//! `FPDFPageObj_GetFillColor` is not used instead: on the same corpus it reports the *first*
+//! object's fill, which for a strikeout is the black object rather than the annotation's colour,
+//! and a `/C` that came back black for a red annotation would be a worse lie than no colour.
+//!
+//! # The blend mode when the file states none
+//!
+//! None of those 242 annotations states `/BM` either: the multiply Preview composites a highlight
+//! with lives in the appearance stream's `ExtGState` (`/BM /Multiply`), which PDFium's C ABI does
+//! not expose — there is no `GetBlendMode` anywhere in `fpdf_annot.h` or `fpdf_edit.h` (checked
+//! against the exported symbols of the vendored dylib). Reporting the dictionary default
+//! `/Normal` is what made the same files look wrong a second time: a yellow highlight at
+//! `/CA 0.97` drawn alpha-over paints over the glyphs instead of tinting them.
+//!
+//! So a markup annotation with no `/BM` is reported with the blend mode PDFium itself composites
+//! it with — see [`RawAnnotationKind::default_blend`], whose table comes from rendering such an
+//! annotation with `FPDF_ANNOT` and reading the pixels. A stated `/BM` always wins.
+//!
 //! # Threading
 //!
 //! Every call here happens under the process-wide `PDFIUM_LOCK` held by
@@ -116,6 +151,10 @@ const ANNOT_REDACT: c_ulong = 28;
 /// colour (a highlight's fill, an underline's stroke).
 const COLORTYPE_COLOR: c_int = 0;
 
+/// `FPDF_ANNOT_APPEARANCEMODE_NORMAL` — the `/AP /N` entry, and the mode
+/// `FPDFAnnot_SetAP(annot, NORMAL, nullptr)` clears together with `/R` and `/D`.
+const APPEARANCE_MODE_NORMAL: c_int = 0;
+
 /// `FPDF_ANNOT_FLAG_*` (fpdf_annot.h): an annotation carrying one of these is not meant to be
 /// seen, and drawing it would contradict the file.
 const FLAG_INVISIBLE: c_int = 1 << 0;
@@ -151,6 +190,7 @@ struct Api {
         unsafe extern "C" fn(FpdfAnnotation, *const c_char, *mut u16, c_ulong) -> c_ulong,
     get_number_value: unsafe extern "C" fn(FpdfAnnotation, *const c_char, *mut f32) -> c_int,
     get_flags: unsafe extern "C" fn(FpdfAnnotation) -> c_int,
+    set_ap: unsafe extern "C" fn(FpdfAnnotation, c_int, *const u16) -> c_int,
 }
 
 /// The resolved API, or `None` when this PDFium build does not export it.
@@ -193,6 +233,7 @@ unsafe fn resolve(library: Library) -> Option<Api> {
         get_string_value: unsafe { symbol(&library, b"FPDFAnnot_GetStringValue\0")? },
         get_number_value: unsafe { symbol(&library, b"FPDFAnnot_GetNumberValue\0")? },
         get_flags: unsafe { symbol(&library, b"FPDFAnnot_GetFlags\0")? },
+        set_ap: unsafe { symbol(&library, b"FPDFAnnot_SetAP\0")? },
         _library: library,
     };
     Some(api)
@@ -362,11 +403,14 @@ impl AnnotationReader {
         let quads = self.quad_points(handle);
         let color = self.color(handle);
         let opacity = self.opacity(handle);
-        let blend = self
-            .string(handle, c"BM")
-            .map_or(AnnotationBlend::Normal, |name| {
-                AnnotationBlend::from_pdf_name(&name)
-            });
+        // The file's own `/BM` wins; when it states none, the kind's measured default does (a
+        // highlight with no `/BM` is multiplied by every renderer, including PDFium — see
+        // [`RawAnnotationKind::default_blend`]). Reporting "normal" there is what painted
+        // Preview's highlights over the text instead of into it.
+        let blend = self.string(handle, c"BM").map_or_else(
+            || kind.default_blend(),
+            |name| AnnotationBlend::from_pdf_name(&name),
+        );
         // SAFETY: `handle` is live; the call reads one integer flag set.
         let flags = unsafe { (self.api.get_flags)(handle) };
         let hidden = flags & (FLAG_INVISIBLE | FLAG_HIDDEN | FLAG_NOVIEW) != 0;
@@ -423,10 +467,27 @@ impl AnnotationReader {
     /// `FPDFAnnot_GetColor` answers `TRUE` with black for an annotation that has no colour at all
     /// (measured; see the module docs), so its result is not trusted on its own — a sticky note
     /// must be reported as "no colour", not as black.
+    ///
+    /// It also answers `FALSE` for **any** annotation with an appearance stream, which is every
+    /// markup annotation Preview and Acrobat write (measured: 242 of 242 in the review corpus).
+    /// Clearing `/AP` on this reader's private handle makes the documented accessor work again
+    /// and hands back the dictionary's own `/C`; see the module docs for why that is sound here
+    /// and why the `FPDFPageObj_GetFillColor` alternative was rejected.
     fn color(&self, handle: FpdfAnnotation) -> Option<RawAnnotationColor> {
         if !self.has_key(handle, c"C") {
             return None;
         }
+        if let Some(color) = self.color_value(handle) {
+            return Some(color);
+        }
+        if !self.clear_appearance(handle) {
+            return None;
+        }
+        self.color_value(handle)
+    }
+
+    /// One `FPDFAnnot_GetColor` call, as a colour or nothing.
+    fn color_value(&self, handle: FpdfAnnotation) -> Option<RawAnnotationColor> {
         let (mut red, mut green, mut blue, mut alpha) = (0 as c_uint, 0, 0, 0);
         // SAFETY: `handle` is live and the four out-pointers are valid.
         let ok = unsafe {
@@ -447,6 +508,25 @@ impl AnnotationReader {
             green: green.min(255) as u8,
             blue: blue.min(255) as u8,
         })
+    }
+
+    /// Drops the annotation's appearance dictionary, on this reader's own document handle only.
+    ///
+    /// Only called when `FPDFAnnot_GetColor` refused a `/C` that `HasKey` says is there, which is
+    /// the appearance-stream case. Returns whether there was an appearance dictionary to clear —
+    /// a `false` means the caller's retry has nothing new to try, not that anything failed.
+    ///
+    /// Nothing is written to disk and no other handle sees this: [`AnnotationReader`] owns a
+    /// second `FPDF_DOCUMENT` opened for reading, never rasterised and never saved (see the type's
+    /// docs), and `PDFIUM_LOCK` is held for the whole call.
+    fn clear_appearance(&self, handle: FpdfAnnotation) -> bool {
+        if !self.has_key(handle, c"AP") {
+            return false;
+        }
+        // SAFETY: `handle` is live. A null `value` is the documented "clear it" argument for the
+        // mode; the mode is Normal, which `fpdf_annot.h` documents as clearing `/R` and `/D`
+        // too. The call only touches this document's in-memory object.
+        unsafe { (self.api.set_ap)(handle, APPEARANCE_MODE_NORMAL, std::ptr::null()) != 0 }
     }
 
     /// `/CA`, the constant opacity, when the file states one.
@@ -630,6 +710,45 @@ mod tests {
         assert!(is_content_annotation(ANNOT_FREETEXT));
         assert!(is_content_annotation(ANNOT_INK));
         assert!(is_content_annotation(ANNOT_STAMP));
+    }
+
+    /// The blend a markup annotation is composited with when the file states no `/BM`.
+    ///
+    /// This is the difference between "the highlight tints the text" and "the highlight paints over
+    /// it": `Highlight`, `Underline` and `StrikeOut` are multiplied by PDFium and by Preview, while
+    /// a squiggly is drawn beside the text and stays alpha-over. The table in
+    /// [`RawAnnotationKind::default_blend`] is the measurement; this pins it.
+    #[test]
+    fn markup_kinds_carry_the_blend_they_are_drawn_with() {
+        assert_eq!(
+            subtype_kind(ANNOT_HIGHLIGHT).default_blend(),
+            AnnotationBlend::Multiply
+        );
+        assert_eq!(
+            subtype_kind(ANNOT_UNDERLINE).default_blend(),
+            AnnotationBlend::Multiply
+        );
+        assert_eq!(
+            subtype_kind(ANNOT_STRIKEOUT).default_blend(),
+            AnnotationBlend::Multiply
+        );
+        assert_eq!(
+            subtype_kind(ANNOT_SQUIGGLY).default_blend(),
+            AnnotationBlend::Normal
+        );
+        // Notes and unmodelled subtypes have no markup drawing rule at all.
+        assert_eq!(
+            subtype_kind(ANNOT_TEXT).default_blend(),
+            AnnotationBlend::Normal
+        );
+        assert_eq!(
+            subtype_kind(ANNOT_FREETEXT).default_blend(),
+            AnnotationBlend::Normal
+        );
+        assert_eq!(
+            subtype_kind(ANNOT_INK).default_blend(),
+            AnnotationBlend::Normal
+        );
     }
 
     #[test]

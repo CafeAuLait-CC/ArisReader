@@ -1,0 +1,138 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R 9 0 R] >>
+endobj
+5 0 obj
+<< /Length 1144 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated with appearances) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (the shape Preview writes: /AP, and no /BM on the annotation) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: marked up through an appearance stream.) Tj T*
+(Line 2: marked up through an appearance stream.) Tj T*
+(Line 3: marked up through an appearance stream.) Tj T*
+(Line 4: marked up through an appearance stream.) Tj T*
+(Line 5: marked up through an appearance stream.) Tj T*
+(Line 6: marked up through an appearance stream.) Tj T*
+(Line 7: marked up through an appearance stream.) Tj T*
+(Line 8: marked up through an appearance stream.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 686 460 701] /QuadPoints [72 686 460 686 460 701 72 701] /C [1 1 0] /CA 0.968627 /AP << /N 11 0 R >> /Contents (Preview's highlight: multiply in the appearance stream.) /T (Reviewer A) /M (D:20240102030405Z) /F 4 >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Underline /Rect [72 656 460 671] /QuadPoints [72 656 460 656 460 671 72 671] /C [0.9 0.1 0.1] /AP << /N 13 0 R >> /Contents (Underline painted by its appearance stream.) /T (Reviewer B) /M (D:20240102030405Z) /F 4 >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 596 460 611] /QuadPoints [72 596 460 596 460 611 72 611] /CA 0.35 /AP << /N 15 0 R >> /Contents (A highlight whose colour only the appearance stream has.) /T (Reviewer C) /M (D:20240102030405Z) /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Squiggly /Rect [72 626 460 641] /QuadPoints [72 626 460 626 460 641 72 641] /C [0.5 0.2 0.8] /CA 0.75 /AP << /N 17 0 R >> /Contents (Squiggly with an appearance stream.) /T (Reviewer D) /M (D:20240102030405Z) /F 4 >>
+endobj
+10 0 obj
+<< /Type /ExtGState /BM /Multiply /ca 0.968627 /CA 0.968627 /AIS false >>
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [72 686 460 701] /Matrix [1 0 0 1 -72 -686] /Group << /S /Transparency /Type /Group >> /Resources << /ExtGState << /X 10 0 R >> >> /Length 57 >>
+stream
+/X gs
+1 1 0 rg
+72 686 m 460 686 l 460 701 l 72 701 l h f
+
+endstream
+endobj
+12 0 obj
+<< /Type /ExtGState /BM /Multiply /ca 0.4 /CA 0.4 /AIS false >>
+endobj
+13 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [72 656 460 671] /Matrix [1 0 0 1 -72 -656] /Group << /S /Transparency /Type /Group >> /Resources << /ExtGState << /X 12 0 R >> >> /Length 63 >>
+stream
+/X gs
+0.9 0.1 0.1 rg
+72 656 m 460 656 l 460 671 l 72 671 l h f
+
+endstream
+endobj
+14 0 obj
+<< /Type /ExtGState /ca 0.35 /CA 0.35 /AIS false >>
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [72 596 460 611] /Matrix [1 0 0 1 -72 -596] /Group << /S /Transparency /Type /Group >> /Resources << /ExtGState << /X 14 0 R >> >> /Length 61 >>
+stream
+/X gs
+0.2 0.6 1 rg
+72 596 m 460 596 l 460 611 l 72 611 l h f
+
+endstream
+endobj
+16 0 obj
+<< /Type /ExtGState /ca 0.75 /CA 0.75 /AIS false >>
+endobj
+17 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [72 626 460 641] /Matrix [1 0 0 1 -72 -626] /Group << /S /Transparency /Type /Group >> /Resources << /ExtGState << /X 16 0 R >> >> /Length 63 >>
+stream
+/X gs
+0.5 0.2 0.8 rg
+72 626 m 460 626 l 460 641 l 72 641 l h f
+
+endstream
+endobj
+xref
+0 18
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000378 00000 n 
+0000001574 00000 n 
+0000001851 00000 n 
+0000002109 00000 n 
+0000002372 00000 n 
+0000002630 00000 n 
+0000002720 00000 n 
+0000003007 00000 n 
+0000003087 00000 n 
+0000003380 00000 n 
+0000003448 00000 n 
+0000003739 00000 n 
+0000003807 00000 n 
+trailer
+<< /Size 18 /Root 1 0 R >>
+startxref
+4100
+%%EOF

@@ -139,6 +139,8 @@ struct ReaderChecks {
         try await annotationColourChecks(a: a)
         try await annotationReadingChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
+        try await annotationAppearanceChecks(
+            url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
         try await previewChecks(url: b)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()

@@ -40,15 +40,23 @@ def escape_pdf_string(text: str) -> str:
 
 
 def build_pdf(
-    pages: list[tuple[str, int]], annotations: dict[int, list[bytes]] | None = None
+    pages: list[tuple[str, int]],
+    annotations: dict[int, list[bytes]] | None = None,
+    extra_objects: list[bytes] | None = None,
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
     `annotations` maps a page index to the annotation dictionaries to attach to it.
     Annotation objects are numbered after every page, so a file with no annotations is
     byte-for-byte what this generator has always written.
+
+    `extra_objects` are appended last, for the streams an annotation can point at (an
+    `/AP` appearance stream and its `/ExtGState`). Their object numbers follow the
+    annotations and are returned by `first_extra_object_id`, which is the only way a
+    caller can write the reference without duplicating the numbering rules.
     """
     annotations = annotations or {}
+    extra_objects = extra_objects or []
     objects: list[bytes] = []
 
     # Object numbering: 1 = catalog, 2 = page tree, 3 = font, then per page
@@ -97,6 +105,8 @@ def build_pdf(
     for index in range(len(pages)):
         objects.extend(annotations.get(index, []))
 
+    objects.extend(extra_objects)
+
     # Serialize with a correct cross-reference table: every offset is measured
     # from the start of the file, so build the body first and then measure.
     out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
@@ -115,6 +125,64 @@ def build_pdf(
         f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
     ).encode("ascii")
     return bytes(out)
+
+
+def first_extra_object_id(page_count: int, annotation_count: int) -> int:
+    """The object number `build_pdf` gives the first `extra_objects` entry.
+
+    Object numbering: 1 = catalog, 2 = page tree, 3 = font, then two per page (page object,
+    content stream), then every annotation, then the extras.
+    """
+    return 4 + 2 * page_count + annotation_count
+
+
+def appearance_stream(
+    bbox: tuple[float, float, float, float],
+    rects: list[tuple[float, float, float, float]],
+    *,
+    colour: tuple[float, float, float],
+    extgstate_id: int,
+    resource_name: str = "X",
+    fill_operator: str = "f",
+) -> bytes:
+    """A `/AP /N` form XObject that fills `rects` in `colour`, as Preview writes highlights.
+
+    The graphical state — blend mode and constant alpha — lives in the referenced
+    `/ExtGState`, which is exactly the shape the reader has to cope with: the annotation
+    dictionary itself carries no `/BM`, and PDFium's `FPDFAnnot_GetColor` refuses an
+    annotation that has an appearance stream at all (see `aris-reader-pdfium::annotations`).
+    """
+    parts = [f"/{resource_name} gs", f"{colour[0]:g} {colour[1]:g} {colour[2]:g} rg"]
+    for left, bottom, right, top in rects:
+        parts.append(
+            f"{left:g} {bottom:g} m {right:g} {bottom:g} l {right:g} {top:g} l "
+            f"{left:g} {top:g} l h {fill_operator}"
+        )
+    stream = ("\n".join(parts) + "\n").encode("ascii")
+    body = (
+        f"<< /Type /XObject /Subtype /Form /FormType 1 "
+        f"/BBox [{bbox[0]:g} {bbox[1]:g} {bbox[2]:g} {bbox[3]:g}] "
+        f"/Matrix [1 0 0 1 {-bbox[0]:g} {-bbox[1]:g}] "
+        f"/Group << /S /Transparency /Type /Group >> "
+        f"/Resources << /ExtGState << /{resource_name} {extgstate_id} 0 R >> >> "
+        f"/Length {len(stream)} >>\nstream\n"
+    ).encode("ascii") + stream + b"\nendstream"
+    return body
+
+
+def extgstate(blend: str | None, alpha: float | None) -> bytes:
+    """One `/ExtGState` dictionary: the blend mode and constant alpha of an appearance.
+
+    `blend=None` and `alpha=None` mean "the key is absent", which is what most producers
+    write for the uninteresting entries.
+    """
+    entries = ["/Type /ExtGState"]
+    if blend is not None:
+        entries.append(f"/BM /{blend}")
+    if alpha is not None:
+        entries += [f"/ca {alpha:g}", f"/CA {alpha:g}"]
+    entries.append("/AIS false")
+    return ("<< " + " ".join(entries) + " >>").encode("ascii")
 
 
 def quad_points(rects: list[tuple[float, float, float, float]]) -> str:
@@ -284,6 +352,93 @@ def annotated_page_fixture() -> dict[int, list[bytes]]:
         ],
     }
 
+
+def annotated_appearance_fixture(pages: int) -> tuple[dict[int, list[bytes]], list[bytes]]:
+    """Annotations that carry an `/AP`, the shape Preview and Acrobat actually write.
+
+    `annotated.pdf` writes its annotations straight into a dictionary, which is the easy
+    case: `/C` and `/BM` are both readable there. A real review PDF is the hard case, and
+    this file is it (measured on the user's seven annotated PDFs, 2026-10-15: all 242 markup
+    annotations have an `/AP`, none of them states `/BM`, and `FPDFAnnot_GetColor` refuses
+    every single one):
+
+    * a yellow highlight whose `/BM /Multiply` and `/ca 0.968627` live in the appearance
+      stream's `/ExtGState`, with only `/C` and `/CA` on the annotation — Preview's exact
+      highlight, and the pair that decided how the canvas has to composite it;
+    * a highlight with **no `/C` at all** but a `/CA`: the one case where the reader has no
+      colour to report, and the canvas must still honour the file's opacity instead of
+      painting an opaque grey over the text;
+    * an underline whose appearance paints it at 40% while the dictionary states no `/CA`,
+      so a reader that trusts only the dictionary overstates it;
+    * a squiggly with an appearance stream and no `/BM`, which stays alpha-over.
+
+    Object numbering: `base` is the first free id (`build_pdf` gives the extras the ids
+    after the annotations), and each annotation's `/ExtGState` and `/AP` stream are the two
+    objects at `base + 2i` and `base + 2i + 1`.
+    """
+    highlight_box = body_line_box(0, 460)
+    underline_box = body_line_box(2, 460)
+    squiggly_box = body_line_box(4, 460)
+    no_colour_box = body_line_box(6, 460)
+    annotation_count = 4
+    base = first_extra_object_id(pages, annotation_count)
+    state = lambda index: base + 2 * index  # noqa: E731
+    stream = lambda index: base + 2 * index + 1  # noqa: E731
+    annotations = {
+        0: [
+            annotation(
+                "Highlight",
+                highlight_box,
+                extra=f"/QuadPoints {quad_points([highlight_box])} "
+                f"/C [1 1 0] /CA 0.968627 /AP << /N {stream(0)} 0 R >>",
+                contents="Preview's highlight: multiply in the appearance stream.",
+                author="Reviewer A",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Underline",
+                underline_box,
+                extra=f"/QuadPoints {quad_points([underline_box])} "
+                f"/C [0.9 0.1 0.1] /AP << /N {stream(1)} 0 R >>",
+                contents="Underline painted by its appearance stream.",
+                author="Reviewer B",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Highlight",
+                no_colour_box,
+                extra=f"/QuadPoints {quad_points([no_colour_box])} "
+                f"/CA 0.35 /AP << /N {stream(2)} 0 R >>",
+                contents="A highlight whose colour only the appearance stream has.",
+                author="Reviewer C",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Squiggly",
+                squiggly_box,
+                extra=f"/QuadPoints {quad_points([squiggly_box])} "
+                f"/C [0.5 0.2 0.8] /CA 0.75 /AP << /N {stream(3)} 0 R >>",
+                contents="Squiggly with an appearance stream.",
+                author="Reviewer D",
+                modified="D:20240102030405Z",
+            ),
+        ]
+    }
+    extras = [
+        extgstate("Multiply", 0.968627),
+        appearance_stream(highlight_box, [highlight_box], colour=(1, 1, 0),
+                          extgstate_id=state(0)),
+        extgstate("Multiply", 0.4),
+        appearance_stream(underline_box, [underline_box], colour=(0.9, 0.1, 0.1),
+                          extgstate_id=state(1)),
+        extgstate(None, 0.35),
+        appearance_stream(no_colour_box, [no_colour_box], colour=(0.2, 0.6, 1),
+                          extgstate_id=state(2)),
+        extgstate(None, 0.75),
+        appearance_stream(squiggly_box, [squiggly_box], colour=(0.5, 0.2, 0.8),
+                          extgstate_id=state(3)),
+    ]
+    return annotations, extras
 
 
 def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
@@ -491,6 +646,24 @@ def main() -> int:
     path = out_dir / "annotated.pdf"
     path.write_bytes(build_pdf(annotated_pages, annotated_page_fixture()))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(annotated_pages)} page(s))")
+
+    # 6) The same idea, but with appearance streams: the annotations carry `/AP`, PDFium refuses
+    #    `FPDFAnnot_GetColor` for them, and the blend mode lives in the stream's `/ExtGState`.
+    #    This is what a file annotated in Preview looks like.
+    appearance_pages = [
+        (
+            text_page(
+                "Annotated with appearances",
+                "the shape Preview writes: /AP, and no /BM on the annotation",
+                [f"Line {number}: marked up through an appearance stream." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    appearance_annotations, appearance_extras = annotated_appearance_fixture(len(appearance_pages))
+    path = out_dir / "annotated-appearance.pdf"
+    path.write_bytes(build_pdf(appearance_pages, appearance_annotations, appearance_extras))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(appearance_pages)} page(s))")
 
     if long_pages > 0:
         pages = long_document(long_pages)

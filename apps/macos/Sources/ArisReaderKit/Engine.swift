@@ -339,7 +339,10 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
         kind == "text" || kind == "freeText"
     }
 
-    /// What the annotation is composited with — the file's `/BM`, not a guess.
+    /// What the annotation is composited with: the file's `/BM`, or — when the file states none,
+    /// which is what Preview's highlights do — the blend that kind is drawn with (multiply for a
+    /// highlight, underline or strikeout; PDFium composites them the same way). The reader decides
+    /// it, because only it can see the file; this carries the answer to the canvas.
     public var quadBlend: QuadBlend { blend == "multiply" ? .multiply : .normal }
 
     /// The boxes to draw: the quad points when the file has them, its `/Rect` otherwise.
