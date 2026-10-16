@@ -39,6 +39,22 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        // Lets the document-opening checks be run on their own while they are being worked on.
+        if CommandLine.arguments.contains("--check-document-opening") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
+                ?? FileManager.default.currentDirectoryPath)
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aris-open-\(UUID())")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let first = scratch.appendingPathComponent("a.pdf")
+            let second = scratch.appendingPathComponent("b.pdf")
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: first)
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: second)
+            try await documentOpeningChecks(a: first, b: second)
+            print("Document-opening checks passed")
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -132,6 +148,9 @@ struct ReaderChecks {
         try scrollGlideChecks()
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
+        // Registered before the frame-scheduling checks: those need a presentable surface and
+        // stop the run where the display is unavailable (an occluded window never presents).
+        try await documentOpeningChecks(a: a, b: b)
         try await frameSchedulingChecks()
         print("All reader regression checks passed")
     }

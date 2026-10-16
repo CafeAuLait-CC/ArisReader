@@ -10,9 +10,13 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
+    /// Documents arriving from outside the window (Dock, Finder, `open -a`) and files dropped on
+    /// the canvas all land in this coordinator; the window draws its hover hint.
+    @ObservedObject private var opener: DocumentOpenCoordinator
 
-    public init(state: AppState) {
+    public init(state: AppState, opener: DocumentOpenCoordinator) {
         self.state = state
+        self.opener = opener
     }
 
     public var body: some View {
@@ -104,7 +108,8 @@ public struct ReaderWindow: View {
                 onCopy: { state.copySelection() },
                 onUndo: { state.undo() },
                 onRedo: { state.redo() },
-                interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
+                interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) },
+                fileDrop: opener
             )
             .background(ReferencePreviewHost(state: state))
             HStack { Spacer(); ScrollIndicator(state: state) }
@@ -118,7 +123,12 @@ public struct ReaderWindow: View {
                 pageHUD
                     .padding(.bottom, 16)
             }
+
+            if let hint = opener.dropHint {
+                FileDropOverlay(hint: hint)
+            }
         }
+        .animation(.easeOut(duration: 0.12), value: opener.dropHint)
     }
 
     private var emptyState: some View {
@@ -128,7 +138,7 @@ public struct ReaderWindow: View {
                 .foregroundStyle(.tertiary)
             Text("Open a paper to start reading")
                 .font(.title3)
-            Text("⌘O to open a file · drag & drop arrives in T2.12")
+            Text("⌘O to open a file, or drop one anywhere on the page")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Button("Open PDF…") {
@@ -373,5 +383,47 @@ struct TabStrip: View {
         .padding(.vertical, 5)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// Feedback for a file being dragged over the canvas (T2.12): a tinted border around the drop
+/// area plus one line saying what letting go would do — including *not* opening the file, which
+/// is why a refusal is drawn in the warning colour rather than simply swallowed.
+///
+/// Only plain shapes and colours: the overlay must stay inside SwiftUI's drawing layers, because
+/// an AppKit view placed here would sit above the canvas and take the drop away from it.
+/// `allowsHitTesting(false)` keeps the mouse paths (selection, scrolling) untouched as well.
+struct FileDropOverlay: View {
+    let hint: FileDropPreview
+
+    private var tint: Color {
+        hint.kind == .acceptable ? .accentColor : .orange
+    }
+
+    var body: some View {
+        ZStack {
+            tint.opacity(0.10)
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(tint, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                .padding(10)
+            VStack(spacing: 8) {
+                Image(systemName: hint.kind == .acceptable
+                    ? "arrow.down.doc"
+                    : "exclamationmark.triangle")
+                    .font(.system(size: 34, weight: .light))
+                Text(hint.message)
+                    .font(.callout)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(16)
+            .background(Color(nsColor: .windowBackgroundColor).opacity(0.92),
+                        in: RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12).strokeBorder(tint.opacity(0.5))
+            )
+            .foregroundStyle(tint)
+            .padding(40)
+        }
+        .allowsHitTesting(false)
     }
 }
