@@ -872,7 +872,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Citations per page and the document's reference list.
     private var citationsByPage: [Int: [Citation]] = [:]
-    private var citationsInFlight: Set<Int> = []
+    /// The fetch of one page's citations, kept so a click made while it is still running can wait
+    /// for it instead of paying for a second read of the page (see `startCitationLoad`).
+    private var citationLoads: [Int: Task<[Citation]?, Never>] = [:]
     @Published public private(set) var references: [Reference] = []
 
     /// `Figure 3` / `Table 2` mentions per page, and the document's caption index.
@@ -1465,7 +1467,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         linkCache = [:]
         linksInFlight = []
         citationsByPage = [:]
-        citationsInFlight = []
+        citationLoads = [:]
         captionMentionsByPage = [:]
         captionMentionsInFlight = []
         figures = []
@@ -2362,17 +2364,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
     /// ⌘C can copy it.
     ///
-    /// A click that stayed inside the canvas' slop never started a selection, so this must not
-    /// change one either: the reader clicks a citation, a figure mention or a link to bring up
-    /// its preview, and a click that resolves nothing leaves whatever they had selected alone.
-    /// The one exception is a click on the page's own background — there is no text under it to
-    /// select and no reference to follow, so it deselects, the way clicking away does everywhere
-    /// else on the platform.
+    /// A click ends whatever was selected, wherever it lands and whether or not it resolves a
+    /// target. That is what a click means everywhere else on the platform, and the alternative —
+    /// keeping the selection alive under the pointer — leaves the reader with no way to drop it
+    /// except by selecting something else. A press that moved past the canvas' slop never reaches
+    /// here: that gesture is a drag, and a drag selects (see `MetalCanvasView.clickSlopPt`).
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         guard wasClick else {
             extendSelection(to: point)
             return
         }
+        // Before the target is resolved, not after: a click that opens a citation or a figure
+        // preview used to leave the old selection highlighted behind the panel, which reads as
+        // "the click did not take".
+        clearSelection()
         previewEpoch &+= 1
 
         // A click tries three things, in this order:
@@ -2383,14 +2388,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // Citation before mention because the two can overlap at one point (a citation group
         // inside a sentence that also names a figure), and the citation is the narrower,
         // more specific match; a mention never resolves to something a citation resolves to,
-        // so nothing is lost by the order. Each step returns false when it has nothing, so
-        // the chain falls through cleanly.
-        let handled = followLink(at: point)
+        // so nothing is lost by the order. Each step returns false when it has nothing — either
+        // because the point is not on a target or because its page's data is still being fetched,
+        // in which case the step has queued the click — so the chain falls through cleanly.
+        _ = followLink(at: point)
             || openCitation(at: point)
             || openFigureMention(at: point)
-        if !handled, characterIndex(at: point) == nil {
-            clearSelection()
-        }
     }
 
     /// Fetches the figure/table mentions of every visible page, so a click resolves immediately.
@@ -2469,21 +2472,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Fetches the citations of every visible page, so a click resolves immediately.
     private func loadCitations() {
         for placement in visiblePagePlacements where citationsByPage[placement.index] == nil {
-            guard !citationsInFlight.contains(placement.index) else { continue }
-            citationsInFlight.insert(placement.index)
-
-            let page = placement.index
-            let epoch = documentEpoch
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard epoch == self.documentEpoch else { return }
-                defer { if epoch == self.documentEpoch { self.citationsInFlight.remove(page) } }
-                if let found = try? await self.engine.citations(page) {
-                    guard epoch == self.documentEpoch else { return }
-                    self.citationsByPage[page] = found
-                }
-            }
+            startCitationLoad(page: placement.index)
         }
+    }
+
+    /// Starts — or joins — the fetch of one page's citations, and hands back the task that
+    /// carries it.
+    ///
+    /// A page's citations are the slowest of the click targets to read: the first call pays the
+    /// document-wide reference scan, and it is queued behind the page rasters and text layers on
+    /// the engine's serial queue. Returning the task instead of only marking the page "in flight"
+    /// is what lets a click made in the meantime wait for the fetch that is already on its way
+    /// rather than starting a second one (or, before, being dropped).
+    @discardableResult
+    private func startCitationLoad(page: Int) -> Task<[Citation]?, Never> {
+        if let started = citationLoads[page] { return started }
+        let epoch = documentEpoch
+        let task: Task<[Citation]?, Never> = Task { @MainActor [weak self] in
+            guard let self, epoch == self.documentEpoch else { return nil }
+            let found = try? await self.engine.citations(page)
+            guard epoch == self.documentEpoch else { return nil }
+            self.citationLoads[page] = nil
+            guard let found else { return nil }
+            self.citationsByPage[page] = found
+            return found
+        }
+        citationLoads[page] = task
+        return task
     }
 
     /// Loads the reference list once (it never changes for an open document).
@@ -2517,72 +2532,118 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 width: placement.widthPt,
                 height: placement.heightPt
             )
-            guard pageRect.contains(point), let citations = citationsByPage[placement.index] else {
-                continue
-            }
+            guard pageRect.contains(point) else { continue }
 
             let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            for citation in citations {
-                let box = CGRect(
-                    x: citation.xPt,
-                    y: citation.yPt,
-                    width: citation.widthPt,
-                    height: citation.heightPt
-                )
-                guard box.contains(local) else { continue }
-
-                // Resolution lives in Rust: exact label match, then position for a numeric
-                // citation against an unnumbered list, once per label so a group resolves
-                // whole. The shell only draws the result.
-                let labels = citation.labels
-                // A long group can wrap in the text layer; the title and the log stay one line.
-                let written = citation.text
-                    .split(whereSeparator: \.isWhitespace)
-                    .joined(separator: " ")
-                let epoch = documentEpoch
-                let request = previewEpoch
-                // Read the anchor before the await: resolution can take a moment, and the reader
-                // may have scrolled by the time it lands, but the panel belongs where they clicked.
-                let anchor = viewRect(local: box, on: placement)
-                Task { @MainActor [weak self] in
-                    guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
-                    let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
-                    guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
-                    guard let first = resolved.first else {
-                        self.statusMessage = "Citation \"\(written)\" has no matching entry"
-                        return
-                    }
-
-                    self.openReferencePreview(
-                        page: first.page,
-                        // The panel names the citation as it appears in the text, so a group
-                        // is recognisable at a glance.
-                        title: written,
-                        from: "page \(placement.index + 1)",
-                        kind: .reference,
-                        anchor: anchor,
-                        region: CGRect(
-                            x: first.xPt,
-                            y: first.yPt,
-                            width: first.widthPt,
-                            height: first.heightPt
-                        ),
-                        entries: resolved.map {
-                            CitationEntry(label: $0.label, text: $0.text, page: $0.page,
-                                region: CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
-                        }
-                    )
-                    if resolved.count == 1 {
-                        self.statusMessage = "Reference [\(first.label)]: \(first.text.prefix(48))"
-                    } else {
-                        let named = resolved.map(\.label).joined(separator: ", ")
-                        self.statusMessage = "\(written) names \(resolved.count) references: \(named)"
-                    }
-                }
-                return true
+            guard let citations = citationsByPage[placement.index] else {
+                // The page's citations are still being fetched — their first read runs the
+                // document-wide reference scan, queued behind this page's rasters and text layer,
+                // so a click can easily beat them. The pointer has already said which page it
+                // meant: resolve when the data lands instead of dropping the click. Nothing is
+                // known synchronously, so report "not handled" and let the panel appear a moment
+                // later, exactly as the figure-mention path does.
+                resolveCitation(on: placement, at: local)
+                return false
             }
+            guard let citation = citation(at: local, in: citations) else { continue }
+            previewCitation(citation, on: placement)
+            return true
         }
         return false
+    }
+
+    /// The citation whose box contains a page-local point, if any.
+    private func citation(at local: CGPoint, in citations: [Citation]) -> Citation? {
+        citations.first { citation in
+            CGRect(
+                x: citation.xPt,
+                y: citation.yPt,
+                width: citation.widthPt,
+                height: citation.heightPt
+            ).contains(local)
+        }
+    }
+
+    /// Opens the reference panel for a citation the reader clicked.
+    ///
+    /// Resolution lives in Rust: exact label match, then position for a numeric citation against
+    /// an unnumbered list, once per label so a group resolves whole. The shell only draws the
+    /// result.
+    private func previewCitation(_ citation: Citation, on placement: PagePlacement) {
+        let labels = citation.labels
+        // A long group can wrap in the text layer; the title and the log stay one line.
+        let written = citation.text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        let epoch = documentEpoch
+        let request = previewEpoch
+        // Read the anchor before the await: resolution can take a moment, and the reader
+        // may have scrolled by the time it lands, but the panel belongs where they clicked.
+        let anchor = viewRect(
+            local: CGRect(x: citation.xPt, y: citation.yPt,
+                          width: citation.widthPt, height: citation.heightPt),
+            on: placement
+        )
+        Task { @MainActor [weak self] in
+            guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard let first = resolved.first else {
+                self.statusMessage = "Citation \"\(written)\" has no matching entry"
+                return
+            }
+
+            self.openReferencePreview(
+                page: first.page,
+                // The panel names the citation as it appears in the text, so a group
+                // is recognisable at a glance.
+                title: written,
+                from: "page \(placement.index + 1)",
+                kind: .reference,
+                anchor: anchor,
+                region: CGRect(
+                    x: first.xPt,
+                    y: first.yPt,
+                    width: first.widthPt,
+                    height: first.heightPt
+                ),
+                entries: resolved.map {
+                    CitationEntry(label: $0.label, text: $0.text, page: $0.page,
+                        region: CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
+                }
+            )
+            if resolved.count == 1 {
+                self.statusMessage = "Reference [\(first.label)]: \(first.text.prefix(48))"
+            } else {
+                let named = resolved.map(\.label).joined(separator: ", ")
+                self.statusMessage = "\(written) names \(resolved.count) references: \(named)"
+            }
+        }
+    }
+
+    /// Opens the citation under a click that arrived before the page's citations were fetched.
+    ///
+    /// The fetch is the one `loadCitations` already started for this page whenever it is still on
+    /// its way, so a click costs no second read of the page. A newer click, or a document switch,
+    /// supersedes this lookup.
+    private func resolveCitation(on placement: PagePlacement, at local: CGPoint) {
+        let page = placement.index
+        let epoch = documentEpoch
+        let request = previewEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let citations: [Citation]
+            if let cached = self.citationsByPage[page] {
+                citations = cached
+            } else {
+                citations = await self.startCitationLoad(page: page).value ?? []
+            }
+            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard let citation = self.citation(at: local, in: citations) else { return }
+            // The placement is the one the reader clicked in even if the view has scrolled since:
+            // the panel belongs where they clicked, the same rule `previewCitation` follows.
+            self.previewCitation(citation, on: placement)
+        }
     }
 
     /// Opens the caption a `Figure 3` / `Table 2` mention in the body points at (M4).

@@ -614,6 +614,47 @@ def main() -> int:
                 0,
             )
         ],
+        # 7) Cross-references: the body names a figure and a table, and their captions are on the
+        #    pages after it. The mentions are the click targets (`find_caption_mentions`) and the
+        #    captions are what a click has to find in the document-wide index (`find_captions`);
+        #    a fixture with only one of the two cannot tell a working click from one that opens
+        #    nothing. The mentions sit mid-line on purpose: an occurrence that opens a line and is
+        #    followed by `:` is the caption itself, and is deliberately not a mention of it.
+        "cross-references.pdf": [
+            (
+                text_page(
+                    "Cross references",
+                    "a figure and a table named in the running text",
+                    [
+                        "The pipeline has three stages (Figure 1).",
+                        "Table 1 lists the settings every run used.",
+                    ],
+                ),
+                0,
+            ),
+            (
+                text_page(
+                    "Results",
+                    "the figure the body points at",
+                    [
+                        "The three stages share one encoder.",
+                        "Figure 1: the pipeline in three stages.",
+                    ],
+                ),
+                0,
+            ),
+            (
+                text_page(
+                    "Settings",
+                    "the table the body points at",
+                    [
+                        "Every run used the same schedule.",
+                        "Table 1: settings used in every run.",
+                    ],
+                ),
+                0,
+            ),
+        ],
     }
 
     for name, pages in fixtures.items():
