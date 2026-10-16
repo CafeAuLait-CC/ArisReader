@@ -23,8 +23,9 @@ import Foundation
 /// distance per second than an exponential approach can deliver without falling behind, so the
 /// offset ends up owing the document a slice of the burst; letting that slice decay on its own is
 /// exactly the drift a reader feels as "it kept sliding after I stopped". So the glide watches its
-/// own clock: once `idleWindow` has passed with no new aim, the input has stopped, and the rest of
-/// the distance is delivered in one or two ticks at `maximumSpeed` instead of exponentially.
+/// own clock: once `idleWindow` has passed with no new aim, the input has stopped, and what is
+/// still owed is delivered at `maximumSpeed` instead of exponentially - a few ticks at the very
+/// most, and then the glide is over.
 public struct ScrollGlide {
     /// Time constant of the approach: the offset covers ~63% of what is left in this long.
     ///
@@ -49,7 +50,9 @@ public struct ScrollGlide {
     /// An exponential approach alone starts at its fastest — for a burst of notches that is a
     /// large fraction of the whole distance in the first tick, which is the jump this type exists
     /// to remove. The cap turns the start of the motion into a fast-but-readable speed and lets
-    /// the approach slow into the destination.
+    /// the approach slow into the destination. It is also the only bound on the ticks that finish
+    /// the distance once the wheel has stopped, so landing the last of a fast spin cannot become
+    /// a jump either: it travels no faster than a fast scroll is already allowed to.
     public static let defaultMaximumSpeed: CGFloat = 2000
 
     /// Where the glide is heading; nil when there is no glide in flight.
@@ -64,7 +67,7 @@ public struct ScrollGlide {
     public var isActive: Bool { destination != nil }
 
     /// True once the input has stopped and the rest of the distance is being finished rather than
-    /// eased into. Read-only, for the checks and for the HUD.
+    /// eased into. Read-only: the checks drive the arithmetic through it.
     public var isFinishing: Bool { destination != nil && idleTime > Self.idleWindow }
 
     /// Aims at an absolute offset. A new notch **moves the destination** rather than restarting
