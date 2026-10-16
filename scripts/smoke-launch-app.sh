@@ -76,6 +76,8 @@ APPEAR_SECONDS="${ARIS_READER_SMOKE_APPEAR_SECONDS:-10}"
 PASS=0
 FAIL=0
 WARN=0
+# The "launch output is not capturable here" notice describes the shell, not the case: say it once.
+DEGRADED_NOTICE_SHOWN=0
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
@@ -91,7 +93,7 @@ for arg in "$@"; do
     --document=*) DOCUMENT="${arg#--document=}" ;;
     --rebuild) BUILD_MODE="always" ;;
     --no-build) BUILD_MODE="never" ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     *) printf 'unknown argument: %s (try --help)\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -481,8 +483,11 @@ open_case() {  # $1 case name, $2 document path or ""
   if [ -n "$evidence" ]; then
     ok "startup evidence: $evidence"
   elif [ "$capture" = "null" ]; then
-    notice "Launch output not capturable" \
-      "'open' dropped --stdout/--stderr in this shell (a restricted/sandboxed shell does; launchd then connects the app to /dev/null), so the app's own 'aris-…' startup lines cannot be read here. This case used filesystem evidence instead: what the launched process has open. CI and a normal terminal run the capture-based checks."
+    if [ "$DEGRADED_NOTICE_SHOWN" = "0" ]; then
+      notice "Launch output not capturable" \
+        "'open' dropped --stdout/--stderr in this shell (a restricted/sandboxed shell does; launchd then connects the app to /dev/null), so the app's own 'aris-…' startup lines cannot be read here. Both cases used filesystem evidence instead: what the launched process has open. CI and a normal terminal run the capture-based checks."
+      DEGRADED_NOTICE_SHOWN=1
+    fi
     warn "launch output not capturable: 'open' ignored --stdout/--stderr (restricted shell)"
     evidence_note="$(process_evidence "$pid")"
     if [ -n "$evidence_note" ]; then
