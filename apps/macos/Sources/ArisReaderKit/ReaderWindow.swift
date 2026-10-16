@@ -10,13 +10,22 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
-    /// Documents arriving from outside the window (Dock, Finder, `open -a`) and files dropped on
-    /// the canvas all land in this coordinator; the window draws its hover hint.
+    /// Documents arriving at *this* window: its own coordinator, so a drop on its canvas becomes a
+    /// tab here and nowhere else. Files dropped on the canvas also drive its hover hint.
     @ObservedObject private var opener: DocumentOpenCoordinator
+    /// The floating reference panel of this window. Defaulted to the process-wide controller so a
+    /// test or preview that only has an `AppState` still works; the app passes the session's own
+    /// (see `ReaderSession`).
+    private let previewPanels: ReferencePreviewPanelController
 
-    public init(state: AppState, opener: DocumentOpenCoordinator) {
+    public init(
+        state: AppState,
+        opener: DocumentOpenCoordinator,
+        previewPanels: ReferencePreviewPanelController = .shared
+    ) {
         self.state = state
         self.opener = opener
+        self.previewPanels = previewPanels
     }
 
     public var body: some View {
@@ -111,7 +120,7 @@ public struct ReaderWindow: View {
                 interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) },
                 fileDrop: opener
             )
-            .background(ReferencePreviewHost(state: state))
+            .background(ReferencePreviewHost(state: state, panels: previewPanels))
             HStack { Spacer(); ScrollIndicator(state: state) }
 
             if state.document == nil {
@@ -303,23 +312,27 @@ public struct ReaderWindow: View {
 /// a setting: it is fixed at 512 px because changing it moves the LOD math and the cache
 /// semantics with it, and no measurement supports that trade. The rest of the configuration is
 /// held by the Rust side (`docs/02-architecture.md` §9).
+///
+/// It reads the `ReaderWindowRegistry` rather than one `AppState`: there is no longer a single
+/// state to show, and the budget it changes is one process-wide setting that *every* window has to
+/// adopt — a reader who raises it while two windows are open means both of them.
 public struct SettingsView: View {
-    @ObservedObject private var state: AppState
+    @ObservedObject private var registry: ReaderWindowRegistry
     @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
 
-    public init(state: AppState) {
-        self.state = state
+    public init(registry: ReaderWindowRegistry) {
+        self.registry = registry
     }
 
     public var body: some View {
         TabView {
             Form {
-                Text("Engine: \(state.engine.version)")
+                Text("Engine: \(registry.settingsState.engine.version)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Stepper("Page cache budget: \(cacheBudgetMB) MB",
                         value: $cacheBudgetMB, in: 16...1024, step: 16)
-                    .onChange(of: cacheBudgetMB) { _, _ in state.applyCacheBudgetSetting() }
+                    .onChange(of: cacheBudgetMB) { _, _ in registry.applyCacheBudgetSetting() }
                 Text("Keeps nearby pages ready for scrolling. A larger budget retains more clear pages. "
                      + "Content currently on screen is preserved even if it exceeds this budget.")
                     .font(.caption)

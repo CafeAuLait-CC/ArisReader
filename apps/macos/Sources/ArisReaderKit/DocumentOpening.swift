@@ -91,25 +91,30 @@ public enum FileOpenPolicy {
     }
 }
 
-/// The one place where documents arriving from outside the app become open tabs: a PDF dropped
-/// on the Dock icon, Finder's “Open With”, `open -a Lyra …`, the reopen request, and files
-/// dropped on the canvas.
+/// The one place where documents arriving at *one window* become open tabs: a PDF opened from
+/// outside the app (routed here by ``ReaderWindowRegistry``) and files dropped on the canvas.
+///
+/// It is scoped to a single window's session (``ReaderSession``), and that is what makes the
+/// reader's tabs independent: the coordinator's `state` is that window's `AppState`, so a tab it
+/// adds exists in that window and nowhere else. It used to be one object for the whole app — the
+/// delegate owned it, and every window was handed the same one — which is why a drop on either
+/// window showed up in both.
 ///
 /// It is a separate object rather than more `AppState` for two reasons:
 ///
 /// * **An open request can arrive before the window exists.** macOS delivers a launch-with-a-
-///   document before `applicationDidFinishLaunching`, so URLs are queued here and flushed once
-///   the app is ready. Opening a document needs only the engine and `AppState` — never a window —
-///   so nothing is lost and nothing has to wait for the first frame.
+///   document before `applicationDidFinishLaunching`; ``ReaderWindowRegistry`` holds the URLs
+///   until a window registers, and if that window's session arrives before the app is ready this
+///   coordinator queues them and flushes them at ``markReady()``. Opening a document needs only
+///   the engine and `AppState` — never a window — so nothing is lost.
 /// * **The drop path needs a hover state.** The canvas asks for a preview while the drag is
 ///   still in the air; that preview lives here so the window can draw it.
 ///
 /// **Several documents**: each one becomes its own tab, in arrival order, and the last one
-/// delivered is the one on screen. That is what this shell can actually support — it has tabs
-/// (`AppState.OpenTab`, the tab strip, per-tab scroll restoration) but a single engine and a
-/// single `WindowGroup`, so a window each would mean a second engine. “Last one wins” was the
-/// other option and it is strictly worse: the reader who dropped five files would silently lose
-/// four of them.
+/// delivered is the one on screen. That is what one window can show — it has tabs
+/// (`AppState.OpenTab`, the tab strip, per-tab scroll restoration) — and several documents
+/// delivered in one event stay together in the window that received them. “Last one wins” would
+/// be strictly worse: the reader who dropped five files would silently lose four of them.
 @MainActor
 public final class DocumentOpenCoordinator: ObservableObject {
     public let state: AppState
@@ -281,35 +286,44 @@ public final class DocumentOpenCoordinator: ObservableObject {
     }
 }
 
-/// Receives the documents macOS hands to Lyra.
+/// Receives the documents macOS hands to Lyra, and routes each one to a window.
 ///
 /// The app had no `NSApplicationDelegate` at all before this: a PDF dropped on the Dock icon,
 /// opened through Finder's “Open With”, or passed to `open -a Lyra` started the process and then
 /// did nothing with the file. SwiftUI installs this object as `NSApp.delegate`
 /// (`@NSApplicationDelegateAdaptor`), which is where AppKit delivers those requests.
 ///
+/// **The delegate owns no document state.** It used to own the app's single `AppState` — on the
+/// argument that open requests can arrive before a window exists — and that is exactly what made
+/// every window show the same tabs: the scene handed `delegate.state` to each of them
+/// (`ArisReaderApp.swift`). What a request needs is somewhere to *wait*, not somewhere to live, so
+/// the delegate owns a ``ReaderWindowRegistry`` instead: it queues URLs until a window exists and
+/// then hands them to that window's own session. The reader's documents, tabs, scroll positions
+/// and zoom live in ``ReaderSession``, one per window.
+///
 /// Main-actor isolated, like every other part of the shell: the delegate methods arrive on the
-/// main thread and the state they touch is `@MainActor`.
+/// main thread and the registry they touch is `@MainActor`.
 @MainActor
 public final class ArisReaderAppDelegate: NSObject, NSApplicationDelegate {
-    public let opener: DocumentOpenCoordinator
-
-    /// The window's view model; owned here so it exists before the window does.
-    public var state: AppState { opener.state }
+    /// The open windows and the delivery point for documents that arrive from outside the app.
+    public let registry: ReaderWindowRegistry
 
     /// The initializer SwiftUI itself calls. `@NSApplicationDelegateAdaptor` instantiates the
     /// delegate through `init()` at launch, so this must exist: without it the app traps before
     /// the first window (`Use of unimplemented initializer 'init()'`).
+    ///
+    /// It builds only the registry: no engine, no document, no window state. The first window's
+    /// session is what makes an engine, and a launch that arrives with a document waits for it.
     public override init() {
-        opener = DocumentOpenCoordinator(state: AppState())
+        registry = ReaderWindowRegistry()
         super.init()
     }
 
-    /// `state` is injectable so the checks can drive the delegate against a known engine. This is
-    /// a separate initializer rather than a default argument on `init()`, which SwiftUI cannot
+    /// `registry` is injectable so the checks can drive the delegate with sessions they hold. This
+    /// is a separate initializer rather than a default argument on `init()`, which SwiftUI cannot
     /// reach through the Objective-C runtime (see above).
-    public init(state: AppState) {
-        opener = DocumentOpenCoordinator(state: state)
+    public init(registry: ReaderWindowRegistry) {
+        self.registry = registry
         super.init()
     }
 
@@ -321,15 +335,15 @@ public final class ArisReaderAppDelegate: NSObject, NSApplicationDelegate {
     /// AppKit calls this *instead of* `openFile:`/`openFiles:` when the delegate implements it
     /// (NSApplicationDelegate); the singular forms are kept below for older senders.
     public func application(_ application: NSApplication, open urls: [URL]) {
-        opener.receive(urls)
+        registry.receive(urls)
     }
 
     public func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        opener.receive(filenames.map { URL(fileURLWithPath: $0) })
+        registry.receive(filenames.map { URL(fileURLWithPath: $0) })
     }
 
     public func application(_ sender: NSApplication, openFile filename: String) -> Bool {
-        opener.receive([URL(fileURLWithPath: filename)])
+        registry.receive([URL(fileURLWithPath: filename)])
         return true
     }
 
@@ -337,14 +351,14 @@ public final class ArisReaderAppDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         // A launch that arrived *with* a document: those requests were queued, and they are
-        // opened here, in order, once the app is up.
-        opener.markReady()
+        // opened here, in order, in the first window that exists.
+        registry.markReady()
     }
 
     public func applicationDidBecomeActive(_ notification: Notification) {
         // Safety net for a launch path that never reaches `didFinishLaunching` (a delegate
         // installed late, or a scene that activates first): the queue drains on first activation.
-        opener.markReady()
+        registry.markReady()
     }
 
     /// Clicking the Dock icon with nothing on screen is the “reopen” request.

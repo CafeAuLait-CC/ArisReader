@@ -447,10 +447,16 @@ final class PreviewResizeGrip: NSView {
 
 /// Owns the floating preview panel and the session-scoped memory of where the reader put it.
 ///
-/// One panel, created when a preview opens and torn down when it closes. Its frame is remembered
-/// for the rest of the run once the reader has moved or resized it — a preview is ephemeral
-/// state, so nothing about it is written to disk — and until then every preview opens next to the
-/// rectangle it belongs to and sized to its own content.
+/// One panel per controller, created when a preview opens and torn down when it closes. Its frame
+/// is remembered for the rest of the run once the reader has moved or resized it — a preview is
+/// ephemeral state, so nothing about it is written to disk — and until then every preview opens
+/// next to the rectangle it belongs to and sized to its own content.
+///
+/// **One controller per reader window** (`ReaderSession.previewPanels`). It used to be a
+/// process-wide singleton (`shared`) that each window's `ReferencePreviewHost` re-synced with its
+/// own `AppState`; with one state per window, the window that updated last would win — opening a
+/// preview in one window and scrolling the other would close it. `shared` stays as the default for
+/// callers that have no window of their own (a check, a preview harness).
 @MainActor
 public final class ReferencePreviewPanelController {
     public static let shared = ReferencePreviewPanelController()
@@ -475,7 +481,9 @@ public final class ReferencePreviewPanelController {
 
     private var fittedKey: FitKey?
 
-    private init() {
+    /// A fresh panel owner. The app makes one per reader window; ``shared`` remains for callers
+    /// without a window.
+    public init() {
         model.onLayoutChange = { [weak self] in self?.fitToContent() }
     }
 
@@ -824,6 +832,9 @@ struct ReferencePreviewPanelContent: View {
 /// it reports the canvas rect in screen coordinates — the space the panel has to open in.
 struct ReferencePreviewHost: NSViewRepresentable {
     let state: AppState
+    /// The controller of the window this host is in (`ReaderSession.previewPanels`); `shared` for
+    /// a caller that has no window of its own.
+    var panels: ReferencePreviewPanelController = .shared
 
     func makeNSView(context: Context) -> NSView {
         NonBlockingView(frame: .zero)
@@ -833,7 +844,7 @@ struct ReferencePreviewHost: NSViewRepresentable {
         let canvasOnScreen = nsView.window.map {
             $0.convertToScreen(nsView.convert(nsView.bounds, to: nil))
         }
-        ReferencePreviewPanelController.shared.sync(
+        panels.sync(
             state: state,
             canvasOnScreen: canvasOnScreen,
             canvasHeightPt: nsView.bounds.height,

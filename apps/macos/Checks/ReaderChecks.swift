@@ -56,6 +56,10 @@ struct ReaderChecks {
             print("Interaction checks passed")
             return
         }
+        if CommandLine.arguments.contains("--measure-window-engine-cost") {
+            try await measureWindowEngineCost()
+            return
+        }
         // Lets the document-opening checks be run on their own while they are being worked on.
         if CommandLine.arguments.contains("--check-document-opening") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
@@ -70,6 +74,23 @@ struct ReaderChecks {
             try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: second)
             try await documentOpeningChecks(a: first, b: second)
             print("Document-opening checks passed")
+            return
+        }
+        // Lets the two-window independence checks be run on their own while they are being worked
+        // on: they are the direct regression for "every window shares one state".
+        if CommandLine.arguments.contains("--check-window-independence") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
+                ?? FileManager.default.currentDirectoryPath)
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aris-windows-\(UUID())")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let first = scratch.appendingPathComponent("a.pdf")
+            let second = scratch.appendingPathComponent("b.pdf")
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: first)
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: second)
+            try await windowIndependenceChecks(a: first, b: second)
+            print("Window-independence checks passed")
             return
         }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
@@ -177,6 +198,7 @@ struct ReaderChecks {
         // Registered before the frame-scheduling checks: those need a presentable surface and
         // stop the run where the display is unavailable (an occluded window never presents).
         try await documentOpeningChecks(a: a, b: b)
+        try await windowIndependenceChecks(a: a, b: b)
         try await frameSchedulingChecks()
         print("All reader regression checks passed")
     }

@@ -29,27 +29,32 @@ extension ReaderChecks {
 
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
-        let delegate = ArisReaderAppDelegate(state: state)
+        let registry = ReaderWindowRegistry()
+        let session = ReaderSession(state: state, registry: registry)
+        let delegate = ArisReaderAppDelegate(registry: registry)
         let app = NSApplication.shared
 
         // 0. The instance SwiftUI creates at launch. `@NSApplicationDelegateAdaptor` calls
         //    `init()` through the Objective-C runtime, so a delegate that only offers
-        //    `init(state:)` traps before the first window — with no check able to see it unless
-        //    this one asks for exactly that initializer.
+        //    `init(registry:)` traps before the first window — with no check able to see it unless
+        //    this one asks for exactly that initializer. It must own no document state either:
+        //    the registry starts empty, and the first *window* is what makes a session.
         let swiftUIInstance = ArisReaderAppDelegate()
-        require(swiftUIInstance.state === swiftUIInstance.opener.state,
-                "the delegate SwiftUI instantiates with init() owns its coordinator")
+        require(swiftUIInstance.registry.sessions.isEmpty && swiftUIInstance.registry.pendingCount == 0,
+                "the delegate SwiftUI instantiates with init() owns an empty registry, not a document")
 
-        // 1. A launch that arrives *with* documents: the delegate callbacks run before the
-        //    window exists, and there are two of them (macOS sends one request per document).
+        // 1. A launch that arrives *with* documents: the delegate callbacks run before the app is
+        //    ready, and there are two of them (macOS sends one request per document). The window
+        //    exists by then (its session is registered), the app has not finished launching.
+        registry.register(session)
         delegate.application(app, open: [a])
         delegate.application(app, open: [b])
-        require(state.document == nil && state.tabs.isEmpty && delegate.opener.queuedCount == 2,
+        require(state.document == nil && state.tabs.isEmpty && session.opener.queuedCount == 2,
                 "documents delivered before the app is ready are queued, not lost")
         delegate.applicationDidFinishLaunching(
             Notification(name: NSApplication.didFinishLaunchingNotification, object: app)
         )
-        require(delegate.opener.queuedCount == 0 && state.tabs.count == 2,
+        require(session.opener.queuedCount == 0 && state.tabs.count == 2,
                 "both queued documents survive the launch")
         require(state.document?.url?.path == b.path && state.document?.pageCount == 3,
                 "the last document delivered is the one on screen")
@@ -65,9 +70,9 @@ extension ReaderChecks {
         require(state.openRequestCount == openRequests + 1,
                 "the delegate path loads through AppState.open(url:)")
 
-        // 3. Several documents in one delivery. The shell keeps a tab each — it has one engine and
-        //    one window scene, so a window each is not available, and keeping only the last would
-        //    silently discard the rest.
+        // 3. Several documents in one delivery. One window keeps a tab each, in arrival order, with
+        //    the last on screen; *which* window they land in is the registry's decision, checked in
+        //    `windowIndependenceChecks`.
         delegate.application(app, open: [a, b])
         require(state.tabs.count == 5 && state.document?.url?.path == b.path,
                 "each document in a plural request gets a tab; the last is on screen")
@@ -206,12 +211,13 @@ extension ReaderChecks {
 ///
 /// AppKit builds the real one only during a live drag, which a headless run cannot start, so the
 /// drop path is fed the one thing it reads from the drag — the pasteboard — through the real
-/// protocol. Everything else is inert.
+/// protocol. Everything else is inert. Internal rather than file-private: the window-independence
+/// checks drive two windows' canvases with the same fake drag.
 ///
 /// `@preconcurrency` on the conformance: AppKit's drag protocols are usable only on the main
 /// thread, which is where the checks call them from.
 @MainActor
-private final class CheckDraggingInfo: NSObject, @preconcurrency NSDraggingInfo {
+final class CheckDraggingInfo: NSObject, @preconcurrency NSDraggingInfo {
     private let pasteboard: NSPasteboard
 
     init(pasteboard: NSPasteboard) {

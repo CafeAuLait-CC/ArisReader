@@ -1031,6 +1031,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public let engine: PDFEngine
 
+    /// Whether the `ARIS_READER_OPEN` launch hook has already opened its document.
+    ///
+    /// One process launches once. With a window per session there is an `AppState` per window, and
+    /// the hook must stay what it says: the document *this launch* was given.
+    private static var launchDocumentConsumed = false
+
     /// `tileCacheBudgetBytes` pins the tile-cache budget instead of resolving it from the
     /// environment and the `cacheBudgetMB` setting; the checks use it so their arithmetic does
     /// not depend on how the machine running them is configured.
@@ -1053,7 +1059,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // Developer/test affordance: open a document at launch
         // (`ARIS_READER_OPEN=/path/to.pdf ArisReader`), which also lets a headless run
         // exercise the whole Swift → UniFFI → PDFium path.
-        if let path = ProcessInfo.processInfo.environment["ARIS_READER_OPEN"], !path.isEmpty {
+        //
+        // **Once per process.** The hook means "the document this launch was given", and a launch
+        // makes exactly one window; since each window now builds its own `AppState`
+        // (`ReaderSession`), consuming it per state would re-open the same file in every window
+        // the reader opens afterwards. The first state in the process — the first window's — is
+        // the one the hook belongs to.
+        if !AppState.launchDocumentConsumed,
+           let path = ProcessInfo.processInfo.environment["ARIS_READER_OPEN"], !path.isEmpty {
+            AppState.launchDocumentConsumed = true
             open(url: URL(fileURLWithPath: path))
             // Optional 1-based page for headless checks: ARIS_READER_OPEN_PAGE=3
             if let raw = ProcessInfo.processInfo.environment["ARIS_READER_OPEN_PAGE"],
@@ -1312,8 +1326,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Installs the flush hooks a shell needs: the normal AppKit quit path, and the signals a
-    /// harness or the OS uses to stop the app. Called once by the window when it appears — the
-    /// check harness deliberately does not install it.
+    /// harness or the OS uses to stop the app. Called by each window when it appears — the check
+    /// harness deliberately does not install it — and safe to call once per window.
+    ///
+    /// **Signals are installed once per process, and flush every window.** The signal path ends the
+    /// process itself (`exit`, below), so with one signal source per window only the first window's
+    /// writes would land and the rest would be lost with the process — a real regression now that
+    /// each window owns its own state: an unsaved highlight or reading position in the second
+    /// window would vanish on a SIGTERM from a harness. The normal quit path needs no such
+    /// treatment: `willTerminateNotification` reaches every observer, so each state flushes its
+    /// own pending writes and they cannot race with each other.
     public func installTerminationHandling() {
         guard terminationObserver == nil else { return }
 
@@ -1327,24 +1349,45 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             MainActor.assumeIsolated { self?.flushPendingWrites() }
         }
 
-        // SIGTERM/SIGINT (what a harness or the OS sends). Flush and leave directly rather than
-        // asking AppKit to terminate: a *modal alert* holds `terminate` back indefinitely, and a
-        // process that ignores SIGTERM is worse than one that exits without animation.
+        AppState.liveStates.removeAll { $0.value == nil }
+        AppState.liveStates.append(WeakState(self))
+        AppState.installSignalFlushOnce()
+    }
+
+    /// Kept so the observers can be removed if the state ever outlives the notification centre.
+    private var terminationObserver: NSObjectProtocol?
+
+    /// A state that installed termination handling, held weakly: a closed window's state must not
+    /// be kept alive by the flush list, and must not be flushed after it is gone.
+    private final class WeakState {
+        weak var value: AppState?
+        init(_ value: AppState) { self.value = value }
+    }
+
+    /// Every state that installed termination handling, so one signal can flush them all.
+    private static var liveStates: [WeakState] = []
+    /// Kept alive for the life of the process: a resumed source that is released stops delivering.
+    private static var terminationSignalSources: [DispatchSourceSignal] = []
+
+    /// SIGTERM/SIGINT (what a harness or the OS sends). Flush every window and leave directly
+    /// rather than asking AppKit to terminate: a *modal alert* holds `terminate` back
+    /// indefinitely, and a process that ignores SIGTERM is worse than one that exits without
+    /// animation.
+    private static func installSignalFlushOnce() {
+        guard terminationSignalSources.isEmpty else { return }
         for number in [SIGTERM, SIGINT] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-            source.setEventHandler { [weak self] in
-                self?.flushPendingWrites()
+            source.setEventHandler {
+                MainActor.assumeIsolated {
+                    for state in AppState.liveStates { state.value?.flushPendingWrites() }
+                }
                 exit(128 + number) // the conventional "terminated by signal N" status
             }
             source.resume()
             terminationSignalSources.append(source)
         }
     }
-
-    /// Kept so the observers can be removed if the state ever outlives the notification centre.
-    private var terminationObserver: NSObjectProtocol?
-    private var terminationSignalSources: [DispatchSourceSignal] = []
 
     public var windowTitle: String {
         document?.title ?? "Lyra"
