@@ -184,6 +184,24 @@ jobs:
           set -o pipefail
           "$GITHUB_WORKSPACE/apps/macos/.build/debug/ArisReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
 
+      # The class of failure nothing above can see. ArisReaderChecks constructs the app delegate
+      # itself, so it never asks SwiftUI to build one through the Objective-C runtime; on
+      # 2026-10-15 a delegate that offered only `init(state:)` trapped the real application at
+      # launch ("Use of unimplemented initializer 'init()'", EXC_BREAKPOINT/SIGTRAP) while the
+      # 423-assertion harness stayed green. This step launches the real bundle through
+      # LaunchServices twice — with a document and without one — and fails on a process that dies,
+      # a new crash report under ~/Library/Logs/DiagnosticReports, or a process that ignores
+      # SIGTERM (SIGKILLed after a bounded wait, so a hang costs seconds instead of blocking the
+      # job). It is fatal like every other gate here: the one non-fatal outcome is an environment
+      # that cannot launch a GUI application at all, which the script announces with a ::notice::
+      # and exits 0 for, because an unrun check is announced rather than passed silently.
+      # The bundle is assembled from the debug build the steps above already produced; capture
+      # logs land in build/smoke-launch-*.log, which the artifact step below preserves.
+      - name: Smoke-launch the packaged app through LaunchServices
+        if: steps.pdfium.outcome == 'success'
+        shell: bash
+        run: ./scripts/smoke-launch-app.sh
+
       # Same statement as in rust-core: the corpus is not in the repository, so nothing above
       # covered it. Do not let a future reader assume otherwise.
       - name: Record that the corpus regression did not run
