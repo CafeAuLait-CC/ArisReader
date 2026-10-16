@@ -216,8 +216,15 @@ def annotation(
     contents: str | None = None,
     author: str | None = None,
     modified: str | None = None,
+    flags: int = 4,
 ) -> bytes:
-    """One annotation dictionary. `/F 4` is the Print flag, the value every producer writes."""
+    """One annotation dictionary. `/F 4` is the Print flag, the value every producer writes.
+
+    `flags` is `/F` verbatim: 4 (Print) unless a fixture needs to say something else about
+    visibility. PDF 32000-1 table 165: 1 Invisible, 2 Hidden, 4 Print, 8 NoZoom, 16 NoRotate,
+    32 NoView. The review corpus is full of notes flagged 26 and 30 — "completed" markers an
+    Acrobat review workflow hides — which a reader must leave off the page.
+    """
     left, bottom, right, top = rect
     body = f"<< /Type /Annot /Subtype /{subtype} /Rect [{left:g} {bottom:g} {right:g} {top:g}]"
     if extra:
@@ -228,7 +235,7 @@ def annotation(
         body += f" /T ({escape_pdf_string(author)})"
     if modified is not None:
         body += f" /M ({modified})"
-    body += " /F 4 >>"
+    body += f" /F {flags} >>"
     return body.encode("cp1252")
 
 
@@ -437,6 +444,116 @@ def annotated_appearance_fixture(pages: int) -> tuple[dict[int, list[bytes]], li
         extgstate(None, 0.75),
         appearance_stream(squiggly_box, [squiggly_box], colour=(0.5, 0.2, 0.8),
                           extgstate_id=state(3)),
+    ]
+    return annotations, extras
+
+
+def annotated_notes_fixture(pages: int) -> tuple[dict[int, list[bytes]], list[bytes]]:
+    """Notes and nothing else, the shape of `review_tang_0905.pdf`.
+
+    One of the user's seven review PDFs carries **22 content annotations and no markup at all**
+    (11 sticky notes and 11 hidden "completed" markers), so a reader that only draws the four
+    text-markup kinds shows that document as if nobody had ever touched it. This fixture is that
+    file in miniature, and it is the one the "every content annotation is either drawn or
+    explicitly classified as skipped" check runs against:
+
+    * a sticky note with `/C [1 0.85 0.2]` and an `/AP` (every note in the review corpus has
+      one, which is why `FPDFAnnot_GetColor` has to have the appearance dictionary cleared
+      before it will report the dictionary's own colour);
+    * a sticky note with **no** `/C` at all — the case the shell draws in its default note
+      colour rather than inventing a hue from a missing key;
+    * a free-text annotation with `/DA (/Helv 14 Tf 0 g) /Q 1 /C [...]`: 14 pt, centred, blue,
+      which is where `/DA` and `/Q` are read from — PDF 32000-1 table 174;
+    * a free-text annotation with no `/C`, drawn in the shell's neutral grey;
+    * a free-text annotation with no `/Contents`, which has no text to lay out and is therefore
+      *classified* as skipped rather than silently dropped (the review corpus has one: an empty
+      2×12 pt box);
+    * a sticky note flagged `/F 6` (Hidden|Print) at `/Rect [0 0 1 1]`, which is what 49 of the
+      corpus's 99 notes are — an Acrobat review workflow's "completed" marker;
+    * an `/Ink` annotation, a subtype this build has no drawing rule for and therefore reports
+      as skipped-with-a-reason instead of leaving the reader to guess.
+
+    Every one of them is a *content* annotation, so the reader reports all seven and the
+    accounting has to add up: drawn + skipped == 7.
+
+    Object numbering matches `annotated_appearance_fixture`: `base` is the first free id
+    (`build_pdf` gives the extras the ids after the annotations), and the one appearance stream
+    and its `/ExtGState` are the two objects at `base` and `base + 1`.
+    """
+    # A sticky note's box is its icon, 20-26 pt square in the corpus; free text is a wide box.
+    note_box = (500, 690, 526, 716)
+    plain_note_box = (500, 640, 526, 666)
+    hidden_note_box = (0, 0, 1, 1)
+    free_text_box = (72, 560, 400, 600)
+    grey_text_box = (72, 500, 400, 528)
+    empty_text_box = (72, 460, 160, 480)
+    ink_box = (72, 400, 220, 440)
+
+    annotation_count = 7
+    base = first_extra_object_id(pages, annotation_count)
+    annotations = {
+        0: [
+            annotation(
+                "Text",
+                note_box,
+                extra=f"/Name /Comment /C [1 0.85 0.2] /AP << /N {base + 1} 0 R >>",
+                contents="A sticky note with a colour of its own.",
+                author="Reviewer A",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Text",
+                plain_note_box,
+                extra="/Name /Comment",
+                contents="A sticky note the file gives no colour.",
+                author="Reviewer B",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "FreeText",
+                free_text_box,
+                extra="/DA (/Helv 14 Tf 0 g) /Q 1 /C [0.1 0.45 0.9]",
+                contents="Free text: 14 pt from /DA, centred by /Q, in its own colour.",
+                author="Reviewer C",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "FreeText",
+                grey_text_box,
+                extra="/DA (/Helv 9 Tf 0 g) /Q 0",
+                contents="Free text with no colour of its own.",
+                author="Reviewer D",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "FreeText",
+                empty_text_box,
+                extra="/DA (/Helv 12 Tf 0 g)",
+                author="Reviewer E",
+                modified="D:20240102030405Z",
+            ),
+            annotation(
+                "Text",
+                hidden_note_box,
+                extra="/Name /Comment /C [1 1 0]",
+                contents="A note the file marks hidden.",
+                author="Reviewer F",
+                modified="D:20240102030405Z",
+                flags=6,  # Hidden | Print: 49 of the review corpus's 99 notes are flagged this way.
+            ),
+            annotation(
+                "Ink",
+                ink_box,
+                extra="/C [0.2 0.2 0.2] /InkList [72 400 100 430 140 405 180 440 220 400]",
+                contents="Ink, a subtype this build does not draw.",
+                author="Reviewer G",
+                modified="D:20240102030405Z",
+            ),
+        ],
+    }
+    extras = [
+        extgstate("Multiply", 0.968627),
+        appearance_stream(note_box, [note_box], colour=(1, 0.85, 0.2), extgstate_id=base),
     ]
     return annotations, extras
 
@@ -705,6 +822,27 @@ def main() -> int:
     path = out_dir / "annotated-appearance.pdf"
     path.write_bytes(build_pdf(appearance_pages, appearance_annotations, appearance_extras))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(appearance_pages)} page(s))")
+
+    # 7) Notes and no markup, which is one of the user's review PDFs exactly: 22 content
+    #    annotations, every one of them a sticky note or a free-text annotation, and not a single
+    #    highlight to draw. A reader that only knows the text-markup kinds shows it as untouched.
+    #    Between them the four annotations below cover everything a note can be asked to do —
+    #    icon in its own colour, icon with no colour, text laid out from /DA and /Q, text in the
+    #    default ink — and the three reasons an annotation is deliberately not drawn.
+    notes_pages = [
+        (
+            text_page(
+                "Annotated with notes",
+                "sticky notes and free text, and no markup at all",
+                [f"Line {number}: commented on rather than marked up." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    notes_annotations, notes_extras = annotated_notes_fixture(len(notes_pages))
+    path = out_dir / "annotated-notes.pdf"
+    path.write_bytes(build_pdf(notes_pages, notes_annotations, notes_extras))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(notes_pages)} page(s))")
 
     if long_pages > 0:
         pages = long_document(long_pages)

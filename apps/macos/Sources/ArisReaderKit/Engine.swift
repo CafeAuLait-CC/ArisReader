@@ -294,6 +294,36 @@ public struct Figure: Sendable {
     public var title: String { "\(kind) \(label)" }
 }
 
+/// What the reader decided to put on the page for one annotation.
+///
+/// Stated by the engine (`RawAnnotation::drawing` in Rust) and carried across the FFI, so the
+/// canvas, the sidebar and the `aris-reader-cli annotations` dump all read one answer. The only
+/// way an annotation the reader reports draws nothing is `.skipped`, and that case always carries
+/// an `AnnotationSkipReason` — "in the sidebar but not on the page" is otherwise indistinguishable
+/// from "we could not read it", which is the failure this whole classification exists to prevent.
+public enum AnnotationDrawing: String, Sendable {
+    /// One of the four text-markup kinds: a tinted box per `/QuadPoints` entry.
+    case markup
+    /// A `/Text` sticky note: its icon, filling `/Rect`.
+    case noteIcon
+    /// A `/FreeText` annotation: its own text, laid out in `/Rect`.
+    case freeText
+    /// Nothing, for the reason in `DocumentAnnotation.skipReason`.
+    case skipped
+}
+
+/// Why a reported annotation is not drawn.
+public enum AnnotationSkipReason: String, Sendable {
+    /// The file's `/F` sets Hidden, Invisible or `/NoView`.
+    case hidden
+    /// `/Rect` has no area to draw in.
+    case emptyRect = "empty-rect"
+    /// A free-text annotation with no `/Contents`: there is no text to lay out.
+    case emptyContents = "no-text"
+    /// A subtype this build has no drawing rule for (`Ink`, `Stamp`, …).
+    case unmodelled
+}
+
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
 ///
 /// The counterpart of `AppState.Annotation`: that one is what this reader wrote and keeps in a
@@ -319,6 +349,18 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let contents: String?
     public let author: String?
     public let modified: String?
+    /// The font size `/DA` states for this annotation's text, in points; `nil` when the file
+    /// states none. Only free text has one in practice, and it is the size its text is drawn at.
+    public let fontSizePt: CGFloat?
+    /// `/Q`: `left`, `center` or `right`. Never anything else — the reader substitutes the PDF's
+    /// own default (left) for an absent or unreadable value.
+    public let alignment: String
+    /// What to put on the page, as the **reader** classified it: `markup`, `noteIcon`, `freeText`
+    /// or `skipped`. Read from the engine rather than re-derived here, so the sidebar, the canvas
+    /// and the CLI dump cannot disagree about which annotations are supposed to appear.
+    public let drawing: AnnotationDrawing
+    /// Why nothing is drawn, when `drawing` is `.skipped`; `nil` for everything that is drawn.
+    public let skipReason: AnnotationSkipReason?
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     public let visible: Bool
 
@@ -327,7 +369,9 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
         "\(page)-\(kind)-\(xPt)-\(yPt)-\(widthPt)-\(heightPt)"
     }
 
-    /// True when this is one of the four text-markup kinds, i.e. something to draw on the page.
+    /// True when this is one of the four text-markup kinds, i.e. what the reader draws a tinted
+    /// box per quad for. A statement about *what the annotation is*; what is actually drawn is
+    /// `drawing`, which is `markup` for exactly these four when the file does not hide them.
     public var isMarkup: Bool {
         ["highlight", "underline", "strikeout", "squiggly"].contains(kind)
     }
@@ -922,6 +966,13 @@ public final class RustEngine: PDFEngine {
             contents: record.contents,
             author: record.author,
             modified: record.modified,
+            fontSizePt: record.fontSizePt.map { CGFloat($0) },
+            alignment: record.alignment,
+            // An unknown classification from a newer engine reads as "not drawn" rather than as
+            // a guess: drawing the wrong thing over a page is worse than drawing nothing, and the
+            // sidebar still lists it.
+            drawing: AnnotationDrawing(rawValue: record.drawing) ?? .skipped,
+            skipReason: record.skipReason.flatMap(AnnotationSkipReason.init(rawValue:)),
             visible: record.visible
         )
     }

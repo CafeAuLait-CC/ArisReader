@@ -293,7 +293,7 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
         }
 
         println!("{path}: {total} page(s)");
-        let mut markup_total = 0usize;
+        let mut account = DrawAccount::default();
         for index in scan_start..scan_end {
             let annotations = match backend.annotations(PageIndex(index)) {
                 Ok(annotations) => annotations,
@@ -313,9 +313,7 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
                 annotations.len()
             );
             for (slot, annotation) in annotations.iter().enumerate() {
-                if annotation.kind.is_markup() {
-                    markup_total += 1;
-                }
+                account.count(annotation);
                 let rect = annotation.rect;
                 println!(
                     "    [{slot}] {:<9} /Rect ({:.1},{:.1} {:.1}×{:.1})  quads={}  /C={}  /CA={}  \
@@ -336,6 +334,16 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
                     annotation.blend.as_str(),
                     if annotation.visible { "" } else { "  HIDDEN" },
                 );
+                // The two keys a note is drawn from, printed next to the draw that uses them —
+                // `/DA` is the only place a free-text annotation's size lives, and `/Q` its
+                // alignment. Printed for every kind, like the reader reads them.
+                println!(
+                    "         /DA {}  /Q {}",
+                    annotation
+                        .font_size_pt
+                        .map_or_else(|| "none".to_string(), |size| format!("{size:.1} pt")),
+                    annotation.alignment.as_str()
+                );
                 if let Some(contents) = &annotation.contents {
                     println!("         /Contents: {}", preview(contents, 96));
                 }
@@ -345,56 +353,171 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
                 println!("         draw: {}", describe_draw(annotation));
             }
         }
-        println!("  → {markup_total} markup annotation(s) to draw");
+        println!("  → {}", account.summary());
     }
     ExitCode::SUCCESS
 }
 
-/// The draw the shell would make for one annotation, in the shell's own terms.
-fn describe_draw(annotation: &aris_reader_core::RawAnnotation) -> String {
-    if !annotation.kind.is_markup() {
-        return format!(
-            "not drawn (the canvas draws the four text-markup kinds; this is {})",
-            annotation.kind.as_str()
+/// What a dump accounted for, so "122 annotations the user could not see" has a number that
+/// adds up: every content annotation lands in exactly one of these buckets.
+#[derive(Default)]
+struct DrawAccount {
+    markup: usize,
+    notes: usize,
+    free_text: usize,
+    skipped: usize,
+    /// How many skips each reason accounts for, in the order the reasons are first seen.
+    reasons: Vec<(&'static str, usize)>,
+}
+
+impl DrawAccount {
+    fn count(&mut self, annotation: &aris_reader_core::RawAnnotation) {
+        match annotation.drawing() {
+            aris_reader_core::AnnotationDrawing::Markup => self.markup += 1,
+            aris_reader_core::AnnotationDrawing::NoteIcon => self.notes += 1,
+            aris_reader_core::AnnotationDrawing::FreeText => self.free_text += 1,
+            aris_reader_core::AnnotationDrawing::Skipped(reason) => {
+                self.skipped += 1;
+                let name = reason.as_str();
+                match self.reasons.iter_mut().find(|(seen, _)| *seen == name) {
+                    Some((_, count)) => *count += 1,
+                    None => self.reasons.push((name, 1)),
+                }
+            }
+        }
+    }
+
+    /// The file's accounting on one line: what is drawn, and every annotation that is not.
+    fn summary(&self) -> String {
+        let mut line = format!(
+            "{} content annotation(s): {} markup + {} note icon(s) + {} free text drawn, \
+             {} skipped",
+            self.total(),
+            self.markup,
+            self.notes,
+            self.free_text,
+            self.skipped
         );
+        if !self.reasons.is_empty() {
+            let reasons = self
+                .reasons
+                .iter()
+                .map(|(reason, count)| format!("{count} {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            line.push_str(&format!(" ({reasons})"));
+        }
+        line
     }
-    if !annotation.visible {
-        return "not drawn (the file marks it hidden/invisible/NoView)".to_string();
+
+    fn total(&self) -> usize {
+        self.markup + self.notes + self.free_text + self.skipped
     }
-    // A missing `/C` is not black: the shell substitutes a neutral grey so the mark is still
-    // visible (see `appendDocumentAnnotations` in `apps/macos`).
-    let (red, green, blue) = annotation
-        .color
-        .map_or((0x80, 0x80, 0x80), |c| (c.red, c.green, c.blue));
+}
+
+/// The draw the shell would make for one annotation, in the shell's own terms.
+///
+/// Reads the reader's own classification ([`RawAnnotation::drawing`]) instead of deciding again,
+/// so this dump and the canvas cannot disagree about which annotations are drawn: the only way
+/// this prints "skipped" for something the canvas draws is if the canvas stopped reading it.
+fn describe_draw(annotation: &aris_reader_core::RawAnnotation) -> String {
+    use aris_reader_core::{AnnotationDrawing, AnnotationSkipReason};
+
     let opacity = annotation.opacity.unwrap_or(1.0);
-    match &annotation.blend {
-        aris_reader_core::AnnotationBlend::Multiply => {
-            let bake = |channel: u8| {
-                (opacity * f64::from(channel) + (1.0 - opacity) * 255.0).round() as u8
+    let ink = |red: u8, green: u8, blue: u8, alpha: u8| {
+        format!("#{red:02X}{green:02X}{blue:02X} at alpha {alpha}")
+    };
+
+    match annotation.drawing() {
+        AnnotationDrawing::Skipped(reason) => {
+            let because = match reason {
+                AnnotationSkipReason::Hidden => {
+                    "the file sets /F's Hidden, Invisible or NoView bit"
+                }
+                AnnotationSkipReason::EmptyRect => "its /Rect has no area to draw in",
+                AnnotationSkipReason::EmptyContents => "it carries no /Contents to draw",
+                AnnotationSkipReason::Unmodelled => {
+                    "this build has no drawing rule for that /Subtype"
+                }
             };
             format!(
-                "multiply, /CA {opacity:.3} baked into tint #{:02X}{:02X}{:02X} at alpha 255 \
-                 (PDF: page × (a·c + 1 − a))",
-                bake(red),
-                bake(green),
-                bake(blue)
+                "skipped ({}: {because}) — the sidebar still lists it",
+                reason.as_str()
             )
         }
-        aris_reader_core::AnnotationBlend::Normal => {
-            let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        // A sticky note is an icon in its own colour: `/C` when the file states one, and the
+        // canvas's default note yellow when it does not (see `NoteGlyph` in `apps/macos`).
+        AnnotationDrawing::NoteIcon => {
+            let colour = annotation
+                .color
+                .map_or("the default note colour".to_string(), |c| {
+                    format!("#{:02X}{:02X}{:02X}", c.red, c.green, c.blue)
+                });
+            format!("note icon, {colour}, filling /Rect")
+        }
+        AnnotationDrawing::FreeText => {
+            let (red, green, blue) = annotation
+                .color
+                .map_or((0x80, 0x80, 0x80), |c| (c.red, c.green, c.blue));
+            let text = annotation.contents.as_deref().unwrap_or("");
+            let size = annotation.font_size_pt.map_or_else(
+                || "the shell's default size (the file states no /DA size)".to_string(),
+                |size| format!("{size:.1} pt from /DA"),
+            );
             format!(
-                "alpha-over, tint #{red:02X}{green:02X}{blue:02X} at alpha {alpha} ({opacity:.3}){}",
-                if annotation.opacity.is_none() {
-                    " — the file states no /CA, so this is fully opaque"
-                } else {
-                    ""
-                }
+                "free text, {} character(s) at {size}, {}-aligned, in {}",
+                text.chars().count(),
+                annotation.alignment.as_str(),
+                ink(
+                    red,
+                    green,
+                    blue,
+                    (opacity * 255.0).round().clamp(0.0, 255.0) as u8
+                )
             )
         }
-        aris_reader_core::AnnotationBlend::Other(name) => format!(
-            "alpha-over (the canvas does not implement /BM /{name}), tint #{red:02X}{green:02X}{blue:02X} at alpha {}",
-            (opacity * 255.0).round().clamp(0.0, 255.0) as u8
-        ),
+        AnnotationDrawing::Markup => {
+            // A missing `/C` is not black: the shell substitutes a neutral grey so the mark is
+            // still visible (see `appendDocumentAnnotations` in `apps/macos`).
+            let (red, green, blue) = annotation
+                .color
+                .map_or((0x80, 0x80, 0x80), |c| (c.red, c.green, c.blue));
+            match &annotation.blend {
+                aris_reader_core::AnnotationBlend::Multiply => {
+                    let bake = |channel: u8| {
+                        (opacity * f64::from(channel) + (1.0 - opacity) * 255.0).round() as u8
+                    };
+                    format!(
+                        "multiply, /CA {opacity:.3} baked into tint #{:02X}{:02X}{:02X} at alpha \
+                         255 (PDF: page × (a·c + 1 − a))",
+                        bake(red),
+                        bake(green),
+                        bake(blue)
+                    )
+                }
+                aris_reader_core::AnnotationBlend::Normal => {
+                    let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+                    format!(
+                        "alpha-over, tint {}, {}",
+                        ink(red, green, blue, alpha),
+                        if annotation.opacity.is_none() {
+                            "the file states no /CA, so this is fully opaque"
+                        } else {
+                            "the file's own /CA"
+                        }
+                    )
+                }
+                aris_reader_core::AnnotationBlend::Other(name) => format!(
+                    "alpha-over (the canvas does not implement /BM /{name}), tint {}",
+                    ink(
+                        red,
+                        green,
+                        blue,
+                        (opacity * 255.0).round().clamp(0.0, 255.0) as u8
+                    )
+                ),
+            }
+        }
     }
 }
 

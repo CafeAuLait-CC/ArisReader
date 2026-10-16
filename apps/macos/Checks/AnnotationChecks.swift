@@ -1,5 +1,8 @@
 import ArisReaderKit
+import CoreGraphics
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 extension ReaderChecks {
     @MainActor static func annotationChecks(a: URL, b: URL) async throws {
@@ -609,15 +612,25 @@ extension ReaderChecks {
 
         // The page-sized quad really is a page: at the 900x700-point viewport the page raster is
         // the whole page at the backing scale, and it must not have been replaced by a 1x1 tint.
+        // Selected by its index block, not by its bitmap size — `annotated.pdf` also carries a
+        // free-text annotation whose text raster is wider than a page raster's minimum.
         let pageRasters = state.canvasPages.filter {
-            $0.placement.index < 0 && $0.image.pixelWidth > 64
+            PlacementIndex.isPageRaster($0.placement.index)
         }
-        require(pageRasters.allSatisfy { $0.image.pixelWidth > 64 && $0.image.pixelHeight > 64 },
-                "every page-sized quad still carries a page-sized bitmap")
-        let tints = state.canvasPages.filter { $0.image.pixelWidth == 1 }
-        require(tints.allSatisfy { $0.blend == .multiply },
+        require(!pageRasters.isEmpty && pageRasters.allSatisfy {
+            $0.image.pixelWidth > 64 && $0.image.pixelHeight > 64
+        }, "every page quad still carries a page-sized bitmap")
+        // Every markup box of a loaded annotation is a 1x1 tint, and it is multiplied.
+        let markupBoxes = state.canvasPages.filter { page in
+            PlacementIndex.isDocumentAnnotationBox(page.placement.index)
+        }
+        require(!markupBoxes.isEmpty && markupBoxes.allSatisfy {
+            $0.image.pixelWidth == 1 && $0.image.pixelHeight == 1
+        }, "every loaded markup box is handed over as a 1x1 tint")
+        require(markupBoxes.allSatisfy { $0.blend == .multiply },
                 "every loaded highlight box is handed to the canvas as a multiplied quad "
-                    + "(\(tints.filter { $0.blend != .multiply }.count) of \(tints.count) are not)")
+                    + "(\(markupBoxes.filter { $0.blend != .multiply }.count) of "
+                    + "\(markupBoxes.count) are not)")
     }
 
     /// The placement-index blocks the shell draws from must stay disjoint.
@@ -639,7 +652,8 @@ extension ReaderChecks {
         }
 
         // Enough of each block to cover any real document: 4096 pages, 4096 selection boxes,
-        // 4096 sidecar annotations, and 4096 loaded annotations with up to 64 quad boxes each.
+        // 4096 sidecar annotations, 4096 loaded annotations with up to 64 quad boxes each, and
+        // 4096 note glyphs.
         for page in 0..<4_096 { claim(PlacementIndex.pageRaster(page), "page \(page)'s raster") }
         for index in 0..<4_096 { claim(PlacementIndex.selection(index), "selection box \(index)") }
         for index in 0..<4_096 {
@@ -651,22 +665,26 @@ extension ReaderChecks {
                       "loaded annotation \(annotation) box \(box)")
             }
         }
+        for index in 0..<4_096 {
+            claim(PlacementIndex.documentNote(index), "note glyph \(index)")
+        }
 
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
-        // sidecar annotation, and the last loaded annotation's last box. The capacities are the
-        // ones `PlacementIndex` documents (2^28 pages, boxes and sidecar slots; 2^18 loaded
-        // annotations of 2^10 boxes each).
+        // sidecar annotation, the last loaded annotation's last box, and the last note glyph. The
+        // capacities are the ones `PlacementIndex` documents (2^28 pages, boxes, sidecar slots and
+        // note glyphs; 2^18 loaded annotations of 2^10 boxes each).
         claim(PlacementIndex.pageRaster(PlacementIndex.block - 1), "the last page's raster")
         claim(PlacementIndex.selection(PlacementIndex.block - 1), "the last selection box")
         claim(PlacementIndex.ownAnnotation(65_535), "the last sidecar annotation")
         claim(PlacementIndex.documentAnnotation(262_143, box: 1_023),
               "the last loaded annotation's last box")
+        claim(PlacementIndex.documentNote(PlacementIndex.block - 1), "the last note glyph")
 
-        require(owner.count == 4_096 + 4_096 + 4_096 + 4_096 * 64 + 4,
-                "page rasters, the selection, this reader's annotations and loaded annotations "
-                    + "never share a placement index (\(owner.count) distinct indices, including "
-                    + "the ends of each block)")
+        require(owner.count == 4_096 * 4 + 4_096 * 64 + 5,
+                "page rasters, the selection, this reader's annotations, loaded annotations and "
+                    + "note glyphs never share a placement index (\(owner.count) distinct indices, "
+                    + "including the ends of each block)")
     }
 
     // MARK: - Colour: anything the file carries, and a sidecar that keeps working either way
@@ -823,5 +841,404 @@ extension ReaderChecks {
                 page.image.pixelWidth == 1 && page.image.bgra == expected
             }
         })
+    }
+
+    // MARK: - The annotations that used to be listed but never drawn
+
+    /// The user's report, end to end in the shell: a file of nothing but notes now *shows* them.
+    ///
+    /// This is the check that fails on the build before the fix. `annotated-notes.pdf` is
+    /// `review_tang_0905.pdf` in miniature — sticky notes and free text, no markup at all — and on
+    /// that build the canvas skipped every one of its seven annotations, so an annotated page
+    /// looked like a blank one. Everything asserted here is user-visible:
+    ///
+    /// * every content annotation the engine reports is either **drawn** or **classified as
+    ///   skipped with a reason** — the accounting has to add up, and an annotation in neither
+    ///   bucket is the bug;
+    /// * a sticky note's quad reaches `canvasPages`, in the note index block, at its own `/Rect`,
+    ///   alpha-over, carrying a bitmap that is not a 1×1 tint (i.e. a real icon);
+    /// * a free-text annotation's quad does too, laid out at the size `/DA` states;
+    /// * the hidden marker and the `/Ink` annotation get no quad at all;
+    /// * clicking a drawn note shows its text (the sidebar follows, and the status line repeats it);
+    /// * and the composite of those quads — the same quads, the same blend modes, composited by
+    ///   CoreGraphics instead of by Metal — has the note's colour where the note is and page white
+    ///   where it is not. That is the pixel evidence a headless run can produce; it is written to
+    ///   `ARIS_READER_CHECK_SNAPSHOT_DIR` when that variable names a directory.
+    @MainActor static func annotationNoteChecks(url: URL) async throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            print("INFO: skipping note annotation checks (no notes fixture at \(url.path))")
+            return
+        }
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 900, height: 700))
+        state.open(url: url)
+        try await eventually("the notes-only file's annotations are read", {
+            !state.documentAnnotations.isEmpty || state.documentAnnotationsError != nil
+        })
+        require(state.documentAnnotationsError == nil, "reading the notes fixture does not fail")
+        require(state.documentAnnotations.count == 7, "all seven content annotations are read")
+
+        // ── 1. Every annotation is drawn or explicitly skipped, and the counts add up ──
+        var drawnNotes = 0
+        var drawnText = 0
+        var drawnMarkup = 0
+        var skipReasons: [String] = []
+        for annotation in state.documentAnnotations {
+            switch annotation.drawing {
+            case .markup:
+                drawnMarkup += 1
+            case .noteIcon:
+                drawnNotes += 1
+            case .freeText:
+                drawnText += 1
+            case .skipped:
+                require(annotation.skipReason != nil,
+                        "a skipped annotation says why (\(annotation.kind))")
+                skipReasons.append(annotation.skipReason?.rawValue ?? "?")
+            }
+        }
+        require(drawnMarkup + drawnNotes + drawnText + skipReasons.count
+                    == state.documentAnnotations.count,
+                "every content annotation is accounted for exactly once")
+        require(drawnMarkup == 0, "this fixture carries no text markup at all")
+        require(drawnNotes == 2, "both sticky notes are classified as drawn")
+        require(drawnText == 2, "both readable free texts are classified as drawn")
+        require(skipReasons == ["no-text", "hidden", "unmodelled"],
+                "the three undrawn annotations say why, got \(skipReasons)")
+
+        // A note that is classified as drawn has to *reach the canvas*, in the note index block.
+        let colouredNote = state.documentAnnotations[0]
+        let plainNote = state.documentAnnotations[1]
+        let freeText = state.documentAnnotations[2]
+        let hiddenNote = state.documentAnnotations[5]
+        let ink = state.documentAnnotations[6]
+        try await eventually("the sticky note's icon reaches the canvas", {
+            state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(0) }
+        })
+        try await eventually("the free-text annotation's text reaches the canvas", {
+            state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(2) }
+        })
+        guard let iconQuad = state.canvasPages.first(where: {
+            $0.placement.index == PlacementIndex.documentNote(0)
+        }), let textQuad = state.canvasPages.first(where: {
+            $0.placement.index == PlacementIndex.documentNote(2)
+        }) else {
+            fatalError("FAIL: the note quads left the frame they were just seen in")
+        }
+
+        // The icon is a bitmap, not a tint, and it is placed exactly on the annotation's /Rect.
+        require(iconQuad.image.pixelWidth > 8 && iconQuad.image.pixelHeight > 8,
+                "a sticky note is drawn as an icon, not as a 1x1 tint "
+                    + "(\(iconQuad.image.pixelWidth)x\(iconQuad.image.pixelHeight) px)")
+        require(iconQuad.blend == .normal, "a note icon is composited alpha-over, not multiplied")
+        require(abs(iconQuad.placement.widthPt - colouredNote.widthPt) < 0.001
+                    && abs(iconQuad.placement.heightPt - colouredNote.heightPt) < 0.001,
+                "the icon fills the /Rect the file gives the note")
+
+        // The free text is laid out at the size the file's /DA states.
+        require(freeText.fontSizePt == 14, "the 14 pt /DA size arrives, got "
+                    + "\(String(describing: freeText.fontSizePt))")
+        require(freeText.alignment == "center", "/Q 1 arrives as center")
+        require(textQuad.image.pixelWidth > 64 && textQuad.image.pixelHeight > 8,
+                "free text is drawn as a text raster (\(textQuad.image.pixelWidth)"
+                    + "x\(textQuad.image.pixelHeight) px)")
+        require(textQuad.blend == .normal, "free text is composited alpha-over")
+
+        // Nothing is drawn for what the file hides or for what this build has no rule for.
+        require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(5) },
+                "a hidden note gets no quad, so the page cannot contradict the file")
+        require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(6) },
+                "an /Ink annotation gets no quad — it is reported, not invented")
+        // Five, not four: the sidebar lists what a note *is*, so the empty free-text annotation
+        // (undrawn, `no-text`) is in the list even though it puts nothing on the page.
+        require(state.documentNotes.count == 5,
+                "the sidebar still lists every visible note, drawn or not "
+                    + "(\(state.documentNotes.count))")
+        require(hiddenNote.visible == false && ink.isNote == false,
+                "the two undrawn annotations are still classified as what they are")
+
+        // ── 2. Clicking a drawn note shows its contents ──
+        // The click point is in content space, which is where the canvas reports pointer events.
+        let iconCentre = CGPoint(
+            x: iconQuad.placement.leftPt + iconQuad.placement.widthPt / 2,
+            y: iconQuad.placement.topPt + iconQuad.placement.heightPt / 2
+        )
+        require(state.openDocumentNote(at: iconCentre), "a click on the note icon finds the note")
+        require(state.selectedDocumentAnnotationID == colouredNote.id,
+                "the clicked note is the one the sidebar highlights")
+        require(state.sidebarTab == .annotations && state.sidebarVisible,
+                "the note list is brought up, which is where a note's text can be read")
+        require(state.statusMessage.contains("sticky note with a colour"),
+                "the note's own text is shown, got \"\(state.statusMessage)\"")
+        require(!state.openDocumentNote(at: CGPoint(x: iconCentre.x - 200, y: iconCentre.y)),
+                "a click on the page background opens no note")
+        // …and the sidebar's own jump selects the same row, so the two directions agree.
+        state.jump(toDocumentAnnotation: plainNote)
+        require(state.selectedDocumentAnnotationID == plainNote.id,
+                "jumping from the sidebar selects that row too")
+
+        // Through the real click path, which ends the selection *first* and only then resolves a
+        // target (#55). A click on a note has to do both halves, so this pins the merge: drop the
+        // first and the note opens with the old selection still highlighted behind it; drop the
+        // second and a drawn note is not clickable at all.
+        let seed = AppState.Annotation(
+            id: UUID(),
+            page: 0,
+            start: 0,
+            end: 3,
+            color: AppState.highlightPalette[0].color,
+            note: "",
+            createdAt: Date()
+        )
+        state.jump(to: seed)
+        require(state.selection != nil, "something is selected before the click")
+        state.endPointerInteraction(at: iconCentre, wasClick: true)
+        require(state.selection == nil, "a click still ends the selection, wherever it lands")
+        require(state.selectedDocumentAnnotationID == colouredNote.id,
+                "…and a click on a drawn note still opens that note")
+        require(state.statusMessage.contains("sticky note with a colour"),
+                "the clicked note's text is what the status line shows, got \"\(state.statusMessage)\"")
+
+        // ── 3. The pixels: the quads the canvas was handed, composited ──
+        guard let snapshot = CanvasSnapshot(pages: state.canvasPages, scale: 2) else {
+            fatalError("FAIL: the canvas quads could not be composited for a pixel check")
+        }
+        let noteBox = CGRect(
+            x: iconQuad.placement.leftPt,
+            y: iconQuad.placement.topPt,
+            width: iconQuad.placement.widthPt,
+            height: iconQuad.placement.heightPt
+        )
+        let noteColour = colouredNote.color ?? AnnotationColor.defaultNote
+        let fill = snapshot.fraction(ofColor: noteColour, inContentRect: noteBox)
+        require(fill > 0.25,
+                "the sticky note is drawn in its own colour over the page (\(Int(fill * 100))% of "
+                    + "its box is \(noteColour.hex) \(snapshot.describe(noteBox)))")
+        let textBox = CGRect(
+            x: textQuad.placement.leftPt,
+            y: textQuad.placement.topPt,
+            width: textQuad.placement.widthPt,
+            height: textQuad.placement.heightPt
+        )
+        let textInk = snapshot.fractionOfInk(inContentRect: textBox)
+        require(textInk > 0.01,
+                "the free-text annotation's text is on the page (\(Int(textInk * 100))% of its "
+                    + "box is ink \(snapshot.describe(textBox)))")
+        // …and the second note, which the file gives no colour, is drawn in the default one.
+        let plainQuad = state.canvasPages.first {
+            $0.placement.index == PlacementIndex.documentNote(1)
+        }
+        if let plainQuad {
+            let plainBox = CGRect(
+                x: plainQuad.placement.leftPt,
+                y: plainQuad.placement.topPt,
+                width: plainQuad.placement.widthPt,
+                height: plainQuad.placement.heightPt
+            )
+            let plainFill = snapshot.fraction(
+                ofColor: AnnotationColor.defaultNote,
+                inContentRect: plainBox
+            )
+            require(plainFill > 0.25,
+                    "a note with no /C is still visible, in the default note colour "
+                        + "(\(Int(plainFill * 100))% of its box)")
+        } else {
+            fatalError("FAIL: the colourless note reached no quad")
+        }
+        if let directory = ProcessInfo.processInfo.environment["ARIS_READER_CHECK_SNAPSHOT_DIR"] {
+            snapshot.write(to: URL(fileURLWithPath: directory)
+                .appendingPathComponent("annotated-notes.png"))
+        }
+    }
+
+    /// The quads `MetalCanvasView` was handed, composited into one bitmap.
+    ///
+    /// **This is not a screenshot.** It is a CPU composite of the same placements and the same
+    /// blend modes the GPU is given, which is the most a headless run can produce: the Metal path
+    /// needs a presentable surface, and an occluded window never presents (see
+    /// `frameSchedulingChecks`). What it does prove is that the *handover* is right — that a note
+    /// glyph is a real bitmap, in the right place, in the right colour — which is where both of
+    /// this area's defects have actually lived.
+    ///
+    /// Blend modes mirror `aris-reader-gpu`'s shaders: alpha-over for `normal`, and CoreGraphics'
+    /// `multiply` for a tint whose `/CA` is already baked into its colour, which reproduces the
+    /// GPU's `dst × (a·c + 1 − a)` exactly at alpha 255.
+    struct CanvasSnapshot {
+        private let width: Int
+        private let height: Int
+        private let pixels: [UInt8]
+        private let origin: CGPoint
+        private let scale: CGFloat
+
+        @MainActor init?(pages: [CanvasPage], scale: CGFloat) {
+            guard !pages.isEmpty else { return nil }
+            let originX = pages.map(\.placement.leftPt).min() ?? 0
+            let originY = pages.map(\.placement.topPt).min() ?? 0
+            let widthPt = (pages.map { $0.placement.leftPt + $0.placement.widthPt }.max() ?? 0) - originX
+            let heightPt = (pages.map { $0.placement.topPt + $0.placement.heightPt }.max() ?? 0) - originY
+            let width = max(1, Int((widthPt * scale).rounded()))
+            let height = max(1, Int((heightPt * scale).rounded()))
+            let info = CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+            guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: info
+            ) else { return nil }
+
+            // The page is white paper under everything: an unpainted pixel is page, not hole.
+            context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+            for page in pages {
+                // Content space is top-down and CoreGraphics is bottom-up, so the rectangle is
+                // placed by its top edge. The image itself is not flipped: `CGContext.draw` maps
+                // an image's first row to the maximum-Y edge of the destination rectangle.
+                let rect = CGRect(
+                    x: (page.placement.leftPt - originX) * scale,
+                    y: (CGFloat(height))
+                        - (page.placement.topPt - originY + page.placement.heightPt) * scale,
+                    width: page.placement.widthPt * scale,
+                    height: page.placement.heightPt * scale
+                )
+                guard let image = Self.cgImage(for: page) else { continue }
+                context.setBlendMode(page.blend == .multiply ? .multiply : .normal)
+                context.draw(image, in: rect)
+            }
+            context.setBlendMode(.normal)
+
+            guard let data = context.data else { return nil }
+            self.width = width
+            self.height = height
+            self.pixels = Array(UnsafeBufferPointer(
+                start: data.bindMemory(to: UInt8.self, capacity: width * height * 4),
+                count: width * height * 4
+            ))
+            self.origin = CGPoint(x: originX, y: originY)
+            self.scale = scale
+        }
+
+        /// A `PageImage` as a `CGImage`, with the alpha convention it was built with.
+        ///
+        /// Page rasters come from PDFium premultiplied; every overlay this application builds —
+        /// the 1×1 tints and both note glyphs — is straight alpha, which is what the quad
+        /// pipeline's blend state expects. Whole-page rasters are opaque and the overlays are
+        /// not, so the two conventions are the ones the bytes were written in.
+        private static func cgImage(for page: CanvasPage) -> CGImage? {
+            let alpha: CGImageAlphaInfo = PlacementIndex.isPageRaster(page.placement.index)
+                ? .premultipliedFirst
+                : .first
+            let info = CGBitmapInfo(rawValue: alpha.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+            guard let provider = CGDataProvider(data: page.image.bgra as CFData) else { return nil }
+            return CGImage(
+                width: page.image.pixelWidth,
+                height: page.image.pixelHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: page.image.pixelWidth * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: info,
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+            )
+        }
+
+        /// The pixel at a point in **content space** (top-left origin, points), or `nil` outside.
+        func pixel(atContentPoint point: CGPoint) -> (red: UInt8, green: UInt8, blue: UInt8)? {
+            let x = Int(((point.x - origin.x) * scale).rounded(.down))
+            let y = Int(((point.y - origin.y) * scale).rounded(.down))
+            guard x >= 0, y >= 0, x < width, y < height else { return nil }
+            let offset = (y * width + x) * 4
+            return (pixels[offset + 2], pixels[offset + 1], pixels[offset])
+        }
+
+        /// How much of a content-space rectangle is a given colour, by area.
+        func fraction(ofColor color: AnnotationColor, inContentRect rect: CGRect) -> Double {
+            scan(rect) { red, green, blue in
+                abs(Int(red) - Int(color.red)) <= 2
+                    && abs(Int(green) - Int(color.green)) <= 2
+                    && abs(Int(blue) - Int(color.blue)) <= 2
+            }
+        }
+
+        /// How much of a content-space rectangle is *not* the white page — i.e. ink.
+        func fractionOfInk(inContentRect rect: CGRect) -> Double {
+            scan(rect) { red, green, blue in
+                Int(red) + Int(green) + Int(blue) < 3 * 240
+            }
+        }
+
+        /// The colours found in a rectangle, for a failure message that says what was drawn.
+        func describe(_ rect: CGRect) -> String {
+            let corners = [
+                CGPoint(x: rect.minX, y: rect.minY),
+                CGPoint(x: rect.midX, y: rect.midY),
+                CGPoint(x: rect.maxX - 1, y: rect.maxY - 1),
+            ].compactMap { point -> String? in
+                guard let colour = pixel(atContentPoint: point) else { return nil }
+                return String(format: "#%02X%02X%02X", colour.red, colour.green, colour.blue)
+            }
+            return "at \(corners.joined(separator: "/"))"
+        }
+
+        private func scan(
+            _ rect: CGRect,
+            _ matches: (UInt8, UInt8, UInt8) -> Bool
+        ) -> Double {
+            let minX = max(0, Int(((rect.minX - origin.x) * scale).rounded(.down)))
+            let minY = max(0, Int(((rect.minY - origin.y) * scale).rounded(.down)))
+            let maxX = min(width, Int(((rect.maxX - origin.x) * scale).rounded(.up)))
+            let maxY = min(height, Int(((rect.maxY - origin.y) * scale).rounded(.up)))
+            guard maxX > minX, maxY > minY else { return 0 }
+            var hits = 0
+            var total = 0
+            for y in minY..<maxY {
+                for x in minX..<maxX {
+                    let offset = (y * width + x) * 4
+                    total += 1
+                    if matches(pixels[offset + 2], pixels[offset + 1], pixels[offset]) {
+                        hits += 1
+                    }
+                }
+            }
+            return total == 0 ? 0 : Double(hits) / Double(total)
+        }
+
+        /// Writes the composite as a PNG, for a human to look at afterwards.
+        func write(to url: URL) {
+            let info = CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+            guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+                  let image = CGImage(
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bitsPerPixel: 32,
+                      bytesPerRow: width * 4,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGBitmapInfo(rawValue: info),
+                      provider: provider,
+                      decode: nil,
+                      shouldInterpolate: false,
+                      intent: .defaultIntent
+                  ),
+                  let destination = CGImageDestinationCreateWithURL(
+                      url as CFURL,
+                      "public.png" as CFString,
+                      1,
+                      nil
+                  )
+            else { return }
+            CGImageDestinationAddImage(destination, image, nil)
+            CGImageDestinationFinalize(destination)
+            print("INFO: wrote \(url.path)")
+        }
     }
 }

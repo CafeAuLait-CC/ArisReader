@@ -111,4 +111,39 @@ public enum PlacementIndex {
     public static func documentAnnotation(_ annotation: Int, box: Int) -> Int {
         -5 * block + annotation * 1_024 + box
     }
+
+    /// A note glyph loaded from the PDF — a sticky note's icon or a free-text annotation's text:
+    /// one per annotation, upwards from `-6·block`. Capacity: 2^28 notes.
+    ///
+    /// Below `documentAnnotation`'s base, which is the only room left: the blocks above are
+    /// `documentAnnotation` (`[-5·block, -4·block)`), the page rasters (`[-4·block + 1, -3·block]`,
+    /// growing *downwards* from `-3·block`), `ownAnnotation` and `selection`. It is a block of its
+    /// own rather than one more `box` slot beside the markup quads because a note glyph is not a
+    /// quad of a markup annotation: an annotation carrying both (a `/FreeText` with `/QuadPoints`
+    /// is malformed but readable) would otherwise draw one of the two with the other's texture. One
+    /// slot per annotation is enough because the reader classifies an annotation as either a note
+    /// icon or a free text, never both.
+    public static func documentNote(_ index: Int) -> Int { -6 * block + index }
+
+    // The blocks above, as predicates. The native checks classify the quads they are handed with
+    // these instead of by bitmap size, which stopped being a usable proxy the moment a free-text
+    // annotation's text raster could be wider than a small page raster.
+
+    /// Whether `index` names a whole-page raster (or a preview backdrop).
+    ///
+    /// Bounded at both ends: `pageRaster` grows downwards from `-3·block` for its whole documented
+    /// capacity, so the last one it can reach is `-4·block + 1`.
+    public static func isPageRaster(_ index: Int) -> Bool {
+        index > -4 * block && index <= -3 * block
+    }
+
+    /// Whether `index` names one box of a markup annotation loaded from the PDF.
+    public static func isDocumentAnnotationBox(_ index: Int) -> Bool {
+        index >= -5 * block && index < -4 * block
+    }
+
+    /// Whether `index` names a note glyph — a sticky note's icon or a free text's raster.
+    public static func isDocumentNote(_ index: Int) -> Bool {
+        index >= -6 * block && index < -5 * block
+    }
 }

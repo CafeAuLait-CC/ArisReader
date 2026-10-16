@@ -78,8 +78,8 @@
 #![allow(unsafe_code)]
 
 use aris_reader_core::{
-    AnnotationBlend, ArisError, ErrorCode, PageIndex, RawAnnotation, RawAnnotationColor,
-    RawAnnotationKind, Rect, Result,
+    AnnotationAlignment, AnnotationBlend, ArisError, ErrorCode, PageIndex, RawAnnotation,
+    RawAnnotationColor, RawAnnotationKind, Rect, Result,
 };
 use libloading::Library;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
@@ -160,6 +160,14 @@ const APPEARANCE_MODE_NORMAL: c_int = 0;
 const FLAG_INVISIBLE: c_int = 1 << 0;
 const FLAG_HIDDEN: c_int = 1 << 1;
 const FLAG_NOVIEW: c_int = 1 << 5;
+
+/// The largest `/DA` font size this reader will report, in points.
+///
+/// Not a rendering limit: a malformed `/DA` can state a size of any magnitude (and one in the
+/// wild states 4288 pt), and a free-text annotation drawn at that size covers the page. Above
+/// this the size is reported as "the file did not say", which is where the shell's own default
+/// takes over. 200 pt is larger than any page heading a reader would annotate with free text.
+const MAX_FONT_SIZE_PT: f64 = 200.0;
 
 /// The PDFium entry points this module uses, resolved once per process.
 struct Api {
@@ -426,6 +434,8 @@ impl AnnotationReader {
             contents: self.string(handle, c"Contents"),
             author: self.string(handle, c"T"),
             modified: self.string(handle, c"M"),
+            font_size_pt: self.font_size(handle),
+            alignment: self.alignment(handle),
             visible: !hidden,
         })
     }
@@ -543,6 +553,40 @@ impl AnnotationReader {
         Some(f64::from(value.clamp(0.0, 1.0)))
     }
 
+    /// The font size `/DA` states, in points.
+    ///
+    /// `/DA` is a content-stream fragment (`/DFWaWaSC-W5 18.000 Tf` in the review corpus); only
+    /// its `Tf` size is wanted here, and the font itself is deliberately not carried: the file
+    /// names a font this process does not have (a Chinese face in 22 of the corpus's 23 free-text
+    /// annotations), so the shell draws the text in its own face at the size the file asked for.
+    ///
+    /// The size is the operand *before* `Tf`, and PDF allows the operands and the operator to be
+    /// separated by any whitespace. A value that is not a usable size — zero, negative,
+    /// non-finite, or larger than [`MAX_FONT_SIZE_PT`] — is reported as "no size" rather than
+    /// clamped: a reader that invents 4288 pt of text is worse than one that falls back to its
+    /// own default and says the file did not state a size.
+    fn font_size(&self, handle: FpdfAnnotation) -> Option<f64> {
+        font_size_from_da(&self.string(handle, c"DA")?)
+    }
+
+    /// `/Q`, the quadding, as the file states it.
+    ///
+    /// `FPDFAnnot_GetNumberValue` is documented for numbers and `/Q` is an integer, so it is
+    /// readable with the same call as `/CA`. An absent or unreadable `/Q` is the PDF default
+    /// (left), which is also what a malformed value means.
+    fn alignment(&self, handle: FpdfAnnotation) -> AnnotationAlignment {
+        if !self.has_key(handle, c"Q") {
+            return AnnotationAlignment::default();
+        }
+        let mut value = 0.0f32;
+        // SAFETY: `handle` is live and `value` is a valid out-pointer.
+        let ok = unsafe { (self.api.get_number_value)(handle, c"Q".as_ptr(), &mut value) };
+        if ok == 0 || !value.is_finite() {
+            return AnnotationAlignment::default();
+        }
+        AnnotationAlignment::from_quadding(value.round() as i64)
+    }
+
     fn has_key(&self, handle: FpdfAnnotation, key: &CStr) -> bool {
         // SAFETY: `handle` is live and `key` is NUL-terminated.
         unsafe { (self.api.has_key)(handle, key.as_ptr()) != 0 }
@@ -595,6 +639,27 @@ impl Drop for AnnotationReader {
         // SAFETY: the handle came from `FPDF_LoadDocument` and is closed exactly once, here.
         unsafe { (self.api.close_document)(self.document) };
     }
+}
+
+/// The size operand of the `Tf` operator in a `/DA` string, when it states a usable one.
+///
+/// A `/DA` is a content-stream fragment, so the operands and the operator may be separated by any
+/// whitespace and the fragment may hold more than one operator (`/Helv 12 Tf 0 g`). The *last*
+/// operand before `Tf` is the size (the operand before that is the font's resource name).
+///
+/// Split out of [`AnnotationReader::font_size`] so it can be tested without a PDFium document:
+/// the parsing is where the edge cases live (a missing `Tf`, a `Tf` with too few operands, a size
+/// that is not a number, a size no reader should draw), and none of them needs a file.
+fn font_size_from_da(da: &str) -> Option<f64> {
+    let mut operands: Vec<&str> = Vec::new();
+    for token in da.split_whitespace() {
+        if token == "Tf" {
+            let size: f64 = operands.last()?.parse().ok()?;
+            return (size.is_finite() && size > 0.0 && size <= MAX_FONT_SIZE_PT).then_some(size);
+        }
+        operands.push(token);
+    }
+    None
 }
 
 /// Whether an annotation of this subtype is something a reader would show or list.
@@ -768,5 +833,61 @@ mod tests {
             subtype_kind(999),
             RawAnnotationKind::Other("Subtype999".to_string())
         );
+    }
+
+    /// `/DA` is the only place a free-text annotation's size lives, and it is a content-stream
+    /// fragment rather than a number. Every shape below is one this reader has to survive: the
+    /// two the review corpus actually writes, a colour operator after the `Tf`, and the malformed
+    /// ones a hand-edited file can carry.
+    #[test]
+    fn a_default_appearance_string_yields_its_font_size_or_nothing() {
+        // The 22 Chinese free-text annotations in the review corpus: no colour operator at all.
+        assert_eq!(font_size_from_da("/DFWaWaSC-W5 18.000 Tf"), Some(18.0));
+        // The one the corpus writes alongside a text-rise operand.
+        assert_eq!(font_size_from_da("/SimSun 12 Tf 16.25 TL "), Some(12.0));
+        // A colour operator after the size, the shape most producers write.
+        assert_eq!(font_size_from_da("/Helv 10 Tf 0 g"), Some(10.0));
+        // Any whitespace separates operands, and the last operand before `Tf` is the size.
+        assert_eq!(font_size_from_da("  /F1\t9.5\nTf "), Some(9.5));
+        // A `Tf` with no size in front of it is not a size.
+        assert_eq!(font_size_from_da("Tf"), None);
+        assert_eq!(font_size_from_da("/Helv Tf"), None);
+        assert_eq!(font_size_from_da("/Helv abc Tf"), None);
+        // No `Tf` at all, an empty string, and nothing to read.
+        assert_eq!(font_size_from_da("/Helv 12 rg"), None);
+        assert_eq!(font_size_from_da(""), None);
+        // A size no reader should draw: zero, negative, not finite, or larger than a page.
+        assert_eq!(font_size_from_da("/Helv 0 Tf"), None);
+        assert_eq!(font_size_from_da("/Helv -12 Tf"), None);
+        assert_eq!(font_size_from_da("/Helv inf Tf"), None);
+        assert_eq!(font_size_from_da("/Helv 4288 Tf"), None);
+        assert_eq!(font_size_from_da("/Helv 200 Tf"), Some(200.0));
+    }
+
+    #[test]
+    fn quadding_maps_to_the_three_alignments_with_left_as_the_default() {
+        assert_eq!(
+            AnnotationAlignment::from_quadding(0),
+            AnnotationAlignment::Left
+        );
+        assert_eq!(
+            AnnotationAlignment::from_quadding(1),
+            AnnotationAlignment::Center
+        );
+        assert_eq!(
+            AnnotationAlignment::from_quadding(2),
+            AnnotationAlignment::Right
+        );
+        // Anything else is the PDF's own default rather than a guess.
+        assert_eq!(
+            AnnotationAlignment::from_quadding(7),
+            AnnotationAlignment::Left
+        );
+        assert_eq!(
+            AnnotationAlignment::from_quadding(-1),
+            AnnotationAlignment::Left
+        );
+        assert_eq!(AnnotationAlignment::default(), AnnotationAlignment::Left);
+        assert_eq!(AnnotationAlignment::Right.as_str(), "right");
     }
 }
