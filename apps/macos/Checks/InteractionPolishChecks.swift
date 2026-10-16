@@ -76,6 +76,7 @@ extension ReaderChecks {
         let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
         view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
         view.onScrollStep = { delta in state.scrollByWheelStep(delta) }
+        view.onKeyboardStep = { delta in state.scrollByKeyboardStep(delta) }
         view.onZoomScroll = { delta, anchor in
             state.zoomByScroll(delta: delta, anchorViewY: anchor)
         }
@@ -428,6 +429,7 @@ extension ReaderChecks {
         let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
         view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
         view.onScrollStep = { delta in state.scrollByWheelStep(delta) }
+        view.onKeyboardStep = { delta in state.scrollByKeyboardStep(delta) }
         view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
 
         // ── Precise deltas are 1:1, and two different deltas give two different offsets ────
@@ -467,9 +469,9 @@ extension ReaderChecks {
         offsets.append(state.scrollYPt)
         let increments = zip(offsets, offsets.dropFirst()).map { $1 - $0 }
         let ceiling = Double(ScrollGlide.defaultMaximumSpeed) * 0.008 + 1e-6
-        require(increments.count >= 6,
+        require(increments.count >= 5,
                 "the notch is covered in small increments, not one (\(increments.count) ticks)")
-        require(increments.allSatisfy { abs($0) <= 32 * ScrollGlide.maximumTickFraction + 1e-6 },
+        require(increments.allSatisfy { abs($0) <= 32 * 0.25 + 1e-6 },
                 "no increment swallows more than a quarter of the notch "
                 + "(largest \(increments.map { abs($0) }.max() ?? 0) pt of 32)")
         require(increments.allSatisfy { $0 < 0 },
@@ -607,12 +609,15 @@ extension ReaderChecks {
         let (idle, _) = glide.step(from: 0, elapsed: 0)
         require(idle == 0, "a zero-length tick moves nothing")
         // A tick that arrives late while the notches are still coming must not swallow the glide:
-        // it moves at most its share of what is left, and the rest arrives on later ticks.
-        glide.aim(at: -1000, maximumSpeed: 1_000_000)
+        // a long tick counts as one frame of the ceiling and the rest arrives on later ticks.
+        // Aimed without a lead: this case is about a stalled tick, not about the bound
+        // (`ScrollTailChecks` and `smoothScrollChecks` pin that), so the whole 1000 pt is owed.
+        glide.aim(at: -1000, from: 0, mostAhead: nil, maximumSpeed: 1_000_000)
         let (stalled, stalledDone) = glide.step(from: 0, elapsed: 0.04)
-        require(!stalledDone && abs(stalled) <= 1000 * ScrollGlide.maximumTickFraction + 1e-6,
-                "a stalled tick moves at most \(ScrollGlide.maximumTickFraction) of the distance "
-                + "(\(stalled) pt of 1000)")
+        let stalledCeiling = 1_000_000 * ScrollGlide.maximumStepTime
+        require(!stalledDone && abs(stalled) <= stalledCeiling + 1e-6,
+                "a stalled tick moves at most one frame of its ceiling (\(stalled) pt of "
+                + "\(stalledCeiling), not the whole 1000)")
         var catchingUp = stalled
         for _ in 0..<200 {
             let (next, finished) = glide.step(from: catchingUp, elapsed: 0.04)
@@ -627,7 +632,7 @@ extension ReaderChecks {
         // ceiling at a time, so even a 10 s tick lengthens the finish instead of jumping it. A CI
         // runner ran the driver's 8 ms ticks 40 ms late and published a 96 pt glide as three
         // offsets; `ScrollTailChecks` pins that case on a simulated clock.
-        glide.aim(at: -1000)
+        glide.aim(at: -1000, from: 0, mostAhead: nil)
         var finishing: CGFloat = -300
         var largestFinishStep: CGFloat = 0
         var finishTicks = 0

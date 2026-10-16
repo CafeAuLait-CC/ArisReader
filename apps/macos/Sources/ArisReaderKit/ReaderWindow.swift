@@ -99,6 +99,9 @@ public struct ReaderWindow: View {
                 // classic wheel's notch is glided to so the page moves instead of stepping.
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
                 onScrollStep: { delta in state.scrollByWheelStep(delta) },
+                // A page key is a destination, not a speed: it keeps its whole page (and its tail,
+                // one screen at the ceiling) while a wheel spin's stale backlog is dropped.
+                onKeyboardStep: { delta in state.scrollByKeyboardStep(delta) },
                 // Ctrl+scroll and ⌘+scroll zoom instead of scrolling (docs/04-ui-ux.md §3). Ctrl
                 // is the binding the request asked for; ⌘ is the documented convention and the
                 // fallback when macOS Accessibility zoom has taken Ctrl over. Pinch works in
