@@ -39,15 +39,21 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
-        // The scroll-tail fix on its own, while it is being worked on
-        // (`ArisReaderChecks --check-scroll-tail .`).
-        if CommandLine.arguments.contains("--check-scroll-tail") {
+        // The two interaction fixes, on their own, while they are being worked on
+        // (`ArisReaderChecks --check-click-intent .`).
+        if CommandLine.arguments.contains("--check-click-intent")
+            || CommandLine.arguments.contains("--check-scroll-tail") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
-            scrollGlideTailChecks()
-            try await scrollTailDriverChecks(
-                url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
-            print("Scroll-tail checks passed")
+            if CommandLine.arguments.contains("--check-click-intent") {
+                try await clickIntentChecks(
+                    url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
+            } else {
+                scrollGlideTailChecks()
+                try await scrollTailDriverChecks(
+                    url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            }
+            print("Interaction checks passed")
             return
         }
         // Lets the document-opening checks be run on their own while they are being worked on.
@@ -139,6 +145,8 @@ struct ReaderChecks {
                 && state.references.isEmpty && state.outline.isEmpty && state.annotations.isEmpty,
                 "closing last tab rejects pending work and clears document data")
         try await interactionChecks(url: a)
+        try await clickIntentChecks(
+            url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
         try await screenPageChecks(url: b)
         try await screenPageDegradationChecks(url: b)
         try await defaultModeRenderChecks(url: b)

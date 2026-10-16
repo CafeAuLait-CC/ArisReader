@@ -2276,6 +2276,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Ends a pointer interaction: a click follows a link, a drag keeps the selection so
     /// ⌘C can copy it.
+    ///
+    /// A click that stayed inside the canvas' slop never started a selection, so this must not
+    /// change one either: the reader clicks a citation, a figure mention or a link to bring up
+    /// its preview, and a click that resolves nothing leaves whatever they had selected alone.
+    /// The one exception is a click on the page's own background — there is no text under it to
+    /// select and no reference to follow, so it deselects, the way clicking away does everywhere
+    /// else on the platform.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         guard wasClick else {
             extendSelection(to: point)
@@ -2296,7 +2303,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let handled = followLink(at: point)
             || openCitation(at: point)
             || openFigureMention(at: point)
-        if handled || selection == nil {
+        if !handled, characterIndex(at: point) == nil {
             clearSelection()
         }
     }
