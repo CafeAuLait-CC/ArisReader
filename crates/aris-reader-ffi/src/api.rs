@@ -11,7 +11,8 @@
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
 use aris_reader_core::{
-    DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, Point, RasterRequest,
+    AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, Point,
+    RasterRequest,
 };
 use aris_reader_pdfium::{PdfiumBackend, backend_description};
 use aris_reader_session::DocumentLayout;
@@ -785,6 +786,9 @@ impl ArisDocument {
 
             for annotation in self.backend.annotations(PageIndex(page))? {
                 let view = page_region_to_view(annotation.rect, geometry);
+                // Classified before the record is built: the answer travels with the annotation
+                // rather than being re-derived by every consumer from `kind` and `visible`.
+                let drawing = annotation.drawing();
                 let quads = annotation
                     .quads
                     .into_iter()
@@ -817,6 +821,13 @@ impl ArisDocument {
                     contents: annotation.contents,
                     author: annotation.author,
                     modified: annotation.modified,
+                    font_size_pt: annotation.font_size_pt,
+                    alignment: annotation.alignment.as_str().to_string(),
+                    drawing: drawing.as_str().to_string(),
+                    skip_reason: match drawing {
+                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
+                        _ => None,
+                    },
                     visible: annotation.visible,
                 });
             }
@@ -1149,6 +1160,29 @@ pub struct AnnotationRecord {
     pub author: Option<String>,
     /// `/M`, as the file writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
     pub modified: Option<String>,
+    /// The font size `/DA` states for this annotation's text, in points; `None` when the file
+    /// states none, or states one no reader should draw (zero, negative, or page-sized — see
+    /// `aris-reader-pdfium::annotations`).
+    ///
+    /// This is what a `/FreeText` annotation's size lives in, and it is read for every kind
+    /// because the key is legal on all of them. The shell draws free text at this size when it has
+    /// one, and otherwise at its own default, which it reports.
+    pub font_size_pt: Option<f64>,
+    /// `/Q`: `left`, `center` or `right` — how a `/FreeText` annotation's text is aligned in its
+    /// rectangle. Always one of the three: the PDF's own default (left) stands in when the file
+    /// says nothing, so the shell never has to decide what "no alignment" means.
+    pub alignment: String,
+    /// What to put on the page, and the reason when the answer is "nothing": `markup` (a tinted
+    /// box per quad), `noteIcon` (a `/Text` sticky note), `freeText` (a `/FreeText` annotation's
+    /// own text), or `skipped`.
+    ///
+    /// Stated by the reader rather than re-derived by each consumer, so the dump, the checks and
+    /// the canvas cannot disagree about which annotations are supposed to appear.
+    pub drawing: String,
+    /// Why nothing is drawn, when `drawing` is `skipped`: `hidden` (the file's `/F` says so),
+    /// `empty-rect` (no box to draw in) or `unmodelled` (a subtype this build has no rule for).
+    /// `None` for every drawn annotation.
+    pub skip_reason: Option<String>,
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     pub visible: bool,
 }
@@ -1701,6 +1735,35 @@ mod tests {
         assert_eq!(sticky.color, None);
         assert_eq!(sticky.contents.as_deref(), Some("A sticky note body."));
         assert_eq!(sticky.author.as_deref(), Some("Reviewer D"));
+        // …and it arrives with the reader's own answer about what to do with it, so the shell
+        // does not have to re-derive the rule from `kind` (the two drifted apart once already).
+        assert_eq!(sticky.drawing, "noteIcon");
+        assert_eq!(sticky.skip_reason, None);
+        assert_eq!(sticky.alignment, "left", "no /Q is the PDF's own default");
+        assert_eq!(sticky.font_size_pt, None, "a sticky note carries no /DA");
+
+        // The free text is the annotation whose layout needs what only the file can say.
+        let free_text = &records[4];
+        assert_eq!(free_text.kind, "freeText");
+        assert_eq!(free_text.drawing, "freeText");
+        assert_eq!(free_text.font_size_pt, Some(10.0), "/DA (/Helv 10 Tf 0 g)");
+        assert_eq!(free_text.alignment, "left");
+
+        // Every record says either what to draw or why nothing is drawn; a record with neither
+        // would be an annotation the reader reports and then loses.
+        for record in &records {
+            match record.drawing.as_str() {
+                "skipped" => assert!(
+                    record.skip_reason.is_some(),
+                    "{record:?} is skipped without a reason"
+                ),
+                "markup" | "noteIcon" | "freeText" => assert_eq!(
+                    record.skip_reason, None,
+                    "{record:?} is drawn and also carries a skip reason"
+                ),
+                other => panic!("{record:?} has no drawing classification: {other}"),
+            }
+        }
 
         // Every record has to be inside its own page: a Y flip that quietly dropped the crop
         // origin would put one of these outside the box.

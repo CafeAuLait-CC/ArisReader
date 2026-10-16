@@ -1,0 +1,108 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R] >>
+endobj
+5 0 obj
+<< /Length 1095 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated with notes) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (sticky notes and free text, and no markup at all) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: commented on rather than marked up.) Tj T*
+(Line 2: commented on rather than marked up.) Tj T*
+(Line 3: commented on rather than marked up.) Tj T*
+(Line 4: commented on rather than marked up.) Tj T*
+(Line 5: commented on rather than marked up.) Tj T*
+(Line 6: commented on rather than marked up.) Tj T*
+(Line 7: commented on rather than marked up.) Tj T*
+(Line 8: commented on rather than marked up.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 690 526 716] /Name /Comment /C [1 0.85 0.2] /AP << /N 14 0 R >> /Contents (A sticky note with a colour of its own.) /T (Reviewer A) /M (D:20240102030405Z) /F 4 >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 640 526 666] /Name /Comment /Contents (A sticky note the file gives no colour.) /T (Reviewer B) /M (D:20240102030405Z) /F 4 >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [72 560 400 600] /DA (/Helv 14 Tf 0 g) /Q 1 /C [0.1 0.45 0.9] /Contents (Free text: 14 pt from /DA, centred by /Q, in its own colour.) /T (Reviewer C) /M (D:20240102030405Z) /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [72 500 400 528] /DA (/Helv 9 Tf 0 g) /Q 0 /Contents (Free text with no colour of its own.) /T (Reviewer D) /M (D:20240102030405Z) /F 4 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [72 460 160 480] /DA (/Helv 12 Tf 0 g) /T (Reviewer E) /M (D:20240102030405Z) /F 4 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Text /Rect [0 0 1 1] /Name /Comment /C [1 1 0] /Contents (A note the file marks hidden.) /T (Reviewer F) /M (D:20240102030405Z) /F 6 >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Ink /Rect [72 400 220 440] /C [0.2 0.2 0.2] /InkList [72 400 100 430 140 405 180 440 220 400] /Contents (Ink, a subtype this build does not draw.) /T (Reviewer G) /M (D:20240102030405Z) /F 4 >>
+endobj
+13 0 obj
+<< /Type /ExtGState /BM /Multiply /ca 0.968627 /CA 0.968627 /AIS false >>
+endobj
+14 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [500 690 526 716] /Matrix [1 0 0 1 -500 -690] /Group << /S /Transparency /Type /Group >> /Resources << /ExtGState << /X 13 0 R >> >> /Length 64 >>
+stream
+/X gs
+1 0.85 0.2 rg
+500 690 m 526 690 l 526 716 l 500 716 l h f
+
+endstream
+endobj
+xref
+0 15
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000399 00000 n 
+0000001546 00000 n 
+0000001766 00000 n 
+0000001950 00000 n 
+0000002188 00000 n 
+0000002383 00000 n 
+0000002526 00000 n 
+0000002704 00000 n 
+0000002940 00000 n 
+0000003030 00000 n 
+trailer
+<< /Size 15 /Root 1 0 R >>
+startxref
+3326
+%%EOF

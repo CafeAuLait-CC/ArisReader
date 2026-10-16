@@ -145,9 +145,10 @@ pub struct RawTextPage {
 
 /// What an annotation found inside a PDF is, reduced to what a reader can act on.
 ///
-/// The four markup kinds carry quad points, which is what makes them drawable as
-/// highlights; `Text` is a sticky note (an icon with a popup and no geometry of its own) and
-/// `FreeText` is a note drawn directly on the page. Everything else is reported but not drawn.
+/// The four markup kinds carry quad points, which is what makes them drawable as highlights;
+/// `Text` is a sticky note, drawn as its icon in `/Rect`, and `FreeText` is a note drawn directly
+/// on the page, drawn as its own text in `/Rect`. Everything else is reported but not drawn —
+/// [`AnnotationDrawing`] is where that "not drawn" comes with a reason attached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawAnnotationKind {
     Highlight,
@@ -178,8 +179,8 @@ impl RawAnnotationKind {
 
     /// Whether this is one of the four text-markup kinds the canvas draws geometry for.
     ///
-    /// `Text` and `FreeText` are notes (listed, not drawn as markup on the page), and everything
-    /// else is reported without a drawing rule. The shell has the same predicate
+    /// `Text` and `FreeText` are notes (drawn as a note icon and as text, not as markup boxes),
+    /// and everything else is reported without a drawing rule. The shell has the same predicate
     /// (`DocumentAnnotation.isMarkup` in `apps/macos`); it is stated once here so the CLI dump and
     /// the canvas cannot disagree about which annotations are supposed to be drawn.
     pub fn is_markup(&self) -> bool {
@@ -187,6 +188,15 @@ impl RawAnnotationKind {
             self,
             Self::Highlight | Self::Underline | Self::Strikeout | Self::Squiggly
         )
+    }
+
+    /// Whether this kind is a note: something whose `/Contents` is the point of it.
+    ///
+    /// The two note kinds are what a review PDF is mostly made of — measured 2026-10-15 on the
+    /// seven annotated review PDFs the user supplied (`pdf-samples/with_annotations/`): 122 of
+    /// their 242 content annotations are notes, and one of the seven is *only* notes.
+    pub fn is_note(&self) -> bool {
+        matches!(self, Self::Text | Self::FreeText)
     }
 
     /// The blend mode this kind is composited with when the file states no `/BM`.
@@ -216,8 +226,8 @@ impl RawAnnotationKind {
         match self {
             Self::Highlight | Self::Underline | Self::Strikeout => AnnotationBlend::Multiply,
             // A squiggly is drawn as a wave *beside* the text rather than through it, and PDFium
-            // composites it alpha-over; `Text`, `FreeText` and everything unmodelled have no
-            // markup drawing rule at all.
+            // composites it alpha-over; a note's icon and its free text are opaque glyphs and
+            // alpha-over too, and everything unmodelled is not drawn at all.
             Self::Squiggly | Self::Text | Self::FreeText | Self::Other(_) => {
                 AnnotationBlend::Normal
             }
@@ -260,6 +270,104 @@ impl AnnotationBlend {
     }
 }
 
+/// How a `/FreeText` annotation's text sits inside its rectangle (`/Q`, the quadding).
+///
+/// PDF 32000-1 table 174 gives `/Q` for free text (and for the markup kinds, where it does not
+/// change any geometry this reader draws). The dictionary default is 0, which is left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnnotationAlignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl AnnotationAlignment {
+    /// `/Q`: 0 left, 1 centre, 2 right. Anything else — including a malformed value — is left,
+    /// which is what the spec's default says rather than a guess at what the file meant.
+    pub fn from_quadding(value: i64) -> Self {
+        match value {
+            1 => Self::Center,
+            2 => Self::Right,
+            _ => Self::Left,
+        }
+    }
+
+    /// Stable lower-case name, used as-is across the FFI boundary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// What a reader should put on the page for one annotation.
+///
+/// This exists so that "it is in the sidebar but not on the page" is always an *answer* rather
+/// than an absence of one: every content annotation the reader reports classifies as exactly one
+/// of these, and the only way to draw nothing is [`AnnotationDrawing::Skipped`], which carries the
+/// reason. The CLI dump prints the same value the canvas acts on, so the two cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnotationDrawing {
+    /// One of the four text-markup kinds: a tinted box per `/QuadPoints` entry.
+    Markup,
+    /// `/Text`: the sticky note's icon, filling `/Rect`.
+    NoteIcon,
+    /// `/FreeText`: the annotation's own text, laid out in `/Rect`.
+    FreeText,
+    /// Nothing is drawn, for the reason carried.
+    Skipped(AnnotationSkipReason),
+}
+
+impl AnnotationDrawing {
+    /// Stable lower-case name, used as-is across the FFI boundary and by the CLI dump.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Markup => "markup",
+            Self::NoteIcon => "noteIcon",
+            Self::FreeText => "freeText",
+            Self::Skipped(_) => "skipped",
+        }
+    }
+}
+
+/// Why an annotation the reader reports is not drawn.
+///
+/// Deliberately a closed set with a reason each: a reader that silently drops an annotation is
+/// indistinguishable from one that cannot read it, which is the failure this whole area exists to
+/// prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnotationSkipReason {
+    /// `/F` marks it `/Invisible`, `/Hidden` or `/NoView`; drawing it would contradict the file.
+    ///
+    /// The review corpus is full of these: 49 of its 99 sticky notes are "completed" markers that
+    /// an Acrobat review workflow flagged hidden and left at `/Rect [0 0 1 1]`.
+    Hidden,
+    /// `/Rect` has no area, so there is no box to put an icon or a line of text in.
+    EmptyRect,
+    /// A `/FreeText` with no `/Contents`: there is no text to lay out, and this reader draws the
+    /// annotation's text rather than its box. (A sticky note with no text is still drawn — its
+    /// icon is the point, which is why that case is not here.)
+    EmptyContents,
+    /// The subtype has no drawing rule in this build (`Ink`, `Stamp`, …). Listing it is all this
+    /// reader promises for now, and the PDF's own `/Subtype` name travels with the annotation.
+    Unmodelled,
+}
+
+impl AnnotationSkipReason {
+    /// Stable lower-case name, used for diagnostics and by the CLI dump.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::EmptyRect => "empty-rect",
+            Self::EmptyContents => "no-text",
+            Self::Unmodelled => "unmodelled",
+        }
+    }
+}
+
 /// An annotation colour as an 8-bit sRGB triple (`/C`, `/IC`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawAnnotationColor {
@@ -298,9 +406,62 @@ pub struct RawAnnotation {
     pub author: Option<String>,
     /// `/M` — modification date, as the PDF writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
     pub modified: Option<String>,
+    /// The font size `/DA` states, in points, when it states one.
+    ///
+    /// `/DA` is required on a `/FreeText` and is where the size of its text lives; PDF 32000-1
+    /// table 174. It is read for every kind (the key is legal on all of them) and is `None` when
+    /// the file carries no `/DA`, no `Tf` operator, or a size no reader should trust — a negative,
+    /// zero, non-finite or absurdly large one. A caller that gets `None` has to choose a size; the
+    /// shell draws free text at its own default and says so.
+    pub font_size_pt: Option<f64>,
+    /// `/Q`, how the text of a `/FreeText` is aligned in `/Rect`; the PDF default (left) when the
+    /// file states none.
+    pub alignment: AnnotationAlignment,
     /// False when the file marks the annotation `/Hidden`, `/Invisible` or `/NoView`, i.e. when
     /// drawing it would contradict the file.
     pub visible: bool,
+}
+
+impl RawAnnotation {
+    /// What to draw for this annotation.
+    ///
+    /// The single place the drawing rules live, so the CLI dump, the native checks and the canvas
+    /// cannot disagree about which annotations are supposed to appear on the page. The shell's
+    /// half of the same question is `DocumentAnnotation.placementKind` in `apps/macos`, which
+    /// switches on the `kind` string this classification is named after.
+    pub fn drawing(&self) -> AnnotationDrawing {
+        if !self.visible {
+            return AnnotationDrawing::Skipped(AnnotationSkipReason::Hidden);
+        }
+        // A box with no area cannot hold an icon or a line of text. A markup annotation is still
+        // drawn from its `/QuadPoints` when it has them, so only the two note kinds care.
+        let has_area = self.rect.size.width > 0.0 && self.rect.size.height > 0.0;
+        let has_text = self
+            .contents
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        match self.kind {
+            RawAnnotationKind::Highlight
+            | RawAnnotationKind::Underline
+            | RawAnnotationKind::Strikeout
+            | RawAnnotationKind::Squiggly => AnnotationDrawing::Markup,
+            RawAnnotationKind::Text | RawAnnotationKind::FreeText if !has_area => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyRect)
+            }
+            RawAnnotationKind::Text => AnnotationDrawing::NoteIcon,
+            // This reader draws a free-text annotation's *text*, not its box, so a file that
+            // carries no text has nothing to show — one such annotation is in the review corpus
+            // (an empty 2×12 pt box), and drawing an empty box would put a mark on the page that
+            // the file does not have.
+            RawAnnotationKind::FreeText if !has_text => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyContents)
+            }
+            RawAnnotationKind::FreeText => AnnotationDrawing::FreeText,
+            RawAnnotationKind::Other(_) => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::Unmodelled)
+            }
+        }
+    }
 }
 
 /// PDF engine interface. See `aris-reader-pdfium` for an implementation (the first backend); a pure Rust backend may follow.

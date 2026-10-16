@@ -1339,8 +1339,22 @@ mod tests {
         Some(PdfiumBackend::open(&fixture, None).expect("open appearance fixture"))
     }
 
-    /// Every field the reader promises, against the values the fixture was written with.
+    /// The same, for the notes-only fixture `annotated-notes.pdf`.
     ///
+    /// One of the user's seven review PDFs (`review_tang_0905.pdf`) carries 22 content
+    /// annotations and **no markup at all**: 11 sticky notes and 11 hidden "completed" markers.
+    /// This is that file in miniature, and it is what the classification test below runs on.
+    fn annotated_notes_fixture() -> Option<PdfiumBackend> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/annotated-notes.pdf");
+        if !fixture.exists() || !crate::is_available() {
+            eprintln!("skipping: notes fixture or PDFium unavailable");
+            return None;
+        }
+        Some(PdfiumBackend::open(&fixture, None).expect("open notes fixture"))
+    }
+
+    /// Every field the reader promises, against the values the fixture was written with.
     /// The expected bytes are the ones PDFium produced for `/C [0.2 0.6 1]` when this test was
     /// written (measured with a ctypes harness against the same library). PDFium truncates
     /// `channel × 255` in `f32`, so the values are asserted exactly: a silent change in that
@@ -1434,6 +1448,124 @@ mod tests {
         assert_eq!(without_quads.kind, RawAnnotationKind::Highlight);
         assert!(without_quads.quads.is_empty());
         assert_eq!(without_quads.rect, Rect::new(72.0, 656.0, 228.0, 15.0));
+    }
+
+    /// Nothing the reader reports is invisible without an answer: every content annotation is
+    /// either drawn or *classified* as skipped, with the reason.
+    ///
+    /// This is the check for the user's report — "文件里有非常多的批注没能显示" — reduced to
+    /// something a test can hold: on `annotated-notes.pdf` (a notes-only file, the shape of
+    /// `review_tang_0905.pdf`), master's reader drew *nothing at all*, because the only drawing
+    /// rule it had was for the four text-markup kinds and this file has none of them. A reader
+    /// whose answer is "not drawn, and here is why" for a hidden "completed" marker and "drawn as
+    /// an icon in #FFD833" for a note is one whose page matches its sidebar.
+    ///
+    /// The four skips are the whole point of the second half: an unclassified annotation would be
+    /// indistinguishable from one this build cannot read, which is the failure mode being fixed.
+    #[test]
+    fn every_content_annotation_is_drawn_or_skipped_with_a_reason() {
+        use aris_reader_core::{AnnotationAlignment, AnnotationDrawing, AnnotationSkipReason};
+
+        let Some(backend) = annotated_notes_fixture() else {
+            return;
+        };
+        let annotations = backend.annotations(PageIndex(0)).expect("annotations");
+        assert_eq!(
+            annotations.len(),
+            7,
+            "the fixture's seven content annotations"
+        );
+
+        let mut drawn_notes = 0;
+        let mut drawn_text = 0;
+        let mut drawn_markup = 0;
+        let mut skips: Vec<AnnotationSkipReason> = Vec::new();
+        for annotation in &annotations {
+            match annotation.drawing() {
+                AnnotationDrawing::Markup => drawn_markup += 1,
+                AnnotationDrawing::NoteIcon => drawn_notes += 1,
+                AnnotationDrawing::FreeText => drawn_text += 1,
+                AnnotationDrawing::Skipped(reason) => skips.push(reason),
+            }
+        }
+        // A notes-only file: nothing here is markup, which is exactly why it used to look blank.
+        assert_eq!(drawn_markup, 0, "this fixture carries no text markup");
+        assert_eq!(drawn_notes, 2, "both of its sticky notes are drawn");
+        assert_eq!(drawn_text, 2, "both of its readable free texts are drawn");
+        assert_eq!(
+            skips,
+            vec![
+                // In file order: the empty free text, the hidden "completed" marker, the ink.
+                AnnotationSkipReason::EmptyContents,
+                AnnotationSkipReason::Hidden,
+                AnnotationSkipReason::Unmodelled,
+            ],
+            "each of the three undrawn annotations says why"
+        );
+
+        // A note with a stated colour is drawn in it; a note without one still has a colour to
+        // draw with (the shell's default), and its `/Rect` is what the icon fills.
+        let coloured = &annotations[0];
+        assert_eq!(coloured.drawing(), AnnotationDrawing::NoteIcon);
+        assert_eq!(
+            coloured.color,
+            Some(RawAnnotationColor {
+                red: 255,
+                // 0.85 × 255 is 216.75, which PDFium truncates in f32 rather than rounding —
+                // the same conversion the markup colours go through.
+                green: 216,
+                blue: 51
+            }),
+            "/C [1 0.85 0.2] survives the appearance stream, which every corpus note carries"
+        );
+        assert_eq!(coloured.rect, Rect::new(500.0, 690.0, 26.0, 26.0));
+        let plain = &annotations[1];
+        assert_eq!(plain.drawing(), AnnotationDrawing::NoteIcon);
+        assert_eq!(
+            plain.color, None,
+            "a note with no /C has no colour to report"
+        );
+
+        // Free text carries the two keys its layout needs, and a file that states neither is
+        // still readable: `/DA` is where the size lives, `/Q` where the alignment does.
+        let free_text = &annotations[2];
+        assert_eq!(free_text.drawing(), AnnotationDrawing::FreeText);
+        assert_eq!(free_text.font_size_pt, Some(14.0), "/DA (/Helv 14 Tf 0 g)");
+        assert_eq!(free_text.alignment, AnnotationAlignment::Center, "/Q 1");
+        assert_eq!(
+            free_text.color,
+            Some(RawAnnotationColor {
+                // `/C [0.1 0.45 0.9]`, truncated in f32 by PDFium: 25.5 → 25, 114.75 → 114.
+                red: 25,
+                green: 114,
+                blue: 229
+            })
+        );
+        let plain_text = &annotations[3];
+        assert_eq!(plain_text.drawing(), AnnotationDrawing::FreeText);
+        assert_eq!(plain_text.font_size_pt, Some(9.0));
+        assert_eq!(plain_text.alignment, AnnotationAlignment::Left, "/Q 0");
+        assert_eq!(plain_text.color, None);
+
+        // The hidden marker keeps its text and its colour and is still not drawn: the file said
+        // so. It is the shape of 49 of the 99 sticky notes in the review corpus.
+        let hidden = &annotations[5];
+        assert!(!hidden.visible);
+        assert_eq!(
+            hidden.contents.as_deref(),
+            Some("A note the file marks hidden.")
+        );
+        assert_eq!(
+            hidden.drawing(),
+            AnnotationDrawing::Skipped(AnnotationSkipReason::Hidden)
+        );
+        // …and an unmodelled subtype keeps its own PDF name, so the sidebar can still name it.
+        let ink = &annotations[6];
+        assert_eq!(ink.kind, RawAnnotationKind::Other("Ink".to_string()));
+        assert_eq!(
+            ink.drawing(),
+            AnnotationDrawing::Skipped(AnnotationSkipReason::Unmodelled)
+        );
     }
 
     /// The user's question, as a test: a colour that is not one of ours comes through unchanged.
