@@ -97,6 +97,17 @@ public struct ScrollGlide {
     /// trade: a stalled main thread is not drawing frames anyway.
     public static let maximumTickFraction: CGFloat = 0.25
 
+    /// The longest a tick may count as while the offset is being finished, in seconds: one 120 Hz
+    /// frame of the speed ceiling, 16 pt at 100% zoom.
+    ///
+    /// The ceiling is a *speed*, so finishing is the one place where a late tick could still cover
+    /// a large distance in one go - and that is the jump this type exists to remove, arriving at
+    /// the end of the gesture instead of at the start of it. The same CI machine showed it: with
+    /// the finish phase bounded only by the ceiling, a 96-point glide was published as three
+    /// offsets. Holding the finish to one frame at a time makes a stall lengthen it instead of
+    /// coarsening it, exactly like `maximumTickFraction` does for the approach.
+    public static let maximumStepTime: TimeInterval = 0.008
+
     /// The next offset toward the destination after `elapsed` seconds, and whether the glide is
     /// finished with it.
     ///
@@ -113,8 +124,10 @@ public struct ScrollGlide {
         let budget = maximumSpeed * CGFloat(max(0, elapsed))
         let travel: CGFloat
         if idleTime > Self.idleWindow {
-            // The wheel has stopped: finish what it asked for, at the speed ceiling.
-            travel = min(abs(remaining), budget)
+            // The wheel has stopped: finish what it asked for, at the speed ceiling - one frame of
+            // it per tick, however late this tick is.
+            let frame = min(max(0, elapsed), Self.maximumStepTime)
+            travel = min(abs(remaining), maximumSpeed * CGFloat(frame))
         } else {
             let fraction = min(Self.maximumTickFraction, min(1, max(0, elapsed / Self.timeConstant)))
             travel = min(abs(remaining), min(abs(remaining) * fraction, budget))

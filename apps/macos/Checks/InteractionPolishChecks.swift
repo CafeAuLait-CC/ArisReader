@@ -526,7 +526,7 @@ extension ReaderChecks {
         require(state.scrollYPt == afterMomentum,
                 "nothing keeps moving after the glide was dropped (no double inertia)")
 
-        // ── The real driver reaches the destination through many offsets ──────────────────
+        // ── The real driver reaches the destination along the way ─────────────────────────
         state.scroll(toFraction: 0.35)
         let driverStart = state.scrollYPt
         var observed: [CGFloat] = []
@@ -538,13 +538,19 @@ extension ReaderChecks {
         })
         observer.cancel()
         observed.append(state.scrollYPt)
+        // How many offsets a *timer-driven* glide publishes is a property of the machine, not of
+        // the glide: a loaded runner hands the driver two 40 ms slots where an idle one hands it
+        // ten 8 ms ones, and this assertion used to demand four offsets and fail on CI for it. What
+        // does not depend on tick density is asserted here - the offset only ever moves toward the
+        // destination, and the motion is stepped rather than one jump - and the deterministic tick
+        // loop above is what pins the increments and their count (ScrollTailChecks pins them for a
+        // stalled tick too).
         let distinct = Set(observed.map { ($0 * 100).rounded() }).count
-        // How many offsets a timer-driven glide publishes depends on how often the main thread
-        // gets to tick - this machine may hand the driver a 40 ms slot where CI hands it an 8 ms
-        // one - so this asserts that the motion is *stepped through* rather than one jump, and the
-        // deterministic tick loop above is what pins the increments themselves.
-        require(distinct >= 4,
-                "the driver publishes intermediate offsets on the way, not one jump (\(distinct))")
+        require(distinct >= 2,
+                "the driver publishes the glide, not one jump (\(distinct) offsets)")
+        let monotonic = zip(observed, observed.dropFirst()).allSatisfy { $1 <= $0 + 1e-9 }
+        require(monotonic,
+                "every offset the driver published is between the start and the destination")
         require(observed.allSatisfy { $0 <= driverStart + 1e-9 && $0 >= driverStart - 96 - 1e-9 },
                 "the driver never leaves the interval it was aimed at")
         print("PASS: the glide driver moved \(driverStart) → \(state.scrollYPt) through "
@@ -616,12 +622,27 @@ extension ReaderChecks {
         require(catchingUp == -1000, "and the glide still lands on its destination")
         glide.cancel()
 
-        // Once the wheel has stopped, the same late tick finishes the distance instead of easing
-        // into it - that is what removes the tail the reader reported.
+        // Once the wheel has stopped, the distance still owed is finished rather than eased into -
+        // that is what removes the tail the reader reported - but still one frame of the speed
+        // ceiling at a time, so even a 10 s tick lengthens the finish instead of jumping it. A CI
+        // runner ran the driver's 8 ms ticks 40 ms late and published a 96 pt glide as three
+        // offsets; `ScrollTailChecks` pins that case on a simulated clock.
         glide.aim(at: -1000)
-        let (finished, done) = glide.step(from: -300, elapsed: 10)
-        require(done && finished == -1000,
-                "a tick after the wheel stopped finishes what is owed and ends the glide")
+        var finishing: CGFloat = -300
+        var largestFinishStep: CGFloat = 0
+        var finishTicks = 0
+        while finishTicks < 500 {
+            let (next, done) = glide.step(from: finishing, elapsed: 10)
+            largestFinishStep = max(largestFinishStep, abs(next - finishing))
+            finishing = next
+            finishTicks += 1
+            if done { break }
+        }
+        require(finishing == -1000, "a glide whose wheel has stopped still lands exactly")
+        let frame = ScrollGlide.defaultMaximumSpeed * CGFloat(ScrollGlide.maximumStepTime)
+        require(largestFinishStep <= frame + 1e-6,
+                "and a 10 s tick moves one frame of the speed ceiling, not the whole 700 pt "
+                + "(\(largestFinishStep) pt of \(frame) pt per tick, \(finishTicks) ticks)")
 
         // The ceiling is per aim, so a zoomed-in canvas glides at screen speed, not content speed.
         glide.aim(at: 100, maximumSpeed: 500)
