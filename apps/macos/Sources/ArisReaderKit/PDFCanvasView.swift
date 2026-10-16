@@ -97,6 +97,10 @@ public final class MetalCanvasView: NSView {
     /// Stepped scroll input — a classic wheel notch, a keyboard page — reported as the distance
     /// the step is worth in screen points. The shell glides toward it rather than jumping.
     public var onScrollStep: ((CGFloat) -> Void)?
+    /// Keyboard paging, when the shell wants to treat it differently from a wheel notch: a page key
+    /// names a destination, where a spin's backlog is dropped once the wheel stops (see `AppState`).
+    /// Falls back to `onScrollStep` when unset, so a canvas that does not care still pages.
+    public var onKeyboardStep: ((CGFloat) -> Void)?
     /// Scroll gestures that carry a zoom modifier (Ctrl or ⌘), reported as the same screen-point
     /// delta the plain path would have scrolled by, plus the pointer's view-space Y (top-left
     /// origin) so the shell can keep the point under the pointer still.
@@ -484,18 +488,20 @@ public final class MetalCanvasView: NSView {
 
     public override func keyDown(with event: NSEvent) {
         let page = bounds.height * 0.9
+        // A page key names a destination, not a speed, so it goes through its own step when the
+        // shell has one (AppState.scrollByKeyboardStep) and falls back to the wheel step otherwise.
+        let step = onKeyboardStep ?? onScrollStep
         switch event.charactersIgnoringModifiers {
         case " ":
             // A page is a step like a wheel notch, so it glides to its destination too.
-            onScrollStep?(event.modifierFlags.contains(.shift) ? -page : page)
-        case "\u{F72D}": // page down
-            onScrollStep?(page)
+            step?(event.modifierFlags.contains(.shift) ? -page : page)        case "\u{F72D}": // page down
+            step?(page)
         case "\u{F72C}": // page up
-            onScrollStep?(-page)
+            step?(-page)
         case "\u{F701}": // down arrow
-            onScrollStep?(40)
+            step?(40)
         case "\u{F700}": // up arrow
-            onScrollStep?(-40)
+            step?(-40)
         default:
             super.keyDown(with: event)
         }
@@ -834,6 +840,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onViewportSize: (CGSize) -> Void
     private let onScroll: (CGFloat) -> Void
     private let onScrollStep: (CGFloat) -> Void
+    /// Paging keys, when the shell wants them to keep their whole destination (see `AppState`).
+    private let onKeyboardStep: ((CGFloat) -> Void)?
     private let onZoomScroll: (CGFloat, CGFloat) -> Void
     private let onMagnify: (CGFloat, CGFloat) -> Void
     private let onPointerDown: (CGPoint) -> Void
@@ -857,6 +865,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
         onScroll: @escaping (CGFloat) -> Void = { _ in },
         onScrollStep: @escaping (CGFloat) -> Void = { _ in },
+        onKeyboardStep: ((CGFloat) -> Void)? = nil,
         onZoomScroll: @escaping (CGFloat, CGFloat) -> Void = { _, _ in },
         onMagnify: @escaping (CGFloat, CGFloat) -> Void = { _, _ in },
         onPointerDown: @escaping (CGPoint) -> Void = { _ in },
@@ -878,6 +887,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onViewportSize = onViewportSize
         self.onScroll = onScroll
         self.onScrollStep = onScrollStep
+        self.onKeyboardStep = onKeyboardStep
         self.onZoomScroll = onZoomScroll
         self.onMagnify = onMagnify
         self.onPointerDown = onPointerDown
@@ -908,6 +918,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onViewportSize = onViewportSize
         view.onScroll = onScroll
         view.onScrollStep = onScrollStep
+        view.onKeyboardStep = onKeyboardStep
         view.onZoomScroll = onZoomScroll
         view.onMagnify = onMagnify
         view.onPointerDown = onPointerDown

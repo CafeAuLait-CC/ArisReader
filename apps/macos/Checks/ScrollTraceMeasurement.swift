@@ -33,6 +33,7 @@ extension ReaderChecks {
         let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
         view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
         view.onScrollStep = { delta in state.scrollByWheelStep(delta) }
+        view.onKeyboardStep = { delta in state.scrollByKeyboardStep(delta) }
         view.onZoomScroll = { delta, anchor in
             state.zoomByScroll(delta: delta, anchorViewY: anchor)
         }
@@ -86,6 +87,9 @@ extension ReaderChecks {
                 records.append([
                     "index": index,
                     "scrolling_delta_y": event.scrollingDeltaY,
+                    // What the notch aimed at after the lead bound: the driver publishes its
+                    // offsets asynchronously, so this - not the offset - is what is known here.
+                    "notch_aimed_pt": (state.scrollDestinationYPt ?? state.scrollYPt) - destinationBefore,
                     "precise": event.hasPreciseScrollingDeltas,
                     "phase": event.phase.rawValue,
                     "momentum_phase": event.momentumPhase.rawValue,
@@ -124,6 +128,11 @@ extension ReaderChecks {
                 "destination_after_events": state.scrollDestinationYPt ?? state.scrollYPt,
                 "offset_at_last_event": offsetAtLastEvent,
                 "owed_at_last_event": destinationAtLastEvent - offsetAtLastEvent,
+                // What the notches aimed at, and what of it arrived. The two differ once the lead
+                // bound drops a backlog that cannot be delivered before the wheel stops; the raw
+                // wheel ask is in `scrolling_delta_y` next to each event's timestamp.
+                "aimed_pt": records.reduce(0) { $0 + ($1["notch_aimed_pt"] as? CGFloat ?? 0) },
+                "delivered_pt": state.scrollYPt - start,
                 "settled": state.scrollYPt,
                 "tail_pt": settled - offsetAtLastEvent,
                 "tail_ms": tailDuration,
@@ -146,6 +155,15 @@ extension ReaderChecks {
         let burst25 = await trace("wheel-burst-25ms", wheel: 1, precise: false, count: 8,
                                   stride: 25_000_000, settleMilliseconds: 500,
                                   realTimeStrideMilliseconds: 25)
+        // A spin: notches every 10 ms, faster than the glide's ceiling can deliver them. This is the
+        // scenario the lead bound exists for - the backlog a wheel builds when it is spun hard, and
+        // what is still owed when it stops.
+        let spin = await trace("wheel-spin-10ms", wheel: 1, precise: false, count: 10,
+                               stride: 10_000_000, settleMilliseconds: 500,
+                               realTimeStrideMilliseconds: 10)
+        let burst20 = await trace("wheel-burst-20ms", wheel: 1, precise: false, count: 5,
+                                  stride: 20_000_000, settleMilliseconds: 500,
+                                  realTimeStrideMilliseconds: 20)
         let single = await trace("wheel-single-notch", wheel: 1, precise: false, count: 1,
                                  stride: 50_000_000, settleMilliseconds: 500)
         // A trackpad: precise deltas a few points wide, as the system delivers them.
@@ -191,12 +209,18 @@ extension ReaderChecks {
             "wheel_line": wheel,
             "wheel_burst_50ms": burst50,
             "wheel_burst_25ms": burst25,
+            "wheel_burst_20ms": burst20,
+            "wheel_spin_10ms": spin,
             "wheel_single_notch": single,
             "glide": [
                 "time_constant_ms": ScrollGlide.timeConstant * 1000,
                 "settle_distance_pt": ScrollGlide.settleDistance,
-                "maximum_tick_fraction": ScrollGlide.maximumTickFraction,
+                "maximum_step_time_ms": ScrollGlide.maximumStepTime * 1000,
                 "maximum_speed_pt_s": ScrollGlide.defaultMaximumSpeed,
+                // The bound on what a glide may still owe when the input stops: the number behind
+                // the tail this measurement reports.
+                "maximum_lead_pt": ScrollGlide.maximumLead,
+                "idle_window_ms": ScrollGlide.idleWindow * 1000,
             ],
             "trackpad_precise": trackpad,
             "quantisation_probe": quantisation,

@@ -1645,23 +1645,42 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         schedulePositionSave()
     }
 
-    /// Scrolls by a **stepped** delta measured in screen points: one wheel notch, one keyboard
-    /// page. The offset glides toward the destination instead of jumping to it, which is what
-    /// makes a classic wheel read as motion rather than as a series of grid lines.
+    /// Scrolls by a **stepped** delta measured in screen points: one wheel notch. The offset glides
+    /// toward the destination instead of jumping to it, which is what makes a classic wheel read as
+    /// motion rather than as a series of grid lines.
     ///
-    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting. The
-    /// glide stops when the notches do: see `ScrollGlide.idleWindow` — the reader asked for the
-    /// tail after the last notch to be gone, so the glide finishes the distance it still owes
-    /// instead of letting it decay.
+    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting, but it
+    /// may not lead the offset by more than `ScrollGlide.maximumLead`: a fast spin asks for more
+    /// distance than the speed ceiling can deliver, and that backlog is what used to scroll on after
+    /// the wheel had stopped. What does not fit is dropped - see the type's documentation for the
+    /// measurements and the trade. The glide still stops when the notches do, through
+    /// `ScrollGlide.idleWindow`.
     public func scrollByWheelStep(_ delta: CGFloat) {
+        stepScroll(delta, mostAhead: ScrollGlide.maximumLead)
+    }
+
+    /// Scrolls by a **stepped** delta the reader asked for as a destination rather than a speed:
+    /// Page Down, Page Up, the arrows. Same glide, deliberately **without** the lead bound - "next
+    /// page" is a place, so the whole page is still delivered (measured, a 450 pt page on a 500 pt
+    /// viewport takes ~225 ms at the ceiling, exactly as before), where a wheel's stale backlog is
+    /// dropped instead.
+    public func scrollByKeyboardStep(_ delta: CGFloat) {
+        stepScroll(delta, mostAhead: nil)
+    }
+
+    private func stepScroll(_ delta: CGFloat, mostAhead lead: CGFloat?) {
         guard document != nil, delta != 0 else { return }
         scrollDirection = delta > 0 ? 1 : -1
         let contentDelta = delta / max(zoomFactor, 0.01)
         // Chaining off the *destination* keeps a burst honest: every notch adds its own distance
-        // even when the previous one has not been drawn yet. The speed ceiling is a screen speed,
-        // so it is converted through the zoom like every other screen-point input.
+        // even when the previous one has not been drawn yet - as far as the lead allows. The
+        // document's own end still wins over both. The speed ceiling is a screen speed, so it is
+        // converted through the zoom like every other screen-point input, and so is the lead.
+        let aimed = clampedScrollOffset((glide.destination ?? scrollYPt) + contentDelta)
         glide.aim(
-            at: clampedScrollOffset((glide.destination ?? scrollYPt) + contentDelta),
+            at: aimed,
+            from: scrollYPt,
+            mostAhead: lead.map { $0 / max(zoomFactor, 0.01) },
             maximumSpeed: ScrollGlide.defaultMaximumSpeed / max(zoomFactor, 0.01)
         )
         beginScrollActivity()
