@@ -7,9 +7,124 @@ import Foundation
 /// Selection used to start in `mouseDown`, so a plain click selected the character under the
 /// pointer — which then took priority over the click's real job: following a citation, a figure
 /// mention or a link into the floating preview. These checks drive the real `MetalCanvasView`
-/// events against a real document whose citations resolve, and pin both halves: a click inside
-/// the slop changes nothing and still reaches the preview, a drag beyond it still selects.
+/// events against a real document whose citations resolve, and pin both halves: a click selects
+/// nothing and ends any selection it finds, while a drag beyond the slop still selects.
 extension ReaderChecks {
+    /// Builds the canvas the app builds, wired to `state` exactly as `ReaderWindow` wires it, so a
+    /// click here travels the same path as a click in the window: `mouseDown`/`mouseUp` →
+    /// `endPointerInteraction`.
+    @MainActor static func clickCanvas(state: AppState, size: CGSize = CGSize(width: 700, height: 500)) -> MetalCanvasView {
+        let view = MetalCanvasView(frame: CGRect(origin: .zero, size: size))
+        view.onPointerDown = { point in state.beginSelection(at: point) }
+        view.onPointerDragged = { point in state.extendSelection(to: point) }
+        view.onPointerUp = { point, wasClick in
+            state.endPointerInteraction(at: point, wasClick: wasClick)
+        }
+        view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
+        return view
+    }
+
+    /// A click that beat the page's click targets still opens the preview they name.
+    ///
+    /// Every click target is fetched when its page becomes visible (`loadCitations`,
+    /// `loadCaptionMentions`, `loadLinks`), and that fetch is queued behind the page's rasters and
+    /// text layer on the engine's serial queue — the first citation read also pays the
+    /// document-wide reference scan. So a click made while the page is still appearing is decided
+    /// *before* the data it needs exists. These checks take the target's rectangle from a **second**
+    /// engine instance (so the state under test stays cold) and click it in the same turn the
+    /// document is opened or jumped to, which no fetch can have run in yet.
+    @MainActor static func coldClickChecks(citationsURL: URL, mentionsURL: URL) async throws {
+        let viewport = CGSize(width: 700, height: 500)
+
+        /// One click, through the canvas' own event path, on a state that is still cold.
+        @MainActor func click(_ state: AppState, at point: CGPoint) {
+            let view = clickCanvas(state: state, size: viewport)
+            let viewPoint = CGPoint(x: point.x, y: viewport.height - (point.y - state.scrollYPt))
+            func event(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: viewPoint, modifierFlags: [], timestamp: 0,
+                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1,
+                                   pressure: 1)!
+            }
+            view.mouseDown(with: event(.leftMouseDown))
+            view.mouseUp(with: event(.leftMouseUp))
+        }
+
+        /// A fresh state, opened on `url` and scrolled to `page`, with nothing fetched yet.
+        func coldState(_ url: URL, at page: Int) throws -> AppState {
+            let state = AppState(engine: try RustEngine(), preferFullPageRasters: false)
+            state.setViewportSize(viewport)
+            require(state.open(url: url), "the click fixture opens")
+            state.gotoPage(page)
+            return state
+        }
+
+        /// The center of `box` (page-local points) in the content space the click is reported in.
+        func contentPoint(_ box: CGRect, page: Int, in state: AppState, using probe: PDFEngine) throws -> CGPoint {
+            guard let placement = probe.visiblePages(scrollYPt: state.scrollYPt,
+                                                     viewportHeightPt: viewport.height,
+                                                     gapPt: state.pageGapPt, marginPt: 0)
+                .first(where: { $0.index == page }) else {
+                fatalError("FAIL: page \(page + 1) is on screen after the jump")
+            }
+            return CGPoint(x: placement.leftPt + box.midX, y: placement.topPt + box.midY)
+        }
+
+        // ── A citation, clicked before its page's citations have been read ───────────────────
+        do {
+            let probe = try RustEngine()
+            _ = try probe.openDocument(at: citationsURL)
+            var page = 0
+            var citations: [Citation] = []
+            for candidate in 0..<4 {
+                let found = try await probe.citations(candidate)
+                if !found.isEmpty { page = candidate; citations = found; break }
+            }
+            guard let citation = citations.first else {
+                fatalError("FAIL: the click fixture carries a citation to click")
+            }
+            let state = try coldState(citationsURL, at: page)
+            click(state, at: try contentPoint(CGRect(x: citation.xPt, y: citation.yPt,
+                                                     width: citation.widthPt, height: citation.heightPt),
+                                              page: page, in: state, using: probe))
+            try await eventually("a click that beats the citation fetch still opens its reference", {
+                state.referencePreview?.kind == .reference
+            })
+            let written = citation.text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            require(state.referencePreview?.title == written,
+                    "and it previews the citation that was clicked (\"\(state.referencePreview?.title ?? "none")\")")
+            state.closeReferencePreview()
+        }
+
+        // ── A figure mention and a table mention, clicked before their page's mentions land ──
+        for kind in ["Figure", "Table"] {
+            let probe = try RustEngine()
+            _ = try probe.openDocument(at: mentionsURL)
+            var page = 0
+            var mention: CaptionMention?
+            for candidate in 0..<8 where mention == nil {
+                mention = (try await probe.captionMentions(page: candidate)).first { $0.kind == kind }
+                if mention != nil { page = candidate }
+            }
+            guard let mention else {
+                fatalError("FAIL: the mention fixture carries a \(kind) mention to click")
+            }
+            let state = try coldState(mentionsURL, at: page)
+            click(state, at: try contentPoint(CGRect(x: mention.xPt, y: mention.yPt,
+                                                     width: mention.widthPt, height: mention.heightPt),
+                                              page: page, in: state, using: probe))
+            try await eventually("a click that beats the \(kind.lowercased()) mention fetch opens its caption", {
+                state.referencePreview != nil
+            })
+            require(state.referencePreview?.title == "\(kind) \(mention.label)",
+                    "and it previews the caption the mention names (\"\(state.referencePreview?.title ?? "none")\")")
+            require(state.referencePreview?.kind == .figure,
+                    "the \(kind.lowercased()) preview shows the caption's region, not the citation body")
+            state.closeReferencePreview()
+        }
+        print("PASS: a click made before a page's click targets have been fetched still opens "
+              + "the citation, the figure or the table it landed on")
+    }
+
     @MainActor static func clickIntentChecks(url: URL) async throws {
         let engine = try RustEngine()
         let state = AppState(engine: engine, preferFullPageRasters: false)
@@ -135,20 +250,32 @@ extension ReaderChecks {
                 + "(\(dragged.range))")
         require(clicks.last?.wasClick == false, "a drag is reported as a drag")
 
-        // ── A click with a selection already made leaves it alone ───────────────────────────
+        // ── A click ends the selection: on a citation, on plain text, anywhere ───────────────
+        // The reader selected something by dragging; the next click is a fresh start, and it must
+        // not leave the old highlight behind — not even when it opens a preview of its own.
         click(at: citationPoint)
-        require(state.selection == dragged,
-                "a click that opens a preview leaves the selection untouched")
+        require(state.selection == nil, "a click that opens a preview ends the selection with it")
         try await eventually("the click still opens its preview", { state.referencePreview != nil })
         state.closeReferencePreview()
-        click(at: point(plainIndex))
-        require(state.selection == dragged, "so does a click on plain text")
 
-        // ── Clicking away from the text still deselects (the platform's click-away) ─────────
+        // The same click on ordinary text: the selection goes, nothing opens.
+        view.mouseDown(with: event(.leftMouseDown, at: point(dragStart)))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(dragEnd)))
+        view.mouseUp(with: event(.leftMouseUp, at: point(dragEnd)))
+        require(state.selection != nil, "a second drag selects again")
+        click(at: point(plainIndex))
+        require(state.selection == nil, "a click on plain text ends the selection")
+        require(state.referencePreview == nil, "and opens no preview")
+
+        // ── Clicking away from the text deselects too (the platform's click-away) ───────────
+        view.mouseDown(with: event(.leftMouseDown, at: point(dragStart)))
+        view.mouseDragged(with: event(.leftMouseDragged, at: point(dragEnd)))
+        view.mouseUp(with: event(.leftMouseUp, at: point(dragEnd)))
+        require(state.selection != nil, "the selection is back for the click-away")
         click(at: viewPoint(-30, 40))
         require(state.selection == nil, "a click on the page's background clears the selection")
         require(state.referencePreview == nil, "and opens nothing")
-        print("PASS: a click selects nothing and still follows the reference under it; "
-              + "a drag past \(MetalCanvasView.clickSlopPt) pt selects")
+        print("PASS: a click selects nothing, ends any selection and still follows the reference "
+              + "under it; a drag past \(MetalCanvasView.clickSlopPt) pt selects")
     }
 }

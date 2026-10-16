@@ -39,6 +39,16 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
+        if CommandLine.arguments.contains("--check-cold-click") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await coldClickChecks(
+                citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
+                mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
+            print("Cold-click checks passed")
+            return
+        }
         // The two interaction fixes, on their own, while they are being worked on
         // (`ArisReaderChecks --check-click-intent .`).
         if CommandLine.arguments.contains("--check-click-intent")
@@ -48,6 +58,9 @@ struct ReaderChecks {
             if CommandLine.arguments.contains("--check-click-intent") {
                 try await clickIntentChecks(
                     url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
+                try await coldClickChecks(
+                    citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
+                    mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
             } else {
                 scrollGlideTailChecks()
                 try await scrollTailDriverChecks(
@@ -168,6 +181,9 @@ struct ReaderChecks {
         try await interactionChecks(url: a)
         try await clickIntentChecks(
             url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
+        try await coldClickChecks(
+            citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
+            mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
         try await screenPageChecks(url: b)
         try await screenPageDegradationChecks(url: b)
         try await defaultModeRenderChecks(url: b)
