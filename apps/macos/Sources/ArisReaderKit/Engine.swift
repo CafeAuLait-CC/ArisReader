@@ -415,6 +415,77 @@ public struct AnnotationQuadBox: Sendable, Equatable {
     }
 }
 
+/// One annotation the shell asks the engine to write into a PDF.
+///
+/// Geometry is **view space at `zoom`** — exactly what the canvas draws — because that is the
+/// shell's coordinate space. The engine converts it to page space once, using the page's own
+/// crop box and rotation, so a highlight saved at 100% and one saved at 300% land in the same
+/// place.
+public struct AnnotationWriteRequest: Sendable, Equatable {
+    /// What the annotation becomes in the PDF.
+    public enum Kind: Sendable, Equatable {
+        /// `/Subtype /Highlight`.
+        case highlight
+        /// `/Subtype /Underline`.
+        case underline
+        /// `/Subtype /Text`: a sticky note icon carrying the contents.
+        case note
+    }
+
+    /// Written as `/NM`; the sidecar's UUID string, so a saved annotation can be recognised.
+    public let id: String
+    public let page: Int
+    public let kind: Kind
+    /// View-space box at `zoom`; for markup the union of `quads` is what is written as `/Rect`.
+    public let rect: CGRect
+    /// View-space `/QuadPoints` at `zoom`; empty only for a `.note`.
+    public let quads: [CGRect]
+    public let color: AnnotationColor
+    /// `/CA`, 0…1. The shell's colour alpha carries it.
+    public let opacity: Double
+    public let contents: String
+    public let author: String
+    /// `/M`, already in PDF date form.
+    public let modified: String
+
+    public init(
+        id: String,
+        page: Int,
+        kind: Kind,
+        rect: CGRect,
+        quads: [CGRect],
+        color: AnnotationColor,
+        opacity: Double,
+        contents: String,
+        author: String,
+        modified: String
+    ) {
+        self.id = id
+        self.page = page
+        self.kind = kind
+        self.rect = rect
+        self.quads = quads
+        self.color = color
+        self.opacity = opacity
+        self.contents = contents
+        self.author = author
+        self.modified = modified
+    }
+}
+
+/// What a successful PDF write did.
+public struct AnnotationWriteReport: Sendable, Equatable {
+    public let destinationPath: String
+    /// The `/NM` values written, so the sidecar can remove exactly those entries.
+    public let writtenIDs: [String]
+    public let appendedBytes: UInt64
+    /// Present only for a replacement; the backup is verified byte-identical.
+    public let backupPath: String?
+    public let preexistingAnnotationCount: Int
+    public let cleanedTemporaryFiles: Int
+    public let sourceBytesPreserved: Bool
+}
+
 /// A `Figure 3` / `Table 2` reference in a page's body text, boxed in view space.
 public struct CaptionMention: Sendable {
     public let page: Int
@@ -589,6 +660,22 @@ public protocol PDFEngine: AnyObject {
     /// Annotations the document **already carries** (highlights, notes, free text), from every
     /// page, in view space. Document-wide, so implementations cache it.
     func annotations() async throws -> [DocumentAnnotation]
+    /// Writes `annotations` into a new PDF at `url`. Never touches the open document.
+    func saveAnnotatedCopy(
+        to url: URL,
+        annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport
+    /// Replaces the open document with one carrying `annotations`; the engine writes and verifies
+    /// a backup first and refuses the replacement if the backup cannot be written.
+    func replaceWithAnnotations(
+        _ annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport
+    /// Whether a previous save of `url` was interrupted, for the next open to report.
+    func interruptedSaveNote(at url: URL) -> String?
+    /// The name to offer for an annotated copy of `url`.
+    func suggestedAnnotatedCopyURL(for url: URL) -> URL
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
     /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
@@ -651,6 +738,39 @@ public extension PDFEngine {
     /// because only it can ask PDFium for `FPDF_ANNOT`.
     func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale)
+    }
+
+    /// Engines without a PDF writer refuse the operation instead of pretending to save.
+    func saveAnnotatedCopy(
+        to url: URL,
+        annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot write annotations into a PDF"]
+        )
+    }
+
+    func replaceWithAnnotations(
+        _ annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot write annotations into a PDF"]
+        )
+    }
+
+    func interruptedSaveNote(at url: URL) -> String? { nil }
+
+    func suggestedAnnotatedCopyURL(for url: URL) -> URL {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let extensionName = url.pathExtension.isEmpty ? "pdf" : url.pathExtension
+        return url.deletingLastPathComponent()
+            .appendingPathComponent("\(stem) (annotated).\(extensionName)")
     }
 
     func contentHeightPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
@@ -1040,6 +1160,126 @@ public final class RustEngine: PDFEngine {
         }
 
         return records.map(Self.documentAnnotation(from:))
+    }
+
+    public func saveAnnotatedCopy(
+        to url: URL,
+        annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = Self.writeRecords(from: annotations)
+        let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
+            // Off the main thread: PDFium writes and reopens the whole document, and the UI must
+            // not wait for it. `rasterQueue` is also what keeps this engine's PDFium calls
+            // serialised with its raster calls.
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.saveAnnotationsCopy(
+                        destination: url.path,
+                        annotations: records,
+                        zoom: Double(zoom)
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.writeReport(from: report)
+    }
+
+    public func replaceWithAnnotations(
+        _ annotations: [AnnotationWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = Self.writeRecords(from: annotations)
+        let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.replaceWithAnnotations(
+                        annotations: records,
+                        zoom: Double(zoom)
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.writeReport(from: report)
+    }
+
+    public func interruptedSaveNote(at url: URL) -> String? {
+        guard let document, document.path() == url.path else { return nil }
+        return document.interruptedSaveNote()
+    }
+
+    public func suggestedAnnotatedCopyURL(for url: URL) -> URL {
+        guard let document else {
+            let stem = url.deletingPathExtension().lastPathComponent
+            return url.deletingLastPathComponent()
+                .appendingPathComponent("\(stem) (annotated).pdf")
+        }
+        return URL(fileURLWithPath: document.suggestedCopyPath())
+    }
+
+    /// One shell request, as the FFI record.
+    private static func writeRecords(from requests: [AnnotationWriteRequest]) -> [WriteAnnotationRecord] {
+        requests.map { request in
+            let quad = { (rect: CGRect) in
+                AnnotationQuad(
+                    xPt: Double(rect.origin.x),
+                    yPt: Double(rect.origin.y),
+                    widthPt: Double(rect.width),
+                    heightPt: Double(rect.height)
+                )
+            }
+            let kind: AnnotationWriteKind = switch request.kind {
+            case .highlight: .highlight
+            case .underline: .underline
+            case .note: .note
+            }
+            return WriteAnnotationRecord(
+                id: request.id,
+                page: UInt32(request.page),
+                kind: kind,
+                rect: quad(request.rect),
+                quads: request.quads.map(quad),
+                color: AnnotationColorRecord(
+                    red: request.color.red,
+                    green: request.color.green,
+                    blue: request.color.blue
+                ),
+                opacity: request.opacity,
+                contents: request.contents,
+                author: request.author,
+                modified: request.modified
+            )
+        }
+    }
+
+    private static func writeReport(from report: AnnotationSaveReport) -> AnnotationWriteReport {
+        AnnotationWriteReport(
+            destinationPath: report.destinationPath,
+            writtenIDs: report.writtenIds,
+            appendedBytes: report.appendedBytes,
+            backupPath: report.backupPath,
+            preexistingAnnotationCount: Int(report.preexistingAnnotationCount),
+            cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles),
+            sourceBytesPreserved: report.sourceBytesPreserved
+        )
     }
 
     /// One FFI record, as the shell models it.

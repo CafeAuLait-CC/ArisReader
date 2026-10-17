@@ -96,6 +96,23 @@ struct ReaderCommands: Commands {
                 .disabled(session == nil)
         }
 
+        // The only two ways this application writes into a PDF. Both are explicit commands,
+        // and the second one is deliberately labelled with what it replaces: it is not a save
+        // key that silently overwrites the document the reader opened.
+        CommandGroup(replacing: .saveItem) {
+            Button("Save Annotated Copy…") {
+                session?.state.presentSaveAnnotatedCopyPanel()
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(session?.state.canSaveAnnotationsToPDF != true)
+
+            Button("Save and Replace Original…") {
+                session?.state.presentReplaceOriginalConfirmation()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .disabled(session?.state.canSaveAnnotationsToPDF != true)
+        }
+
         CommandMenu("Reading") {
             Button("Previous Page") { session?.state.previousPage() }
                 .keyboardShortcut(.leftArrow, modifiers: .command)
