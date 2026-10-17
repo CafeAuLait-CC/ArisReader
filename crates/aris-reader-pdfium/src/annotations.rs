@@ -95,7 +95,7 @@ type FpdfAnnotation = *mut c_void;
 /// left/bottom/right/top order every other rectangle in this workspace uses.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FsRectF {
+pub(crate) struct FsRectF {
     left: f32,
     top: f32,
     right: f32,
@@ -105,7 +105,7 @@ struct FsRectF {
 /// `FS_QUADPOINTSF`: the four corners of one quadrilateral, page space.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FsQuadPointsF {
+pub(crate) struct FsQuadPointsF {
     x1: f32,
     y1: f32,
     x2: f32,
@@ -160,6 +160,16 @@ const APPEARANCE_MODE_NORMAL: c_int = 0;
 const FLAG_INVISIBLE: c_int = 1 << 0;
 const FLAG_HIDDEN: c_int = 1 << 1;
 const FLAG_NOVIEW: c_int = 1 << 5;
+
+/// `FPDF_ANNOT_FLAG_PRINT` — the annotation is printed. The review corpus and Preview both
+/// write `/F 4`; an annotation that exists but disappears when the document is printed is a
+/// surprise, so the writer sets the same bit.
+const FLAG_PRINT: c_int = 1 << 2;
+
+/// `FPDF_INCREMENTAL` (`fpdf_save.h`): append an update, keep every original byte. The writer
+/// never passes `FPDF_NO_INCREMENTAL` — the incremental save is the whole data-safety story for
+/// a file somebody may have signed.
+const SAVE_INCREMENTAL: c_uint = 1;
 
 /// FNV-1a over the annotation fields that make up a fallback identity.
 ///
@@ -244,6 +254,150 @@ struct Api {
     get_linked_annot: unsafe extern "C" fn(FpdfAnnotation, *const c_char) -> FpdfAnnotation,
 }
 
+/// The PDFium entry points only an annotation **writer** needs.
+///
+/// Resolved separately from [`Api`] on purpose: a PDFium build that can read annotations but
+/// exports no write symbols must keep reading, and the read path must not start failing because
+/// a save feature found a missing symbol once. [`AnnotationAppender::open`] reports the missing
+/// API instead.
+struct WriteApi {
+    _library: Library,
+    load_document: unsafe extern "C" fn(*const c_char, *const c_char) -> FpdfDocument,
+    close_document: unsafe extern "C" fn(FpdfDocument),
+    get_page_count: unsafe extern "C" fn(FpdfDocument) -> c_int,
+    load_page: unsafe extern "C" fn(FpdfDocument, c_int) -> FpdfPage,
+    close_page: unsafe extern "C" fn(FpdfPage),
+    create_annot: unsafe extern "C" fn(FpdfPage, c_ulong) -> FpdfAnnotation,
+    close_annot: unsafe extern "C" fn(FpdfAnnotation),
+    set_rect: unsafe extern "C" fn(FpdfAnnotation, *const FsRectF) -> c_int,
+    append_attachment_points: unsafe extern "C" fn(FpdfAnnotation, *const FsQuadPointsF) -> c_int,
+    set_color: unsafe extern "C" fn(FpdfAnnotation, c_int, c_uint, c_uint, c_uint, c_uint) -> c_int,
+    set_string_value: unsafe extern "C" fn(FpdfAnnotation, *const c_char, *const u16) -> c_int,
+    set_flags: unsafe extern "C" fn(FpdfAnnotation, c_int) -> c_int,
+    save_as_copy: unsafe extern "C" fn(FpdfDocument, *mut FpdfFileWrite, c_uint) -> c_int,
+}
+
+static WRITE_API: OnceLock<Option<&'static WriteApi>> = OnceLock::new();
+
+/// One annotation the writer appends. Page space, like every other annotation geometry in this
+/// crate; the FFI layer does the view → page conversion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WriteAnnotation {
+    /// `/NM`, the annotation name. Unique in the document and used by the shell to recognise
+    /// the annotation after it has been saved (and therefore to stop showing it twice).
+    pub id: String,
+    pub page: PageIndex,
+    pub kind: WriteAnnotationKind,
+    /// Outer box, page space. For a markup annotation this is the union of `quads`.
+    pub rect: Rect,
+    /// `/QuadPoints`, page space. Empty for a note.
+    pub quads: Vec<Rect>,
+    pub color: [u8; 3],
+    /// `/CA`; 1.0 means fully opaque and is still written, because the shell's model carries
+    /// an opacity for every annotation.
+    pub opacity: f64,
+    pub contents: Option<String>,
+    pub author: Option<String>,
+    /// `/M`, already formatted as a PDF date (`D:YYYYMMDDHHmmSSOHH'mm'`).
+    pub modified: Option<String>,
+}
+
+/// What a [`WriteAnnotation`] becomes in the PDF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAnnotationKind {
+    /// `/Highlight`: the filled, quad-based text markup.
+    Highlight,
+    /// `/Underline`: the same shape as a highlight, drawn along the baseline. Not required by
+    /// the write-back task, but the sidecar already models underlines and the code is the same.
+    Underline,
+    /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
+    Text,
+}
+
+impl WriteAnnotationKind {
+    fn subtype(self) -> c_ulong {
+        match self {
+            Self::Highlight => ANNOT_HIGHLIGHT,
+            Self::Underline => ANNOT_UNDERLINE,
+            Self::Text => ANNOT_TEXT,
+        }
+    }
+
+    /// `/Subj` (the subject line a viewer shows in the annotation list).
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Highlight => "Highlight",
+            Self::Underline => "Underline",
+            Self::Text => "Note",
+        }
+    }
+}
+
+/// `FPDF_FILEWRITE` (fpdf_save.h), by value: PDFium's incremental writer calls back into
+/// [`FileSink`] for every byte it produces.
+#[repr(C)]
+struct FpdfFileWrite {
+    version: c_int,
+    write_block: unsafe extern "C" fn(*mut FpdfFileWrite, *const c_void, c_ulong) -> c_int,
+}
+
+/// The state behind the callback. `header` **must stay first**: PDFium passes the same pointer
+/// it was given, and the callback casts it back to `FileSink`.
+#[repr(C)]
+struct FileSink {
+    header: FpdfFileWrite,
+    file: std::fs::File,
+    failed: bool,
+}
+
+/// Writes one block into the sink, returning `1` exactly when every byte was written.
+///
+/// # Safety
+///
+/// PDFium calls this with the `FPDF_FILEWRITE*` it was handed, which is `&mut FileSink.header`
+/// from [`FileSink::new`]. `data`/`size` describe a readable buffer for the duration of the call.
+unsafe extern "C" fn write_block(
+    this: *mut FpdfFileWrite,
+    data: *const c_void,
+    size: c_ulong,
+) -> c_int {
+    if this.is_null() || (data.is_null() && size != 0) {
+        return 0;
+    }
+    // SAFETY: `this` is the `header` field of a `FileSink` that outlives the save call, and
+    // `header` is the first field, so the cast points at the same object.
+    let sink = unsafe { &mut *this.cast::<FileSink>() };
+    if sink.failed {
+        return 0;
+    }
+    let bytes = if size == 0 {
+        &[][..]
+    } else {
+        // SAFETY: PDFium hands a buffer of `size` bytes that is valid for this call.
+        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) }
+    };
+    match std::io::Write::write_all(&mut sink.file, bytes) {
+        Ok(()) => 1,
+        Err(_) => {
+            sink.failed = true;
+            0
+        }
+    }
+}
+
+impl FileSink {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            header: FpdfFileWrite {
+                version: 1,
+                write_block,
+            },
+            file,
+            failed: false,
+        }
+    }
+}
+
 /// The resolved API, or `None` when this PDFium build does not export it.
 ///
 /// A `OnceLock` and not a `Result`: the answer cannot change during a process, and a PDFium
@@ -317,6 +471,369 @@ fn api() -> Option<&'static Api> {
     })
     .as_ref()
     .copied()
+}
+
+/// Resolves the write entry points, which are a superset of the read ones plus the annotation
+/// creation and incremental-save calls.
+///
+/// # Safety
+///
+/// The caller must have loaded a PDFium-compatible library; every signature is transcribed from
+/// `vendor/pdfium/include/fpdf_annot.h` and `fpdf_save.h`.
+unsafe fn resolve_write(library: Library) -> Option<WriteApi> {
+    // SAFETY: same contract as `resolve` above.
+    unsafe fn symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+        // SAFETY: `T` is always one of the `extern "C" fn` types declared in `WriteApi`, matching
+        // the exported PDFium symbol of that name.
+        unsafe { library.get::<T>(name).ok().map(|symbol| *symbol) }
+    }
+
+    let api = WriteApi {
+        load_document: unsafe { symbol(&library, b"FPDF_LoadDocument\0")? },
+        close_document: unsafe { symbol(&library, b"FPDF_CloseDocument\0")? },
+        get_page_count: unsafe { symbol(&library, b"FPDF_GetPageCount\0")? },
+        load_page: unsafe { symbol(&library, b"FPDF_LoadPage\0")? },
+        close_page: unsafe { symbol(&library, b"FPDF_ClosePage\0")? },
+        create_annot: unsafe { symbol(&library, b"FPDFPage_CreateAnnot\0")? },
+        close_annot: unsafe { symbol(&library, b"FPDFPage_CloseAnnot\0")? },
+        set_rect: unsafe { symbol(&library, b"FPDFAnnot_SetRect\0")? },
+        append_attachment_points: unsafe {
+            symbol(&library, b"FPDFAnnot_AppendAttachmentPoints\0")?
+        },
+        set_color: unsafe { symbol(&library, b"FPDFAnnot_SetColor\0")? },
+        set_string_value: unsafe { symbol(&library, b"FPDFAnnot_SetStringValue\0")? },
+        set_flags: unsafe { symbol(&library, b"FPDFAnnot_SetFlags\0")? },
+        save_as_copy: unsafe { symbol(&library, b"FPDF_SaveAsCopy\0")? },
+        _library: library,
+    };
+    Some(api)
+}
+
+fn write_api() -> Option<&'static WriteApi> {
+    WRITE_API
+        .get_or_init(|| {
+            for candidate in crate::backend::library_candidates() {
+                // SAFETY: `Library::new` loads arbitrary code; these are the same PDFium paths the
+                // rest of the backend resolves, and `resolve_write` checks every symbol.
+                let Ok(library) = (unsafe { Library::new(candidate.as_os_str()) }) else {
+                    continue;
+                };
+                // SAFETY: the library at these paths is PDFium, whose annotation ABI is fixed by
+                // the vendored headers.
+                if let Some(api) = unsafe { resolve_write(library) } {
+                    return Some(&*Box::leak(Box::new(api)));
+                }
+            }
+            None
+        })
+        .as_ref()
+        .copied()
+}
+
+/// Appends annotations to one open PDF and saves it incrementally.
+///
+/// This type touches PDFium only; it does **not** decide where bytes go. The safety policy —
+/// temporary file, verification, backup, atomic rename — lives one layer up in
+/// [`crate::writeback::save_annotated_pdf`], which is the only public entry point.
+///
+/// Every method takes the process-wide `PDFIUM_LOCK`, because a PDFium call is never safe to run
+/// concurrently with another one, even on a different document.
+pub struct AnnotationAppender {
+    api: &'static WriteApi,
+    document: FpdfDocument,
+    page_count: u32,
+}
+
+// SAFETY: raw PDFium handles are not thread-safe; every method (and `Drop`) serialises on
+// `PDFIUM_LOCK`, which is what makes the markers sound.
+unsafe impl Send for AnnotationAppender {}
+unsafe impl Sync for AnnotationAppender {}
+
+impl AnnotationAppender {
+    /// Opens `path` for writing. The document is modified in memory only; call
+    /// [`AnnotationAppender::save_incremental`] to produce bytes.
+    pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
+        let Some(api) = write_api() else {
+            return Err(ArisError::new(
+                ErrorCode::BackendUnavailable,
+                "this PDFium build does not export the annotation-writing API",
+            )
+            .with_detail(
+                "missing one of FPDFPage_CreateAnnot / FPDFAnnot_Set* / FPDF_SaveAsCopy",
+            ));
+        };
+        // Make sure the library is initialised the same way the rest of the backend does it.
+        // `pdfium_instance` is process-cached, so this costs nothing after the first open.
+        crate::backend::pdfium_instance()?;
+
+        let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            ArisError::new(
+                ErrorCode::InvalidArgument,
+                "the document path contains a NUL byte",
+            )
+        })?;
+        let password = password.map(CString::new).transpose().map_err(|_| {
+            ArisError::new(
+                ErrorCode::InvalidArgument,
+                "the password contains a NUL byte",
+            )
+        })?;
+
+        // SAFETY: the C strings outlive the call and the library is initialised above.
+        let document = {
+            let _guard = crate::backend::PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unsafe {
+                (api.load_document)(
+                    path.as_ptr(),
+                    password
+                        .as_ref()
+                        .map_or(std::ptr::null(), |value| value.as_ptr()),
+                )
+            }
+        };
+        if document.is_null() {
+            return Err(ArisError::new(
+                ErrorCode::CorruptDocument,
+                "PDFium could not open the document for annotation writing",
+            )
+            .with_detail(format!("path: {}", path.to_string_lossy())));
+        }
+
+        // SAFETY: `document` is a live document handle.
+        let page_count = {
+            let _guard = crate::backend::PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unsafe { (api.get_page_count)(document) }.max(0) as u32
+        };
+
+        Ok(Self {
+            api,
+            document,
+            page_count,
+        })
+    }
+
+    pub fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    /// Appends one annotation. The caller has already validated the geometry and identity.
+    pub fn add(&mut self, annotation: &WriteAnnotation) -> Result<()> {
+        if annotation.page.get() >= self.page_count {
+            return Err(ArisError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "annotation {} names page {}, but the document has {} page(s)",
+                    annotation.id,
+                    annotation.page.get(),
+                    self.page_count
+                ),
+            ));
+        }
+        let page_index = c_int::try_from(annotation.page.get()).map_err(|_| {
+            ArisError::new(
+                ErrorCode::InvalidArgument,
+                format!("page {} is out of range for PDFium", annotation.page.get()),
+            )
+        })?;
+
+        let _guard = crate::backend::PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // SAFETY: `document` is live and `page_index` was checked against the page count.
+        let page = unsafe { (self.api.load_page)(self.document, page_index) };
+        if page.is_null() {
+            return Err(ArisError::new(
+                ErrorCode::RenderFailed,
+                format!(
+                    "PDFium could not load page {} for annotation writing",
+                    annotation.page.get()
+                ),
+            ));
+        }
+
+        let result = self.add_to_page(page, annotation);
+        // SAFETY: `page` came from `load_page` and is not used after this point.
+        unsafe { (self.api.close_page)(page) };
+        result
+    }
+
+    /// The annotation-dictionary half of [`AnnotationAppender::add`], split out so the page
+    /// handle is closed on every path.
+    fn add_to_page(&self, page: FpdfPage, annotation: &WriteAnnotation) -> Result<()> {
+        // SAFETY: `page` is a live page handle.
+        let handle = unsafe { (self.api.create_annot)(page, annotation.kind.subtype()) };
+        if handle.is_null() {
+            return Err(ArisError::new(
+                ErrorCode::RenderFailed,
+                format!(
+                    "PDFium did not create a {:?} annotation named {}",
+                    annotation.kind, annotation.id
+                ),
+            ));
+        }
+
+        let result = self.populate(handle, annotation);
+        // SAFETY: `handle` came from `create_annot` and is not used after this point. Closing it
+        // does not remove the annotation from the page.
+        unsafe { (self.api.close_annot)(handle) };
+        result
+    }
+
+    fn populate(&self, handle: FpdfAnnotation, annotation: &WriteAnnotation) -> Result<()> {
+        // SAFETY (all calls below): `handle` is a live annotation for the duration of this
+        // function, and every pointer points at a local that outlives the call.
+        unsafe {
+            let rect = FsRectF {
+                left: annotation.rect.min_x() as f32,
+                top: annotation.rect.max_y() as f32,
+                right: annotation.rect.max_x() as f32,
+                bottom: annotation.rect.min_y() as f32,
+            };
+            if (self.api.set_rect)(handle, &rect) == 0 {
+                return Err(write_error("FPDFAnnot_SetRect", &annotation.id));
+            }
+
+            // PDF 32000-1 table 179 order: upper-left, upper-right, lower-left, lower-right.
+            // PDFKit refuses to fill a highlight whose points are in any other order (measured
+            // with PDFKit on a hand-written fixture, 2026-10-16: LL/LR/UR/UL draws two thin
+            // bars instead of a filled quad). PDFium only takes the bounding box, so the
+            // standard order is the one to write.
+            for quad in &annotation.quads {
+                let points = FsQuadPointsF {
+                    x1: quad.min_x() as f32,
+                    y1: quad.max_y() as f32,
+                    x2: quad.max_x() as f32,
+                    y2: quad.max_y() as f32,
+                    x3: quad.min_x() as f32,
+                    y3: quad.min_y() as f32,
+                    x4: quad.max_x() as f32,
+                    y4: quad.min_y() as f32,
+                };
+                if (self.api.append_attachment_points)(handle, &points) == 0 {
+                    return Err(write_error(
+                        "FPDFAnnot_AppendAttachmentPoints",
+                        &annotation.id,
+                    ));
+                }
+            }
+
+            let alpha = (annotation.opacity.clamp(0.0, 1.0) * 255.0).round() as c_uint;
+            if (self.api.set_color)(
+                handle,
+                COLORTYPE_COLOR,
+                c_uint::from(annotation.color[0]),
+                c_uint::from(annotation.color[1]),
+                c_uint::from(annotation.color[2]),
+                alpha,
+            ) == 0
+            {
+                return Err(write_error("FPDFAnnot_SetColor", &annotation.id));
+            }
+
+            set_string(self.api, handle, c"NM", Some(&annotation.id))?;
+            set_string(self.api, handle, c"T", annotation.author.as_deref())?;
+            set_string(
+                self.api,
+                handle,
+                c"Contents",
+                annotation.contents.as_deref(),
+            )?;
+            set_string(self.api, handle, c"M", annotation.modified.as_deref())?;
+            set_string(self.api, handle, c"Subj", Some(annotation.kind.subject()))?;
+
+            // Preview and the review corpus write `/F 4` (print). No appearance stream is set:
+            // see the module-level note in `writeback` for why, and what other viewers show.
+            if (self.api.set_flags)(handle, FLAG_PRINT) == 0 {
+                return Err(write_error("FPDFAnnot_SetFlags", &annotation.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the incrementally-updated document into `file`, flushes it and `fsync`s it.
+    ///
+    /// Returns the number of bytes written (the full output, including the original prefix).
+    pub fn save_incremental(&mut self, file: std::fs::File) -> Result<u64> {
+        let mut sink = FileSink::new(file);
+        let ok = {
+            let _guard = crate::backend::PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: `self.document` is live, and `sink.header` is an `FPDF_FILEWRITE` whose
+            // callback writes into `sink`. PDFium only calls it during this call.
+            unsafe {
+                (self.api.save_as_copy)(
+                    self.document,
+                    std::ptr::addr_of_mut!(sink.header),
+                    SAVE_INCREMENTAL,
+                )
+            }
+        };
+        if ok == 0 || sink.failed {
+            return Err(ArisError::new(
+                ErrorCode::RenderFailed,
+                "PDFium failed to write the incremental update",
+            )
+            .with_detail(format!("save_as_copy={ok}, write_error={}", sink.failed)));
+        }
+        std::io::Write::flush(&mut sink.file).map_err(|error| {
+            ArisError::new(ErrorCode::Io, "could not flush the saved PDF")
+                .with_detail(error.to_string())
+        })?;
+        sink.file.sync_all().map_err(|error| {
+            ArisError::new(ErrorCode::Io, "could not fsync the saved PDF")
+                .with_detail(error.to_string())
+        })?;
+        let bytes = sink.file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        Ok(bytes)
+    }
+}
+
+impl Drop for AnnotationAppender {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `load_document` and is closed exactly once, here.
+        let _guard = crate::backend::PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe { (self.api.close_document)(self.document) };
+    }
+}
+
+fn write_error(call: &str, id: &str) -> ArisError {
+    ArisError::new(
+        ErrorCode::RenderFailed,
+        format!("PDFium refused {call} while writing annotation {id}"),
+    )
+}
+
+/// Sets one UTF-16 dictionary string. An absent value is not an error: the key is simply not
+/// written, which is what "the file did not have an author" should mean on the way out too.
+fn set_string(
+    api: &WriteApi,
+    handle: FpdfAnnotation,
+    key: &CStr,
+    value: Option<&str>,
+) -> Result<()> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let mut wide: Vec<u16> = value.encode_utf16().collect();
+    wide.push(0);
+    // SAFETY: `handle` is live, `key` is NUL-terminated and `wide` is a valid UTF-16LE buffer
+    // terminated by a NUL unit.
+    let ok = unsafe { (api.set_string_value)(handle, key.as_ptr(), wide.as_ptr()) };
+    if ok == 0 {
+        return Err(write_error(
+            "FPDFAnnot_SetStringValue",
+            key.to_string_lossy().as_ref(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reads annotations from one open document.

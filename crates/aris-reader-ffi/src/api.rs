@@ -11,11 +11,14 @@
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
 use aris_reader_core::{
-    AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageIndex, Point,
-    RasterRequest,
+    AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
+    PageIndex, Point, RasterRequest, Transform2D,
 };
-use aris_reader_pdfium::{PdfiumBackend, backend_description};
+use aris_reader_pdfium::{
+    PdfiumBackend, SaveMode, WriteAnnotation, WriteAnnotationKind, backend_description,
+};
 use aris_reader_session::{DocumentLayout, LayoutMode};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
@@ -205,6 +208,11 @@ pub struct ArisDocument {
     figures: Mutex<Option<Vec<FigureRecord>>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
     annotations: Mutex<Option<Vec<AnnotationRecord>>>,
+    /// Set when [`ArisDocument::replace_with_annotations`] has replaced the file on disk. The
+    /// in-memory PDFium document is the pre-replacement one, so every content read would be a
+    /// stale answer; the shell reopens the file immediately and this makes a missed reopen a
+    /// loud error instead of a quiet one.
+    replaced: std::sync::atomic::AtomicBool,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -326,6 +334,7 @@ impl ArisDocument {
             references: Mutex::new(None),
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
+            replaced: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -809,6 +818,12 @@ impl ArisDocument {
     /// disappearing from the answer — "the file has no annotations" and "we could not read them"
     /// are different things, and the shell says so.
     pub fn annotations(&self) -> Result<Vec<AnnotationRecord>, ArisFfiError> {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ArisFfiError::Document {
+                message: "the document was replaced on disk; reopen it before reading annotations"
+                    .to_string(),
+            });
+        }
         if let Ok(cache) = self.annotations.lock()
             && let Some(cached) = cache.as_ref()
         {
@@ -885,6 +900,65 @@ impl ArisDocument {
             *cache = Some(records.clone());
         }
         Ok(records)
+    }
+
+    /// The name to offer when saving an annotated copy: `<name> (annotated).pdf`.
+    pub fn suggested_copy_path(&self) -> String {
+        aris_reader_pdfium::suggested_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Writes `annotations` into a **new PDF** at `destination`.
+    ///
+    /// The document that is open is not modified, and neither is its sidecar. `annotations`
+    /// cross the boundary as view-space geometry at `zoom`; Rust converts it to page space with
+    /// the page's own `/CropBox`, `/Rotate` and `/UserUnit`, so the same highlight saved at 100%
+    /// and at 300% lands in the same PDF coordinates.
+    ///
+    /// The write is append-only: the destination begins with every byte of the source. It is
+    /// written to a temporary file beside `destination`, flushed, reopened, verified annotation
+    /// by annotation, and only then renamed into place. A failure leaves the source untouched.
+    pub fn save_annotations_copy(
+        &self,
+        destination: String,
+        annotations: Vec<WriteAnnotationRecord>,
+        zoom: f64,
+    ) -> Result<AnnotationSaveReport, ArisFfiError> {
+        self.save_annotations_to(
+            std::path::PathBuf::from(destination),
+            annotations,
+            zoom,
+            SaveMode::Copy,
+        )
+    }
+
+    /// Replaces the document that is open with a version carrying `annotations`.
+    ///
+    /// This is the explicit second choice, never the default. A byte-identical backup is written
+    /// first to `<name>.lyra-backup-<unix>-<n>.<ext>`; if it cannot be written *and verified*,
+    /// the save aborts before the original is touched. The replacement itself is the atomic
+    /// rename of a verified temporary file, so a crash leaves the original readable.
+    pub fn replace_with_annotations(
+        &self,
+        annotations: Vec<WriteAnnotationRecord>,
+        zoom: f64,
+    ) -> Result<AnnotationSaveReport, ArisFfiError> {
+        self.save_annotations_to(
+            std::path::PathBuf::from(&self.path),
+            annotations,
+            zoom,
+            SaveMode::ReplaceOriginal,
+        )
+    }
+
+    /// Whether a previous save of this document was interrupted.
+    ///
+    /// A save is only applied by the final rename, so a `<name>.lyra-save-*.tmp` file beside the
+    /// document means the save never reached that point and the document is still the last good
+    /// copy. The shell reports this on open; the next save removes the leftovers.
+    pub fn interrupted_save_note(&self) -> Option<String> {
+        aris_reader_pdfium::interrupted_save_note(Path::new(&self.path))
     }
 
     /// Total height of the scrolling content for the given page gap and layout.
@@ -975,6 +1049,138 @@ impl ArisDocument {
 }
 
 impl ArisDocument {
+    fn save_annotations_to(
+        &self,
+        destination: std::path::PathBuf,
+        annotations: Vec<WriteAnnotationRecord>,
+        zoom: f64,
+        mode: SaveMode,
+    ) -> Result<AnnotationSaveReport, ArisFfiError> {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ArisFfiError::Document {
+                message: "the document was replaced on disk; reopen it before saving again"
+                    .to_string(),
+            });
+        }
+        if self.backend.is_encrypted() {
+            return Err(ArisFfiError::Document {
+                message:
+                    "this document is encrypted; saving annotations into it is not supported yet"
+                        .to_string(),
+            });
+        }
+        if !(zoom.is_finite() && zoom > 0.0 && zoom <= 64.0) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("zoom must be positive, finite and at most 64, got {zoom}"),
+            });
+        }
+        let page_count = self.backend.page_count();
+        let mut geometries: std::collections::HashMap<u32, PageGeometry> =
+            std::collections::HashMap::new();
+        let mut specs = Vec::with_capacity(annotations.len());
+        for record in annotations {
+            if record.page >= page_count {
+                return Err(ArisFfiError::InvalidArgument {
+                    message: format!(
+                        "annotation {:?} names page {}, but the document has {page_count} page(s)",
+                        record.id,
+                        record.page + 1
+                    ),
+                });
+            }
+            let geometry = match geometries.get(&record.page) {
+                Some(geometry) => *geometry,
+                None => {
+                    let geometry = self.backend.page_info(PageIndex(record.page))?.geometry;
+                    geometries.insert(record.page, geometry);
+                    geometry
+                }
+            };
+            let inverse =
+                geometry
+                    .view_to_page(zoom)
+                    .ok_or_else(|| ArisFfiError::InvalidArgument {
+                        message: format!("page {} has no invertible geometry", record.page + 1),
+                    })?;
+            let quads = record
+                .quads
+                .iter()
+                .map(|quad| view_box_to_page_rect(quad, inverse, &geometry))
+                .collect::<Result<Vec<_>, _>>()?;
+            let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
+            let (kind, rect, quads) = match record.kind {
+                AnnotationWriteKind::Note => (WriteAnnotationKind::Text, supplied_rect, Vec::new()),
+                AnnotationWriteKind::Highlight | AnnotationWriteKind::Underline => {
+                    if quads.is_empty() {
+                        return Err(ArisFfiError::InvalidArgument {
+                            message: format!("annotation {:?} has no quads to write", record.id),
+                        });
+                    }
+                    let mut union = quads[0];
+                    for quad in &quads[1..] {
+                        union = union.union(*quad);
+                    }
+                    if !rects_close(union, supplied_rect) {
+                        return Err(ArisFfiError::InvalidArgument {
+                            message: format!(
+                                "annotation {:?} has a rect that does not cover its quads",
+                                record.id
+                            ),
+                        });
+                    }
+                    let kind = match record.kind {
+                        AnnotationWriteKind::Highlight => WriteAnnotationKind::Highlight,
+                        AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
+                        AnnotationWriteKind::Note => unreachable!("handled above"),
+                    };
+                    (kind, union, quads)
+                }
+            };
+            specs.push(WriteAnnotation {
+                id: record.id,
+                page: PageIndex(record.page),
+                kind,
+                rect,
+                quads,
+                color: [record.color.red, record.color.green, record.color.blue],
+                opacity: record.opacity,
+                contents: text_or_none(&record.contents),
+                author: text_or_none(&record.author),
+                modified: text_or_none(&record.modified),
+            });
+        }
+
+        let report = aris_reader_pdfium::save_annotated_pdf(
+            Path::new(&self.path),
+            &destination,
+            &specs,
+            self.password.as_deref(),
+            mode,
+        )?;
+        if mode == SaveMode::ReplaceOriginal {
+            // The open backend still holds the pre-replacement in-memory document; the shell
+            // reopens it after a replace, and every read before that reopen is refused rather
+            // than answered from the old file.
+            self.replaced
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Ok(mut cache) = self.annotations.lock() {
+                *cache = None;
+            }
+        }
+        Ok(AnnotationSaveReport {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            written_ids: report.written_ids,
+            appended_bytes: report.appended_bytes,
+            backup_path: report
+                .backup_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
+                .unwrap_or(u32::MAX),
+            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            source_bytes_preserved: report.source_bytes_preserved,
+        })
+    }
+
     /// Builds (and caches) the layout for `layout` and `gap_pt`.
     ///
     /// The cache key carries both: the same gap produces a different layout in facing mode,
@@ -1315,6 +1521,64 @@ pub struct AnnotationColorRecord {
     pub blue: u8,
 }
 
+/// The PDF annotation a pending write becomes.
+///
+/// `Note` is a sticky note (`/Subtype /Text`): its `rect` is the icon box and its contents are
+/// the note. `Highlight`/`Underline` are the quad-based text marks: their `quads` are the text
+/// boxes and `contents` is the comment attached to the mark (what the shell's `note` field is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AnnotationWriteKind {
+    Highlight,
+    Underline,
+    Note,
+}
+
+/// One annotation the shell asks the writer to put into a PDF.
+///
+/// Geometry is **view space at `zoom`** (points, top-left origin), exactly the space the canvas
+/// draws in. The Rust side owns the single conversion into page space, so a highlight saved at
+/// 100% and the same highlight saved at 300% produce identical PDF coordinates.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WriteAnnotationRecord {
+    /// Stable identity written as `/NM`; the shell uses the sidecar's UUID string so a saved
+    /// annotation can be recognised after reopening.
+    pub id: String,
+    pub page: u32,
+    pub kind: AnnotationWriteKind,
+    /// View-space box at `zoom`. For a note this is its icon; for markup the union of `quads`
+    /// is used and this box is validated for consistency.
+    pub rect: AnnotationQuad,
+    /// View-space `/QuadPoints` at `zoom`; empty only for [`AnnotationWriteKind::Note`].
+    pub quads: Vec<AnnotationQuad>,
+    pub color: AnnotationColorRecord,
+    /// `/CA`; the shell's colour alpha carries it (0…1).
+    pub opacity: f64,
+    /// `/Contents` — the highlight comment or the note body.
+    pub contents: String,
+    /// `/T`.
+    pub author: String,
+    /// `/M`, PDF date format (`D:YYYYMMDDHHmmSSOHH'mm'`).
+    pub modified: String,
+}
+
+/// What a successful write did. Every value is about the *file that was written*, not about the
+/// request: `written_ids` comes back so the shell removes exactly those sidecar entries.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnnotationSaveReport {
+    pub destination_path: String,
+    pub written_ids: Vec<String>,
+    /// Bytes appended to the original (the original prefix is kept byte-for-byte).
+    pub appended_bytes: u64,
+    /// Present only when the original was replaced; the file is verified byte-identical.
+    pub backup_path: Option<String>,
+    /// Content annotations the source already had; all were verified unchanged.
+    pub preexisting_annotation_count: u32,
+    /// Stale `.lyra-save-*.tmp` files removed before this save.
+    pub cleaned_temporary_files: u32,
+    /// True when the written file's prefix equals the source byte-for-byte.
+    pub source_bytes_preserved: bool,
+}
+
 /// One outline entry.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct OutlineEntry {
@@ -1472,6 +1736,83 @@ fn page_region_to_view(
     geometry.page_to_view(1.0).apply_rect(region)
 }
 
+/// One view-space box at `zoom`, converted into page space.
+///
+/// The inverse of [`page_region_to_view`]'s transform, with the zoom the canvas is drawing at.
+/// The returned rectangle is axis-aligned in page space: `/Rotate` is a multiple of 90° in PDF,
+/// so a view rectangle maps to another axis-aligned rectangle (the canvas only ever produces
+/// horizontal text boxes anyway). Bounds are checked against `/CropBox` with one point of slack
+/// so a hairline round-off at the page edge is not turned into a refusal.
+fn view_box_to_page_rect(
+    view: &AnnotationQuad,
+    inverse: Transform2D,
+    geometry: &PageGeometry,
+) -> Result<aris_reader_core::Rect, ArisFfiError> {
+    let values = [view.x_pt, view.y_pt, view.width_pt, view.height_pt];
+    if !values.iter().all(|value| value.is_finite())
+        || view.width_pt <= 0.0
+        || view.height_pt <= 0.0
+    {
+        return Err(ArisFfiError::InvalidArgument {
+            message: format!(
+                "a view-space box has no area or is not finite: {:?}",
+                values
+            ),
+        });
+    }
+    let top_left = inverse.apply(Point::new(view.x_pt, view.y_pt));
+    let bottom_right = inverse.apply(Point::new(
+        view.x_pt + view.width_pt,
+        view.y_pt + view.height_pt,
+    ));
+    let rect = aris_reader_core::Rect::new(
+        top_left.x.min(bottom_right.x),
+        top_left.y.min(bottom_right.y),
+        (top_left.x - bottom_right.x).abs(),
+        (top_left.y - bottom_right.y).abs(),
+    );
+    if !rect.origin.x.is_finite()
+        || !rect.origin.y.is_finite()
+        || !rect.size.width.is_finite()
+        || !rect.size.height.is_finite()
+        || rect.size.width <= 0.0
+        || rect.size.height <= 0.0
+    {
+        return Err(ArisFfiError::InvalidArgument {
+            message: "a view-space box converted to an empty page-space box".to_string(),
+        });
+    }
+    let crop = geometry.crop_box;
+    const SLACK: f64 = 1.0;
+    if rect.min_x() < crop.min_x() - SLACK
+        || rect.min_y() < crop.min_y() - SLACK
+        || rect.max_x() > crop.max_x() + SLACK
+        || rect.max_y() > crop.max_y() + SLACK
+    {
+        return Err(ArisFfiError::InvalidArgument {
+            message: format!("annotation box {rect:?} falls outside the page's crop box {crop:?}"),
+        });
+    }
+    Ok(rect)
+}
+
+/// An empty optional string means "the file should not carry this key".
+fn text_or_none(text: &str) -> Option<String> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Whether two page-space rectangles agree to within half a point.
+fn rects_close(left: aris_reader_core::Rect, right: aris_reader_core::Rect) -> bool {
+    (left.min_x() - right.min_x()).abs() <= 0.5
+        && (left.min_y() - right.min_y()).abs() <= 0.5
+        && (left.max_x() - right.max_x()).abs() <= 0.5
+        && (left.max_y() - right.max_y()).abs() <= 0.5
+}
+
 /// The view transform of `page`, remembered in `cache` for the rest of the scan.
 fn document_page_view(
     backend: &PdfiumBackend,
@@ -1574,6 +1915,7 @@ impl ArisEngine {
             references: Mutex::new(None),
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
+            replaced: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 }
@@ -2302,5 +2644,227 @@ mod tests {
         assert_eq!(summary.first_page_height_pt, 842.0);
         assert_eq!(summary.rotation_degrees, 0);
         assert!(!summary.is_encrypted);
+    }
+
+    // ── Annotation write-back ──────────────────────────────────────────────────────────
+
+    /// A scratch copy of the committed annotated fixture, or `None` when PDFium is absent.
+    fn writeback_fixture(name: &str) -> Option<std::path::PathBuf> {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return None;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let directory = std::env::temp_dir().join(format!(
+            "aris-ffi-writeback-{}-{nanos}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let copy = directory.join("source.pdf");
+        std::fs::copy(&fixture, &copy).expect("copy fixture");
+        Some(directory)
+    }
+
+    fn zoom_annotation(zoom: f64) -> WriteAnnotationRecord {
+        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x * zoom,
+            y_pt: y * zoom,
+            width_pt: width * zoom,
+            height_pt: height * zoom,
+        };
+        WriteAnnotationRecord {
+            id: "33333333-3333-3333-3333-333333333333".to_string(),
+            page: 0,
+            kind: AnnotationWriteKind::Highlight,
+            rect: box_at_zoom(72.0, 141.0, 388.0, 15.0),
+            // View space at 100% is page space y-flipped: page [72 686 388 15] on an 842 pt
+            // page is view (72, 842 - 686 - 15) = (72, 141).
+            quads: vec![box_at_zoom(72.0, 141.0, 388.0, 15.0)],
+            color: AnnotationColorRecord {
+                red: 255,
+                green: 216,
+                blue: 64,
+            },
+            opacity: 0.4,
+            contents: "Saved at an arbitrary zoom.".to_string(),
+            author: "Lyra".to_string(),
+            modified: "D:20261016213000-07'00'".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
+        let Some(directory) = writeback_fixture("zoom") else {
+            return;
+        };
+        let engine = ArisEngine::new();
+        let source = directory.join("source.pdf");
+        let document = engine
+            .open_document(source.display().to_string(), None)
+            .expect("open source");
+        assert_eq!(document.annotations().expect("annotations").len(), 7);
+        let source_bytes = std::fs::read(&source).expect("source readable");
+
+        assert!(
+            document
+                .suggested_copy_path()
+                .ends_with("source (annotated).pdf"),
+            "the suggested name is <name> (annotated).pdf"
+        );
+
+        let at_100 = directory.join("at-100.pdf");
+        let at_300 = directory.join("at-300.pdf");
+        let report_100 = document
+            .save_annotations_copy(
+                at_100.display().to_string(),
+                vec![zoom_annotation(1.0)],
+                1.0,
+            )
+            .expect("save at 100%");
+        let report_300 = document
+            .save_annotations_copy(
+                at_300.display().to_string(),
+                vec![zoom_annotation(3.0)],
+                3.0,
+            )
+            .expect("save at 300%");
+
+        assert_eq!(report_100.written_ids, vec![zoom_annotation(1.0).id]);
+        assert_eq!(report_100.backup_path, None);
+        assert_eq!(report_100.preexisting_annotation_count, 7);
+        assert!(report_100.appended_bytes > 0);
+        assert!(report_100.source_bytes_preserved);
+        assert_eq!(
+            std::fs::read(&source).expect("source readable"),
+            source_bytes,
+            "a copy save leaves the open document untouched"
+        );
+        assert_eq!(report_300.preexisting_annotation_count, 7);
+
+        // The two saves were made from different view-space geometry and zoom factors. Their
+        // page-space output must be identical, which is the promise that a highlight saved at
+        // one zoom reloads in the same place at another.
+        let page_space = |path: &std::path::Path| {
+            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
+            let annotations = backend.annotations(PageIndex(0)).expect("page annotations");
+            annotations
+                .into_iter()
+                .find(|annotation| annotation.id == "nm:33333333-3333-3333-3333-333333333333")
+                .expect("written annotation")
+        };
+        let first = page_space(&at_100);
+        let second = page_space(&at_300);
+        assert_eq!(first, second, "zoom must not change page-space geometry");
+        assert_eq!(
+            first.rect,
+            aris_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)
+        );
+        assert_eq!(
+            first.quads,
+            vec![aris_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)]
+        );
+
+        // Reopening through the FFI at "another zoom" is the same file-space geometry: the
+        // reader reports view space at 100%, and the canvas scales it. Both saved files agree
+        // with the original view box, so the annotation reloads at the same place.
+        for path in [&at_100, &at_300] {
+            let reopened = engine
+                .open_document(path.display().to_string(), None)
+                .expect("reopen saved copy");
+            let records = reopened.annotations().expect("annotations");
+            let ours: Vec<_> = records
+                .iter()
+                .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
+                .collect();
+            assert_eq!(ours.len(), 1, "exactly one copy of the written annotation");
+            assert!((ours[0].x_pt - 72.0).abs() < 1e-6);
+            assert!((ours[0].y_pt - 141.0).abs() < 1e-6);
+            assert!((ours[0].width_pt - 388.0).abs() < 1e-6);
+            assert!((ours[0].height_pt - 15.0).abs() < 1e-6);
+            assert_eq!(
+                ours[0].contents.as_deref(),
+                Some("Saved at an arbitrary zoom.")
+            );
+            assert_eq!(ours[0].author.as_deref(), Some("Lyra"));
+            assert_eq!(ours[0].blend, "multiply");
+        }
+
+        let bad_zoom = document.save_annotations_copy(
+            directory.join("bad.pdf").display().to_string(),
+            vec![zoom_annotation(1.0)],
+            0.0,
+        );
+        assert!(bad_zoom.is_err(), "a zero zoom is refused before any write");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn replacing_the_fixture_reports_a_verified_backup_and_reopens_once() {
+        let Some(directory) = writeback_fixture("replace") else {
+            return;
+        };
+        let engine = ArisEngine::new();
+        let source = directory.join("source.pdf");
+        let document = engine
+            .open_document(source.display().to_string(), None)
+            .expect("open source");
+        let original = std::fs::read(&source).expect("source readable");
+
+        // A next-open report can only be produced from a leftover temporary, and must not
+        // change the document.
+        let stale = directory.join("source.pdf.lyra-save-42-1.tmp");
+        std::fs::write(&stale, b"partial").expect("write stale temp");
+        let note = document
+            .interrupted_save_note()
+            .expect("interrupted save is reported");
+        assert!(note.contains("interrupted"), "{note}");
+        std::fs::remove_file(&stale).expect("remove stale temp");
+        assert!(document.interrupted_save_note().is_none());
+
+        let report = document
+            .replace_with_annotations(vec![zoom_annotation(1.0)], 1.0)
+            .expect("replace original");
+        let backup = report.backup_path.expect("backup path");
+        let backup_bytes = std::fs::read(&backup).expect("backup readable");
+        assert_eq!(
+            backup_bytes, original,
+            "the backup is byte-identical to the original"
+        );
+        assert!(
+            document.annotations().is_err(),
+            "reads from the pre-replacement document are refused until the shell reopens it"
+        );
+
+        let reopened = engine
+            .open_document(source.display().to_string(), None)
+            .expect("reopen replaced source");
+        let records = reopened.annotations().expect("annotations");
+        assert_eq!(
+            records.len(),
+            8,
+            "the seven pre-existing content annotations plus the new one"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
+                .count(),
+            1,
+            "the saved annotation appears exactly once"
+        );
+        assert!(
+            std::fs::read(&source)
+                .expect("replaced source")
+                .starts_with(&original),
+            "the replaced file still begins with the original bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

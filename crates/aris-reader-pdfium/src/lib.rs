@@ -47,15 +47,22 @@ mod annotations;
 mod backend;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
+#[cfg(feature = "pdfium")]
+mod writeback;
 
 #[cfg(feature = "pdfium")]
-pub use annotations::AnnotationReader;
+pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind};
 #[cfg(feature = "pdfium")]
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
 };
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
+#[cfg(feature = "pdfium")]
+pub use writeback::{
+    SaveMode, SaveReport, cleanup_interrupted_save_temporaries, interrupted_save_note,
+    interrupted_save_temporaries, save_annotated_pdf, suggested_copy_path,
+};
 
 /// Environment variable that overrides the PDFium library location.
 pub const PDFIUM_PATH_ENV: &str = "ARIS_READER_PDFIUM_PATH";
