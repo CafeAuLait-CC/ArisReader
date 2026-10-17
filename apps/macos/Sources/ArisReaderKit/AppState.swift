@@ -2,6 +2,7 @@ import ArisReaderFFI
 import Combine
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 /// Sidebar tabs (see `docs/04-ui-ux.md` §2.2).
 public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
@@ -932,6 +933,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// How many times this document's sidecar has been written since the document opened.
     /// Instrumentation: it is what makes write coalescing measurable instead of asserted.
     @Published public private(set) var annotationWriteCount = 0
+    /// True while a PDF write-back is running, so the save commands cannot run twice at once.
+    @Published public private(set) var annotationSaveInProgress = false
+    /// A note from the last open that a previous save of this document was interrupted.
+    ///
+    /// The document itself is intact (a save only takes effect at the final rename); this is
+    /// how the shell tells the reader rather than staying silent about a leftover temp file.
+    @Published public private(set) var interruptedAnnotationSaveNotice: String?
+    /// What the last successful write-back did, for the status line, diagnostics and checks.
+    @Published public private(set) var lastAnnotationWriteReport: AnnotationWriteReport?
     /// True while the note editor holds text that has not reached the sidecar yet.
     @Published public private(set) var hasPendingAnnotationWrite = false
     /// The last recovery backup, so the UI can offer to reveal it in Finder.
@@ -1612,6 +1622,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt = 0
 
             loadAnnotations(for: url)
+            noticeInterruptedSave(at: url)
             reloadVisiblePages()
             restoreReadingPosition(for: url)
             loadOutline()
@@ -1656,6 +1667,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotations = []
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
+        annotationSaveInProgress = false
+        interruptedAnnotationSaveNotice = nil
+        lastAnnotationWriteReport = nil
         annotationTextures = [:]
         outline = []
         thumbnails = [:]
@@ -2438,6 +2452,374 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return true
     }
 
+    // MARK: - Saving annotations into the PDF
+
+    /// Whether the two PDF-writing commands can run.
+    ///
+    /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
+    /// command from the reader, and it is disabled when there is nothing to write.
+    public var canSaveAnnotationsToPDF: Bool {
+        document != nil && !annotations.isEmpty && !annotationSaveInProgress
+    }
+
+    /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
+    public var suggestedAnnotatedCopyURL: URL? {
+        guard let url = document?.url else { return nil }
+        return engine.suggestedAnnotatedCopyURL(for: url)
+    }
+
+    /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
+    /// document on screen (and its sidecar) stays exactly where it is.
+    public func presentSaveAnnotatedCopyPanel() {
+        guard let suggestion = suggestedAnnotatedCopyURL else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save Annotated Copy"
+        panel.message =
+            "Every highlight and underline in the reader's list is written into a new PDF. "
+            + "The original file is not modified."
+        panel.nameFieldStringValue = suggestion.lastPathComponent
+        panel.directoryURL = suggestion.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.saveAnnotatedCopy(to: destination)
+        }
+    }
+
+    /// The clearly-labelled second choice: replace the original. The alert spells out the backup;
+    /// the engine refuses the replacement if that backup cannot be written and verified.
+    public func presentReplaceOriginalConfirmation() {
+        guard let url = document?.url else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Replace “\(url.lastPathComponent)” with the annotated version?"
+        alert.informativeText =
+            "This changes the file on disk. A byte-identical backup is written first; "
+            + "if the backup cannot be written, nothing is replaced."
+        alert.addButton(withTitle: "Save and Replace")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor [weak self] in
+            await self?.replaceOriginalWithSavedAnnotations()
+        }
+    }
+
+    /// Writes every annotation currently in the reader's list into a new PDF at `destination`.
+    ///
+    /// The original document is not touched, and its sidecar is not changed: the copy carries
+    /// the annotations itself, so a fresh Lyra opening that copy sees them from the PDF and no
+    /// sidecar duplicates them. Returns `false` when nothing was written.
+    @discardableResult
+    public func saveAnnotatedCopy(to destination: URL) async -> Bool {
+        guard !annotationSaveInProgress else { return false }
+        guard let documentURL = document?.url else {
+            lastError = "Open a document before saving annotations"
+            return false
+        }
+        guard !annotations.isEmpty else {
+            statusMessage = "There are no annotations to save"
+            return false
+        }
+        if Self.resolvesToSameFile(destination, documentURL) {
+            lastError = "The annotated copy would be the original. Choose another name, or use “Save and Replace Original”."
+            return false
+        }
+        // A sidecar beside the chosen copy would make every saved annotation appear twice when
+        // that copy is opened: once from the PDF, once from the stale sidecar. Refuse rather
+        // than silently deleting somebody else's file.
+        let destinationSidecar = Self.sidecarURL(for: destination)
+        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
+            lastError =
+                "“\(destination.lastPathComponent)” already has a Lyra annotation sidecar. "
+                + "Choose another name so the copy cannot show every annotation twice."
+            return false
+        }
+
+        annotationSaveInProgress = true
+        defer { annotationSaveInProgress = false }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            lastError = "Could not flush the note that is still being edited; nothing was saved"
+            return false
+        }
+
+        do {
+            let requests = try await pendingAnnotationWrites()
+            let report = try await engine.saveAnnotatedCopy(
+                to: destination,
+                annotations: requests,
+                zoom: zoomFactor
+            )
+            lastAnnotationWriteReport = report
+            let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
+            statusMessage =
+                "Saved \(report.writtenIDs.count) annotation(s) to \(destination.lastPathComponent)"
+                + " · \(report.appendedBytes) bytes appended · the original is unchanged\(backup)"
+            FileHandle.standardError.write(Data((
+                "aris-annotate: saved \(report.writtenIDs.count) annotation(s) to \(destination.path)"
+                + " (append \(report.appendedBytes) bytes)\(backup)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not save the annotated copy: \(error.localizedDescription)"
+            statusMessage = "Could not save the annotated copy"
+            FileHandle.standardError.write(
+                Data("aris-annotate: annotated-copy save failed: \(error)\n".utf8)
+            )
+            return false
+        }
+    }
+
+    /// Replaces the open document with one carrying the reader's annotations.
+    ///
+    /// The engine writes a verified backup first and replaces the original by an atomic rename
+    /// of a verified temporary file. Only after that succeeds are exactly the saved sidecar
+    /// entries removed; the document is reopened so its annotations now come from the PDF.
+    /// Returns `false` when nothing was replaced.
+    @discardableResult
+    public func replaceOriginalWithSavedAnnotations() async -> Bool {
+        guard !annotationSaveInProgress else { return false }
+        guard let url = document?.url else {
+            lastError = "Open a document before saving annotations"
+            return false
+        }
+        guard !annotations.isEmpty else {
+            statusMessage = "There are no annotations to save"
+            return false
+        }
+
+        annotationSaveInProgress = true
+        defer { annotationSaveInProgress = false }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            lastError = "Could not flush the note that is still being edited; nothing was replaced"
+            return false
+        }
+
+        do {
+            let requests = try await pendingAnnotationWrites()
+            let report = try await engine.replaceWithAnnotations(requests, zoom: zoomFactor)
+
+            // The PDF is now the source of truth. Remove exactly the written ids from the
+            // sidecar so reopening the file does not show each annotation twice.
+            let cleanedSidecar = forgetAnnotationsSavedToPDF(
+                ids: Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
+            )
+
+            // The engine marks the old handle stale; reopen the file in place, keeping the
+            // reading position and zoom.
+            let loaded = try engine.openDocument(at: url)
+            document = loaded
+            documentEpoch &+= 1
+            documentAnnotations = []
+            documentAnnotationsLoading = false
+            documentAnnotationsError = nil
+            interruptedAnnotationSaveNotice = nil
+            selectedDocumentAnnotationID = nil
+            openDocumentNoteID = nil
+            invalidateTiles()
+            if cleanedSidecar {
+                loadAnnotations(for: url)
+            }
+            loadDocumentAnnotations()
+            reloadVisiblePages()
+
+            lastAnnotationWriteReport = report
+            if !cleanedSidecar {
+                lastError =
+                    "The annotations are saved in the PDF, but the sidecar could not be updated. "
+                    + "They will be reconciled the next time the document is opened, so they do not appear twice."
+            }
+            let backup = report.backupPath
+                .map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
+            statusMessage =
+                "Saved \(report.writtenIDs.count) annotation(s) into \(url.lastPathComponent)"
+                + " · backup: \(backup)"
+            if !cleanedSidecar {
+                statusMessage += " · the sidecar could not be updated and will be reconciled on open"
+            }
+            FileHandle.standardError.write(Data((
+                "aris-annotate: replaced \(url.path) with \(report.writtenIDs.count) annotation(s)"
+                + ", backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not replace the original: \(error.localizedDescription)"
+            statusMessage = "Could not replace the original"
+            FileHandle.standardError.write(
+                Data("aris-annotate: replace failed: \(error)\n".utf8)
+            )
+            return false
+        }
+    }
+
+    /// Builds write requests from the sidecar annotations.
+    ///
+    /// The quads are the same `TextPage.selectionRects` the canvas draws, scaled to the zoom the
+    /// reader is at now. They are **view-space** on purpose: the engine inverts that scale with
+    /// the page geometry, so the stored PDF coordinates do not depend on the zoom this happened
+    /// to be called at.
+    private func pendingAnnotationWrites() async throws -> [AnnotationWriteRequest] {
+        guard let document else { return [] }
+        let zoom = zoomFactor
+        let savedAt = Date()
+        let modified = Self.pdfDate(savedAt)
+        var requests: [AnnotationWriteRequest] = []
+        for annotation in annotations {
+            guard annotation.page >= 0, annotation.page < document.pageCount else {
+                throw NSError(
+                    domain: "Lyra",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Annotation \(annotation.id.uuidString) names page \(annotation.page + 1), which is outside this document"]
+                )
+            }
+            let text: TextPage
+            if let cached = textPages[annotation.page] {
+                text = cached
+            } else {
+                text = try await engine.textPage(annotation.page)
+                textPages[annotation.page] = text
+            }
+            guard annotation.start >= 0,
+                  annotation.end >= annotation.start,
+                  annotation.end < text.chars.count
+            else {
+                throw NSError(
+                    domain: "Lyra",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Annotation \(annotation.id.uuidString) covers characters \(annotation.start)…\(annotation.end), "
+                        + "but page \(annotation.page + 1) has \(text.chars.count) characters"]
+                )
+            }
+            let rects = text.selectionRects(in: annotation.start...annotation.end)
+            guard !rects.isEmpty else {
+                throw NSError(
+                    domain: "Lyra",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Annotation \(annotation.id.uuidString) covers no visible text and cannot be written"]
+                )
+            }
+            let quads = rects.map { rect in
+                CGRect(
+                    x: rect.origin.x * zoom,
+                    y: rect.origin.y * zoom,
+                    width: rect.width * zoom,
+                    height: rect.height * zoom
+                )
+            }
+            let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
+            requests.append(AnnotationWriteRequest(
+                id: annotation.id.uuidString,
+                page: annotation.page,
+                kind: annotation.kind == .highlight ? .highlight : .underline,
+                rect: union,
+                quads: quads,
+                color: annotation.color,
+                opacity: Double(annotation.color.alpha) / 255.0,
+                contents: annotation.note,
+                author: Self.annotationAuthor,
+                modified: modified
+            ))
+        }
+        return requests
+    }
+
+    /// Removes exactly `ids` from the sidecar, keeping every other entry, foreign entry, bookmark
+    /// and their order. Returns false when the sidecar could not be written; the in-memory model
+    /// is still trimmed so the canvas cannot show a duplicate until the next open reconciles it.
+    @discardableResult
+    private func forgetAnnotationsSavedToPDF(ids: Set<UUID>) -> Bool {
+        guard !ids.isEmpty else { return true }
+        let remaining = annotations.filter { !ids.contains($0.id) }
+        let slots = annotationSidecarSlots.filter { slot in
+            if case .annotation(let id) = slot { return !ids.contains(id) }
+            return true
+        }
+        undoStack.removeAll()
+        redoStack.removeAll()
+        if writeSidecar(
+            annotations: remaining,
+            bookmarks: bookmarks,
+            slots: slots,
+            trigger: "saved-to-pdf"
+        ) {
+            return true
+        }
+        annotations = remaining
+        annotationSidecarSlots = slots
+        FileHandle.standardError.write(Data(
+            "aris-annotate: the PDF was saved but the sidecar could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
+        ))
+        return false
+    }
+
+    /// The open-time half of duplicate avoidance.
+    ///
+    /// A write-back can succeed and then fail to update the sidecar (or somebody can restore an
+    /// old sidecar). The PDF's `/NM` is the sidecar's UUID string, so an entry whose identity is
+    /// already in the file is stale by definition: show the PDF's copy and drop the sidecar's,
+    /// never both. The stale entries are removed from the slot list, so the next ordinary
+    /// sidecar write also drops them from the file.
+    private func reconcileAnnotationsAlreadySaved(_ found: [DocumentAnnotation]) {
+        guard !annotations.isEmpty else { return }
+        let identities = Set(found.map(\.id))
+        let saved = annotations.filter { identities.contains("nm:\($0.id.uuidString)") }
+        guard !saved.isEmpty else { return }
+        let savedIDs = Set(saved.map(\.id))
+        annotations.removeAll { savedIDs.contains($0.id) }
+        annotationSidecarSlots.removeAll { slot in
+            if case .annotation(let id) = slot { return savedIDs.contains(id) }
+            return true
+        }
+        undoStack.removeAll()
+        redoStack.removeAll()
+        statusMessage =
+            "\(savedIDs.count) annotation(s) in this PDF were already saved; they now come from the file"
+        FileHandle.standardError.write(Data(
+            "aris-annotate: reconciled \(savedIDs.count) sidecar entr(ies) already present in the PDF\n".utf8
+        ))
+    }
+
+    /// Reports a leftover temporary from an interrupted save, without treating it as damage to
+    /// the document: the rename is the last step, so the document is still the last good copy.
+    private func noticeInterruptedSave(at url: URL) {
+        interruptedAnnotationSaveNotice = engine.interruptedSaveNote(at: url)
+        guard let notice = interruptedAnnotationSaveNotice else { return }
+        statusMessage = notice
+        FileHandle.standardError.write(Data("aris-annotate: \(notice)\n".utf8))
+    }
+
+    /// The account's display name for `/T`, or "Lyra" when it has none.
+    public nonisolated static let annotationAuthor: String = {
+        let name = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Lyra" : name
+    }()
+
+    /// A date in the PDF `/M` format: `D:YYYYMMDDHHmmSSOHH'mm'`.
+    public nonisolated static func pdfDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyyMMddHHmmss"
+        let offset = TimeZone.current.secondsFromGMT(for: date)
+        let sign = offset >= 0 ? "+" : "-"
+        let absolute = abs(offset)
+        let hours = absolute / 3600
+        let minutes = (absolute % 3600) / 60
+        return String(format: "D:%@%@%02d'%02d'", formatter.string(from: date), sign, hours, minutes)
+    }
+
+    /// Whether two URLs name the same file, resolving symlinks when both exist.
+    private static func resolvesToSameFile(_ first: URL, _ second: URL) -> Bool {
+        let firstPath = first.standardizedFileURL.resolvingSymlinksInPath().path
+        let secondPath = second.standardizedFileURL.resolvingSymlinksInPath().path
+        return firstPath == secondPath
+    }
+
     /// `document.pdf` → `document.pdf.aris-annotations.json`.
     private static func sidecarURL(for document: URL) -> URL {
         document.appendingPathExtension("aris-annotations.json")
@@ -2876,6 +3258,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 let found = try await self.engine.annotations()
                 guard epoch == self.documentEpoch else { return }
                 self.documentAnnotations = found
+                self.reconcileAnnotationsAlreadySaved(found)
                 self.reloadVisiblePages()
                 FileHandle.standardError.write(
                     Data("aris-pdf-annotations: \(found.count) in the file, \(self.documentNotes.count) note(s)\n".utf8)

@@ -99,6 +99,9 @@ cd apps/macos && swift build && swift run ArisReader
 #      ARIS_READER_QUIT_AFTER=<ms>         quit through the normal flush path
 #    Sidecar writes are instrumented as `aris-annotate: saved N annotation(s) … write #K [trigger]`,
 #    which is what makes note-write coalescing measurable (at most one write per ~500 ms of typing).
+#    PDF write-back is instrumented as `aris-annotate: saved … to … (append N bytes)` and
+#    `aris-annotate: replaced … , backup …`; the checks can run it alone with
+#    `ArisReaderChecks --check-annotation-writeback .
 
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/Lyra.app
@@ -119,6 +122,47 @@ cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-m
 #    count, /C, /CA, the blend mode it is drawn with, /Contents, and the tint the canvas uploads
 cargo run -p aris-reader-cli -- annotations tests/fixtures/annotated-appearance.pdf
 ```
+
+## Annotation write-back
+
+The reader's highlights, underlines and notes can be written into the PDF itself, so another
+viewer sees them. This is deliberately the only code path that writes to a user's document, and
+it is always an explicit command:
+
+* **File ▸ Save Annotated Copy… (⌘S)** writes a new PDF (suggested name `<name> (annotated).pdf`).
+  The open document and its sidecar are not touched. The copy has no sidecar, so reopening it
+  shows each annotation once, from the file.
+* **File ▸ Save and Replace Original… (⇧⌘S)** replaces the document. It first writes
+  `<name>.lyra-backup-<unix>-<n>.pdf`, verifies that the backup is byte-identical, and refuses to
+  run if the backup cannot be written. The replacement itself is an atomic rename of a verified
+  temporary file, so a crash leaves the original readable.
+
+Both paths save **incrementally**: every original byte stays at its original offset and the new
+objects are appended. Before the temporary file is renamed into place it is reopened and checked:
+each written annotation must read back exactly once with its geometry, colour, opacity, contents,
+author and date, and every annotation the file already carried must read back unchanged. The
+sidecar's per-entry compatibility rules are untouched; a replace removes exactly the entries it
+saved and preserves foreign entries, bookmarks and their order. If the sidecar update fails after
+the PDF was written, reopening reconciles by `/NM` and shows the PDF's copy only.
+
+**Appearance streams, and what to expect in Preview.** The highlight/underline writer does not
+write `/AP`. PDFium's C ABI has only one way to attach one (`FPDFAnnot_SetAP`), and its generated
+`/ExtGState` is hard-coded to `/BM /Normal`; writing that for a translucent highlight would tint
+the glyphs instead of multiplying into the page, which is visibly worse than letting viewers
+synthesize the appearance. PDFKit — the engine Preview uses — does synthesize it from
+`/QuadPoints` and `/C`: the regression suite renders a saved copy with PDFKit and asserts that the
+band is painted while the glyph pixels stay black. PDFium (and therefore Chrome) does the same.
+A viewer that requires an explicit appearance stream (some older readers) will not show the
+highlight; that is the honest cost of not writing a knowingly wrong blend mode. `/Text` notes are
+written with `/Subtype /Text`, contents, author, date and colour, but PDFium exposes no setter for
+the `/Name` icon, so viewers show their default note icon rather than `/Comment`. An opaque `/CA`
+(1.0) is omitted by PDFium because absence already means fully opaque.
+
+**Crash recovery.** A save writes `<destination>.lyra-save-<pid>-<n>.tmp` in the destination's
+directory and removes the temporary on every error. On the next open, the reader reports any
+leftover temporary in the status line; the document is intact because only the final rename makes
+a save take effect. The next save removes the leftovers (the engine's
+`interruptedSaveNote(at:)` is the detection point).
 
 ## Development workflow
 
@@ -336,7 +380,7 @@ resolve locally.
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: resolved in PR #6 |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo. A sidecar that cannot be read still refuses every write, but the reader can now back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. PDF annotation import/write-back, ink, page operations, AcroForm forms and export remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Ink, free text, page operations, AcroForm forms and export remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. On the **twenty-paper arXiv corpus**, 94.7% of 1979 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations and short parenthesised numerals remain unsupported. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning, index persistence and bibliography metadata remain. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
