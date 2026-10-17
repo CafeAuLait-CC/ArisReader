@@ -390,11 +390,19 @@ pub unsafe extern "C" fn aris_reader_surface_draw_page(
 /// of one acquire/present per page. Each quad carries its own blend mode, because a page and a
 /// highlight loaded from a PDF composite differently (`/BM /Multiply`).
 ///
+/// `count == 0` is a valid frame: it clears the surface to the reading background and presents
+/// it with no quads. The shell needs that to **clear the canvas when the last document closes**
+/// — a `CAMetalLayer` keeps its last drawable on screen until another frame is presented, so
+/// refusing an empty frame left the closed document painted under the empty state. The GPU
+/// layer already implements the clear-first pass for an empty draw list
+/// (`render_pages`), so the only thing standing in the way was this validation.
+///
 /// # Safety
 ///
-/// `texture_ids` must point to `count` readable `u64`s, `rects` to `count * 4` readable
-/// `f32`s (`[x, y, width, height]` each), `blend_modes` to `count` readable `u8`s (see
-/// [`blend`]) and `stats` must be null or writable.
+/// When `count > 0`, `texture_ids` must point to `count` readable `u64`s, `rects` to
+/// `count * 4` readable `f32`s (`[x, y, width, height]` each), `blend_modes` to `count`
+/// readable `u8`s (see [`blend`]). When `count == 0` those three pointers are not read and may
+/// be null. `stats` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn aris_reader_surface_draw_pages(
     surface_id: u64,
@@ -404,29 +412,31 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
     count: usize,
     stats: *mut ArisFrameStats,
 ) -> i32 {
-    if count == 0 || texture_ids.is_null() || rects.is_null() || blend_modes.is_null() {
+    if count > 0 && (texture_ids.is_null() || rects.is_null() || blend_modes.is_null()) {
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    // SAFETY: the caller guarantees all three arrays cover `count` elements (documented above).
-    let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
-    let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
-    let modes = unsafe { std::slice::from_raw_parts(blend_modes, count) };
-
     let mut draws = Vec::with_capacity(count);
-    for (index, id) in ids.iter().enumerate() {
-        let rect = &coordinates[index * 4..index * 4 + 4];
-        let blend = match modes[index] {
-            blend::MULTIPLY => QuadBlend::Multiply,
-            // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
-            // harmless reading, and the alternative (failing the whole frame) would blank the page.
-            _ => QuadBlend::Normal,
-        };
-        draws.push((
-            aris_reader_gpu::TextureId(*id),
-            [rect[0], rect[1], rect[2], rect[3]],
-            blend,
-        ));
+    if count > 0 {
+        // SAFETY: the caller guarantees all three arrays cover `count` elements (documented above).
+        let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
+        let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
+        let modes = unsafe { std::slice::from_raw_parts(blend_modes, count) };
+
+        for (index, id) in ids.iter().enumerate() {
+            let rect = &coordinates[index * 4..index * 4 + 4];
+            let blend = match modes[index] {
+                blend::MULTIPLY => QuadBlend::Multiply,
+                // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
+                // harmless reading, and the alternative (failing the whole frame) would blank the page.
+                _ => QuadBlend::Normal,
+            };
+            draws.push((
+                aris_reader_gpu::TextureId(*id),
+                [rect[0], rect[1], rect[2], rect[3]],
+                blend,
+            ));
+        }
     }
 
     let mut report = None;

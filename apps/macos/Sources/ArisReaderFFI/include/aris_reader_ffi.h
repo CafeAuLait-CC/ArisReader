@@ -128,6 +128,11 @@ int32_t aris_reader_surface_draw_page(uint64_t surface_id,
  * (rects holds count * 4 floats: x, y, width, height; blend_modes holds count bytes,
  * one ARIS_BLEND_* each). `stats` may be NULL.
  *
+ * count == 0 is a valid frame: it clears the surface to the reading background and
+ * presents it with no quads. The shell needs it to clear the canvas when the last
+ * document closes (a CAMetalLayer otherwise keeps showing its last drawable). With
+ * count == 0 the three array pointers are not read and may be NULL.
+ *
  * A draw with ARIS_BLEND_MULTIPLY must use a tint texture whose colour already has the
  * annotation's /CA opacity baked in at alpha 255: PDF mixes opacity in the stored
  * (gamma-encoded) colour space and the GPU mixes in linear light, which is visibly

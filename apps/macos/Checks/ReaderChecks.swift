@@ -172,6 +172,23 @@ struct ReaderChecks {
             print("Window-independence checks passed")
             return
         }
+        // The clear-on-close regression on its own while it is being worked on: it needs a
+        // presentable surface, so it is kept runnable outside the full suite.
+        if CommandLine.arguments.contains("--check-canvas-clear") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
+                ?? FileManager.default.currentDirectoryPath)
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aris-canvas-clear-\(UUID())")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let first = scratch.appendingPathComponent("a.pdf")
+            let second = scratch.appendingPathComponent("b.pdf")
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: first)
+            try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: second)
+            try await canvasClearChecks(a: first, b: second)
+            print("Canvas-clear checks passed")
+            return
+        }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -300,6 +317,9 @@ struct ReaderChecks {
         try await pageOperationChecks(root: root)
         try await documentOpeningChecks(a: a, b: b)
         try await windowIndependenceChecks(a: a, b: b)
+        // Registered with the other surface checks: it asserts the frame presented after the
+        // last tab closes, so it needs a window wgpu will actually present.
+        try await canvasClearChecks(a: a, b: b)
         try await frameSchedulingChecks()
         print("All reader regression checks passed")
     }
