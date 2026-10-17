@@ -155,6 +155,14 @@ public final class MetalCanvasView: NSView {
     /// `draggingEntered`).
     private var dragCarriesFiles = false
 
+    /// Builds the right-click menu for a point in content space.
+    ///
+    /// The view owns no menu policy — the shell decides what is available from the reader's state
+    /// (`CanvasContextMenu`) — and `nil` means "nothing to offer here", which leaves AppKit's
+    /// default menu alone. Returning a menu is what lets a right-click on the page reach the same
+    /// `AppState` commands the toolbar and the Pages menu use.
+    public var onContextMenu: ((CGPoint) -> NSMenu?)?
+
     /// Width of the widest page in points; used to centre narrow documents.
     public var contentWidthPt: CGFloat = 0 {
         didSet {
@@ -413,6 +421,16 @@ public final class MetalCanvasView: NSView {
     }
 
     public override var acceptsFirstResponder: Bool { true }
+
+    // MARK: - Context menu
+
+    /// AppKit asks for this when the reader right-clicks. The point is converted to the same
+    /// content space selection and link hit-testing use, so a command in the menu acts on exactly
+    /// the thing under the pointer.
+    public override func menu(for event: NSEvent) -> NSMenu? {
+        guard let onContextMenu else { return super.menu(for: event) }
+        return onContextMenu(contentPoint(for: event)) ?? super.menu(for: event)
+    }
 
     // MARK: - Pointer
 
@@ -870,6 +888,9 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
     /// Documents dropped on the canvas: the shell's open funnel (see `DocumentOpenCoordinator`).
     private let fileDrop: DocumentOpenCoordinator?
+    /// Right-click menu, built from the reader's state at the clicked point. `nil` leaves AppKit's
+    /// default menu alone.
+    private let onContextMenu: ((CGPoint) -> NSMenu?)?
 
     public init(
         pages: [CanvasPage] = [],
@@ -892,7 +913,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         onUndo: @escaping () -> Void = {},
         onRedo: @escaping () -> Void = {},
         interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
-        fileDrop: DocumentOpenCoordinator? = nil
+        fileDrop: DocumentOpenCoordinator? = nil,
+        onContextMenu: ((CGPoint) -> NSMenu?)? = nil
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -915,6 +937,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onRedo = onRedo
         self.interactionSnapshot = interactionSnapshot
         self.fileDrop = fileDrop
+        self.onContextMenu = onContextMenu
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -944,6 +967,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onCopy = onCopy
         view.onUndo = onUndo
         view.onRedo = onRedo
+        view.onContextMenu = onContextMenu
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt

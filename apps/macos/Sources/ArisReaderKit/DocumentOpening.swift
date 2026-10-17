@@ -24,6 +24,14 @@ public struct FileDropPreview: Equatable, Sendable {
     }
 }
 
+/// Where a drop would put the document. The same files mean different things depending on the
+/// target: the canvas opens a tab in *this* window, the sidebar opens a *new* window. Keeping this
+/// beside the preview is what makes the highlight say which one the reader will get.
+public enum DropDestination: Equatable, Sendable {
+    case currentWindow
+    case newWindow
+}
+
 /// Why a file cannot be opened, decided without touching the engine.
 ///
 /// These are the cases a reader hits by dragging the wrong thing: a folder, a text file, a file
@@ -119,16 +127,28 @@ public enum FileOpenPolicy {
 public final class DocumentOpenCoordinator: ObservableObject {
     public let state: AppState
 
+    /// Who owns the windows, when this coordinator belongs to one of them. `nil` in the checks
+    /// that only exercise the single-window open path; the app always supplies it through
+    /// ``ReaderSession``.
+    private weak var registry: ReaderWindowRegistry?
+
     /// What the canvas should show while a drag hovers over it (`nil` when no drag is over us).
     @Published public private(set) var dropHint: FileDropPreview?
 
+    /// What the sidebar should show while a drag hovers over it, where letting go opens a **new
+    /// window** rather than a tab in this one.
+    @Published public private(set) var newWindowDropHint: FileDropPreview?
+
     /// URLs delivered before the app was ready, in arrival order.
     private var queued: [URL] = []
+    /// The page a queued delivery should show once it opens (a thumbnail's "Open in New Window").
+    private var queuedStartPage: Int?
     /// Set by ``markReady()``; until then, deliveries are queued rather than opened.
     private var isReady = false
 
-    public init(state: AppState) {
+    public init(state: AppState, registry: ReaderWindowRegistry? = nil) {
         self.state = state
+        self.registry = registry
     }
 
     // MARK: - System open requests
@@ -145,7 +165,11 @@ public final class DocumentOpenCoordinator: ObservableObject {
 
     /// A document request from the system: `application(_:open:)`, `openFile(s)`, or a drop on
     /// the Dock icon. Non-file URLs are refused out loud instead of being ignored.
-    public func receive(_ urls: [URL]) {
+    ///
+    /// `startingAt` is for a request that also names a page — a thumbnail's “Open in New Window”.
+    /// It is kept with the queued batch, so a delivery that waits for its window still lands on
+    /// the page the reader asked for.
+    public func receive(_ urls: [URL], startingAt page: Int? = nil) {
         guard !urls.isEmpty else { return }
         var files: [URL] = []
         for url in urls {
@@ -156,6 +180,7 @@ public final class DocumentOpenCoordinator: ObservableObject {
             files.append(file)
         }
         guard !files.isEmpty else { return }
+        if let page { queuedStartPage = page }
         queued.append(contentsOf: files)
         flushQueue()
     }
@@ -163,8 +188,15 @@ public final class DocumentOpenCoordinator: ObservableObject {
     private func flushQueue() {
         guard isReady, !queued.isEmpty else { return }
         let batch = queued
+        let startPage = queuedStartPage
         queued.removeAll()
-        openDocuments(batch)
+        queuedStartPage = nil
+        let opened = openDocuments(batch)
+        // Only after a document actually opened: jumping a page in whatever was already on screen
+        // would be a side effect the reader never asked for.
+        if opened > 0, let startPage, startPage >= 0 {
+            state.gotoPage(startPage)
+        }
     }
 
     /// Opens documents — one tab each — and reports every one that failed. This is the shared
@@ -195,7 +227,7 @@ public final class DocumentOpenCoordinator: ObservableObject {
     /// Called while a drag hovers: what the canvas should show, and what letting go would do.
     @discardableResult
     public func previewDrop(_ urls: [URL]) -> FileDropPreview {
-        let preview = Self.preview(of: urls)
+        let preview = Self.preview(of: urls, destination: .currentWindow)
         // Publishing only a change keeps the window from redrawing on every mouse move AppKit
         // reports during one drag.
         if dropHint != preview { dropHint = preview }
@@ -221,6 +253,80 @@ public final class DocumentOpenCoordinator: ObservableObject {
         return opened > 0
     }
 
+    // MARK: - Drag and drop on the sidebar (new window)
+
+    /// Called while a drag hovers over the sidebar: it will open in a **new window**.
+    ///
+    /// The preview is built by the same policy the canvas uses, with the destination in the
+    /// wording. A drag the app would refuse shows the refusal it will produce, never an invitation
+    /// to drop.
+    @discardableResult
+    public func previewNewWindowDrop(_ urls: [URL]) -> FileDropPreview {
+        let preview = Self.preview(of: urls, destination: .newWindow)
+        if newWindowDropHint != preview { newWindowDropHint = preview }
+        return preview
+    }
+
+    /// The drag left the sidebar (or was cancelled): cancel the new-window highlight.
+    public func endNewWindowDropPreview() {
+        newWindowDropHint = nil
+    }
+
+    /// The reader let go over the sidebar: open the files in a new window, through the window
+    /// registry. Returns whether a new window was asked for; every refusal has been reported.
+    @discardableResult
+    public func acceptNewWindowDrop(_ urls: [URL]) -> Bool {
+        newWindowDropHint = nil
+        guard !urls.isEmpty else {
+            report("Nothing was opened. Lyra needs a PDF file.")
+            return false
+        }
+        return openInNewWindow(urls)
+    }
+
+    /// Opens documents in a **new** reader window, leaving this one exactly as it is.
+    ///
+    /// This is the sidebar's drop path and the thumbnail menu's “Open in New Window”. The files
+    /// are validated here (the same `FileOpenPolicy` the canvas uses), then handed to
+    /// ``ReaderWindowRegistry`` — the app-wide machinery that owns windows — which asks SwiftUI
+    /// for one and delivers the URLs to the session that registers for it. Validation happens
+    /// before the window is requested so a drag of the wrong file produces a sentence, not an
+    /// empty window.
+    @discardableResult
+    public func openInNewWindow(_ urls: [URL], page: Int? = nil) -> Bool {
+        let files = urls.compactMap(Self.normalizedFileURL)
+        guard !files.isEmpty else {
+            report(FileOpenRefusal.notAFile.message(for: urls.first ?? URL(fileURLWithPath: "/")))
+            return false
+        }
+        var openable: [URL] = []
+        for url in files {
+            if let refusal = FileOpenPolicy.refusal(for: url) {
+                report(refusal.message(for: url))
+            } else {
+                openable.append(url)
+            }
+        }
+        guard !openable.isEmpty else { return false }
+        guard let registry, registry.canOpenNewWindow else {
+            report("Lyra can’t open a new window right now, so nothing was opened.")
+            return false
+        }
+        guard registry.requestNewWindow(opening: openable, page: page) else {
+            report("Lyra can’t open a new window right now, so nothing was opened.")
+            return false
+        }
+        state.statusMessage = openable.count == 1
+            ? "Opening “\(openable[0].lastPathComponent)” in a new window"
+            : "Opening \(openable.count) documents in a new window"
+        traceNewWindowRequest(openable, page: page)
+        return true
+    }
+
+    /// Whether a drop on the sidebar can actually create a window. The sidebar omits “Open in New
+    /// Window” when it cannot, rather than offering a command that reports failure.
+    public var canOpenInNewWindow: Bool { registry?.canOpenNewWindow == true }
+
     /// Connects a canvas so drags on it go through this coordinator. The window and the checks
     /// call the same method, so what the checks exercise is the wiring the app runs.
     public func connect(_ canvas: MetalCanvasView) {
@@ -230,8 +336,11 @@ public final class DocumentOpenCoordinator: ObservableObject {
     }
 
     /// The hover hint for a set of dragged URLs: one line, saying either what will open or why
-    /// nothing will.
-    public static func preview(of urls: [URL]) -> FileDropPreview {
+    /// nothing will, and — when the destination is the sidebar — that it opens a new window.
+    public static func preview(
+        of urls: [URL],
+        destination: DropDestination = .currentWindow
+    ) -> FileDropPreview {
         let files = urls.compactMap(normalizedFileURL)
         guard !files.isEmpty else {
             return FileDropPreview(
@@ -243,23 +352,27 @@ public final class DocumentOpenCoordinator: ObservableObject {
             FileOpenPolicy.refusal(for: url).map { (url, $0) }
         }
         let openable = files.count - refusals.count
+        let destinationText = destination == .newWindow ? " in a new window" : " here"
         if openable == 0, let (url, refusal) = refusals.first {
             return FileDropPreview(kind: .refused, message: refusal.message(for: url))
         }
         if let (url, refusal) = refusals.first {
             return FileDropPreview(
                 kind: .acceptable,
-                message: "Drop to open \(openable) of \(files.count) files — "
+                message: "Drop to open \(openable) of \(files.count) files\(destinationText) — "
                     + refusal.message(for: url)
             )
         }
         if files.count == 1 {
             return FileDropPreview(
                 kind: .acceptable,
-                message: "Drop to open “\(files[0].lastPathComponent)”"
+                message: "Drop to open “\(files[0].lastPathComponent)”\(destinationText)"
             )
         }
-        return FileDropPreview(kind: .acceptable, message: "Drop to open \(files.count) documents")
+        return FileDropPreview(
+            kind: .acceptable,
+            message: "Drop to open \(files.count) documents\(destinationText)"
+        )
     }
 
     /// A file URL reduced to a plain, standardised path, or `nil` for anything that is not a
@@ -282,6 +395,14 @@ public final class DocumentOpenCoordinator: ObservableObject {
     /// a headless run can see what macOS handed over even though it cannot show the window.
     private func trace(urls: [URL], opened: Int) {
         let line = "aris-open: \(urls.count) url(s) → \(opened) opened, \(state.tabs.count) tab(s)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    /// Development aid for the sidebar drop: says a new window was asked for, before the window
+    /// exists. The registry's own `aris-window:` line then says which session received it.
+    private func traceNewWindowRequest(_ urls: [URL], page: Int?) {
+        let pageNote = page.map { ", page \($0 + 1)" } ?? ""
+        let line = "aris-drop: \(urls.count) url(s) → new window\(pageNote)\n"
         FileHandle.standardError.write(Data(line.utf8))
     }
 }
