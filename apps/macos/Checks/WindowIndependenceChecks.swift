@@ -89,18 +89,17 @@ extension ReaderChecks {
                 && right.state.zoomPercent == rightZoom,
                 "zooming one window leaves the other window's zoom alone")
 
-        // 5. The wheel glide is per window as well. `AppState` owns a `ScrollGlide` and its driver
-        //    (not a global), so a window's session isolates it the same way it isolates the offset
-        //    — but that is exactly the class of accident this change exists to prevent (one shared
-        //    object animating two windows), so it is asserted rather than assumed: a notch in one
-        //    window must aim a glide there, leave the other window with no glide at all, and the
-        //    ticks of that glide must move only the window that owns it.
-        require(right.state.scrollDestinationYPt == nil, "the second window starts with no glide")
+        // 5. Immediate wheel input and keyboard animation both belong to one window.
+        let beforeWheel = left.state.scrollYPt
+        let otherBeforeWheel = right.state.scrollYPt
         left.state.scrollByWheelStep(96)
+        require(left.state.scrollYPt > beforeWheel && left.state.scrollDestinationYPt == nil,
+                "wheel input moves only its window immediately without a glide")
+        require(right.state.scrollYPt == otherBeforeWheel && right.state.scrollDestinationYPt == nil,
+                "wheel input leaves the other window stationary")
+        left.state.scrollByKeyboardStep(96)
         require(left.state.scrollDestinationYPt != nil,
-                "a wheel notch aims a glide in the window it happened in")
-        require(right.state.scrollDestinationYPt == nil,
-                "…and the other window has no glide of its own (the glide is not shared)")
+                "keyboard input starts an animation in its own window")
         let leftBeforeGlide = left.state.scrollYPt
         let rightBeforeGlide = right.state.scrollYPt
         var glideFinished = false

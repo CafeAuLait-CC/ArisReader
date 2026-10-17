@@ -112,18 +112,8 @@ extension ReaderChecks {
         view.scrollWheel(with: plain)
         require(state.zoomPercent == zoomBeforePlain,
                 "an ordinary scroll does not change the zoom")
-        require(state.scrollYPt == scrollBeforePlain,
-                "an ordinary wheel notch no longer jumps the offset")
-        guard let plainDestination = state.scrollDestinationYPt else {
-            fatalError("FAIL: an ordinary wheel notch aims at a destination")
-        }
-        require(plainDestination < scrollBeforePlain,
-                "an ordinary scroll still scrolls the document (one notch down)")
-        for _ in 0..<400 {
-            if state.advanceScrollGlide(elapsed: 0.008) { break }
-        }
-        require(abs(state.scrollYPt - plainDestination) < 1e-9,
-                "the ordinary scroll reaches the offset it aimed at")
+        require(state.scrollYPt < scrollBeforePlain && state.scrollDestinationYPt == nil,
+                "an ordinary wheel scroll moves immediately without queued motion")
         require(pagesBeforePlain == state.canvasPages.map(\.placement.index) || state.canvasPages.isEmpty,
                 "an ordinary scroll keeps the same pages in the band")
 
@@ -415,166 +405,34 @@ extension ReaderChecks {
 
     // MARK: - Smooth scrolling
 
-    /// Stepped input glides; precise input is applied 1:1 and is never quantised.
-    ///
-    /// The offsets below are the real model offsets after the real `scrollWheel(with:)` and
-    /// `keyDown(with:)` paths, sampled from the state. What a display would add on top is pacing,
-    /// and that is `frameSchedulingChecks`.
+    /// Trackpad precision and keyboard animation remain independent of the immediate wheel path.
     @MainActor static func smoothScrollChecks(url: URL) async throws {
         let state = AppState(engine: try RustEngine(), preferFullPageRasters: false)
         state.setViewportSize(CGSize(width: 700, height: 500))
-        require(state.open(url: url), "smooth-scroll fixture opens")
-        state.scroll(toFraction: 0.35)
-
-        let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
-        view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
-        view.onScrollStep = { delta in state.scrollByWheelStep(delta) }
-        view.onKeyboardStep = { delta in state.scrollByKeyboardStep(delta) }
-        view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
-
-        // ── Precise deltas are 1:1, and two different deltas give two different offsets ────
+        require(state.open(url: url), "scroll fixture opens")
         state.scroll(toFraction: 0.35)
         let base = state.scrollYPt
         state.scroll(byScreenPoints: 7.25)
-        require(abs(state.scrollYPt - (base + 7.25)) < 1e-9,
-                "a precise delta moves the offset by exactly what it reported (7.25 pt)")
         state.scroll(byScreenPoints: 3.5)
-        require(abs(state.scrollYPt - (base + 10.75)) < 1e-9,
-                "a second, smaller precise delta moves it by exactly its own 3.5 pt")
-        require(abs((base - state.scrollYPt) - 10.75) > 0.001,
-                "the offset is not snapped: 3.5 pt and 7.25 pt land 3.75 pt apart")
-        require(state.scrollDestinationYPt == nil,
-                "a precise delta starts no glide (the system already animated it)")
-
-        // ── A stepped notch glides instead of jumping ─────────────────────────────────────
-        state.scroll(toFraction: 0.35)
-        let glideStart = state.scrollYPt
-        let step = -32.0
-        state.scrollByWheelStep(step)
-        require(state.scrollYPt == glideStart,
-                "a wheel notch does not move the offset on the spot (it starts a glide)")
-        guard let destination = state.scrollDestinationYPt else {
-            fatalError("FAIL: a wheel notch aims at a destination")
-        }
-        require(abs(destination - (glideStart + step)) < 1e-9,
-                "the destination is one notch away from where the scroll was")
-
-        // Drive the exact code the timer drives, at a fixed tick, so the trace below is the
-        // production arithmetic and not a re-implementation of it.
-        var offsets: [CGFloat] = [state.scrollYPt]
-        for _ in 0..<200 {
-            if state.advanceScrollGlide(elapsed: 0.008) { break }
-            offsets.append(state.scrollYPt)
-        }
-        offsets.append(state.scrollYPt)
-        let increments = zip(offsets, offsets.dropFirst()).map { $1 - $0 }
-        let ceiling = Double(ScrollGlide.defaultMaximumSpeed) * 0.008 + 1e-6
-        require(increments.count >= 5,
-                "the notch is covered in small increments, not one (\(increments.count) ticks)")
-        require(increments.allSatisfy { abs($0) <= 32 * 0.25 + 1e-6 },
-                "no increment swallows more than a quarter of the notch "
-                + "(largest \(increments.map { abs($0) }.max() ?? 0) pt of 32)")
-        require(increments.allSatisfy { $0 < 0 },
-                "every increment moves toward the destination")
-        require(increments.allSatisfy { abs($0) <= ceiling },
-                "no increment exceeds the glide's speed ceiling "
-                + "(largest \(increments.map { abs($0) }.max() ?? 0) pt vs \(ceiling) pt)")
-        require(offsets.allSatisfy { $0 <= glideStart + 1e-9 && $0 >= destination - 1e-9 },
-                "the offset stays between where it started and the destination (no overshoot)")
-        require(abs(state.scrollYPt - destination) < 1e-9,
-                "the glide converges exactly on its destination")
-        require(state.scrollDestinationYPt == nil, "and reports itself finished")
-        print("PASS: one wheel notch glides \(offsets.count) offsets from "
-              + "\(glideStart) to \(state.scrollYPt): "
-              + increments.map { String(format: "%.1f", $0) }.joined(separator: ", "))
-
-        // ── A burst accumulates into one longer glide ─────────────────────────────────────
-        state.scroll(toFraction: 0.35)
-        let burstStart = state.scrollYPt
-        for _ in 0..<3 { state.scrollByWheelStep(step) }
-        guard let burstDestination = state.scrollDestinationYPt else {
-            fatalError("FAIL: a burst aims somewhere")
-        }
-        require(abs(burstDestination - (burstStart + step * 3)) < 1e-9,
-                "three notches aim three notches away, not one")
-        var burstOffsets: [CGFloat] = []
-        var burstTicks = 0
-        for _ in 0..<400 {
-            burstTicks += 1
-            if state.advanceScrollGlide(elapsed: 0.008) { break }
-            burstOffsets.append(state.scrollYPt)
-        }
-        require(abs(state.scrollYPt - burstDestination) < 1e-9,
-                "the burst converges on the accumulated destination")
-        // A longer distance is not a longer *tail*: the glide delivers at the speed ceiling once
-        // the notches stop, so three notches take the same handful of ticks as one, not three
-        // times as many.
-        require(burstTicks <= offsets.count + 2,
-                "three notches are delivered in \(burstTicks) ticks against the one notch's "
-                + "\(offsets.count): distance does not become drift")
-
-        // ── Momentum is not applied twice: precise input takes over and ends the glide ────
-        state.scroll(toFraction: 0.35)
-        state.scrollByWheelStep(-96)
-        require(state.scrollDestinationYPt != nil, "a notch glide is in flight")
-        let beforeMomentum = state.scrollYPt
-        state.scroll(byScreenPoints: 7)
-        require(abs(state.scrollYPt - (beforeMomentum + 7)) < 1e-9,
-                "a precise (momentum) delta is applied exactly once, on top of the glide")
-        require(state.scrollDestinationYPt == nil,
-                "the glide is dropped when the fingers take over")
-        let afterMomentum = state.scrollYPt
-        try await Task.sleep(for: .milliseconds(120))
-        require(state.scrollYPt == afterMomentum,
-                "nothing keeps moving after the glide was dropped (no double inertia)")
-
-        // ── The real driver reaches the destination along the way ─────────────────────────
-        state.scroll(toFraction: 0.35)
-        let driverStart = state.scrollYPt
-        var observed: [CGFloat] = []
-        let observer = state.$scrollYPt.sink { value in observed.append(value) }
-        view.onScrollStep?(-96)
-        try await eventually("the glide driver settles on the destination", {
-            state.scrollDestinationYPt == nil
-                && abs(state.scrollYPt - (driverStart - 96)) < 1e-6
-        })
-        observer.cancel()
-        observed.append(state.scrollYPt)
-        // How many offsets a *timer-driven* glide publishes is a property of the machine, not of
-        // the glide: a loaded runner hands the driver two 40 ms slots where an idle one hands it
-        // ten 8 ms ones, and this assertion used to demand four offsets and fail on CI for it. What
-        // does not depend on tick density is asserted here - the offset only ever moves toward the
-        // destination, and the motion is stepped rather than one jump - and the deterministic tick
-        // loop above is what pins the increments and their count (ScrollTailChecks pins them for a
-        // stalled tick too).
-        let distinct = Set(observed.map { ($0 * 100).rounded() }).count
-        require(distinct >= 2,
-                "the driver publishes the glide, not one jump (\(distinct) offsets)")
-        let monotonic = zip(observed, observed.dropFirst()).allSatisfy { $1 <= $0 + 1e-9 }
-        require(monotonic,
-                "every offset the driver published is between the start and the destination")
-        require(observed.allSatisfy { $0 <= driverStart + 1e-9 && $0 >= driverStart - 96 - 1e-9 },
-                "the driver never leaves the interval it was aimed at")
-        print("PASS: the glide driver moved \(driverStart) → \(state.scrollYPt) through "
-              + "\(distinct) distinct offsets")
-
-        // ── Keyboard paging glides through the same path ──────────────────────────────────
-        state.scroll(toFraction: 0.35)
+        require(abs(state.scrollYPt - base - 10.75) < 1e-9 && state.scrollDestinationYPt == nil,
+                "precise deltas keep their fractional distances without animation")
+        let view = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
+        view.onScrollStep = { state.scrollByWheelStep($0) }
+        view.onKeyboardStep = { state.scrollByKeyboardStep($0) }
         let beforeKey = state.scrollYPt
         view.keyDown(with: keyEvent("\u{F72D}"))
-        require(state.scrollYPt == beforeKey,
-                "Page Down starts a glide rather than jumping a screen")
-        guard let keyDestination = state.scrollDestinationYPt else {
-            fatalError("FAIL: Page Down aims at a destination")
-        }
-        require(abs(keyDestination - (beforeKey + view.bounds.height * 0.9)) < 1e-9,
-                "Page Down aims one screen (0.9 of the viewport) away")
-        for _ in 0..<400 {
-            if state.advanceScrollGlide(elapsed: 0.008) { break }
-        }
-        require(abs(state.scrollYPt - keyDestination) < 1e-9,
-                "Page Down converges on that destination as well")
-        print("PASS: Page Down glides \(beforeKey) → \(state.scrollYPt)")
+        require(state.scrollYPt == beforeKey && state.scrollDestinationYPt == beforeKey + 450,
+                "Page Down still animates to a full page destination")
+        try await eventually("keyboard navigation reaches its destination", {
+            state.scrollDestinationYPt == nil && abs(state.scrollYPt - beforeKey - 450) < 1e-6
+        })
+        view.keyDown(with: keyEvent("\u{F72C}"))
+        require(state.scrollDestinationYPt != nil, "Page Up starts its animation")
+        state.scrollByWheelStep(40)
+        let parked = state.scrollYPt
+        require(state.scrollDestinationYPt == nil, "wheel input cancels a keyboard animation")
+        try await Task.sleep(for: .milliseconds(150))
+        require(state.scrollYPt == parked, "a canceled keyboard driver cannot move the document later")
     }
 
     /// The glide's own arithmetic, independent of any document or timer.

@@ -1673,25 +1673,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         schedulePositionSave()
     }
 
-    /// Scrolls by a **stepped** delta measured in screen points: one wheel notch. The offset glides
-    /// toward the destination instead of jumping to it, which is what makes a classic wheel read as
-    /// motion rather than as a series of grid lines.
-    ///
-    /// The destination accumulates, so spinning the wheel keeps moving instead of restarting, but it
-    /// may not lead the offset by more than `ScrollGlide.maximumLead`: a fast spin asks for more
-    /// distance than the speed ceiling can deliver, and that backlog is what used to scroll on after
-    /// the wheel had stopped. What does not fit is dropped - see the type's documentation for the
-    /// measurements and the trade. The glide still stops when the notches do, through
-    /// `ScrollGlide.idleWindow`.
+    /// Applies the wheel's accelerated distance immediately. Nothing is queued after the last
+    /// event, so a fast spin keeps its full distance and stopping the wheel stops the document.
     public func scrollByWheelStep(_ delta: CGFloat) {
-        stepScroll(delta, mostAhead: ScrollGlide.maximumLead)
+        scroll(byScreenPoints: delta)
     }
 
     /// Scrolls by a **stepped** delta the reader asked for as a destination rather than a speed:
-    /// Page Down, Page Up, the arrows. Same glide, deliberately **without** the lead bound - "next
-    /// page" is a place, so the whole page is still delivered (measured, a 450 pt page on a 500 pt
-    /// viewport takes ~225 ms at the ceiling, exactly as before), where a wheel's stale backlog is
-    /// dropped instead.
+    /// Page Down, Page Up and the arrows keep a short animation to their full destination.
     public func scrollByKeyboardStep(_ delta: CGFloat) {
         stepScroll(delta, mostAhead: nil)
     }

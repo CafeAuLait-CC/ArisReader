@@ -94,13 +94,11 @@ public struct ReaderWindow: View {
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
                 onViewportSize: { size in state.setViewportSize(size) },
-                // Two scroll paths, split by what the device reports: a trackpad's precise
-                // deltas are applied 1:1 (they are already animated, momentum included), while a
-                // classic wheel's notch is glided to so the page moves instead of stepping.
+                // Precise input preserves system deltas; wheel input applies its accelerated
+                // distance immediately, with no queued motion after the wheel stops.
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
                 onScrollStep: { delta in state.scrollByWheelStep(delta) },
-                // A page key is a destination, not a speed: it keeps its whole page (and its tail,
-                // one screen at the ceiling) while a wheel spin's stale backlog is dropped.
+                // Keyboard paging keeps its animation to the requested destination.
                 onKeyboardStep: { delta in state.scrollByKeyboardStep(delta) },
                 // Ctrl+scroll and ⌘+scroll zoom instead of scrolling (docs/04-ui-ux.md §3). Ctrl
                 // is the binding the request asked for; ⌘ is the documented convention and the
