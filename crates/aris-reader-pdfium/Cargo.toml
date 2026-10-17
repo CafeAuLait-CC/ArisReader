@@ -27,6 +27,10 @@ pdfium-render = { version = "0.9", optional = true, default-features = false, fe
 # same 0.8 line the wrapper uses so the process keeps one copy of the crate. Only compiled
 # with the `pdfium` feature.
 libloading = { version = "0.8", optional = true }
+# PDFium does not paint legacy /Link borders without an appearance stream. Read their
+# dictionaries (including compressed objects) and stroke them into the existing raster.
+lopdf = { version = "0.45", default-features = false, optional = true }
+tiny-skia = { version = "0.11", default-features = false, features = ["std"], optional = true }
 
 # XMP metadata streams are usually FlateDecode-compressed (see `src/xmp.rs`). PDFium's C
 # ABI has no XMP accessor, so the backend inflates the packet itself.
@@ -37,4 +41,4 @@ default = ["pdfium"]
 # Enables the real PDFium implementation. With `--no-default-features` only the stub
 # is built, which keeps `cargo check --target x86_64-unknown-linux-gnu` (and any
 # machine without PDFium) working.
-pdfium = ["dep:pdfium-render", "dep:libloading"]
+pdfium = ["dep:pdfium-render", "dep:libloading", "dep:lopdf", "dep:tiny-skia"]

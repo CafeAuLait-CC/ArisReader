@@ -1,0 +1,90 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >>
+endobj
+5 0 obj
+<< /Length 1033 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated page 1) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (someone else's highlights, notes and free text) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: marked up by another viewer.) Tj T*
+(Line 2: marked up by another viewer.) Tj T*
+(Line 3: marked up by another viewer.) Tj T*
+(Line 4: marked up by another viewer.) Tj T*
+(Line 5: marked up by another viewer.) Tj T*
+(Line 6: marked up by another viewer.) Tj T*
+(Line 7: marked up by another viewer.) Tj T*
+(Line 8: marked up by another viewer.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 650 220 670] /Border [0 0 1] /C [0 1 0] /A << /S /URI /URI (https://example.org/green) >> /F 4 >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Link /Rect [260 650 300 670] /Border [0 0 1] /C [1 0 0] /Dest [4 0 R /Fit] /F 4 >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Link /Rect [350 650 390 670] /Border [0 0 1] /C [0 0 1] /A << /S /URI /URI (https://example.org/hidden) >> /F 2 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 600 220 620] /Border [0 0 0] /C [0 0 1] /A << /S /URI /URI (https://example.org/invisible) >> /F 4 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [260 600 390 620] /BS << /W 2 /S /D /D [4 4] >> /C [1 0 0] /A << /S /URI /URI (https://example.org/dashed) >> /F 4 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [420 700 500 720] /C [0 0 1] /QuadPoints [420 720 500 720 420 700 500 700] /Contents (Shell-rendered content annotation.) /F 4 >>
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000392 00000 n 
+0000001477 00000 n 
+0000001631 00000 n 
+0000001755 00000 n 
+0000001911 00000 n 
+0000002069 00000 n 
+0000002240 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+2428
+%%EOF

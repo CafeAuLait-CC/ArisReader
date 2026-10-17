@@ -31,7 +31,9 @@ pub enum RasterFormat {
 /// Rasterization options (corresponding to PDFium render flags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RasterFlags {
-    /// Whether to burn annotations into the bitmap. Default **false**: we draw annotations ourselves so they can be edited and toggled live.
+    /// Whether to burn content annotations into the bitmap. Default **false**: the shell draws
+    /// these so they can be edited live. Navigation link borders are always rendered as the PDF
+    /// specifies, including zero-width/hidden borders.
     pub annotations: bool,
     /// Subpixel antialiasing (`FPDF_LCD_TEXT`); needs an A/B evaluation on Retina before deciding.
     pub lcd_text: bool,

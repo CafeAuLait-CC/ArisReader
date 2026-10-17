@@ -1200,6 +1200,19 @@ def main() -> int:
     path.write_bytes(build_pdf(appearance_pages, appearance_annotations, appearance_extras))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(appearance_pages)} page(s))")
 
+    # Navigation borders must render even when content annotations are drawn by the shell.
+    link_borders = [
+        annotation("Link", (72, 650, 220, 670), extra="/Border [0 0 1] /C [0 1 0] /A << /S /URI /URI (https://example.org/green) >>"),
+        annotation("Link", (260, 650, 300, 670), extra="/Border [0 0 1] /C [1 0 0] /Dest [4 0 R /Fit]"),
+        annotation("Link", (350, 650, 390, 670), flags=2, extra="/Border [0 0 1] /C [0 0 1] /A << /S /URI /URI (https://example.org/hidden) >>"),
+        annotation("Link", (72, 600, 220, 620), extra="/Border [0 0 0] /C [0 0 1] /A << /S /URI /URI (https://example.org/invisible) >>"),
+        annotation("Link", (260, 600, 390, 620), extra="/BS << /W 2 /S /D /D [4 4] >> /C [1 0 0] /A << /S /URI /URI (https://example.org/dashed) >>"),
+        annotation("Highlight", (420, 700, 500, 720), extra="/C [0 0 1] /QuadPoints [420 720 500 720 420 700 500 700]", contents="Shell-rendered content annotation."),
+    ]
+    path = out_dir / "link-borders.pdf"
+    path.write_bytes(build_pdf(annotated_pages[:1], {0: link_borders}))
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page)")
+
     # 7) Notes and no markup, which is one of the user's review PDFs exactly: 22 content
     #    annotations, every one of them a sticky note or a free-text annotation, and not a single
     #    highlight to draw. A reader that only knows the text-markup kinds shows it as untouched.

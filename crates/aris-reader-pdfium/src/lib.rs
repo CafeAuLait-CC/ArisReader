@@ -96,3 +96,9 @@ pub fn backend_description() -> &'static str {
         "stub (built with --no-default-features)"
     }
 }
+
+#[cfg(all(test, feature = "pdfium"))]
+mod link_border_tests;
+
+#[cfg(feature = "pdfium")]
+mod link_borders;

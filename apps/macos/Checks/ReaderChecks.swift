@@ -49,6 +49,10 @@ struct ReaderChecks {
             print("Facing-layout checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-link-borders") {
+            try await linkBorderCanvasChecks(url: fastRoot.appendingPathComponent("tests/fixtures/link-borders.pdf"))
+            return
+        }
         if CommandLine.arguments.contains("--check-hosted-preview") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -245,6 +249,7 @@ struct ReaderChecks {
         try await scrollingQualityChecks(url: b)
         try await scrollingRenderChecks(url: b)
         try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
+        try await linkBorderCanvasChecks(url: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
         try await annotationChecks(a: a, b: b)
         try await annotationRecoveryChecks(a: a, b: b)
         try await annotationColourChecks(a: a)
