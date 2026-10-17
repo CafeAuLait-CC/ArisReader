@@ -5,9 +5,9 @@
 
 use crate::annotations::AnnotationReader;
 use aris_reader_core::{
-    ArisError, DocumentBackend, ErrorCode, LineSegment, LinkInfo, OutlineNode, PageGeometry,
-    PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawAnnotation, RawCharBox,
-    RawTextPage, Rect, Result, Rotation, Size,
+    ArisError, DocMetadata, DocumentBackend, EmbeddedMetadata, ErrorCode, LineSegment, LinkInfo,
+    OutlineNode, PageGeometry, PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile,
+    RawAnnotation, RawCharBox, RawTextPage, Rect, Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -884,6 +884,39 @@ impl DocumentBackend for PdfiumBackend {
         })
     }
 
+    fn embedded_metadata(&self) -> Result<EmbeddedMetadata> {
+        // `FPDF_GetMetaText` reads document state, exactly like the text layer.
+        let info = {
+            let _guard = PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let document = self.document.as_ref().expect("live document");
+            let metadata = document.metadata();
+            let tag = |kind: PdfDocumentMetadataTagType| {
+                metadata
+                    .get(kind)
+                    .map(|tag| tag.value().to_string())
+                    .and_then(|value| trimmed_metadata(&value))
+            };
+
+            DocMetadata {
+                title: tag(PdfDocumentMetadataTagType::Title),
+                author: tag(PdfDocumentMetadataTagType::Author),
+                subject: tag(PdfDocumentMetadataTagType::Subject),
+                keywords: tag(PdfDocumentMetadataTagType::Keywords),
+                creator: tag(PdfDocumentMetadataTagType::Creator),
+                producer: tag(PdfDocumentMetadataTagType::Producer),
+                creation_date: tag(PdfDocumentMetadataTagType::CreationDate),
+            }
+        };
+
+        // XMP has no PDFium C accessor; the packet is read from the file's own bytes.
+        Ok(EmbeddedMetadata {
+            info,
+            xmp: crate::xmp::read_xmp(&self.path),
+        })
+    }
+
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile> {
         // See `PDFIUM_LOCK`: rendering is serialised process-wide until this PDFium build's
         // cross-document behaviour is understood. The raster pool therefore buys a responsive
@@ -1236,6 +1269,22 @@ fn rect_from_pdf(rect: PdfRect) -> Rect {
     let right = f64::from(rect.right().value);
     let top = f64::from(rect.top().value);
     Rect::new(left, bottom, right - left, top - bottom)
+}
+
+/// A metadata string without surrounding whitespace or NUL padding, or `None` when it is empty.
+///
+/// `/Info` values are PDF text strings and are not normalised by producers: trailing NULs and
+/// stray newlines are common, and an empty string must mean "absent" rather than "a value that
+/// happens to be blank" so recognition can fall through to the text layer.
+fn trimmed_metadata(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim_matches(|character: char| character.is_whitespace() || character == '\0')
+        .trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn rotation_from_pdf(rotation: PdfPageRenderRotation) -> Rotation {
