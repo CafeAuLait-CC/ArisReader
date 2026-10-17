@@ -995,6 +995,85 @@ def references_page(left: list[str], right: list[str]) -> str:
     return "\n".join(parts)
 
 
+def numeric_citation_page() -> str:
+    """The body page of the parenthesised-numeral fixture.
+
+    Every shape the detector has to classify is on this one page, so a test can assert one
+    result per line:
+
+    * the accepted forms — a single number, a range, a comma list, a mixed list with a range;
+    * a year in parentheses, an equation number pushed to the right margin, a function call
+      `f(3)`, two enumerations opening their lines, a figure sub-label, a section reference,
+      and a number beyond the bibliography's entry count.
+
+    The equation number is placed at x=500 on its formula's baseline, independent of the
+    formula text: that is the right-aligned shape a display equation really has, and it is
+    position, not a character class, that separates it from a citation.
+    """
+    lines = [
+        "Prior work established the baseline method (12).",
+        "Related approaches extend that method (3\u20135).",
+        "Two independent studies agree on this point (7, 9).",
+        "A mixed group cites a span and one more work (3\u20135, 9).",
+        "The dataset was released to the public (2020).",
+        "The balance condition is stated below.",
+        "The function f(3) is evaluated in the appendix.",
+        "(1) First enumerated item, written as running prose.",
+        "(2) Second enumerated item of the same list.",
+        "Figure 3(b) shows the pipeline for a single run.",
+        "Section 4 describes the setup in detail.",
+        "A later work is discussed elsewhere (25).",
+        "The page ends before the bibliography begins.",
+    ]
+    parts = [
+        "0 0 0 rg",
+        "BT /F1 20 Tf 72 790 Td (Numeric citation fixture) Tj ET",
+        "BT /F1 10 Tf 72 766 Td (a numbered bibliography and the parenthesised citation shapes) Tj ET",
+    ]
+    y = 730
+    for line in lines:
+        parts.append(f"BT /F1 10 Tf 72 {y} Td ({escape_pdf_string(line)}) Tj ET")
+        if line == "The balance condition is stated below.":
+            # A display equation and its right-aligned number: the formula is at the left
+            # edge, the number is at the right margin of the same baseline.
+            parts.append(f"BT /F1 10 Tf 72 {y - 16} Td (x + y = z) Tj ET")
+            parts.append(f"BT /F1 10 Tf 500 {y - 16} Td ((3)) Tj ET")
+            y -= 16
+        y -= 18
+    return "\n".join(parts)
+
+
+def numeric_references_page() -> str:
+    """A Nature-like numbered bibliography: `1.` … `14.` at the start of each entry.
+
+    Entry 12 is the work the single-number citation names; the range and list forms name
+    entries 3–5, 7, 9 and 9 again. Fourteen entries are enough for every accepted form and
+    for `(25)` to fall outside the count.
+    """
+    entries = [
+        "1. Alpha, A. 2019. A first work on motion.",
+        "2. Beta, B. 2020. A second work on shape.",
+        "3. Gamma, C. 2021. A third work on light.",
+        "4. Delta, D. 2022. A fourth work on sound.",
+        "5. Epsilon, E. 2023. A fifth work on colour.",
+        "6. Zeta, F. 2024. A sixth work on texture.",
+        "7. Eta, G. 2019. A seventh work on flow.",
+        "8. Theta, H. 2020. An eighth work on depth.",
+        "9. Iota, I. 2021. A ninth work on edges.",
+        "10. Kappa, J. 2022. A tenth work on style.",
+        "11. Lambda, K. 2023. An eleventh work on shape.",
+        "12. Mu, L. 2024. The cited baseline method.",
+        "13. Nu, M. 2025. A thirteenth work on pose.",
+        "14. Xi, N. 2026. A final work on motion.",
+    ]
+    parts = ["0 0 0 rg", "BT /F1 12 Tf 72 790 Td (References) Tj ET"]
+    y = 760
+    for entry in entries:
+        parts.append(f"BT /F1 10 Tf 72 {y} Td ({escape_pdf_string(entry)}) Tj ET")
+        y -= 15
+    return "\n".join(parts)
+
+
 def long_document(page_count: int) -> list[tuple[str, int]]:
     """A synthetic long document for the T1.13 measurement (~300 pages).
 
@@ -1160,6 +1239,13 @@ def main() -> int:
                 ),
                 0,
             ),
+        ],
+        # 8) A parenthesised-numeral paper: a Nature-like `1.` … `14.` bibliography and one body
+        #    page holding every accepted form and every non-citation form the detector must
+        #    classify. The test (`paren_fixture.rs`) asserts one decision per case.
+        "numeric-citations.pdf": [
+            (numeric_citation_page(), 0),
+            (numeric_references_page(), 0),
         ],
     }
 

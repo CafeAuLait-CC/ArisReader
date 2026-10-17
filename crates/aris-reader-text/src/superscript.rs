@@ -25,8 +25,8 @@
 //! `1712.01815` contributes a negative result worth recording: its arXiv text layer renders the
 //! citations as ordinary `(9)` / `(2, 14)` at body size on the baseline (height ratio 0.97, rise
 //! +0.27 pt), so no geometric rule can see them there. The shape it does have is the short
-//! parenthesised numeral, which is a different detector and is counted by the evaluation's
-//! `(12)` column.
+//! parenthesised numeral, which is a body-size detector of its own: see
+//! [`inspect_parenthesised_citations`](crate::inspect_parenthesised_citations), which reads it when the bibliography is a numbered list.
 //!
 //! # Why geometry alone is not enough
 //!
@@ -107,8 +107,8 @@ const WORD_MIN: usize = 3;
 /// Built with [`CitationStyle::for_document`] from the same entry list the resolver uses and the
 /// body pages the detector will read, so the detector and the resolver agree on which labels
 /// exist. [`CitationStyle::numeric_only`] is what a caller with no bibliography gets: it detects
-/// the bracket and author-year styles exactly as before and never invents a superscript
-/// citation.
+/// the bracket and author-year styles exactly as before and never invents a superscript or
+/// parenthesised citation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CitationStyle {
     /// Every numeric label the bibliography carries.
@@ -118,6 +118,9 @@ pub struct CitationStyle {
     /// Whether the body brackets its numeric citations.
     bracketed: bool,
     alphanumeric: bool,
+    /// How many entries the selected bibliography has. A bare parenthesised numeral may only
+    /// name a label inside this count (see [`crate::inspect_parenthesised_citations`]).
+    reference_count: usize,
 }
 
 impl CitationStyle {
@@ -174,6 +177,7 @@ impl CitationStyle {
             numbered,
             bracketed,
             alphanumeric,
+            reference_count: references.len(),
         }
     }
 
@@ -186,6 +190,39 @@ impl CitationStyle {
     /// Whether this document cites by number at all.
     pub fn is_numbered(&self) -> bool {
         self.numbered
+    }
+
+    /// How many entries the selected bibliography has.
+    ///
+    /// This is the bound a bare parenthesised numeral is checked against: a number larger than
+    /// the list cannot label one of its entries, whatever else the line looks like.
+    pub fn reference_count(&self) -> usize {
+        self.reference_count
+    }
+
+    /// How many distinct integer labels the bibliography prints.
+    pub fn numeric_label_count(&self) -> usize {
+        self.labels.len()
+    }
+
+    /// Whether the bibliography itself is a numbered list.
+    ///
+    /// A parenthesised numeral is a citation only in such a document: an author-year list has no
+    /// integer labels to resolve it against, so the same parentheses mean a year, an equation
+    /// number or an enumeration instead.
+    pub fn bibliography_is_numeric(&self) -> bool {
+        self.numbered
+    }
+
+    /// Whether a bare parenthesised numeral (`(12)`, `(3–5)`) may be read as a citation here.
+    ///
+    /// Two document-level facts must both hold: the bibliography is a numbered list (so the
+    /// number can resolve to an entry), and the body does not bracket its numeric citations.
+    /// The second is the same guard superscripts use, and for the same measured reason: in a
+    /// `[12]` paper the parenthesised numbers are overwhelmingly equation numbers, enumerations
+    /// and figure sub-labels, not citations.
+    pub fn accepts_parenthesised_numerals(&self) -> bool {
+        self.numbered && !self.bracketed && !self.alphanumeric
     }
 
     /// Whether the document brackets its numeric citations, which rules superscripts out.
@@ -207,6 +244,15 @@ impl CitationStyle {
                 .iter()
                 .all(|label| label.parse::<u32>().is_ok_and(|n| self.labels.contains(&n)))
     }
+
+    /// Whether one integer label is printed by the bibliography.
+    ///
+    /// The bare parenthesised detector checks every expanded label against this, separately from
+    /// the entry-count bound: a list numbered `34..68` prints label 60, and the two checks answer
+    /// different questions ("is it a label at all?" and "is it inside the list's size?").
+    pub(crate) fn carries_numeric_label(&self, label: u32) -> bool {
+        self.labels.contains(&label)
+    }
 }
 
 /// Whether a font name belongs to a mathematical or symbol face.
@@ -214,7 +260,7 @@ impl CitationStyle {
 /// A citation numeral is never set in one, so a run drawn in these faces is an exponent or a
 /// symbol. `CMR` is deliberately absent: Computer Modern Roman is a *text* face, and it is the
 /// body font of exactly the LaTeX papers that use this citation style.
-fn is_math_font(name: &str) -> bool {
+pub(crate) fn is_math_font(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     [
         "CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "STIX", "MATH", "EUSM", "EUFM", "RSFS", "SYMBOL",
@@ -562,6 +608,7 @@ mod tests {
             numbered: true,
             bracketed: false,
             alphanumeric: false,
+            reference_count: 40,
         }
     }
 

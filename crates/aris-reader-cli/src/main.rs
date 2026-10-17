@@ -36,7 +36,9 @@ Usage:
   aris-reader-cli config                         print the default engine config
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
-  aris-reader-cli cite <file.pdf>                match body citations against the reference list
+  aris-reader-cli cite <file.pdf>                match body citations against the reference list; print
+                                                 the detected style and every parenthesised-numeral
+                                                 candidate with its accept/reject reason
   aris-reader-cli figures <file.pdf>...          figure/table captions and the region to preview
                  [--pages N]                    (grid / image / page per caption)
   aris-reader-cli tables <file.pdf>...           table previews: grid-derived or full-page fallback
@@ -1610,9 +1612,14 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         }
     }
 
-    // One style for the whole document: superscript numerals are only reported when the
-    // bibliography above carries their labels and the body does not bracket its citations.
+    // One style for the whole document: superscript and bare parenthesised numerals are only
+    // reported when the bibliography above carries their labels and the body does not bracket
+    // its citations.
     let style = aris_reader_text::CitationStyle::for_document(&pages, &references);
+    println!(
+        "  citation style: {}",
+        citation_style_summary(&style, references.len())
+    );
 
     let mut resolved = 0usize;
     let mut attempted = 0usize;
@@ -1620,6 +1627,31 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
             continue;
         };
+
+        // Every bare parenthesised numeral the detector considered, with its decision. This is
+        // the inspectable form of the rule set: a reader can see an equation number rejected as
+        // right-aligned, or a year rejected as year-shaped, instead of guessing why a span is
+        // missing. Candidates are printed even when the document style turns them off — the
+        // reason then names the document-level fact that did it.
+        for candidate in aris_reader_text::inspect_parenthesised_citations(&text, &style) {
+            let labels = if candidate.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" → labels {}", candidate.labels.join(", "))
+            };
+            println!(
+                "    p{} {} {}{} — {}",
+                index + 1,
+                candidate.text,
+                if candidate.accepted {
+                    "ACCEPT"
+                } else {
+                    "REJECT"
+                },
+                labels,
+                candidate.reason
+            );
+        }
 
         // One detector for the whole project: the crate produces the labels (including the
         // surname-year keys author-year lists are matched by). The CLI used to re-extract
@@ -1668,6 +1700,39 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     };
     println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
     ExitCode::SUCCESS
+}
+
+/// The detected citation style, in the terms the reader acts on.
+///
+/// Printed by `cite` so a run is self-describing: whether the bibliography is numeric or
+/// author-year, whether the body brackets its numeric citations, and therefore whether bare
+/// parenthesised numerals are being read at all.
+fn citation_style_summary(style: &aris_reader_text::CitationStyle, entries: usize) -> String {
+    let bibliography = if style.bibliography_is_numeric() {
+        format!(
+            "numeric bibliography ({entries} entries, {} integer labels)",
+            style.numeric_label_count()
+        )
+    } else if style.uses_alphanumeric_labels() {
+        format!("alphanumeric-key bibliography ({entries} entries)")
+    } else if entries == 0 {
+        "no bibliography found".to_string()
+    } else {
+        format!("author-year bibliography ({entries} entries)")
+    };
+    let body = if !style.bibliography_is_numeric() {
+        "no numeric citation style in the body"
+    } else if style.brackets_its_citations() {
+        "body cites as [n], so parenthesised numerals are not read as citations"
+    } else {
+        "body does not bracket its numeric citations"
+    };
+    let paren = if style.accepts_parenthesised_numerals() {
+        "parenthesised numerals ON"
+    } else {
+        "parenthesised numerals OFF"
+    };
+    format!("{bibliography}; {body}; {paren}")
 }
 
 /// Marks an entry that is drawn in more than one piece, so `cite` output shows which
