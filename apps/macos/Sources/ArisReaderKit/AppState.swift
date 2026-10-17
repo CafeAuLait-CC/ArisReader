@@ -3265,6 +3265,77 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: Thumbnail drag reorder
+
+    /// The block a drag that starts on `page` would carry, using the same page selection the
+    /// Pages menu acts on. The thumbnail drag source asks this when the pointer passes the drag
+    /// threshold; a refusal means no drag session starts (and so no insertion indicator either).
+    public func thumbnailDragBlock(startingAt page: Int) -> ThumbnailDragBlockResolution {
+        ThumbnailDrag.block(
+            pressedPage: page,
+            selection: pageSelection,
+            pageCount: document?.pageCount ?? 0,
+            isEditable: canPageEdit
+        )
+    }
+
+    /// Stages a thumbnail drag's move through the same session as the Pages menu.
+    ///
+    /// This is the only entry point the drop target calls. It re-validates the request against
+    /// the document as it is now (a drop can arrive after a revision or a tab switch), asks the
+    /// same rules the indicator used, and then hands the move to ``applyPageEdit(_:label:)`` —
+    /// so undo/redo, the remapped annotations and bookmarks, and the "file on disk is unchanged"
+    /// contract are exactly the menu path's, not a second implementation.
+    ///
+    /// On success the moved block is the page selection, so the reader sees what they moved even
+    /// when the drag started on an unselected thumbnail.
+    @discardableResult
+    public func performThumbnailDrop(_ request: ThumbnailDropRequest) async -> Bool {
+        guard let document else {
+            lastError = "There is no document to reorder."
+            return false
+        }
+        let pageCount = document.pageCount
+        let pages = request.pages
+        guard let first = pages.first, let last = pages.last,
+              first >= 0, last < pageCount,
+              last - first + 1 == pages.count,
+              request.destination >= 0,
+              request.destination + pages.count <= pageCount else {
+            lastError = "The page drag does not match the document any more; nothing was moved."
+            statusMessage = "The page drag no longer matches the document"
+            return false
+        }
+        // Re-run the drop rules on the request's final position. This catches a drag whose
+        // document changed under it, and makes the no-op verdict the indicator showed true of
+        // the command that actually runs.
+        let boundary = request.destination < first
+            ? request.destination
+            : request.destination + pages.count
+        let resolution = ThumbnailDrag.drop(
+            block: ThumbnailDragBlock(pages: pages, pressedPage: request.pressedPage),
+            boundary: boundary,
+            pageCount: pageCount
+        )
+        if case .refused(let refusal) = resolution {
+            statusMessage = refusal.message
+            return false
+        }
+        let label = pages.count == 1
+            ? "Move page \(first + 1) to position \(request.destination + 1)"
+            : "Move pages \(first + 1)–\(last + 1) to position \(request.destination + 1)"
+        let staged = await applyPageEdit(
+            .move(pages: pages, destination: request.destination),
+            label: label
+        )
+        guard staged else { return false }
+        // The session remaps the old selection through the page map. A drag states its intent
+        // more directly: the block the reader dropped is selected at its landing place.
+        pageSelection = Set(request.finalRange)
+        pageSelectionAnchor = request.destination
+        return true
+    }
+
     public func presentExtractPagesPanel() {
         guard let source = pageEditDisplayURL else { return }
         let pages = selectedPageIndices

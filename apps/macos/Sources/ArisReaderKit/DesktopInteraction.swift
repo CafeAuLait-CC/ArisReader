@@ -365,4 +365,40 @@ public enum PageContextMenu {
             return true
         }
     }
+
+    /// Builds the AppKit menu the thumbnail strip shows, from the same items ``sections``
+    /// decides. The drag overlay owns the pointer now, so this is where the thumbnail's
+    /// right-click menu is attached; it must not grow a second command list.
+    @MainActor
+    public static func menu(
+        state: AppState,
+        page: Int,
+        canOpenNewWindow: Bool,
+        newWindow: @escaping (URL, Int) -> Bool
+    ) -> NSMenu? {
+        let sections = sections(state: state, page: page, canOpenNewWindow: canOpenNewWindow)
+        guard !sections.isEmpty else { return nil }
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (sectionIndex, section) in sections.enumerated() {
+            if sectionIndex > 0 { menu.addItem(.separator()) }
+            for item in section {
+                let handler = ContextMenuHandler { [weak state] in
+                    guard let state else { return }
+                    _ = perform(item.action, state: state, newWindow: newWindow)
+                }
+                let menuItem = NSMenuItem(
+                    title: item.title,
+                    action: #selector(ContextMenuHandler.invoke),
+                    keyEquivalent: ""
+                )
+                menuItem.target = handler
+                menuItem.representedObject = handler
+                menuItem.isEnabled = item.isEnabled
+                menu.addItem(menuItem)
+            }
+        }
+        return menu
+    }
 }
