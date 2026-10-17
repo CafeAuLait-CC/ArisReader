@@ -16,7 +16,8 @@ use aris_reader_core::{
 };
 use aris_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::{
-    PdfiumBackend, SaveMode, WriteAnnotation, WriteAnnotationKind, backend_description,
+    PageOperation, PdfiumBackend, SaveMode, WriteAnnotation, WriteAnnotationKind,
+    backend_description,
 };
 use aris_reader_session::{DocumentLayout, LayoutMode};
 use std::path::Path;
@@ -1045,6 +1046,113 @@ impl ArisDocument {
         Ok(records)
     }
 
+    /// The `/Rotate` of every page, in quarter turns (0–3).
+    ///
+    /// The shell reads this once when a page-edit session starts. "Reset to the file's original
+    /// rotation" is a property of that snapshot: after a reorder the page has moved, and after a
+    /// rotation the file no longer says what the original was.
+    pub fn page_rotations(&self) -> Result<Vec<u32>, ArisFfiError> {
+        let count = self.backend.page_count();
+        let mut rotations = Vec::with_capacity(count as usize);
+        for page in 0..count {
+            let info = self.backend.page_info(PageIndex(page))?;
+            rotations.push((info.geometry.rotation.degrees().rem_euclid(360) / 90) as u32);
+        }
+        Ok(rotations)
+    }
+
+    /// Applies a page operation to a **copy** of this document and writes it to `destination`.
+    ///
+    /// This object's file is never modified. The written file is verified to have the requested
+    /// page count, rotations and page sizes before the final rename. `page_map[old] = Some(new)`
+    /// lets the shell remap its sidecar annotations; `None` means the page was removed.
+    pub fn apply_page_operation(
+        &self,
+        destination: String,
+        operation: PageOperationRecord,
+    ) -> Result<PageEditReport, ArisFfiError> {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ArisFfiError::Document {
+                message: "the document was replaced on disk; reopen it before editing pages"
+                    .to_string(),
+            });
+        }
+        if self.backend.is_encrypted() {
+            return Err(ArisFfiError::Document {
+                message:
+                    "this document is encrypted; page editing is not supported for encrypted files"
+                        .to_string(),
+            });
+        }
+        let operation = page_operation(operation);
+        let report = aris_reader_pdfium::apply_page_operation(
+            Path::new(&self.path),
+            Path::new(&destination),
+            &operation,
+            self.password.as_deref(),
+        )?;
+        Ok(page_edit_report(report))
+    }
+
+    /// Extracts `pages` into a new PDF at `destination`; this document is not modified.
+    pub fn extract_pages(
+        &self,
+        destination: String,
+        pages: Vec<u32>,
+    ) -> Result<PageEditReport, ArisFfiError> {
+        if self.backend.is_encrypted() {
+            return Err(ArisFfiError::Document {
+                message:
+                    "this document is encrypted; page editing is not supported for encrypted files"
+                        .to_string(),
+            });
+        }
+        let report = aris_reader_pdfium::extract_pages(
+            Path::new(&self.path),
+            Path::new(&destination),
+            &pages,
+            self.password.as_deref(),
+        )?;
+        Ok(page_edit_report(report))
+    }
+
+    /// Publishes the current page-edit revision as a new file, without touching the original.
+    pub fn save_edited_copy(&self, destination: String) -> Result<PageEditReport, ArisFfiError> {
+        let report = aris_reader_pdfium::publish_edited_copy(
+            Path::new(&self.path),
+            Path::new(&destination),
+            self.backend.page_count(),
+        )?;
+        Ok(page_edit_report(report))
+    }
+
+    /// Replaces `original_path` with this page-edit revision.
+    ///
+    /// This is the explicitly destructive command. A byte-identical backup of `original_path` is
+    /// written and verified first; the revision is written into a temporary file beside it,
+    /// verified, and only then renamed over the original. The in-memory handle is marked stale so
+    /// the shell must reopen the file rather than quietly reading the old page tree.
+    pub fn replace_with_edited_pages(
+        &self,
+        original_path: String,
+    ) -> Result<PageEditReport, ArisFfiError> {
+        if self.backend.is_encrypted() {
+            return Err(ArisFfiError::Document {
+                message:
+                    "this document is encrypted; page editing is not supported for encrypted files"
+                        .to_string(),
+            });
+        }
+        let report = aris_reader_pdfium::replace_original_with_edit(
+            Path::new(&self.path),
+            Path::new(&original_path),
+            self.backend.page_count(),
+        )?;
+        self.replaced
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(page_edit_report(report))
+    }
+
     /// The name to offer when saving an annotated copy: `<name> (annotated).pdf`.
     pub fn suggested_copy_path(&self) -> String {
         aris_reader_pdfium::suggested_copy_path(Path::new(&self.path))
@@ -1188,6 +1296,45 @@ impl ArisDocument {
             gap_pt,
             margin_pt,
         )
+    }
+}
+
+fn page_operation(record: PageOperationRecord) -> PageOperation {
+    match record {
+        PageOperationRecord::Rotate {
+            pages,
+            quarter_turns,
+        } => PageOperation::Rotate {
+            pages,
+            quarter_turns,
+        },
+        PageOperationRecord::SetRotation {
+            pages,
+            quarter_turns,
+        } => PageOperation::SetRotation {
+            pages,
+            quarter_turns,
+        },
+        PageOperationRecord::Delete { pages } => PageOperation::Delete { pages },
+        PageOperationRecord::Move { pages, destination } => {
+            PageOperation::Move { pages, destination }
+        }
+        PageOperationRecord::InsertBlank { index } => PageOperation::InsertBlank { index },
+    }
+}
+
+fn page_edit_report(report: aris_reader_pdfium::PageOperationReport) -> PageEditReport {
+    PageEditReport {
+        destination_path: report.destination.to_string_lossy().into_owned(),
+        page_count: report.page_count,
+        page_map: report.page_map,
+        rotations: report.rotations,
+        inserted_page: report.inserted_page,
+        backup_path: report
+            .backup_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        output_bytes: report.output_bytes,
+        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
     }
 }
 
@@ -1720,6 +1867,54 @@ pub struct AnnotationSaveReport {
     pub cleaned_temporary_files: u32,
     /// True when the written file's prefix equals the source byte-for-byte.
     pub source_bytes_preserved: bool,
+}
+
+/// A destructive-ish page operation requested by the shell.
+///
+/// Every variant operates on a copy; the source path is this document's file. Page numbers are
+/// 0-based. `Move.destination` is the index in the list **after** the moved pages are removed,
+/// which is what PDFium's `FPDF_MovePages` expects; for a single page, moving it up is
+/// `destination = page - 1` and moving it down is `destination = page` on a document with at
+/// least one page after it.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum PageOperationRecord {
+    Rotate {
+        pages: Vec<u32>,
+        quarter_turns: i32,
+    },
+    SetRotation {
+        pages: Vec<u32>,
+        quarter_turns: Vec<u32>,
+    },
+    Delete {
+        pages: Vec<u32>,
+    },
+    Move {
+        pages: Vec<u32>,
+        destination: u32,
+    },
+    InsertBlank {
+        index: u32,
+    },
+}
+
+/// The result of a page operation or of publishing a page-edit revision.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PageEditReport {
+    /// The file that was written.
+    pub destination_path: String,
+    pub page_count: u32,
+    /// `page_map[old] = Some(new)` for surviving pages, `None` for removed/not-extracted ones.
+    pub page_map: Vec<Option<u32>>,
+    /// `/Rotate` of every written page, in quarter turns.
+    pub rotations: Vec<u32>,
+    /// The inserted blank page's index, when the operation inserted one.
+    pub inserted_page: Option<u32>,
+    /// The verified backup, only when the original was replaced.
+    pub backup_path: Option<String>,
+    pub output_bytes: u64,
+    /// Stale `.lyra-save-*.tmp` files removed before writing.
+    pub cleaned_temporary_files: u32,
 }
 
 /// One outline entry.
