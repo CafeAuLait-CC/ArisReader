@@ -88,18 +88,112 @@ public struct AIReaderContext: Equatable, Sendable {
     }
 }
 
+/// The provider's reasoning control. Plain OpenAI compatibility has no standard disable field;
+/// this endpoint exposes documented request extensions instead, and the user chooses which one
+/// is sent.
+public enum AIReasoningMode: String, CaseIterable, Identifiable, Sendable {
+    case providerDefault = "default"
+    case off
+    case low
+    case high
+    case max
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .providerDefault: return "Provider default (send nothing)"
+        case .off: return "Off"
+        case .low: return "Low effort"
+        case .high: return "High effort"
+        case .max: return "Max effort"
+        }
+    }
+}
+
+public enum AIReasoningEncoding: String, CaseIterable, Identifiable, Sendable {
+    case none
+    case thinking
+    case reasoningEffort = "reasoning_effort"
+    case outputConfig = "output_config"
+    case reasoning = "reasoning.effort"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .none: return "None"
+        case .thinking: return "thinking"
+        case .reasoningEffort: return "reasoning_effort"
+        case .outputConfig: return "output_config"
+        case .reasoning: return "reasoning.effort"
+        }
+    }
+
+    /// The one JSON field this encoding inserts, or `nil` for no encoding.
+    public var wireField: String? {
+        switch self {
+        case .none: return nil
+        case .thinking: return "thinking"
+        case .reasoningEffort: return "reasoning_effort"
+        case .outputConfig: return "output_config"
+        case .reasoning: return "reasoning"
+        }
+    }
+}
+
 /// Provider settings that are not secret. The key is deliberately not part of this value.
 public struct AIProviderSettings: Equatable, Sendable {
     public var baseURL: String
     public var model: String
     public var temperature: Double?
     public var maxTokens: Int?
+    public var reasoningMode: AIReasoningMode
+    public var reasoningEncoding: AIReasoningEncoding
 
-    public init(baseURL: String, model: String, temperature: Double?, maxTokens: Int?) {
+    public init(
+        baseURL: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: Int?,
+        reasoningMode: AIReasoningMode = .off,
+        reasoningEncoding: AIReasoningEncoding = .thinking
+    ) {
         self.baseURL = baseURL
         self.model = model
         self.temperature = temperature
         self.maxTokens = maxTokens
+        self.reasoningMode = reasoningMode
+        self.reasoningEncoding = reasoningEncoding
+    }
+
+    /// Plain words for the request preview. This is the part that changes cost and latency.
+    public var reasoningSummary: String {
+        switch reasoningMode {
+        case .providerDefault:
+            return "Reasoning: provider default — no reasoning field is sent."
+        case .off:
+            switch reasoningEncoding {
+            case .thinking: return "Reasoning: off — thinking: disabled is sent."
+            case .reasoning: return "Reasoning: off — reasoning.effort: none is sent."
+            default: return "Reasoning: off (this encoding combination is not sendable)."
+            }
+        case .low, .high, .max:
+            let effort = reasoningMode.rawValue
+            switch reasoningEncoding {
+            case .reasoningEffort: return "Reasoning effort: \(effort) — reasoning_effort: \(effort) is sent."
+            case .outputConfig: return "Reasoning effort: \(effort) — output_config.effort: \(effort) is sent."
+            case .reasoning: return "Reasoning effort: \(effort) — reasoning.effort: \(effort) is sent."
+            default: return "Reasoning effort: \(effort) (this encoding combination is not sendable)."
+            }
+        }
+    }
+
+    public var reasoningFieldDescription: String {
+        guard let field = reasoningEncoding.wireField, reasoningMode != .providerDefault else {
+            return "No reasoning JSON field is sent."
+        }
+        return "Reasoning JSON field: \(field)."
     }
 }
 
@@ -129,21 +223,57 @@ public struct AIMakePlanRequest: Sendable {
     }
 }
 
+/// A completed part summary, ready for the separate consolidation request.
+public struct AIMergePart: Equatable, Sendable {
+    public var index: Int
+    public var total: Int
+    public var pages: [Int]
+    public var summary: String
+
+    public init(index: Int, total: Int, pages: [Int], summary: String) {
+        self.index = index
+        self.total = total
+        self.pages = pages
+        self.summary = summary
+    }
+}
+
+public struct AIMergePlanRequest: Sendable {
+    public var documentTitle: String
+    public var settings: AIProviderSettings
+    public var parts: [AIMergePart]
+
+    public init(documentTitle: String, settings: AIProviderSettings, parts: [AIMergePart]) {
+        self.documentTitle = documentTitle
+        self.settings = settings
+        self.parts = parts
+    }
+}
+
 // MARK: - Usage and stream events
 
 public struct AIUsage: Equatable, Sendable {
     public var promptTokens: Int?
     public var completionTokens: Int?
     public var totalTokens: Int?
+    /// A subset of completion tokens on providers that expose thinking-token details.
+    public var reasoningTokens: Int?
 
-    public init(promptTokens: Int? = nil, completionTokens: Int? = nil, totalTokens: Int? = nil) {
+    public init(
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        totalTokens: Int? = nil,
+        reasoningTokens: Int? = nil
+    ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
+        self.reasoningTokens = reasoningTokens
     }
 
     public var isEmpty: Bool {
         promptTokens == nil && completionTokens == nil && totalTokens == nil
+            && reasoningTokens == nil
     }
 
     /// Sums the token counts reported by the parts of one plan.
@@ -151,7 +281,8 @@ public struct AIUsage: Equatable, Sendable {
         AIUsage(
             promptTokens: Self.add(promptTokens, other.promptTokens),
             completionTokens: Self.add(completionTokens, other.completionTokens),
-            totalTokens: Self.add(totalTokens, other.totalTokens)
+            totalTokens: Self.add(totalTokens, other.totalTokens),
+            reasoningTokens: Self.add(reasoningTokens, other.reasoningTokens)
         )
     }
 
@@ -160,6 +291,7 @@ public struct AIUsage: Equatable, Sendable {
         var pieces: [String] = []
         if let promptTokens { pieces.append("\(promptTokens) prompt") }
         if let completionTokens { pieces.append("\(completionTokens) completion") }
+        if let reasoningTokens { pieces.append("\(reasoningTokens) reasoning (of completion)") }
         if let totalTokens { pieces.append("\(totalTokens) total") }
         if pieces.isEmpty { return "No token usage was reported by the provider." }
         return "Tokens: " + pieces.joined(separator: " + ")
@@ -175,10 +307,57 @@ public struct AIUsage: Equatable, Sendable {
     }
 }
 
+/// Counts only: what the HTTP/SSE request actually produced. Shown when the answer is empty.
+public struct AIStreamDiagnostics: Equatable, Sendable {
+    public var httpStatus: Int
+    public var bytes: Int
+    public var frames: Int
+    public var dataFrames: Int
+    public var contentFrames: Int
+    public var reasoningFrames: Int
+    public var roleOnlyFrames: Int
+    public var emptyFrames: Int
+    public var usageFrames: Int
+    public var contentShape: String
+    public var finishReason: String?
+    public var usage: AIUsage
+
+    public init(
+        httpStatus: Int,
+        bytes: Int,
+        frames: Int,
+        dataFrames: Int,
+        contentFrames: Int,
+        reasoningFrames: Int,
+        roleOnlyFrames: Int,
+        emptyFrames: Int,
+        usageFrames: Int,
+        contentShape: String,
+        finishReason: String?,
+        usage: AIUsage
+    ) {
+        self.httpStatus = httpStatus
+        self.bytes = bytes
+        self.frames = frames
+        self.dataFrames = dataFrames
+        self.contentFrames = contentFrames
+        self.reasoningFrames = reasoningFrames
+        self.roleOnlyFrames = roleOnlyFrames
+        self.emptyFrames = emptyFrames
+        self.usageFrames = usageFrames
+        self.contentShape = contentShape
+        self.finishReason = finishReason
+        self.usage = usage
+    }
+}
+
 public enum AIStreamEvent: Equatable, Sendable {
     case partStarted(index: Int, total: Int, label: String)
     case delta(String)
+    /// The provider's reasoning/thinking channel. Kept separate from the answer by contract.
+    case reasoningDelta(String)
     case usage(AIUsage)
+    case diagnostics(AIStreamDiagnostics)
     case done
     case error(message: String, cancelled: Bool)
 }
@@ -198,7 +377,15 @@ public protocol AIChatHandle: AnyObject {
 @MainActor
 public protocol AIChatServicing: AnyObject {
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord
+    func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord
     func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle
+}
+
+public extension AIChatServicing {
+    /// Older test doubles do not need to implement consolidation; the production service does.
+    func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
+        throw AISettingsError.invalid("This service cannot prepare a consolidation request.")
+    }
 }
 
 /// The production service: context, prompts and HTTP all live in Rust. This type only translates
@@ -231,9 +418,33 @@ public final class RustAIChatService: AIChatServicing {
             baseUrl: request.settings.baseURL,
             model: request.settings.model,
             temperature: request.settings.temperature,
-            maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) }
+            maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
+            reasoningMode: request.settings.reasoningMode.rawValue,
+            reasoningEncoding: request.settings.reasoningEncoding.rawValue
         )
         return try await engine.prepareAIPlan(record)
+    }
+
+    public func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
+        try buildAiMergePlan(
+            request: AiMergePlanRequestRecord(
+                documentTitle: request.documentTitle,
+                parts: request.parts.map {
+                    AiMergePartRecord(
+                        index: UInt32(max(0, $0.index)),
+                        total: UInt32(max(0, $0.total)),
+                        pages: $0.pages.map { UInt32(max(0, $0)) },
+                        summary: $0.summary
+                    )
+                },
+                baseUrl: request.settings.baseURL,
+                model: request.settings.model,
+                temperature: request.settings.temperature,
+                maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
+                reasoningMode: request.settings.reasoningMode.rawValue,
+                reasoningEncoding: request.settings.reasoningEncoding.rawValue
+            )
+        )
     }
 
     public func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
@@ -261,11 +472,34 @@ private final class RustAIChatHandle: AIChatHandle {
                 return .partStarted(index: Int(index), total: Int(total), label: label)
             case .delta(let text):
                 return .delta(text)
-            case .usage(let promptTokens, let completionTokens, let totalTokens):
+            case .reasoningDelta(let text):
+                return .reasoningDelta(text)
+            case .usage(let promptTokens, let completionTokens, let totalTokens, let reasoningTokens):
                 return .usage(AIUsage(
                     promptTokens: promptTokens.map(Int.init),
                     completionTokens: completionTokens.map(Int.init),
-                    totalTokens: totalTokens.map(Int.init)
+                    totalTokens: totalTokens.map(Int.init),
+                    reasoningTokens: reasoningTokens.map(Int.init)
+                ))
+            case .diagnostics(let diagnostics):
+                return .diagnostics(AIStreamDiagnostics(
+                    httpStatus: Int(diagnostics.httpStatus),
+                    bytes: Int(diagnostics.bytes),
+                    frames: Int(diagnostics.frames),
+                    dataFrames: Int(diagnostics.dataFrames),
+                    contentFrames: Int(diagnostics.contentFrames),
+                    reasoningFrames: Int(diagnostics.reasoningFrames),
+                    roleOnlyFrames: Int(diagnostics.roleOnlyFrames),
+                    emptyFrames: Int(diagnostics.emptyFrames),
+                    usageFrames: Int(diagnostics.usageFrames),
+                    contentShape: diagnostics.contentShape,
+                    finishReason: diagnostics.finishReason,
+                    usage: AIUsage(
+                        promptTokens: diagnostics.promptTokens.map(Int.init),
+                        completionTokens: diagnostics.completionTokens.map(Int.init),
+                        totalTokens: diagnostics.totalTokens.map(Int.init),
+                        reasoningTokens: diagnostics.reasoningTokens.map(Int.init)
+                    )
                 ))
             case .done:
                 return .done
@@ -430,11 +664,15 @@ public final class AISettingsStore: ObservableObject {
     public static let modelKey = "aiModel"
     public static let temperatureKey = "aiTemperature"
     public static let maxTokensKey = "aiMaxTokens"
+    public static let reasoningModeKey = "aiReasoningMode"
+    public static let reasoningEncodingKey = "aiReasoningEncoding"
 
     public static let defaultBaseURL = "https://api.openai.com/v1"
     public static let defaultModel = "gpt-4o-mini"
     public static let defaultTemperature = 0.2
     public static let defaultMaxTokens = 900
+    public static let defaultReasoningMode = AIReasoningMode.off
+    public static let defaultReasoningEncoding = AIReasoningEncoding.thinking
     public static let temperatureRange = 0.0...2.0
     public static let maxTokensRange = 1...32_768
 
@@ -444,6 +682,8 @@ public final class AISettingsStore: ObservableObject {
     @Published public private(set) var model: String
     @Published public private(set) var temperature: Double
     @Published public private(set) var maxTokens: Int
+    @Published public private(set) var reasoningMode: AIReasoningMode
+    @Published public private(set) var reasoningEncoding: AIReasoningEncoding
     @Published public private(set) var hasKey: Bool
     @Published public private(set) var invalidSettingsMessage: String?
     /// The validated endpoint for the current base URL, from the Rust validator.
@@ -466,12 +706,19 @@ public final class AISettingsStore: ObservableObject {
         self.maxTokens = defaults.object(forKey: Self.maxTokensKey) == nil
             ? Self.defaultMaxTokens
             : defaults.integer(forKey: Self.maxTokensKey)
+        self.reasoningMode = defaults.string(forKey: Self.reasoningModeKey)
+            .flatMap(AIReasoningMode.init(rawValue:)) ?? Self.defaultReasoningMode
+        self.reasoningEncoding = defaults.string(forKey: Self.reasoningEncodingKey)
+            .flatMap(AIReasoningEncoding.init(rawValue:)) ?? Self.defaultReasoningEncoding
         self.hasKey = (try? keyStore.hasKey()) ?? false
         self.endpointInfo = try? inspectAiBaseUrl(baseUrl: self.baseURL)
         self.invalidSettingsMessage = Self.validateBaseAndModel(
             baseURL: self.baseURL,
             model: self.model
-        ).errorMessage
+        ).errorMessage ?? Self.reasoningValidationMessage(
+            mode: self.reasoningMode,
+            encoding: self.reasoningEncoding
+        )
     }
 
     /// Validate and persist. A non-nil, non-empty `apiKey` replaces the stored key; an empty value
@@ -482,7 +729,9 @@ public final class AISettingsStore: ObservableObject {
         model rawModel: String,
         temperature: Double,
         maxTokens: Int,
-        apiKey: String?
+        apiKey: String?,
+        reasoningMode: AIReasoningMode = .off,
+        reasoningEncoding: AIReasoningEncoding = .thinking
     ) -> Bool {
         invalidSettingsMessage = nil
         let endpoint: AiEndpointRecord
@@ -500,6 +749,10 @@ public final class AISettingsStore: ObservableObject {
         }
         guard Self.maxTokensRange.contains(maxTokens) else {
             invalidSettingsMessage = "Max tokens must be between 1 and 32,768."
+            return false
+        }
+        if let message = Self.reasoningValidationMessage(mode: reasoningMode, encoding: reasoningEncoding) {
+            invalidSettingsMessage = message
             return false
         }
 
@@ -525,10 +778,14 @@ public final class AISettingsStore: ObservableObject {
         defaults.set(model, forKey: Self.modelKey)
         defaults.set(temperature, forKey: Self.temperatureKey)
         defaults.set(maxTokens, forKey: Self.maxTokensKey)
+        defaults.set(reasoningMode.rawValue, forKey: Self.reasoningModeKey)
+        defaults.set(reasoningEncoding.rawValue, forKey: Self.reasoningEncodingKey)
         baseURL = endpoint.baseUrl
         self.model = model
         self.temperature = temperature
         self.maxTokens = maxTokens
+        self.reasoningMode = reasoningMode
+        self.reasoningEncoding = reasoningEncoding
         endpointInfo = endpoint
         hasKey = (try? keyStore.hasKey()) ?? false
         return true
@@ -564,16 +821,63 @@ public final class AISettingsStore: ObservableObject {
         guard Self.maxTokensRange.contains(maxTokens) else {
             throw AISettingsError.invalid("Max tokens must be between 1 and 32,768.")
         }
+        if let message = Self.reasoningValidationMessage(mode: reasoningMode, encoding: reasoningEncoding) {
+            throw AISettingsError.invalid(message)
+        }
         return AIProviderSettings(
             baseURL: endpoint.baseUrl,
             model: model,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding
         )
     }
 
     public var isLocalEndpoint: Bool {
         endpointInfo?.isLocal ?? false
+    }
+
+    public var reasoningSummary: String {
+        AIProviderSettings(
+            baseURL: baseURL,
+            model: model,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding
+        ).reasoningSummary
+    }
+
+    public var reasoningFieldDescription: String {
+        AIProviderSettings(
+            baseURL: baseURL,
+            model: model,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding
+        ).reasoningFieldDescription
+    }
+
+    /// The provider's extension table has no single "off"/intensity field; reject combinations
+    /// that would silently send nothing or something different from the label.
+    public static func reasoningValidationMessage(
+        mode: AIReasoningMode,
+        encoding: AIReasoningEncoding
+    ) -> String? {
+        if mode == .providerDefault { return nil }
+        if encoding == .none {
+            return "Choose a reasoning encoding, or set reasoning to provider default to send no reasoning field."
+        }
+        if mode == .off {
+            if encoding == .thinking || encoding == .reasoning { return nil }
+            return "That encoding has no documented off value. Use thinking or reasoning.effort for off, or choose provider default."
+        }
+        if encoding == .reasoningEffort || encoding == .outputConfig || encoding == .reasoning {
+            return nil
+        }
+        return "The thinking encoding is a toggle: use off or provider default with it. For low, high or max choose reasoning_effort, output_config, or reasoning.effort."
     }
 
     private static func validateBaseAndModel(

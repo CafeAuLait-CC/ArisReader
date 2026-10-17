@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The passage is a greeting. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"Translate it plainly."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Bonjour le monde"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":300,"completion_tokens":40,"total_tokens":340,"completion_tokens_details":{"reasoning_tokens":30}}}
+
+data: [DONE]
+

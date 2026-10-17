@@ -1,0 +1,43 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 669 >>
+stream
+BT /F1 8 Tf 40 760 Td (001) Tj ET
+BT /F1 8 Tf 40 742 Td (002) Tj ET
+BT /F1 8 Tf 40 724 Td (003) Tj ET
+BT /F1 8 Tf 40 706 Td (004) Tj ET
+BT /F1 8 Tf 40 688 Td (005) Tj ET
+BT /F1 9 Tf 72 760 Td (ABSTRACT) Tj ET
+BT /F1 9 Tf 72 742 Td (Existing 3D motion generators face a trade-off between convenient but coarse   ) Tj ET
+BT /F1 9 Tf 72 724 Td (text-based control and precise but manually specified pose guidance. Moreover,   ) Tj ET
+BT /F1 9 Tf 72 706 Td (diffusion-based methods further incur substantial iterative sampling costs.   ) Tj ET
+BT /F1 9 Tf 72 688 Td (The next line exists so a selection can end inside a later word.   ) Tj ET
+BT /F1 9 Tf 72 650 Td ( ) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1064
+%%EOF

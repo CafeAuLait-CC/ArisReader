@@ -44,6 +44,8 @@ impl MockProvider {
                 prompt_tokens: Some(123),
                 completion_tokens: Some(45),
                 total_tokens: Some(168),
+
+                reasoning_tokens: None,
             },
         }
     }
@@ -87,7 +89,9 @@ impl MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{Action, ChatSettings, PageText, PlanRequest, build_plan};
+    use crate::chat::{
+        Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode, build_plan,
+    };
 
     fn plan() -> ChatPlan {
         build_plan(PlanRequest {
@@ -102,11 +106,15 @@ mod tests {
                 PageText {
                     page: 0,
                     text: "Page one has text about retrieval.".to_string(),
+
+                    chars: Vec::new(),
                 },
                 PageText {
                     page: 1,
                     text: "Page two has the method described in enough detail for a summary."
                         .to_string(),
+
+                    chars: Vec::new(),
                 },
             ],
             settings: ChatSettings {
@@ -114,6 +122,9 @@ mod tests {
                 model: "mock".to_string(),
                 temperature: None,
                 max_tokens: None,
+
+                reasoning_mode: ReasoningMode::Off,
+                reasoning_encoding: ReasoningEncoding::Thinking,
             },
         })
         .unwrap()

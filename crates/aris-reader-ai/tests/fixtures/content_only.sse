@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-content-only","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Bonjour"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-content-only","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" le monde"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-content-only","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":300,"completion_tokens":12,"total_tokens":312}}
+
+data: [DONE]
+

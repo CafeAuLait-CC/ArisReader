@@ -13,6 +13,7 @@ public final class AIAssistantModel: ObservableObject {
         case idle
         case preparing
         case preview
+        case mergePreview
         case streaming
         case finished
         case cancelled
@@ -30,8 +31,19 @@ public final class AIAssistantModel: ObservableObject {
 
     @Published public private(set) var phase: Phase = .idle
     @Published public private(set) var plan: AiPlanRecord?
+    /// The second, explicit request that consolidates part summaries. It is previewed on its own.
+    @Published public private(set) var mergePlan: AiPlanRecord?
+    @Published public private(set) var partAnswers: [Int: String] = [:]
+    @Published public private(set) var partLabels: [Int: String] = [:]
     @Published public private(set) var answer = ""
+    /// The provider's reasoning/thinking channel, shown separately and never appended to
+    /// `answer`. DeepSeek's reasoner streams this as `delta.reasoning_content`.
+    @Published public private(set) var reasoning = ""
     @Published public private(set) var usage: AIUsage?
+    @Published public private(set) var diagnostics: [AIStreamDiagnostics] = []
+    @Published public private(set) var contentDeltaCount = 0
+    @Published public private(set) var reasoningDeltaCount = 0
+    @Published public private(set) var usageUpdateCount = 0
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusNote: String?
     @Published public private(set) var documentKey: String?
@@ -44,6 +56,8 @@ public final class AIAssistantModel: ObservableObject {
     private var service: (any AIChatServicing)?
     private var handle: (any AIChatHandle)?
     private var pollTask: Task<Void, Never>?
+    private var currentPartIndex: Int?
+    private var merging = false
 
     public init(settings: AISettingsStore = .shared) {
         self.settings = settings
@@ -51,9 +65,41 @@ public final class AIAssistantModel: ObservableObject {
 
     public var isSending: Bool { phase == .streaming }
     public var isPreparing: Bool { phase == .preparing }
-    public var hasPreview: Bool { plan != nil && (phase == .preview || phase == .streaming || phase.isTerminal) }
+    public var hasPreview: Bool {
+        plan != nil && (phase == .preview || phase == .mergePreview || phase == .streaming || phase.isTerminal)
+    }
     public var canRetry: Bool { plan != nil && (phase == .failed || phase == .cancelled || phase == .finished) }
+    public var isMerging: Bool { merging }
+    public var canSendMerge: Bool { mergePlan != nil && phase == .mergePreview }
     public var canCancel: Bool { phase == .streaming }
+
+    /// The merged instrumentation for this plan. Counts only; never content.
+    public var streamDiagnostics: AIStreamDiagnostics? {
+        guard var merged = diagnostics.first else { return nil }
+        for next in diagnostics.dropFirst() {
+            merged.httpStatus = next.httpStatus
+            merged.bytes += next.bytes
+            merged.frames += next.frames
+            merged.dataFrames += next.dataFrames
+            merged.contentFrames += next.contentFrames
+            merged.reasoningFrames += next.reasoningFrames
+            merged.roleOnlyFrames += next.roleOnlyFrames
+            merged.emptyFrames += next.emptyFrames
+            merged.usageFrames += next.usageFrames
+            if merged.contentShape == "none" {
+                merged.contentShape = next.contentShape
+            }
+            if let reason = next.finishReason { merged.finishReason = reason }
+            merged.usage = merged.usage.merged(with: next.usage)
+        }
+        return merged
+    }
+
+    public var finishReason: String? { streamDiagnostics?.finishReason }
+
+    public var reasoningTokensIgnored: Bool {
+        settings.reasoningMode == .off && (usage?.reasoningTokens ?? 0) > 0
+    }
 
     /// How many requests Send will make. The preview lists each one.
     public var requestCount: Int { plan?.parts.count ?? 0 }
@@ -104,8 +150,8 @@ public final class AIAssistantModel: ObservableObject {
         cancelWork()
         phase = .preparing
         plan = nil
-        answer = ""
-        usage = nil
+        resetMergeState()
+        resetStreamOutput()
         errorMessage = nil
         statusNote = "Preparing the context preview. Nothing has been sent."
 
@@ -173,8 +219,8 @@ public final class AIAssistantModel: ObservableObject {
         }
         pollTask?.cancel()
         self.handle = handle
-        answer = ""
-        usage = nil
+        resetMergeState()
+        resetStreamOutput()
         errorMessage = nil
         phase = .streaming
         statusNote = plan.parts.count > 1
@@ -218,11 +264,57 @@ public final class AIAssistantModel: ObservableObject {
     public func discard() {
         cancelWork()
         plan = nil
-        answer = ""
-        usage = nil
+        resetMergeState()
+        resetStreamOutput()
         errorMessage = nil
         statusNote = nil
         phase = .idle
+    }
+
+    /// Send the separately previewed consolidation request. The part summaries stay available;
+    /// this is the only place the merge request is sent, and only after the reader presses it.
+    public func sendMerge() {
+        guard let mergePlan, let service, phase == .mergePreview else { return }
+        let key: String
+        do {
+            guard let stored = try settings.readKey() else {
+                phase = .failed
+                errorMessage = Self.noKeyMessage
+                statusNote = Self.noKeyMessage
+                return
+            }
+            key = stored
+        } catch {
+            phase = .failed
+            errorMessage = AIReadableError.message(error)
+            statusNote = errorMessage
+            return
+        }
+        let handle: any AIChatHandle
+        do {
+            handle = try service.start(mergePlan, apiKey: key)
+        } catch {
+            phase = .failed
+            errorMessage = AIReadableError.message(error)
+            statusNote = errorMessage
+            return
+        }
+        pollTask?.cancel()
+        self.handle = handle
+        merging = true
+        resetStreamOutput()
+        errorMessage = nil
+        phase = .streaming
+        statusNote = "Streaming the consolidated summary…"
+        startPolling(handle)
+    }
+
+    /// Dismiss the consolidation preview without sending it; the part summaries stay available.
+    public func keepPartSummaries() {
+        guard phase == .mergePreview else { return }
+        mergePlan = nil
+        phase = .finished
+        statusNote = "Part summaries kept. No consolidation was sent."
     }
 
     // MARK: - Polling
@@ -252,6 +344,11 @@ public final class AIAssistantModel: ObservableObject {
         for event in events {
             switch event {
             case .partStarted(let index, let total, let label):
+                currentPartIndex = index
+                partLabels[index] = label
+                if !merging && partAnswers[index] == nil {
+                    partAnswers[index] = ""
+                }
                 if total > 1 {
                     let header = "Part \(index + 1) of \(total) · \(label)"
                     if answer.isEmpty {
@@ -265,19 +362,28 @@ public final class AIAssistantModel: ObservableObject {
                     : "Streaming…"
             case .delta(let text):
                 answer += text
+                contentDeltaCount += 1
+                if !merging {
+                    let index = currentPartIndex ?? 0
+                    partAnswers[index, default: ""] += text
+                }
+            case .reasoningDelta(let text):
+                reasoning += text
+                reasoningDeltaCount += 1
+                if answer.isEmpty {
+                    statusNote = "The provider is sending reasoning (not the answer)…"
+                }
             case .usage(let reported):
+                usageUpdateCount += 1
                 if let existing = usage {
                     usage = existing.merged(with: reported)
                 } else {
                     usage = reported
                 }
+            case .diagnostics(let reported):
+                diagnostics.append(reported)
             case .done:
-                phase = .finished
-                statusNote = answer.isEmpty
-                    ? "The provider returned an empty answer."
-                    : "Finished. The answer is complete."
-                handle = nil
-                pollTask?.cancel()
+                handleDone()
             case .error(let message, let cancelled):
                 if cancelled {
                     phase = .cancelled
@@ -287,12 +393,163 @@ public final class AIAssistantModel: ObservableObject {
                 } else {
                     phase = .failed
                     errorMessage = message
-                    statusNote = message
+                    var note = message
+                    if !merging,
+                       let plan,
+                       plan.action == .summarizeDocument,
+                       plan.parts.count > 1
+                    {
+                        let failed = (currentPartIndex ?? 0) + 1
+                        note += " Part \(failed) of \(plan.parts.count) failed, so no consolidation was attempted; the part summaries are kept."
+                    }
+                    statusNote = note
                 }
                 handle = nil
                 pollTask?.cancel()
             }
         }
+    }
+
+    private func handleDone() {
+        if merging {
+            finishAnswer()
+            return
+        }
+        guard let plan else {
+            finishAnswer()
+            return
+        }
+        if plan.action == .summarizeDocument && plan.parts.count > 1 {
+            let missing = (0..<plan.parts.count).filter {
+                (partAnswers[$0] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            if missing.isEmpty {
+                // Leave the polling phase synchronously: finishPolling() runs as soon as this
+                // event batch ends and would otherwise call a completed request a failure.
+                phase = .mergePreview
+                mergePlan = nil
+                statusNote = "Part summaries complete. Building the consolidation preview locally; nothing else has been sent."
+                handle = nil
+                pollTask?.cancel()
+                Task { @MainActor [weak self] in
+                    await self?.prepareMergePreview(for: plan)
+                }
+                return
+            }
+            phase = .finished
+            let labels = missing.map { "Part \($0 + 1) of \(plan.parts.count)" }
+            let subject = labels.count == 1 ? labels[0] : labels.joined(separator: ", ")
+            statusNote = "\(subject) is missing, so no consolidation was attempted. The per-part summaries are kept."
+            handle = nil
+            pollTask?.cancel()
+            return
+        }
+        finishAnswer()
+    }
+
+    private func prepareMergePreview(for plan: AiPlanRecord) async {
+        guard let service else {
+            phase = .finished
+            statusNote = "The Rust engine is not available, so no consolidation preview could be built."
+            return
+        }
+        phase = .mergePreview
+        mergePlan = nil
+        statusNote = "Part summaries complete. Building the consolidation preview locally; nothing else has been sent."
+        let parts = plan.parts.map { part in
+            AIMergePart(
+                index: Int(part.index) + 1,
+                total: Int(part.total),
+                pages: part.pages.map(Int.init),
+                summary: partAnswers[Int(part.index)] ?? ""
+            )
+        }
+        let providerSettings: AIProviderSettings
+        do {
+            providerSettings = try settings.providerSettings()
+        } catch {
+            phase = .finished
+            errorMessage = AIReadableError.message(error)
+            statusNote = "No consolidation: \(AIReadableError.message(error)) The per-part summaries are kept."
+            return
+        }
+        do {
+            let mergePlan = try await service.prepareMerge(
+                AIMergePlanRequest(
+                    documentTitle: plan.documentTitle,
+                    settings: providerSettings,
+                    parts: parts
+                )
+            )
+            self.mergePlan = mergePlan
+            phase = .mergePreview
+            statusNote = "Part summaries complete. Review the consolidation request below; sending it is a separate request."
+        } catch {
+            phase = .finished
+            mergePlan = nil
+            errorMessage = AIReadableError.message(error)
+            statusNote = "No consolidation: \(AIReadableError.message(error)) The per-part summaries are kept."
+            handle = nil
+            pollTask?.cancel()
+        }
+    }
+
+    private func finishAnswer() {
+        phase = .finished
+        if answer.isEmpty {
+            statusNote = emptyAnswerMessage()
+        } else if finishReason == "length" {
+            statusNote = "Finished at the provider's token limit; the answer may be truncated."
+        } else {
+            statusNote = "Finished. The answer is complete."
+        }
+        handle = nil
+        pollTask?.cancel()
+    }
+
+    /// A completed stream with no `content` deltas is not a success story. Name what arrived so a
+    /// reader (or a developer) does not have to infer it from a usage line under a blank pane.
+    private func emptyAnswerMessage() -> String {
+        var prefix = "The provider returned no answer."
+        if finishReason == "length" {
+            prefix = "The provider stopped at its token limit before answering."
+        } else if !reasoning.isEmpty {
+            prefix = "The provider sent reasoning but no answer."
+        }
+
+        var observations: [String] = []
+        let stats = streamDiagnostics
+        if let stats {
+            observations.append("HTTP \(stats.httpStatus)")
+            observations.append("\(stats.frames) frame(s), \(stats.dataFrames) data")
+            observations.append("\(stats.contentFrames) content, \(stats.reasoningFrames) reasoning, \(stats.roleOnlyFrames) role-only, \(stats.emptyFrames) empty")
+            observations.append("content shape \(stats.contentShape)")
+            observations.append("finish_reason \(stats.finishReason ?? "not reported")")
+            observations.append("\(stats.bytes) bytes")
+            if !stats.usage.isEmpty {
+                observations.append("usage \(stats.usage.summary)")
+            }
+        } else {
+            observations.append("no `content` deltas")
+            if reasoningDeltaCount > 0 {
+                observations.append("\(reasoningDeltaCount) reasoning delta(s)")
+            }
+            if usageUpdateCount > 0 {
+                observations.append("\(usageUpdateCount) usage update(s)")
+            }
+        }
+        if let completion = stats?.usage.completionTokens ?? usage?.completionTokens {
+            if stats?.usage.completionTokens == nil {
+                observations.append("usage reports \(completion) completion tokens")
+            }
+            if let budget = plan?.maxTokens.map({ Int($0) }), completion >= budget {
+                observations.append("the request's max_tokens was \(budget)")
+            }
+        }
+        if reasoningTokensIgnored {
+            observations.append("the provider reported reasoning tokens even though thinking is off")
+        }
+        return prefix + " " + observations.joined(separator: "; ") + "."
     }
 
     private func finishPolling() {
@@ -320,8 +577,26 @@ public final class AIAssistantModel: ObservableObject {
 
     private func clearConversation() {
         plan = nil
-        answer = ""
-        usage = nil
+        resetMergeState()
+        resetStreamOutput()
         errorMessage = nil
+    }
+
+    private func resetMergeState() {
+        mergePlan = nil
+        partAnswers = [:]
+        partLabels = [:]
+        currentPartIndex = nil
+        merging = false
+    }
+
+    private func resetStreamOutput() {
+        answer = ""
+        reasoning = ""
+        usage = nil
+        diagnostics = []
+        contentDeltaCount = 0
+        reasoningDeltaCount = 0
+        usageUpdateCount = 0
     }
 }

@@ -224,6 +224,62 @@ pub struct TokenUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Reasoning tokens are a subset of completion tokens on providers that expose them.,
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            prompt_tokens: add_optional(self.prompt_tokens, other.prompt_tokens),
+            completion_tokens: add_optional(self.completion_tokens, other.completion_tokens),
+            total_tokens: add_optional(self.total_tokens, other.total_tokens),
+            reasoning_tokens: add_optional(self.reasoning_tokens, other.reasoning_tokens),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+    }
+}
+
+/// Instrumentation for one request. The shell shows these counts when no answer text arrived,
+/// instead of guessing from the usage line. Counts and byte totals only; no content.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamDiagnostics {
+    pub http_status: u16,
+    pub bytes: u64,
+    pub frames: u32,
+    pub data_frames: u32,
+    pub content_frames: u32,
+    pub reasoning_frames: u32,
+    pub role_only_frames: u32,
+    pub empty_frames: u32,
+    pub usage_frames: u32,
+    /// "string", "array", "complete JSON", or "none".
+    pub content_shape: String,
+    pub finish_reason: Option<String>,
+    pub usage: TokenUsage,
+}
+
+impl StreamDiagnostics {
+    fn merge_usage(&mut self, usage: TokenUsage) {
+        self.usage = self.usage.merge(usage);
+    }
+
+    fn note_shape(&mut self, shape: &str) {
+        if self.content_shape == "none" {
+            self.content_shape = shape.to_string();
+        }
+    }
 }
 
 /// One event from a plan run. The FFI surface mirrors these variants.
@@ -235,7 +291,11 @@ pub enum RunEvent {
         label: String,
     },
     Delta(String),
+    /// The provider's reasoning/thinking channel. Never appended to the answer.
+    ReasoningDelta(String),
     Usage(TokenUsage),
+    /// End-of-request instrumentation for the panel and the optional trace.
+    Diagnostics(StreamDiagnostics),
     Done,
 }
 
@@ -707,12 +767,30 @@ fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamPayload {
     Delta(String),
+    /// The provider's reasoning/thinking channel. Kept separate from the answer.
+    ReasoningDelta(String),
     Usage(TokenUsage),
 }
 
 /// Decode one `data:` payload. Unknown fields and empty keep-alives are ignored; an `error`
 /// object or malformed JSON becomes a readable error.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PayloadMeta {
+    content: bool,
+    reasoning: bool,
+    role_only: bool,
+    empty: bool,
+    usage: bool,
+    usage_value: TokenUsage,
+    content_shape: Option<String>,
+    finish_reason: Option<String>,
+}
+
 pub fn parse_stream_payload(data: &str) -> Result<Vec<StreamPayload>, AiError> {
+    parse_stream_frame(data).map(|(payloads, _)| payloads)
+}
+
+fn parse_stream_frame(data: &str) -> Result<(Vec<StreamPayload>, PayloadMeta), AiError> {
     let value: Value = serde_json::from_str(data).map_err(|error| {
         AiError::Protocol(format!(
             "The provider sent a data event that is not JSON ({}): {}",
@@ -720,36 +798,168 @@ pub fn parse_stream_payload(data: &str) -> Result<Vec<StreamPayload>, AiError> {
             truncate(data, 160)
         ))
     })?;
+    let mut meta = PayloadMeta::default();
     let mut payloads = Vec::new();
     if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| error.as_str().map(str::to_string))
-            .unwrap_or_else(|| "The provider reported an error mid-stream.".to_string());
-        return Err(AiError::Other(message));
+        let message = error_message(error).unwrap_or("The provider reported an error mid-stream.");
+        return Err(AiError::Other(format!(
+            "The provider reported an error: {message}"
+        )));
     }
     if let Some(choices) = value.get("choices").and_then(Value::as_array)
         && let Some(choice) = choices.first()
-        && let Some(delta) = choice.get("delta").and_then(|delta| delta.get("content"))
     {
-        let text = content_text(delta);
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            && !reason.is_empty()
+        {
+            meta.finish_reason = Some(reason.to_string());
+        }
+        if let Some(delta) = choice.get("delta") {
+            if let Some(content) = delta.get("content") {
+                meta.content = !content_text(content).is_empty();
+                meta.content_shape = Some(if content.is_array() {
+                    "array".to_string()
+                } else if content.is_string() {
+                    "string".to_string()
+                } else {
+                    "other".to_string()
+                });
+            }
+            meta.reasoning = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .is_some_and(|reasoning| !content_text(reasoning).is_empty());
+            meta.role_only = !meta.content
+                && !meta.reasoning
+                && delta.get("role").and_then(Value::as_str).is_some();
+            meta.empty = !meta.content && !meta.reasoning && !meta.role_only;
+            append_text_payloads(delta, &mut payloads);
+        }
+    }
+    append_usage(&value, &mut payloads);
+    for payload in &payloads {
+        if let StreamPayload::Usage(usage) = payload {
+            meta.usage = true;
+            meta.usage_value = usage.merge(meta.usage_value);
+        }
+    }
+    Ok((payloads, meta))
+}
+
+/// Parse a complete non-SSE JSON response.
+///
+/// Some gateways ignore `stream: true` and return one `choices[0].message.content` object.
+/// Parsing that shape (and a 200 response whose body is an `error` object) is preferable to
+/// reporting an empty answer or a misleading "missing [DONE]".
+pub fn parse_complete_body(body: &str) -> Result<Vec<StreamPayload>, AiError> {
+    parse_complete_body_with_meta(body).map(|(payloads, _)| payloads)
+}
+
+fn parse_complete_body_with_meta(body: &str) -> Result<(Vec<StreamPayload>, PayloadMeta), AiError> {
+    let value: Value = serde_json::from_str(body).map_err(|error| {
+        AiError::Protocol(format!(
+            "The provider returned a non-SSE response that is not JSON ({}): {}",
+            error,
+            truncate(body, 160)
+        ))
+    })?;
+    if let Some(error) = value.get("error") {
+        let message = error_message(error).unwrap_or("The provider returned an error.");
+        return Err(AiError::Other(format!(
+            "The provider returned an error: {message}"
+        )));
+    }
+    let mut payloads = Vec::new();
+    let mut meta = PayloadMeta::default();
+    if let Some(choices) = value.get("choices").and_then(Value::as_array)
+        && let Some(choice) = choices.first()
+    {
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            && !reason.is_empty()
+        {
+            meta.finish_reason = Some(reason.to_string());
+        }
+        if let Some(message) = choice.get("message") {
+            append_text_payloads(message, &mut payloads);
+        }
+        // Legacy completions API / a few gateways use `choices[0].text`.
+        if let Some(text) = choice.get("text").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            payloads.push(StreamPayload::Delta(text.to_string()));
+        }
+    }
+    append_usage(&value, &mut payloads);
+    if payloads.is_empty() {
+        return Err(AiError::Protocol(
+            "The provider returned a JSON body with neither a message nor usage.".to_string(),
+        ));
+    }
+    meta.content = payloads
+        .iter()
+        .any(|payload| matches!(payload, StreamPayload::Delta(_)));
+    meta.reasoning = payloads
+        .iter()
+        .any(|payload| matches!(payload, StreamPayload::ReasoningDelta(_)));
+    for payload in &payloads {
+        if let StreamPayload::Usage(usage) = payload {
+            meta.usage = true;
+            meta.usage_value = usage.merge(meta.usage_value);
+        }
+    }
+    meta.content_shape = if meta.content || meta.reasoning {
+        Some("complete JSON".to_string())
+    } else {
+        None
+    };
+    Ok((payloads, meta))
+}
+
+fn append_text_payloads(container: &Value, payloads: &mut Vec<StreamPayload>) {
+    // DeepSeek's thinking-mode streams use `reasoning_content`; some gateways use `reasoning`.
+    // Both are the thinking channel, never the answer.
+    if let Some(reasoning) = container
+        .get("reasoning_content")
+        .or_else(|| container.get("reasoning"))
+    {
+        let text = content_text(reasoning);
+        if !text.is_empty() {
+            payloads.push(StreamPayload::ReasoningDelta(text));
+        }
+    }
+    if let Some(content) = container.get("content") {
+        let text = content_text(content);
         if !text.is_empty() {
             payloads.push(StreamPayload::Delta(text));
         }
     }
+}
+
+fn append_usage(value: &Value, payloads: &mut Vec<StreamPayload>) {
     if let Some(usage) = value.get("usage").and_then(Value::as_object) {
+        let reasoning_tokens = usage
+            .get("completion_tokens_details")
+            .and_then(Value::as_object)
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get("reasoning_tokens").and_then(Value::as_u64));
         let parsed = TokenUsage {
             prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
             completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+            reasoning_tokens,
         };
         if parsed != TokenUsage::default() {
             payloads.push(StreamPayload::Usage(parsed));
         }
     }
-    Ok(payloads)
+}
+
+fn error_message(error: &Value) -> Option<&str> {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
 }
 
 fn content_text(value: &Value) -> String {
@@ -758,14 +968,141 @@ fn content_text(value: &Value) -> String {
         Value::Array(parts) => {
             let mut text = String::new();
             for part in parts {
-                if let Some(segment) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(segment);
+                match part {
+                    Value::String(segment) => text.push_str(segment),
+                    _ => {
+                        if let Some(segment) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(segment);
+                        }
+                    }
                 }
             }
             text
         }
         _ => String::new(),
     }
+}
+
+/// Largest non-SSE JSON body accepted as a complete answer. A normal answer is far smaller;
+/// this is a sanity ceiling, not a context budget.
+const MAX_COMPLETE_BODY: usize = 4 * 1024 * 1024;
+
+/// Whether the raw-stream trace is enabled. Read once, like the app's other development hooks.
+fn trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARIS_READER_AI_TRACE")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn trace(message: impl AsRef<str>) {
+    if trace_enabled() {
+        eprintln!("aris-ai-trace: {}", message.as_ref());
+    }
+}
+
+fn trace_sse_frame(frame: &SseFrame) {
+    match frame {
+        SseFrame::Done => trace("sse frame=done"),
+        SseFrame::Data(data) => match serde_json::from_str::<Value>(data) {
+            Ok(value) => trace(format!("sse frame=data {}", json_shape(&value))),
+            Err(_) => trace(format!(
+                "sse frame=data non-json chars={}",
+                data.chars().count()
+            )),
+        },
+    }
+}
+
+fn trace_complete_body(body: &str) {
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => trace(format!("non-sse body json {}", json_shape(&value))),
+        Err(_) => trace(format!(
+            "non-sse body non-json chars={}",
+            body.chars().count()
+        )),
+    }
+}
+
+/// Describe a JSON payload by its keys and content lengths only. Never include values: the
+/// trace exists so a reader can share what a provider streams without sharing the text.
+fn json_shape(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return "type=non-object".to_string();
+    };
+    let keys = |map: &serde_json::Map<String, Value>| {
+        map.keys().map(String::as_str).collect::<Vec<_>>().join(",")
+    };
+    let mut parts = vec![format!("keys=[{}]", keys(object))];
+    if let Some(error) = object.get("error").and_then(Value::as_object) {
+        parts.push(format!("error_keys=[{}]", keys(error)));
+    }
+    if let Some(usage) = object.get("usage").and_then(Value::as_object) {
+        parts.push(format!("usage_keys=[{}]", keys(usage)));
+    }
+    if let Some(choices) = object.get("choices").and_then(Value::as_array) {
+        parts.push(format!("choices={}", choices.len()));
+        if let Some(choice) = choices.first().and_then(Value::as_object) {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                parts.push(format!("finish_reason={reason}"));
+            }
+            for field in ["delta", "message"] {
+                if let Some(container) = choice.get(field).and_then(Value::as_object) {
+                    parts.push(format!("{field}_keys=[{}]", keys(container)));
+                    for key in ["content", "reasoning_content", "reasoning"] {
+                        if let Some(value) = container.get(key) {
+                            parts.push(format!(
+                                "{key}_chars={}",
+                                content_text(value).chars().count()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn emit_payload(payload: StreamPayload, emit: &mut dyn FnMut(RunEvent)) {
+    match payload {
+        StreamPayload::Delta(text) => emit(RunEvent::Delta(text)),
+        StreamPayload::ReasoningDelta(text) => emit(RunEvent::ReasoningDelta(text)),
+        StreamPayload::Usage(usage) => emit(RunEvent::Usage(usage)),
+    }
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn read_complete_body(
+    response: &mut dyn ResponseStream,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, AiError> {
+    let mut body = Vec::new();
+    loop {
+        cancel.check()?;
+        match response.next_chunk() {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_COMPLETE_BODY {
+                    return Err(AiError::Protocol(format!(
+                        "The provider sent a non-SSE response larger than {} MiB.",
+                        MAX_COMPLETE_BODY / (1024 * 1024)
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(body)
 }
 
 // ── Running a plan ─────────────────────────────────────────────────────────────────────────
@@ -822,12 +1159,52 @@ fn run_plan_inner(
         let spec = build_request_spec(plan, part, api_key)?;
         let mut response = transport.execute(&spec, cancel)?;
         let status = response.status();
+        let mut diagnostics = StreamDiagnostics {
+            http_status: status,
+            content_shape: "none".to_string(),
+            ..Default::default()
+        };
         if !(200..300).contains(&status) {
             let body = read_error_body(&mut *response, cancel)?;
             return Err(http_error(status, response.reason(), &body));
         }
 
+        let content_type = header_value(response.headers(), "content-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        trace(format!(
+            "response status={status} content_type={}",
+            if content_type.is_empty() {
+                "(none)"
+            } else {
+                content_type.as_str()
+            }
+        ));
+
+        // A gateway may ignore `stream: true` and return one ordinary JSON response. Parse that
+        // as a complete answer (or a 200-with-error body) instead of demanding [DONE].
+        if !content_type.contains("text/event-stream") {
+            let body = read_complete_body(&mut *response, cancel)?;
+            let text = String::from_utf8_lossy(&body);
+            trace_complete_body(&text);
+            let (payloads, meta) = parse_complete_body_with_meta(&text)?;
+            diagnostics.bytes = body.len() as u64;
+            diagnostics.frames = 1;
+            diagnostics.data_frames = 1;
+            absorb_meta(&mut diagnostics, &meta);
+            for payload in payloads {
+                emit_payload(payload, emit);
+            }
+            trace_diagnostics(&diagnostics);
+            emit(RunEvent::Diagnostics(diagnostics));
+            continue;
+        }
+
         let mut decoder = SseDecoder::new();
+        let mut frames_seen = false;
+        // If the server claims SSE but actually sends one JSON object, keep the raw bytes until
+        // the first real SSE frame so EOF can be retried as a complete body.
+        let mut fallback = Vec::new();
         loop {
             cancel.check()?;
             let chunk = match response.next_chunk() {
@@ -835,15 +1212,32 @@ fn run_plan_inner(
                 Ok(None) => break,
                 Err(error) => return Err(error),
             };
-            for frame in decoder.push(&chunk)? {
+            diagnostics.bytes = diagnostics.bytes.saturating_add(chunk.len() as u64);
+            if !frames_seen {
+                if fallback.len() + chunk.len() > MAX_COMPLETE_BODY {
+                    return Err(AiError::Protocol(format!(
+                        "The provider sent an SSE response with no frames and more than {} MiB of data.",
+                        MAX_COMPLETE_BODY / (1024 * 1024)
+                    )));
+                }
+                fallback.extend_from_slice(&chunk);
+            }
+            let frames = decoder.push(&chunk)?;
+            if !frames.is_empty() {
+                frames_seen = true;
+                fallback.clear();
+            }
+            for frame in frames {
+                diagnostics.frames += 1;
+                trace_sse_frame(&frame);
                 match frame {
                     SseFrame::Done => {}
                     SseFrame::Data(data) => {
-                        for payload in parse_stream_payload(&data)? {
-                            match payload {
-                                StreamPayload::Delta(text) => emit(RunEvent::Delta(text)),
-                                StreamPayload::Usage(usage) => emit(RunEvent::Usage(usage)),
-                            }
+                        diagnostics.data_frames += 1;
+                        let (payloads, meta) = parse_stream_frame(&data)?;
+                        absorb_meta(&mut diagnostics, &meta);
+                        for payload in payloads {
+                            emit_payload(payload, emit);
                         }
                     }
                 }
@@ -856,14 +1250,71 @@ fn run_plan_inner(
             }
         }
         if !decoder.is_done() {
-            return Err(AiError::Protocol(
-                "The server closed the connection before [DONE]; the answer is incomplete."
-                    .to_string(),
-            ));
+            if !frames_seen && !fallback.is_empty() {
+                let text = String::from_utf8_lossy(&fallback);
+                trace_complete_body(&text);
+                let (payloads, meta) = parse_complete_body_with_meta(&text)?;
+                diagnostics.frames = 1;
+                diagnostics.data_frames = 1;
+                absorb_meta(&mut diagnostics, &meta);
+                for payload in payloads {
+                    emit_payload(payload, emit);
+                }
+            } else {
+                return Err(AiError::Protocol(
+                    "The server closed the connection before [DONE]; the answer is incomplete."
+                        .to_string(),
+                ));
+            }
         }
+        trace_diagnostics(&diagnostics);
+        emit(RunEvent::Diagnostics(diagnostics));
     }
     emit(RunEvent::Done);
     Ok(())
+}
+
+fn absorb_meta(diagnostics: &mut StreamDiagnostics, meta: &PayloadMeta) {
+    if meta.content {
+        diagnostics.content_frames += 1;
+    }
+    if meta.reasoning {
+        diagnostics.reasoning_frames += 1;
+    }
+    if meta.role_only {
+        diagnostics.role_only_frames += 1;
+    }
+    if meta.empty {
+        diagnostics.empty_frames += 1;
+    }
+    if meta.usage {
+        diagnostics.usage_frames += 1;
+    }
+    if let Some(shape) = &meta.content_shape {
+        diagnostics.note_shape(shape);
+    }
+    if let Some(reason) = &meta.finish_reason {
+        diagnostics.finish_reason = Some(reason.clone());
+    }
+    diagnostics.merge_usage(meta.usage_value);
+}
+
+fn trace_diagnostics(diagnostics: &StreamDiagnostics) {
+    trace(format!(
+        "request summary http={} bytes={} frames={} data={} content={} reasoning={} role_only={} empty={} usage_frames={} content_shape={} finish_reason={} usage={:?}",
+        diagnostics.http_status,
+        diagnostics.bytes,
+        diagnostics.frames,
+        diagnostics.data_frames,
+        diagnostics.content_frames,
+        diagnostics.reasoning_frames,
+        diagnostics.role_only_frames,
+        diagnostics.empty_frames,
+        diagnostics.usage_frames,
+        diagnostics.content_shape,
+        diagnostics.finish_reason.as_deref().unwrap_or("none"),
+        diagnostics.usage
+    ));
 }
 
 fn read_error_body(
@@ -911,12 +1362,37 @@ fn http_error(status: u16, reason: &str, body: &str) -> AiError {
         429 => with_detail(format!(
             "The provider is rate limiting this key ({status_label}). Wait a moment and try again."
         )),
-        400 | 404 | 422 => with_detail(format!(
-            "The provider rejected the request ({status_label})."
-        )),
+        400 | 404 | 422 => {
+            let mut message = with_detail(format!(
+                "The provider rejected the request ({status_label})."
+            ));
+            if let Some(hint) = reasoning_parameter_hint(&detail) {
+                message.push(' ');
+                message.push_str(hint);
+            }
+            message
+        }
         500..=599 => with_detail(format!("The provider failed ({status_label}).")),
         _ => with_detail(format!("The provider answered with {status_label}.")),
     })
+}
+
+fn reasoning_parameter_hint(detail: &str) -> Option<&'static str> {
+    let lower = detail.to_ascii_lowercase();
+    let names_parameter = lower.contains("unknown")
+        || lower.contains("unrecognized")
+        || lower.contains("unsupported")
+        || lower.contains("not supported");
+    let is_reasoning = lower.contains("reasoning")
+        || lower.contains("thinking")
+        || lower.contains("output_config")
+        || lower.contains("reasoning_effort");
+    (names_parameter
+        && is_reasoning
+        && (lower.contains("parameter") || lower.contains("argument") || lower.contains("field")))
+    .then_some(
+        "The reasoning encoding selected in Settings > AI was not accepted; change it or set reasoning to provider default.",
+    )
 }
 
 fn error_detail(body: &str) -> String {
@@ -958,7 +1434,9 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{Action, ChatSettings, PageText, PlanRequest, build_plan};
+    use crate::chat::{
+        Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode, build_plan,
+    };
 
     fn test_plan() -> ChatPlan {
         build_plan(PlanRequest {
@@ -972,13 +1450,16 @@ mod tests {
             pages: vec![PageText {
                 page: 0,
                 text: "The method has three steps. It builds an index, ranks blocks and streams an answer.".to_string(),
-            }],
+
+                chars: Vec::new(),}],
             settings: ChatSettings {
                 base_url: "http://127.0.0.1:9/v1".to_string(),
                 model: "test-model".to_string(),
                 temperature: Some(0.2),
                 max_tokens: Some(100),
-            },
+
+                reasoning_mode: ReasoningMode::Off,
+                reasoning_encoding: ReasoningEncoding::Thinking,},
         })
         .unwrap()
     }
@@ -1061,10 +1542,166 @@ mod tests {
                 StreamPayload::Usage(TokenUsage {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(2),
-                    total_tokens: Some(12)
+                    total_tokens: Some(12),
+
+                    reasoning_tokens: None,
                 })
             ]
         );
+    }
+
+    #[test]
+    fn payload_keeps_reasoning_and_answer_separate() {
+        let payloads = parse_stream_payload(
+            r#"{"choices":[{"delta":{"reasoning_content":"think first","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            payloads,
+            vec![
+                StreamPayload::ReasoningDelta("think first".to_string()),
+                StreamPayload::Delta("answer".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn payload_parses_content_parts_and_reasoning_only() {
+        let mut decoder = SseDecoder::new();
+        let frames = decoder
+            .push(include_bytes!("../tests/fixtures/content_parts.sse"))
+            .unwrap();
+        let mut payloads = Vec::new();
+        for frame in frames {
+            if let SseFrame::Data(data) = frame {
+                payloads.extend(parse_stream_payload(&data).unwrap());
+            }
+        }
+        assert_eq!(
+            payloads,
+            vec![
+                StreamPayload::Delta("Hello from a content array.".to_string()),
+                StreamPayload::Usage(TokenUsage {
+                    prompt_tokens: Some(12),
+                    completion_tokens: Some(6),
+                    total_tokens: Some(18),
+
+                    reasoning_tokens: None,
+                })
+            ]
+        );
+
+        let reasoning = parse_stream_payload(
+            r#"{"choices":[{"delta":{"reasoning_content":"still thinking"}}],"usage":{"completion_tokens":900}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reasoning,
+            vec![
+                StreamPayload::ReasoningDelta("still thinking".to_string()),
+                StreamPayload::Usage(TokenUsage {
+                    prompt_tokens: None,
+                    completion_tokens: Some(900),
+                    total_tokens: None,
+
+                    reasoning_tokens: None,
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_body_parses_message_content_and_usage() {
+        let payloads = parse_complete_body(
+            r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"Bonjour"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            payloads,
+            vec![
+                StreamPayload::Delta("Bonjour".to_string()),
+                StreamPayload::Usage(TokenUsage {
+                    prompt_tokens: Some(3),
+                    completion_tokens: Some(2),
+                    total_tokens: Some(5),
+
+                    reasoning_tokens: None,
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_body_keeps_reasoning_out_of_the_answer() {
+        let payloads = parse_complete_body(
+            r#"{"choices":[{"message":{"content":null,"reasoning_content":"internal"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            payloads,
+            vec![StreamPayload::ReasoningDelta("internal".to_string())]
+        );
+    }
+
+    #[test]
+    fn complete_body_surfaces_a_200_error_object() {
+        let error = parse_complete_body(
+            r#"{"error":{"message":"Model Not Exist","type":"invalid_request_error"}}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Model Not Exist"), "{error}");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn the_wire_body_streams_without_vendor_extensions() {
+        let plan = build_plan(PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "DeepSeek".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: None,
+            question: None,
+            language: None,
+            pages: vec![PageText {
+                page: 0,
+                text: "A sentence long enough to be a context block for the translation test."
+                    .to_string(),
+
+                chars: Vec::new(),
+            }],
+            settings: ChatSettings {
+                base_url: "https://api.deepseek.com".to_string(),
+                model: "deepseek-flash".to_string(),
+                temperature: Some(0.2),
+                max_tokens: Some(900),
+
+                reasoning_mode: ReasoningMode::Off,
+                reasoning_encoding: ReasoningEncoding::Thinking,
+            },
+        })
+        .unwrap();
+        assert_eq!(plan.endpoint, "https://api.deepseek.com/chat/completions");
+        assert!(
+            plan.parts[0]
+                .wire_body
+                .contains("\"model\":\"deepseek-flash\"")
+        );
+        assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
+        assert!(!plan.parts[0].wire_body.contains("stream_options"));
+    }
+
+    #[test]
+    fn trace_shape_lists_keys_without_values() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":"SECRET-REASONING"},"finish_reason":null}],"usage":{"prompt_tokens":1}}"#,
+        )
+        .unwrap();
+        let shape = json_shape(&value);
+        assert!(shape.contains("reasoning_content"));
+        assert!(shape.contains("reasoning_content_chars=16"));
+        assert!(shape.contains("usage_keys="));
+        assert!(!shape.contains("SECRET-REASONING"));
     }
 
     #[test]

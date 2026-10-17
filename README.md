@@ -209,16 +209,72 @@ same code works with OpenAI, DeepSeek, and a local Ollama
 (`http://localhost:11434/v1`, any non-empty key). No vendor SDK is used.
 
 **What it does.** Summarise the current page, summarise the whole document (split into parts for
-long documents, displayed as separate part summaries), ask a question about the current
-selection, and translate the selection. Every answer streams. While streaming, Cancel aborts the
-HTTP request and keeps the partial answer; Retry re-sends the plan that was already previewed.
-Token usage is shown when the provider reports it. Answers are rendered as paragraphs, headings,
+long documents), ask a question about the current selection, and translate the selection. For a
+long document, the per-part answers are kept, and a **separate consolidation request** is
+previewed after the parts with its own page/character/token cost. Sending it produces the single
+summary shown as the answer; it is never sent automatically, and if a part is missing the panel
+names that part instead of silently consolidating the rest. Every answer streams. While streaming,
+Cancel aborts the HTTP request and keeps the partial answer; Retry re-sends the plan that was
+already previewed. Token usage is shown when the provider reports it. Answers are rendered as paragraphs, headings,
 bullet lists and numbered lists; the model is instructed to cite sources as `[p.N]`, and only
 that exact form with an in-range page becomes a clickable page jump. Bare numbers, `[12]`,
 `[p.12–14]` and out-of-range pages stay plain text.
 
+**Reasoning control.** Plain OpenAI compatibility has no standard reasoning switch, but the
+provider exposes several request extensions. Settings > AI has two controls: a **mode**
+(`provider default`, `off`, `low`, `high`, `max`) and an **encoding** (`none`, `thinking`,
+`reasoning_effort`, `output_config`, `reasoning.effort`). The default is **off via thinking**
+(`{"thinking":{"type":"disabled"}}`), because reasoning changes cost and latency. Lyra sends
+exactly one chosen field and nothing else; unsupported combinations (such as an intensity with
+the thinking toggle, or `off` via `output_config`) are rejected in Settings rather than silently
+sending a different value. The request preview states in plain words what is sent
+("Thinking: disabled" / "Reasoning effort: high") and shows the exact JSON body. If a provider
+returns a 4xx naming an unknown or unsupported parameter, the error quotes it and points back at
+the reasoning setting. The completion budget (`max_tokens`) is shown in the same preview and
+remains user-editable; it is not silently raised.
+
+`usage.completion_tokens_details.reasoning_tokens` (or a top-level `reasoning_tokens`) is
+displayed as a subset of completion tokens. If the provider reports reasoning tokens when the
+mode is `off`, the answer footer says so: the provider may have ignored the toggle.
+
+**Reasoning is not the answer.** DeepSeek's thinking-mode models stream their analysis in
+`choices[0].delta.reasoning_content` (the [DeepSeek streaming guide](https://api-docs.deepseek.com/guides/thinking_mode_api_example_streaming/)
+shows a chunk carrying either `reasoning_content` or `content`). Lyra accumulates that channel
+separately and never concatenates it into the answer, the translation, or the page linkifier.
+If a stream ends with no content but the provider reported usage, the panel says so explicitly,
+names `finish_reason` and the frame/delta counts, shows the HTTP status, content shape, byte
+count and usage, and puts the reasoning in a labelled, obviously-not-the-answer section. A
+`finish_reason: "length"` with no content says "The provider stopped at its token limit before
+answering." A usage-only stream gets the same diagnostic; the usage line is deliberately small
+and muted below it, never the headline. The reasoning text is not linkified.
+
+**Other response shapes.** A streaming delta may carry `content` as an array of text parts
+(`[{"type":"text","text":…}]`); those are concatenated in order. If a gateway ignores
+`stream: true` and returns one ordinary JSON response, it is parsed as
+`choices[0].message.content` (plus optional usage) rather than failing for a missing `[DONE]`.
+A 200 response whose body is an `error` object is surfaced as the provider's `error.message`,
+not as an empty success. `stream_options` is never sent, and the model name is passed through
+exactly as typed (no catalogue validation or remapping); an endpoint error is shown to the
+reader.
+
+**Selection exactness and the line-number gutter.** The AI prompt slices the raw page text with
+the same `TextChar` indices the canvas uses for drawing and copy. Page text is normalised only
+for the surrounding page context and retrieval, never before extracting a selection: CRLF→LF and
+whitespace changes would shift the range (the manuscript's `000`–`053` margin made that shift
+very visible). Whatever the reader highlights is what the model receives, including partial words
+at either edge and any internal whitespace; no word-boundary trimming is applied.
+
+For page and document context, a **leading margin line-number block** is removed by a geometric
+rule, not by stripping digits: the text layer must begin with at least five consecutive lines
+that contain only digits, share an aligned equal-width column whose values increase by exactly
+one, sit within 40 pt of the page's left text edge, and have a visible gap before the body.
+Numbered list items and table rows carry other text on the same line, so they are left alone.
+The committed `selection-numbered-margin.pdf` fixture and the local `manuscript_0925.pdf` prove
+the page context has no `000`–`053` run while the abstract and the exact selected characters
+survive.
+
 **What it does not do, and says so.** No document chat, no region screenshots/vision, no
-auto-retry, no background requests, and no merging of part summaries. A scanned PDF with no text
+auto-retry, no background requests, and no automatic consolidation. A scanned PDF with no text
 layer gets a clear message rather than a fabricated answer. The panel renders only the small
 Markdown subset above; other Markdown is shown literally.
 
@@ -274,23 +330,46 @@ and for the SSE body.
 **Protocol.** `POST {base}/chat/completions` with
 `Content-Type: application/json`, `Accept: text/event-stream`,
 `Authorization: Bearer <key>` and `User-Agent: Lyra/0.0`. The body contains `model`, `messages`
-(system + user), `stream: true`, and optionally `temperature` and `max_tokens`. The response is
-parsed as SSE: each `data:` line is JSON, `choices[0].delta.content` is appended, an optional
-`usage` object is shown, `[DONE]` ends the request, and EOF without `[DONE]` is an error. HTTP
-status and the provider's JSON error message are surfaced as readable text; 401 points at the
-Keychain setting. `stream_options` is not sent, so token usage appears only when a provider
-reports it in its stream.
+(system + user), `stream: true`, and optionally `temperature`, `max_tokens` and exactly one
+reasoning extension. The response is parsed as SSE: each `data:` line is JSON,
+`choices[0].delta.content` and `delta.reasoning_content` are accumulated in separate channels,
+`choices[0].finish_reason` is recorded, an optional `usage` object (including reasoning-token
+details) is shown, `[DONE]` ends the request, and EOF without `[DONE]` is an error. Every request
+also produces a diagnostics record: HTTP status, bytes, frame/data counts, content/reasoning/
+role-only/empty frame counts, content shape (string, array, complete JSON or none), finish reason
+and usage. HTTP status and the provider's JSON error message are surfaced as readable text; 401
+points at the Keychain setting and an unsupported reasoning parameter points at Settings > AI.
+`stream_options` is not sent, so token usage appears only when a provider reports it in its
+stream.
+
+**Raw-stream trace.** Set `ARIS_READER_AI_TRACE=1` (any non-empty value except `0`) to print one
+`aris-ai-trace:` line per response frame and one `request summary` line per request to stderr.
+Each frame line names the frame type (`data` or `done`), the JSON keys it carried, and character
+counts for content/reasoning. The summary has HTTP status, bytes, frame/data counts, delta-kind
+counts, content shape, `finish_reason`, usage (including reasoning tokens) and no content
+values. It never prints header values, the Authorization header, document text, answer text or
+reasoning text; it is safe to send the log when asking why a provider produced no answer. The
+environment variable is read once per process.
 
 **Tests.** `cargo test -p aris-reader-ai` covers split JSON across SSE chunks, `[DONE]`, HTTP
 401 with an error body, a mid-stream disconnect, cancellation (the loopback server observes the
 connection closing), idle timeouts, and that the wire body equals the previewed body. The TLS
 path is tested with a loopback `rustls` server and a generated CA: a full streaming round trip
 with the CA injected into the client's roots, and a refusal when the server's certificate is
-signed by a different CA.
+signed by a different CA. Stream fixtures cover content-only, reasoning-then-content, content
+array, usage-only, a `finish_reason: "length"` stop with no content, non-SSE complete JSON and a
+200 error body. The raw-selection and gutter regressions are checked against a committed
+numbered-margin fixture (and the live manuscript when the local corpus is mounted): canvas hit
+testing, copy and both prompt paths must produce identical characters, while page context loses
+the margin run and keeps the abstract. Consolidation tests cover the one-request merge, its
+prompt/cost, and a missing part naming the gap.
 `ArisReaderChecks --check-ai-assistant .` covers settings validation, Keychain-hygiene (the key
 never appears in UserDefaults or captured stdout/stderr; a real Keychain round-trip runs when the
-login Keychain is available and is skipped, not faked, when it is not), the citation rules, and
-the panel state machine with the Rust mock provider. No check makes a real API call.
+login Keychain is available and is skipped, not faked, when it is not), the citation rules, the
+reasoning settings, reasoning/empty-answer panel state, the truncated-at-limit message, the
+four-action request profile (same model/temperature/max_tokens/stream/reasoning field, only
+prompts differ), and the part-summary consolidation flow with the Rust mock provider. No check
+makes a real API call.
 
 ## Development workflow
 

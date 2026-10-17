@@ -1,3 +1,4 @@
+import AppKit
 import ArisReaderBindings
 import ArisReaderKit
 import Darwin
@@ -30,6 +31,101 @@ private final class RecordingAIService: AIChatServicing {
     }
 }
 
+/// A service that uses the real Rust planner for the preview but scripts the stream. This is how
+/// the checks exercise provider shapes the Rust MockProvider does not produce (reasoning-only,
+/// usage-only) while still using the production plan/validation path.
+@MainActor
+private final class ScriptedAIChatService: AIChatServicing {
+    private let base: RustAIChatService
+    private let scriptedEvents: [AIStreamEvent]
+    private(set) var startCount = 0
+
+    init(engine: RustEngine, events: [AIStreamEvent]) {
+        self.base = RustAIChatService(engine: engine)
+        self.scriptedEvents = events
+    }
+
+    func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
+        try await base.prepare(request)
+    }
+
+    func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+        startCount += 1
+        return ScriptedAIChatHandle(events: scriptedEvents)
+    }
+}
+
+@MainActor
+private final class ScriptedAIChatHandle: AIChatHandle {
+    private var events: [AIStreamEvent]
+    private var finished = false
+
+    init(events: [AIStreamEvent]) {
+        self.events = events
+    }
+
+    func poll() -> [AIStreamEvent] {
+        let pending = events
+        events = []
+        if pending.contains(where: { event in
+            switch event {
+            case .done, .error: return true
+            default: return false
+            }
+        }) {
+            finished = true
+        }
+        return pending
+    }
+
+    func cancel() {
+        events = []
+        finished = true
+    }
+
+    var isFinished: Bool { finished }
+}
+
+/// Scripts a two-part document summary plus the separately previewed consolidation. The original
+/// plan is synthetic because producing a real multi-part plan needs a large document; the merge
+/// plan itself is built by the production Rust code.
+@MainActor
+private final class MergeScriptedService: AIChatServicing {
+    let base: RustAIChatService
+    let originalPlan: AiPlanRecord
+    let partEvents: [AIStreamEvent]
+    let mergeEvents: [AIStreamEvent]
+    private(set) var startedPlans: [AiPlanRecord] = []
+
+    init(
+        engine: RustEngine,
+        originalPlan: AiPlanRecord,
+        partEvents: [AIStreamEvent],
+        mergeEvents: [AIStreamEvent]
+    ) {
+        self.base = RustAIChatService(engine: engine)
+        self.originalPlan = originalPlan
+        self.partEvents = partEvents
+        self.mergeEvents = mergeEvents
+    }
+
+    func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
+        originalPlan
+    }
+
+    func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
+        try await base.prepareMerge(request)
+    }
+
+    func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+        startedPlans.append(plan)
+        if plan.parts.count == 1 && plan.parts[0].label.hasPrefix("Consolidated summary") {
+            return ScriptedAIChatHandle(events: mergeEvents)
+        }
+        return ScriptedAIChatHandle(events: partEvents)
+    }
+}
+
 private struct AISettingsFixture {
     let suiteName: String
     let defaults: UserDefaults
@@ -49,7 +145,9 @@ extension ReaderChecks {
         try aiKeyHygieneChecks()
         try aiCitationChecks()
         try aiKeychainRoundTripCheck()
+        try await aiSelectionChecks(root: root)
         try await aiPanelChecks(root: root)
+        try await aiMergeChecks()
     }
 
     @MainActor
@@ -96,6 +194,56 @@ extension ReaderChecks {
         require(store.endpointInfo?.endpoint == "http://localhost:11434/v1/chat/completions",
                 "the endpoint appends /chat/completions once")
         require(store.endpointInfo?.isLocal == true, "localhost is classified as local")
+        require(store.reasoningMode == .off && store.reasoningEncoding == .thinking,
+                "reasoning defaults to off via the thinking encoding")
+        let offSettings = try store.providerSettings()
+        require(offSettings.reasoningSummary.contains("thinking: disabled"),
+                "the off setting is stated in plain words: \(offSettings.reasoningSummary)")
+        require(AISettingsStore.reasoningValidationMessage(mode: .high, encoding: .thinking) != nil,
+                "the thinking toggle rejects an intensity mode")
+        require(store.save(
+            baseURL: "http://localhost:11434/v1",
+            model: "llama3.2",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: nil,
+            reasoningMode: .high,
+            reasoningEncoding: .reasoningEffort
+        ), "high effort via reasoning_effort is accepted")
+        let highSettings = try store.providerSettings()
+        require(highSettings.reasoningSummary.contains("reasoning_effort: high"),
+                "the high-effort field is stated: \(highSettings.reasoningSummary)")
+        require(store.save(
+            baseURL: "http://localhost:11434/v1",
+            model: "llama3.2",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: nil,
+            reasoningMode: .off,
+            reasoningEncoding: .reasoningEffort
+        ) == false, "off via reasoning_effort is rejected rather than sending an invented value")
+        require(store.reasoningMode == .high, "a rejected combination does not overwrite the saved setting")
+        require(store.save(
+            baseURL: "http://localhost:11434/v1",
+            model: "llama3.2",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: nil,
+            reasoningMode: .providerDefault,
+            reasoningEncoding: .thinking
+        ), "provider-default mode is accepted")
+        let defaultSettings = try store.providerSettings()
+        require(defaultSettings.reasoningSummary.contains("provider default"),
+                "provider default is stated in plain words")
+        require(store.save(
+            baseURL: "http://localhost:11434/v1",
+            model: "llama3.2",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: nil,
+            reasoningMode: .off,
+            reasoningEncoding: .thinking
+        ), "the default off/thinking setting restores")
         require(store.hasKey, "saving a key updates the key-configured state")
         require(fixture.keyStore.key == key, "the key went to the injected key store")
         require((try? store.readKey()) == key, "the key can be read back only through the key store")
@@ -185,6 +333,476 @@ extension ReaderChecks {
         require((try? keychain.readKey()) == key, "the Keychain round-trips the key")
         try keychain.deleteKey()
         require((try? keychain.hasKey()) == false, "the Keychain item is gone after clearing")
+    }
+
+    /// Compare the four action paths on the same settings. This is evidence, not inference: it
+    /// prints the wire controls (max_tokens, temperature, model, stream, reasoning field), and it
+    /// drives each action through the same content event to prove the panel accumulator is shared.
+    @MainActor
+    private static func aiActionPathChecks(
+        engine: RustEngine,
+        settings: AISettingsStore,
+        pageContext: AIReaderContext,
+        selectionContext: AIReaderContext
+    ) async throws {
+        func bodyValue(_ body: String, _ key: String) -> Any? {
+            guard let data = body.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return object[key]
+        }
+
+        var profiles: [(AIAssistantAction, String)] = []
+        for action in AIAssistantAction.allCases {
+            let context = action.requiresSelection ? selectionContext : pageContext
+            let service = ScriptedAIChatService(
+                engine: engine,
+                events: [
+                    .partStarted(index: 0, total: 1, label: "Page 1"),
+                    .delta("Visible answer from \(action.rawValue)"),
+                    .done,
+                ]
+            )
+            let model = AIAssistantModel(settings: settings)
+            model.attach(service: service, context: context)
+            await model.prepare(action: action, context: context)
+            try await eventually("the \(action.rawValue) profile has a preview", { model.phase == .preview })
+            guard let plan = model.plan, let part = plan.parts.first else {
+                fatalError("no plan for \(action.rawValue)")
+            }
+            let body = part.wireBody
+            let maxTokens = (bodyValue(body, "max_tokens") as? NSNumber)?.intValue
+            let temperature = (bodyValue(body, "temperature") as? NSNumber)?.doubleValue
+            let modelName = bodyValue(body, "model") as? String
+            let stream = (bodyValue(body, "stream") as? NSNumber)?.boolValue
+            let reasoning = bodyValue(body, "thinking") as? [String: Any]
+            let wireReasoning = reasoning?["type"] as? String
+            let maxText = maxTokens.map { String($0) } ?? "nil"
+            let temperatureText = temperature.map { String($0) } ?? "nil"
+            let streamText = stream.map { String($0) } ?? "nil"
+            print("AI-REQUEST action=\(action.rawValue) parts=\(plan.parts.count) max_tokens=\(maxText) temperature=\(temperatureText) model=\(modelName ?? "nil") stream=\(streamText) reasoning_field=thinking type=\(wireReasoning ?? "nil") system_chars=\(part.systemPrompt.count) user_chars=\(part.userPrompt.count)")
+            print("AI-REQUEST \(action.rawValue) system=\(part.systemPrompt.debugDescription)")
+            print("AI-REQUEST \(action.rawValue) wire=\(body)")
+            profiles.append((action, body))
+            require(maxTokens == 900, "\(action.rawValue) uses the configured max_tokens")
+            require(abs((temperature ?? -1) - 0.2) < 0.0001,
+                    "\(action.rawValue) uses the configured temperature")
+            require(modelName == "mock-model", "\(action.rawValue) uses the configured model")
+            require(stream == true, "\(action.rawValue) is a streaming request")
+            require(wireReasoning == "disabled", "\(action.rawValue) sends the selected reasoning field")
+            require(!body.contains("reasoning_effort"), "\(action.rawValue) sends only one reasoning field")
+
+            model.send()
+            try await eventually("the \(action.rawValue) content reaches the shared answer accumulator", {
+                model.phase == .finished && model.answer.contains("Visible answer from")
+            })
+            require(model.answer.contains(action.rawValue),
+                    "\(action.rawValue) feeds the same answer accumulator")
+            model.discard()
+        }
+        require(profiles.count == AIAssistantAction.allCases.count,
+                "all four action paths were profiled")
+        for (action, body) in profiles {
+            require(body.contains("\"thinking\":{\"type\":\"disabled\"}"),
+                    "\(action.rawValue) carries exactly thinking:disabled")
+        }
+    }
+
+    /// Reproduces the live selection with the canvas's own hit testing    /// Reproduces the live selection with the canvas's own hit testing, then compares the
+    /// selection model, the copy path and the AI prompt extraction on the same range.
+    ///
+    /// The committed numbered-margin fixture runs in CI. The local manuscript is the real-paper
+    /// reproduction and is skipped when the copyright corpus is absent.
+    @MainActor
+    private static func aiSelectionChecks(root: URL) async throws {
+        let fixture = root.appendingPathComponent("tests/fixtures/selection-numbered-margin.pdf")
+        if FileManager.default.fileExists(atPath: fixture.path) {
+            try await selectionRoundTrip(
+                url: fixture,
+                label: "numbered-margin fixture",
+                startPhrase: "motion",
+                endPhrase: "sampling",
+                endOffset: 3,
+                expectedPageText: "001",
+                gutterDigits: ["001", "002", "003", "004", "005"]
+            )
+        } else {
+            print("INFO: skipping numbered-margin selection fixture (missing)")
+        }
+
+        let samples = ProcessInfo.processInfo.environment["ARIS_READER_PDF_SAMPLES"]
+            .map { URL(fileURLWithPath: $0) }
+            ?? root.appendingPathComponent("pdf-samples")
+        let manuscript = samples.appendingPathComponent("manuscript_0925.pdf")
+        if FileManager.default.fileExists(atPath: manuscript.path) {
+            try await selectionRoundTrip(
+                url: manuscript,
+                label: "manuscript_0925",
+                startPhrase: "Existing 3D motion generators",
+                endPhrase: "pose guidance.",
+                endOffset: "pose guidance.".count - 1,
+                expectedPageText: "000",
+                gutterDigits: (0...53).map { String(format: "%03d", $0) }
+            )
+        } else {
+            print("INFO: skipping live numbered-margin reproduction (no manuscript_0925.pdf)")
+        }
+    }
+
+    /// Open `url`, build the intended character range by scanning the text layer, then drive
+    /// `AppState.beginSelection`/`extendSelection` with points inside the first and last
+    /// character boxes. The text the model receives must equal the canvas/copy text exactly.
+    @MainActor
+    private static func selectionRoundTrip(
+        url: URL,
+        label: String,
+        startPhrase: String,
+        endPhrase: String,
+        endOffset: Int,
+        expectedPageText: String,
+        gutterDigits: [String]
+    ) async throws {
+        let pasteboard = NSPasteboard.general
+        let savedClipboard = pasteboard.string(forType: .string)
+        defer {
+            pasteboard.clearContents()
+            if let savedClipboard {
+                pasteboard.setString(savedClipboard, forType: .string)
+            }
+        }
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        state.newTab(url: url)
+        state.gotoPage(0)
+        guard let engine = state.engine as? RustEngine else {
+            fatalError("the selection round-trip needs the Rust engine")
+        }
+        let text = try await engine.textPage(0)
+        let characters = text.chars
+        // Search the TextChar array, not a Swift String: CRLF is one grapheme but two text
+        // characters here, and the layer contains U+0002 position markers. String distances
+        // would not be selection indices.
+        func find(_ phrase: String, from: Int) -> Int? {
+            let needle = Array(phrase.unicodeScalars).map(\.value)
+            guard !needle.isEmpty, from >= 0, characters.count >= needle.count else {
+                return nil
+            }
+            for start in from...(characters.count - needle.count) {
+                var matches = true
+                for offset in 0..<needle.count where characters[start + offset].unicode != needle[offset] {
+                    matches = false
+                    break
+                }
+                if matches { return start }
+            }
+            return nil
+        }
+        func selectedText(_ range: ClosedRange<Int>) -> String {
+            String(characters[range].map {
+                Character(UnicodeScalar($0.unicode) ?? "?")
+            })
+        }
+        guard let startIndex = find(startPhrase, from: 0),
+              let endPhraseIndex = find(endPhrase, from: startIndex) else {
+            fatalError("\(label): selection phrases were not found in the text layer")
+        }
+        let endIndex = endPhraseIndex + endOffset
+        let intendedRange = startIndex...endIndex
+        let intendedText = selectedText(intendedRange)
+        require(text.text.contains(expectedPageText),
+                "\(label): the raw text layer carries the numbered margin")
+        for digit in gutterDigits {
+            require(!intendedText.contains(digit),
+                    "\(label): a gutter run outside the selection is not in the selected text")
+        }
+
+        guard let placement = engine.visiblePages(
+            scrollYPt: state.scrollYPt,
+            viewportHeightPt: 500,
+            gapPt: state.pageGapPt,
+            marginPt: 0,
+            layout: state.layoutMode
+        ).first(where: { $0.index == 0 }) else {
+            fatalError("\(label): page 1 is not visible for the selection reproduction")
+        }
+        func point(at index: Int) -> CGPoint {
+            let character = characters[index]
+            return CGPoint(
+                x: placement.leftPt + character.xPt + min(1, character.widthPt / 2),
+                y: placement.topPt + character.yPt + max(1, character.heightPt / 2)
+            )
+        }
+
+        var attempts = 0
+        while state.selection == nil && attempts < 100 {
+            state.beginSelection(at: point(at: startIndex))
+            attempts += 1
+            if state.selection == nil {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        state.extendSelection(to: point(at: endIndex))
+        guard let selection = state.selection else {
+            fatalError("\(label): canvas hit testing produced no selection")
+        }
+        let selectedByCanvas = selectedText(
+            selection.range.clamped(to: 0...(characters.count - 1))
+        )
+
+        state.copySelection()
+        let copied = pasteboard.string(forType: .string) ?? ""
+
+        func promptSelection(for range: ClosedRange<Int>) async throws -> String {
+            let record = AiPlanRequestRecord(
+                action: .translateSelection,
+                currentPage: 0,
+                selection: AiSelectionRecord(
+                    page: 0,
+                    start: UInt32(range.lowerBound),
+                    end: UInt32(range.upperBound)
+                ),
+                question: nil,
+                language: "English",
+                baseUrl: "http://127.0.0.1:11434/v1",
+                model: "mock-model",
+                temperature: 0.2,
+                maxTokens: 900,
+                reasoningMode: "off",
+                reasoningEncoding: "thinking"
+            )
+            let plan = try await engine.prepareAIPlan(record)
+            let prompt = plan.parts[0].userPrompt
+            let marker = "[Selected text - page 1]\n"
+            guard let markerRange = prompt.range(of: marker) else {
+                return "<missing selection marker>"
+            }
+            return String(prompt[markerRange.upperBound...])
+                .trimmingCharacters(in: .newlines)
+        }
+
+        let promptFromIntendedRange = try await promptSelection(for: intendedRange)
+        let promptFromCanvas = try await promptSelection(
+            for: selection.range.clamped(to: 0...(characters.count - 1))
+        )
+
+        let summaryPlan = try await engine.prepareAIPlan(
+            AiPlanRequestRecord(
+                action: .summarizePage,
+                currentPage: 0,
+                selection: nil,
+                question: nil,
+                language: "English",
+                baseUrl: "http://127.0.0.1:11434/v1",
+                model: "mock-model",
+                temperature: 0.2,
+                maxTokens: 4096,
+                reasoningMode: "off",
+                reasoningEncoding: "thinking"
+            )
+        )
+        let summaryPrompt = summaryPlan.parts[0].userPrompt
+        let summaryLines = Set(
+            summaryPrompt.split(separator: "\n").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+        )
+        for digit in gutterDigits {
+            require(!summaryLines.contains(digit),
+                    "\(label): page context does not send a standalone margin line \(digit)")
+        }
+        require(summaryPrompt.contains("Existing 3D motion generators")
+                    && summaryPrompt.contains("diffusion-based methods further incur substantial iterative sampling costs"),
+                "\(label): page context keeps the abstract intact after gutter removal")
+
+        if label == "manuscript_0925" {
+            let documentPlan = try await engine.prepareAIPlan(
+                AiPlanRequestRecord(
+                    action: .summarizeDocument,
+                    currentPage: 0,
+                    selection: nil,
+                    question: nil,
+                    language: nil,
+                    baseUrl: "http://127.0.0.1:11434/v1",
+                    model: "mock-model",
+                    temperature: 0.2,
+                    maxTokens: 900,
+                    reasoningMode: "off",
+                    reasoningEncoding: "thinking"
+                )
+            )
+            let totalPageCharacters = documentPlan.parts.reduce(UInt64(0)) {
+                $0 + $1.pageCharacters
+            }
+            let largestPart = documentPlan.parts.map(\.pageCharacters).max() ?? 0
+            print("AI-DOCUMENT-SUMMARY pages=\(documentPlan.pageCount) parts=\(documentPlan.parts.count) total_page_chars=\(totalPageCharacters) largest_part_page_chars=\(largestPart)")
+            require(largestPart <= 12_000,
+                    "each document-summary part respects the 12,000 page-character budget")
+        }
+
+        print("AI-SELECTION \(label) range intended=\(intendedRange) canvas=\(selection.range) charCount=\(characters.count) textCount=\(text.text.count)")
+        print("AI-SELECTION \(label) intended=\(intendedText.debugDescription)")
+        print("AI-SELECTION \(label) canvas=\(selectedByCanvas.debugDescription)")
+        print("AI-SELECTION \(label) copied=\(copied.debugDescription)")
+        print("AI-SELECTION \(label) prompt(intended)=\(promptFromIntendedRange.debugDescription)")
+        print("AI-SELECTION \(label) prompt(canvas)=\(promptFromCanvas.debugDescription)")
+        print("AI-SELECTION \(label) textLayerPrefix=\(String(text.text.prefix(120)).debugDescription)")
+        print("AI-SELECTION \(label) summaryPromptPrefix=\(String(summaryPrompt.prefix(240)).debugDescription)")
+        require(selection.range == intendedRange,
+                "\(label): canvas hit testing selects the intended character range")
+        require(selectedByCanvas == intendedText,
+                "\(label): the canvas selection model text matches the intended range")
+        require(copied == intendedText,
+                "\(label): the copy path sends the same characters as the selection model")
+        require(promptFromIntendedRange == intendedText,
+                "\(label): an index-built selection sends exactly the canvas text")
+        require(promptFromCanvas == intendedText,
+                "\(label): a hit-tested selection sends exactly the canvas text")
+    }
+
+    /// A two-part synthetic summary proves the consolidation is a separate previewed request,
+    /// that the per-part answers survive, and that a missing part stops the merge by name.
+    @MainActor
+    private static func aiMergeChecks() async throws {
+        let fixture = makeSettings(key: "sk-merge-check")
+        defer { fixture.cleanup() }
+        require(fixture.store.save(
+            baseURL: "http://127.0.0.1:11434/v1",
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: "sk-merge-check"
+        ), "the merge fixture saves its provider")
+
+        let baseURL = "http://127.0.0.1:11434/v1"
+        let planPart: (UInt32, String, UInt32, [UInt32]) -> AiPlanPartRecord = { index, label, primary, pages in
+            AiPlanPartRecord(
+                index: index,
+                total: 2,
+                label: label,
+                primaryPage: primary,
+                pages: pages,
+                pageCharacters: 100,
+                requestCharacters: 200,
+                systemPrompt: "system",
+                userPrompt: "part \(index + 1)",
+                wireBody: "{\"stream\":true,\"max_tokens\":900}",
+                note: nil
+            )
+        }
+        let originalPlan = AiPlanRecord(
+            action: .summarizeDocument,
+            actionLabel: "Summarise document",
+            documentTitle: "Synthetic long paper",
+            pageCount: 3,
+            baseUrl: baseURL,
+            endpoint: baseURL + "/chat/completions",
+            host: "127.0.0.1",
+            isLocal: true,
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            parts: [
+                planPart(0, "Pages 1-2", 1, [1, 2]),
+                planPart(1, "Page 3", 3, [3]),
+            ],
+            sourcePages: [1, 2, 3],
+            note: "split into 2 parts",
+            previewHeaders: [],
+            estimatedTokens: 400
+        )
+        let partEvents: [AIStreamEvent] = [
+            .partStarted(index: 0, total: 2, label: "Pages 1-2"),
+            .delta("Part one summary [p.1]. "),
+            .partStarted(index: 1, total: 2, label: "Page 3"),
+            .delta("Part two summary [p.3]."),
+            .done,
+        ]
+        let mergeEvents: [AIStreamEvent] = [
+            .partStarted(index: 0, total: 1, label: "Consolidated summary · Pages 1-3"),
+            .delta("Consolidated answer [p.1]."),
+            .done,
+        ]
+        let engine = try RustEngine()
+        let service = MergeScriptedService(
+            engine: engine,
+            originalPlan: originalPlan,
+            partEvents: partEvents,
+            mergeEvents: mergeEvents
+        )
+        let model = AIAssistantModel(settings: fixture.store)
+        let context = AIReaderContext(
+            documentKey: "merge-check",
+            documentTitle: "Synthetic long paper",
+            pageCount: 3,
+            currentPage: 1,
+            selection: nil
+        )
+        model.attach(service: service, context: context)
+        await model.prepare(action: .summarizeDocument, context: context)
+        try await eventually("the synthetic long summary has a preview", { model.phase == .preview })
+        model.send()
+        try await eventually("all part summaries finish and the merge is previewed", {
+            model.phase == .mergePreview && model.mergePlan != nil
+        })
+        require(service.startedPlans.count == 1, "the merge is not sent automatically")
+        require(model.partAnswers.count == 2, "both per-part answers are retained")
+        require(model.partAnswers[0]?.contains("Part one") == true, "part 1 is available")
+        require(model.partAnswers[1]?.contains("Part two") == true, "part 2 is available")
+        guard let mergePlan = model.mergePlan else { fatalError("expected a merge plan") }
+        require(mergePlan.parts.count == 1, "the consolidation is one request")
+        require(mergePlan.parts[0].userPrompt.contains("Part one summary"), "the merge carries part 1")
+        require(mergePlan.parts[0].userPrompt.contains("Part two summary"), "the merge carries part 2")
+        require(mergePlan.parts[0].userPrompt.contains("[Part 1 of 2"), "the merge names the part range")
+        require(model.statusNote?.contains("Consolidation request") == true
+                    || model.statusNote?.contains("consolidation request") == true,
+                "the merge is shown as its own previewable step")
+        require(model.phase == .mergePreview, "the merge waits for a separate Send")
+
+        model.sendMerge()
+        try await eventually("the consolidation finishes", {
+            model.phase == .finished && model.answer.contains("Consolidated answer")
+        })
+        require(service.startedPlans.count == 2, "the merge is the second request")
+        require(model.answer.contains("[p.1]"), "the consolidated answer keeps citations")
+        require(model.partAnswers.count == 2, "per-part answers survive the consolidation")
+        require(model.answer.contains("Part one") == false, "the consolidated answer is the main answer")
+
+        // A missing part stops the merge and names it; the panel never silently summarises 8/9.
+        let missingFixture = makeSettings(key: "sk-merge-missing")
+        defer { missingFixture.cleanup() }
+        require(missingFixture.store.save(
+            baseURL: baseURL,
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: "sk-merge-missing"
+        ), "the missing-part fixture saves its provider")
+        let missingService = MergeScriptedService(
+            engine: engine,
+            originalPlan: originalPlan,
+            partEvents: [
+                .partStarted(index: 0, total: 2, label: "Pages 1-2"),
+                .delta("Part one summary [p.1]."),
+                .done,
+            ],
+            mergeEvents: mergeEvents
+        )
+        let missingModel = AIAssistantModel(settings: missingFixture.store)
+        missingModel.attach(service: missingService, context: context)
+        await missingModel.prepare(action: .summarizeDocument, context: context)
+        try await eventually("the incomplete summary has a preview", { missingModel.phase == .preview })
+        missingModel.send()
+        try await eventually("the missing part is handled", {
+            missingModel.phase == .finished && missingModel.mergePlan == nil
+        })
+        require(missingModel.statusNote?.contains("Part 2") == true,
+                "the panel names the missing part")
+        require(missingModel.statusNote?.contains("no consolidation") == true,
+                "the panel says no consolidation was sent")
+        require(missingModel.partAnswers.count == 1, "the successful part is kept")
+        require(missingService.startedPlans.count == 1, "no merge request is sent with a missing part")
     }
 
     @MainActor
@@ -295,6 +913,13 @@ extension ReaderChecks {
         require(selectionPlan.sourcePages.contains(1), "the selected page is cited in the plan")
         model.discard()
 
+        try await aiActionPathChecks(
+            engine: engine,
+            settings: fixture.store,
+            pageContext: context,
+            selectionContext: selectionContext
+        )
+
         // 4. Cancel stops the stream; Retry sends the same plan again.
         model.attach(service: recording, context: context)
         await model.prepare(action: .summarizePage, context: context)
@@ -319,6 +944,125 @@ extension ReaderChecks {
         require(model.answer.contains("This page explains the method"),
                 "retry shows a fresh answer")
         require(model.usage?.totalTokens == 168, "retry reports usage again")
+        require(model.reasoning.isEmpty, "a content-only answer does not invent reasoning")
+
+        // 5. Reasoning-only stream: the answer stays empty, the reasoning is shown separately,
+        // and the empty-answer diagnostic names what arrived and the completion tokens.
+        let reasoningFixture = makeSettings(key: fakeKey)
+        defer { reasoningFixture.cleanup() }
+        require(reasoningFixture.store.save(
+            baseURL: baseURL,
+            model: "deepseek-flash",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: fakeKey
+        ), "the reasoning fixture saves its provider")
+        let reasoningService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Page 1"),
+                .reasoningDelta("I need to translate the selected passage. "),
+                .reasoningDelta("The answer would follow, but the budget ran out."),
+                .usage(AIUsage(promptTokens: 300, completionTokens: 900, totalTokens: 1200)),
+                .done,
+            ]
+        )
+        let reasoningModel = AIAssistantModel(settings: reasoningFixture.store)
+        reasoningModel.attach(service: reasoningService, context: selectionContext)
+        await reasoningModel.prepare(action: .translateSelection, context: selectionContext)
+        try await eventually("the reasoning fixture has a preview", { reasoningModel.phase == .preview })
+        reasoningModel.send()
+        try await eventually("the reasoning-only stream finishes", { reasoningModel.phase == .finished })
+        require(reasoningService.startCount == 1, "the reasoning fixture starts one request")
+        require(reasoningModel.answer.isEmpty, "reasoning is never concatenated into the answer")
+        require(reasoningModel.reasoning.contains("I need to translate the selected passage"),
+                "the reasoning text is retained separately")
+        require(reasoningModel.reasoningDeltaCount == 2 && reasoningModel.contentDeltaCount == 0,
+                "the panel counts reasoning and content deltas separately")
+        require(reasoningModel.usage?.totalTokens == 1200, "reasoning usage is retained")
+        let reasoningStatus = reasoningModel.statusNote ?? ""
+        require(reasoningStatus.contains("The provider sent reasoning but no answer"),
+                "the status line says reasoning arrived without an answer: \(reasoningStatus)")
+        require(reasoningStatus.contains("no `content` deltas"),
+                "the empty-answer diagnostic names the missing content deltas: \(reasoningStatus)")
+        require(reasoningStatus.contains("900 completion tokens"),
+                "the empty-answer diagnostic reports completion tokens: \(reasoningStatus)")
+
+        // 5b. A length stop with reasoning and usage: the panel names the token limit and the
+        // frame/byte counts instead of saying only "empty answer".
+        let truncatedUsage = AIUsage(
+            promptTokens: 300,
+            completionTokens: 900,
+            totalTokens: 1200,
+            reasoningTokens: 900
+        )
+        let truncatedService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Page 1"),
+                .reasoningDelta("The passage needs a careful translation. "),
+                .usage(truncatedUsage),
+                .diagnostics(AIStreamDiagnostics(
+                    httpStatus: 200,
+                    bytes: 1234,
+                    frames: 4,
+                    dataFrames: 3,
+                    contentFrames: 0,
+                    reasoningFrames: 1,
+                    roleOnlyFrames: 1,
+                    emptyFrames: 1,
+                    usageFrames: 1,
+                    contentShape: "none",
+                    finishReason: "length",
+                    usage: truncatedUsage
+                )),
+                .done,
+            ]
+        )
+        let truncatedModel = AIAssistantModel(settings: reasoningFixture.store)
+        truncatedModel.attach(service: truncatedService, context: selectionContext)
+        await truncatedModel.prepare(action: .translateSelection, context: selectionContext)
+        try await eventually("the truncated fixture has a preview", { truncatedModel.phase == .preview })
+        truncatedModel.send()
+        try await eventually("the truncated fixture finishes", { truncatedModel.phase == .finished })
+        require(truncatedModel.answer.isEmpty && truncatedModel.reasoning.contains("careful translation"),
+                "the truncated fixture separates reasoning from the empty answer")
+        require(truncatedModel.finishReason == "length", "the panel retains finish_reason=length")
+        let truncatedStatus = truncatedModel.statusNote ?? ""
+        require(truncatedStatus.contains("stopped at its token limit"),
+                "the panel says the provider stopped at its token limit: \(truncatedStatus)")
+        require(truncatedStatus.contains("finish_reason length"),
+                "the panel reports finish_reason explicitly: \(truncatedStatus)")
+        require(truncatedStatus.contains("0 content") && truncatedStatus.contains("1 reasoning"),
+                "the panel reports delta-kind counts: \(truncatedStatus)")
+        require(truncatedStatus.contains("4 frame") && truncatedStatus.contains("1234 bytes"),
+                "the panel reports frame and byte counts: \(truncatedStatus)")
+        require(truncatedModel.reasoningTokensIgnored,
+                "the panel notices reasoning tokens while thinking is off")
+
+        // 6. Usage-only stream: same diagnostic, with no reasoning section.
+        let usageOnlyService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Page 1"),
+                .usage(AIUsage(promptTokens: 300, completionTokens: 900, totalTokens: 1200)),
+                .done,
+            ]
+        )
+        let usageOnlyModel = AIAssistantModel(settings: reasoningFixture.store)
+        usageOnlyModel.attach(service: usageOnlyService, context: selectionContext)
+        await usageOnlyModel.prepare(action: .translateSelection, context: selectionContext)
+        try await eventually("the usage-only fixture has a preview", { usageOnlyModel.phase == .preview })
+        usageOnlyModel.send()
+        try await eventually("the usage-only stream finishes", { usageOnlyModel.phase == .finished })
+        require(usageOnlyModel.answer.isEmpty && usageOnlyModel.reasoning.isEmpty,
+                "a usage-only stream produces neither answer nor reasoning")
+        let usageOnlyStatus = usageOnlyModel.statusNote ?? ""
+        require(usageOnlyStatus.contains("The provider returned no answer"),
+                "a usage-only stream says there is no answer: \(usageOnlyStatus)")
+        require(usageOnlyStatus.contains("no `content` deltas")
+                    && usageOnlyStatus.contains("900 completion tokens"),
+                "a usage-only stream names the delta counts and completion tokens: \(usageOnlyStatus)")
     }
 }
 
