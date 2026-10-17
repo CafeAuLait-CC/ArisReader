@@ -152,10 +152,10 @@ struct ReaderChecks {
         var wheel = WheelMotion()
         let first = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1)
         let fast = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.05)
-        require(first == 32 && fast > first, "wheel has useful step and burst acceleration")
-        require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -32,
+        require(first == 40 && fast > first, "wheel has useful step and burst acceleration")
+        require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -40,
                 "reversing wheel resets acceleration")
-        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 32,
+        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 40,
                 "pausing wheel resets acceleration")
         require(wheel.delta(scrollingDeltaY: 2.5, precise: true, timestamp: 2.1) == -2.5,
                 "trackpad preserves system precision and direction")

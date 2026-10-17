@@ -94,11 +94,10 @@ public final class MetalCanvasView: NSView {
     /// This is the *continuous* path: a trackpad's precise deltas, and its momentum, arrive here
     /// already animated by the system and are applied one to one.
     public var onScroll: ((CGFloat) -> Void)?
-    /// Stepped scroll input — a classic wheel notch, a keyboard page — reported as the distance
-    /// the step is worth in screen points. The shell glides toward it rather than jumping.
+    /// Wheel input, accelerated by cadence and reported as a distance in screen points.
     public var onScrollStep: ((CGFloat) -> Void)?
     /// Keyboard paging, when the shell wants to treat it differently from a wheel notch: a page key
-    /// names a destination, where a spin's backlog is dropped once the wheel stops (see `AppState`).
+    /// names an animated destination, while a wheel distance is applied immediately.
     /// Falls back to `onScrollStep` when unset, so a canvas that does not care still pages.
     public var onKeyboardStep: ((CGFloat) -> Void)?
     /// Scroll gestures that carry a zoom modifier (Ctrl or ⌘), reported as the same screen-point
@@ -377,8 +376,7 @@ public final class MetalCanvasView: NSView {
             // same gesture applied twice.
             onScroll?(delta)
         } else {
-            // A classic wheel reports "one notch", which is not a distance: the shell turns it
-            // into a short glide so the page moves instead of jumping a grid line at a time.
+            // Apply the cadence-scaled distance now; wheel input must leave no animation debt.
             onScrollStep?(delta)
         }
         syncInteraction()
@@ -493,8 +491,9 @@ public final class MetalCanvasView: NSView {
         let step = onKeyboardStep ?? onScrollStep
         switch event.charactersIgnoringModifiers {
         case " ":
-            // A page is a step like a wheel notch, so it glides to its destination too.
-            step?(event.modifierFlags.contains(.shift) ? -page : page)        case "\u{F72D}": // page down
+            // Keyboard paging animates to its destination.
+            step?(event.modifierFlags.contains(.shift) ? -page : page)
+        case "\u{F72D}": // page down
             step?(page)
         case "\u{F72C}": // page up
             step?(-page)
@@ -937,17 +936,16 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 }
 
-/// Discrete wheels need a useful line step; precise devices already carry system
-/// acceleration and momentum. A short same-direction burst gets a bounded boost.
+/// Precise devices carry system acceleration. Discrete wheels scale with event cadence;
+/// a pause or reversal resets the gain, and no velocity survives the final event.
 public struct WheelMotion {
+    public static let pointsPerLine: CGFloat = 40
     private var lastTime: TimeInterval?
     private var lastDelta: CGFloat = 0
-    private var boost: CGFloat = 1
     public init() {}
     public mutating func reset() {
         lastTime = nil
         lastDelta = 0
-        boost = 1
     }
     public mutating func delta(scrollingDeltaY: CGFloat, precise: Bool, timestamp: TimeInterval) -> CGFloat {
         if precise {
@@ -955,14 +953,14 @@ public struct WheelMotion {
             return -scrollingDeltaY
         }
         guard scrollingDeltaY != 0 else { return 0 }
-        if let lastTime, timestamp > lastTime, timestamp - lastTime < 0.12,
-           scrollingDeltaY * lastDelta > 0 {
-            boost = min(3, boost + 0.35)
-        } else {
-            boost = 1
+        var gain: CGFloat = 1
+        if let lastTime, timestamp > lastTime, scrollingDeltaY * lastDelta > 0 {
+            // 100 ms per event is a deliberate line scroll; faster turns increase the distance,
+            // up to 3x at 33 ms. This uses the current rate rather than the length of a burst.
+            gain = min(3, max(1, CGFloat(0.1 / (timestamp - lastTime))))
         }
         lastTime = timestamp
         lastDelta = scrollingDeltaY
-        return -scrollingDeltaY * 32 * boost
+        return -scrollingDeltaY * Self.pointsPerLine * gain
     }
 }
