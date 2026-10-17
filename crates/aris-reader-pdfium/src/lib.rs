@@ -8,7 +8,8 @@
 //! | T1.3 | tile/region rasterization, per-thread document copies, failure placeholders | pending |
 //! | T2.1 | text page (per-character boxes, structure tree) | pending |
 //! | T2.4 | outline / bookmarks | pending |
-//! | T3.2 | annotation **read** (see `annotations.rs`); write, forms, incremental save | partial |
+//! | T3.2 | annotation **read** (see `annotations.rs`); write, forms, incremental save | done |
+//! | T3.9 | page operations: rotate, delete, reorder, insert blank, extract (see `page_ops.rs`) | done |
 //! | T4.1 | link enumeration and destinations | pending |
 //!
 //! # Reading annotations
@@ -45,6 +46,8 @@
 mod annotations;
 #[cfg(feature = "pdfium")]
 mod backend;
+#[cfg(feature = "pdfium")]
+mod page_ops;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 #[cfg(feature = "pdfium")]
@@ -57,6 +60,11 @@ pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, Wri
 #[cfg(feature = "pdfium")]
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
+};
+#[cfg(feature = "pdfium")]
+pub use page_ops::{
+    PageOperation, PageOperationReport, apply_page_operation, extract_pages, publish_edited_copy,
+    replace_original_with_edit,
 };
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;

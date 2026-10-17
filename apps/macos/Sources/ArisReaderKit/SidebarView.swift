@@ -208,7 +208,10 @@ public struct SidebarView: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: state.thumbnailWidthPt))], spacing: 10) {
                 ForEach(0..<max(state.document?.pageCount ?? 0, 0), id: \.self) { page in
                     Button {
-                        state.gotoPage(page)
+                        state.handleThumbnailClick(
+                            page,
+                            modifiers: NSApp.currentEvent?.modifierFlags ?? []
+                        )
                     } label: {
                         VStack(spacing: 4) {
                             thumbnail(for: page)
@@ -225,6 +228,52 @@ public struct SidebarView: View {
                         RoundedRectangle(cornerRadius: 6)
                             .fill(page + 1 == state.currentPage ? Color.accentColor.opacity(0.18) : .clear)
                     )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(
+                                state.pageSelection.contains(page) ? Color.accentColor : .clear,
+                                lineWidth: 2
+                            )
+                    )
+                    .contextMenu {
+                        Button("Select Page") {
+                            state.selectPage(page, extending: false, toggling: false)
+                        }
+                        Button("Select Range to Here") {
+                            state.selectPage(page, extending: true, toggling: false)
+                        }
+                        Divider()
+                        Button("Rotate 90° Clockwise") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.rotateSelectedPages(clockwise: true)
+                        }
+                        Button("Rotate 90° Anticlockwise") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.rotateSelectedPages(clockwise: false)
+                        }
+                        Button("Reset Rotation to Original") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.resetSelectedPageRotations()
+                        }
+                        Divider()
+                        Button("Insert Blank Page Before") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.insertBlankPage(before: true)
+                        }
+                        Button("Insert Blank Page After") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.insertBlankPage(before: false)
+                        }
+                        Button("Delete Page…") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.confirmDeleteSelectedPages()
+                        }
+                        Divider()
+                        Button("Extract Selected Pages…") {
+                            state.selectPage(page, extending: false, toggling: false)
+                            state.presentExtractPagesPanel()
+                        }
+                    }
                 }
             }
             .padding(10)

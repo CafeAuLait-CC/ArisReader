@@ -285,6 +285,20 @@ public final class AppState: ObservableObject {
     @Published public var lastError: String?
     @Published public var showFileImporter: Bool = false
 
+    // ── Page editing (T3.9) ────────────────────────────────────────────────────
+    /// Pages selected in the thumbnail sidebar (0-based). Empty means "the current page".
+    @Published public private(set) var pageSelection: Set<Int> = []
+    /// The page a shift-click extends from.
+    private var pageSelectionAnchor: Int?
+    /// Human-readable, newest-last list of page changes staged in the working copy.
+    @Published public private(set) var pageEditPendingOperations: [String] = []
+    /// Set only for a moment after an explicit apply, so the interface can say "applied".
+    @Published public private(set) var pageEditIsApplied: Bool = false
+    /// True while PDFium is rewriting a revision; commands are disabled rather than queued.
+    @Published public private(set) var pageEditBusy: Bool = false
+    /// The staged session. Nil means the file on disk is the document on screen.
+    private var pageEditSession: PageEditSession?
+
     /// Pages the canvas should draw right now (usually one or two while scrolling).
     @Published public private(set) var canvasPages: [CanvasPage] = []
     private var canvasTiles: [CanvasPage] = []
@@ -1627,6 +1641,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func open(url: URL) -> Bool {
         openRequestCount += 1
+        if let session = pageEditSession {
+            let same = Self.resolvesToSameFile(url, session.originalURL)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = same
+                ? "Discard the pending page changes and reopen the original?"
+                : "Discard the pending page changes to “\(session.originalURL.lastPathComponent)”?"
+            alert.informativeText =
+                "The original file is unchanged, but annotations and bookmarks added during the "
+                + "page-editing session are discarded with the working copy."
+            alert.addButton(withTitle: "Discard and Open")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+            endPageEditSession(deleteFiles: true)
+        }
         do {
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
@@ -1700,6 +1729,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
         annotationSaveInProgress = false
+        pageEditIsApplied = false
         interruptedAnnotationSaveNotice = nil
         lastAnnotationWriteReport = nil
         annotationTextures = [:]
@@ -1714,6 +1744,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectionAnchor = nil
         annotations = []
         bookmarks = []
+        pageSelection = []
+        pageSelectionAnchor = nil
         annotationsURL = nil
         annotationWritesBlockedReason = nil
         annotationSidecarSlots = []
@@ -2971,6 +3003,820 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             return false
         }
+    }
+
+    // MARK: - Page editing (T3.9)
+    //
+    // The original file is never modified until the reader chooses "Replace Original". Every
+    // operation is applied by the Rust engine to a temporary revision in a session directory;
+    // the app renders that revision and keeps the reader's sidecar in a session copy. That gives
+    // a coherent undo history (a stack of revisions, not an inverse operation that cannot restore
+    // deleted content) and means a crash or a discarded session leaves the PDF and its sidecar
+    // exactly as they were.
+
+    /// One revision plus the reader's marks at that revision. Undo/redo restore both together:
+    /// an annotation added to a page that a later undo removes must disappear, and come back on
+    /// redo, rather than being pushed onto a neighbour.
+    private struct PageEditSnapshot {
+        let revisionURL: URL
+        let revisionNumber: Int
+        let currentToOriginal: [Int]
+        let operations: [String]
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+        let slots: [AnnotationSidecar.Slot]
+        let currentPage: Int
+        let selection: Set<Int>
+        let label: String
+    }
+
+    private struct PageEditSession {
+        let originalURL: URL
+        let originalSidecarURL: URL
+        let title: String
+        let directory: URL
+        let sidecarURL: URL
+        /// `/Rotate` of every page of the file the session started from.
+        let originalRotations: [Int]
+        var revisionURL: URL
+        var revisionNumber: Int
+        /// current page index → index in `originalRotations`; -1 for an inserted blank page.
+        var currentToOriginal: [Int]
+        var operations: [String]
+        var undo: [PageEditSnapshot]
+        var redo: [PageEditSnapshot]
+    }
+
+    /// Whether the page commands can run at all.
+    public var canPageEdit: Bool {
+        document != nil && !annotationSaveInProgress && !pageEditBusy
+    }
+
+    public var pageEditSessionActive: Bool { pageEditSession != nil }
+    public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
+    public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
+    public var canApplyPageEdits: Bool {
+        pageEditSession != nil && !pageEditBusy && !annotationSaveInProgress
+    }
+
+    /// The entry point behind the menu commands, exposed separately so the headless checks can
+    /// exercise the real session without driving AppKit menus or modal alerts.
+    @discardableResult
+    public func applyPageEditOperation(_ operation: PageEditOperation, label: String) async -> Bool {
+        await applyPageEdit(operation, label: label)
+    }
+
+    /// What the interface must say about the staged state. Nil when nothing is pending.
+    public var pageEditPendingSummary: String? {
+        guard let session = pageEditSession else { return nil }
+        let count = session.operations.count
+        let label = count == 1 ? "1 page change pending" : "\(count) page changes pending"
+        return "\(label) · the file on disk is unchanged"
+    }
+
+    /// The most recent pending action, for the banner's second line.
+    public var pageEditLastAction: String? {
+        pageEditSession?.operations.last
+    }
+
+    /// The pages a command acts on: the thumbnail selection, or the current page when there is
+    /// no selection.
+    public var selectedPageIndices: [Int] {
+        let count = document?.pageCount ?? 0
+        guard count > 0 else { return [] }
+        let selected = pageSelection.filter { $0 >= 0 && $0 < count }.sorted()
+        if !selected.isEmpty { return selected }
+        return [min(max(currentPage - 1, 0), count - 1)]
+    }
+
+    /// The display name for suggestions and alerts. During a session the open document is a
+    /// revision, but the reader is still working on the original file.
+    private var pageEditDisplayURL: URL? {
+        pageEditSession?.originalURL ?? document?.url
+    }
+
+    public func handleThumbnailClick(_ page: Int, modifiers: NSEvent.ModifierFlags) {
+        guard let pageCount = document?.pageCount, page >= 0, page < pageCount else { return }
+        if modifiers.contains(.shift) {
+            selectPage(page, extending: true, toggling: false)
+        } else if modifiers.contains(.command) {
+            selectPage(page, extending: false, toggling: true)
+        } else {
+            selectPage(page, extending: false, toggling: false)
+            gotoPage(page)
+        }
+    }
+
+    public func selectPage(_ page: Int, extending: Bool, toggling: Bool) {
+        guard let pageCount = document?.pageCount, page >= 0, page < pageCount else { return }
+        if extending, let anchor = pageSelectionAnchor {
+            pageSelection.formUnion(anchor <= page ? anchor...page : page...anchor)
+        } else if toggling {
+            if pageSelection.contains(page) {
+                pageSelection.remove(page)
+            } else {
+                pageSelection.insert(page)
+            }
+            pageSelectionAnchor = page
+        } else {
+            pageSelection = [page]
+            pageSelectionAnchor = page
+        }
+        statusMessage = pageSelection.count <= 1
+            ? "Page \(page + 1) selected · ⌘-click to add pages, shift-click for a range"
+            : "\(pageSelection.count) pages selected"
+    }
+
+    public func clearPageSelection() {
+        pageSelection = []
+        pageSelectionAnchor = nil
+    }
+
+    // MARK: Commands
+
+    public func rotateSelectedPages(clockwise: Bool) {
+        let pages = selectedPageIndices
+        guard !pages.isEmpty else { return }
+        if let conflict = rotationConflict(on: pages) {
+            lastError = conflict
+            statusMessage = "Rotation refused: the page has text-range annotations"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await self.applyPageEdit(
+                .rotate(pages: pages, quarterTurns: clockwise ? 1 : -1),
+                label: "Rotate \(Self.pageList(pages)) \(clockwise ? "90° clockwise" : "90° anticlockwise")"
+            )
+        }
+    }
+
+    public func resetSelectedPageRotations() {
+        let checkedPages = selectedPageIndices
+        if let conflict = rotationConflict(on: checkedPages) {
+            lastError = conflict
+            statusMessage = "Rotation refused: the page has text-range annotations"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, await self.ensurePageEditSession() else { return }
+            guard let session = self.pageEditSession else { return }
+            let pages = self.selectedPageIndices
+            guard !pages.isEmpty else { return }
+            let values = pages.map { page -> Int in
+                guard page < session.currentToOriginal.count else { return 0 }
+                let original = session.currentToOriginal[page]
+                guard original >= 0, original < session.originalRotations.count else { return 0 }
+                return session.originalRotations[original]
+            }
+            _ = await self.applyPageEdit(
+                .setRotation(pages: pages, quarterTurns: values),
+                label: "Reset rotation of \(Self.pageList(pages)) to the file's original"
+            )
+        }
+    }
+
+    public func confirmDeleteSelectedPages() {
+        guard let document else { return }
+        let pages = selectedPageIndices
+        guard !pages.isEmpty else { return }
+        guard pages.count < document.pageCount else {
+            lastError = "A PDF must keep at least one page; every page is selected for deletion."
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = pages.count == 1
+            ? "Delete page \(pages[0] + 1) from the working copy?"
+            : "Delete \(pages.count) pages from the working copy?"
+        alert.informativeText =
+            "The file on disk is not changed. The pages disappear from this editing session, and "
+            + "annotations or bookmarks on them are removed rather than pushed to a neighbour; "
+            + "Undo restores them until you apply or discard the changes."
+        alert.addButton(withTitle: "Delete Pages")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor [weak self] in
+            _ = await self?.applyPageEdit(
+                .delete(pages: pages),
+                label: "Delete \(Self.pageList(pages))"
+            )
+        }
+    }
+
+    public func moveSelectedPagesUp() {
+        moveSelectedPages(by: -1)
+    }
+
+    public func moveSelectedPagesDown() {
+        moveSelectedPages(by: 1)
+    }
+
+    private func moveSelectedPages(by offset: Int) {
+        guard let document else { return }
+        let pages = selectedPageIndices
+        guard let first = pages.first, let last = pages.last else { return }
+        guard pages.count == last - first + 1 else {
+            lastError = "Move requires a contiguous selection; select a range of pages, not a scattered set."
+            return
+        }
+        if offset < 0 {
+            guard first > 0 else {
+                statusMessage = "The selected pages are already at the top"
+                return
+            }
+        } else {
+            guard last < document.pageCount - 1 else {
+                statusMessage = "The selected pages are already at the bottom"
+                return
+            }
+        }
+        let destination = offset < 0 ? first - 1 : first + 1
+        Task { @MainActor [weak self] in
+            _ = await self?.applyPageEdit(
+                .move(pages: pages, destination: destination),
+                label: "Move \(Self.pageList(pages)) \(offset < 0 ? "up one page" : "down one page")"
+            )
+        }
+    }
+
+    public func insertBlankPage(before: Bool) {
+        let pages = selectedPageIndices
+        guard let first = pages.first, let last = pages.last else { return }
+        let index = before ? first : last + 1
+        Task { @MainActor [weak self] in
+            _ = await self?.applyPageEdit(
+                .insertBlank(index: index),
+                label: before
+                    ? "Insert a blank page before page \(first + 1)"
+                    : "Insert a blank page after page \(last + 1)"
+            )
+        }
+    }
+
+    public func presentExtractPagesPanel() {
+        guard let source = pageEditDisplayURL else { return }
+        let pages = selectedPageIndices
+        guard !pages.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Extract Pages"
+        panel.message =
+            "Writes the selected pages to a new PDF. The open document is not modified; "
+            + "annotations embedded in the PDF travel with their pages."
+        panel.nameFieldStringValue =
+            "\(source.deletingPathExtension().lastPathComponent) (pages \(Self.pageList(pages))).pdf"
+        panel.directoryURL = source.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.extractPages(pages, to: destination)
+        }
+    }
+
+    @discardableResult
+    public func extractPages(_ pages: [Int], to destination: URL) async -> Bool {
+        guard let url = document?.url else { return false }
+        guard !Self.resolvesToSameFile(destination, url) else {
+            lastError = "The extracted pages cannot overwrite the document they came from."
+            return false
+        }
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let report = try await engine.extractPages(pages, to: destination)
+            statusMessage =
+                "Extracted \(Self.pageList(pages)) to \(destination.lastPathComponent)"
+                + " · \(report.pageCount) page(s) written"
+            FileHandle.standardError.write(Data((
+                "aris-pages: extracted \(pages.count) page(s) to \(destination.path)"
+                + " (\(report.outputBytes) bytes)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not extract the pages: \(error.localizedDescription)"
+            statusMessage = "Could not extract the pages"
+            return false
+        }
+    }
+
+    public func presentSavePageEditsCopyPanel() {
+        guard let source = pageEditDisplayURL, pageEditSession != nil else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save Edited Copy"
+        panel.message =
+            "Writes the staged page changes to a new PDF and leaves the original untouched. "
+            + "The reader's annotations are saved beside the copy."
+        panel.nameFieldStringValue =
+            "\(source.deletingPathExtension().lastPathComponent) (page edits).pdf"
+        panel.directoryURL = source.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.savePageEditsCopy(to: destination)
+        }
+    }
+
+    @discardableResult
+    public func savePageEditsCopy(to destination: URL) async -> Bool {
+        guard let session = pageEditSession, !pageEditBusy else { return false }
+        if Self.resolvesToSameFile(destination, session.originalURL) {
+            lastError = "The edited copy would be the original. Use “Replace Original with Page Changes” for that."
+            return false
+        }
+        let destinationSidecar = Self.sidecarURL(for: destination)
+        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
+            lastError =
+                "“\(destination.lastPathComponent)” already has a Lyra annotation sidecar. "
+                + "Choose another name so the copy cannot show every annotation twice."
+            return false
+        }
+        let sidecarData: Data?
+        do {
+            sidecarData = try pageEditSidecarData()
+        } catch {
+            lastError = "Could not prepare the annotations for the copy: \(error.localizedDescription)"
+            return false
+        }
+        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
+        if hasMarks, let sidecarData {
+            do {
+                try sidecarData.write(to: destinationSidecar, options: .atomic)
+            } catch {
+                lastError = "Could not write the copy's annotation sidecar: \(error.localizedDescription)"
+                return false
+            }
+        }
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let report = try await engine.saveEditedCopy(to: destination)
+            endPageEditSession(deleteFiles: true)
+            _ = open(url: destination)
+            pageEditIsApplied = true
+            let notes = hasMarks ? " · annotations saved beside it" : ""
+            statusMessage =
+                "Saved edited copy \(destination.lastPathComponent) · \(report.pageCount) page(s)"
+                + " · the original is unchanged\(notes)"
+            return true
+        } catch {
+            if hasMarks {
+                try? FileManager.default.removeItem(at: destinationSidecar)
+            }
+            lastError = "Could not save the edited copy: \(error.localizedDescription)"
+            statusMessage = "Could not save the edited copy"
+            return false
+        }
+    }
+
+    public func presentReplaceOriginalWithPageEditsConfirmation() {
+        guard let session = pageEditSession else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Replace “\(session.originalURL.lastPathComponent)” with the page-edited version?"
+        alert.informativeText =
+            "This changes the file on disk. A byte-identical backup is written first; if the "
+            + "backup cannot be written and verified, nothing is replaced. The reader's "
+            + "annotations and bookmarks are remapped to the new page order."
+        alert.addButton(withTitle: "Save and Replace")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor [weak self] in
+            await self?.replaceOriginalWithPageEdits()
+        }
+    }
+
+    @discardableResult
+    public func replaceOriginalWithPageEdits() async -> Bool {
+        guard let session = pageEditSession, !pageEditBusy else { return false }
+        let sidecarData: Data?
+        do {
+            sidecarData = try pageEditSidecarData()
+        } catch {
+            lastError = "Could not prepare the annotations for the replacement: \(error.localizedDescription)"
+            return false
+        }
+        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
+        let hadSidecar = FileManager.default.fileExists(atPath: session.originalSidecarURL.path)
+        let previousSidecar = hadSidecar ? try? Data(contentsOf: session.originalSidecarURL) : nil
+        if hasMarks || hadSidecar, let sidecarData {
+            do {
+                try sidecarData.write(to: session.originalSidecarURL, options: .atomic)
+            } catch {
+                lastError = "Could not write the annotation sidecar; the original was left untouched: \(error.localizedDescription)"
+                return false
+            }
+        }
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let report = try await engine.replaceOriginalWithPageEdits(original: session.originalURL)
+            let backup = report.backupPath?.lastPathComponent ?? "none"
+            endPageEditSession(deleteFiles: true)
+            _ = open(url: session.originalURL)
+            pageEditIsApplied = true
+            statusMessage =
+                "Applied page changes to \(session.originalURL.lastPathComponent)"
+                + " · backup: \(backup)"
+            FileHandle.standardError.write(Data((
+                "aris-pages: replaced \(session.originalURL.path) · backup \(backup)\n"
+            ).utf8))
+            return true
+        } catch {
+            // The PDF was not replaced; put the sidecar back exactly as it was.
+            if hadSidecar {
+                if let previousSidecar {
+                    try? previousSidecar.write(to: session.originalSidecarURL, options: .atomic)
+                }
+            } else {
+                try? FileManager.default.removeItem(at: session.originalSidecarURL)
+            }
+            lastError = "Could not replace the original; it was left untouched: \(error.localizedDescription)"
+            statusMessage = "Could not replace the original"
+            return false
+        }
+    }
+
+    public func presentDiscardPageEditsConfirmation() {
+        guard pageEditSession != nil else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Discard the pending page changes?"
+        alert.informativeText =
+            "The working copy is closed and the original file stays exactly as it is. "
+            + "Annotations and bookmarks added during this page-editing session are discarded too."
+        alert.addButton(withTitle: "Discard Changes")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        discardPageEdits()
+    }
+
+    public func discardPageEdits() {
+        guard let session = pageEditSession else { return }
+        endPageEditSession(deleteFiles: true)
+        _ = open(url: session.originalURL)
+        pageEditIsApplied = false
+        statusMessage = "Discarded the page changes; \(session.originalURL.lastPathComponent) is unchanged"
+    }
+
+    public func undoPageEdit() {
+        Task { @MainActor [weak self] in
+            await self?.undoOrRedoPageEdit(redo: false)
+        }
+    }
+
+    public func redoPageEdit() {
+        Task { @MainActor [weak self] in
+            await self?.undoOrRedoPageEdit(redo: true)
+        }
+    }
+
+    private func undoOrRedoPageEdit(redo: Bool) async {
+        guard var session = pageEditSession, !pageEditBusy else { return }
+        let target = redo ? session.redo.last : session.undo.last
+        guard let target, let current = pageEditSnapshot(label: redo ? "redo" : "undo") else { return }
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        if redo {
+            session.redo.removeLast()
+            session.undo.append(current)
+        } else {
+            session.undo.removeLast()
+            session.redo.append(current)
+        }
+        guard (try? loadPageEditRevision(
+            at: target.revisionURL,
+            title: session.title,
+            sidecarURL: session.sidecarURL,
+            annotations: target.annotations,
+            bookmarks: target.bookmarks,
+            slots: target.slots,
+            currentPage: target.currentPage,
+            selection: target.selection
+        )) != nil else {
+            lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
+            return
+        }
+        session.revisionURL = target.revisionURL
+        session.revisionNumber = target.revisionNumber
+        session.currentToOriginal = target.currentToOriginal
+        session.operations = target.operations
+        pageEditSession = session
+        pageEditPendingOperations = session.operations
+        pageEditIsApplied = false
+        statusMessage = "\(redo ? "Redid" : "Undid") \(target.label) · \(session.operations.count) page change(s) still pending"
+    }
+
+    // MARK: Session plumbing
+
+    private func pageEditSnapshot(label: String) -> PageEditSnapshot? {
+        guard let session = pageEditSession, let url = document?.url else { return nil }
+        return PageEditSnapshot(
+            revisionURL: url,
+            revisionNumber: session.revisionNumber,
+            currentToOriginal: session.currentToOriginal,
+            operations: session.operations,
+            annotations: annotations,
+            bookmarks: bookmarks,
+            slots: annotationSidecarSlots,
+            currentPage: currentPage,
+            selection: pageSelection,
+            label: label
+        )
+    }
+
+    @discardableResult
+    private func ensurePageEditSession() async -> Bool {
+        if pageEditSession != nil { return true }
+        guard document != nil, let url = document?.url else {
+            lastError = "Open a document before editing pages"
+            return false
+        }
+        guard preservedAnnotationEntryCount == 0 else {
+            lastError =
+                "This document's annotation sidecar contains entries written by a newer Lyra. "
+                + "Their page numbers cannot be remapped safely, so page editing is disabled "
+                + "rather than risking an annotation on the wrong page."
+            return false
+        }
+        guard !annotationSaveInProgress else { return false }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            lastError = "Could not flush the annotation that is still being edited; no page change was made"
+            return false
+        }
+        do {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("LyraPageEdits-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let originalRotations = try await engine.pageRotations()
+            let pageCount = document?.pageCount ?? 0
+            let session = PageEditSession(
+                originalURL: url,
+                originalSidecarURL: Self.sidecarURL(for: url),
+                title: document?.title ?? url.deletingPathExtension().lastPathComponent,
+                directory: directory,
+                sidecarURL: directory.appendingPathComponent("annotations.json"),
+                originalRotations: originalRotations,
+                revisionURL: url,
+                revisionNumber: 0,
+                currentToOriginal: Array(0..<pageCount),
+                operations: [],
+                undo: [],
+                redo: []
+            )
+            pageEditSession = session
+            annotationsURL = session.sidecarURL
+            let wrote = writeSidecar(
+                annotations: annotations,
+                bookmarks: bookmarks,
+                slots: annotationSidecarSlots,
+                trigger: "page-edit-session"
+            )
+            guard wrote else {
+                pageEditSession = nil
+                annotationsURL = session.originalSidecarURL
+                try? FileManager.default.removeItem(at: directory)
+                return false
+            }
+            pageEditPendingOperations = []
+            pageEditIsApplied = false
+            statusMessage = "Page editing: changes are staged in a working copy; the file on disk is unchanged"
+            return true
+        } catch {
+            lastError = "Could not start the page-editing session: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    private func applyPageEdit(_ operation: PageEditOperation, label: String) async -> Bool {
+        // A rotation changes the page's text-layer order (PDFium reports a 90° page's text in
+        // rotated order). The sidecar addresses annotations by character range, so rotating a
+        // page that has Lyra marks would silently move them onto different words. Embedded PDF
+        // annotations are unaffected: they are page-space geometry and rotate with the page.
+        let rotating: [Int]?
+        switch operation {
+        case .rotate(let pages, _), .setRotation(let pages, _): rotating = pages
+        default: rotating = nil
+        }
+        if let rotating, let conflict = rotationConflict(on: rotating) {
+            lastError = conflict
+            statusMessage = "Rotation refused: the page has text-range annotations"
+            return false
+        }
+        guard await ensurePageEditSession() else { return false }
+        guard var session = pageEditSession, !pageEditBusy else { return false }
+        guard let snapshot = pageEditSnapshot(label: label) else { return false }
+        let nextNumber = session.revisionNumber + 1
+        let nextURL = session.directory.appendingPathComponent("rev-\(nextNumber).pdf")
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let report = try await engine.applyPageOperation(operation, to: nextURL)
+            let mappedAnnotations = Self.remap(annotations, with: report.pageMap)
+            let mappedBookmarks = Self.remap(bookmarks, with: report.pageMap)
+            let annotationIDs = Set(mappedAnnotations.map(\.id))
+            let bookmarkIDs = Set(mappedBookmarks.map(\.id))
+            let mappedSlots = annotationSidecarSlots.filter { slot in
+                switch slot {
+                case .annotation(let id): return annotationIDs.contains(id)
+                case .bookmark(let id): return bookmarkIDs.contains(id)
+                case .opaque: return true
+                }
+            }
+            var mapping = [Int](repeating: -1, count: Int(report.pageCount))
+            for (old, new) in report.pageMap.enumerated() {
+                guard let new, new >= 0, new < mapping.count else { continue }
+                mapping[new] = old < session.currentToOriginal.count ? session.currentToOriginal[old] : -1
+            }
+            let previousPage = min(max(currentPage - 1, 0), max(report.pageMap.count - 1, 0))
+            var newPage = report.insertedPage
+                ?? report.pageMap[previousPage]
+                ?? min(previousPage, max(Int(report.pageCount) - 1, 0))
+            if let inserted = report.insertedPage {
+                newPage = inserted
+            }
+            var newSelection = Set<Int>()
+            for selected in pageSelection {
+                if selected < report.pageMap.count, let mapped = report.pageMap[selected] {
+                    newSelection.insert(mapped)
+                }
+            }
+            if let inserted = report.insertedPage {
+                newSelection = [inserted]
+                pageSelectionAnchor = inserted
+            }
+
+            guard (try? loadPageEditRevision(
+                at: nextURL,
+                title: session.title,
+                sidecarURL: session.sidecarURL,
+                annotations: mappedAnnotations,
+                bookmarks: mappedBookmarks,
+                slots: mappedSlots,
+                currentPage: newPage + 1,
+                selection: newSelection
+            )) != nil else {
+                lastError = "The page change was written, but the revision could not be reopened; the original is unchanged"
+                return false
+            }
+            session.revisionURL = nextURL
+            session.revisionNumber = nextNumber
+            session.currentToOriginal = mapping
+            session.operations.append(label)
+            session.undo.append(snapshot)
+            session.redo.removeAll()
+            pageEditSession = session
+            pageEditPendingOperations = session.operations
+            pageEditIsApplied = false
+            statusMessage =
+                "\(label) · \(Self.annotationRule(for: operation)) · pending "
+                + "(the file on disk is unchanged)"
+            FileHandle.standardError.write(Data((
+                "aris-pages: \(label) · revision \(nextNumber) · "
+                + "\(session.operations.count) pending change(s)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Page change failed; nothing was written: \(error.localizedDescription)"
+            statusMessage = "Page change failed"
+            // A failed operation may have created a partial revision file; it is never referenced
+            // by the session, so remove it best-effort.
+            try? FileManager.default.removeItem(at: nextURL)
+            return false
+        }
+    }
+
+    private func loadPageEditRevision(
+        at url: URL,
+        title: String,
+        sidecarURL: URL,
+        annotations newAnnotations: [Annotation],
+        bookmarks newBookmarks: [Bookmark],
+        slots newSlots: [AnnotationSidecar.Slot],
+        currentPage newCurrentPage: Int,
+        selection newSelection: Set<Int>
+    ) throws {
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            throw NSError(
+                domain: "Lyra",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "an annotation is still being edited"]
+            )
+        }
+        resetDocumentState()
+        var loaded = try engine.openDocument(at: url)
+        loaded.title = title
+        document = loaded
+        annotationsURL = sidecarURL
+        annotationWritesBlockedReason = nil
+        preservedAnnotationEntryCount = 0
+        annotations = newAnnotations
+        bookmarks = newBookmarks
+        annotationSidecarSlots = newSlots
+        pageSelection = newSelection
+        pageSelectionAnchor = newSelection.first
+        currentPage = min(max(1, newCurrentPage), max(loaded.pageCount, 1))
+        invalidateTiles()
+        scrollYPt = engine.pageTopPt(currentPage - 1, gapPt: pageGapPt, layout: layoutMode)
+        reloadVisiblePages()
+        _ = writeSidecar(
+            annotations: newAnnotations,
+            bookmarks: newBookmarks,
+            slots: newSlots,
+            trigger: "page-edit-revision"
+        )
+        loadThumbnails()
+        loadDocumentAnnotations()
+        loadOutline()
+        loadReferences()
+        loadFigures()
+        loadMetadata()
+    }
+
+    private func endPageEditSession(deleteFiles: Bool) {
+        let directory = pageEditSession?.directory
+        pageEditSession = nil
+        pageEditPendingOperations = []
+        pageEditIsApplied = false
+        if deleteFiles, let directory {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    private func pageEditSidecarData() throws -> Data? {
+        if annotations.isEmpty && bookmarks.isEmpty && annotationSidecarSlots.isEmpty {
+            return nil
+        }
+        return try AnnotationSidecar.encode(
+            annotations: annotations,
+            bookmarks: bookmarks,
+            slots: annotationSidecarSlots
+        )
+    }
+
+    /// Why rotating `pages` would invalidate Lyra's own marks, or nil when it is safe.
+    ///
+    /// Sidecar annotations address character ranges in the page's text layer, and a rotated
+    /// page's text layer is reported in a different order. Rotating the page would not move the
+    /// highlight with the words; it would leave the same offsets pointing at different text.
+    /// Annotations already embedded in the PDF are page-space geometry and rotate correctly, so
+    /// only entries this app owns are a reason to refuse.
+    private func rotationConflict(on pages: [Int]) -> String? {
+        let marked = Set(annotations.filter { pages.contains($0.page) }.map(\.page))
+            .union(bookmarks.filter { pages.contains($0.page) }.map(\.page))
+            .sorted()
+        guard !marked.isEmpty else { return nil }
+        return "Page \(Self.pageList(marked)) has Lyra annotations or bookmarks stored as "
+            + "text positions. Rotating the page reorders its text layer, so those marks would "
+            + "no longer point at the same words. The rotation was not applied. Annotations "
+            + "already saved inside the PDF rotate with the page."
+    }
+
+    /// One sentence stating what happened to the reader's marks, shown with the pending action.
+    private static func annotationRule(for operation: PageEditOperation) -> String {
+        switch operation {
+        case .move:
+            return "annotations and bookmarks moved with their pages"
+        case .delete:
+            return "marks on deleted pages were removed; Undo restores them"
+        case .insertBlank:
+            return "the blank page carries no annotations"
+        case .rotate, .setRotation:
+            return "marks stay on their pages"
+        }
+    }
+
+    private static func remap(_ annotations: [Annotation], with pageMap: [Int?]) -> [Annotation] {
+        annotations.compactMap { annotation in
+            guard annotation.page >= 0, annotation.page < pageMap.count,
+                  let page = pageMap[annotation.page] else { return nil }
+            var copy = annotation
+            copy.page = page
+            return copy
+        }
+    }
+
+    private static func remap(_ bookmarks: [Bookmark], with pageMap: [Int?]) -> [Bookmark] {
+        bookmarks.compactMap { bookmark in
+            guard bookmark.page >= 0, bookmark.page < pageMap.count,
+                  let page = pageMap[bookmark.page] else { return nil }
+            var copy = bookmark
+            copy.page = page
+            return copy
+        }
+    }
+
+    private static func pageList(_ pages: [Int]) -> String {
+        guard let first = pages.first, let last = pages.last else { return "no pages" }
+        if pages.count == 1 { return "page \(first + 1)" }
+        if last - first + 1 == pages.count {
+            return first == last ? "page \(first + 1)" : "pages \(first + 1)–\(last + 1)"
+        }
+        return "pages " + pages.map { String($0 + 1) }.joined(separator: ", ")
     }
 
     // MARK: - Recovery from a sidecar that cannot be read

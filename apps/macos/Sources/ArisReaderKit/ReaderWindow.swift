@@ -128,6 +128,14 @@ public struct ReaderWindow: View {
                 emptyState
             }
 
+            if state.pageEditSessionActive {
+                VStack {
+                    pageEditBanner
+                    Spacer()
+                }
+                .padding(.top, 12)
+            }
+
             VStack {
                 Spacer()
                 pageHUD
@@ -141,6 +149,49 @@ public struct ReaderWindow: View {
             }
         }
         .animation(.easeOut(duration: 0.12), value: opener.dropHint)
+    }
+
+    /// The one place the interface states, without qualification, that the file on disk is not
+    /// what is on screen. It stays visible for the whole staged session, not just after an action.
+    private var pageEditBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "square.stack.3d.up")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Page changes pending")
+                    .font(.callout.weight(.semibold))
+                Text(
+                    [state.pageEditPendingSummary, state.pageEditLastAction]
+                        .compactMap { $0 }
+                        .joined(separator: " · ")
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Divider().frame(height: 24)
+            Button("Undo") { state.undoPageEdit() }
+                .disabled(!state.canUndoPageEdit)
+            Button("Redo") { state.redoPageEdit() }
+                .disabled(!state.canRedoPageEdit)
+            Button("Apply to Original…") {
+                state.presentReplaceOriginalWithPageEditsConfirmation()
+            }
+            .disabled(!state.canApplyPageEdits)
+            Button("Save Copy…") { state.presentSavePageEditsCopyPanel() }
+                .disabled(!state.canApplyPageEdits)
+            Button("Discard…") { state.presentDiscardPageEditsConfirmation() }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.orange.opacity(0.5), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Page changes pending. The file on disk is unchanged.")
     }
 
     private var emptyState: some View {

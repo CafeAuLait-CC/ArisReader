@@ -195,5 +195,80 @@ struct ReaderCommands: Commands {
             }
             .disabled(session?.state.lastSidecarBackupURL == nil)
         }
+
+        // Page operations (T3.9). Everything here is staged in a working copy until one of the
+        // two explicit save commands; "Discard" throws the staging away and leaves the file alone.
+        CommandMenu("Pages") {
+            Button("Rotate Selected Pages Clockwise") {
+                session?.state.rotateSelectedPages(clockwise: true)
+            }
+            .disabled(session?.state.canPageEdit != true)
+            Button("Rotate Selected Pages Anticlockwise") {
+                session?.state.rotateSelectedPages(clockwise: false)
+            }
+            .disabled(session?.state.canPageEdit != true)
+            Button("Reset Rotation to the File's Original") {
+                session?.state.resetSelectedPageRotations()
+            }
+            .disabled(session?.state.canPageEdit != true)
+
+            Divider()
+
+            Button("Delete Selected Pages…") {
+                session?.state.confirmDeleteSelectedPages()
+            }
+            .disabled(session?.state.canPageEdit != true)
+
+            Button("Move Selected Pages Up") {
+                session?.state.moveSelectedPagesUp()
+            }
+            .disabled(session?.state.canPageEdit != true)
+            Button("Move Selected Pages Down") {
+                session?.state.moveSelectedPagesDown()
+            }
+            .disabled(session?.state.canPageEdit != true)
+
+            Divider()
+
+            Button("Insert Blank Page Before") {
+                session?.state.insertBlankPage(before: true)
+            }
+            .disabled(session?.state.canPageEdit != true)
+            Button("Insert Blank Page After") {
+                session?.state.insertBlankPage(before: false)
+            }
+            .disabled(session?.state.canPageEdit != true)
+            Button("Extract Selected Pages…") {
+                session?.state.presentExtractPagesPanel()
+            }
+            .disabled(session?.state.document == nil)
+
+            Divider()
+
+            Button("Undo Page Change") { session?.state.undoPageEdit() }
+                .disabled(session?.state.canUndoPageEdit != true)
+            Button("Redo Page Change") { session?.state.redoPageEdit() }
+                .disabled(session?.state.canRedoPageEdit != true)
+
+            Divider()
+
+            Button("Save Edited Copy…") {
+                session?.state.presentSavePageEditsCopyPanel()
+            }
+            .disabled(session?.state.canApplyPageEdits != true)
+            Button("Replace Original with Page Changes…") {
+                session?.state.presentReplaceOriginalWithPageEditsConfirmation()
+            }
+            .disabled(session?.state.canApplyPageEdits != true)
+            Button("Discard Page Changes…") {
+                session?.state.presentDiscardPageEditsConfirmation()
+            }
+            .disabled(session?.state.pageEditSessionActive != true)
+
+            Divider()
+
+            Button("Clear Page Selection") { session?.state.clearPageSelection() }
+                .disabled(session?.state.pageSelection.isEmpty != false)
+        }
     }
 }

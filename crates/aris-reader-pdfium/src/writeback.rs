@@ -90,6 +90,34 @@ pub struct SaveReport {
     pub source_bytes_preserved: bool,
 }
 
+/// How a rewritten document (page edits, extraction) is allowed to land.
+///
+/// This is deliberately **not** [`SaveMode`]: an annotation save appends to the source, so
+/// `ReplaceOriginal` can require `source == destination`. A page rewrite consumes the source and
+/// produces an unrelated file, and the shell's working copy is a temporary revision, so the file
+/// that gets replaced is the *destination* (the original document) while the source is the
+/// revision. [`OutputMode::ReplaceDestination`] makes that asymmetry explicit: the destination is
+/// backed up and verified before it is replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputMode {
+    /// Write a new file. Refuses to name the source.
+    Copy,
+    /// Replace the destination with the rewritten source after a verified backup.
+    ReplaceDestination,
+}
+
+/// What [`write_rewritten_pdf`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RewrittenOutput {
+    pub destination: PathBuf,
+    /// The verified backup of the destination, only for [`OutputMode::ReplaceDestination`].
+    pub backup_path: Option<PathBuf>,
+    /// Stale `*.lyra-save-*.tmp` files removed before this write.
+    pub cleaned_temporaries: usize,
+    /// Size of the verified output file.
+    pub output_bytes: u64,
+}
+
 /// The marker in every temporary file this module creates. Kept distinctive so a file left by a
 /// crash is recognisable, and so the cleanup can never match an unrelated file.
 const TEMP_MARKER: &str = ".lyra-save-";
@@ -251,6 +279,176 @@ pub fn save_annotated_pdf(
     // `appender` is dropped after this, closing the source document handle. On an error the temp
     // guard removes the partial output; on success it was disarmed by the rename.
     result
+}
+
+/// Writes a **rewritten** document under the same file-safety contract as an annotation save.
+///
+/// Used by page operations, which cannot be incremental: `FPDF_SaveAsCopy` without
+/// `FPDF_INCREMENTAL` produces a complete new file, so a byte-prefix check does not apply. What
+/// does apply, and is shared with [`save_annotated_pdf`], is everything that protects the user:
+///
+/// 1. `build` writes into a fresh temporary file in the destination's own directory.
+/// 2. The file is flushed and `fsync`ed, then `verify` *reopens the temporary file* and checks
+///    it before anything is renamed.
+/// 3. For [`OutputMode::ReplaceDestination`], a byte-identical backup of the destination is
+///    written and verified **before** the temporary is built. A failure at any point leaves the
+///    destination as it was.
+/// 4. The source and (when replacing) the destination are checked for concurrent modification
+///    during the operation.
+/// 5. The final step is an atomic rename; leftovers use the same `.lyra-save-*.tmp` marker as
+///    annotation saves, so [`cleanup_interrupted_save_temporaries`] handles both.
+pub(crate) fn write_rewritten_pdf<Build, Verify>(
+    source: &Path,
+    destination: &Path,
+    mode: OutputMode,
+    build: Build,
+    verify: Verify,
+) -> Result<RewrittenOutput>
+where
+    Build: FnOnce(&mut File) -> Result<()>,
+    Verify: FnOnce(&Path) -> Result<()>,
+{
+    let source = fs::canonicalize(source).map_err(|error| {
+        io_error(
+            "could not resolve the document being rewritten",
+            source,
+            error,
+        )
+    })?;
+    if !source.is_file() {
+        return Err(ArisError::new(
+            ErrorCode::NotFound,
+            "the document being rewritten is not a regular file",
+        )
+        .with_detail(source.display().to_string()));
+    }
+    let destination = canonical_destination(destination)?;
+    if mode == OutputMode::Copy && destination == source {
+        return Err(ArisError::new(
+            ErrorCode::InvalidArgument,
+            "an edited copy cannot overwrite the document it was made from",
+        )
+        .with_detail(destination.display().to_string()));
+    }
+    if mode == OutputMode::ReplaceDestination && destination == source {
+        return Err(ArisError::new(
+            ErrorCode::InvalidArgument,
+            "the rewritten file is the file being replaced; nothing would change",
+        )
+        .with_detail(destination.display().to_string()));
+    }
+    if mode == OutputMode::ReplaceDestination && !destination.is_file() {
+        return Err(ArisError::new(
+            ErrorCode::NotFound,
+            "the file to be replaced does not exist",
+        )
+        .with_detail(destination.display().to_string()));
+    }
+
+    let source_before = fs::metadata(&source)
+        .map_err(|error| io_error("could not read the source metadata", &source, error))?;
+    let destination_before = if mode == OutputMode::ReplaceDestination {
+        Some(fs::metadata(&destination).map_err(|error| {
+            io_error(
+                "could not read the destination metadata",
+                &destination,
+                error,
+            )
+        })?)
+    } else {
+        fs::metadata(&destination).ok()
+    };
+
+    let mut cleaned_temporaries = cleanup_interrupted_save_temporaries(&destination)?;
+    if destination != source {
+        cleaned_temporaries += cleanup_interrupted_save_temporaries(&source)?;
+    }
+
+    // The backup comes first: a crash immediately after this point still leaves the reader a
+    // byte-identical copy of what was about to be replaced.
+    let backup_path = match mode {
+        OutputMode::ReplaceDestination => Some(write_backup(&destination)?),
+        OutputMode::Copy => None,
+    };
+
+    let (temp, mut file) = TempFile::create(&destination)?;
+    (|| -> Result<RewrittenOutput> {
+        build(&mut file)?;
+        file.flush().map_err(|error| {
+            io_error("could not flush the rewritten document", temp.path(), error)
+        })?;
+        file.sync_all().map_err(|error| {
+            io_error("could not fsync the rewritten document", temp.path(), error)
+        })?;
+        drop(file);
+
+        // Neither input may have moved while the output was being produced.
+        let source_after = fs::metadata(&source)
+            .map_err(|error| io_error("could not re-read the source metadata", &source, error))?;
+        if source_after.len() != source_before.len()
+            || source_after.modified().ok() != source_before.modified().ok()
+        {
+            return Err(ArisError::new(
+                ErrorCode::Io,
+                "the document changed on disk while the edited copy was being written; nothing was replaced",
+            ));
+        }
+        if let Some(before) = &destination_before {
+            let after = fs::metadata(&destination).map_err(|error| {
+                io_error(
+                    "could not re-read the destination metadata; nothing was replaced",
+                    &destination,
+                    error,
+                )
+            })?;
+            if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+                return Err(ArisError::new(
+                    ErrorCode::Io,
+                    "the destination changed on disk while the edited copy was being written; nothing was replaced",
+                ));
+            }
+        }
+
+        verify(temp.path())?;
+        let output_bytes = fs::metadata(temp.path())
+            .map_err(|error| {
+                io_error(
+                    "could not measure the rewritten document",
+                    temp.path(),
+                    error,
+                )
+            })?
+            .len();
+
+        let permissions = destination_before
+            .as_ref()
+            .unwrap_or(&source_before)
+            .permissions();
+        fs::set_permissions(temp.path(), permissions).map_err(|error| {
+            io_error(
+                "could not preserve the document's permissions",
+                temp.path(),
+                error,
+            )
+        })?;
+
+        fs::rename(temp.path(), &destination).map_err(|error| {
+            io_error(
+                "could not move the verified file into place",
+                &destination,
+                error,
+            )
+        })?;
+        temp.disarm();
+        sync_directory(destination.parent());
+
+        Ok(RewrittenOutput {
+            destination: destination.clone(),
+            backup_path: backup_path.clone(),
+            cleaned_temporaries,
+            output_bytes,
+        })
+    })()
 }
 
 /// Every temporary file this module would create for `target`. Does not remove anything.

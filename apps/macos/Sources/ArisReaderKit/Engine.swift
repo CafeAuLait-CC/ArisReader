@@ -762,6 +762,56 @@ public struct AnnotationWriteReport: Sendable, Equatable {
     public let sourceBytesPreserved: Bool
 }
 
+/// One page operation the reader asked for, in 0-based page numbers.
+///
+/// Every case is applied to a **copy**: the file on disk changes only through the explicit
+/// `replaceOriginalWithPageEdits` command, which backs the original up first.
+public enum PageEditOperation: Sendable, Equatable {
+    /// Add `quarterTurns` × 90° clockwise.
+    case rotate(pages: [Int], quarterTurns: Int)
+    /// Set the rotation explicitly, one value per page (used to reset to the file's original).
+    case setRotation(pages: [Int], quarterTurns: [Int])
+    case delete(pages: [Int])
+    /// Move the pages (as a block) to `destination`, an index in the list after removal.
+    case move(pages: [Int], destination: Int)
+    /// Insert a blank page at `index`, sized like its neighbour.
+    case insertBlank(index: Int)
+}
+
+/// What a page operation wrote. The engine reopens its own output before returning, so a
+/// successful report means the file was verified, not merely produced.
+public struct PageOperationReport: Sendable, Equatable {
+    public let destination: URL
+    public let pageCount: Int
+    /// `pageMap[old] = new` for pages that survived; `nil` for deleted/not-extracted pages.
+    public let pageMap: [Int?]
+    public let rotations: [Int]
+    public let insertedPage: Int?
+    public let backupPath: URL?
+    public let outputBytes: UInt64
+    public let cleanedTemporaryFiles: Int
+
+    public init(
+        destination: URL,
+        pageCount: Int,
+        pageMap: [Int?],
+        rotations: [Int],
+        insertedPage: Int?,
+        backupPath: URL?,
+        outputBytes: UInt64,
+        cleanedTemporaryFiles: Int
+    ) {
+        self.destination = destination
+        self.pageCount = pageCount
+        self.pageMap = pageMap
+        self.rotations = rotations
+        self.insertedPage = insertedPage
+        self.backupPath = backupPath
+        self.outputBytes = outputBytes
+        self.cleanedTemporaryFiles = cleanedTemporaryFiles
+    }
+}
+
 /// A `Figure 3` / `Table 2` reference in a page's body text, boxed in view space.
 public struct CaptionMention: Sendable {
     public let page: Int
@@ -948,6 +998,17 @@ public protocol PDFEngine: AnyObject {
         _ annotations: [AnnotationWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
+    /// The `/Rotate` of every page, in quarter turns (0–3).
+    func pageRotations() async throws -> [Int]
+    /// Applies a page operation to a copy of the open document and writes it to `destination`.
+    /// The open document is not modified.
+    func applyPageOperation(_ operation: PageEditOperation, to destination: URL) async throws -> PageOperationReport
+    /// Extracts `pages` (0-based) from the open document into a new PDF.
+    func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport
+    /// Publishes the current page-edit revision as a new file; the open document is untouched.
+    func saveEditedCopy(to destination: URL) async throws -> PageOperationReport
+    /// Replaces `original` with the current page-edit revision. Backup first, atomic rename.
+    func replaceOriginalWithPageEdits(original: URL) async throws -> PageOperationReport
     /// Whether a previous save of `url` was interrupted, for the next open to report.
     func interruptedSaveNote(at url: URL) -> String?
     /// The name to offer for an annotated copy of `url`.
@@ -1042,6 +1103,49 @@ public extension PDFEngine {
             domain: "Lyra",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "This engine cannot write annotations into a PDF"]
+        )
+    }
+
+    func pageRotations() async throws -> [Int] {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit pages"]
+        )
+    }
+
+    func applyPageOperation(
+        _ operation: PageEditOperation,
+        to destination: URL
+    ) async throws -> PageOperationReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit pages"]
+        )
+    }
+
+    func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot extract pages"]
+        )
+    }
+
+    func saveEditedCopy(to destination: URL) async throws -> PageOperationReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit pages"]
+        )
+    }
+
+    func replaceOriginalWithPageEdits(original: URL) async throws -> PageOperationReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit pages"]
         )
     }
 
@@ -1500,6 +1604,167 @@ public final class RustEngine: PDFEngine {
             }
         }
         return Self.writeReport(from: report)
+    }
+
+    public func pageRotations() async throws -> [Int] {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let rotations: [UInt32] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.pageRotations())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return rotations.map(Int.init)
+    }
+
+    public func applyPageOperation(
+        _ operation: PageEditOperation,
+        to destination: URL
+    ) async throws -> PageOperationReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let record = Self.pageOperationRecord(operation)
+        let report: PageEditReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.applyPageOperation(
+                            destination: destination.path,
+                            operation: record
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        // The whole engine is main-actor isolated, so the UniFFI record is converted here rather
+        // than on `rasterQueue` (a main-actor assertion would trap there).
+        return Self.pageEditReport(report, destination: destination)
+    }
+
+    public func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let indices = pages.map { UInt32(max(0, $0)) }
+        let report: PageEditReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.extractPages(
+                            destination: destination.path,
+                            pages: indices
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.pageEditReport(report, destination: destination)
+    }
+
+    public func saveEditedCopy(to destination: URL) async throws -> PageOperationReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let report: PageEditReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.saveEditedCopy(destination: destination.path)
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.pageEditReport(report, destination: destination)
+    }
+
+    public func replaceOriginalWithPageEdits(original: URL) async throws -> PageOperationReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let report: PageEditReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.replaceWithEditedPages(originalPath: original.path)
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.pageEditReport(report, destination: original)
+    }
+
+    private static func pageOperationRecord(_ operation: PageEditOperation) -> PageOperationRecord {
+        switch operation {
+        case .rotate(let pages, let quarterTurns):
+            return .rotate(
+                pages: pages.map { UInt32(max(0, $0)) },
+                quarterTurns: Int32(clamping: quarterTurns)
+            )
+        case .setRotation(let pages, let quarterTurns):
+            return .setRotation(
+                pages: pages.map { UInt32(max(0, $0)) },
+                quarterTurns: quarterTurns.map { UInt32(clamping: max(0, $0)) }
+            )
+        case .delete(let pages):
+            return .delete(pages: pages.map { UInt32(max(0, $0)) })
+        case .move(let pages, let destination):
+            return .move(
+                pages: pages.map { UInt32(max(0, $0)) },
+                destination: UInt32(max(0, destination))
+            )
+        case .insertBlank(let index):
+            return .insertBlank(index: UInt32(max(0, index)))
+        }
+    }
+
+    private static func pageEditReport(
+        _ report: PageEditReport,
+        destination: URL
+    ) -> PageOperationReport {
+        PageOperationReport(
+            destination: URL(fileURLWithPath: report.destinationPath),
+            pageCount: Int(report.pageCount),
+            pageMap: report.pageMap.map { $0.map(Int.init) },
+            rotations: report.rotations.map(Int.init),
+            insertedPage: report.insertedPage.map(Int.init),
+            backupPath: report.backupPath.map { URL(fileURLWithPath: $0) },
+            outputBytes: report.outputBytes,
+            cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles)
+        )
     }
 
     public func interruptedSaveNote(at url: URL) -> String? {
