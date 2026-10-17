@@ -15,7 +15,7 @@ public enum OutlineNumbering {
 
         public var depth: Int { Int(entry.depth) }
         /// Indentation in points. One step per level, including for an entry with no page.
-        public var indentPt: CGFloat { CGFloat(depth) * 14 }
+        public var indentPt: CGFloat { CGFloat(depth) * 10 }
     }
 
     /// Numbers a depth-first, flat outline: `1`, `1.1`, `1.1.1`, then `2`, `2.1`, …

@@ -35,7 +35,9 @@ extension ReaderChecks {
                 "the section without a destination is still in the outline")
         require(rows[4].depth == 1 && rows[5].depth == 2,
                 "its children are indented under it, not promoted to top level")
-        require(rows[0].indentPt == 0 && rows[1].indentPt == 14 && rows[2].indentPt == 28,
+        // 10 pt per level, down from 14: the user asked for a tighter outline whose left edge
+        // sits closer to the sidebar, with hierarchy carried by indentation alone.
+        require(rows[0].indentPt == 0 && rows[1].indentPt == 10 && rows[2].indentPt == 20,
                 "indentation follows depth by one step per level")
         require(rows[2].entry.page == 1 && rows[7].entry.page == 2,
                 "the page targets survive the hierarchy walk")

@@ -299,10 +299,13 @@ public struct SidebarView: View {
                                 .font(.caption2)
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
-                                .frame(minWidth: 24, alignment: .trailing)
+                                .frame(minWidth: 18, alignment: .trailing)
                             Text(row.entry.title)
                                 .lineLimit(2)
-                                .font(row.depth == 0 ? .callout : .caption)
+                                // One size at every level: the number already carries the
+                                // hierarchy, and shrinking nested titles made deep sections hard
+                                // to read in a narrow sidebar.
+                                .font(.callout)
                             Spacer(minLength: 0)
                             if let page = row.entry.page {
                                 Text("\(page + 1)")
@@ -312,6 +315,9 @@ public struct SidebarView: View {
                             }
                         }
                         .padding(.leading, row.indentPt)
+                        // The sidebar list inset plus a 24 pt number column left the outline
+                        // about 35 pt from the edge; the user asked for it to sit closer.
+                        .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 4))
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
