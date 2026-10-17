@@ -39,6 +39,10 @@ struct ReaderChecks {
             print("Bookmark checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-metadata") {
+            try await metadataChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-facing-layout") {
             try await facingLayoutChecks(
                 url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
@@ -258,6 +262,7 @@ struct ReaderChecks {
         try await outlineNumberingChecks(
             url: root.appendingPathComponent("tests/fixtures/outlined.pdf"))
         try await bookmarkChecks(url: a)
+        try await metadataChecks(root: root)
         try await facingLayoutChecks(url: b)
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)

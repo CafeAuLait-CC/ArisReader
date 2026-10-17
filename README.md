@@ -17,7 +17,8 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 
 Current status: **M1–M4 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
-tabs, sidecar highlights/underlines/notes, and citation/figure/table/algorithm previews.
+tabs, sidecar highlights/underlines/notes, citation/figure/table/algorithm previews, and document
+metadata recognition with per-field provenance plus BibTeX export.
 At ordinary zoom, the reader presents one page raster at the screen's actual resolution and prepares
 nearby pages on every scroll update; a facing-page mode shows page 1 alone and 2–3/4–5 spreads with a
 configurable gap, and named user bookmarks ride in the same sidecar as the reader's annotations. Page rasters and tiles share the configured byte budget, so lower
@@ -52,7 +53,7 @@ background execution does not imply parallel PDFium rendering.
 
 ```
 ArisReader/
-├── Cargo.toml                  # Rust workspace (10 crates)
+├── Cargo.toml                  # Rust workspace (11 crates)
 ├── rust-toolchain.toml         # Pinned toolchain
 ├── crates/
 │   ├── aris-reader-core/              # Document model, geometry/coordinates, errors, backend traits (zero platform deps)
@@ -63,8 +64,9 @@ ArisReader/
 │   ├── aris-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
 │   ├── aris-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
 │   ├── aris-reader-ai/                # LLM provider abstraction, context building, citation index
+│   ├── aris-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
 │   ├── aris-reader-ffi/               # UniFFI interface definitions + C ABI exports
-│   └── aris-reader-cli/               # Headless CLI: render/text/benchmarks (also the golden test entry point)
+│   └── aris-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
 ├── apps/macos/                 # SwiftPM package: ArisReaderKit (UI library) + ArisReader (executable app)
 ├── scripts/                    # Build, packaging, PDFium fetch and check scripts
 ├── docs/                       # Design and planning documents (see below)
@@ -121,6 +123,9 @@ cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-m
 # 7) See what a PDF somebody else annotated carries, page by page: subtype, /Rect, /QuadPoints
 #    count, /C, /CA, the blend mode it is drawn with, /Contents, and the tint the canvas uploads
 cargo run -p aris-reader-cli -- annotations tests/fixtures/annotated-appearance.pdf
+
+# 8) Recognise title/authors/venue/year/DOI/arXiv and print each field with its source
+cargo run -p aris-reader-cli -- metadata tests/fixtures/metadata-text-layer.pdf
 ```
 
 ## Annotation write-back
@@ -163,6 +168,38 @@ directory and removes the temporary on every error. On the next open, the reader
 leftover temporary in the status line; the document is intact because only the final rename makes
 a save take effect. The next save removes the leftovers (the engine's
 `interruptedSaveNote(at:)` is the detection point).
+
+## Document metadata and BibTeX
+
+The Metadata sidebar section (and `aris-reader-cli metadata <file.pdf>`) reads the open document
+offline, in this priority order:
+
+1. **XMP** — `dc:title`, `dc:creator`, `prism:doi`, `prism:publicationName`, `prism:coverDate`;
+2. **the `/Info` dictionary** — `/Title`, `/Author`, and `/Subject`/`/Keywords` as a place a DOI is
+   sometimes parked;
+3. **page one's text layer** — the largest text above the abstract (title block), the author line
+   below it, and identifiers/venue/year from the page furniture.
+
+Every field carries its source, and the panel marks layout-derived values as **Guessed**. An empty
+field stays empty: the recogniser has no filename, creation-date or "Anonymous" fallback, so a
+scanned page or a paper with no text layer produces no metadata rather than plausible-looking
+metadata. The DOI (`10.\d{4,9}/…`) and arXiv id (`arXiv:2303.08774`, `2303.08774v2`) are found in
+page-one text and reported as identified, not guessed.
+
+The same values generate the BibTeX entry: `@article` for a journal venue, `@inproceedings` for a
+conference/proceedings venue, `@misc` when there is no venue (including arXiv preprints, with
+`eprint`/`archivePrefix`). The key is author/year/title, field values are brace-wrapped and LaTeX
+escaped (`& % _ # $ ~ ^ \`, balanced `{…}` groups preserved, common Latin diacritics translated to
+accent commands), and URLs in `url`/`doi` are not text-escaped. **Copy BibTeX (⇧⌘B)** and
+**Save BibTeX…** both use exactly the string the panel shows, including any corrections the reader
+made; a correction changes the field's source to `Edited`.
+
+The accuracy of the recognition is measured in the pull request that introduced it: the title,
+author, venue, year and DOI of the twelve sample papers and seven review PDFs were compared by hand
+with the produced fields, and the fixtures `metadata-embedded.pdf`, `metadata-info.pdf`,
+`metadata-text-layer.pdf` and `metadata-arxiv.pdf` pin the known answers (XMP priority, `/Info`
+fallback, page-one fallback, arXiv-only) in `crates/aris-reader-cli/tests/metadata_fixtures.rs` and
+`apps/macos/Checks/MetadataChecks.swift`.
 
 ## Development workflow
 
@@ -381,7 +418,7 @@ resolve locally.
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: resolved in PR #6 |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
 | M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Ink, free text, page operations, AcroForm forms and export remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
-| M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. On the **twenty-paper arXiv corpus**, 94.7% of 1979 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations and short parenthesised numerals remain unsupported. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning, index persistence and bibliography metadata remain. |
+| M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. On the **twenty-paper arXiv corpus**, 94.7% of 1979 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations and short parenthesised numerals remain unsupported. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning and index persistence remain. Document metadata (title, authors, venue, year, DOI, arXiv id) is recognised from XMP, `/Info` and page one, shown with per-field provenance in a sidebar section, editable, and exported as BibTeX with an offline generator. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
 | M7 | Polish: performance, accessibility, internationalization, auto-update, notarized distribution | ⬜ |

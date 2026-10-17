@@ -137,6 +137,16 @@ struct ReaderCommands: Commands {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(session?.state.document == nil)
 
+            Divider()
+
+            // The payload is the panel's generated entry, not a fresh extraction: edit the
+            // fields in the Metadata sidebar section and both commands use the corrected values.
+            Button("Copy BibTeX") { session?.state.copyMetadataBibtex() }
+                .keyboardShortcut("b", modifiers: [.command, .shift])
+                .disabled(session?.state.canCopyMetadataBibtex != true)
+            Button("Save BibTeX…") { session?.state.presentSaveBibtexPanel() }
+                .disabled(session?.state.canCopyMetadataBibtex != true)
+
             Menu("Page Layout") {
                 Button("Continuous") { session?.state.setLayoutMode(.continuous) }
                     .keyboardShortcut("1", modifiers: .command)
