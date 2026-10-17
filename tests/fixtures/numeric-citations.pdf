@@ -1,0 +1,76 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 1268 >>
+stream
+0 0 0 rg
+BT /F1 20 Tf 72 790 Td (Numeric citation fixture) Tj ET
+BT /F1 10 Tf 72 766 Td (a numbered bibliography and the parenthesised citation shapes) Tj ET
+BT /F1 10 Tf 72 730 Td (Prior work established the baseline method \(12\).) Tj ET
+BT /F1 10 Tf 72 712 Td (Related approaches extend that method \(3ñ5\).) Tj ET
+BT /F1 10 Tf 72 694 Td (Two independent studies agree on this point \(7, 9\).) Tj ET
+BT /F1 10 Tf 72 676 Td (A mixed group cites a span and one more work \(3ñ5, 9\).) Tj ET
+BT /F1 10 Tf 72 658 Td (The dataset was released to the public \(2020\).) Tj ET
+BT /F1 10 Tf 72 640 Td (The balance condition is stated below.) Tj ET
+BT /F1 10 Tf 72 624 Td (x + y = z) Tj ET
+BT /F1 10 Tf 500 624 Td ((3)) Tj ET
+BT /F1 10 Tf 72 606 Td (The function f\(3\) is evaluated in the appendix.) Tj ET
+BT /F1 10 Tf 72 588 Td (\(1\) First enumerated item, written as running prose.) Tj ET
+BT /F1 10 Tf 72 570 Td (\(2\) Second enumerated item of the same list.) Tj ET
+BT /F1 10 Tf 72 552 Td (Figure 3\(b\) shows the pipeline for a single run.) Tj ET
+BT /F1 10 Tf 72 534 Td (Section 4 describes the setup in detail.) Tj ET
+BT /F1 10 Tf 72 516 Td (A later work is discussed elsewhere \(25\).) Tj ET
+BT /F1 10 Tf 72 498 Td (The page ends before the bibliography begins.) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 1088 >>
+stream
+0 0 0 rg
+BT /F1 12 Tf 72 790 Td (References) Tj ET
+BT /F1 10 Tf 72 760 Td (1. Alpha, A. 2019. A first work on motion.) Tj ET
+BT /F1 10 Tf 72 745 Td (2. Beta, B. 2020. A second work on shape.) Tj ET
+BT /F1 10 Tf 72 730 Td (3. Gamma, C. 2021. A third work on light.) Tj ET
+BT /F1 10 Tf 72 715 Td (4. Delta, D. 2022. A fourth work on sound.) Tj ET
+BT /F1 10 Tf 72 700 Td (5. Epsilon, E. 2023. A fifth work on colour.) Tj ET
+BT /F1 10 Tf 72 685 Td (6. Zeta, F. 2024. A sixth work on texture.) Tj ET
+BT /F1 10 Tf 72 670 Td (7. Eta, G. 2019. A seventh work on flow.) Tj ET
+BT /F1 10 Tf 72 655 Td (8. Theta, H. 2020. An eighth work on depth.) Tj ET
+BT /F1 10 Tf 72 640 Td (9. Iota, I. 2021. A ninth work on edges.) Tj ET
+BT /F1 10 Tf 72 625 Td (10. Kappa, J. 2022. A tenth work on style.) Tj ET
+BT /F1 10 Tf 72 610 Td (11. Lambda, K. 2023. An eleventh work on shape.) Tj ET
+BT /F1 10 Tf 72 595 Td (12. Mu, L. 2024. The cited baseline method.) Tj ET
+BT /F1 10 Tf 72 580 Td (13. Nu, M. 2025. A thirteenth work on pose.) Tj ET
+BT /F1 10 Tf 72 565 Td (14. Xi, N. 2026. A final work on motion.) Tj ET
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000350 00000 n 
+0000001670 00000 n 
+0000001796 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+2936
+%%EOF

@@ -20,6 +20,7 @@ mod bibliography;
 mod bibliography_tests;
 mod figures;
 mod fragments;
+mod paren;
 mod superscript;
 pub mod tables;
 
@@ -27,6 +28,7 @@ pub use figures::{
     CaptionMention, PageEvidence, caption_region, caption_region_from,
     caption_region_without_margin, find_caption_mentions,
 };
+pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
 pub use superscript::CitationStyle;
 pub use tables::table_region;
 
@@ -1756,9 +1758,12 @@ pub struct Citation {
 /// * author-year — `(He et al. 2024)`, `(Kim and Lee, 2023)`, `(A, 2024; B, 2022)`
 ///
 /// A third style — superscript numerals, `winds5,6,23-26` — needs the bibliography to
-/// corroborate a run, so it is only found by [`find_citations_with`]. This function is the two
-/// styles that need nothing but the page, which is what the CLI's span *count* (`inspect`) and
-/// the crate's own tests ask for.
+/// corroborate a run, so it is only found by [`find_citations_with`]. The same is true of the
+/// bare parenthesised numeral (`(12)`, `(3–5)`) used by much of the numeric literature: a
+/// parenthesised number is a citation only when the document's bibliography is numbered and the
+/// body does not bracket its citations (see [`inspect_parenthesised_citations`]). This function
+/// is the styles that need nothing but the page, which is what the CLI's span *count* (`inspect`)
+/// and the crate's own tests ask for.
 pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
     find_citations_with(text, &CitationStyle::numeric_only())
 }
@@ -1769,17 +1774,21 @@ pub fn find_citations(text: &RawTextPage) -> Vec<Citation> {
 /// `style` is built once per document with [`CitationStyle::for_document`] from the same entry
 /// list the resolver uses and the body pages being read. Beyond the bracket and author-year
 /// styles of
-/// [`find_citations`], it enables superscript numerals: a run of raised, smaller glyphs whose
-/// labels all exist in the reference list, in a document whose list is numbered. See
-/// [`superscript`](crate::superscript) for the thresholds and the measurements behind them.
+/// [`find_citations`], it enables two bibliography-corroborated detectors: superscript numerals
+/// (a run of raised, smaller glyphs whose labels all exist in the reference list, in a document
+/// whose list is numbered — see the superscript detector) and bare parenthesised
+/// numerals (`(12)`, `(3–5)`, in a numbered document that does not bracket its citations — see
+/// [`inspect_parenthesised_citations`]).
 pub fn find_citations_with(text: &RawTextPage, style: &CitationStyle) -> Vec<Citation> {
     let mut found = find_bracketed_citations(text);
     found.extend(superscript::find(text, style));
+    found.extend(paren::find(text, style));
     if style.uses_alphanumeric_labels() {
         found.extend(alphanumeric::citations(text));
     }
-    // Two detectors, one reading order: the CLI prints the spans in the order they appear, and a
-    // superscript run inside a bracket group is impossible, so only the order needs merging.
+    // Every detector writes into one reading order: the CLI prints the spans in the order they
+    // appear. A parenthesised numeral and a superscript run cannot overlap by construction, and
+    // only the order needs merging.
     found.sort_by_key(|citation| (citation.start, citation.end));
     found
 }
