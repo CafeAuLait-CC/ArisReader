@@ -19,6 +19,12 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
+        if CommandLine.arguments.contains("--check-hosted-preview") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await hostedPreviewChecks(root: root)
+            return
+        }
         if CommandLine.arguments.contains("--measure-page-navigation") {
             try await measurePageNavigation()
             return
@@ -37,12 +43,6 @@ struct ReaderChecks {
         }
         if CommandLine.arguments.contains("--measure-scroll-trace") {
             try await measureScrollTrace()
-            return
-        }
-        if CommandLine.arguments.contains("--check-hosted-preview") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
-            try await hostedPreviewChecks(root: root)
             return
         }
         // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
