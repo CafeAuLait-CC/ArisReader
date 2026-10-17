@@ -3078,7 +3078,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self, epoch == self.documentEpoch else { return }
-            let image = try? await self.engine.renderPage(page, scale: scale)
+            let image = try? await self.engine.renderThumbnail(page, scale: scale)
             guard epoch == self.documentEpoch else { return }
             if backingScale == self.deviceScale, let image {
                 let reduced = await Task.detached { image.downsampled(toWidth: targetWidth) }.value
