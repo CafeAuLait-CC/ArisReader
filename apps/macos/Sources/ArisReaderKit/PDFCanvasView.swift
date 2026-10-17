@@ -56,7 +56,11 @@ enum ArisStatus: Int32 {
 ///    (`aris_reader_surface_draw_page`) at the current zoom;
 /// 4. frames are produced **on demand** — a change of page, zoom or size — so an idle
 ///    window costs no GPU work;
-/// 5. on teardown the order is fixed: detach the surface, release textures, *then* let
+/// 5. **an empty page list still produces a frame**, with the background and no quads:
+///    the last presented drawable would otherwise keep showing the closed document, which
+///    is what the empty state was drawn over. Every path that empties the document (the
+///    last tab closing, a failed first open, launch) therefore clears by construction;
+/// 6. on teardown the order is fixed: detach the surface, release textures, *then* let
 ///    AppKit release the layer (a hard requirement of wgpu's Metal backend).
 ///
 /// Both sides use the process-wide default `MTLDevice`, which is what makes the layers
@@ -211,6 +215,13 @@ public final class MetalCanvasView: NSView {
     private var framesRendered: UInt64 = 0
     /// Native regression checks observe successful submissions without the HUD's throttle.
     package var submittedFrameCount: UInt64 { framesRendered }
+    /// Page quads in the most recent frame the GPU accepted (`nil` before the first one).
+    ///
+    /// `0` is a real, observable frame: the background with nothing drawn over it. A check can
+    /// wait for `submittedFrameCount` to advance after the last tab closes and then require this
+    /// to be zero, which catches the regression where the model empties but the old page stays
+    /// on screen because no new frame was submitted.
+    package private(set) var lastSubmittedQuadCount: Int?
     /// Whether this view's layer is attached to an engine surface. Checks use it where they
     /// cannot ask for a presented frame (an occluded window never presents).
     package var hasAttachedSurface: Bool { surfaceId != 0 }
@@ -741,8 +752,11 @@ public final class MetalCanvasView: NSView {
             }
         }
 
-        guard !textureIds.isEmpty else { return }
-
+        // No `guard !textureIds.isEmpty else { return }` here on purpose. A frame with zero
+        // quads is still a frame: the Rust side clears the surface to the reading background
+        // and presents it. Skipping the submission is what left the last drawn document on
+        // screen behind the empty state when its last tab closed, because a `CAMetalLayer`
+        // keeps showing the last drawable until another one is presented.
         if let traceLayer = layer as? PresentationTraceLayer {
             traceLayer.traceSurface = surfaceId
             traceLayer.traceY = Double(scrollYPt)
@@ -783,6 +797,10 @@ public final class MetalCanvasView: NSView {
         }
 
         framesRendered += 1
+        // Recorded only for frames the surface actually presented, so it pairs with
+        // `submittedFrameCount`: together they say "a new frame reached the screen, and it had
+        // this many page quads".
+        lastSubmittedQuadCount = textureIds.count
         if framesRendered == 1 || framesRendered % 15 == 0 {
             onFrame?(stats)
         }
