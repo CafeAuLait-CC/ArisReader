@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 aris-reader-core = { workspace = true }
+serde_json = "1"
 
-# Landed in M5:
-# tokio = { version = "1", features = ["rt", "sync", "time"] }
+# The AI layer runs on plain OS threads and blocking sockets: one worker per request, with a
+# cancellation flag polled between reads. That keeps the crate independent of an async runtime
+# and makes cancellation exercisable on every platform.

@@ -6,10 +6,24 @@
 //!
 //! See `docs/06-ai.md` for details.
 
+pub mod chat;
 pub mod citation;
+pub mod mock;
+pub mod openai;
 pub mod provider;
 
+pub use chat::{
+    Action, ChatPart, ChatPlan, ChatSettings, EndpointInfo, PageText, PlanRequest, SelectionRange,
+    inspect_base_url, validate_model,
+};
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
+pub use mock::MockProvider;
+pub use openai::{
+    CancellationToken, ClientConfig, CurlInvocation, CurlTransport, RequestSpec, ResponseStream,
+    RunEvent, SseDecoder, SseFrame, StreamPayload, TcpTransport, TokenUsage, Transport,
+    build_request_spec, curl_invocation, default_transport, preview_headers, redact, redact_error,
+    run_plan, run_plan_with_transport,
+};
 pub use provider::{
     AiError, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,
 };

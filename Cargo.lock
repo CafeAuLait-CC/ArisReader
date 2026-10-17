@@ -60,6 +60,7 @@ name = "aris-reader-ai"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -90,6 +91,7 @@ dependencies = [
 name = "aris-reader-ffi"
 version = "0.0.0"
 dependencies = [
+ "aris-reader-ai",
  "aris-reader-core",
  "aris-reader-gpu",
  "aris-reader-metadata",
