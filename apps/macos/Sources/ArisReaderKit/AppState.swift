@@ -3537,6 +3537,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ReadingLayoutPreferences.store(layoutMode: mode)
         }
         applyLayoutChange(anchor)
+        if mode == .facing { fitSpreadToViewportIfNeeded() }
         statusMessage = mode.title
     }
 
@@ -3568,6 +3569,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         layoutMode = mode
         pageGapPt = gap
         applyLayoutChange(anchor)
+        if mode == .facing { fitSpreadToViewportIfNeeded() }
+    }
+
+    /// Zooms a facing spread out until both pages fit the canvas.
+    ///
+    /// A facing pair is wider than the single page the reader was looking at: an A4 spread is
+    /// 1202 pt at 100%, while the default window leaves about 960 pt for the canvas. Without
+    /// this the right-hand page would be clipped and there is no horizontal scrolling to reach
+    /// it. Only ever zooms **out**, and never below the normal minimum. The anchor is the
+    /// viewport centre, so the spread opens where the reader was looking rather than at a page
+    /// corner. The user's 100% zoom is still one ⌘+ away.
+    private func fitSpreadToViewportIfNeeded() {
+        guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
+        let fitPercent = Int((viewportSizePt.width / contentWidthPt * 100).rounded(.down))
+        guard fitPercent < zoomPercent else { return }
+        let target = max(Self.minimumZoomPercent, fitPercent)
+        guard target < zoomPercent else { return }
+
+        cancelScrollGlide()
+        pointerZoomRemainder = 0
+        let centreContentY = scrollYPt + viewportHeightContentPt / 2
+        zoomPercent = target
+        let fittedViewport = viewportSizePt.height / zoomFactor
+        scrollYPt = clampedScrollOffset(centreContentY - fittedViewport / 2)
+        reloadVisiblePages()
+        schedulePositionSave()
     }
 
     private struct ReadingLayoutAnchor {

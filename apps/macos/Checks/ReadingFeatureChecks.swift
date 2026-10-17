@@ -227,6 +227,18 @@ extension ReaderChecks {
                     && abs(centerViewAfter - anchorViewY) < 0.05,
                 "the page centre is at the same view point before and after the zoom")
 
+        // A narrow canvas cannot show an A4 spread at 100% and the reader has no horizontal
+        // scrolling; switching to facing fits the spread to the width instead of clipping the
+        // right page. A wide canvas keeps the reader's zoom.
+        let narrow = AppState(engine: try RustEngine())
+        narrow.setViewportSize(CGSize(width: 900, height: 700))
+        narrow.open(url: url)
+        narrow.setLayoutMode(.facing)
+        require(narrow.zoomPercent < 100,
+                "a spread wider than the canvas is fitted instead of clipping its right page")
+        require(narrow.contentWidthPt * narrow.zoomFactor <= 900.5,
+                "the fitted spread fits inside the canvas width")
+
         // ── The prefetch band knows both pages of a spread ───────────────────────────────
         let bandEngine = try RustEngine()
         let bandState = AppState(engine: bandEngine, preferFullPageRasters: false)
