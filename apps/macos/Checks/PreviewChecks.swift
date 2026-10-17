@@ -31,6 +31,8 @@ import Foundation
     func references() async throws -> [Reference] { [] }
     func resolveCitations(labels: [String]) async throws -> [Reference] { [] }
     func outline() async throws -> [OutlineEntry] { [] }
+    func metadata() async throws -> DocumentMetadata { .empty }
+    func generateBibtex(_ draft: MetadataDraft) -> String { draft.bibtex }
     func search(_ pattern: String, limit: Int) async throws -> [SearchHit] { [] }
     func contentHeightPt(gapPt: CGFloat) -> CGFloat { 3600 }
     func contentWidthPt(gapPt: CGFloat) -> CGFloat { 600 }

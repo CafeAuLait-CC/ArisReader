@@ -14,6 +14,7 @@ use aris_reader_core::{
     AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
     PageIndex, Point, RasterRequest, Transform2D,
 };
+use aris_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::{
     PdfiumBackend, SaveMode, WriteAnnotation, WriteAnnotationKind, backend_description,
 };
@@ -184,6 +185,114 @@ pub struct PageBitmap {
     pub pixels: Vec<u8>,
 }
 
+/// Where a metadata field came from, as the panel shows it.
+///
+/// `Absent` is the only correct source of an empty field: "no value" is not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MetadataSourceKind {
+    Absent,
+    Xmp,
+    Info,
+    FirstPage,
+    PageFurniture,
+    Text,
+    ArxivDerived,
+    Edited,
+}
+
+/// One field with its value(s) and the source that produced them.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MetadataFieldRecord {
+    pub values: Vec<String>,
+    pub source: MetadataSourceKind,
+    /// Stable code for logs and checks (`xmp`, `first-page`, …).
+    pub source_code: String,
+    /// Short human label (`XMP`, `page 1 guess`, …).
+    pub source_label: String,
+    /// `embedded`, `identified`, `guessed`, `edited`, or `none`.
+    pub trust: String,
+    /// Whether the panel must mark this value as a guess.
+    pub guessed: bool,
+}
+
+/// The recognised metadata for one document, plus the BibTeX its values generate.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DocumentMetadataRecord {
+    pub title: MetadataFieldRecord,
+    pub authors: MetadataFieldRecord,
+    pub venue: MetadataFieldRecord,
+    pub year: MetadataFieldRecord,
+    pub doi: MetadataFieldRecord,
+    pub arxiv_id: MetadataFieldRecord,
+    pub bibtex: String,
+}
+
+/// The values the shell sends back after the reader corrected a field.
+///
+/// Provenance is not part of the request: an edited value is the reader's, not the file's.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MetadataDraftRecord {
+    pub title: String,
+    pub authors: Vec<String>,
+    pub venue: String,
+    pub year: String,
+    pub doi: String,
+    pub arxiv_id: String,
+}
+
+fn metadata_kind(source: Option<MetadataSource>) -> MetadataSourceKind {
+    match source {
+        None => MetadataSourceKind::Absent,
+        Some(MetadataSource::Xmp) => MetadataSourceKind::Xmp,
+        Some(MetadataSource::Info) => MetadataSourceKind::Info,
+        Some(MetadataSource::FirstPage) => MetadataSourceKind::FirstPage,
+        Some(MetadataSource::PageFurniture) => MetadataSourceKind::PageFurniture,
+        Some(MetadataSource::Text) => MetadataSourceKind::Text,
+        Some(MetadataSource::ArxivDerived) => MetadataSourceKind::ArxivDerived,
+        Some(MetadataSource::Edited) => MetadataSourceKind::Edited,
+    }
+}
+
+fn metadata_field(field: &aris_reader_metadata::MetadataField) -> MetadataFieldRecord {
+    MetadataFieldRecord {
+        values: field.values.clone(),
+        source: metadata_kind(field.source),
+        source_code: field.source_code().to_string(),
+        source_label: field.source_label().to_string(),
+        trust: field.trust().to_string(),
+        guessed: field.is_guessed(),
+    }
+}
+
+fn metadata_report(metadata: &RecognizedMetadata) -> DocumentMetadataRecord {
+    DocumentMetadataRecord {
+        title: metadata_field(&metadata.title),
+        authors: metadata_field(&metadata.authors),
+        venue: metadata_field(&metadata.venue),
+        year: metadata_field(&metadata.year),
+        doi: metadata_field(&metadata.doi),
+        arxiv_id: metadata_field(&metadata.arxiv_id),
+        bibtex: metadata.bibtex(),
+    }
+}
+
+/// Generates the BibTeX entry for the values currently in the panel.
+///
+/// The same Rust function generates the preview, the clipboard payload and the `.bib` file,
+/// so those three cannot disagree with each other.
+#[uniffi::export]
+pub fn generate_bibtex_entry(draft: MetadataDraftRecord) -> String {
+    BibEntry {
+        title: draft.title,
+        authors: draft.authors,
+        venue: draft.venue,
+        year: draft.year,
+        doi: draft.doi,
+        arxiv_id: draft.arxiv_id,
+    }
+    .to_bibtex()
+}
+
 /// An open document.
 ///
 /// Long-lived by design: the shell opens once and then asks for pages as the reader
@@ -208,6 +317,8 @@ pub struct ArisDocument {
     figures: Mutex<Option<Vec<FigureRecord>>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
     annotations: Mutex<Option<Vec<AnnotationRecord>>>,
+    /// Recognised metadata; page one does not change while the document is open.
+    metadata: Mutex<Option<DocumentMetadataRecord>>,
     /// Set when [`ArisDocument::replace_with_annotations`] has replaced the file on disk. The
     /// in-memory PDFium document is the pre-replacement one, so every content read would be a
     /// stale answer; the shell reopens the file immediately and this makes a missed reopen a
@@ -334,6 +445,7 @@ impl ArisDocument {
             references: Mutex::new(None),
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
+            metadata: Mutex::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -799,6 +911,37 @@ impl ArisDocument {
         let mut entries = Vec::new();
         flatten_outline(&self.backend.outline()?, 0, &mut entries);
         Ok(entries)
+    }
+
+    /// The document's recognised metadata, with the source of every field.
+    ///
+    /// The three sources are read once and cached: XMP, `/Info`, then page one's text layer
+    /// for anything the file did not state. An empty field is returned empty with source
+    /// `absent`; this call never invents a title, author, venue, year, DOI or arXiv id.
+    ///
+    /// The BibTeX string in the report is generated from exactly these values. After the
+    /// reader edits a field, [`generate_bibtex_entry`] regenerates the entry from the draft.
+    pub fn metadata(&self) -> Result<DocumentMetadataRecord, ArisFfiError> {
+        if let Ok(cache) = self.metadata.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        let embedded = self.backend.embedded_metadata()?;
+        let first_page = self.backend.raw_text_page(PageIndex(0)).ok();
+        // The text boxes are in unrotated PDF user space; the footer band is measured there.
+        let page_height = self
+            .backend
+            .page_info(PageIndex(0))
+            .map(|info| info.geometry.crop_box.size.height)
+            .unwrap_or(842.0);
+        let recognized = recognize(&embedded, first_page.as_ref(), page_height);
+        let report = metadata_report(&recognized);
+        if let Ok(mut cache) = self.metadata.lock() {
+            *cache = Some(report.clone());
+        }
+        Ok(report)
     }
 
     /// Annotations the document **already carries**, from every page, in **view space**.
@@ -1915,6 +2058,7 @@ impl ArisEngine {
             references: Mutex::new(None),
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
+            metadata: Mutex::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
         }))
     }

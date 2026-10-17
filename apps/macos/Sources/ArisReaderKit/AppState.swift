@@ -10,6 +10,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
     case outline
     case bookmarks
     case annotations
+    case metadata
     case search
     case ai
 
@@ -21,6 +22,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .outline: return "Outline"
         case .bookmarks: return "Bookmarks"
         case .annotations: return "Annotations"
+        case .metadata: return "Metadata"
         case .search: return "Search"
         case .ai: return "AI"
         }
@@ -32,6 +34,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .outline: return "list.bullet.indent"
         case .bookmarks: return "bookmark"
         case .annotations: return "highlighter"
+        case .metadata: return "text.badge.checkmark"
         case .search: return "magnifyingglass"
         case .ai: return "sparkles"
         }
@@ -43,6 +46,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .thumbnails, .outline: return "M2"
         case .bookmarks: return "M2"
         case .annotations: return "M3"
+        case .metadata: return "M4"
         case .search: return "M2"
         case .ai: return "M5"
         }
@@ -1064,6 +1068,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var captionMentionsByPage: [Int: [CaptionMention]] = [:]
     private var captionMentionsInFlight: Set<Int> = []
     @Published public private(set) var figures: [Figure] = []
+    /// Recognised document metadata, with the source of every field.
+    @Published public private(set) var metadata: DocumentMetadata?
+    /// The editable values and the BibTeX generated from them. This is the panel's single
+    /// source of truth; copying and saving use `metadataBibtex`, not a fresh guess.
+    @Published public private(set) var metadataDraft: MetadataDraft = .empty
+    @Published public private(set) var metadataBibtex: String = ""
+    @Published public private(set) var metadataLoading = false
+    @Published public private(set) var metadataError: String?
     /// Bumped on every document open, so caption data that arrives afterwards is dropped
     /// instead of being attributed to the document now on screen (the `renderEpoch` idea).
     private var documentEpoch: UInt64 = 0
@@ -1629,6 +1641,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadThumbnails()
             loadReferences()
             loadFigures()
+            loadMetadata()
             loadDocumentAnnotations()
             return true
 
@@ -1664,6 +1677,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         captionMentionsInFlight = []
         figures = []
         references = []
+        metadata = nil
+        metadataDraft = .empty
+        metadataBibtex = ""
+        metadataLoading = false
+        metadataError = nil
         documentAnnotations = []
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
@@ -3320,6 +3338,154 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("aris-references: \(self.references.count) entries\n".utf8)
             )
         }
+    }
+
+    /// Loads the recognised metadata once per open document.
+    ///
+    /// The engine reads XMP, `/Info` and page one, then caches the answer for the lifetime of the
+    /// document. An empty field stays empty: this method never falls back to the filename or the
+    /// file's creation date to make the panel look complete.
+    private func loadMetadata() {
+        guard document != nil else { return }
+        metadataLoading = true
+        metadataError = nil
+        let epoch = documentEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard epoch == self.documentEpoch else { return }
+            defer { if epoch == self.documentEpoch { self.metadataLoading = false } }
+            do {
+                let found = try await self.engine.metadata()
+                guard epoch == self.documentEpoch else { return }
+                self.metadata = found
+                self.metadataDraft = MetadataDraft(metadata: found)
+                self.metadataBibtex = found.bibtex
+                FileHandle.standardError.write(Data((
+                    "aris-metadata: title=\(found.title.source.label.lowercased()) "
+                    + "authors=\(found.authors.source.label.lowercased()) "
+                    + "venue=\(found.venue.source.label.lowercased()) "
+                    + "year=\(found.year.source.label.lowercased()) "
+                    + "doi=\(found.doi.source.label.lowercased()) "
+                    + "arxiv=\(found.arxivID.source.label.lowercased())\n"
+                ).utf8))
+            } catch {
+                guard epoch == self.documentEpoch else { return }
+                self.metadata = nil
+                self.metadataDraft = .empty
+                self.metadataBibtex = ""
+                self.metadataError = String(describing: error)
+                self.statusMessage = "Could not read the document metadata"
+                FileHandle.standardError.write(
+                    Data("aris-metadata: read failed: \(error)\n".utf8)
+                )
+            }
+        }
+    }
+
+    /// The visible source badge for a field. Edited values say "Edited", not the old source.
+    public func metadataSource(for key: MetadataFieldKey) -> MetadataFieldSource {
+        metadata?.field(key).source ?? .absent
+    }
+
+    public func metadataIsEmpty() -> Bool {
+        metadata?.isEmpty ?? true
+    }
+
+    /// Applies a correction from the panel and regenerates the entry immediately.
+    ///
+    /// The field's provenance becomes `edited`: the reader's value is no longer a guess and no
+    /// longer the file's claim, and the badge must say so.
+    public func updateMetadata(_ key: MetadataFieldKey, text: String) {
+        guard document != nil else { return }
+        var draft = metadataDraft
+        draft.setText(text, for: key)
+        if var fields = metadata {
+            switch key {
+            case .authors:
+                fields.authors.markEdited(values: metadataDraft.authors)
+            case .title:
+                fields.title.markEdited(value: metadataDraft.title)
+            case .venue:
+                fields.venue.markEdited(value: metadataDraft.venue)
+            case .year:
+                fields.year.markEdited(value: metadataDraft.year)
+            case .doi:
+                fields.doi.markEdited(value: metadataDraft.doi)
+            case .arxivID:
+                fields.arxivID.markEdited(value: metadataDraft.arxivID)
+            }
+            metadata = fields
+        }
+        let generated = engine.generateBibtex(draft)
+        draft.bibtex = generated
+        metadataDraft = draft
+        metadataBibtex = generated
+    }
+
+    /// Copies **the panel's** generated entry. Nothing regenerates here: the payload is the
+    /// string on screen, which is what the checks compare.
+    public func copyMetadataBibtex() {
+        guard document != nil, !metadataBibtex.isEmpty else {
+            statusMessage = "There is no BibTeX to copy"
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(metadataBibtex, forType: .string)
+        statusMessage = "Copied \(metadataBibtex.count) characters of BibTeX"
+    }
+
+    /// Writes the same string the panel shows, for the menu's Save command and the tests.
+    @discardableResult
+    public func saveMetadataBibtex(to url: URL) -> Bool {
+        guard !metadataBibtex.isEmpty else {
+            lastError = "There is no BibTeX to save"
+            return false
+        }
+        do {
+            try metadataBibtex.write(to: url, atomically: true, encoding: .utf8)
+            statusMessage = "Saved BibTeX to \(url.lastPathComponent)"
+            return true
+        } catch {
+            lastError = "Could not save BibTeX: \(error.localizedDescription)"
+            statusMessage = "Could not save BibTeX"
+            return false
+        }
+    }
+
+    /// The name to offer in the Save panel: the entry key, so a folder of PDFs and a folder of
+    /// `.bib` files correspond one to one.
+    public var suggestedBibtexFilename: String {
+        let firstLine = metadataBibtex.split(separator: "\n").first.map(String.init) ?? ""
+        var key = "reference"
+        if let open = firstLine.firstIndex(of: "{"),
+           let comma = firstLine[open...].firstIndex(of: ",")
+        {
+            let candidate = String(firstLine[firstLine.index(after: open)..<comma])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty { key = candidate }
+        }
+        let safe = key.map { character in
+            character.isASCII && (character.isLetter || character.isNumber) ? character : "_"
+        }
+        return "\(String(safe)).bib"
+    }
+
+    public func presentSaveBibtexPanel() {
+        guard document != nil else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save BibTeX"
+        panel.nameFieldStringValue = suggestedBibtexFilename
+        if let type = UTType(filenameExtension: "bib") {
+            panel.allowedContentTypes = [type]
+        }
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.saveMetadataBibtex(to: url)
+        }
+    }
+
+    public var canCopyMetadataBibtex: Bool {
+        document != nil && metadata != nil && !metadataBibtex.isEmpty
     }
 
     /// Opens the references an in-text citation points at (M4).

@@ -25,8 +25,8 @@ pub use backend::{
 };
 pub use config::{CacheBudget, EngineConfig};
 pub use document::{
-    DestView, Destination, DocId, DocMetadata, DocumentSnapshot, LinkInfo, LinkKind, OutlineNode,
-    PageIndex, PageInfo,
+    DestView, Destination, DocId, DocMetadata, DocumentSnapshot, EmbeddedMetadata, LinkInfo,
+    LinkKind, OutlineNode, PageIndex, PageInfo, XmpMetadata,
 };
 pub use error::{ArisError, ErrorCode, Result, Severity};
 pub use geometry::{LineSegment, PageGeometry, Point, Rect, Rotation, Size, Transform2D};

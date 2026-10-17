@@ -28,6 +28,10 @@ pdfium-render = { version = "0.9", optional = true, default-features = false, fe
 # with the `pdfium` feature.
 libloading = { version = "0.8", optional = true }
 
+# XMP metadata streams are usually FlateDecode-compressed (see `src/xmp.rs`). PDFium's C
+# ABI has no XMP accessor, so the backend inflates the packet itself.
+flate2 = "1"
+
 [features]
 default = ["pdfium"]
 # Enables the real PDFium implementation. With `--no-default-features` only the stub

@@ -5,9 +5,9 @@
 
 use crate::annotations::AnnotationReader;
 use aris_reader_core::{
-    ArisError, DocumentBackend, ErrorCode, LineSegment, LinkInfo, OutlineNode, PageGeometry,
-    PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile, RawAnnotation, RawCharBox,
-    RawTextPage, Rect, Result, Rotation, Size,
+    ArisError, DocMetadata, DocumentBackend, EmbeddedMetadata, ErrorCode, LineSegment, LinkInfo,
+    OutlineNode, PageGeometry, PageIndex, PageInfo, Point, RasterFormat, RasterRequest, RasterTile,
+    RawAnnotation, RawCharBox, RawTextPage, Rect, Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -776,6 +776,18 @@ impl DocumentBackend for PdfiumBackend {
                 ArisError::new(ErrorCode::RenderFailed, "PDFium reported no character box")
                     .with_detail(format!("page {} → {error}", page.get()))
             })?;
+            // The baseline origin, not the bottom of the ink box. `loose_bounds().bottom()` is
+            // the bottom of the glyph's ink, which sits at a different height for a descender
+            // (`g`) than for a capital (`H`); grouping characters into lines by it split one
+            // printed line into several, and a page of text came out as fragments like
+            // "ENERATION FROM3D H EMONSTRATIONSV". PDFium's own text origin is the baseline.
+            let (origin_x, origin_y) = character.origin().map_err(|error| {
+                ArisError::new(
+                    ErrorCode::RenderFailed,
+                    "PDFium reported no character origin",
+                )
+                .with_detail(format!("page {} → {error}", page.get()))
+            })?;
             let unicode = character
                 .unicode_char()
                 .map(u32::from)
@@ -783,10 +795,7 @@ impl DocumentBackend for PdfiumBackend {
 
             chars.push(RawCharBox {
                 rect: rect_from_pdf(bounds),
-                origin: Point::new(
-                    f64::from(bounds.left().value),
-                    f64::from(bounds.bottom().value),
-                ),
+                origin: Point::new(f64::from(origin_x.value), f64::from(origin_y.value)),
                 unicode,
                 // `PdfPageTextChar::font_size` is not usable here (its trait bounds are
                 // not satisfied); the loose box height is a good stand-in for selection UI.
@@ -872,6 +881,39 @@ impl DocumentBackend for PdfiumBackend {
             // exposed by pdfium-render yet; both matter for search reliability.
             is_generated: false,
             has_unicode_map_error: false,
+        })
+    }
+
+    fn embedded_metadata(&self) -> Result<EmbeddedMetadata> {
+        // `FPDF_GetMetaText` reads document state, exactly like the text layer.
+        let info = {
+            let _guard = PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let document = self.document.as_ref().expect("live document");
+            let metadata = document.metadata();
+            let tag = |kind: PdfDocumentMetadataTagType| {
+                metadata
+                    .get(kind)
+                    .map(|tag| tag.value().to_string())
+                    .and_then(|value| trimmed_metadata(&value))
+            };
+
+            DocMetadata {
+                title: tag(PdfDocumentMetadataTagType::Title),
+                author: tag(PdfDocumentMetadataTagType::Author),
+                subject: tag(PdfDocumentMetadataTagType::Subject),
+                keywords: tag(PdfDocumentMetadataTagType::Keywords),
+                creator: tag(PdfDocumentMetadataTagType::Creator),
+                producer: tag(PdfDocumentMetadataTagType::Producer),
+                creation_date: tag(PdfDocumentMetadataTagType::CreationDate),
+            }
+        };
+
+        // XMP has no PDFium C accessor; the packet is read from the file's own bytes.
+        Ok(EmbeddedMetadata {
+            info,
+            xmp: crate::xmp::read_xmp(&self.path),
         })
     }
 
@@ -1227,6 +1269,22 @@ fn rect_from_pdf(rect: PdfRect) -> Rect {
     let right = f64::from(rect.right().value);
     let top = f64::from(rect.top().value);
     Rect::new(left, bottom, right - left, top - bottom)
+}
+
+/// A metadata string without surrounding whitespace or NUL padding, or `None` when it is empty.
+///
+/// `/Info` values are PDF text strings and are not normalised by producers: trailing NULs and
+/// stray newlines are common, and an empty string must mean "absent" rather than "a value that
+/// happens to be blank" so recognition can fall through to the text layer.
+fn trimmed_metadata(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim_matches(|character: char| character.is_whitespace() || character == '\0')
+        .trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn rotation_from_pdf(rotation: PdfPageRenderRotation) -> Rotation {
