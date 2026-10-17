@@ -112,7 +112,7 @@ public enum PlacementIndex {
         -5 * block + annotation * 1_024 + box
     }
 
-    /// A note glyph loaded from the PDF — a sticky note's icon or a free-text annotation's text:
+    /// A note glyph loaded from the PDF — a sticky icon, free text or inline-comment label:
     /// one per annotation, upwards from `-6·block`. Capacity: 2^28 notes.
     ///
     /// Below `documentAnnotation`'s base, which is the only room left: the blocks above are
@@ -121,8 +121,8 @@ public enum PlacementIndex {
     /// own rather than one more `box` slot beside the markup quads because a note glyph is not a
     /// quad of a markup annotation: an annotation carrying both (a `/FreeText` with `/QuadPoints`
     /// is malformed but readable) would otherwise draw one of the two with the other's texture. One
-    /// slot per annotation is enough because the reader classifies an annotation as either a note
-    /// icon or a free text, never both.
+    /// slot per annotation is enough: a markup comment has one label, while a standalone note
+    /// is either an icon or free text.
     public static func documentNote(_ index: Int) -> Int { -6 * block + index }
 
     // The blocks above, as predicates. The native checks classify the quads they are handed with
@@ -142,7 +142,7 @@ public enum PlacementIndex {
         index >= -5 * block && index < -4 * block
     }
 
-    /// Whether `index` names a note glyph — a sticky note's icon or a free text's raster.
+    /// Whether `index` names a note glyph, including an inline-comment label.
     public static func isDocumentNote(_ index: Int) -> Bool {
         index >= -6 * block && index < -5 * block
     }

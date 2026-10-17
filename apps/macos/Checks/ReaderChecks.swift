@@ -75,6 +75,10 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        if CommandLine.arguments.contains("--check-inline-notes") {
+            try await inlineNoteChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-note-overlay") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -253,6 +257,7 @@ struct ReaderChecks {
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
         try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+        try await inlineNoteChecks(root: root)
         try await annotationNoteChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await annotationReplyChecks(

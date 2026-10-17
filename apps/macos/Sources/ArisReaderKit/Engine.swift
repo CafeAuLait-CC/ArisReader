@@ -139,6 +139,15 @@ public struct TextPage: Sendable {
         self.selectionLines = SelectionLine.build(chars)
     }
 
+    /// The text line touched by an annotation, excluding a separate line-number gutter.
+    public func lineBounds(overlapping region: CGRect) -> CGRect? {
+        selectionLines.map(\.bounds).filter { $0.intersects(region) }.max {
+            let a = $0.intersection(region)
+            let b = $1.intersection(region)
+            return a.width * a.height < b.width * b.height
+        }
+    }
+
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
     public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
@@ -646,6 +655,12 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     /// the whole point of the annotation.
     public var isNote: Bool {
         kind == "text" || kind == "freeText"
+    }
+
+    /// A text-markup comment needs a label as well as its highlight/underline geometry.
+    public var hasInlineNote: Bool {
+        visible && drawing == .markup
+            && !(contents ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// What the annotation is composited with: the file's `/BM`, or — when the file states none,
