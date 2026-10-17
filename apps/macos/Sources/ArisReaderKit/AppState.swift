@@ -161,6 +161,114 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// A user bookmark: a named place in this document.
+///
+/// `yPt` is a **page-local** content-space Y (0 at the page's top), not a scroll offset. A
+/// bookmark therefore stays on its paragraph when the window is resized, the zoom changes or
+/// the layout switches between continuous and facing pages — all of those move a page's top
+/// without moving anything inside the page.
+///
+/// Persisted in the same sidecar as the reader's annotations, tagged `"kind": "bookmark"`.
+/// The tag is what keeps an annotation-only build from misreading the entry: that build puts
+/// unknown kinds in its verbatim bucket before it looks at `page` or `title`, so it preserves
+/// this entry even though `yPt` is not an annotation key. See `AnnotationSidecar`.
+public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
+    /// The discriminator written to the sidecar. Also the reason an older build preserves the
+    /// entry instead of trying to decode it as a highlight.
+    public static let sidecarKind = "bookmark"
+
+    public let id: UUID
+    public var page: Int
+    public var title: String
+    /// Page-local Y in points, 0 at the page's top.
+    public var yPt: CGFloat
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        page: Int,
+        title: String,
+        yPt: CGFloat = 0,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.page = page
+        self.title = title
+        self.yPt = yPt
+        self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, page, title, yPt, createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        // `kind` is checked by `AnnotationSidecar` before this decoder runs. Tolerating its
+        // absence here keeps the model decodable on its own (tests, future formats).
+        _ = try values.decodeIfPresent(String.self, forKey: .kind)
+        page = try values.decode(Int.self, forKey: .page)
+        title = try values.decode(String.self, forKey: .title)
+        yPt = try values.decode(CGFloat.self, forKey: .yPt)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(Self.sidecarKind, forKey: .kind)
+        try values.encode(page, forKey: .page)
+        try values.encode(title, forKey: .title)
+        try values.encode(yPt, forKey: .yPt)
+        try values.encode(createdAt, forKey: .createdAt)
+    }
+}
+
+/// The reader's global layout preferences (T2.10): facing pages and the gap between pages.
+///
+/// These are view preferences, not document content, so they live in `UserDefaults` rather
+/// than in the sidecar: a reader who prefers facing spreads wants them in the next paper too,
+/// and the sidecar is the place for marks on *this* file. The checks disable stored lookups
+/// (`AppState.usesStoredReadingLayoutPreferences`) so their geometry never depends on what the
+/// person running them chose in the app.
+public enum ReadingLayoutPreferences {
+    public static let layoutKey = "readerLayoutMode"
+    public static let gapKey = "pageGapPt"
+    public static let didChange = Notification.Name("LyraReadingLayoutPreferencesDidChange")
+
+    public static let defaultGapPt: CGFloat = 12
+    /// A continuous range with honest bounds: 0 packs pages together, 48 is already more
+    /// whitespace than a reader needs between two pages. The layout clamps, it does not trust.
+    public static let gapRange: ClosedRange<CGFloat> = 0...48
+
+    public static func clampGap(_ value: CGFloat) -> CGFloat {
+        guard value.isFinite else { return defaultGapPt }
+        return min(max(value, gapRange.lowerBound), gapRange.upperBound)
+    }
+
+    public static func layoutMode(defaults: UserDefaults = .standard) -> ReaderLayoutMode {
+        guard let raw = defaults.string(forKey: layoutKey),
+              let mode = ReaderLayoutMode(rawValue: raw) else { return .continuous }
+        return mode
+    }
+
+    public static func gapPt(defaults: UserDefaults = .standard) -> CGFloat {
+        guard defaults.object(forKey: gapKey) != nil else { return defaultGapPt }
+        return clampGap(CGFloat(defaults.double(forKey: gapKey)))
+    }
+
+    static func store(layoutMode: ReaderLayoutMode, defaults: UserDefaults = .standard) {
+        defaults.set(layoutMode.rawValue, forKey: layoutKey)
+        NotificationCenter.default.post(name: didChange, object: nil)
+    }
+
+    static func store(gapPt: CGFloat, defaults: UserDefaults = .standard) {
+        defaults.set(Double(clampGap(gapPt)), forKey: gapKey)
+        NotificationCenter.default.post(name: didChange, object: nil)
+    }
+}
+
 @MainActor
 public final class AppState: ObservableObject {
     @Published public var document: LoadedDocument?
@@ -200,8 +308,24 @@ public final class AppState: ObservableObject {
     /// Width of the widest page in points; the canvas centres the content with it.
     @Published public private(set) var contentWidthPt: CGFloat = 0
 
-    /// Gap between pages, in points.
-    public let pageGapPt: CGFloat = 12
+    /// Gap between pages, in points. Set through `setPageGap` so it is clamped and the layout
+    /// is rebuilt immediately; read by the engine on every layout query.
+    @Published public private(set) var pageGapPt: CGFloat = ReadingLayoutPreferences.defaultGapPt
+    /// How pages are arranged horizontally (continuous or facing spreads).
+    @Published public private(set) var layoutMode: ReaderLayoutMode = .continuous
+    /// The gap range the Settings slider and the checks share.
+    public static let pageGapRange = ReadingLayoutPreferences.gapRange
+
+    /// Whether this process reads (and writes) the stored reading preferences.
+    ///
+    /// The regression checks set this to `false` before constructing any state: their geometry
+    /// must be the same on a machine where the reader happened to leave facing mode at 48 pt.
+    /// The app never changes it.
+    public static var usesStoredReadingLayoutPreferences = true
+
+    /// Set while `AppState` listens for a preference change made in another window.
+    private var layoutPreferencesObserver: NSObjectProtocol?
+
     /// Viewport size in screen points, reported by the canvas.
     private var viewportSizePt: CGSize = .zero
     /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
@@ -796,6 +920,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
     /// `AnnotationSidecar`).
     @Published public private(set) var annotations: [Annotation] = []
+    /// The reader's bookmarks for this document, in the order the sidebar shows them.
+    ///
+    /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
+    /// entries a newer build wrote in a shape this one cannot interpret stay in the slot list
+    /// and are written back verbatim, exactly as foreign annotation entries are.
+    @Published public private(set) var bookmarks: [Bookmark] = []
     /// Number of sidecar entries preserved verbatim because this version cannot interpret
     /// them (unknown `kind`, colour outside the palette, unknown fields).
     @Published public private(set) var preservedAnnotationEntryCount = 0
@@ -1095,6 +1225,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         statusMessage = self.engine.version
         if let tileCacheBudgetBytes { tileCache.setBudget(max(1, tileCacheBudgetBytes)) }
+
+        if Self.usesStoredReadingLayoutPreferences {
+            layoutMode = ReadingLayoutPreferences.layoutMode()
+            pageGapPt = ReadingLayoutPreferences.gapPt()
+            // One preference change must reach every open window, not just the one that moved
+            // the slider. Each state reads the stored value and preserves its own reading
+            // position through the layout change.
+            layoutPreferencesObserver = NotificationCenter.default.addObserver(
+                forName: ReadingLayoutPreferences.didChange, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.adoptStoredReadingLayoutPreferences() }
+            }
+        }
 
         // Developer/test affordance: open a document at launch
         // (`ARIS_READER_OPEN=/path/to.pdf ArisReader`), which also lets a headless run
@@ -1524,6 +1667,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = nil
         selectionAnchor = nil
         annotations = []
+        bookmarks = []
         annotationsURL = nil
         annotationWritesBlockedReason = nil
         annotationSidecarSlots = []
@@ -1910,6 +2054,140 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage = "Deleted annotation"
     }
 
+    // MARK: - Bookmarks (T2.13)
+
+    /// Adds a bookmark at the viewport top of the current page and persists it.
+    ///
+    /// The stored position is page-local (`yPt`), so the bookmark survives a zoom change, a
+    /// window resize and a continuous↔facing switch without drifting inside the page.
+    @discardableResult
+    public func addBookmarkAtCurrentPage(name: String? = nil) -> Bool {
+        guard let document, document.pageCount > 0, let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+        if annotationWritesBlockedReason != nil {
+            statusMessage = "Could not add the bookmark because the sidecar could not be loaded"
+            lastError = statusMessage
+            return false
+        }
+
+        let page = min(max(currentPage - 1, 0), document.pageCount - 1)
+        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let yPt = max(0, scrollYPt - top)
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
+
+        let bookmark = Bookmark(page: page, title: title, yPt: yPt)
+        var updated = bookmarks
+        updated.append(bookmark)
+        var slots = annotationSidecarSlots
+        slots.append(.bookmark(bookmark.id))
+        guard writeSidecar(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: slots,
+            trigger: "bookmark-add"
+        ) else { return false }
+
+        statusMessage = "Added bookmark “\(title)”"
+        return true
+    }
+
+    /// Deletes a bookmark. Its slot is left in the file; the encoder skips an id that is no
+    /// longer present, so a later save cannot accidentally revive it.
+    public func removeBookmark(_ id: UUID) {
+        guard let index = bookmarks.firstIndex(where: { $0.id == id }) else { return }
+        let title = bookmarks[index].title
+        var updated = bookmarks
+        updated.remove(at: index)
+        guard writeSidecar(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: annotationSidecarSlots,
+            trigger: "bookmark-remove"
+        ) else { return }
+        statusMessage = "Deleted bookmark “\(title)”"
+    }
+
+    /// Renames a bookmark. An empty title is allowed; the sidebar falls back to "Page N" when
+    /// displaying it, and nothing is silently rewritten.
+    public func renameBookmark(_ id: UUID, to title: String) {
+        guard let index = bookmarks.firstIndex(where: { $0.id == id }),
+              bookmarks[index].title != title else { return }
+        var updated = bookmarks
+        updated[index].title = title
+        guard writeSidecar(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: annotationSidecarSlots,
+            trigger: "bookmark-rename"
+        ) else { return }
+    }
+
+    /// Moves a bookmark by `offset` places in the reader's order. The order is the array's,
+    /// and it is persisted by reordering the bookmark slots in the sidecar in place, so
+    /// foreign entries keep their positions.
+    public func moveBookmark(_ id: UUID, by offset: Int) {
+        guard let index = bookmarks.firstIndex(where: { $0.id == id }), offset != 0 else { return }
+        let target = min(max(index + offset, 0), bookmarks.count - 1)
+        guard target != index else { return }
+
+        var updated = bookmarks
+        let bookmark = updated.remove(at: index)
+        updated.insert(bookmark, at: target)
+        guard writeSidecar(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: bookmarkSlots(matching: updated),
+            trigger: "bookmark-move"
+        ) else { return }
+        statusMessage = "Moved bookmark “\(bookmark.title)”"
+    }
+
+    /// Jumps so the bookmarked page position is at the top of the viewport.
+    public func jump(to bookmark: Bookmark) {
+        guard let document, bookmark.page >= 0, bookmark.page < document.pageCount else { return }
+        cancelScrollGlide()
+        let top = engine.pageTopPt(bookmark.page, gapPt: pageGapPt, layout: layoutMode)
+        scrollYPt = clampedScrollOffset(top + bookmark.yPt)
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = "Jumped to “\(bookmark.title)”"
+    }
+
+    /// The display name for a bookmark with an empty custom title.
+    public static func defaultBookmarkTitle(page: Int) -> String {
+        "Page \(page + 1)"
+    }
+
+    /// The current bookmark list split into one section per page, in the reader's order.
+    ///
+    /// Grouping by page is what makes a list of named places readable; the order *within* and
+    /// *between* sections is still the reader's (first appearance wins), which is what the
+    /// move commands manipulate.
+    public var bookmarkGroups: [BookmarkGroup] {
+        BookmarkGrouping.groups(for: bookmarks)
+    }
+
+    /// Rebuilds the `.bookmark` slots in the current order while leaving every other slot in
+    /// place. Appending covers bookmarks added after the file was loaded.
+    private func bookmarkSlots(matching ordered: [Bookmark]) -> [AnnotationSidecar.Slot] {
+        var remaining = ordered.makeIterator()
+        var slots: [AnnotationSidecar.Slot] = []
+        for slot in annotationSidecarSlots {
+            if case .bookmark = slot {
+                if let next = remaining.next() {
+                    slots.append(.bookmark(next.id))
+                }
+            } else {
+                slots.append(slot)
+            }
+        }
+        while let next = remaining.next() {
+            slots.append(.bookmark(next.id))
+        }
+        return slots
+    }
+
     // MARK: - Undo / redo
 
     /// One reversible change. Note edits are represented as old/new values so an edit can
@@ -2095,7 +2373,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
         selectionAnchor = nil
 
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt)
+        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
         if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
             scrollYPt = top
         }
@@ -2113,7 +2391,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // sidebar highlights the row it was asked to show, and a click on the annotation's own
         // glyph on the page comes here too.
         selectedDocumentAnnotationID = annotation.id
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt)
+        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
         let box = annotation.boxes.first
         // Put the annotation a third of the way down the viewport rather than at its very top:
         // a highlight is easier to recognise with the text above it visible.
@@ -2183,19 +2461,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 paletteCount: Self.highlightPalette.count
             )
             annotations = contents.annotations
+            bookmarks = contents.bookmarks
             annotationSidecarSlots = contents.slots
             preservedAnnotationEntryCount = contents.preservedCount
             undoStack.removeAll()
             redoStack.removeAll()
-            let line = "aris-annotate: loaded \(contents.annotations.count) annotation(s)"
-                + ", \(contents.preservedCount) preserved from a newer version\n"
+            let line = "aris-annotate: loaded \(contents.annotations.count) annotation(s),"
+                + " \(contents.bookmarks.count) bookmark(s),"
+                + " \(contents.preservedCount) preserved from a newer version\n"
             FileHandle.standardError.write(Data(line.utf8))
         } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             annotations = []
+            bookmarks = []
             undoStack.removeAll()
             redoStack.removeAll()
         } catch {
             annotations = []
+            bookmarks = []
             undoStack.removeAll()
             redoStack.removeAll()
             annotationWritesBlockedReason = error.localizedDescription
@@ -2214,6 +2496,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// happened (a keystroke, a coalesced flush, a tab switch, …).
     @discardableResult
     private func saveAnnotations(_ candidate: [Annotation], trigger: String) -> Bool {
+        writeSidecar(
+            annotations: candidate,
+            bookmarks: bookmarks,
+            slots: annotationSidecarSlots,
+            trigger: trigger
+        )
+    }
+
+    /// Writes both kinds of entry to the one sidecar and publishes the new arrays only after
+    /// the atomic write succeeds. Any unreadable/corrupt existing sidecar is protected from
+    /// accidental replacement.
+    ///
+    /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
+    /// happened (a keystroke, a coalesced flush, a bookmark move, …).
+    @discardableResult
+    private func writeSidecar(
+        annotations candidateAnnotations: [Annotation],
+        bookmarks candidateBookmarks: [Bookmark],
+        slots: [AnnotationSidecar.Slot],
+        trigger: String
+    ) -> Bool {
         guard let annotationsURL else {
             statusMessage = "Could not save annotations: no document sidecar is selected"
             lastError = statusMessage
@@ -2230,14 +2533,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let data = try AnnotationSidecar.encode(
-                annotations: candidate,
-                slots: annotationSidecarSlots
+                annotations: candidateAnnotations,
+                bookmarks: candidateBookmarks,
+                slots: slots
             )
             try data.write(to: annotationsURL, options: .atomic)
-            annotations = candidate
+            annotations = candidateAnnotations
+            bookmarks = candidateBookmarks
+            annotationSidecarSlots = slots
             hasPendingAnnotationWrite = false
             annotationWriteCount += 1
-            let line = "aris-annotate: saved \(candidate.count) annotation(s)"
+            let line = "aris-annotate: saved \(candidateAnnotations.count) annotation(s),"
+                + " \(candidateBookmarks.count) bookmark(s)"
                 + " (\(preservedAnnotationEntryCount) preserved),"
                 + " write #\(annotationWriteCount) [\(trigger)]\n"
             FileHandle.standardError.write(Data(line.utf8))
@@ -2295,6 +2602,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // The path is free now, so a stale blocked flag must not stop the fresh write.
         annotationWritesBlockedReason = nil
         annotations = []
+        bookmarks = []
         annotationSidecarSlots = []
         preservedAnnotationEntryCount = 0
         undoStack.removeAll()
@@ -2354,7 +2662,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = Selection(page: hit.page, range: hit.start...(max(hit.start, hit.end - 1)))
         selectionAnchor = nil
 
-        let top = engine.pageTopPt(hit.page, gapPt: pageGapPt)
+        let top = engine.pageTopPt(hit.page, gapPt: pageGapPt, layout: layoutMode)
         if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
             scrollYPt = top
         }
@@ -3207,7 +3515,118 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
         cancelScrollGlide()
-        scrollYPt = engine.pageTopPt(max(0, page), gapPt: pageGapPt)
+        scrollYPt = engine.pageTopPt(
+            max(0, page), gapPt: pageGapPt, layout: layoutMode
+        )
+        reloadVisiblePages()
+        schedulePositionSave()
+    }
+
+    // MARK: - Reading layout (T2.10)
+
+    /// Switches between continuous and facing pages, keeping the reader's place.
+    ///
+    /// The anchor is the page under the viewport top and the offset *inside* that page. The
+    /// same anchor is used for a gap change: both edits move page tops, and neither should
+    /// throw the reader to a different paragraph.
+    public func setLayoutMode(_ mode: ReaderLayoutMode) {
+        guard mode != layoutMode else { return }
+        let anchor = readingLayoutAnchor()
+        layoutMode = mode
+        if Self.usesStoredReadingLayoutPreferences {
+            ReadingLayoutPreferences.store(layoutMode: mode)
+        }
+        applyLayoutChange(anchor)
+        if mode == .facing { fitSpreadToViewportIfNeeded() }
+        statusMessage = mode.title
+    }
+
+    /// Convenience for the View menu and the toolbar.
+    public func toggleFacingPages() {
+        setLayoutMode(layoutMode == .facing ? .continuous : .facing)
+    }
+
+    /// Sets the gap between pages, clamped to `pageGapRange`, and applies it immediately.
+    public func setPageGap(_ value: CGFloat) {
+        let clamped = ReadingLayoutPreferences.clampGap(value)
+        guard abs(clamped - pageGapPt) > 0.0001 else { return }
+        let anchor = readingLayoutAnchor()
+        pageGapPt = clamped
+        if Self.usesStoredReadingLayoutPreferences {
+            ReadingLayoutPreferences.store(gapPt: clamped)
+        }
+        applyLayoutChange(anchor)
+        statusMessage = String(format: "Page gap: %.0f pt", Double(clamped))
+    }
+
+    /// Reads the process-wide preferences. Called for this state when another window changed
+    /// them (and by `ReaderWindowRegistry` when the Settings window moves the slider).
+    public func adoptStoredReadingLayoutPreferences() {
+        let mode = ReadingLayoutPreferences.layoutMode()
+        let gap = ReadingLayoutPreferences.gapPt()
+        guard mode != layoutMode || abs(gap - pageGapPt) > 0.0001 else { return }
+        let anchor = readingLayoutAnchor()
+        layoutMode = mode
+        pageGapPt = gap
+        applyLayoutChange(anchor)
+        if mode == .facing { fitSpreadToViewportIfNeeded() }
+    }
+
+    /// Zooms a facing spread out until both pages fit the canvas.
+    ///
+    /// A facing pair is wider than the single page the reader was looking at: an A4 spread is
+    /// 1202 pt at 100%, while the default window leaves about 960 pt for the canvas. Without
+    /// this the right-hand page would be clipped and there is no horizontal scrolling to reach
+    /// it. Only ever zooms **out**, and never below the normal minimum. The anchor is the
+    /// viewport centre, so the spread opens where the reader was looking rather than at a page
+    /// corner. The user's 100% zoom is still one ⌘+ away.
+    private func fitSpreadToViewportIfNeeded() {
+        guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
+        let fitPercent = Int((viewportSizePt.width / contentWidthPt * 100).rounded(.down))
+        guard fitPercent < zoomPercent else { return }
+        let target = max(Self.minimumZoomPercent, fitPercent)
+        guard target < zoomPercent else { return }
+
+        cancelScrollGlide()
+        pointerZoomRemainder = 0
+        let centreContentY = scrollYPt + viewportHeightContentPt / 2
+        zoomPercent = target
+        let fittedViewport = viewportSizePt.height / zoomFactor
+        scrollYPt = clampedScrollOffset(centreContentY - fittedViewport / 2)
+        reloadVisiblePages()
+        schedulePositionSave()
+    }
+
+    private struct ReadingLayoutAnchor {
+        let page: Int
+        /// Distance from the page's top to the viewport top, in content points.
+        let offsetY: CGFloat
+    }
+
+    private func readingLayoutAnchor() -> ReadingLayoutAnchor {
+        guard document != nil else { return ReadingLayoutAnchor(page: 0, offsetY: 0) }
+        let page = engine.pageIndex(
+            atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode
+        )
+        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        return ReadingLayoutAnchor(page: page, offsetY: max(0, scrollYPt - top))
+    }
+
+    /// Rebuilds the scroll geometry after `layoutMode` or `pageGapPt` changed and restores the
+    /// anchored reading position. The tile cache is untouched: a page's pixels do not depend on
+    /// where the page is placed, only its quads do.
+    private func applyLayoutChange(_ anchor: ReadingLayoutAnchor) {
+        guard document != nil else {
+            contentHeightPt = 0
+            contentWidthPt = 0
+            canvasPages = []
+            canvasTiles = []
+            return
+        }
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+        contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
+        let top = engine.pageTopPt(anchor.page, gapPt: pageGapPt, layout: layoutMode)
+        scrollYPt = clampedScrollOffset(top + anchor.offsetY)
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -3251,8 +3670,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
 
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt)
-        contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt)
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+        contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt
         let margin = viewportHeight * 2
@@ -3260,7 +3679,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt: scrollYPt,
             viewportHeightPt: viewportHeight,
             gapPt: pageGapPt,
-            marginPt: margin
+            marginPt: margin,
+            layout: layoutMode
         )
 
         let lod = rasterLod
@@ -3418,7 +3838,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles = wanted
         evictTiles()
         canvasPages = pages
-        currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt) + 1
+        currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
@@ -3498,6 +3918,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let local = region ?? CGRect(x: 0, y: 0,
                                      width: placement.widthPt, height: placement.heightPt)
         return viewRect(local: local, on: placement)
+    }
+
+    /// The page under a content-space point, or nil for a gap, the margin or no document.
+    ///
+    /// The click paths all walk `visiblePagePlacements` in reading order and test the same
+    /// rectangle; exposing the decision makes the facing-layout hit test checkable directly
+    /// (a point in the right-hand page must name that page's index, not its partner's).
+    public func pagePlacement(at point: CGPoint) -> PagePlacement? {
+        visiblePagePlacements.first { placement in
+            CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            ).contains(point)
+        }
     }
 
     /// A page-local rectangle in the canvas's view space (top-left origin).
@@ -4236,13 +4672,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
                                        viewportHeight: CGFloat, screenScale: CGFloat) {
         desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
-        let current = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt)
+        let current = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode)
         let bandPages = Set(band.map(\.placement.index))
         let candidates: [PagePlacement]
         let budget: Int
         if usesScreenPageRasters {
             candidates = engine.visiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
-                gapPt: pageGapPt, marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3))
+                gapPt: pageGapPt, marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3),
+                layout: layoutMode)
                 .filter { abs($0.index - current) <= 3 && canRasterizeScreenPage($0, scale: screenScale) }
             budget = tileCache.budgetBytes
         } else {

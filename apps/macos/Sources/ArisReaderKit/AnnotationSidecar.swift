@@ -2,7 +2,9 @@ import Foundation
 
 /// Reading and writing the annotation sidecar (`<doc>.pdf.aris-annotations.json`).
 ///
-/// The sidecar is a JSON array of `AppState.Annotation`. Two properties shape this code:
+/// The sidecar is a JSON array of `AppState.Annotation` entries **and user bookmarks**.
+/// Both live in one file because they are the reader's marks on one document, and the
+/// array's per-entry compatibility rule keeps them safe together:
 ///
 /// * **Forward compatibility.** A sidecar written by a newer Lyra can hold entries this
 ///   version cannot draw: an `ink` kind, a `color` value in a shape this version does not
@@ -10,6 +12,14 @@ import Foundation
 ///   an older version refuse the file and, if the reader forced a reset, destroy entries the
 ///   newer version still needs. Instead the *raw text* of such an entry is kept and written
 ///   back untouched, so the file round-trips through this version unchanged.
+/// * **Bookmarks and older builds.** A bookmark is written with `"kind": "bookmark"`, which
+///   no annotation-only build understands. Such a build classifies it as an entry it cannot
+///   interpret — before it ever looks at `page` or `title` — and preserves its exact JSON
+///   text. That is why bookmarks can share this file without an older build misreading one as
+///   a broken highlight: the tag comes first. This build reads those entries back as
+///   `Bookmark`; a *newer* build may add bookmark fields, which this version then preserves
+///   verbatim in the same way. The compatibility machinery is per entry, so neither direction
+///   has to know the other's schema.
 /// * **Colour, and why the two encodings exist.** An annotation's colour used to be an index
 ///   into a four-entry palette (`colorIndex`); it is now an `AnnotationColor` written as
 ///   `"color": "#RRGGBBAA"`, because a PDF annotated by somebody else carries colours no
@@ -36,12 +46,15 @@ enum AnnotationSidecar {
         /// An entry this version understands; looking it up by id in the current array keeps
         /// edits, undo and redo working without a second copy of the data.
         case annotation(UUID)
+        /// A bookmark this version understands; its array order is the reader's order.
+        case bookmark(UUID)
         /// Verbatim JSON text of an entry this version does not understand.
         case opaque(String)
     }
 
     struct Contents {
         var annotations: [AppState.Annotation]
+        var bookmarks: [Bookmark]
         var slots: [Slot]
 
         var preservedCount: Int {
@@ -62,10 +75,17 @@ enum AnnotationSidecar {
         }
     }
 
-    /// Keys this version knows how to interpret. An entry carrying anything else is preserved
-    /// rather than parsed: guessing at a newer schema risks writing back a half-understood entry.
-    private static let knownKeys: Set<String> = [
+    /// Keys this version knows how to interpret on an annotation entry. An entry carrying
+    /// anything else is preserved rather than parsed: guessing at a newer schema risks writing
+    /// back a half-understood entry.
+    private static let knownAnnotationKeys: Set<String> = [
         "id", "kind", "page", "start", "end", "color", "colorIndex", "note", "createdAt",
+    ]
+
+    /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
+    /// encoder; a newer build's additional key makes this build preserve the whole entry.
+    private static let knownBookmarkKeys: Set<String> = [
+        "id", "kind", "page", "title", "yPt", "createdAt",
     ]
 
     // MARK: - Loading
@@ -74,8 +94,10 @@ enum AnnotationSidecar {
         let elements = try JSONArrayElements.parse(data)
 
         var annotations: [AppState.Annotation] = []
+        var bookmarks: [Bookmark] = []
         var slots: [Slot] = []
         var seenIDs = Set<UUID>()
+        var seenBookmarkIDs = Set<UUID>()
 
         for element in elements {
             let elementData = Data(element.utf8)
@@ -83,11 +105,38 @@ enum AnnotationSidecar {
                 throw SidecarError.structure("an entry is not a JSON object")
             }
 
+            let kindText = object["kind"] as? String
+
+            // A bookmark is classified before the annotation rules are applied. The `kind`
+            // tag is what an annotation-only build sees first too, and it preserves the
+            // entry because "bookmark" is a kind it cannot draw.
+            if kindText == Bookmark.sidecarKind {
+                let unknownKeys = Set(object.keys).subtracting(knownBookmarkKeys)
+                guard unknownKeys.isEmpty else {
+                    slots.append(.opaque(element))
+                    continue
+                }
+                guard let bookmark = try? JSONDecoder().decode(Bookmark.self, from: elementData) else {
+                    throw SidecarError.structure("a bookmark is missing a required field")
+                }
+                guard bookmark.page >= 0, bookmark.page < pageCount else {
+                    throw SidecarError.structure("bookmark page \(bookmark.page + 1) is outside the document")
+                }
+                guard bookmark.yPt.isFinite, bookmark.yPt >= 0 else {
+                    throw SidecarError.structure("bookmark position \(bookmark.yPt) is invalid")
+                }
+                guard seenBookmarkIDs.insert(bookmark.id).inserted else {
+                    throw SidecarError.structure("duplicate bookmark identity")
+                }
+                bookmarks.append(bookmark)
+                slots.append(.bookmark(bookmark.id))
+                continue
+            }
+
             // Decide whether this version can interpret the entry at all. Anything it cannot
             // interpret is kept verbatim and skipped while rendering — never dropped, and
             // never a reason to reject the whole file.
-            let unknownKeys = Set(object.keys).subtracting(knownKeys)
-            let kindText = object["kind"] as? String
+            let unknownKeys = Set(object.keys).subtracting(knownAnnotationKeys)
             let kindUnderstood = kindText == nil
                 || AppState.Annotation.Kind(rawValue: kindText ?? "") != nil
             // Either colour shape counts as understood: this version's `color`, or the older
@@ -122,49 +171,75 @@ enum AnnotationSidecar {
             slots.append(.annotation(annotation.id))
         }
 
-        return Contents(annotations: annotations, slots: slots)
+        return Contents(annotations: annotations, bookmarks: bookmarks, slots: slots)
     }
 
     // MARK: - Saving
 
-    /// The bytes to write for `annotations`, in the sidecar's original entry order, with the
-    /// preserved entries reproduced verbatim.
+    /// The bytes to write for `annotations` and `bookmarks`, in the sidecar's original entry
+    /// order, with the preserved entries reproduced verbatim.
     ///
     /// Note the shape of the output: entries this version understands go through `JSONEncoder`
     /// (`.prettyPrinted, .sortedKeys`, as before this change), so a file with no foreign
     /// entries is byte-identical to what the previous implementation wrote. Foreign entries are
     /// spliced in as the exact text they had in the file they came from.
-    static func encode(annotations: [AppState.Annotation], slots: [Slot]) throws -> Data {
+    static func encode(
+        annotations: [AppState.Annotation],
+        bookmarks: [Bookmark],
+        slots: [Slot]
+    ) throws -> Data {
         var pieces: [Piece] = []
-        var pending: [AppState.Annotation] = []
-        var emitted = Set<UUID>()
+        var pendingAnnotations: [AppState.Annotation] = []
+        var pendingBookmarks: [Bookmark] = []
+        var emittedAnnotations = Set<UUID>()
+        var emittedBookmarks = Set<UUID>()
 
-        func closePendingRun() {
-            guard !pending.isEmpty else { return }
-            pieces.append(.understood(pending))
-            pending = []
+        func closePendingRuns() {
+            if !pendingAnnotations.isEmpty {
+                pieces.append(.annotations(pendingAnnotations))
+                pendingAnnotations = []
+            }
+            if !pendingBookmarks.isEmpty {
+                pieces.append(.bookmarks(pendingBookmarks))
+                pendingBookmarks = []
+            }
         }
 
         for slot in slots {
             switch slot {
             case .opaque(let raw):
-                closePendingRun()
+                closePendingRuns()
                 pieces.append(.foreign(raw))
             case .annotation(let id):
+                // Leaving a bookmark run flushes it, so an interleaved file keeps its order.
+                if !pendingBookmarks.isEmpty { closePendingRuns() }
                 // Absent means the entry was deleted; a second slot for the same id (only
                 // possible in a hand-edited file) is ignored.
-                guard !emitted.contains(id),
+                guard !emittedAnnotations.contains(id),
                       let annotation = annotations.first(where: { $0.id == id }) else { continue }
-                emitted.insert(id)
-                pending.append(annotation)
+                emittedAnnotations.insert(id)
+                pendingAnnotations.append(annotation)
+            case .bookmark(let id):
+                if !pendingAnnotations.isEmpty { closePendingRuns() }
+                guard !emittedBookmarks.contains(id),
+                      let bookmark = bookmarks.first(where: { $0.id == id }) else { continue }
+                emittedBookmarks.insert(id)
+                pendingBookmarks.append(bookmark)
             }
         }
-        for annotation in annotations where !emitted.contains(annotation.id) {
-            pending.append(annotation)
+        for annotation in annotations where !emittedAnnotations.contains(annotation.id) {
+            if !pendingBookmarks.isEmpty { closePendingRuns() }
+            pendingAnnotations.append(annotation)
         }
-        closePendingRun()
+        closePendingRuns()
+        for bookmark in bookmarks where !emittedBookmarks.contains(bookmark.id) {
+            pendingBookmarks.append(bookmark)
+        }
+        closePendingRuns()
 
-        guard !pieces.isEmpty else { return try encoder().encode([AppState.Annotation]()) }
+        guard !pieces.isEmpty else {
+            return try encoder().encode([AppState.Annotation]())
+        }
 
         var lines: [String] = []
         for piece in pieces {
@@ -173,7 +248,9 @@ enum AnnotationSidecar {
                 // `raw` starts at the entry's first byte (`{`); the two spaces put it back at
                 // the array's indentation level. Its own interior text is untouched.
                 lines.append("  " + raw)
-            case .understood(let run):
+            case .annotations(let run):
+                lines.append(try entriesBody(of: try encoder().encode(run)))
+            case .bookmarks(let run):
                 lines.append(try entriesBody(of: try encoder().encode(run)))
             }
         }
@@ -182,7 +259,8 @@ enum AnnotationSidecar {
     }
 
     private enum Piece {
-        case understood([AppState.Annotation])
+        case annotations([AppState.Annotation])
+        case bookmarks([Bookmark])
         case foreign(String)
     }
 

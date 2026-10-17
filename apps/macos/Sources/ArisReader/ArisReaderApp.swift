@@ -116,6 +116,32 @@ struct ReaderCommands: Commands {
 
             Divider()
 
+            Button("Add Bookmark") { session?.state.addBookmarkAtCurrentPage() }
+                .keyboardShortcut("d", modifiers: .command)
+                .disabled(session?.state.document == nil)
+
+            Menu("Page Layout") {
+                Button("Continuous") { session?.state.setLayoutMode(.continuous) }
+                    .keyboardShortcut("1", modifiers: .command)
+                    .disabled(session == nil)
+                Button("Facing Pages") { session?.state.setLayoutMode(.facing) }
+                    .keyboardShortcut("3", modifiers: .command)
+                    .disabled(session == nil)
+                Divider()
+                Button("Increase Page Gap") {
+                    guard let state = session?.state else { return }
+                    state.setPageGap(state.pageGapPt + 4)
+                }
+                .disabled(session == nil)
+                Button("Decrease Page Gap") {
+                    guard let state = session?.state else { return }
+                    state.setPageGap(state.pageGapPt - 4)
+                }
+                .disabled(session == nil)
+            }
+
+            Divider()
+
             Button("Zoom In") { session?.state.zoomIn() }
                 .keyboardShortcut("+", modifiers: .command)
                 .disabled(session == nil)

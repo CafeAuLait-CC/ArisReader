@@ -266,6 +266,23 @@ public struct ReaderWindow: View {
             .help("Underline the selection")
 
             Button {
+                state.addBookmarkAtCurrentPage()
+            } label: {
+                Image(systemName: "bookmark.badge.plus")
+            }
+            .disabled(state.document == nil)
+            .help("Add bookmark (⌘D)")
+
+            Button {
+                state.toggleFacingPages()
+            } label: {
+                Image(systemName: state.layoutMode == .facing
+                    ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+            }
+            .disabled(state.document == nil)
+            .help(state.layoutMode == .facing ? "Continuous pages (⌘1)" : "Facing pages (⌘3)")
+
+            Button {
                 state.undo()
             } label: {
                 Image(systemName: "arrow.uturn.backward")
@@ -322,6 +339,8 @@ public struct ReaderWindow: View {
 public struct SettingsView: View {
     @ObservedObject private var registry: ReaderWindowRegistry
     @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
+    @AppStorage(ReadingLayoutPreferences.layoutKey) private var layoutRaw = ReaderLayoutMode.continuous.rawValue
+    @AppStorage(ReadingLayoutPreferences.gapKey) private var pageGapPt = Double(ReadingLayoutPreferences.defaultGapPt)
 
     public init(registry: ReaderWindowRegistry) {
         self.registry = registry
@@ -345,6 +364,32 @@ public struct SettingsView: View {
             .tabItem { Label("Performance", systemImage: "speedometer") }
 
             Form {
+                Picker("Page layout", selection: layoutBinding) {
+                    ForEach(ReaderLayoutMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                HStack {
+                    Text("Page gap")
+                    Slider(value: $pageGapPt, in: pageGapRange, step: 1)
+                        .onChange(of: pageGapPt) { _, _ in registry.applyReadingLayoutSetting() }
+                    Text("\(Int(pageGapPt.rounded())) pt")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .frame(width: 48, alignment: .trailing)
+                }
+
+                Text("Facing pages show page 1 alone, then pages 2–3 side by side. "
+                     + "Both settings are remembered for the reader and apply to every window immediately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(20)
+            .tabItem { Label("Reading", systemImage: "book") }
+
+            Form {
                 Text("AI provider configuration, keys (Keychain), and privacy toggles arrive in M5 (T5.1 / T5.2).")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -352,7 +397,21 @@ public struct SettingsView: View {
             .padding(20)
             .tabItem { Label("AI", systemImage: "sparkles") }
         }
-        .frame(width: 460, height: 260)
+        .frame(width: 480, height: 300)
+    }
+
+    private var layoutBinding: Binding<ReaderLayoutMode> {
+        Binding(
+            get: { ReaderLayoutMode(rawValue: layoutRaw) ?? .continuous },
+            set: { mode in
+                layoutRaw = mode.rawValue
+                registry.applyReadingLayoutSetting()
+            }
+        )
+    }
+
+    private var pageGapRange: ClosedRange<Double> {
+        Double(ReadingLayoutPreferences.gapRange.lowerBound)...Double(ReadingLayoutPreferences.gapRange.upperBound)
     }
 }
 

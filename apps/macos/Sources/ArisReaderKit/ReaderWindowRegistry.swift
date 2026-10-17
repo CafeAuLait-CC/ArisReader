@@ -294,4 +294,15 @@ public final class ReaderWindowRegistry: ObservableObject {
         for session in sessions { session.state.applyCacheBudgetSetting() }
         settingsStateStorage?.applyCacheBudgetSetting()
     }
+
+    /// Adopts the stored facing/gap preferences in *every* window.
+    ///
+    /// The layout is a reading preference, not document content: a reader who switches to
+    /// facing pages in one window expects the others to follow (and the next launch to remember
+    /// it). The `@AppStorage` slider already wrote the value; this is what makes existing
+    /// states rebuild their geometry from it.
+    public func applyReadingLayoutSetting() {
+        for session in sessions { session.state.adoptStoredReadingLayoutPreferences() }
+        settingsStateStorage?.adoptStoredReadingLayoutPreferences()
+    }
 }

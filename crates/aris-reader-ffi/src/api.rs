@@ -15,7 +15,7 @@ use aris_reader_core::{
     RasterRequest,
 };
 use aris_reader_pdfium::{PdfiumBackend, backend_description};
-use aris_reader_session::DocumentLayout;
+use aris_reader_session::{DocumentLayout, LayoutMode};
 use std::sync::{Arc, Mutex};
 
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
@@ -66,6 +66,26 @@ pub struct DocumentSummary {
     pub is_encrypted: bool,
     /// Which backend produced this summary (for diagnostics in the UI).
     pub backend: String,
+}
+
+/// How the session lays pages out horizontally.
+///
+/// Separate from the older [`aris_reader_session::Layout`] command enum because only the two
+/// modes the shell can actually draw cross the FFI boundary today. `Facing` means the book
+/// convention: page 1 alone, then 2–3, 4–5, … with odd pages on the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReaderLayout {
+    Continuous,
+    Facing,
+}
+
+impl ReaderLayout {
+    fn session(self) -> LayoutMode {
+        match self {
+            Self::Continuous => LayoutMode::Continuous,
+            Self::Facing => LayoutMode::Facing,
+        }
+    }
 }
 
 /// The engine handle owned by the shell.
@@ -176,8 +196,8 @@ pub struct ArisDocument {
     /// Page sizes in points, filled on first layout request (a 2000-page manual would
     /// otherwise pay for every box at open time).
     page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
-    /// Last computed layout, keyed by the page gap it was built for.
-    layout: Mutex<Option<(f64, Arc<DocumentLayout>)>>,
+    /// Last computed layout, keyed by the mode and page gap it was built for.
+    layout: Mutex<Option<(ReaderLayout, f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list, with the citation style it implies (scanning the tail pages is
     /// not free, and neither ever changes while the document is open).
     references: Mutex<Option<ReferenceCache>>,
@@ -867,37 +887,63 @@ impl ArisDocument {
         Ok(records)
     }
 
-    /// Total height of the scrolling content for the given page gap.
-    pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
-        self.layout(gap_pt).content_height_pt()
+    /// Total height of the scrolling content for the given page gap and layout.
+    ///
+    /// The three-argument `content_height_pt` below is the continuous mode this reader
+    /// shipped before facing pages existed; it stays for callers that only know one layout.
+    pub fn content_height_pt_for(&self, layout: ReaderLayout, gap_pt: f64) -> f64 {
+        self.layout(layout, gap_pt).content_height_pt()
     }
 
-    /// Width of the widest page (pages are centred horizontally).
+    /// Total height of the scrolling content in continuous layout.
+    pub fn content_height_pt(&self, gap_pt: f64) -> f64 {
+        self.content_height_pt_for(ReaderLayout::Continuous, gap_pt)
+    }
+
+    /// Width of the widest page, or of the whole spread in facing layout.
+    pub fn content_width_pt_for(&self, layout: ReaderLayout, gap_pt: f64) -> f64 {
+        self.layout(layout, gap_pt).content_width_pt()
+    }
+
+    /// Width of the widest page in continuous layout.
     pub fn content_width_pt(&self, gap_pt: f64) -> f64 {
-        self.layout(gap_pt).content_width_pt()
+        self.content_width_pt_for(ReaderLayout::Continuous, gap_pt)
     }
 
     /// Top edge of a page in content space (for "go to page" and anchoring).
+    pub fn page_top_pt_for(&self, page: u32, layout: ReaderLayout, gap_pt: f64) -> f64 {
+        self.layout(layout, gap_pt).page_top_pt(page).unwrap_or(0.0)
+    }
+
+    /// Top edge of a page in continuous layout.
     pub fn page_top_pt(&self, page: u32, gap_pt: f64) -> f64 {
-        self.layout(gap_pt).page_top_pt(page).unwrap_or(0.0)
+        self.page_top_pt_for(page, ReaderLayout::Continuous, gap_pt)
     }
 
     /// Page occupying the viewport top — the "current page" for the HUD.
+    ///
+    /// In facing layout a spread names its left page (see `DocumentLayout::page_at`).
+    pub fn page_index_at_for(&self, scroll_y_pt: f64, layout: ReaderLayout, gap_pt: f64) -> u32 {
+        self.layout(layout, gap_pt).page_at(scroll_y_pt)
+    }
+
+    /// Page occupying the viewport top in continuous layout.
     pub fn page_index_at(&self, scroll_y_pt: f64, gap_pt: f64) -> u32 {
-        self.layout(gap_pt).page_at(scroll_y_pt)
+        self.page_index_at_for(scroll_y_pt, ReaderLayout::Continuous, gap_pt)
     }
 
     /// Pages overlapping the viewport, in reading order.
     ///
     /// `margin_pt` widens the window so the shell can prefetch the next page.
-    pub fn visible_pages(
+    pub fn visible_pages_for(
         &self,
         scroll_y_pt: f64,
         viewport_height_pt: f64,
+        layout: ReaderLayout,
         gap_pt: f64,
         margin_pt: f64,
     ) -> Vec<PagePlacementRecord> {
-        self.layout(gap_pt)
+        self.layout(layout, gap_pt)
             .visible_pages(scroll_y_pt, viewport_height_pt, margin_pt)
             .iter()
             .map(|page| PagePlacementRecord {
@@ -909,26 +955,51 @@ impl ArisDocument {
             })
             .collect()
     }
+
+    /// Pages overlapping the viewport in continuous layout.
+    pub fn visible_pages(
+        &self,
+        scroll_y_pt: f64,
+        viewport_height_pt: f64,
+        gap_pt: f64,
+        margin_pt: f64,
+    ) -> Vec<PagePlacementRecord> {
+        self.visible_pages_for(
+            scroll_y_pt,
+            viewport_height_pt,
+            ReaderLayout::Continuous,
+            gap_pt,
+            margin_pt,
+        )
+    }
 }
 
 impl ArisDocument {
-    /// Builds (and caches) the layout for `gap_pt`.
-    fn layout(&self, gap_pt: f64) -> Arc<DocumentLayout> {
+    /// Builds (and caches) the layout for `layout` and `gap_pt`.
+    ///
+    /// The cache key carries both: the same gap produces a different layout in facing mode,
+    /// and a mode switch must not be answered from the previous mode's placements.
+    fn layout(&self, layout: ReaderLayout, gap_pt: f64) -> Arc<DocumentLayout> {
         // Rust 2024 let-chains keep the lookups flat.
         if let Ok(cache) = self.layout.lock()
-            && let Some((cached_gap, layout)) = cache.as_ref()
+            && let Some((cached_layout, cached_gap, placements)) = cache.as_ref()
+            && *cached_layout == layout
             && (*cached_gap - gap_pt).abs() < f64::EPSILON
         {
-            return Arc::clone(layout);
+            return Arc::clone(placements);
         }
 
         let sizes = self.page_sizes();
-        let layout = Arc::new(DocumentLayout::new(sizes.iter().copied(), gap_pt));
+        let placements = Arc::new(DocumentLayout::new_with_mode(
+            sizes.iter().copied(),
+            gap_pt,
+            layout.session(),
+        ));
 
         if let Ok(mut cache) = self.layout.lock() {
-            *cache = Some((gap_pt, Arc::clone(&layout)));
+            *cache = Some((layout, gap_pt, Arc::clone(&placements)));
         }
-        layout
+        placements
     }
 
     /// Page sizes in points, computed once and cached.

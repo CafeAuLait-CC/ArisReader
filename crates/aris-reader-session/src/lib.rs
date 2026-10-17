@@ -13,7 +13,7 @@ pub mod viewport;
 
 pub use command::{Anchor, Command, Event, Layout, Zoom};
 pub use keymap::{CommandId, Key, KeyBinding, Modifiers, default_keymap, lookup};
-pub use layout::{DocumentLayout, PagePlacement};
+pub use layout::{DocumentLayout, LayoutMode, PagePlacement};
 pub use viewport::{Viewport, resolve_zoom};
 
 use aris_reader_core::{Destination, DocId, PageIndex, Rect, Size};

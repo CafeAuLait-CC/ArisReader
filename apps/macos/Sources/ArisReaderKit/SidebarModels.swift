@@ -254,3 +254,33 @@ public extension DocumentAnnotation {
         return display.string(from: date)
     }
 }
+
+/// One page's bookmarks, in the reader's own order.
+public struct BookmarkGroup: Identifiable {
+    public let page: Int
+    public let bookmarks: [Bookmark]
+
+    public var id: Int { page }
+
+    public var title: String {
+        bookmarks.count == 1 ? "Page \(page + 1) · 1 bookmark"
+            : "Page \(page + 1) · \(bookmarks.count) bookmarks"
+    }
+}
+
+/// The sidebar's bookmark grouping, kept apart from the view so it can be checked directly.
+///
+/// A bookmark list is the reader's outline, not a sorted index: the order is whatever they set
+/// with the move commands. Grouping therefore preserves first appearance — a page's section
+/// sits where its first bookmark is — and within a section the array order is kept.
+public enum BookmarkGrouping {
+    public static func groups(for bookmarks: [Bookmark]) -> [BookmarkGroup] {
+        var pageOrder: [Int] = []
+        var byPage: [Int: [Bookmark]] = [:]
+        for bookmark in bookmarks {
+            if byPage[bookmark.page] == nil { pageOrder.append(bookmark.page) }
+            byPage[bookmark.page, default: []].append(bookmark)
+        }
+        return pageOrder.map { BookmarkGroup(page: $0, bookmarks: byPage[$0] ?? []) }
+    }
+}
