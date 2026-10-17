@@ -2101,16 +2101,17 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
     order.sort_by(|left, right| {
         let a = &raw.chars[*left];
         let b = &raw.chars[*right];
-        b.rect
-            .origin
+        // Sort by the *baseline* origin, not by the bottom of the ink box: a descender's box
+        // reaches lower than a capital's, and grouping on that bottom split one printed line
+        // into a dozen fragments. `RawCharBox::origin` is the text origin PDFium reports.
+        b.origin
             .y
-            .partial_cmp(&a.rect.origin.y)
+            .partial_cmp(&a.origin.y)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(
-                a.rect
-                    .origin
+                a.origin
                     .x
-                    .partial_cmp(&b.rect.origin.x)
+                    .partial_cmp(&b.origin.x)
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
@@ -2136,6 +2137,9 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
     let max_advance = (median_width * 3.0).max(15.0);
 
     let mut lines: Vec<TextLine> = Vec::new();
+    // The baseline each line was started at. `TextLine::rect` is the union of ink boxes and
+    // its bottom is not a baseline, so the two cannot share one field.
+    let mut baselines: Vec<f64> = Vec::new();
     let mut visible_right: Vec<f64> = Vec::new();
     let mut pending_break = false;
 
@@ -2153,16 +2157,17 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
         }
 
         if is_space {
-            // Attach to the current line without moving its measured right edge.
-            if let Some(line) = lines.last_mut() {
-                line.rect = union_rect(line.rect, character.rect);
-                line.range.end = line.range.end.max(index as u32 + 1);
-                push_ink(line, character.rect);
-                if let Some(character) = decoded {
-                    line.text.push(character);
-                }
-                continue;
-            }
+            // A whitespace character never starts a line.
+            //
+            // PDFium reports the spaces of a line at the *space's own* y, which need not equal
+            // the glyph baseline: on the twelve-paper corpus, several arXiv/LaTeX files place a
+            // line's spaces a few points above it. Sorting by baseline then put every space in a
+            // zero-height line of its own, and the real line lost its word breaks ("thequick").
+            // Whitespace is therefore not copied into the text at all; the gap between adjacent
+            // glyph boxes is the reliable evidence of a word break, and is turned into one space
+            // below. `pending_break` deliberately survives a space, so a newline followed by
+            // indentation still starts a new line at the next glyph.
+            continue;
         }
 
         let starts_new_line = match lines.last() {
@@ -2172,9 +2177,10 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
                     .last()
                     .copied()
                     .unwrap_or(line.rect.origin.x + line.rect.size.width);
+                let baseline = baselines.last().copied().unwrap_or(line.rect.origin.y);
                 pending_break
-                    || (line.rect.origin.y - character.rect.origin.y).abs() > tolerance
-                    || character.rect.origin.x - reference > max_advance
+                    || (baseline - character.origin.y).abs() > tolerance
+                    || character.origin.x - reference > max_advance
             }
         };
 
@@ -2187,11 +2193,21 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
             };
             push_ink(&mut line, character.rect);
             lines.push(line);
+            baselines.push(character.origin.y);
             visible_right.push(character.rect.origin.x + character.rect.size.width);
         } else if let Some(line) = lines.last_mut() {
+            let reference = visible_right
+                .last()
+                .copied()
+                .unwrap_or(line.rect.origin.x + line.rect.size.width);
+            let gap = character.origin.x - reference;
             line.rect = union_rect(line.rect, character.rect);
             line.range.end = line.range.end.max(index as u32 + 1);
             if let Some(character) = decoded {
+                // Wider than kerning: this is the space the producer did not draw as a glyph.
+                if gap > INK_RUN_GAP_PT && !line.text.is_empty() && !line.text.ends_with(' ') {
+                    line.text.push(' ');
+                }
                 line.text.push(character);
             }
             push_ink(line, character.rect);

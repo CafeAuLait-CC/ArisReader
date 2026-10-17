@@ -776,6 +776,18 @@ impl DocumentBackend for PdfiumBackend {
                 ArisError::new(ErrorCode::RenderFailed, "PDFium reported no character box")
                     .with_detail(format!("page {} → {error}", page.get()))
             })?;
+            // The baseline origin, not the bottom of the ink box. `loose_bounds().bottom()` is
+            // the bottom of the glyph's ink, which sits at a different height for a descender
+            // (`g`) than for a capital (`H`); grouping characters into lines by it split one
+            // printed line into several, and a page of text came out as fragments like
+            // "ENERATION FROM3D H EMONSTRATIONSV". PDFium's own text origin is the baseline.
+            let (origin_x, origin_y) = character.origin().map_err(|error| {
+                ArisError::new(
+                    ErrorCode::RenderFailed,
+                    "PDFium reported no character origin",
+                )
+                .with_detail(format!("page {} → {error}", page.get()))
+            })?;
             let unicode = character
                 .unicode_char()
                 .map(u32::from)
@@ -783,10 +795,7 @@ impl DocumentBackend for PdfiumBackend {
 
             chars.push(RawCharBox {
                 rect: rect_from_pdf(bounds),
-                origin: Point::new(
-                    f64::from(bounds.left().value),
-                    f64::from(bounds.bottom().value),
-                ),
+                origin: Point::new(f64::from(origin_x.value), f64::from(origin_y.value)),
                 unicode,
                 // `PdfPageTextChar::font_size` is not usable here (its trait bounds are
                 // not satisfied); the loose box height is a good stand-in for selection UI.
