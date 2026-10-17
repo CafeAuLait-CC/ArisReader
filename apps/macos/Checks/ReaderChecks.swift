@@ -39,6 +39,12 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        if CommandLine.arguments.contains("--check-hosted-preview") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await hostedPreviewChecks(root: root)
+            return
+        }
         // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -202,6 +208,7 @@ struct ReaderChecks {
         try await annotationNoteChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         placementIndexChecks()
+        try await hostedPreviewChecks(root: root)
         try await previewChecks(url: b)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()
