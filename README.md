@@ -15,10 +15,22 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 > `ARIS_READER_*`, Swift targets `ArisReaderKit` / `ArisReaderFFI`). Suite-level shared modules will claim the `aris-*`
 > prefix later, to avoid ambiguity.
 
-Current status: **M1–M4 have working core paths and remain under active development**. The reader
+Current status: **M1–M5 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
 tabs, sidecar highlights/underlines/notes, citation/figure/table/algorithm previews, and document
 metadata recognition with per-field provenance plus BibTeX export.
+Those annotations can be written back into a PDF: saving an annotated copy, or replacing the
+original after a verified backup, appends real PDF annotations with quads, colour, opacity, author
+and date through an incremental save that leaves every pre-existing annotation byte-identical.
+Replacing the original also removes exactly the sidecar entries it saved, so nothing appears twice;
+a saved copy carries no sidecar and shows each annotation once, from the file. Pages can be rotated,
+deleted, reordered, inserted and extracted through a staged session whose undo covers the whole
+session; the file on disk stays untouched until the reader applies the changes, and applying writes
+a verified backup before replacing anything. An optional AI assistant speaks the OpenAI-compatible
+chat API, so a hosted service or a local Ollama works with nothing but a base URL, a model and a
+key: it summarises a page or a long document, answers about a selection and translates one, previews
+exactly what will be sent before anything leaves the machine, streams, cancels and retries, and keeps
+the key in the Keychain rather than in any file or log.
 At ordinary zoom, the reader presents one page raster at the screen's actual resolution and prepares
 nearby pages on every scroll update; a facing-page mode shows page 1 alone and 2–3/4–5 spreads with a
 configurable gap, and named user bookmarks ride in the same sidecar as the reader's annotations. Page rasters and tiles share the configured byte budget, so lower
@@ -35,6 +47,15 @@ full review record (findings, evidence and follow-ups) is kept with the project'
 this repository. Concrete
 fixes, validation evidence and outstanding work. PDFium remains serialized within a process;
 background execution does not imply parallel PDFium rendering.
+
+Capabilities, each backed by a check rather than a claim: selection and click-precise text, search,
+tabs and independent windows, outline with section numbers and levels, page and annotation sidebars
+with reply threads, highlight/underline/note creation with a colour and blend, saved annotations
+inside the PDF, staged page editing, facing pages and bookmarks, citation/figure/table/algorithm
+previews with draggable panels, paper metadata and BibTeX export, and the AI assistant described
+above. Known gaps are listed in the project's design notes: ink and shape annotations, standalone
+sticky notes and text boxes, form filling, redaction and printing, an index cache, thumbnail drag
+reordering, and cross-platform shells.
 
 ---
 
