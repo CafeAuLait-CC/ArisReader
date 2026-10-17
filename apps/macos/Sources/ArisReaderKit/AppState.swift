@@ -179,6 +179,12 @@ public final class AppState: ObservableObject {
     @Published public private(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
     @Published public private(set) var isScrolling = false
+    /// True while the pointer is in the indicator's lane, so a faded-out scroller comes back as
+    /// soon as the reader reaches for it.
+    @Published public private(set) var isScrollIndicatorHovered = false
+    /// True from a press on the indicator's thumb until the release. It keeps the thumb visible
+    /// and tells the view to stop easing the thumb while the hand is on it.
+    @Published public private(set) var isDraggingScrollIndicator = false
     /// Fades the indicator out once scrolling stops.
     private var scrollIdleTask: Task<Void, Never>?
     /// Debounces writing the reading position to `UserDefaults`.
@@ -1533,6 +1539,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         scrollYPt = 0
         contentHeightPt = 0
         contentWidthPt = 0
+        // The next document starts still, with no pointer or drag left over from the old one:
+        // both would otherwise keep the fresh indicator visible for a document nobody touched.
+        scrollIdleTask?.cancel()
+        scrollIdleTask = nil
+        isScrolling = false
+        isScrollIndicatorHovered = false
+        isDraggingScrollIndicator = false
     }
 
     public func zoomIn() {
@@ -2362,10 +2375,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return Double(min(max(viewportHeightContentPt / contentHeightPt, 0.02), 1))
     }
 
-    /// Whether the indicator should be visible: only while scrolling, and only when there is
-    /// something to scroll.
+    /// Whether the document is longer than the viewport: there is something to scroll, so there
+    /// is a scroller to show and to grab.
+    public var hasScrollableContent: Bool {
+        contentHeightPt > viewportHeightContentPt
+    }
+
+    /// Whether the indicator accepts pointer input.
+    ///
+    /// This is the document's own fact, deliberately **not** `isScrolling`. The indicator used to
+    /// be hit-testable only while a scroll was in flight (`showsScrollIndicator`, which folded in
+    /// `isScrolling`), so a reader who reached for the bar between scrolls had nothing under the
+    /// mouse to grab. A scrollable document now always has a hit-testable thumb; only the fade
+    /// depends on use, and a document that fits has neither.
+    public var scrollIndicatorIsInteractive: Bool {
+        hasScrollableContent
+    }
+
+    /// Whether the indicator is drawn. Reading is quiet: it fades in while a scroll is in flight,
+    /// while the pointer is in its lane, or while the thumb is held, and fades out when idle.
     public var showsScrollIndicator: Bool {
-        contentHeightPt > viewportHeightContentPt && isScrolling
+        hasScrollableContent && (isScrolling || isScrollIndicatorHovered || isDraggingScrollIndicator)
     }
 
     /// Scrolls to a 0…1 position (drag on the indicator).
@@ -3147,6 +3177,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard !Task.isCancelled else { return }
             self?.isScrolling = false
         }
+    }
+
+    /// The pointer entered or left the indicator's lane. Hover is input, not animation: it is
+    /// what brings the faded-out thumb back before the reader presses it.
+    public func setScrollIndicatorHovered(_ hovered: Bool) {
+        guard hovered != isScrollIndicatorHovered else { return }
+        isScrollIndicatorHovered = hovered
+    }
+
+    /// A press landed on the thumb. Any keyboard glide still in flight is dropped before the
+    /// first drag event, so the document cannot keep travelling toward a page key's destination
+    /// while the hand is moving the thumb somewhere else.
+    public func beginScrollIndicatorDrag() {
+        guard scrollIndicatorIsInteractive, !isDraggingScrollIndicator else { return }
+        isDraggingScrollIndicator = true
+        cancelScrollGlide()
+        beginScrollActivity()
+    }
+
+    /// The hand released the thumb. The idle fade starts here, exactly as it does after a scroll.
+    public func endScrollIndicatorDrag() {
+        guard isDraggingScrollIndicator else { return }
+        isDraggingScrollIndicator = false
+        beginScrollActivity()
     }
 
     /// Jumps so that `page` (0-based) sits at the top of the viewport.
