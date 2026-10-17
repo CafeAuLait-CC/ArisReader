@@ -901,10 +901,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var openDocumentNoteID: String?
 
     public var openDocumentNote: DocumentAnnotation? {
-        documentNotes.first { $0.id == openDocumentNoteID }
+        documentAnnotations.first { $0.visible && $0.id == openDocumentNoteID }
     }
 
     public func closeDocumentNote() { openDocumentNoteID = nil }
+
+    public var inlineNoteMarkers: [InlineNoteMarker] {
+        InlineNoteMarker.layout(annotations: documentAnnotations, textPages: textPages)
+    }
+
+    /// The paper belongs to the clicked label for inline notes, or the PDF's own note box.
+    public func documentNoteAnchor(_ note: DocumentAnnotation) -> CGRect? {
+        if let marker = inlineNoteMarkers.first(where: { $0.id == note.id }) {
+            return anchorViewRect(page: note.page, region: marker.rect)
+        }
+        guard let box = note.boxes.first else { return nil }
+        return anchorViewRect(page: note.page, region: CGRect(
+            x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt))
+    }
 
     /// The document's own annotations that are notes rather than markup — what the sidebar lists.
     ///
@@ -3129,26 +3143,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         closeDocumentNote()
         previewEpoch &+= 1
 
-        // A click tries four things, in this order:
-        //   1. a link annotation — the PDF's own target, and the only one that can leave the
-        //      document (a URI), so it always wins;
-        //   2. an in-text citation — `[12]`, `(Kim 2023)`;
-        //   3. a `Figure 3` / `Table 2` mention;
-        //   4. a note drawn on the page — a sticky note's icon or a free-text annotation, which
-        //      is the only way a note's contents can be reached from the page it is on.
-        // Citation before mention because the two can overlap at one point (a citation group
-        // inside a sentence that also names a figure), and the citation is the narrower,
-        // more specific match; a mention never resolves to something a citation resolves to,
-        // so nothing is lost by the order. A note is last because it is drawn *over* the text,
-        // and a link or a citation under the same point is the more specific target. Each step
-        // returns false when it has nothing — either because the point is not on a target or
-        // because its page's data is still being fetched, in which case the step has queued the
-        // click — so the chain falls through cleanly. What the chain returns no longer decides
-        // anything: the selection was already cleared above, wherever the click landed.
-        _ = followLink(at: point)
+        // A visible inline-comment label wins over text underneath it. Elsewhere, preserve
+        // navigation priority: the PDF's link, a citation, a caption mention, then a note glyph.
+        _ = openInlineNote(at: point)
+            || followLink(at: point)
             || openCitation(at: point)
             || openFigureMention(at: point)
             || openDocumentNote(at: point)
+    }
+
+    private func showDocumentNote(_ annotation: DocumentAnnotation) {
+        selectedDocumentAnnotationID = annotation.id
+        openDocumentNoteID = annotation.id
+        let text = (annotation.contents ?? "").split(whereSeparator: \.isNewline)
+            .first.map(String.init) ?? ""
+        statusMessage = text.isEmpty
+            ? "Page \(annotation.page + 1): a note with no text"
+            : "Page \(annotation.page + 1): \(text.prefix(120))"
+    }
+
+    @discardableResult
+    public func openInlineNote(at point: CGPoint) -> Bool {
+        for marker in inlineNoteMarkers.reversed() {
+            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            guard marker.rect.contains(local) else { continue }
+            showDocumentNote(documentAnnotations[marker.annotationIndex])
+            return true
+        }
+        return false
     }
 
     /// Expands a fixed-size paper beside the clicked glyph without moving the document.
@@ -3177,13 +3200,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     .insetBy(dx: -Self.noteClickSlackPt, dy: -Self.noteClickSlackPt)
                 guard hit.contains(local) else { continue }
 
-                selectedDocumentAnnotationID = annotation.id
-                openDocumentNoteID = annotation.id
-                let text = (annotation.contents ?? "").split(whereSeparator: \.isNewline)
-                    .first.map(String.init) ?? ""
-                statusMessage = text.isEmpty
-                    ? "Page \(annotation.page + 1): a note with no text"
-                    : "Page \(annotation.page + 1): \(text.prefix(120))"
+                showDocumentNote(annotation)
                 FileHandle.standardError.write(
                     Data("aris-annot: opened note \(annotation.id) (\(annotation.drawing.rawValue)) on page \(annotation.page + 1)\n".utf8)
                 )
@@ -4685,6 +4702,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
         }
+        for marker in inlineNoteMarkers {
+            let annotation = documentAnnotations[marker.annotationIndex]
+            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
+            let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: 255)
+            let opaque = AnnotationColor(red: color.red, green: color.green, blue: color.blue, alpha: 255)
+            let box = AnnotationQuadBox(xPt: marker.rect.minX, yPt: marker.rect.minY,
+                                        widthPt: marker.rect.width, heightPt: marker.rect.height)
+            guard let image = noteGlyphTexture(for: annotation, index: marker.annotationIndex,
+                                               color: opaque, boxPt: marker.rect.size) else { continue }
+            appendNoteGlyph(image, index: PlacementIndex.documentNote(marker.annotationIndex),
+                            box: box, placement: placement, annotation: annotation, to: &pages)
+        }
     }
 
     /// Hands one note glyph — an icon or a rasterized free text — to the canvas.
@@ -4764,7 +4793,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 scale: scale,
                 generation: generation
             )
-        case .markup, .skipped:
+        case .markup:
+            NoteGlyph.inlineComment(color: color, boxPt: boxPt, scale: scale, generation: generation)
+        case .skipped:
             nil
         }
         if let image { noteGlyphTextures[key] = image }

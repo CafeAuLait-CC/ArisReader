@@ -7,9 +7,8 @@ struct DocumentNoteOverlay: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if let note = state.openDocumentNote, let box = note.boxes.first,
-               let anchor = state.anchorViewRect(page: note.page, region: CGRect(
-                   x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)),
+            if let note = state.openDocumentNote,
+               let anchor = state.documentNoteAnchor(note),
                anchor.intersects(CGRect(origin: .zero, size: geometry.size)) {
                 let frame = DocumentNoteLayout.frame(anchor: anchor, viewport: geometry.size)
                 VStack(spacing: 0) {

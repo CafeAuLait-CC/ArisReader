@@ -94,6 +94,35 @@ enum NoteGlyph {
         )
     }
 
+    /// A small comment label, tinted with the markup's colour and pointing toward its line.
+    static func inlineComment(color: AnnotationColor, boxPt: CGSize, scale: CGFloat,
+                              generation: UInt64) -> PageImage? {
+        guard let (width, height) = pixelSize(boxPt, scale: scale),
+              let context = context(width: width, height: height) else { return nil }
+        let w = CGFloat(width), h = CGFloat(height)
+        let inset = max(1, scale * 0.5)
+        let tip = w * 0.17
+        let rect = CGRect(x: inset, y: inset, width: w - tip - inset * 2, height: h - inset * 2)
+        let path = CGMutablePath()
+        path.addRoundedRect(in: rect, cornerWidth: h * 0.15, cornerHeight: h * 0.15)
+        path.move(to: CGPoint(x: rect.maxX - 1, y: h * 0.27))
+        path.addLine(to: CGPoint(x: w - inset, y: h / 2))
+        path.addLine(to: CGPoint(x: rect.maxX - 1, y: h * 0.73))
+        path.closeSubpath()
+        context.addPath(path)
+        context.setFillColor(CGColor(srgbRed: CGFloat(color.red) / 255,
+                                     green: CGFloat(color.green) / 255,
+                                     blue: CGFloat(color.blue) / 255, alpha: 1))
+        context.fillPath()
+        context.setFillColor(CGColor(gray: 0.15, alpha: 0.65))
+        let dot = h * 0.14
+        for fraction: CGFloat in [0.28, 0.5, 0.72] {
+            context.fillEllipse(in: CGRect(x: rect.minX + rect.width * fraction - dot / 2,
+                                           y: h / 2 - dot / 2, width: dot, height: dot))
+        }
+        return finish(context, width: width, height: height, pointSize: boxPt, generation: generation)
+    }
+
     /// A free-text annotation's text, laid out in its own rectangle.
     ///
     /// `alignment` is `/Q` as the reader reports it (`left`, `center`, `right`); the text is

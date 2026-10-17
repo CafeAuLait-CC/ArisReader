@@ -1034,6 +1034,27 @@ def main() -> int:
     path.write_bytes(build_pdf(annotated_pages, annotated_page_fixture()))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(annotated_pages)} page(s))")
 
+    # Inline comments are /Contents on markup, rather than standalone /Text notes.
+    inline_annotations = [
+        annotation("Highlight", highlight_box(),
+                   extra=f"/QuadPoints {quad_points([body_line_box(0, 460), body_line_box(1, 360)])} /C [0.95 0.8 0.8] /NM (inline-multiline)",
+                   contents="A comment on two highlighted lines.", author="Reviewer A"),
+        annotation("Highlight", body_line_box(0, 60),
+                   extra=f"/QuadPoints {quad_points([body_line_box(0, 60)])} /C [1 0.5 0] /CA 0.4 /NM (inline-overlapping)",
+                   contents="Another comment on the same line.", author="Reviewer B"),
+        annotation("Underline", body_line_box(2, 460),
+                   extra=f"/QuadPoints {quad_points([body_line_box(2, 460)])} /C [0.2 0.6 1]",
+                   contents="An underline comment."),
+        annotation("Highlight", body_line_box(3, 200), extra="/C [1 1 0]"),
+        annotation("Highlight", body_line_box(4, 200), extra="/C [1 1 0]", contents="   "),
+        annotation("Highlight", body_line_box(5, 200), extra="/C [1 1 0]", flags=2, contents="Hidden comment."),
+        annotation("Highlight", body_line_box(6, 200), contents="A comment without quads or colour."),
+        annotation("Text", (500, 700, 520, 720), contents="A separate sticky note."),
+    ]
+    path = out_dir / "annotated-inline-notes.pdf"
+    path.write_bytes(build_pdf(annotated_pages[:1], {0: inline_annotations}))
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page)")
+
     # 6) The same idea, but with appearance streams: the annotations carry `/AP`, PDFium refuses
     #    `FPDFAnnot_GetColor` for them, and the blend mode lives in the stream's `/ExtGState`.
     #    This is what a file annotated in Preview looks like.
