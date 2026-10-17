@@ -19,10 +19,9 @@ pub use chat::{
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
 pub use mock::MockProvider;
 pub use openai::{
-    CancellationToken, ClientConfig, CurlInvocation, CurlTransport, RequestSpec, ResponseStream,
-    RunEvent, SseDecoder, SseFrame, StreamPayload, TcpTransport, TokenUsage, Transport,
-    build_request_spec, curl_invocation, default_transport, preview_headers, redact, redact_error,
-    run_plan, run_plan_with_transport,
+    CancellationToken, ClientConfig, RequestSpec, ResponseStream, RunEvent, SseDecoder, SseFrame,
+    StreamPayload, TokenUsage, Transport, UreqTransport, build_request_spec, default_transport,
+    preview_headers, redact, redact_error, run_plan, run_plan_with_transport,
 };
 pub use provider::{
     AiError, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,

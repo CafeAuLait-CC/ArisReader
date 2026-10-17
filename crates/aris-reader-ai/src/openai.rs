@@ -5,33 +5,35 @@
 //! `POST {base}/chat/completions` with a JSON body and `stream: true`; the answer arrives as
 //! server-sent events whose `data:` lines are JSON objects and whose last event is `[DONE]`.
 //!
-//! Two transports are provided:
+//! One transport is used for both schemes: [`UreqTransport`] runs `http://` and `https://`
+//! through the same ureq/rustls client. The loopback tests therefore exercise the same
+//! connection, TLS, timeout and body-reading code the app uses for a real provider; only the
+//! certificate roots differ (`with_certificates` in the tests).
 //!
-//! * [`TcpTransport`] speaks HTTP/1.1 directly for `http://` endpoints (Ollama and the tests);
-//! * [`CurlTransport`] sends the same request through the system `curl` program for `https://`
-//!   endpoints, keeping the `Authorization` header out of its argv by passing the whole request
-//!   configuration on stdin.
+//! Trust roots come from the operating system through `rustls-native-certs`. If that yields no
+//! certificates, the client falls back to ureq's bundled webpki roots. If neither is usable the
+//! handshake fails with the provider's certificate error, surfaced as a readable message.
 //!
-//! Neither transport logs. The key lives only in the request headers and, for curl, in the
-//! config written to the child's stdin.
+//! The client never logs. The key lives only in the request's `Authorization` header and in the
+//! in-process request spec; there is no shell-out and no temporary request file.
 
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::process::{Child, Command, Stdio};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use ureq::tls::{Certificate, RootCerts, TlsConfig};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::time::Duration as UreqDuration;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout,
+    Transport as UreqTransportTrait,
+};
 
 use crate::chat::{ChatPart, ChatPlan};
 use crate::provider::AiError;
-
-/// Status, reason, headers, and body bytes that followed the response head.
-type ResponseHead = (u16, String, Vec<(String, String)>, Vec<u8>);
 
 /// Default time allowed to establish a connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -257,917 +259,352 @@ pub trait Transport: Send + Sync {
     ) -> Result<Box<dyn ResponseStream>, AiError>;
 }
 
-/// Pick the transport for an endpoint: plain HTTP uses the in-process TCP client, HTTPS goes
-/// through the system `curl` (the dependency set has no TLS client crate).
+/// The one production transport. Both `http://` and `https://` go through the same ureq agent;
+/// only the `TlsConfig` is different (system roots in the app, injected roots in the TLS test).
+pub struct UreqTransport {
+    config: ClientConfig,
+    roots: RootCerts,
+}
+
+impl UreqTransport {
+    /// The production configuration: roots loaded from the operating system's trust store.
+    pub fn system(config: ClientConfig) -> Self {
+        Self {
+            config,
+            roots: system_roots(),
+        }
+    }
+
+    /// A transport with explicit roots. Used by the loopback TLS test to trust its own CA.
+    pub fn with_certificates(
+        config: ClientConfig,
+        certificates: Vec<Certificate<'static>>,
+    ) -> Self {
+        Self {
+            config,
+            roots: RootCerts::from(certificates),
+        }
+    }
+
+    /// A transport with a pre-built root set. Exposed for tests and for a future platform shell
+    /// that wants to supply its own trust policy.
+    pub fn with_roots(config: ClientConfig, roots: RootCerts) -> Self {
+        Self { config, roots }
+    }
+
+    fn make_agent(&self, cancel: &CancellationToken) -> ureq::Agent {
+        let tls = TlsConfig::builder().root_certs(self.roots.clone()).build();
+        let agent_config = ureq::Agent::config_builder()
+            // The total budget covers connect + TLS + headers + the whole stream. Idle time is
+            // enforced by CancellableTransport, which resets on every received chunk.
+            .timeout_global(Some(self.config.max_time))
+            .timeout_resolve(Some(self.config.connect_timeout))
+            .timeout_connect(Some(self.config.connect_timeout))
+            .timeout_send_request(Some(self.config.connect_timeout))
+            .timeout_send_body(Some(self.config.max_time))
+            .timeout_recv_response(None)
+            .timeout_recv_body(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .tls_config(tls)
+            .build();
+        ureq::Agent::with_parts(
+            agent_config,
+            CancellableConnector {
+                cancel: cancel.clone(),
+                idle_timeout: self.config.idle_timeout,
+            },
+            DefaultResolver::default(),
+        )
+    }
+}
+
+impl Transport for UreqTransport {
+    fn execute(
+        &self,
+        spec: &RequestSpec,
+        cancel: &CancellationToken,
+    ) -> Result<Box<dyn ResponseStream>, AiError> {
+        cancel.check()?;
+        let agent = self.make_agent(cancel);
+        let mut request = agent.post(&spec.url);
+        for (name, value) in &spec.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        // `http_status_as_error(false)` above is what makes a 401 body readable instead of an
+        // opaque status error.
+        let response = request
+            .send(&spec.body)
+            .map_err(|error| map_ureq_error(error, cancel))?;
+        let status = response.status().as_u16();
+        let reason = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect();
+        let reader: Box<dyn Read + Send> = Box::new(response.into_body().into_reader());
+        Ok(Box::new(UreqResponseStream {
+            reader,
+            status,
+            reason,
+            headers,
+            cancel: cancel.clone(),
+            done: false,
+        }))
+    }
+}
+
+/// Trust roots: the OS store first, the bundled webpki roots as a documented fallback. The
+/// result is cached because loading the platform store parses every root certificate.
+fn system_roots() -> RootCerts {
+    static ROOTS: OnceLock<RootCerts> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            let certificates: Vec<Certificate<'static>> = loaded
+                .certs
+                .iter()
+                .map(|der| Certificate::from_der(der.as_ref()).to_owned())
+                .collect();
+            if certificates.is_empty() {
+                RootCerts::WebPki
+            } else {
+                RootCerts::from(certificates)
+            }
+        })
+        .clone()
+}
+
+struct UreqResponseStream {
+    reader: Box<dyn Read + Send>,
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    cancel: CancellationToken,
+    done: bool,
+}
+
+impl ResponseStream for UreqResponseStream {
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, AiError> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; 8192];
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(AiError::Cancelled);
+            }
+            match self.reader.read(&mut buffer) {
+                Ok(0) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(read) => return Ok(Some(buffer[..read].to_vec())),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // The HTTP framing may have ended early. Treat it as EOF: run_plan then
+                    // reports the missing [DONE] rather than a misleading socket error.
+                    self.done = true;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if self.cancel.is_cancelled() {
+                        return Err(AiError::Cancelled);
+                    }
+                    let message = error.to_string();
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        || error.kind() == std::io::ErrorKind::WouldBlock
+                        || message.to_ascii_lowercase().contains("timeout")
+                    {
+                        return Err(AiError::Timeout(
+                            "the provider stopped sending data; the idle timeout expired"
+                                .to_string(),
+                        ));
+                    }
+                    return Err(AiError::Unreachable(format!(
+                        "the connection failed while reading: {message}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken) -> AiError {
+    if cancel.is_cancelled() {
+        return AiError::Cancelled;
+    }
+    match error {
+        ureq::Error::Timeout(_) => AiError::Timeout(
+            "the provider did not answer within the configured timeout".to_string(),
+        ),
+        ureq::Error::Tls(message) => {
+            AiError::Unreachable(format!("TLS handshake failed: {message}"))
+        }
+        ureq::Error::Io(error) => AiError::Unreachable(format!("the connection failed: {error}")),
+        ureq::Error::HostNotFound => {
+            AiError::Unreachable("could not resolve the provider host".to_string())
+        }
+        ureq::Error::BadUri(message) => {
+            AiError::InvalidSettings(format!("The endpoint URL is not valid: {message}"))
+        }
+        other => AiError::Unreachable(format!("the HTTP request failed: {other}")),
+    }
+}
+
+fn cancelled_ureq_error() -> ureq::Error {
+    ureq::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "request cancelled",
+    ))
+}
+
+/// Ensures the connection is handed to a transport that notices cancellation between short
+/// socket reads. Ureq itself is blocking; the adapter bounds each inner read to
+/// [`POLL_INTERVAL`] (or the remaining idle budget), checks the cancel flag, and then retries.
+/// That is what keeps a stalled provider from making Cancel wait forever.
+#[derive(Debug)]
+struct CancellableConnector {
+    cancel: CancellationToken,
+    idle_timeout: Duration,
+}
+
+impl Connector<()> for CancellableConnector {
+    type Out = Box<dyn UreqTransportTrait>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        let Some(inner) = DefaultConnector::new().connect(details, chained)? else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(CancellableTransport {
+            inner,
+            cancel: self.cancel.clone(),
+            idle_timeout: self.idle_timeout,
+            last_activity: Instant::now(),
+        })))
+    }
+}
+
+struct CancellableTransport {
+    inner: Box<dyn UreqTransportTrait>,
+    cancel: CancellationToken,
+    idle_timeout: Duration,
+    last_activity: Instant,
+}
+
+impl fmt::Debug for CancellableTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancellableTransport")
+            .field("idle_timeout", &self.idle_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UreqTransportTrait for CancellableTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        if self.cancel.is_cancelled() {
+            return Err(cancelled_ureq_error());
+        }
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let requested = timeout.not_zero().map(|remaining| *remaining);
+        let started = Instant::now();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(cancelled_ureq_error());
+            }
+            let now = Instant::now();
+            let idle_elapsed = now.duration_since(self.last_activity);
+            if idle_elapsed >= self.idle_timeout {
+                return Err(ureq::Error::Timeout(ureq::Timeout::RecvBody));
+            }
+            let mut wait = self.idle_timeout.saturating_sub(idle_elapsed);
+            if let Some(requested) = requested {
+                let remaining = requested.saturating_sub(now.duration_since(started));
+                if remaining.is_zero() {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                wait = wait.min(remaining);
+            }
+            let poll = wait.min(POLL_INTERVAL).max(Duration::from_millis(1));
+            match self.inner.await_input(NextTimeout {
+                after: UreqDuration::Exact(poll),
+                reason: timeout.reason,
+            }) {
+                Ok(progress) => {
+                    if progress {
+                        self.last_activity = Instant::now();
+                    }
+                    return Ok(progress);
+                }
+                // The short poll expired; this is not the request's timeout. Re-check the
+                // cancel flag and the real idle/global deadline.
+                Err(ureq::Error::Timeout(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+/// Pick the transport for an endpoint. This is intentionally the same implementation for both
+/// schemes: only the TLS configuration (and therefore whether a handshake happens) differs.
 pub fn default_transport(url: &str, config: ClientConfig) -> Result<Box<dyn Transport>, AiError> {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://") {
-        Ok(Box::new(TcpTransport::new(config)))
-    } else if lower.starts_with("https://") {
-        Ok(Box::new(CurlTransport::new(config)))
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Ok(Box::new(UreqTransport::system(config)))
     } else {
         Err(AiError::InvalidSettings(
             "The endpoint must use http:// or https://.".to_string(),
         ))
     }
-}
-
-// ── Plain HTTP transport ────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-struct HttpTarget {
-    host: String,
-    port: u16,
-    path: String,
-    host_header: String,
-}
-
-pub struct TcpTransport {
-    config: ClientConfig,
-}
-
-impl TcpTransport {
-    pub fn new(config: ClientConfig) -> Self {
-        Self { config }
-    }
-
-    fn connect(
-        &self,
-        target: &HttpTarget,
-        cancel: &CancellationToken,
-    ) -> Result<TcpStream, AiError> {
-        cancel.check()?;
-        let addresses: Vec<SocketAddr> = (target.host.as_str(), target.port)
-            .to_socket_addrs()
-            .map_err(|error| {
-                AiError::Unreachable(format!("could not resolve {}: {error}", target.host))
-            })?
-            .collect();
-        if addresses.is_empty() {
-            return Err(AiError::Unreachable(format!(
-                "could not resolve {}",
-                target.host
-            )));
-        }
-        let mut last_error = None;
-        for address in addresses {
-            cancel.check()?;
-            match TcpStream::connect_timeout(&address, self.config.connect_timeout) {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    let _ = stream.set_read_timeout(Some(POLL_INTERVAL));
-                    let _ = stream.set_write_timeout(Some(self.config.connect_timeout));
-                    return Ok(stream);
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(AiError::Unreachable(match last_error {
-            Some(error) => format!("could not connect to {}: {error}", target.host),
-            None => format!("could not connect to {}", target.host),
-        }))
-    }
-}
-
-impl Transport for TcpTransport {
-    fn execute(
-        &self,
-        spec: &RequestSpec,
-        cancel: &CancellationToken,
-    ) -> Result<Box<dyn ResponseStream>, AiError> {
-        let target = parse_http_target(&spec.url)?;
-        let mut stream = self.connect(&target, cancel)?;
-        let mut request = Vec::new();
-        request.extend_from_slice(
-            format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\n",
-                spec.method, target.path, target.host_header
-            )
-            .as_bytes(),
-        );
-        for (name, value) in &spec.headers {
-            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
-        }
-        request.extend_from_slice(format!("Content-Length: {}\r\n", spec.body.len()).as_bytes());
-        request.extend_from_slice(b"Connection: close\r\n\r\n");
-        request.extend_from_slice(&spec.body);
-        cancel.check()?;
-        stream.write_all(&request).map_err(|error| {
-            AiError::Unreachable(format!("could not send the request: {error}"))
-        })?;
-
-        let (status, reason, headers, leftover) =
-            read_response_headers(&mut stream, &self.config, cancel)?;
-        let body = BodyDecoder::new(&headers);
-        Ok(Box::new(TcpResponseStream {
-            stream,
-            status,
-            reason,
-            headers,
-            body,
-            leftover,
-            cancel: cancel.clone(),
-            config: self.config,
-            last_activity: Instant::now(),
-            started: Instant::now(),
-        }))
-    }
-}
-
-struct TcpResponseStream {
-    stream: TcpStream,
-    status: u16,
-    reason: String,
-    headers: Vec<(String, String)>,
-    body: BodyDecoder,
-    leftover: Vec<u8>,
-    cancel: CancellationToken,
-    config: ClientConfig,
-    last_activity: Instant,
-    started: Instant,
-}
-
-impl ResponseStream for TcpResponseStream {
-    fn status(&self) -> u16 {
-        self.status
-    }
-
-    fn reason(&self) -> &str {
-        &self.reason
-    }
-
-    fn headers(&self) -> &[(String, String)] {
-        &self.headers
-    }
-
-    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, AiError> {
-        loop {
-            self.cancel.check()?;
-            check_deadline(self.last_activity, self.started, &self.config)?;
-
-            if !self.leftover.is_empty() {
-                let chunk = std::mem::take(&mut self.leftover);
-                let decoded = self.body.feed(&chunk)?;
-                if !decoded.is_empty() {
-                    return Ok(Some(decoded));
-                }
-                if self.body.is_done() {
-                    return Ok(None);
-                }
-                continue;
-            }
-            if self.body.is_done() {
-                return Ok(None);
-            }
-
-            let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
-                Ok(0) => {
-                    self.body.finish()?;
-                    return Ok(None);
-                }
-                Ok(read) => {
-                    self.last_activity = Instant::now();
-                    let decoded = self.body.feed(&buffer[..read])?;
-                    if !decoded.is_empty() {
-                        return Ok(Some(decoded));
-                    }
-                    if self.body.is_done() {
-                        return Ok(None);
-                    }
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    // The read timeout is how a blocking transport notices cancellation.
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    return Err(AiError::Unreachable(format!(
-                        "the connection failed while reading: {error}"
-                    )));
-                }
-            }
-        }
-    }
-}
-
-fn check_deadline(
-    last_activity: Instant,
-    started: Instant,
-    config: &ClientConfig,
-) -> Result<(), AiError> {
-    if last_activity.elapsed() >= config.idle_timeout {
-        return Err(AiError::Timeout(format!(
-            "the provider sent no data for {} seconds",
-            config.idle_timeout.as_secs().max(1)
-        )));
-    }
-    if started.elapsed() >= config.max_time {
-        return Err(AiError::Timeout(format!(
-            "the request exceeded its {} second limit",
-            config.max_time.as_secs().max(1)
-        )));
-    }
-    Ok(())
-}
-
-fn parse_http_target(url: &str) -> Result<HttpTarget, AiError> {
-    let lower = url.to_ascii_lowercase();
-    let rest = if lower.starts_with("http://") {
-        &url[7..]
-    } else {
-        return Err(AiError::InvalidSettings(
-            "The plain HTTP transport only handles http:// URLs.".to_string(),
-        ));
-    };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let path = if authority_end == rest.len() {
-        "/".to_string()
-    } else {
-        rest[authority_end..].to_string()
-    };
-    let (host, port) = parse_authority(authority)?;
-    let default_port = 80u16;
-    let port = port.unwrap_or(default_port);
-    let host_header = if port == default_port && !host.contains(':') {
-        host.clone()
-    } else if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    Ok(HttpTarget {
-        host,
-        port,
-        path,
-        host_header,
-    })
-}
-
-fn parse_authority(authority: &str) -> Result<(String, Option<u16>), AiError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let Some(close) = rest.find(']') else {
-            return Err(AiError::InvalidSettings(
-                "The IPv6 address is missing ']'.".to_string(),
-            ));
-        };
-        let host = rest[..close].to_string();
-        let after = &rest[close + 1..];
-        let port = if after.is_empty() {
-            None
-        } else if let Some(port) = after.strip_prefix(':') {
-            Some(port.parse::<u16>().map_err(|_| {
-                AiError::InvalidSettings("The endpoint port is not a number.".to_string())
-            })?)
-        } else {
-            return Err(AiError::InvalidSettings(
-                "The endpoint has characters after the IPv6 address.".to_string(),
-            ));
-        };
-        return Ok((host, port));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port.parse::<u16>().map_err(|_| {
-                AiError::InvalidSettings("The endpoint port is not a number.".to_string())
-            })?;
-            Ok((host.to_string(), Some(port)))
-        }
-        None => Ok((authority.to_string(), None)),
-    }
-}
-
-fn read_response_headers(
-    stream: &mut TcpStream,
-    config: &ClientConfig,
-    cancel: &CancellationToken,
-) -> Result<ResponseHead, AiError> {
-    let started = Instant::now();
-    let mut last_activity = Instant::now();
-    let mut buffer = Vec::new();
-    loop {
-        cancel.check()?;
-        check_deadline(last_activity, started, config)?;
-        if let Some((status, reason, headers, leftover)) = parse_head_block(&buffer)? {
-            if (100..200).contains(&status) {
-                buffer = leftover;
-                continue;
-            }
-            return Ok((status, reason, headers, leftover));
-        }
-        if buffer.len() > 64 * 1024 {
-            return Err(AiError::Protocol(
-                "The server sent more than 64 KiB of response headers.".to_string(),
-            ));
-        }
-        let mut chunk = [0u8; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => {
-                return Err(AiError::Unreachable(
-                    "the server closed the connection before sending response headers".to_string(),
-                ));
-            }
-            Ok(read) => {
-                last_activity = Instant::now();
-                buffer.extend_from_slice(&chunk[..read]);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                return Err(AiError::Unreachable(format!(
-                    "could not read response headers: {error}"
-                )));
-            }
-        }
-    }
-}
-
-fn parse_head_block(buffer: &[u8]) -> Result<Option<ResponseHead>, AiError> {
-    let Some(end) = find_bytes(buffer, b"\r\n\r\n") else {
-        return Ok(None);
-    };
-    let head = String::from_utf8_lossy(&buffer[..end]);
-    let leftover = buffer[end + 4..].to_vec();
-    let mut lines = head.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| AiError::Protocol("The server sent an empty response head.".to_string()))?;
-    let mut parts = status_line.splitn(3, ' ');
-    let protocol = parts.next().unwrap_or("");
-    if !protocol.starts_with("HTTP/") {
-        return Err(AiError::Protocol(format!(
-            "The server did not answer with HTTP: {}",
-            truncate(status_line, 120)
-        )));
-    }
-    let status: u16 = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| {
-            AiError::Protocol(format!(
-                "Unreadable HTTP status line: {}",
-                truncate(status_line, 120)
-            ))
-        })?;
-    let reason = parts.next().unwrap_or("").trim().to_string();
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-        }
-    }
-    Ok(Some((status, reason, headers, leftover)))
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-// ── Decoding the response body ─────────────────────────────────────────────────────────────
-
-enum BodyMode {
-    Chunked(ChunkedDecoder),
-    ContentLength(u64),
-    UntilEof,
-}
-
-struct BodyDecoder {
-    mode: BodyMode,
-    done: bool,
-}
-
-impl BodyDecoder {
-    fn new(headers: &[(String, String)]) -> Self {
-        let chunked = header_value(headers, "transfer-encoding")
-            .map(|value| value.to_ascii_lowercase().contains("chunked"))
-            .unwrap_or(false);
-        let mode = if chunked {
-            BodyMode::Chunked(ChunkedDecoder::default())
-        } else if let Some(length) =
-            header_value(headers, "content-length").and_then(|value| value.parse::<u64>().ok())
-        {
-            BodyMode::ContentLength(length)
-        } else {
-            BodyMode::UntilEof
-        };
-        Self { mode, done: false }
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, AiError> {
-        match &mut self.mode {
-            BodyMode::Chunked(decoder) => {
-                let decoded = decoder.feed(bytes)?;
-                if decoder.done {
-                    self.done = true;
-                }
-                Ok(decoded)
-            }
-            BodyMode::ContentLength(remaining) => {
-                if *remaining == 0 {
-                    self.done = true;
-                    return Ok(Vec::new());
-                }
-                let take = bytes.len().min(*remaining as usize);
-                *remaining -= take as u64;
-                if *remaining == 0 {
-                    self.done = true;
-                }
-                Ok(bytes[..take].to_vec())
-            }
-            BodyMode::UntilEof => {
-                if bytes.is_empty() {
-                    self.done = true;
-                    Ok(Vec::new())
-                } else {
-                    Ok(bytes.to_vec())
-                }
-            }
-        }
-    }
-
-    fn finish(&mut self) -> Result<(), AiError> {
-        match &mut self.mode {
-            BodyMode::Chunked(decoder) => {
-                if decoder.done {
-                    self.done = true;
-                    Ok(())
-                } else {
-                    Err(AiError::Protocol(
-                        "The server closed the connection in the middle of a chunked response."
-                            .to_string(),
-                    ))
-                }
-            }
-            BodyMode::ContentLength(remaining) => {
-                if *remaining == 0 {
-                    self.done = true;
-                    Ok(())
-                } else {
-                    Err(AiError::Protocol(
-                        "The server closed the connection before the response body was complete."
-                            .to_string(),
-                    ))
-                }
-            }
-            BodyMode::UntilEof => {
-                self.done = true;
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct ChunkedDecoder {
-    buffer: Vec<u8>,
-    state: ChunkState,
-    done: bool,
-}
-
-#[derive(Default)]
-enum ChunkState {
-    #[default]
-    NeedSize,
-    Data(u64),
-    Crlf,
-    Trailers,
-}
-
-impl ChunkedDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, AiError> {
-        self.buffer.extend_from_slice(bytes);
-        let mut output = Vec::new();
-        loop {
-            match &mut self.state {
-                ChunkState::NeedSize => {
-                    let Some(end) = find_bytes(&self.buffer, b"\r\n") else {
-                        if self.buffer.len() > 1024 {
-                            return Err(AiError::Protocol(
-                                "The chunked response has an overlong size line.".to_string(),
-                            ));
-                        }
-                        break;
-                    };
-                    let line = String::from_utf8_lossy(&self.buffer[..end]).to_string();
-                    self.buffer.drain(..end + 2);
-                    let size_text = line.split(';').next().unwrap_or("").trim();
-                    let size = u64::from_str_radix(size_text, 16).map_err(|_| {
-                        AiError::Protocol(format!(
-                            "The chunked response has an unreadable chunk size: {}",
-                            truncate(&line, 80)
-                        ))
-                    })?;
-                    if size == 0 {
-                        self.state = ChunkState::Trailers;
-                    } else {
-                        self.state = ChunkState::Data(size);
-                    }
-                }
-                ChunkState::Data(remaining) => {
-                    if self.buffer.is_empty() {
-                        break;
-                    }
-                    let take = (self.buffer.len() as u64).min(*remaining) as usize;
-                    output.extend(self.buffer.drain(..take));
-                    *remaining -= take as u64;
-                    if *remaining == 0 {
-                        self.state = ChunkState::Crlf;
-                    }
-                }
-                ChunkState::Crlf => {
-                    if self.buffer.len() < 2 {
-                        break;
-                    }
-                    if &self.buffer[..2] != b"\r\n" {
-                        return Err(AiError::Protocol(
-                            "The chunked response is missing the CRLF after a chunk.".to_string(),
-                        ));
-                    }
-                    self.buffer.drain(..2);
-                    self.state = ChunkState::NeedSize;
-                }
-                ChunkState::Trailers => {
-                    if let Some(end) = find_bytes(&self.buffer, b"\r\n\r\n") {
-                        self.buffer.drain(..end + 4);
-                        self.done = true;
-                    } else if self.buffer.starts_with(b"\r\n") {
-                        self.buffer.drain(..2);
-                        self.done = true;
-                    } else {
-                        break;
-                    }
-                    if self.done {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(output)
-    }
-}
-
-// ── curl transport for HTTPS ───────────────────────────────────────────────────────────────
-
-/// The argv and stdin configuration for a curl request. Public so a test can prove the key is not
-/// in the argv; the struct intentionally has no `Debug` implementation.
-pub struct CurlInvocation {
-    pub args: Vec<String>,
-    pub stdin_config: String,
-}
-
-pub struct CurlTransport {
-    config: ClientConfig,
-}
-
-impl CurlTransport {
-    pub fn new(config: ClientConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl Transport for CurlTransport {
-    fn execute(
-        &self,
-        spec: &RequestSpec,
-        cancel: &CancellationToken,
-    ) -> Result<Box<dyn ResponseStream>, AiError> {
-        let invocation = curl_invocation(spec, self.config)?;
-        cancel.check()?;
-        let mut child = Command::new("curl")
-            .args(&invocation.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                AiError::Unreachable(format!(
-                    "HTTPS needs the system curl program, which could not be started: {error}"
-                ))
-            })?;
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(error) = stdin.write_all(invocation.stdin_config.as_bytes())
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AiError::Unreachable(format!(
-                "could not pass the request to curl: {error}"
-            )));
-        }
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AiError::Unreachable("curl has no stdout".to_string()));
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AiError::Unreachable("curl has no stderr".to_string()));
-        };
-        let child = Arc::new(Mutex::new(child));
-        let stderr_text = Arc::new(Mutex::new(String::new()));
-        spawn_stderr_reader(stderr, Arc::clone(&stderr_text));
-
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut stdout = stdout;
-            let mut buffer = [0u8; 8192];
-            loop {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        if sender.send(Ok(buffer[..read].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error.to_string()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        let started = Instant::now();
-        let mut last_activity = Instant::now();
-        let mut header_buffer = Vec::new();
-        let result = (|| -> Result<Box<dyn ResponseStream>, AiError> {
-            loop {
-                cancel.check()?;
-                check_deadline(last_activity, started, &self.config)?;
-                if let Some((status, reason, headers, leftover)) = parse_head_block(&header_buffer)?
-                {
-                    if (100..200).contains(&status) {
-                        header_buffer = leftover;
-                        continue;
-                    }
-                    return Ok(Box::new(CurlResponseStream {
-                        receiver,
-                        status,
-                        reason,
-                        headers,
-                        leftover,
-                        child: Arc::clone(&child),
-                        stderr: Arc::clone(&stderr_text),
-                        cancel: cancel.clone(),
-                        config: self.config,
-                        last_activity: Instant::now(),
-                        started,
-                        finished: false,
-                    }));
-                }
-                match receiver.recv_timeout(POLL_INTERVAL) {
-                    Ok(Ok(chunk)) => {
-                        last_activity = Instant::now();
-                        header_buffer.extend_from_slice(&chunk);
-                    }
-                    Ok(Err(error)) => {
-                        let detail = error.to_string();
-                        return Err(AiError::Unreachable(format!(
-                            "could not read curl's output: {detail}"
-                        )));
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        let code = terminate(&child);
-                        let detail = take_stderr(&stderr_text);
-                        return Err(curl_exit_error(code, &detail));
-                    }
-                }
-            }
-        })();
-        if result.is_err() {
-            terminate(&child);
-        }
-        result
-    }
-}
-
-struct CurlResponseStream {
-    receiver: Receiver<Result<Vec<u8>, String>>,
-    status: u16,
-    reason: String,
-    headers: Vec<(String, String)>,
-    leftover: Vec<u8>,
-    child: Arc<Mutex<Child>>,
-    stderr: Arc<Mutex<String>>,
-    cancel: CancellationToken,
-    config: ClientConfig,
-    last_activity: Instant,
-    started: Instant,
-    finished: bool,
-}
-
-impl ResponseStream for CurlResponseStream {
-    fn status(&self) -> u16 {
-        self.status
-    }
-
-    fn reason(&self) -> &str {
-        &self.reason
-    }
-
-    fn headers(&self) -> &[(String, String)] {
-        &self.headers
-    }
-
-    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, AiError> {
-        if !self.leftover.is_empty() {
-            return Ok(Some(std::mem::take(&mut self.leftover)));
-        }
-        loop {
-            if self.cancel.is_cancelled() {
-                self.finished = true;
-                terminate(&self.child);
-                return Err(AiError::Cancelled);
-            }
-            check_deadline(self.last_activity, self.started, &self.config)?;
-            match self.receiver.recv_timeout(POLL_INTERVAL) {
-                Ok(Ok(chunk)) => {
-                    self.last_activity = Instant::now();
-                    return Ok(Some(chunk));
-                }
-                Ok(Err(error)) => {
-                    self.finished = true;
-                    terminate(&self.child);
-                    return Err(AiError::Unreachable(format!(
-                        "could not read curl's output: {error}"
-                    )));
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.finished = true;
-                    let code = terminate(&self.child);
-                    if code == 0 {
-                        return Ok(None);
-                    }
-                    return Err(curl_exit_error(code, &take_stderr(&self.stderr)));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for CurlResponseStream {
-    fn drop(&mut self) {
-        if !self.finished {
-            terminate(&self.child);
-        }
-    }
-}
-
-fn spawn_stderr_reader(mut stderr: std::process::ChildStderr, output: Arc<Mutex<String>>) {
-    thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if let Ok(mut text) = output.lock()
-                        && text.len() < MAX_ERROR_BODY
-                    {
-                        text.push_str(&String::from_utf8_lossy(&buffer[..read]));
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn take_stderr(stderr: &Arc<Mutex<String>>) -> String {
-    stderr
-        .lock()
-        .map(|text| text.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Kill and reap a curl child, returning its exit code when one is available.
-fn terminate(child: &Arc<Mutex<Child>>) -> i32 {
-    let mut child = match child.lock() {
-        Ok(child) => child,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let _ = child.kill();
-    match child.wait() {
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(_) => -1,
-    }
-}
-
-fn curl_exit_error(code: i32, stderr: &str) -> AiError {
-    let detail = truncate(stderr, MAX_DETAIL_CHARS);
-    if code == 28 {
-        return AiError::Timeout(if detail.is_empty() {
-            "the request timed out".to_string()
-        } else {
-            format!("the request timed out: {detail}")
-        });
-    }
-    let suffix = if detail.is_empty() {
-        String::new()
-    } else {
-        format!(": {detail}")
-    };
-    AiError::Unreachable(format!("curl exited with status {code}{suffix}"))
-}
-
-/// Build the argv and stdin configuration for a curl request.
-///
-/// The API key is written into the **stdin config**, never into `args`: process arguments are
-/// visible to other processes, and this is the only place where that is easy to get wrong.
-pub fn curl_invocation(
-    spec: &RequestSpec,
-    config: ClientConfig,
-) -> Result<CurlInvocation, AiError> {
-    if !spec
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-    {
-        return Err(AiError::InvalidSettings(
-            "The request has no Authorization header.".to_string(),
-        ));
-    }
-    let mut lines = Vec::new();
-    lines.push(format!("url = \"{}\"", curl_quote(&spec.url)));
-    lines.push(format!("request = \"{}\"", spec.method));
-    for (name, value) in &spec.headers {
-        if name.eq_ignore_ascii_case("authorization") {
-            // Keep the key on stdin with the rest of the configuration.
-            lines.push(format!("header = \"{}: {}\"", name, curl_quote(value)));
-        } else {
-            lines.push(format!("header = \"{}: {}\"", name, curl_quote(value)));
-        }
-    }
-    let body = String::from_utf8_lossy(&spec.body);
-    lines.push(format!("data-binary = \"{}\"", curl_quote(&body)));
-    lines.push(format!(
-        "connect-timeout = {}",
-        config.connect_timeout.as_secs().max(1)
-    ));
-    lines.push(format!("max-time = {}", config.max_time.as_secs().max(1)));
-    lines.push("speed-limit = 1".to_string());
-    lines.push(format!(
-        "speed-time = {}",
-        config.idle_timeout.as_secs().max(1)
-    ));
-    // `--include` prints the response head; `--no-buffer` keeps the SSE chunks flowing.
-    let args = vec![
-        "--silent".to_string(),
-        "--show-error".to_string(),
-        "--include".to_string(),
-        "--no-buffer".to_string(),
-        "--http1.1".to_string(),
-        "--config".to_string(),
-        "-".to_string(),
-    ];
-    Ok(CurlInvocation {
-        args,
-        stdin_config: lines.join("\n") + "\n",
-    })
-}
-
-fn curl_quote(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }
 
 // ── SSE decoding ────────────────────────────────────────────────────────────────────────────
@@ -1245,6 +682,15 @@ impl SseDecoder {
         }
         Ok(frames)
     }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -1626,16 +1072,6 @@ mod tests {
         let error =
             parse_stream_payload(r#"{"error":{"message":"model overloaded"}}"#).unwrap_err();
         assert!(error.to_string().contains("model overloaded"));
-    }
-
-    #[test]
-    fn curl_keeps_the_key_out_of_argv() {
-        let plan = test_plan();
-        let spec = build_request_spec(&plan, &plan.parts[0], "sk-secret-12345").unwrap();
-        let invocation = curl_invocation(&spec, ClientConfig::default()).unwrap();
-        assert!(!invocation.args.join(" ").contains("sk-secret-12345"));
-        assert!(invocation.stdin_config.contains("sk-secret-12345"));
-        assert!(invocation.stdin_config.contains("data-binary"));
     }
 
     #[test]

@@ -251,11 +251,25 @@ preview shows every system/user message and the exact JSON body (plus a redacted
 `Authorization: Bearer <redacted until you press Send>`), so the reader can see what would leave
 the machine before anything is sent.
 
-**Transport note.** `http://` endpoints use an in-process HTTP/1.1 client (Ollama and the tests).
-`https://` endpoints use the system `curl` program; the whole request configuration, including
-the `Authorization` header, is written to curl's stdin, never to its argv. This is a deliberate
-consequence of the pinned dependency set not containing a TLS client crate. A future native TLS
-transport can replace it without touching the protocol, prompt, retrieval or SSE code.
+**Transport and trust roots.** One in-process client (`ureq` 3.4.2 over `rustls` 0.23) handles
+both `http://` and `https://`; there is no shell-out and no external program is required.
+The loopback tests and the app therefore exercise the same connection, TLS, timeout, body-reader
+and SSE code. Root certificates come from the operating system through `rustls-native-certs`
+(Security.framework on macOS, schannel on Windows, the platform OpenSSL paths on Linux), so
+OS-managed corporate roots work. The standard `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+environment variables are honoured by ureq's default connector; the macOS Network-pane proxy
+settings are not read. If the platform store yields no certificates, the
+client falls back to ureq's bundled Mozilla roots (`webpki-roots`, CDLA-Permissive-2.0); if
+neither is usable the TLS handshake fails and the provider's certificate error is shown. Roots
+are cached for the process.
+
+Because ureq is synchronous, cancellation is handled below it: a small transport adapter passed
+to ureq's connector wraps the real connection and bounds every blocking read to 100 ms or the
+remaining idle budget. Between those short reads it checks the request's cancel flag and the
+real idle (60 s) and total (300 s) deadlines. Cancel therefore returns promptly even when a
+provider has stopped sending; the connection is dropped and the reader sees `Cancelled` rather
+than waiting for the next token. The same adapter enforces the idle timeout for response headers
+and for the SSE body.
 
 **Protocol.** `POST {base}/chat/completions` with
 `Content-Type: application/json`, `Accept: text/event-stream`,
@@ -269,7 +283,10 @@ reports it in its stream.
 
 **Tests.** `cargo test -p aris-reader-ai` covers split JSON across SSE chunks, `[DONE]`, HTTP
 401 with an error body, a mid-stream disconnect, cancellation (the loopback server observes the
-connection closing), idle timeouts, and that the wire body equals the previewed body.
+connection closing), idle timeouts, and that the wire body equals the previewed body. The TLS
+path is tested with a loopback `rustls` server and a generated CA: a full streaming round trip
+with the CA injected into the client's roots, and a refusal when the server's certificate is
+signed by a different CA.
 `ArisReaderChecks --check-ai-assistant .` covers settings validation, Keychain-hygiene (the key
 never appears in UserDefaults or captured stdout/stderr; a real Keychain round-trip runs when the
 login Keychain is available and is skipped, not faked, when it is not), the citation rules, and
@@ -500,5 +517,5 @@ resolve locally.
 ## License
 
 This project is released under the MIT license (see [ADR-0005](docs/adr/0005-licensing.md)).
-Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only).
+Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), ring (Apache-2.0 AND ISC), rustls-native-certs (Apache-2.0 OR ISC OR MIT), webpki-roots (CDLA-Permissive-2.0), rcgen (MIT OR Apache-2.0, tests only).
 **No AGPL components** (MuPDF is excluded).
