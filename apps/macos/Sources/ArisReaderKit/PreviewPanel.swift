@@ -831,7 +831,10 @@ struct ReferencePreviewPanelContent: View {
 /// It sits behind the canvas, so it can never take a scroll or a click away from the reader, and
 /// it reports the canvas rect in screen coordinates — the space the panel has to open in.
 struct ReferencePreviewHost: NSViewRepresentable {
-    let state: AppState
+    // The state object's identity stays the same when a click opens/closes a preview. Observe
+    // its publications here: otherwise SwiftUI can skip updateNSView for this unchanged value,
+    // leaving parsed preview content in AppState with no AppKit panel to display it.
+    @ObservedObject var state: AppState
     /// The controller of the window this host is in (`ReaderSession.previewPanels`); `shared` for
     /// a caller that has no window of its own.
     var panels: ReferencePreviewPanelController = .shared
