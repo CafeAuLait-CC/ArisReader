@@ -507,6 +507,33 @@ public enum QuadBlend: UInt8, Sendable {
     case multiply = 1
 }
 
+/// How the reader arranges pages horizontally (T2.10).
+///
+/// A shell-level name for the two layouts the engine can compute. `facing` is the book
+/// convention the Rust layout implements: page 1 alone, then 2–3, 4–5, … with odd (1-based)
+/// pages on the right. It is deliberately not `single`: the reader's existing canvas is the
+/// continuous one, and a facing pair changes what "visible pages" means.
+public enum ReaderLayoutMode: String, CaseIterable, Identifiable, Sendable {
+    case continuous
+    case facing
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .continuous: return "Continuous"
+        case .facing: return "Facing Pages"
+        }
+    }
+
+    var rust: ReaderLayout {
+        switch self {
+        case .continuous: return .continuous
+        case .facing: return .facing
+        }
+    }
+}
+
 /// One page ready to be drawn: where it goes and the bitmap that goes there.
 public struct CanvasPage: Sendable {
     public let placement: PagePlacement
@@ -593,6 +620,26 @@ public protocol PDFEngine: AnyObject {
     func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int
     /// Top edge of a page in content space (used by "go to page").
     func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat
+
+    // Layout-aware variants (T2.10). Every one of them has a default below that forwards to
+    // the continuous implementation, so the existing test doubles stay valid; only an engine
+    // that can actually compute a facing layout overrides them.
+    /// Total height of the scrolling content for `layout`.
+    func contentHeightPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat
+    /// Width of the content for `layout`: the widest page, or the whole spread.
+    func contentWidthPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat
+    /// Pages overlapping the viewport, in reading order, for `layout`.
+    func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat,
+        layout: ReaderLayoutMode
+    ) -> [PagePlacement]
+    /// Page under the viewport top for `layout` (a spread names its left page).
+    func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat, layout: ReaderLayoutMode) -> Int
+    /// Top edge of a page in content space for `layout`.
+    func pageTopPt(_ index: Int, gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat
     /// Engine version plus backend description (About panel, diagnostics).
     var version: String { get }
 }
@@ -604,6 +651,37 @@ public extension PDFEngine {
     /// because only it can ask PDFium for `FPDF_ANNOT`.
     func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale)
+    }
+
+    func contentHeightPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
+        contentHeightPt(gapPt: gapPt)
+    }
+
+    func contentWidthPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
+        contentWidthPt(gapPt: gapPt)
+    }
+
+    func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat,
+        layout: ReaderLayoutMode
+    ) -> [PagePlacement] {
+        visiblePages(
+            scrollYPt: scrollYPt,
+            viewportHeightPt: viewportHeightPt,
+            gapPt: gapPt,
+            marginPt: marginPt
+        )
+    }
+
+    func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat, layout: ReaderLayoutMode) -> Int {
+        pageIndex(atScrollYPt: scrollYPt, gapPt: gapPt)
+    }
+
+    func pageTopPt(_ index: Int, gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
+        pageTopPt(index, gapPt: gapPt)
     }
 }
 
@@ -1155,13 +1233,21 @@ public final class RustEngine: PDFEngine {
     }
 
     public func contentHeightPt(gapPt: CGFloat) -> CGFloat {
+        contentHeightPt(gapPt: gapPt, layout: .continuous)
+    }
+
+    public func contentHeightPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
         guard let document else { return 0 }
-        return CGFloat(document.contentHeightPt(gapPt: Double(gapPt)))
+        return CGFloat(document.contentHeightPtFor(layout: layout.rust, gapPt: Double(gapPt)))
     }
 
     public func contentWidthPt(gapPt: CGFloat) -> CGFloat {
+        contentWidthPt(gapPt: gapPt, layout: .continuous)
+    }
+
+    public func contentWidthPt(gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
         guard let document else { return 0 }
-        return CGFloat(document.contentWidthPt(gapPt: Double(gapPt)))
+        return CGFloat(document.contentWidthPtFor(layout: layout.rust, gapPt: Double(gapPt)))
     }
 
     public func visiblePages(
@@ -1170,11 +1256,28 @@ public final class RustEngine: PDFEngine {
         gapPt: CGFloat,
         marginPt: CGFloat
     ) -> [PagePlacement] {
+        visiblePages(
+            scrollYPt: scrollYPt,
+            viewportHeightPt: viewportHeightPt,
+            gapPt: gapPt,
+            marginPt: marginPt,
+            layout: .continuous
+        )
+    }
+
+    public func visiblePages(
+        scrollYPt: CGFloat,
+        viewportHeightPt: CGFloat,
+        gapPt: CGFloat,
+        marginPt: CGFloat,
+        layout: ReaderLayoutMode
+    ) -> [PagePlacement] {
         guard let document else { return [] }
         return document
-            .visiblePages(
+            .visiblePagesFor(
                 scrollYPt: Double(scrollYPt),
                 viewportHeightPt: Double(viewportHeightPt),
+                layout: layout.rust,
                 gapPt: Double(gapPt),
                 marginPt: Double(marginPt)
             )
@@ -1190,14 +1293,34 @@ public final class RustEngine: PDFEngine {
     }
 
     public func pageIndex(atScrollYPt scrollYPt: CGFloat, gapPt: CGFloat) -> Int {
+        pageIndex(atScrollYPt: scrollYPt, gapPt: gapPt, layout: .continuous)
+    }
+
+    public func pageIndex(
+        atScrollYPt scrollYPt: CGFloat,
+        gapPt: CGFloat,
+        layout: ReaderLayoutMode
+    ) -> Int {
         guard let document else { return 0 }
-        return Int(document.pageIndexAt(scrollYPt: Double(scrollYPt), gapPt: Double(gapPt)))
+        return Int(document.pageIndexAtFor(
+            scrollYPt: Double(scrollYPt),
+            layout: layout.rust,
+            gapPt: Double(gapPt)
+        ))
     }
 
     public func pageTopPt(_ index: Int, gapPt: CGFloat) -> CGFloat {
+        pageTopPt(index, gapPt: gapPt, layout: .continuous)
+    }
+
+    public func pageTopPt(_ index: Int, gapPt: CGFloat, layout: ReaderLayoutMode) -> CGFloat {
         guard let document else { return 0 }
-        return CGFloat(document.pageTopPt(page: UInt32(index), gapPt: Double(gapPt)))
-}
+        return CGFloat(document.pageTopPtFor(
+            page: UInt32(index),
+            layout: layout.rust,
+            gapPt: Double(gapPt)
+        ))
+    }
 
 }
 

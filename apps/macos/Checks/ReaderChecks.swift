@@ -19,6 +19,32 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
+        // The reader's layout preferences live in UserDefaults (so the app remembers facing
+        // pages and the page gap). Checks must not inherit them from whatever the person
+        // running the suite chose in the app: pin continuous/12 for this process. Setters still
+        // exercise the real layout path, they just do not write the preference.
+        AppState.usesStoredReadingLayoutPreferences = false
+
+        let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+            ?? FileManager.default.currentDirectoryPath)
+        if CommandLine.arguments.contains("--check-bookmarks") {
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aris-bookmarks-\(UUID())")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let fixture = scratch.appendingPathComponent("a.pdf")
+            try FileManager.default.copyItem(
+                at: fastRoot.appendingPathComponent("tests/fixtures/text-page.pdf"), to: fixture)
+            try await bookmarkChecks(url: fixture)
+            print("Bookmark checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--check-facing-layout") {
+            try await facingLayoutChecks(
+                url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Facing-layout checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-hosted-preview") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -76,7 +102,7 @@ struct ReaderChecks {
             } else {
                 scrollGlideTailChecks()
                 try await scrollTailDriverChecks(
-                    url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+                    url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
             }
             print("Interaction checks passed")
             return
@@ -220,6 +246,8 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
         try await outlineNumberingChecks(
             url: root.appendingPathComponent("tests/fixtures/outlined.pdf"))
+        try await bookmarkChecks(url: a)
+        try await facingLayoutChecks(url: b)
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)
         try await previewChecks(url: b)

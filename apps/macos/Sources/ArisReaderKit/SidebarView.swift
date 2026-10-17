@@ -49,7 +49,7 @@ public struct SidebarView: View {
         case .search:
             searchResults
         case .bookmarks:
-            emptyState("Bookmarks", "bookmark", task: "T2.4")
+            bookmarkList
         case .annotations:
             annotationList
         case .ai:
@@ -206,6 +206,116 @@ public struct SidebarView: View {
                 }
                 .listStyle(.sidebar)
             }
+        }
+    }
+
+    // MARK: - Bookmarks
+
+    /// The reader's own bookmarks: one section per page, in the order the reader set.
+    ///
+    /// Renaming is committed on Return or blur (`BookmarkNameField`), not on every keystroke,
+    /// so typing a title costs one sidecar write rather than one per character. Moving is
+    /// explicit (↑/↓) instead of drag-only: the list is also reachable from the keyboard, and
+    /// a drag in a grouped `List` cannot say whether the reader meant to reorder or to regroup.
+    private var bookmarkList: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button {
+                    state.addBookmarkAtCurrentPage()
+                } label: {
+                    Label("Add Bookmark", systemImage: "bookmark.badge.plus")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .disabled(state.document == nil)
+                .help("Bookmark the current page and position (⌘D)")
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            if state.bookmarks.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "bookmark")
+                        .font(.system(size: 30, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text(state.document == nil ? "No document" : "No bookmarks")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if state.document != nil {
+                        Text("⌘D or Add Bookmark puts the current page and position here.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .multilineTextAlignment(.center)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(20)
+            } else {
+                List {
+                    ForEach(state.bookmarkGroups) { group in
+                        Section(group.title) {
+                            ForEach(group.bookmarks) { bookmark in
+                                bookmarkRow(bookmark)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
+    private func bookmarkRow(_ bookmark: Bookmark) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "bookmark.fill")
+                .font(.caption2)
+                .foregroundStyle(Color.accentColor)
+                .padding(.top, 3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                BookmarkNameField(state: state, bookmark: bookmark)
+                Button {
+                    state.jump(to: bookmark)
+                } label: {
+                    Text("Page \(bookmark.page + 1) · \(Int(bookmark.yPt.rounded())) pt")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Jump to this bookmark")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                state.moveBookmark(bookmark.id, by: -1)
+            } label: {
+                Image(systemName: "arrow.up")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+            .help("Move bookmark up")
+
+            Button {
+                state.moveBookmark(bookmark.id, by: 1)
+            } label: {
+                Image(systemName: "arrow.down")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+            .help("Move bookmark down")
+
+            Button {
+                state.removeBookmark(bookmark.id)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+            .help("Delete bookmark")
         }
     }
 
@@ -476,5 +586,38 @@ public struct SidebarView: View {
         .multilineTextAlignment(.center)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(20)
+    }
+}
+
+/// A bookmark's name, edited locally and committed once.
+///
+/// The field is not bound straight to `AppState`: a `TextField` setter fires per keystroke, and
+/// unlike note typing there is no coalescing window for bookmarks. A small draft keeps the
+/// sidecar write count equal to the number of edits the reader actually finished.
+private struct BookmarkNameField: View {
+    let state: AppState
+    let bookmark: Bookmark
+
+    @State private var draft: String = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextField("Name", text: $draft)
+            .textFieldStyle(.plain)
+            .font(.caption)
+            .focused($isFocused)
+            .onAppear { draft = bookmark.title }
+            .onChange(of: bookmark.title) { _, title in
+                // Do not clobber what the reader is typing when another change lands.
+                if !isFocused { draft = title }
+            }
+            .onSubmit { commit() }
+            .onChange(of: isFocused) { _, focused in
+                if !focused { commit() }
+            }
+    }
+
+    private func commit() {
+        state.renameBookmark(bookmark.id, to: draft)
     }
 }
