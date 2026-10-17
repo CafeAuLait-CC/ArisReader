@@ -16,7 +16,7 @@
 //! no metadata rather than plausible-looking metadata.
 
 use aris_reader_core::{EmbeddedMetadata, RawTextPage, Rect};
-use aris_reader_text::{TextLine, lines_from};
+use aris_reader_text::{TextLine, lines_from_baseline};
 
 use crate::bibtex::BibEntry;
 
@@ -213,7 +213,7 @@ pub fn recognize(
 ) -> RecognizedMetadata {
     let lines = first_page
         .filter(|page| !page.chars.is_empty())
-        .map(lines_from)
+        .map(lines_from_baseline)
         .unwrap_or_default();
     let page_height = if page_height_pt.is_finite() && page_height_pt > 0.0 {
         page_height_pt

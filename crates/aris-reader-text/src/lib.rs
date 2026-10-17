@@ -2101,6 +2101,143 @@ pub fn lines_from(raw: &RawTextPage) -> Vec<TextLine> {
     order.sort_by(|left, right| {
         let a = &raw.chars[*left];
         let b = &raw.chars[*right];
+        b.rect
+            .origin
+            .y
+            .partial_cmp(&a.rect.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.rect
+                    .origin
+                    .x
+                    .partial_cmp(&b.rect.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    let smallest = raw
+        .chars
+        .iter()
+        .map(|character| character.rect.size.height)
+        .filter(|height| *height > 0.0)
+        .fold(f64::MAX, f64::min);
+    let tolerance = (smallest / 2.0).max(1.0);
+
+    let mut widths: Vec<f64> = raw
+        .chars
+        .iter()
+        .map(|character| character.rect.size.width)
+        .filter(|width| *width > 0.0)
+        .collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_width = widths.get(widths.len() / 2).copied().unwrap_or(5.0);
+
+    // Wider than a space: a column gutter, a tab, or the jump between two text runs.
+    let max_advance = (median_width * 3.0).max(15.0);
+
+    let mut lines: Vec<TextLine> = Vec::new();
+    let mut visible_right: Vec<f64> = Vec::new();
+    let mut pending_break = false;
+
+    for index in order {
+        let character = &raw.chars[index];
+        let decoded = char::from_u32(character.unicode);
+        let is_break = matches!(decoded, Some('\n') | Some('\r'));
+        let is_space = decoded
+            .map(|character| character.is_whitespace() && !is_break)
+            .unwrap_or(false);
+
+        if is_break {
+            pending_break = true;
+            continue;
+        }
+
+        if is_space {
+            // Attach to the current line without moving its measured right edge.
+            if let Some(line) = lines.last_mut() {
+                line.rect = union_rect(line.rect, character.rect);
+                line.range.end = line.range.end.max(index as u32 + 1);
+                push_ink(line, character.rect);
+                if let Some(character) = decoded {
+                    line.text.push(character);
+                }
+                continue;
+            }
+        }
+
+        let starts_new_line = match lines.last() {
+            None => true,
+            Some(line) => {
+                let reference = visible_right
+                    .last()
+                    .copied()
+                    .unwrap_or(line.rect.origin.x + line.rect.size.width);
+                pending_break
+                    || (line.rect.origin.y - character.rect.origin.y).abs() > tolerance
+                    || character.rect.origin.x - reference > max_advance
+            }
+        };
+
+        if starts_new_line {
+            let mut line = TextLine {
+                rect: character.rect,
+                range: (index as u32)..(index as u32 + 1),
+                text: decoded.map(|c| c.to_string()).unwrap_or_default(),
+                ink: Vec::new(),
+            };
+            push_ink(&mut line, character.rect);
+            lines.push(line);
+            visible_right.push(character.rect.origin.x + character.rect.size.width);
+        } else if let Some(line) = lines.last_mut() {
+            line.rect = union_rect(line.rect, character.rect);
+            line.range.end = line.range.end.max(index as u32 + 1);
+            if let Some(character) = decoded {
+                line.text.push(character);
+            }
+            push_ink(line, character.rect);
+            if let Some(right) = visible_right.last_mut() {
+                *right = character.rect.origin.x + character.rect.size.width;
+            }
+        }
+
+        pending_break = false;
+    }
+
+    // Characters reach a line in reading order, which is by baseline first: a superscript can
+    // therefore arrive after the glyphs that sit to its right. Sorting and merging here gives
+    // every consumer runs that are disjoint and left to right, whatever the extraction order was.
+    for line in lines.iter_mut() {
+        line.ink = merge_ink_runs(std::mem::take(&mut line.ink));
+    }
+
+    lines
+}
+
+/// Groups a page's characters into lines using PDFium's **baseline origin**, with word spaces
+/// reconstructed from the gaps between glyphs.
+///
+/// [`lines_from`] predates the backend's baseline origin and groups on the bottom of each
+/// character's ink box, copying the producer's whitespace glyphs into the line text. Several
+/// existing consumers — the column-gutter detector, caption runs and table geometry — have
+/// corpus contracts calibrated against that behaviour, and changing it moves their numbers
+/// (measured on the twelve sample papers: 52 → 45 pages with a detected gutter because lines
+/// grouped per column no longer cross a gutter, and 21 → 24 split entries). Those consumers are
+/// therefore left on [`lines_from`].
+///
+/// Metadata recognition needs the baseline form: a descender must not split a title line, and a
+/// title whose producer draws no space glyph must not come out as `TheQuickBrownFox`. This is the
+/// same algorithm and the same `TextLine` type, not a second parser; it differs only in which
+/// origin places a character on a line and in how a word break is recovered.
+///
+pub fn lines_from_baseline(raw: &RawTextPage) -> Vec<TextLine> {
+    if raw.chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut order: Vec<usize> = (0..raw.chars.len()).collect();
+    order.sort_by(|left, right| {
+        let a = &raw.chars[*left];
+        let b = &raw.chars[*right];
         // Sort by the *baseline* origin, not by the bottom of the ink box: a descender's box
         // reaches lower than a capital's, and grouping on that bottom split one printed line
         // into a dozen fragments. `RawCharBox::origin` is the text origin PDFium reports.
@@ -2418,6 +2555,41 @@ mod block_tests {
         let blocks = blocks_from(&lines_from(&page), 0.8);
         assert_eq!(blocks.len(), 2, "{blocks:?}");
         assert!(blocks.iter().all(|block| block.lines.len() == 2));
+    }
+
+    #[test]
+    fn baseline_grouping_synthesises_a_word_space_without_a_space_glyph() {
+        // The producer advanced 5 pt between the words but emitted no space glyph at all.
+        let page = page_of_lines(&[(100.0, 800.0, "hello"), (130.0, 800.0, "world")]);
+        let lines = lines_from_baseline(&page);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].text, "hello world");
+    }
+
+    #[test]
+    fn baseline_grouping_keeps_a_descender_on_its_line() {
+        // A descender's ink box starts lower than a capital's, but its text origin is the same
+        // baseline. A whitespace glyph sits above the line (as several arXiv producers write it).
+        let mut page = page_of_lines(&[(100.0, 800.0, "targeting"), (150.0, 800.0, "motion")]);
+        for character in &mut page.chars {
+            if char::from_u32(character.unicode) == Some('g') {
+                character.rect.origin.y = 794.0;
+            }
+        }
+        page.chars.insert(
+            9,
+            RawCharBox {
+                rect: Rect::new(145.0, 804.0, 0.0, 0.0),
+                origin: Point::new(145.0, 804.0),
+                unicode: ' ' as u32,
+                font_size: 0.0,
+                angle: 0.0,
+                font_name: "Body".to_string(),
+            },
+        );
+        let lines = lines_from_baseline(&page);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].text, "targeting motion");
     }
 }
 
