@@ -383,6 +383,28 @@ pub struct RawAnnotationColor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawAnnotation {
     pub page: PageIndex,
+    /// Identity other annotations use to point at this one.
+    ///
+    /// The PDF gives an annotation a `/NM` (its "annotation name"), which is the only
+    /// document-level identity PDFium's C API exposes: the handles from
+    /// `FPDFPage_GetAnnot` are wrappers, so two calls that return the same annotation do not
+    /// compare equal (measured against the review corpus, 2026-10-16). The reader therefore
+    /// reports `/NM` as `nm:<name>`; when a file carries no `/NM`, it falls back to a stable
+    /// fingerprint of the annotation's own dictionary so replies to it can still be
+    /// recognised. See [`RawAnnotation::is_reply`] and [`RawAnnotation::parent_id`].
+    pub id: String,
+    /// The identity of the annotation this one answers through `/IRT`, when it is a reply.
+    ///
+    /// `None` means either "not a reply" (see [`RawAnnotation::is_reply`]) or "the file has
+    /// an `/IRT` entry but PDFium could not resolve it"; the two cases are deliberately
+    /// distinguished because only one of them is an orphaned reply.
+    pub parent_id: Option<String>,
+    /// Whether the file carries a `/IRT` entry for this annotation, making it a reply.
+    ///
+    /// The parent need not be on this page, and need not be something the reader shows
+    /// (hidden annotations are still read). The shell is responsible for noticing when the
+    /// parent is absent from the list it is rendering.
+    pub is_reply: bool,
     pub kind: RawAnnotationKind,
     /// The annotation's `/Rect` — the icon box for a sticky note, the text box for free text.
     pub rect: Rect,

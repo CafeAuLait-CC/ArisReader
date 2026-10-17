@@ -235,6 +235,30 @@ impl ArisDocument {
     /// because PDFium's renderer is not thread-safe even across documents. The shell still
     /// keeps its own queue so the main thread never blocks.
     pub fn rasterize_page(&self, page: u32, scale: f64) -> Result<PageBitmap, ArisFfiError> {
+        self.rasterize_page_bitmap(page, scale, false)
+    }
+
+    /// Rasterizes `page` with the file's own annotations burned in, for a thumbnail.
+    ///
+    /// The same page, clamp and threading rules as [`ArisDocument::rasterize_page`]; the only
+    /// difference is PDFium's `FPDF_ANNOT` flag. The canvas must keep using the plain method:
+    /// it draws annotations itself, with live editing and the app's own sidecar marks. This one
+    /// is for a small preview whose job is to show *where the marks are* — including marks the
+    /// canvas does not model. It does not include the sidecar, which is not part of the PDF.
+    pub fn rasterize_page_with_annotations(
+        &self,
+        page: u32,
+        scale: f64,
+    ) -> Result<PageBitmap, ArisFfiError> {
+        self.rasterize_page_bitmap(page, scale, true)
+    }
+
+    fn rasterize_page_bitmap(
+        &self,
+        page: u32,
+        scale: f64,
+        annotations: bool,
+    ) -> Result<PageBitmap, ArisFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(ArisFfiError::InvalidArgument {
                 message: format!("scale must be positive and finite, got {scale}"),
@@ -248,7 +272,8 @@ impl ArisDocument {
             .unwrap_or((612.0, 792.0));
         let scale = clamp_scale(size, scale);
 
-        let request = RasterRequest::full_page(PageIndex(page), scale);
+        let mut request = RasterRequest::full_page(PageIndex(page), scale);
+        request.flags.annotations = annotations;
         let tile = self.backend.rasterize(&request)?;
         let info = self.backend.page_info(PageIndex(page))?;
         let view = info.geometry.view_size(1.0);
@@ -805,6 +830,9 @@ impl ArisDocument {
 
                 records.push(AnnotationRecord {
                     page,
+                    id: annotation.id,
+                    parent_id: annotation.parent_id,
+                    is_reply: annotation.is_reply,
                     kind: annotation.kind.as_str().to_string(),
                     x_pt: view.origin.x,
                     y_pt: view.origin.y,
@@ -1131,6 +1159,18 @@ pub struct LinkRegion {
 pub struct AnnotationRecord {
     /// Page the annotation is on (0-based).
     pub page: u32,
+    /// The annotation's identity: `nm:<NM>` when the file names it, otherwise a stable
+    /// fingerprint (`fp:<hex>`) of its dictionary. This is what `/IRT` entries name, and it is
+    /// unique among the annotations this reader reports for one document.
+    pub id: String,
+    /// The [`AnnotationRecord::id`] of the annotation this one replies to via `/IRT`; `None`
+    /// when it is not a reply, or when `/IRT` is present but PDFium cannot resolve it.
+    pub parent_id: Option<String>,
+    /// Whether this annotation carries an `/IRT` entry, whether or not its parent could be read.
+    ///
+    /// The parent may be on another page, hidden from the page, or skipped from the reader's
+    /// annotation list. Those are the shell's cases to resolve, not reasons to drop the reply.
+    pub is_reply: bool,
     /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype.
     pub kind: String,
     pub x_pt: f64,
@@ -1780,6 +1820,69 @@ mod tests {
         }
     }
 
+    /// `/IRT` parent identities cross the FFI, including for a parent on a different page, a
+    /// parent the reader does not list, and a malformed two-annotation cycle.
+    #[test]
+    fn reply_parent_identities_cross_the_ffi() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated-replies.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: reply fixture or PDFium unavailable");
+            return;
+        }
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open reply fixture");
+        let records = document.annotations().expect("annotations");
+
+        assert_eq!(
+            records.len(),
+            11,
+            "eight replies and three parents/other marks"
+        );
+        let by_id: std::collections::HashMap<&str, &AnnotationRecord> = records
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect();
+        assert_eq!(
+            by_id.len(),
+            records.len(),
+            "every annotation gets its own identity"
+        );
+
+        let nested = by_id["nm:reply-two"];
+        assert!(nested.is_reply);
+        assert_eq!(nested.parent_id.as_deref(), Some("nm:reply-one"));
+        assert_eq!(
+            nested.contents.as_deref(),
+            Some("Second-level reply, answering the first reply.")
+        );
+        assert_eq!(nested.author.as_deref(), Some("Reviewer C"));
+        assert_eq!(nested.modified.as_deref(), Some("D:20240102032000Z"));
+
+        // The parent is on page 1, the reply on page 2; the identity is document-wide.
+        let cross_page = by_id["nm:reply-cross-page"];
+        assert_eq!(cross_page.page, 1);
+        assert_eq!(cross_page.parent_id.as_deref(), Some("nm:parent-highlight"));
+        assert_eq!(by_id["nm:parent-highlight"].page, 0);
+
+        // A link is not a content annotation, so a reply to one has a parent identity that is
+        // absent from the annotation list. The shell reports that as an orphan, not a crash.
+        let to_link = by_id["nm:reply-to-link"];
+        assert_eq!(to_link.parent_id.as_deref(), Some("nm:structural-parent"));
+        assert!(!by_id.contains_key("nm:structural-parent"));
+
+        // A two-annotation cycle arrives as two parent links; detecting it is the shell's job.
+        assert_eq!(by_id["nm:cycle-a"].parent_id.as_deref(), Some("nm:cycle-b"));
+        assert_eq!(by_id["nm:cycle-b"].parent_id.as_deref(), Some("nm:cycle-a"));
+
+        // The hidden reply without /Contents still crosses the FFI as a reply.
+        let empty = by_id["nm:reply-empty"];
+        assert!(empty.is_reply && empty.contents.is_none());
+        assert_eq!(empty.parent_id.as_deref(), Some("nm:parent-highlight"));
+    }
+
     /// The user's question at the FFI boundary: somebody else's colour is reported as it is.
     #[test]
     fn a_colour_outside_the_palette_survives_the_ffi() {
@@ -1887,6 +1990,42 @@ mod tests {
                 assert!(page < document.page_count());
             }
         }
+    }
+
+    /// The outline fixture is three levels deep, and one section has no destination but does
+    /// have children. `flatten_outline` has always carried a `depth`; before this fixture the
+    /// backend put every bookmark at depth 0, so the sidebar could not number a hierarchy at all.
+    #[test]
+    fn outline_keeps_three_levels_and_a_section_without_a_page() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/outlined.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: outline fixture or PDFium unavailable");
+            return;
+        }
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open outline fixture");
+        let entries = document.outline().expect("outline");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.title.as_str(), entry.depth, entry.page))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Chapter One", 0, Some(0)),
+                ("Background", 1, Some(0)),
+                ("Prior work", 2, Some(1)),
+                ("Chapter Two", 0, None),
+                ("Method", 1, Some(1)),
+                ("Detail", 2, Some(2)),
+                ("Setup", 1, Some(2)),
+                ("Chapter Three", 0, Some(2)),
+            ],
+            "the fixture's outline, depth-first with its real depths"
+        );
     }
 
     #[test]
@@ -2008,6 +2147,69 @@ mod tests {
             document.rasterize_region(0, 1.0, 0.0, 0.0, 10_000.0, 10.0),
             Err(ArisFfiError::InvalidArgument { .. })
         ));
+    }
+
+    /// The thumbnail path asks PDFium to burn the file's annotations into the raster; the canvas
+    /// path must keep asking for a plain page. `annotated-appearance.pdf`'s highlight carries an
+    /// `/AP` (the shape Preview writes) and paints yellow, which the fixture's black text and blue
+    /// page border cannot produce.
+    #[test]
+    fn the_thumbnail_raster_carries_the_files_marks() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotated-appearance.pdf");
+        if !fixture.exists() || !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: annotated fixture or PDFium unavailable");
+            return;
+        }
+        let engine = ArisEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+
+        let plain = document.rasterize_page(0, 1.0).expect("plain page");
+        let marked = document
+            .rasterize_page_with_annotations(0, 1.0)
+            .expect("thumbnail page");
+        assert_eq!(
+            (plain.width_px, plain.height_px),
+            (marked.width_px, marked.height_px)
+        );
+        assert_ne!(
+            plain.pixels, marked.pixels,
+            "the annotated raster must differ from the plain one"
+        );
+
+        // BGRA. The yellow highlight covers the first body line; the page's own blue rectangle
+        // is at a different height, so limiting the sample to the highlight's box distinguishes
+        // the mark from the page artwork. The highlight's view-space box is x 72…460, y 141…156.
+        let width = marked.width_px as usize;
+        let yellow_in_highlight = |pixels: &[u8]| {
+            let mut count = 0;
+            for y in 141..=156 {
+                for x in 72..=460 {
+                    let offset = (y * width + x) * 4;
+                    let (b, g, r) = (
+                        u16::from(pixels[offset]),
+                        u16::from(pixels[offset + 1]),
+                        u16::from(pixels[offset + 2]),
+                    );
+                    if r > 200 && g > 180 && b < 150 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        assert!(
+            yellow_in_highlight(&marked.pixels) > 100,
+            "the thumbnail carries the highlight ({} yellow pixels)",
+            yellow_in_highlight(&marked.pixels)
+        );
+        assert_eq!(
+            yellow_in_highlight(&plain.pixels),
+            0,
+            "the canvas raster must stay annotation-free"
+        );
     }
 
     #[test]

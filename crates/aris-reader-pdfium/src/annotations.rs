@@ -161,6 +161,47 @@ const FLAG_INVISIBLE: c_int = 1 << 0;
 const FLAG_HIDDEN: c_int = 1 << 1;
 const FLAG_NOVIEW: c_int = 1 << 5;
 
+/// FNV-1a over the annotation fields that make up a fallback identity.
+///
+/// Deliberately not `DefaultHasher`: its output is allowed to change between Rust releases, and
+/// an annotation identity is carried across the FFI and stored in the shell's row selection. A
+/// fixed algorithm makes `fp:…` repeatable for the same file on every run.
+struct StableHash(u64);
+
+impl StableHash {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // A separator so ("ab", "c") and ("a", "bc") do not hash alike.
+        self.bytes_raw(&[0xff]);
+    }
+
+    fn bytes_raw(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn integer(&mut self, value: u64) {
+        self.bytes_raw(&value.to_le_bytes());
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// The largest `/DA` font size this reader will report, in points.
 ///
 /// Not a rendering limit: a malformed `/DA` can state a size of any magnitude (and one in the
@@ -199,6 +240,8 @@ struct Api {
     get_number_value: unsafe extern "C" fn(FpdfAnnotation, *const c_char, *mut f32) -> c_int,
     get_flags: unsafe extern "C" fn(FpdfAnnotation) -> c_int,
     set_ap: unsafe extern "C" fn(FpdfAnnotation, c_int, *const u16) -> c_int,
+    /// `FPDFAnnot_GetLinkedAnnot`: follows `/IRT` or `/Popup` to another annotation.
+    get_linked_annot: unsafe extern "C" fn(FpdfAnnotation, *const c_char) -> FpdfAnnotation,
 }
 
 /// The resolved API, or `None` when this PDFium build does not export it.
@@ -242,6 +285,7 @@ unsafe fn resolve(library: Library) -> Option<Api> {
         get_number_value: unsafe { symbol(&library, b"FPDFAnnot_GetNumberValue\0")? },
         get_flags: unsafe { symbol(&library, b"FPDFAnnot_GetFlags\0")? },
         set_ap: unsafe { symbol(&library, b"FPDFAnnot_SetAP\0")? },
+        get_linked_annot: unsafe { symbol(&library, b"FPDFAnnot_GetLinkedAnnot\0")? },
         _library: library,
     };
     Some(api)
@@ -423,21 +467,90 @@ impl AnnotationReader {
         let flags = unsafe { (self.api.get_flags)(handle) };
         let hidden = flags & (FLAG_INVISIBLE | FLAG_HIDDEN | FLAG_NOVIEW) != 0;
 
+        // Finish reading the child before following `/IRT`: closing the linked handle must not
+        // be able to invalidate a field this annotation still has to report, even if a malformed
+        // file links an annotation to itself.
+        let id = self.identity(handle, subtype);
+        let contents = self.string(handle, c"Contents");
+        let author = self.string(handle, c"T");
+        let modified = self.string(handle, c"M");
+        let font_size_pt = self.font_size(handle);
+        let alignment = self.alignment(handle);
+
+        // `/IRT` is the reply link. Close the linked handle PDFium hands back: `fpdf_annot.h`
+        // says the caller owns it. A reply whose parent is hidden, on another page, or not a
+        // content annotation still gets an identity here; deciding whether it can be nested is
+        // the shell's job, done against the whole list.
+        let is_reply = self.has_key(handle, c"IRT");
+        let parent_id = if is_reply {
+            self.linked_identity(handle)
+        } else {
+            None
+        };
+
         Some(RawAnnotation {
             page,
+            id,
+            parent_id,
+            is_reply,
             kind,
             rect,
             quads,
             color,
             opacity,
             blend,
-            contents: self.string(handle, c"Contents"),
-            author: self.string(handle, c"T"),
-            modified: self.string(handle, c"M"),
-            font_size_pt: self.font_size(handle),
-            alignment: self.alignment(handle),
+            contents,
+            author,
+            modified,
+            font_size_pt,
+            alignment,
             visible: !hidden,
         })
+    }
+
+    /// The identity a `/IRT` entry uses for this annotation.
+    ///
+    /// `/NM` is the file's own annotation name and the only identity PDFium exposes across
+    /// pages. The fallback is a fingerprint of the fields the linked handle can read too: a file
+    /// that omits `/NM` still gets a stable key, at the cost that two byte-identical unnamed
+    /// annotations would share one. The corpus carries `/NM` on every annotation, so this is a
+    /// malformed-file fallback rather than the normal path.
+    fn identity(&self, handle: FpdfAnnotation, subtype: c_ulong) -> String {
+        if let Some(name) = self.string(handle, c"NM") {
+            return format!("nm:{name}");
+        }
+
+        let mut hash = StableHash::new();
+        hash.integer(subtype);
+        let mut raw_rect = FsRectF::default();
+        // SAFETY: `handle` is live and `raw_rect` is a valid out-pointer.
+        if unsafe { (self.api.get_rect)(handle, &mut raw_rect) } != 0 {
+            for value in [raw_rect.left, raw_rect.bottom, raw_rect.right, raw_rect.top] {
+                hash.integer(u64::from(value.to_bits()));
+            }
+        }
+        for key in [c"Contents", c"T", c"M"] {
+            if let Some(value) = self.string(handle, key) {
+                hash.string(&value);
+            }
+        }
+        format!("fp:{:016x}", hash.finish())
+    }
+
+    /// The identity of the annotation `/IRT` points at, or `None` if PDFium cannot follow it.
+    fn linked_identity(&self, handle: FpdfAnnotation) -> Option<String> {
+        // SAFETY: `handle` is live and the key is NUL-terminated. The returned handle is owned by
+        // the caller according to fpdf_annot.h, so it is closed before this function returns.
+        let linked = unsafe { (self.api.get_linked_annot)(handle, c"IRT".as_ptr()) };
+        if linked.is_null() {
+            return None;
+        }
+        // SAFETY: `linked` is a live annotation handle until `close_annot` below.
+        let subtype = unsafe { (self.api.get_subtype)(linked) };
+        let identity = self.identity(linked, subtype);
+        // SAFETY: the handle came from `get_linked_annot` and is not used afterwards.
+        unsafe { (self.api.close_annot)(linked) };
+        Some(identity)
     }
 
     /// `/QuadPoints` as bounding rectangles.

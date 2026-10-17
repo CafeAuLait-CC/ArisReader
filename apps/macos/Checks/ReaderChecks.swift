@@ -214,6 +214,12 @@ struct ReaderChecks {
         try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await annotationNoteChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+        try await annotationReplyChecks(
+            url: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"))
+        try await thumbnailAnnotationChecks(
+            url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
+        try await outlineNumberingChecks(
+            url: root.appendingPathComponent("tests/fixtures/outlined.pdf"))
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)
         try await previewChecks(url: b)

@@ -331,6 +331,15 @@ public enum AnnotationSkipReason: String, Sendable {
 /// sticky note. `quads` is what markup annotations are really drawn from; `xPt`/`yPt`/`widthPt`/
 /// `heightPt` is the `/Rect` and the fallback when a file has no quad points.
 public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
+    /// The file's own identity for this annotation, carried from Rust: `nm:<NM>` when the
+    /// annotation is named, otherwise a stable fingerprint. Two replies in a review PDF often
+    /// share a page and a 1×1 pt `/Rect`, so this cannot be re-derived from the visible fields.
+    public let id: String
+    /// The [`id`] of the annotation this one answers through `/IRT`, when readable.
+    public let parentID: String?
+    /// Whether the file carries an `/IRT` entry. True even when `parentID` is nil because the
+    /// parent could not be read; that is the orphan case, not "not a reply".
+    public let isReply: Bool
     /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype
     /// name for anything this build does not model (`Ink`, `Stamp`, …).
     public let kind: String
@@ -363,11 +372,6 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let skipReason: AnnotationSkipReason?
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     public let visible: Bool
-
-    /// Stable identity for `ForEach` and selection: the file gives no id, so page + kind + box.
-    public var id: String {
-        "\(page)-\(kind)-\(xPt)-\(yPt)-\(widthPt)-\(heightPt)"
-    }
 
     /// True when this is one of the four text-markup kinds, i.e. what the reader draws a tinted
     /// box per quad for. A statement about *what the annotation is*; what is actually drawn is
@@ -529,6 +533,11 @@ public protocol PDFEngine: AnyObject {
     /// Asynchronous because it runs off the main thread: PDFium is not thread-safe, so
     /// implementations serialise calls, but the UI must never wait for them.
     func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage
+    /// Rasterizes a sidebar thumbnail, with the file's own annotations burned in.
+    ///
+    /// Implementations that cannot do the annotated raster fall back to the plain page; the
+    /// real engine overrides this so marks from another viewer appear in the strip.
+    func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage
     /// Rasterizes one tile of a page at a discrete LOD (`scale = 2^lod`).
     func rasterizeTile(
         page: Int,
@@ -588,6 +597,16 @@ public protocol PDFEngine: AnyObject {
     var version: String { get }
 }
 
+public extension PDFEngine {
+    /// A plain page raster for engines that have no annotation-burn-in path.
+    ///
+    /// Every test double keeps working through this default; only `RustEngine` overrides it,
+    /// because only it can ask PDFium for `FPDF_ANNOT`.
+    func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
+        try await renderPage(page, scale: scale)
+    }
+}
+
 /// The real engine: the UniFFI control plane described in `docs/05-ffi.md`.
 @MainActor
 public final class RustEngine: PDFEngine {
@@ -636,6 +655,23 @@ public final class RustEngine: PDFEngine {
     }
 
     public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
+        try await renderPage(page, scale: scale, withAnnotations: false)
+    }
+
+    /// A sidebar thumbnail: the same page raster, with the file's own annotations burned in.
+    ///
+    /// Only the thumbnail path asks for this. The canvas keeps `renderPage`'s plain raster and
+    /// draws the marks itself, because those can be edited, filtered, and composited with the
+    /// multiply pipeline; a thumbnail is a preview of where the file's marks are.
+    public func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
+        try await renderPage(page, scale: scale, withAnnotations: true)
+    }
+
+    private func renderPage(
+        _ page: Int,
+        scale: CGFloat,
+        withAnnotations: Bool
+    ) async throws -> PageImage {
         guard let document else {
             throw NSError(
                 domain: "Lyra",
@@ -652,10 +688,15 @@ public final class RustEngine: PDFEngine {
             rasterQueue.async {
                 let started = DispatchTime.now()
                 do {
-                    let bitmap = try document.rasterizePage(
-                        page: UInt32(page),
-                        scale: requestedScale
-                    )
+                    let bitmap = try withAnnotations
+                        ? document.rasterizePageWithAnnotations(
+                            page: UInt32(page),
+                            scale: requestedScale
+                        )
+                        : document.rasterizePage(
+                            page: UInt32(page),
+                            scale: requestedScale
+                        )
                     let milliseconds =
                         Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
                     // Written to stderr (unbuffered) on purpose: it is how the
@@ -953,6 +994,9 @@ public final class RustEngine: PDFEngine {
         }
 
         return DocumentAnnotation(
+            id: record.id,
+            parentID: record.parentId,
+            isReply: record.isReply,
             kind: record.kind,
             page: Int(record.page),
             xPt: CGFloat(record.xPt),

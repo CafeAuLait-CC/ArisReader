@@ -49,7 +49,8 @@ Usage:
   aris-reader-cli text <file.pdf> [--page N]     export the text of one page
   aris-reader-cli annotations <file.pdf>...      dump what the annotation reader found, per page:
                  [--page N] [--pages N] [--all]  subtype, /Rect, /C, /CA, /BM, quad count,
-                                                 /Contents, and the draw the canvas would make
+                                                 /NM identity, /IRT parent, /Contents, and the
+                                                 draw the canvas would make, plus a reply summary
   aris-reader-cli bench <file.pdf>               measure the engine: first frame, scroll raster
                  [--pages N] [--dpi D]           times, RSS peak, first search results and a
                  [--viewport WxH]                per-page render checksum baseline
@@ -294,6 +295,9 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
 
         println!("{path}: {total} page(s)");
         let mut account = DrawAccount::default();
+        // Kept for the reply summary: a parent can sit on a page printed before or after the
+        // reply, so the relationship cannot be resolved one page at a time.
+        let mut scanned = Vec::new();
         for index in scan_start..scan_end {
             let annotations = match backend.annotations(PageIndex(index)) {
                 Ok(annotations) => annotations,
@@ -304,6 +308,7 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            scanned.extend(annotations.iter().cloned());
             if annotations.is_empty() && !show_all {
                 continue;
             }
@@ -350,10 +355,20 @@ fn cmd_annotations(args: &[String]) -> ExitCode {
                 if let Some(author) = &annotation.author {
                     println!("         /T: {}", preview(author, 48));
                 }
+                if annotation.is_reply {
+                    println!(
+                        "         /IRT -> {}",
+                        annotation
+                            .parent_id
+                            .as_deref()
+                            .unwrap_or("unreadable (PDFium could not follow /IRT)")
+                    );
+                }
                 println!("         draw: {}", describe_draw(annotation));
             }
         }
-        println!("  → {}", account.summary());
+        let replies = ReplyAccount::of(&scanned);
+        println!("  → {} · {}", account.summary(), replies.summary());
     }
     ExitCode::SUCCESS
 }
@@ -412,6 +427,115 @@ impl DrawAccount {
 
     fn total(&self) -> usize {
         self.markup + self.notes + self.free_text + self.skipped
+    }
+}
+
+/// What the dump found out about `/IRT`, separately from what it draws.
+///
+/// The three numbers answer different questions and are kept apart on purpose:
+///
+/// * **tied** — the reply's parent identity exists in the scanned annotations, whatever page it
+///   is on and whether or not the reader shows it;
+/// * **nested** — the whole parent chain is displayable, so the sidebar can indent the reply;
+/// * **orphaned** — the reply was read but cannot be nested, with the reason.
+///
+/// A hidden parent is therefore tied but not nested. Replies themselves are always included in
+/// the display set, even when the file hides them: `/F` says what to paint on the page, not
+/// whether a review conversation may be read. That is the same rule the Swift sidebar uses.
+#[derive(Default)]
+struct ReplyAccount {
+    replies: usize,
+    tied: usize,
+    nested: usize,
+    orphans: Vec<(&'static str, usize)>,
+}
+
+impl ReplyAccount {
+    fn of(annotations: &[aris_reader_core::RawAnnotation]) -> Self {
+        use std::collections::{HashMap, HashSet};
+
+        let by_id: HashMap<&str, &aris_reader_core::RawAnnotation> = annotations
+            .iter()
+            .map(|annotation| (annotation.id.as_str(), annotation))
+            .collect();
+        let displayed: HashSet<&str> = annotations
+            .iter()
+            .filter(|annotation| annotation.visible || annotation.is_reply)
+            .map(|annotation| annotation.id.as_str())
+            .collect();
+
+        let mut account = Self::default();
+        for annotation in annotations.iter().filter(|annotation| annotation.is_reply) {
+            account.replies += 1;
+            if annotation
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| by_id.contains_key(parent))
+            {
+                account.tied += 1;
+            }
+
+            let mut seen = HashSet::new();
+            seen.insert(annotation.id.as_str());
+            let mut current = annotation;
+            let outcome = loop {
+                let Some(parent_id) = current.parent_id.as_deref() else {
+                    break "unreadable /IRT";
+                };
+                if !seen.insert(parent_id) {
+                    break "reply cycle";
+                }
+                let Some(parent) = by_id.get(parent_id) else {
+                    break "parent not in the reader's list";
+                };
+                if !displayed.contains(parent_id) {
+                    break "parent hidden on the page";
+                }
+                if !parent.is_reply {
+                    break "";
+                }
+                current = parent;
+            };
+
+            if outcome.is_empty() {
+                account.nested += 1;
+            } else {
+                match account
+                    .orphans
+                    .iter_mut()
+                    .find(|(reason, _)| *reason == outcome)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => account.orphans.push((outcome, 1)),
+                }
+            }
+        }
+        account
+    }
+
+    fn summary(&self) -> String {
+        let noun = if self.replies == 1 {
+            "reply"
+        } else {
+            "replies"
+        };
+        let mut line = format!(
+            "{} {noun} ({} tied to a parent in the file, {} shown nested",
+            self.replies, self.tied, self.nested
+        );
+        let orphaned = self.replies - self.nested;
+        if orphaned == 0 {
+            line.push_str(", 0 orphaned)");
+            return line;
+        }
+        let reasons = self
+            .orphans
+            .iter()
+            .map(|(reason, count)| format!("{count} {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line.push_str(&format!(", {orphaned} orphaned: {reasons})"));
+        line
     }
 }
 

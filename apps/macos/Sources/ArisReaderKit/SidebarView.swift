@@ -10,6 +10,10 @@ public struct SidebarView: View {
     /// Which note field has focus, so losing it commits the pending write immediately instead
     /// of leaving the text to the coalescing window (`AppState.updateNote`).
     @FocusState private var focusedNote: UUID?
+    /// Page groups the reader has collapsed. Empty means every group is expanded: the panel is
+    /// opened to read annotations, and a review PDF's threads should not hide behind a second
+    /// click. Disclosure is local view state, so switching tabs or documents resets it.
+    @State private var collapsedAnnotationPages: Set<Int> = []
 
     public init(state: AppState) {
         self.state = state
@@ -139,25 +143,31 @@ public struct SidebarView: View {
             if state.outline.isEmpty {
                 emptyState("No outline", "list.bullet.indent", task: "T2.4")
             } else {
-                List(state.outline) { entry in
+                let rows = OutlineNumbering.rows(for: state.outline)
+                List(rows) { row in
                     Button {
-                        if let page = entry.page {
+                        if let page = row.entry.page {
                             state.gotoPage(page)
                         }
                     } label: {
-                        HStack(spacing: 6) {
-                            Text(entry.title)
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(row.number)
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .frame(minWidth: 24, alignment: .trailing)
+                            Text(row.entry.title)
                                 .lineLimit(2)
-                                .font(entry.depth == 0 ? .callout : .caption)
+                                .font(row.depth == 0 ? .callout : .caption)
                             Spacer(minLength: 0)
-                            if let page = entry.page {
+                            if let page = row.entry.page {
                                 Text("\(page + 1)")
                                     .font(.caption2)
                                     .monospacedDigit()
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .padding(.leading, CGFloat(entry.depth) * 12)
+                        .padding(.leading, row.indentPt)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -227,7 +237,7 @@ public struct SidebarView: View {
         }
     }
 
-    /// The annotations the file itself carries.
+    /// The annotations the file itself carries, grouped by page and threaded by `/IRT`.
     @ViewBuilder
     private var documentAnnotationSection: some View {
         if state.documentAnnotationsLoading {
@@ -244,43 +254,123 @@ public struct SidebarView: View {
                     .foregroundStyle(.secondary)
             }
         } else if !state.documentAnnotations.isEmpty {
+            let panel = AnnotationPanelModel.build(from: state.documentAnnotations)
             Section("In this PDF") {
-                ForEach(state.documentAnnotations.filter { $0.visible }) { annotation in
-                    Button {
-                        state.jump(toDocumentAnnotation: annotation)
-                    } label: {
-                        HStack(alignment: .top, spacing: 8) {
-                            // The annotation's own colour, so a list entry is recognisable as the
-                            // mark the reader can see on the page.
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(color(of: annotation))
-                                .frame(width: 8, height: 8)
-                                .padding(.top, 3)
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(documentAnnotationTitle(annotation))
-                                    .font(.caption)
-                                    .lineLimit(3)
-                                Text(documentAnnotationSubtitle(annotation))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                ForEach(panel.sections) { section in
+                    DisclosureGroup(
+                        isExpanded: Binding(
+                            get: { !collapsedAnnotationPages.contains(section.page) },
+                            set: { expanded in
+                                if expanded {
+                                    collapsedAnnotationPages.remove(section.page)
+                                } else {
+                                    collapsedAnnotationPages.insert(section.page)
+                                }
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
+                        )
+                    ) {
+                        ForEach(section.rows) { row in
+                            documentAnnotationRow(row)
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Page \(section.page + 1)")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                            Text(
+                                section.annotationCount == 1
+                                    ? "1 annotation" : "\(section.annotationCount) annotations"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                         }
                     }
-                    .buttonStyle(.plain)
-                    // A note clicked on the page lands here (see `openDocumentNote`): the row is
-                    // the one place the whole of its text is readable, so a drawn note has to be
-                    // able to put the reader in front of it.
-                    .listRowBackground(
-                        state.selectedDocumentAnnotationID == annotation.id
-                            ? Color.accentColor.opacity(0.22)
-                            : Color.clear
-                    )
                 }
             }
         }
+    }
+
+    /// One row, at its depth in the thread. A reply shows its author, date and its own text; an
+    /// orphan says why it is not under a parent instead of disappearing into a silent gap.
+    private func documentAnnotationRow(_ row: AnnotationPanelRow) -> some View {
+        Button {
+            state.jump(toDocumentAnnotation: row.annotation)
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                // The annotation's own colour, so a list entry is recognisable as the mark the
+                // reader can see on the page. Replies usually carry no colour of their own.
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(color(of: row.annotation))
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 3)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    if row.annotation.isReply {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrowshape.turn.up.left")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(row.replyAuthor ?? "Reply")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .lineLimit(1)
+                        }
+                        Text(replyBody(row.annotation))
+                            .font(.caption)
+                            .lineLimit(5)
+                            .foregroundStyle(row.annotation.contents == nil ? .secondary : .primary)
+                        if let date = row.replyDate {
+                            Text(date)
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text(documentAnnotationTitle(row.annotation))
+                            .font(.caption)
+                            .lineLimit(3)
+                        Text(documentAnnotationSubtitle(row.annotation))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if !row.annotation.visible {
+                        Label("Hidden on page", systemImage: "eye.slash")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if row.showsPage {
+                        Text("On page \(row.annotation.page + 1)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let orphan = row.orphanReason {
+                        Label(orphan.message, systemImage: "exclamationmark.triangle")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .lineLimit(3)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .padding(.leading, CGFloat(row.depth) * 14)
+        }
+        .buttonStyle(.plain)
+        // A note clicked on the page opens its paper overlay and still marks this row (both go
+        // through `selectedDocumentAnnotationID`); a click here jumps to the annotation's page.
+        .listRowBackground(
+            state.selectedDocumentAnnotationID == row.annotation.id
+                ? Color.accentColor.opacity(0.22)
+                : Color.clear
+        )
+    }
+
+    private func replyBody(_ annotation: DocumentAnnotation) -> String {
+        guard let contents = annotation.contents,
+              !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return "No text" }
+        return contents
     }
 
     /// The highlights this reader added, with their editable notes.
