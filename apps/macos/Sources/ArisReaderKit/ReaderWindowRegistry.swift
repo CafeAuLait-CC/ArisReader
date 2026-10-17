@@ -42,6 +42,51 @@ public final class ReaderWindowRegistry: ObservableObject {
     /// URLs delivered while there was no window to open them in, in arrival order.
     private var pending: [URL] = []
 
+    /// Documents that asked for a **new** window (a drop on the sidebar, a thumbnail's "Open in
+    /// New Window"), waiting for that window's session to register.
+    ///
+    /// They are deliberately not in `pending`: `pending` is drained into whichever window exists,
+    /// and the whole point of these URLs is that they must *not* land in the window they were
+    /// dropped on. The next session that registers is the window SwiftUI made for them.
+    private var pendingNewWindow: [URL] = []
+    /// The page the new window should show after opening, for a thumbnail menu request.
+    private var pendingNewWindowPage: Int?
+
+    /// How the app asks SwiftUI for another reader window.
+    ///
+    /// Injected by ``ReaderWindowRoot`` (`@Environment(\.openWindow)`), so the registry itself
+    /// knows nothing about SwiftUI scenes. The checks substitute a closure that registers a
+    /// session of their own, which is what lets them assert routing on the registry rather than
+    /// on pixels. `nil` means this build cannot make a window, and callers report that instead of
+    /// pretending the document opened.
+    public var newWindow: (() -> Void)?
+
+    /// How many new-window requests the registry has served (the checks read this).
+    public private(set) var newWindowRequestCount = 0
+
+    /// How many documents are waiting for the window they asked for (the checks read this).
+    public var pendingNewWindowCount: Int { pendingNewWindow.count }
+
+    /// Whether this registry can make another reader window.
+    public var canOpenNewWindow: Bool { newWindow != nil }
+
+    /// Splits a delivery: the URLs are kept here, a new window is asked for, and ``register(_:)``
+    /// hands them to that window's own session. Nothing is opened in the window that asked.
+    ///
+    /// Returns `false` when there is no way to make a window; the caller then reports that, so a
+    /// drop is never silently swallowed.
+    @discardableResult
+    public func requestNewWindow(opening urls: [URL], page: Int? = nil) -> Bool {
+        guard !urls.isEmpty else { return false }
+        guard let newWindow else { return false }
+        pendingNewWindow.append(contentsOf: urls)
+        pendingNewWindowPage = page
+        newWindowRequestCount += 1
+        // Last, so a closure that registers its session synchronously finds the URLs waiting.
+        newWindow()
+        return true
+    }
+
     /// How many sessions have ever registered, and what that count was when the last document from
     /// outside the app was delivered.
     ///
@@ -78,6 +123,12 @@ public final class ReaderWindowRegistry: ObservableObject {
 
     public init() {}
 
+    /// The id of the reader's `WindowGroup` in `ArisReaderApp`.
+    ///
+    /// `openWindow(id:)` needs it to make another *reader* window (not a Settings window). It
+    /// lives here so the scene declaration and the drop path name the same string once.
+    public static let readerWindowID = "reader"
+
     /// The window AppKit currently treats as key — the reader's window, as far as a document
     /// arriving from outside is concerned.
     ///
@@ -91,7 +142,7 @@ public final class ReaderWindowRegistry: ObservableObject {
     // MARK: - Registration
 
     /// How many documents are waiting for a window (the checks read this).
-    public var pendingCount: Int { pending.count }
+    public var pendingCount: Int { pending.count + pendingNewWindow.count }
 
     /// Whether the queued documents are waiting for a specific window to be identified, rather
     /// than for *any* window to exist. Everything that would otherwise flush the queue on the spot
@@ -128,6 +179,18 @@ public final class ReaderWindowRegistry: ObservableObject {
         session.registrationOrdinal = registrations
         sessions.append(session)
         if isReady { session.opener.markReady() }
+        // A window that was asked for by a drop on the sidebar (or a thumbnail's "Open in New
+        // Window") is this one: its session is the next to register, and the documents that
+        // asked for it go here — never into the window the reader dropped them on.
+        if !pendingNewWindow.isEmpty {
+            let batch = pendingNewWindow
+            let page = pendingNewWindowPage
+            pendingNewWindow.removeAll()
+            pendingNewWindowPage = nil
+            traceNewWindow(batch, to: session, page: page)
+            session.opener.receive(batch, startingAt: page)
+            return
+        }
         // A held delivery belongs to a window that is not identified yet; `sessionAttached` is what
         // releases it, so registering must not race ahead and hand it to whichever session happened
         // to register first.
@@ -260,6 +323,17 @@ public final class ReaderWindowRegistry: ObservableObject {
         pending.removeAll()
         trace(batch, to: session)
         session.opener.receive(batch)
+    }
+
+    /// Development aid: one line per new-window delivery, so a headless run can tell "the drop
+    /// made a second window and opened there" from "the drop landed in the old window" without
+    /// looking at pixels.
+    private func traceNewWindow(_ urls: [URL], to session: ReaderSession, page: Int?) {
+        let index = sessions.firstIndex { $0 === session }.map { $0 + 1 } ?? sessions.count
+        let pageNote = page.map { ", page \($0 + 1)" } ?? ""
+        let line = "aris-window: \(urls.count) url(s) → new window session \(index) of "
+            + "\(sessions.count)\(pageNote)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// Development aid, next to the shell's other `aris-…` trace lines: one line per delivery

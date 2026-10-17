@@ -71,9 +71,18 @@ public final class ReaderSession: ObservableObject, Identifiable {
     /// leaves it out and gets a session with its own engine.
     public init(state: AppState? = nil, registry: ReaderWindowRegistry) {
         self.state = state ?? AppState()
-        self.opener = DocumentOpenCoordinator(state: self.state)
+        self.opener = DocumentOpenCoordinator(state: self.state, registry: registry)
         self.previewPanels = ReferencePreviewPanelController()
         self.registry = registry
+    }
+
+    /// Installs the app's "make another reader window" command into the registry.
+    ///
+    /// `ReaderWindowRoot` passes SwiftUI's `openWindow` here. The registry stays free of SwiftUI,
+    /// and a check can substitute a closure that registers a session, so the new-window drop path
+    /// is asserted against the real routing rule rather than against a screenshot.
+    public func installNewWindowAction(_ action: @escaping () -> Void) {
+        registry?.newWindow = action
     }
 
     // MARK: - Window lifecycle
@@ -146,6 +155,9 @@ public final class ReaderSession: ObservableObject, Identifiable {
 /// state at all — it cannot leak one window's session into another, because it never holds one.
 public struct ReaderWindowRoot: View {
     @StateObject private var session: ReaderSession
+    /// SwiftUI's command for making another window in this scene. Handed to the registry once the
+    /// window exists, so a drop on the sidebar can ask for one without the registry knowing SwiftUI.
+    @Environment(\.openWindow) private var openWindow
 
     public init(registry: ReaderWindowRegistry) {
         _session = StateObject(wrappedValue: ReaderSession(registry: registry))
@@ -157,7 +169,13 @@ public struct ReaderWindowRoot: View {
             // read the session of the *focused* window rather than a single global one.
             .focusedSceneValue(\.readerSession, session)
             .background(ReaderWindowAttachment { session.attach(window: $0) })
-            .onAppear { session.register() }
+            .onAppear {
+                session.register()
+                // `openWindow(id:)` is what makes a second, independent `ReaderSession` (and so a
+                // second window in the registry). Every window installs the same action; it is
+                // idempotent and always refers to this scene's WindowGroup.
+                session.installNewWindowAction { openWindow(id: ReaderWindowRegistry.readerWindowID) }
+            }
     }
 }
 

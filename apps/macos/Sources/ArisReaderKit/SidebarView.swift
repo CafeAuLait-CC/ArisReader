@@ -1,5 +1,7 @@
 import CoreGraphics
+import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Sidebar: tab switching plus the content of each tab (`docs/04-ui-ux.md` §2.2).
 ///
@@ -7,6 +9,14 @@ import SwiftUI
 /// (bookmarks, annotations, AI) keep their empty state until their milestone.
 public struct SidebarView: View {
     @ObservedObject private var state: AppState
+    /// The window this sidebar belongs to. A file dropped on the sidebar opens in a **new**
+    /// window through this coordinator; `nil` in previews/checks that only want the panel, in
+    /// which case the sidebar is not a drop target.
+    private let opener: DocumentOpenCoordinator?
+    /// Shared by the drop delegate: it bumps a generation for every drag that enters or leaves,
+    /// so a slow item-provider load that lands after the drag moved on cannot paint a stale hint
+    /// or perform a stale drop.
+    @State private var dropSession = SidebarDropSession()
     /// Which note field has focus, so losing it commits the pending write immediately instead
     /// of leaving the text to the coalescing window (`AppState.updateNote`).
     @FocusState private var focusedNote: UUID?
@@ -18,8 +28,9 @@ public struct SidebarView: View {
     /// when the reader checks the outline) but not the window.
     @StateObject private var aiAssistant = AIAssistantModel()
 
-    public init(state: AppState) {
+    public init(state: AppState, opener: DocumentOpenCoordinator? = nil) {
         self.state = state
+        self.opener = opener
     }
 
     public var body: some View {
@@ -40,6 +51,19 @@ public struct SidebarView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 180)
+        // Dropping a file here opens a new window (the canvas keeps opening tabs in this one).
+        // The whole panel is the target: thumbnails, the outline and the empty background all
+        // answer the same way, because "on the sidebar" is one place to a reader holding a file.
+        .onDrop(
+            of: [.fileURL],
+            delegate: SidebarFileDropDelegate(coordinator: opener, session: dropSession)
+        )
+        .overlay {
+            if let hint = opener?.newWindowDropHint {
+                FileDropOverlay(hint: hint)
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: opener?.newWindowDropHint)
     }
 
     @ViewBuilder
@@ -239,49 +263,44 @@ public struct SidebarView: View {
                             )
                     )
                     .contextMenu {
-                        Button("Select Page") {
-                            state.selectPage(page, extending: false, toggling: false)
-                        }
-                        Button("Select Range to Here") {
-                            state.selectPage(page, extending: true, toggling: false)
-                        }
-                        Divider()
-                        Button("Rotate 90° Clockwise") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.rotateSelectedPages(clockwise: true)
-                        }
-                        Button("Rotate 90° Anticlockwise") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.rotateSelectedPages(clockwise: false)
-                        }
-                        Button("Reset Rotation to Original") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.resetSelectedPageRotations()
-                        }
-                        Divider()
-                        Button("Insert Blank Page Before") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.insertBlankPage(before: true)
-                        }
-                        Button("Insert Blank Page After") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.insertBlankPage(before: false)
-                        }
-                        Button("Delete Page…") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.confirmDeleteSelectedPages()
-                        }
-                        Divider()
-                        Button("Extract Selected Pages…") {
-                            state.selectPage(page, extending: false, toggling: false)
-                            state.presentExtractPagesPanel()
-                        }
+                        pageContextMenu(for: page)
                     }
                 }
             }
             .padding(10)
         }
         .onAppear { state.loadThumbnails() }
+    }
+
+    /// The thumbnail's right-click menu, built from the same page/window commands the Pages menu
+    /// and the window registry expose.
+    ///
+    /// The model decides which items exist and whether they are enabled
+    /// (`PageContextMenu.sections`); this view only renders them, so a command's precondition and
+    /// its menu entry cannot disagree.
+    @ViewBuilder
+    private func pageContextMenu(for page: Int) -> some View {
+        let sections = PageContextMenu.sections(
+            state: state,
+            page: page,
+            canOpenNewWindow: opener?.canOpenInNewWindow == true
+        )
+        ForEach(sections.indices, id: \.self) { sectionIndex in
+            if sectionIndex > 0 { Divider() }
+            ForEach(sections[sectionIndex].indices, id: \.self) { itemIndex in
+                let item = sections[sectionIndex][itemIndex]
+                Button(item.title) {
+                    _ = PageContextMenu.perform(
+                        item.action,
+                        state: state,
+                        newWindow: { url, targetPage in
+                            opener?.openInNewWindow([url], page: targetPage) ?? false
+                        }
+                    )
+                }
+                .disabled(!item.isEnabled)
+            }
+        }
     }
 
     @ViewBuilder
@@ -821,5 +840,139 @@ private struct BookmarkNameField: View {
 
     private func commit() {
         state.renameBookmark(bookmark.id, to: draft)
+    }
+}
+
+// MARK: - Sidebar file drop (new window)
+
+/// Mutable state shared with ``SidebarFileDropDelegate``: one drag generation.
+///
+/// SwiftUI constructs a `DropDelegate` value, so it cannot own the "a newer drag began" counter
+/// itself. The class lives in `@State` for the lifetime of the sidebar and is what keeps a slow
+/// `NSItemProvider` load from a previous drag from painting a highlight — or opening a file — over
+/// the drag the reader is actually making.
+@MainActor
+final class SidebarDropSession {
+    private(set) var generation = 0
+    /// True once the reader let go: a late enter-load must not bring the hint back.
+    private(set) var finished = false
+
+    func begin() -> Int {
+        generation += 1
+        finished = false
+        return generation
+    }
+
+    func cancel() -> Int {
+        generation += 1
+        finished = true
+        return generation
+    }
+
+    func tokenIsCurrent(_ token: Int) -> Bool { token == generation }
+}
+
+/// Accepts file drags on the sidebar and routes them to ``DocumentOpenCoordinator``'s
+/// new-window path.
+///
+/// The unchanged part of the drop story stays where it was: the canvas is an AppKit
+/// `NSDraggingDestination` and opens a tab in this window. The sidebar is the one target whose
+/// meaning differs, so it answers with a new window and says so while the drag hovers. A drag the
+/// app would refuse still gets a sentence (the coordinator's `FileOpenPolicy` refusal), never a
+/// silent no-op.
+struct SidebarFileDropDelegate: DropDelegate {
+    let coordinator: DocumentOpenCoordinator?
+    let session: SidebarDropSession
+
+    func validateDrop(info: DropInfo) -> Bool {
+        coordinator != nil && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard let coordinator else { return }
+        let token = session.begin()
+        Self.fileURLs(from: info) { urls in
+            guard session.tokenIsCurrent(token), !session.finished else { return }
+            _ = coordinator.previewNewWindowDrop(urls)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        _ = session.cancel()
+        coordinator?.endNewWindowDropPreview()
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let coordinator, info.hasItemsConforming(to: [.fileURL]) else { return false }
+        // Invalidate the enter-load first: it must not re-publish a hover hint after the drop.
+        let token = session.cancel()
+        coordinator.endNewWindowDropPreview()
+        Self.fileURLs(from: info) { urls in
+            guard session.tokenIsCurrent(token) else { return }
+            _ = coordinator.acceptNewWindowDrop(urls)
+        }
+        return true
+    }
+
+    /// Reads the file URLs a drag is carrying from its item providers.
+    ///
+    /// `DropInfo` exposes providers rather than a pasteboard, so the URL arrives asynchronously.
+    /// The load is per provider and ordered back into the drag order; duplicates are removed the
+    /// same way the canvas removes them.
+    private static func fileURLs(
+        from info: DropInfo,
+        completion: @escaping @MainActor ([URL]) -> Void
+    ) {
+        let providers = info.itemProviders(for: [.fileURL])
+        guard !providers.isEmpty else {
+            completion([])
+            return
+        }
+        let collector = FileURLCollector(count: providers.count)
+        let group = DispatchGroup()
+        for (index, provider) in providers.enumerated() {
+            group.enter()
+            provider.loadDataRepresentation(
+                forTypeIdentifier: UTType.fileURL.identifier
+            ) { data, _ in
+                if let data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    collector.store(url, at: index)
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            MainActor.assumeIsolated {
+                completion(collector.urls)
+            }
+        }
+    }
+}
+
+/// Collects URLs from item-provider callbacks, which arrive on arbitrary queues.
+private final class FileURLCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var slots: [URL?]
+
+    init(count: Int) {
+        slots = Array(repeating: nil, count: count)
+    }
+
+    func store(_ url: URL, at index: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard slots.indices.contains(index) else { return }
+        slots[index] = url
+    }
+
+    var urls: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        var seen = Set<String>()
+        return slots.compactMap { $0 }.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 }

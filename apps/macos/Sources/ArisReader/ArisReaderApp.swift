@@ -58,7 +58,12 @@ struct ArisReaderApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Lyra") {
+        // A named scene so the app can ask for another window by id: a drop on the sidebar, and a
+        // thumbnail's "Open in New Window", create an independent `ReaderSession` here
+        // (`openWindow(id: ReaderWindowRegistry.readerWindowID)`). The id is the only thing that
+        // makes a *second* reader window possible; without it `openWindow` would have nothing to
+        // open.
+        WindowGroup("Lyra", id: ReaderWindowRegistry.readerWindowID) {
             // One session per window, made by the window's own `@StateObject` — the app holds no
             // per-window state, so it cannot hand one window's documents to another. The delegate
             // below is the delivery point for documents macOS opens *at* Lyra; it routes each to

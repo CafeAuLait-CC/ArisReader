@@ -2120,6 +2120,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         addAnnotationFromSelection(kind: .highlight, color: color)
     }
 
+    /// Attaches a note to the current selection.
+    ///
+    /// A note in this reader is a highlight that carries text (the same `Annotation.note` the
+    /// sidebar edits), so this is not a second annotation model: it is
+    /// ``addAnnotationFromSelection(kind:color:note:)`` with the note the reader typed. The text
+    /// range stays visible on the page, and the note is edited where every other note is.
+    @discardableResult
+    public func addNoteFromSelection(note: String) -> Bool {
+        addAnnotationFromSelection(kind: .highlight, note: note)
+    }
+
     public func removeAnnotation(_ id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         let removed = annotations[index]
@@ -4617,12 +4628,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Follows the link under a content-space point, if there is one.
+    /// The link whose box contains a content-space point, if any, with the page it is on.
     ///
-    /// Called on a *click* (no drag): dragging selects text, clicking follows links — the
-    /// convention PDF readers share.
-    @discardableResult
-    public func followLink(at point: CGPoint) -> Bool {
+    /// Links are loaded per visible page in the background (`loadLinks`); until a page's links
+    /// have arrived, a right-click on that page has no link to offer. That is the same latency
+    /// a click already has, rather than a second source of truth.
+    private func linkHit(at point: CGPoint) -> (link: DocumentLink, placement: PagePlacement)? {
         for placement in visiblePagePlacements {
             let pageRect = CGRect(
                 x: placement.leftPt,
@@ -4638,36 +4649,73 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             for link in links {
                 let box = CGRect(x: link.xPt, y: link.yPt, width: link.widthPt, height: link.heightPt)
                 guard box.contains(local) else { continue }
-
-                if let uri = link.uri, let url = URL(string: uri) {
-                    // Only hand schemes we trust to the system.
-                    if let scheme = url.scheme?.lowercased(),
-                       ["http", "https", "mailto"].contains(scheme) {
-                        NSWorkspace.shared.open(url)
-                        statusMessage = "Opened \(url.host ?? uri)"
-                        return true
-                    }
-                }
-                if let page = link.page {
-                    if openCitation(at: point) || openFigureMention(at: point) { return true }
-                    // M4: show the target in a floating panel rather than jumping, so the
-                    // citation can be read without losing the place in the text. When the
-                    // destination names a region (/FitR), only that region is shown -- which
-                    // is what a citation to a figure or table means.
-                    openReferencePreview(
-                        page: page,
-                        title: link.region == nil
-                            ? "Page \(page + 1)"
-                            : "Figure on page \(page + 1)",
-                        from: "page \(placement.index + 1)",
-                        kind: link.region == nil ? .page : .figure,
-                        anchor: viewRect(local: box, on: placement),
-                        region: link.region
-                    )
-                    statusMessage = "Previewing page \(page + 1)"
-                    return true
-                }
+                return (link, placement)
             }
+        }
+        return nil
+    }
+
+    /// The link under a content-space point, **without following it**.
+    ///
+    /// This is the query a context menu asks before it offers "Open Link": an item that appears
+    /// where there is no link would be a menu entry that does nothing. Following it stays
+    /// ``followLink(at:)``'s job.
+    public func link(at point: CGPoint) -> DocumentLink? {
+        linkHit(at: point)?.link
+    }
+
+    /// The index of the page under a content-space point.
+    ///
+    /// The page-level context-menu commands act on a page, not on a character or a link, and the
+    /// reader's right-click has already said which one they mean. Gaps between pages answer `nil`,
+    /// so a right-click in the gap offers no page operation at all.
+    public func pageIndex(at point: CGPoint) -> Int? {
+        visiblePagePlacements.first { placement in
+            CGRect(
+                x: placement.leftPt,
+                y: placement.topPt,
+                width: placement.widthPt,
+                height: placement.heightPt
+            ).contains(point)
+        }?.index
+    }
+
+    /// Follows the link under a content-space point, if there is one.
+    ///
+    /// Called on a *click* (no drag): dragging selects text, clicking follows links — the
+    /// convention PDF readers share.
+    @discardableResult
+    public func followLink(at point: CGPoint) -> Bool {
+        guard let (link, placement) = linkHit(at: point) else { return false }
+        let box = CGRect(x: link.xPt, y: link.yPt, width: link.widthPt, height: link.heightPt)
+
+        if let uri = link.uri, let url = URL(string: uri) {
+            // Only hand schemes we trust to the system.
+            if let scheme = url.scheme?.lowercased(),
+               ["http", "https", "mailto"].contains(scheme) {
+                NSWorkspace.shared.open(url)
+                statusMessage = "Opened \(url.host ?? uri)"
+                return true
+            }
+        }
+        if let page = link.page {
+            if openCitation(at: point) || openFigureMention(at: point) { return true }
+            // M4: show the target in a floating panel rather than jumping, so the
+            // citation can be read without losing the place in the text. When the
+            // destination names a region (/FitR), only that region is shown -- which
+            // is what a citation to a figure or table means.
+            openReferencePreview(
+                page: page,
+                title: link.region == nil
+                    ? "Page \(page + 1)"
+                    : "Figure on page \(page + 1)",
+                from: "page \(placement.index + 1)",
+                kind: link.region == nil ? .page : .figure,
+                anchor: viewRect(local: box, on: placement),
+                region: link.region
+            )
+            statusMessage = "Previewing page \(page + 1)"
+            return true
         }
         return false
     }

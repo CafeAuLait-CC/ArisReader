@@ -160,6 +160,27 @@ struct ReaderChecks {
             print("Document-opening checks passed")
             return
         }
+        // Lets the context-menu/new-window checks be run on their own while they are being
+        // worked on (`ArisReaderChecks --check-desktop-interaction .`).
+        if CommandLine.arguments.contains("--check-desktop-interaction") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aris-desktop-\(UUID())")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let first = scratch.appendingPathComponent("a.pdf")
+            let second = scratch.appendingPathComponent("b.pdf")
+            try FileManager.default.copyItem(
+                at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: first)
+            try FileManager.default.copyItem(
+                at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: second)
+            try await desktopInteractionChecks(
+                a: first, b: second,
+                linkFixture: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
+            print("Desktop-interaction checks passed")
+            return
+        }
         // Lets the two-window independence checks be run on their own while they are being worked
         // on: they are the direct regression for "every window shares one state".
         if CommandLine.arguments.contains("--check-window-independence") {
@@ -322,6 +343,9 @@ struct ReaderChecks {
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)
         try await documentOpeningChecks(a: a, b: b)
+        try await desktopInteractionChecks(
+            a: a, b: b,
+            linkFixture: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
         try await windowIndependenceChecks(a: a, b: b)
         // Registered with the other surface checks: it asserts the frame presented after the
         // last tab closes, so it needs a window wgpu will actually present.
