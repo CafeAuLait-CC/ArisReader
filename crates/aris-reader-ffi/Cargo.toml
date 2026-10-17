@@ -23,6 +23,7 @@ workspace = true
 
 [dependencies]
 aris-reader-text = { path = "../aris-reader-text" }
+aris-reader-ai = { workspace = true }
 aris-reader-metadata = { workspace = true }
 aris-reader-core = { workspace = true }
 aris-reader-session = { workspace = true }

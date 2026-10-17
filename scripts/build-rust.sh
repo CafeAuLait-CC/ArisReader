@@ -10,6 +10,13 @@
 #   apps/macos/Sources/aris_reader_ffiFFI/           (C header + modulemap, gitignored)
 set -euo pipefail
 
+# Match the Swift package's macOS deployment target. Ring compiles C/assembly through the SDK,
+# and without this it stamps the objects with the SDK's current version; the Swift linker then
+# warns that the static library was built for a newer macOS than the app.
+if [ "$(uname -s)" = "Darwin" ]; then
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 

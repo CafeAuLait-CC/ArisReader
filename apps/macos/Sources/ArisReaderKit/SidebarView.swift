@@ -14,6 +14,9 @@ public struct SidebarView: View {
     /// opened to read annotations, and a review PDF's threads should not hide behind a second
     /// click. Disclosure is local view state, so switching tabs or documents resets it.
     @State private var collapsedAnnotationPages: Set<Int> = []
+    /// One assistant per window's sidebar. It outlives tab switches (so an answer is not lost
+    /// when the reader checks the outline) but not the window.
+    @StateObject private var aiAssistant = AIAssistantModel()
 
     public init(state: AppState) {
         self.state = state
@@ -55,7 +58,7 @@ public struct SidebarView: View {
         case .metadata:
             metadataPanel
         case .ai:
-            emptyState("AI assistant", "sparkles", task: "T5.4")
+            AIAssistantPanel(state: state, model: aiAssistant)
         }
     }
 

@@ -10,6 +10,12 @@
 //! The full object graph (long-lived documents, sessions, viewports, event streams)
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
+use aris_reader_ai::MockProvider;
+use aris_reader_ai::chat::{
+    Action as AiAction, ChatPlan, ChatSettings, PageText, PlanRequest,
+    SelectionRange as AiSelectionRange, build_plan, inspect_base_url, validate_model,
+};
+use aris_reader_ai::openai::{CancellationToken, RunEvent, TokenUsage, preview_headers, run_plan};
 use aris_reader_core::{
     AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
     PageIndex, Point, RasterRequest, Transform2D,
@@ -32,6 +38,8 @@ pub enum ArisFfiError {
     Backend { message: String },
     /// The caller passed something invalid.
     InvalidArgument { message: String },
+    /// The AI layer could not build a plan or run a request.
+    Ai { message: String },
 }
 
 impl std::fmt::Display for ArisFfiError {
@@ -40,6 +48,15 @@ impl std::fmt::Display for ArisFfiError {
             Self::Document { message } => write!(f, "document error: {message}"),
             Self::Backend { message } => write!(f, "backend error: {message}"),
             Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
+            Self::Ai { message } => write!(f, "AI error: {message}"),
+        }
+    }
+}
+
+impl From<aris_reader_ai::AiError> for ArisFfiError {
+    fn from(error: aris_reader_ai::AiError) -> Self {
+        Self::Ai {
+            message: error.to_string(),
         }
     }
 }
@@ -325,6 +342,10 @@ pub struct ArisDocument {
     /// stale answer; the shell reopens the file immediately and this makes a missed reopen a
     /// loud error instead of a quiet one.
     replaced: std::sync::atomic::AtomicBool,
+    /// Plain text per page, extracted once for AI context building. Text cannot change while
+    /// the document is open (the annotation writer replaces the file, and then the shell
+    /// reopens it), so this cache has the document's lifetime.
+    ai_text: Mutex<std::collections::HashMap<u32, String>>,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -448,6 +469,7 @@ impl ArisDocument {
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
+            ai_text: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -1297,6 +1319,111 @@ impl ArisDocument {
             margin_pt,
         )
     }
+
+    /// Build the context and request plan for the AI panel.
+    ///
+    /// This is local work: it reads the document's text layer, selects blocks, and assembles the
+    /// prompts and JSON bodies. It does not read an API key and does not open a connection. The
+    /// shell shows the returned plan and starts a request only after the reader presses Send.
+    pub fn prepare_ai_plan(
+        &self,
+        request: AiPlanRequestRecord,
+    ) -> Result<AiPlanRecord, ArisFfiError> {
+        let action = match request.action {
+            AiActionRecord::SummarizePage => AiAction::SummarizePage,
+            AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
+            AiActionRecord::AskSelection => AiAction::AskSelection,
+            AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
+        };
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return Err(ArisFfiError::Ai {
+                message: "This document has no pages.".to_string(),
+            });
+        }
+        if request.current_page >= page_count {
+            return Err(ArisFfiError::Ai {
+                message: format!(
+                    "The current page {} is outside this document ({} pages).",
+                    request.current_page + 1,
+                    page_count
+                ),
+            });
+        }
+        let selection = request.selection.map(|selection| AiSelectionRange {
+            page: selection.page,
+            start: selection.start,
+            end: selection.end,
+        });
+        if action.requires_selection() && selection.is_none() {
+            return Err(ArisFfiError::Ai {
+                message: "Select text first; there is no selection to send.".to_string(),
+            });
+        }
+        if let Some(selection) = selection
+            && selection.page >= page_count
+        {
+            return Err(ArisFfiError::Ai {
+                message: format!(
+                    "The selected page {} is outside this document.",
+                    selection.page + 1
+                ),
+            });
+        }
+
+        // Translation only needs the selected page. Every other action can retrieve context
+        // from the whole document, and a document summary needs all of it.
+        let page_list: Vec<u32> = if action == AiAction::TranslateSelection {
+            vec![selection.expect("checked above").page]
+        } else {
+            (0..page_count).collect()
+        };
+        let mut pages = Vec::with_capacity(page_list.len());
+        for page in page_list {
+            pages.push(PageText {
+                page,
+                text: self.ai_page_text(page)?,
+            });
+        }
+
+        let temperature = request.temperature.and_then(|value| {
+            if value.is_finite() {
+                Some(value as f32)
+            } else {
+                None
+            }
+        });
+        // A non-finite value becomes None, which would silently drop the field; keep the
+        // validation honest by passing NaN through so the core rejects it.
+        let temperature = if request.temperature.is_some_and(|value| !value.is_finite()) {
+            Some(f32::NAN)
+        } else {
+            temperature
+        };
+        let settings = ChatSettings {
+            base_url: request.base_url,
+            model: request.model,
+            temperature,
+            max_tokens: request.max_tokens,
+        };
+        let document_title = Path::new(&self.path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Document")
+            .to_string();
+        let plan = build_plan(PlanRequest {
+            action,
+            document_title,
+            page_count,
+            current_page: request.current_page,
+            selection,
+            question: request.question,
+            language: request.language,
+            pages,
+            settings,
+        })?;
+        Ok(ai_plan_record(plan))
+    }
 }
 
 fn page_operation(record: PageOperationRecord) -> PageOperation {
@@ -1339,6 +1466,30 @@ fn page_edit_report(report: aris_reader_pdfium::PageOperationReport) -> PageEdit
 }
 
 impl ArisDocument {
+    /// Plain text for one page, extracted once and kept for the document's lifetime.
+    fn ai_page_text(&self, page: u32) -> Result<String, ArisFfiError> {
+        if page >= self.backend.page_count() {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!("page {page} is outside the document"),
+            });
+        }
+        if let Some(text) = self
+            .ai_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&page)
+        {
+            return Ok(text.clone());
+        }
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let text = text_of(&raw);
+        self.ai_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(page, text.clone());
+        Ok(text)
+    }
+
     fn save_annotations_to(
         &self,
         destination: std::path::PathBuf,
@@ -2255,8 +2406,394 @@ impl ArisEngine {
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
+            ai_text: Mutex::new(std::collections::HashMap::new()),
         }))
     }
+}
+
+// ── AI assistant: plans and streaming requests ──────────────────────────────────────────────
+
+/// What the reader asked the assistant to do, as the Swift panel names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiActionRecord {
+    SummarizePage,
+    SummarizeDocument,
+    AskSelection,
+    TranslateSelection,
+}
+
+/// A selected character range on one page (0-based, inclusive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct AiSelectionRecord {
+    pub page: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Everything needed to build a preview. The API key is deliberately absent.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiPlanRequestRecord {
+    pub action: AiActionRecord,
+    pub current_page: u32,
+    pub selection: Option<AiSelectionRecord>,
+    pub question: Option<String>,
+    pub language: Option<String>,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiHeaderRecord {
+    pub name: String,
+    pub value: String,
+}
+
+/// One request in the preview. `wire_body` is the exact JSON body; the key is added only when
+/// the reader presses Send, so it can never appear here.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiPlanPartRecord {
+    pub index: u32,
+    pub total: u32,
+    pub label: String,
+    pub primary_page: u32,
+    pub pages: Vec<u32>,
+    pub page_characters: u64,
+    pub request_characters: u64,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub wire_body: String,
+    pub note: Option<String>,
+}
+
+/// The complete, previewable plan for one action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiPlanRecord {
+    pub action: AiActionRecord,
+    pub action_label: String,
+    pub document_title: String,
+    pub page_count: u32,
+    pub base_url: String,
+    pub endpoint: String,
+    pub host: String,
+    pub is_local: bool,
+    pub model: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub parts: Vec<AiPlanPartRecord>,
+    pub source_pages: Vec<u32>,
+    pub note: Option<String>,
+    pub preview_headers: Vec<AiHeaderRecord>,
+    pub estimated_tokens: u64,
+}
+
+/// A validated base URL: the settings panel and the preview show the same normalised values.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiEndpointRecord {
+    pub base_url: String,
+    pub endpoint: String,
+    pub host: String,
+    pub is_local: bool,
+}
+
+/// Validate and normalise a base URL without touching the network.
+#[uniffi::export]
+pub fn inspect_ai_base_url(base_url: String) -> Result<AiEndpointRecord, ArisFfiError> {
+    let endpoint = inspect_base_url(&base_url)?;
+    Ok(AiEndpointRecord {
+        base_url: endpoint.base_url,
+        endpoint: endpoint.endpoint,
+        host: endpoint.host,
+        is_local: endpoint.is_local,
+    })
+}
+
+/// Validate a model name without touching the network.
+#[uniffi::export]
+pub fn validate_ai_model(model: String) -> Result<String, ArisFfiError> {
+    Ok(validate_model(&model)?)
+}
+
+/// One event from a running request. The shell polls a handle and renders these in order.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AiEventRecord {
+    PartStarted {
+        index: u32,
+        total: u32,
+        label: String,
+    },
+    Delta {
+        text: String,
+    },
+    Usage {
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    },
+    Done,
+    Error {
+        message: String,
+        cancelled: bool,
+    },
+}
+
+struct AiJob {
+    events: Mutex<std::collections::VecDeque<AiEventRecord>>,
+    finished: std::sync::atomic::AtomicBool,
+    cancel: CancellationToken,
+}
+
+impl Default for AiJob {
+    fn default() -> Self {
+        Self {
+            events: Mutex::new(std::collections::VecDeque::new()),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+impl AiJob {
+    fn push_event(&self, event: RunEvent) {
+        let event = match event {
+            RunEvent::PartStarted {
+                index,
+                total,
+                label,
+            } => AiEventRecord::PartStarted {
+                index,
+                total,
+                label,
+            },
+            RunEvent::Delta(text) => AiEventRecord::Delta { text },
+            RunEvent::Usage(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            }) => AiEventRecord::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            },
+            RunEvent::Done => AiEventRecord::Done,
+        };
+        self.push(event);
+    }
+
+    fn push(&self, event: AiEventRecord) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(event);
+    }
+}
+
+/// A running AI request. The worker thread owns the key for the duration of the request and
+/// drops it when the worker ends; this handle holds only events and a cancellation flag.
+#[derive(uniffi::Object)]
+pub struct ArisAiRequest {
+    job: Arc<AiJob>,
+}
+
+impl Drop for ArisAiRequest {
+    fn drop(&mut self) {
+        // The Swift handle owns this object. If the panel goes away without calling cancel, the
+        // worker must still stop rather than stream into a queue nobody reads.
+        self.job.cancel.cancel();
+    }
+}
+
+#[uniffi::export]
+impl ArisAiRequest {
+    /// Events queued since the previous poll, oldest first.
+    pub fn poll(&self) -> Vec<AiEventRecord> {
+        let mut events = self
+            .job
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *events).into_iter().collect()
+    }
+
+    /// Ask the worker to stop. The transports observe this flag and the HTTP request is closed.
+    pub fn cancel(&self) {
+        self.job.cancel.cancel();
+    }
+
+    /// Whether the worker has stopped. A final `poll()` may still return the last events.
+    pub fn is_finished(&self) -> bool {
+        self.job.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Start a request for a previously previewed plan.
+///
+/// `api_key` crosses the FFI boundary here and is moved into the worker thread; it is not stored
+/// in [`ArisAiRequest`], the job, or any record. `use_mock_provider` is the deterministic,
+/// network-free path used by the checks; the app always passes `false`.
+#[uniffi::export]
+pub fn start_ai_request(
+    plan: AiPlanRecord,
+    api_key: String,
+    use_mock_provider: bool,
+) -> Result<Arc<ArisAiRequest>, ArisFfiError> {
+    if api_key.is_empty() {
+        return Err(ArisFfiError::Ai {
+            message: "No API key is configured. Add one in Settings > AI; nothing was sent."
+                .to_string(),
+        });
+    }
+    if api_key.chars().any(|character| character.is_control()) {
+        return Err(ArisFfiError::Ai {
+            message: "The API key contains a control character or line break, so it was not sent."
+                .to_string(),
+        });
+    }
+    let plan = chat_plan_from_record(plan)?;
+    let job = Arc::new(AiJob::default());
+    let worker_job = Arc::clone(&job);
+    std::thread::Builder::new()
+        .name("lyra-ai-request".to_string())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut emit = |event: RunEvent| worker_job.push_event(event);
+                if use_mock_provider {
+                    MockProvider::preset().run(&plan, &worker_job.cancel, &mut emit)
+                } else {
+                    run_plan(&plan, &api_key, &worker_job.cancel, &mut emit)
+                }
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(aris_reader_ai::AiError::Cancelled)) => {
+                    worker_job.push(AiEventRecord::Error {
+                        message: "Cancelled".to_string(),
+                        cancelled: true,
+                    });
+                }
+                Ok(Err(error)) => {
+                    worker_job.push(AiEventRecord::Error {
+                        message: error.to_string(),
+                        cancelled: false,
+                    });
+                }
+                Err(_) => {
+                    worker_job.push(AiEventRecord::Error {
+                        message: "The AI request worker stopped unexpectedly.".to_string(),
+                        cancelled: false,
+                    });
+                }
+            }
+            worker_job
+                .finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .map_err(|error| ArisFfiError::Ai {
+            message: format!("could not start the AI request worker: {error}"),
+        })?;
+    Ok(Arc::new(ArisAiRequest { job }))
+}
+
+fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
+    let estimated_tokens = plan.estimated_tokens();
+    AiPlanRecord {
+        action: ai_action_record(plan.action),
+        action_label: plan.action.label().to_string(),
+        document_title: plan.document_title,
+        page_count: plan.page_count,
+        base_url: plan.base_url,
+        endpoint: plan.endpoint,
+        host: plan.host,
+        is_local: plan.is_local,
+        model: plan.model,
+        temperature: plan.temperature.map(f64::from),
+        max_tokens: plan.max_tokens,
+        parts: plan
+            .parts
+            .into_iter()
+            .map(|part| AiPlanPartRecord {
+                index: part.index,
+                total: part.total,
+                label: part.label,
+                primary_page: part.primary_page,
+                pages: part.pages,
+                page_characters: part.page_characters,
+                request_characters: part.request_characters,
+                system_prompt: part.system_prompt,
+                user_prompt: part.user_prompt,
+                wire_body: part.wire_body,
+                note: part.note,
+            })
+            .collect(),
+        source_pages: plan.source_pages,
+        note: plan.note,
+        preview_headers: preview_headers()
+            .into_iter()
+            .map(|(name, value)| AiHeaderRecord { name, value })
+            .collect(),
+        estimated_tokens,
+    }
+}
+
+fn ai_action_record(action: AiAction) -> AiActionRecord {
+    match action {
+        AiAction::SummarizePage => AiActionRecord::SummarizePage,
+        AiAction::SummarizeDocument => AiActionRecord::SummarizeDocument,
+        AiAction::AskSelection => AiActionRecord::AskSelection,
+        AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
+    }
+}
+
+fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, ArisFfiError> {
+    let action = match plan.action {
+        AiActionRecord::SummarizePage => AiAction::SummarizePage,
+        AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
+        AiActionRecord::AskSelection => AiAction::AskSelection,
+        AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
+    };
+    if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
+        return Err(ArisFfiError::Ai {
+            message: "The request preview has an invalid endpoint.".to_string(),
+        });
+    }
+    if plan.parts.is_empty() {
+        return Err(ArisFfiError::Ai {
+            message: "The request preview has no requests.".to_string(),
+        });
+    }
+    let parts = plan
+        .parts
+        .into_iter()
+        .map(|part| aris_reader_ai::ChatPart {
+            index: part.index,
+            total: part.total,
+            label: part.label,
+            pages: part.pages,
+            primary_page: part.primary_page,
+            page_characters: part.page_characters,
+            request_characters: part.request_characters,
+            system_prompt: part.system_prompt,
+            user_prompt: part.user_prompt,
+            wire_body: part.wire_body,
+            note: part.note,
+        })
+        .collect();
+    Ok(ChatPlan {
+        action,
+        document_title: plan.document_title,
+        page_count: plan.page_count,
+        base_url: plan.base_url,
+        endpoint: plan.endpoint,
+        host: plan.host,
+        is_local: plan.is_local,
+        model: plan.model,
+        temperature: plan.temperature.map(|value| value as f32),
+        max_tokens: plan.max_tokens,
+        parts,
+        source_pages: plan.source_pages,
+        note: plan.note,
+    })
 }
 
 #[cfg(test)]

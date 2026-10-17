@@ -2160,6 +2160,43 @@ public final class RustEngine: PDFEngine {
         ))
     }
 
+    // MARK: - AI context
+
+    /// Build the AI request preview from the document's text layer.
+    ///
+    /// The work runs on `rasterQueue` (the queue that serialises this engine's PDFium calls)
+    /// and never on the main thread: a document summary reads every page. The result still
+    /// describes the document that was open when the call started; an epoch change means the
+    /// reader switched tabs, and a stale preview must not be shown for the new file.
+    public func prepareAIPlan(_ request: AiPlanRequestRecord) async throws -> AiPlanRecord {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let plan: AiPlanRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.prepareAiPlan(request: request))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "Lyra",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the AI preview was being prepared; nothing was sent."]
+            )
+        }
+        return plan
+    }
+
 }
 
 /// Fallback engine for builds where the Rust backend cannot start (for example a build

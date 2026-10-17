@@ -440,15 +440,10 @@ public struct SettingsView: View {
             .padding(20)
             .tabItem { Label("Reading", systemImage: "book") }
 
-            Form {
-                Text("AI provider configuration, keys (Keychain), and privacy toggles arrive in M5 (T5.1 / T5.2).")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(20)
-            .tabItem { Label("AI", systemImage: "sparkles") }
+            AISettingsView(store: AISettingsStore.shared)
+                .tabItem { Label("AI", systemImage: "sparkles") }
         }
-        .frame(width: 480, height: 300)
+        .frame(width: 520, height: 480)
     }
 
     private var layoutBinding: Binding<ReaderLayoutMode> {

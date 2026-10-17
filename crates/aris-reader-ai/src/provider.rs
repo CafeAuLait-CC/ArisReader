@@ -15,6 +15,16 @@ pub enum AiError {
     Cancelled,
     /// The model does not support the requested capability (for example an image sent to a text-only model).
     UnsupportedCapability(&'static str),
+    /// The reader's settings are not usable (empty URL, bad model, an impossible temperature).
+    InvalidSettings(String),
+    /// The requested context has nothing to send (no text layer, empty selection, no pages).
+    EmptyContext(String),
+    /// The provider answered with an HTTP status that is not 2xx.
+    HttpStatus(String),
+    /// The response was not the streaming protocol this client speaks.
+    Protocol(String),
+    /// The connection or the stream took too long.
+    Timeout(String),
     /// Any other error.
     Other(String),
 }
@@ -28,6 +38,11 @@ impl std::fmt::Display for AiError {
             Self::RateLimited => write!(f, "rate limited"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::UnsupportedCapability(c) => write!(f, "model lacks capability: {c}"),
+            Self::InvalidSettings(message) => write!(f, "{message}"),
+            Self::EmptyContext(message) => write!(f, "{message}"),
+            Self::HttpStatus(message) => write!(f, "{message}"),
+            Self::Protocol(message) => write!(f, "{message}"),
+            Self::Timeout(message) => write!(f, "{message}"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
