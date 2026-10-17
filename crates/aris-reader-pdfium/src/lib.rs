@@ -49,6 +49,8 @@ mod backend;
 mod stub;
 #[cfg(feature = "pdfium")]
 mod writeback;
+#[cfg(feature = "pdfium")]
+mod xmp;
 
 #[cfg(feature = "pdfium")]
 pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind};

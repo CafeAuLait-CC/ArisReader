@@ -1,0 +1,40 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 486 >>
+stream
+0 0 0 rg
+BT /F1 26 Tf 72 760 Td (An arXiv Paper Without a Venue) Tj ET
+BT /F1 12 Tf 72 722 Td (Grace Hopper) Tj ET
+BT /F1 9 Tf 72 702 Td (Department of Testing, Example University) Tj ET
+BT /F1 10 Tf 72 662 Td (Abstract) Tj ET
+BT /F1 10 Tf 72 642 Td (This paper is a preprint and its venue is deliberately absent from page one.) Tj ET
+BT /F1 10 Tf 72 629 Td (Only the arXiv identifier and its date can be found on the page.) Tj ET
+BT /F1 8 Tf 72 70 Td (arXiv:2303.08774v2 [cs.CL]) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+881
+%%EOF

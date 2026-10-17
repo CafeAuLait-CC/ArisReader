@@ -280,6 +280,267 @@ public struct Reference: Sendable {
     public let heightPt: CGFloat
 }
 
+/// Where one metadata field came from.
+public enum MetadataFieldSource: Equatable, Sendable {
+    /// No value; nothing produced it.
+    case absent
+    /// The document's XMP metadata stream.
+    case xmp
+    /// The PDF information dictionary (`/Title`, `/Author`, …).
+    case info
+    /// A layout guess on page one (title block, author block).
+    case firstPage
+    /// Page-one header/footer furniture (venue, copyright year).
+    case pageFurniture
+    /// An identifier found in page-one text (DOI, arXiv id). Found, not guessed.
+    case text
+    /// The year encoded in an arXiv identifier's `YYMM` prefix.
+    case arxivDerived
+    /// The reader corrected the value in the panel.
+    case edited
+
+    public init(_ kind: MetadataSourceKind) {
+        switch kind {
+        case .absent: self = .absent
+        case .xmp: self = .xmp
+        case .info: self = .info
+        case .firstPage: self = .firstPage
+        case .pageFurniture: self = .pageFurniture
+        case .text: self = .text
+        case .arxivDerived: self = .arxivDerived
+        case .edited: self = .edited
+        }
+    }
+
+    /// Human label for the badge next to a field.
+    public var label: String {
+        switch self {
+        case .absent: return "no source"
+        case .xmp: return "XMP"
+        case .info: return "PDF info"
+        case .firstPage: return "Page 1 guess"
+        case .pageFurniture: return "Page 1 furniture guess"
+        case .text: return "Found on page 1"
+        case .arxivDerived: return "From arXiv id"
+        case .edited: return "Edited"
+        }
+    }
+
+    /// Whether the value is a guess the reader should check.
+    public var isGuessed: Bool {
+        switch self {
+        case .firstPage, .pageFurniture, .arxivDerived: return true
+        case .absent, .xmp, .info, .text, .edited: return false
+        }
+    }
+
+    /// Whether the value came from the document's own description of itself.
+    public var isEmbedded: Bool {
+        switch self {
+        case .xmp, .info: return true
+        case .absent, .firstPage, .pageFurniture, .text, .arxivDerived, .edited: return false
+        }
+    }
+}
+
+/// One metadata field: its values and the source that produced them.
+public struct MetadataField: Equatable, Sendable {
+    public var values: [String]
+    public var source: MetadataFieldSource
+    /// The source as the engine worded it; for an edited field the shell says "Edited".
+    public var sourceLabel: String
+    public var guessed: Bool
+
+    public init(
+        values: [String] = [],
+        source: MetadataFieldSource = .absent,
+        sourceLabel: String = "no source",
+        guessed: Bool = false
+    ) {
+        self.values = values
+        self.source = source
+        self.sourceLabel = sourceLabel
+        self.guessed = guessed
+    }
+
+    public static let empty = MetadataField()
+
+    public var isEmpty: Bool { values.isEmpty }
+    public var first: String { values.first ?? "" }
+    /// Authors are one field in the panel but several values in the model.
+    public var text: String { values.joined(separator: "; ") }
+
+    public mutating func markEdited(value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        values = trimmed.isEmpty ? [] : [trimmed]
+        source = .edited
+        sourceLabel = "Edited"
+        guessed = false
+    }
+
+    public mutating func markEdited(values: [String]) {
+        let cleaned = values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        self.values = cleaned
+        source = .edited
+        sourceLabel = "Edited"
+        guessed = false
+    }
+}
+
+/// What the metadata panel shows for the open document.
+public struct DocumentMetadata: Equatable, Sendable {
+    public var title: MetadataField
+    public var authors: MetadataField
+    public var venue: MetadataField
+    public var year: MetadataField
+    public var doi: MetadataField
+    public var arxivID: MetadataField
+    /// The BibTeX the engine generated from exactly these values when the document opened.
+    public var bibtex: String
+
+    public static let empty = DocumentMetadata(
+        title: .empty,
+        authors: .empty,
+        venue: .empty,
+        year: .empty,
+        doi: .empty,
+        arxivID: .empty,
+        bibtex: ""
+    )
+
+    public func field(_ key: MetadataFieldKey) -> MetadataField {
+        switch key {
+        case .title: return title
+        case .authors: return authors
+        case .venue: return venue
+        case .year: return year
+        case .doi: return doi
+        case .arxivID: return arxivID
+        }
+    }
+
+    public var isEmpty: Bool {
+        [title, authors, venue, year, doi, arxivID].allSatisfy(\.isEmpty)
+    }
+}
+
+/// The fields the panel lets the reader edit, in display order.
+public enum MetadataFieldKey: String, CaseIterable, Sendable {
+    case title
+    case authors
+    case venue
+    case year
+    case doi
+    case arxivID
+
+    public var label: String {
+        switch self {
+        case .title: return "Title"
+        case .authors: return "Authors"
+        case .venue: return "Venue"
+        case .year: return "Year"
+        case .doi: return "DOI"
+        case .arxivID: return "arXiv ID"
+        }
+    }
+
+    public var prompt: String {
+        switch self {
+        case .authors: return "One author per “;”"
+        default: return "Not in this file"
+        }
+    }
+}
+
+/// Editable values sent back to the Rust BibTeX generator.
+///
+/// The draft is the single source of truth for the panel's text fields; `bibtex` is regenerated
+/// by the engine after every edit, so the preview, the clipboard payload and the saved file are
+/// the same string.
+public struct MetadataDraft: Equatable, Sendable {
+    public var title: String
+    public var authors: [String]
+    public var venue: String
+    public var year: String
+    public var doi: String
+    public var arxivID: String
+    public var bibtex: String
+
+    public static let empty = MetadataDraft(
+        title: "", authors: [], venue: "", year: "", doi: "", arxivID: "", bibtex: ""
+    )
+
+    public init(
+        title: String,
+        authors: [String],
+        venue: String,
+        year: String,
+        doi: String,
+        arxivID: String,
+        bibtex: String
+    ) {
+        self.title = title
+        self.authors = authors
+        self.venue = venue
+        self.year = year
+        self.doi = doi
+        self.arxivID = arxivID
+        self.bibtex = bibtex
+    }
+
+    public init(metadata: DocumentMetadata) {
+        self.init(
+            title: metadata.title.first,
+            authors: metadata.authors.values,
+            venue: metadata.venue.first,
+            year: metadata.year.first,
+            doi: metadata.doi.first,
+            arxivID: metadata.arxivID.first,
+            bibtex: metadata.bibtex
+        )
+    }
+
+    public func text(for key: MetadataFieldKey) -> String {
+        switch key {
+        case .title: return title
+        case .authors: return authors.joined(separator: "; ")
+        case .venue: return venue
+        case .year: return year
+        case .doi: return doi
+        case .arxivID: return arxivID
+        }
+    }
+
+    public func values(for key: MetadataFieldKey) -> [String] {
+        switch key {
+        case .title: return title.isEmpty ? [] : [title]
+        case .authors: return authors
+        case .venue: return venue.isEmpty ? [] : [venue]
+        case .year: return year.isEmpty ? [] : [year]
+        case .doi: return doi.isEmpty ? [] : [doi]
+        case .arxivID: return arxivID.isEmpty ? [] : [arxivID]
+        }
+    }
+
+    public mutating func setText(_ text: String, for key: MetadataFieldKey) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch key {
+        case .title: title = trimmed
+        case .authors:
+            authors = text
+                .split(whereSeparator: { $0 == ";" || $0 == "\n" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        case .venue: venue = trimmed
+        case .year: year = trimmed
+        case .doi: doi = trimmed
+        case .arxivID: arxivID = trimmed
+        }
+    }
+}
+
 /// One figure or table caption, with the region of its page to preview.
 ///
 /// The region is the caption box unioned with the artwork above it, or the caption box alone
@@ -705,6 +966,11 @@ public protocol PDFEngine: AnyObject {
     func resolveCitations(labels: [String]) async throws -> [Reference]
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
+    /// Recognised metadata for the open document, with the source of every field.
+    func metadata() async throws -> DocumentMetadata
+    /// Generates the BibTeX entry from the values currently in the panel. One function in Rust
+    /// backs the preview, the clipboard and the saved `.bib`, so they cannot disagree.
+    func generateBibtex(_ draft: MetadataDraft) -> String
     /// Searches every page for `pattern` (ASCII case-insensitive), in reading order.
     func search(_ pattern: String, limit: Int) async throws -> [SearchHit]
     /// Total height of the scrolling content, in points.
@@ -1463,6 +1729,58 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    public func metadata() async throws -> DocumentMetadata {
+        guard let document else { return .empty }
+
+        let record: DocumentMetadataRecord = try await withCheckedThrowingContinuation { continuation in
+            // Metadata reads a page of text and the XMP stream; keep it off the main thread and
+            // serialised with the other PDFium calls.
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.metadata())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.documentMetadata(from: record)
+    }
+
+    public func generateBibtex(_ draft: MetadataDraft) -> String {
+        generateBibtexEntry(
+            draft: MetadataDraftRecord(
+                title: draft.title,
+                authors: draft.authors,
+                venue: draft.venue,
+                year: draft.year,
+                doi: draft.doi,
+                arxivId: draft.arxivID
+            )
+        )
+    }
+
+    private static func metadataField(from record: MetadataFieldRecord) -> MetadataField {
+        let source = MetadataFieldSource(record.source)
+        return MetadataField(
+            values: record.values,
+            source: source,
+            sourceLabel: record.sourceLabel,
+            guessed: record.guessed
+        )
+    }
+
+    private static func documentMetadata(from record: DocumentMetadataRecord) -> DocumentMetadata {
+        DocumentMetadata(
+            title: metadataField(from: record.title),
+            authors: metadataField(from: record.authors),
+            venue: metadataField(from: record.venue),
+            year: metadataField(from: record.year),
+            doi: metadataField(from: record.doi),
+            arxivID: metadataField(from: record.arxivId),
+            bibtex: record.bibtex
+        )
+    }
+
     public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] {
         guard let document else { return [] }
 
@@ -1655,6 +1973,21 @@ public final class MockEngine: PDFEngine {
     public func resolveCitations(labels: [String]) async throws -> [Reference] { [] }
 
     public func outline() async throws -> [OutlineEntry] { [] }
+
+    public func metadata() async throws -> DocumentMetadata { .empty }
+
+    public func generateBibtex(_ draft: MetadataDraft) -> String {
+        generateBibtexEntry(
+            draft: MetadataDraftRecord(
+                title: draft.title,
+                authors: draft.authors,
+                venue: draft.venue,
+                year: draft.year,
+                doi: draft.doi,
+                arxivId: draft.arxivID
+            )
+        )
+    }
 
     public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] { [] }
 

@@ -41,6 +41,7 @@ name = "aris-reader-cli"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+ "aris-reader-metadata",
  "aris-reader-pdfium",
  "aris-reader-render",
  "aris-reader-text",
@@ -65,6 +66,7 @@ version = "0.0.0"
 dependencies = [
  "aris-reader-core",
  "aris-reader-gpu",
+ "aris-reader-metadata",
  "aris-reader-pdfium",
  "aris-reader-session",
  "aris-reader-text",
@@ -80,10 +82,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aris-reader-metadata"
+version = "0.0.0"
+dependencies = [
+ "aris-reader-core",
+ "aris-reader-text",
+]
+
+[[package]]
 name = "aris-reader-pdfium"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+ "flate2",
  "libloading 0.8.9",
  "pdfium-render",
 ]

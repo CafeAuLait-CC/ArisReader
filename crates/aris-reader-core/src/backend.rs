@@ -513,6 +513,16 @@ pub trait DocumentBackend: Send + Sync {
     /// Raw text layer (built lazily and cached by the upper layer).
     fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage>;
 
+    /// The document's own description of itself: `/Info` plus the XMP metadata stream.
+    ///
+    /// Deliberately raw. No field is cleaned or rejected here, because "empty" and "garbage"
+    /// are recognition questions and a backend that silently dropped a placeholder title would
+    /// hide the evidence from the panel that shows the reader where each field came from.
+    /// Implementations that cannot read metadata return [`EmbeddedMetadata::default`].
+    fn embedded_metadata(&self) -> Result<crate::document::EmbeddedMetadata> {
+        Ok(crate::document::EmbeddedMetadata::default())
+    }
+
     /// Rasterize (CPU, PDFium).
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile>;
 

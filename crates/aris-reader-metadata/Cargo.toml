@@ -1,0 +1,14 @@
+[package]
+name = "aris-reader-metadata"
+description = "Document metadata recognition (Info/XMP/first-page text) and BibTeX export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+aris-reader-text = { path = "../aris-reader-text" }

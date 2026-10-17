@@ -24,6 +24,7 @@ PDF objects and a correct cross-reference table are emitted by hand.
 from __future__ import annotations
 
 import sys
+import zlib
 from pathlib import Path
 
 A4_WIDTH = 595
@@ -44,6 +45,8 @@ def build_pdf(
     annotations: dict[int, list[bytes]] | None = None,
     extra_objects: list[bytes] | None = None,
     outline: list[dict] | None = None,
+    info: dict[str, str] | None = None,
+    xmp: bytes | None = None,
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -59,6 +62,10 @@ def build_pdf(
     `outline` is a nested tree of `{"title", "page", "children"}` dictionaries. Its objects
     come after every extra object, and only a file that passes it gains an `/Outlines` entry
     in the catalog, so the existing fixtures stay byte-identical.
+
+    `info` writes the document information dictionary and `xmp` an XMP metadata stream
+    (compressed with `/FlateDecode`, as real producers write it). Both are optional and come
+    after every other object, so a file that passes neither is unchanged.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
@@ -121,6 +128,41 @@ def build_pdf(
     if outline:
         objects.extend(outline_objects(outline, outline_root_id, page_object_ids))
 
+    info_id = None
+    if info:
+        info_id = len(objects) + 1
+        entries = []
+        for key in (
+            "Title",
+            "Author",
+            "Subject",
+            "Keywords",
+            "Creator",
+            "Producer",
+            "CreationDate",
+        ):
+            if info.get(key):
+                entries.append(f"/{key} ({escape_pdf_string(info[key])})")
+        objects.append(("<< " + " ".join(entries) + " >>").encode("cp1252"))
+
+    xmp_id = None
+    if xmp:
+        xmp_id = len(objects) + 1
+        compressed = zlib.compress(xmp)
+        objects.append(
+            b"<< /Type /Metadata /Subtype /XML /Filter /FlateDecode /Length "
+            + str(len(compressed)).encode("ascii")
+            + b" >>\nstream\n"
+            + compressed
+            + b"\nendstream"
+        )
+        # The catalog was assembled before the object count was known; the `/Metadata`
+        # reference is added now.
+        if objects[0].endswith(b" >>"):
+            objects[0] = (
+                objects[0][:-3] + f" /Metadata {xmp_id} 0 R >>".encode("ascii")
+            )
+
     # Serialize with a correct cross-reference table: every offset is measured
     # from the start of the file, so build the body first and then measure.
     out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
@@ -135,9 +177,11 @@ def build_pdf(
     out += b"0000000000 65535 f \n"
     for offset in offsets:
         out += f"{offset:010d} 00000 n \n".encode("ascii")
-    out += (
-        f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
-    ).encode("ascii")
+    trailer = f"trailer\n<< /Size {count} /Root 1 0 R"
+    if info_id is not None:
+        trailer += f" /Info {info_id} 0 R"
+    trailer += f" >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    out += trailer.encode("ascii")
     return bytes(out)
 
 
@@ -819,6 +863,89 @@ def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def metadata_page(
+    title: str,
+    authors: str,
+    affiliation: str,
+    abstract_lines: list[str],
+    footer_lines: list[str],
+    *,
+    title_size: int = 26,
+) -> str:
+    """A page laid out like the first page of a paper, for metadata recognition.
+
+    The title is the largest text near the top, the author line sits directly below it and the
+    ability to tell them apart is what the test is for. The footer carries the venue/identifier
+    line; the abstract gives the recogniser a body size to compare the title against.
+    """
+    parts = [
+        "0 0 0 rg",
+        f"BT /F1 {title_size} Tf 72 760 Td ({escape_pdf_string(title)}) Tj ET",
+        f"BT /F1 12 Tf 72 722 Td ({escape_pdf_string(authors)}) Tj ET",
+        f"BT /F1 9 Tf 72 702 Td ({escape_pdf_string(affiliation)}) Tj ET",
+        "BT /F1 10 Tf 72 662 Td (Abstract) Tj ET",
+    ]
+    y = 642
+    for line in abstract_lines:
+        parts.append(f"BT /F1 10 Tf 72 {y} Td ({escape_pdf_string(line)}) Tj ET")
+        y -= 13
+    y = 70
+    for line in footer_lines:
+        parts.append(f"BT /F1 8 Tf 72 {y} Td ({escape_pdf_string(line)}) Tj ET")
+        y -= 12
+    return "\n".join(parts)
+
+
+def xmp_packet(
+    title: str | None = None,
+    authors: list[str] | None = None,
+    doi: str | None = None,
+    venue: str | None = None,
+    year: str | None = None,
+) -> bytes:
+    """An XMP packet with the properties the recogniser reads, XML-escaped."""
+    def escaped(value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    parts = [
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>',
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">',
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">',
+        '  <rdf:Description rdf:about=""',
+        '    xmlns:dc="http://purl.org/dc/elements/1.1/"',
+        '    xmlns:prism="http://prismstandard.org/namespaces/basic/2.0/">',
+    ]
+    if title is not None:
+        parts.append(
+            "   <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">"
+            + escaped(title)
+            + "</rdf:li></rdf:Alt></dc:title>"
+        )
+    if authors:
+        items = "".join(f"<rdf:li>{escaped(author)}</rdf:li>" for author in authors)
+        parts.append(f"   <dc:creator><rdf:Seq>{items}</rdf:Seq></dc:creator>")
+    if doi is not None:
+        parts.append(f"   <prism:doi>{escaped(doi)}</prism:doi>")
+    if venue is not None:
+        parts.append(
+            f"   <prism:publicationName>{escaped(venue)}</prism:publicationName>"
+        )
+    if year is not None:
+        parts.append(f"   <prism:coverDate>{escaped(year)}-01-01</prism:coverDate>")
+    parts += [
+        "  </rdf:Description>",
+        " </rdf:RDF>",
+        "</x:xmpmeta>",
+        '<?xpacket end="w"?>',
+    ]
+    return "\n".join(parts).encode("utf-8")
+
+
 def references_page(left: list[str], right: list[str]) -> str:
     """A two-column bibliography page, left column first in the content stream.
 
@@ -1178,6 +1305,99 @@ def main() -> int:
     path = out_dir / "outlined.pdf"
     path.write_bytes(build_pdf(outline_pages, outline=outline))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(outline_pages)} page(s), 8 outline entries)")
+
+    # 10) Metadata fixtures. `metadata-embedded.pdf` has both `/Info` and XMP (XMP wins);
+    #     `metadata-info.pdf` has only `/Info` (the first-page title must not win);
+    #     `metadata-text-layer.pdf` has no embedded metadata at all, so title, authors, venue,
+    #     year and DOI have to come from page one; `metadata-arxiv.pdf` adds an arXiv id and
+    #     no venue, which must produce a `misc` entry, not an invented journal.
+    embedded_metadata = xmp_packet(
+        title="Embedded Metadata: A Study of {Braces} & Percent 100%",
+        authors=["Ada Lovelace", "Alan Turing"],
+        doi="10.1234/embedded.2024.001",
+        venue="Journal of Embedded Testing",
+        year="2024",
+    )
+    embedded_page = metadata_page(
+        "Page One Text Title",
+        "Grace Hopper",
+        "Department of Testing, Example University",
+        [
+            "This body paragraph is long enough to establish the page's body text size.",
+            "It is deliberately not the metadata the reader should see in the panel.",
+        ],
+        [
+            "Proceedings of the Wrong Venue 1999",
+            "https://doi.org/10.9999/page.one",
+        ],
+    )
+    path = out_dir / "metadata-embedded.pdf"
+    path.write_bytes(
+        build_pdf(
+            [(embedded_page, 0)],
+            info={
+                "Title": "Wrong Information Dictionary Title",
+                "Author": "Wrong Information Dictionary Author",
+                "Producer": "make-fixtures.py",
+            },
+            xmp=embedded_metadata,
+        )
+    )
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, /Info + XMP)")
+
+    info_page = metadata_page(
+        "Page One Text Title",
+        "Grace Hopper",
+        "Department of Testing, Example University",
+        [
+            "This body paragraph is long enough to establish the page's body text size.",
+            "The embedded dictionary below is the only source of a title and authors.",
+        ],
+        [],
+    )
+    path = out_dir / "metadata-info.pdf"
+    path.write_bytes(
+        build_pdf(
+            [(info_page, 0)],
+            info={
+                "Title": "Information Dictionary Title",
+                "Author": "Info Author; Second Author",
+                "Subject": "A subject with no identifier in it",
+            },
+        )
+    )
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, /Info only)")
+
+    text_layer_page = metadata_page(
+        "Page One Title: 100% & Under_Score",
+        "Marek Müller, Ada Lovelace",
+        "Department of Testing, Example University",
+        [
+            "The abstract begins here and has enough words to look like ordinary body text.",
+            "A second line keeps the median line height stable for the layout heuristics.",
+        ],
+        [
+            "Proceedings of the 2024 Testing Conference",
+            "https://doi.org/10.5555/2024.12345",
+        ],
+    )
+    path = out_dir / "metadata-text-layer.pdf"
+    path.write_bytes(build_pdf([(text_layer_page, 0)]))
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, text layer only)")
+
+    arxiv_page = metadata_page(
+        "An arXiv Paper Without a Venue",
+        "Grace Hopper",
+        "Department of Testing, Example University",
+        [
+            "This paper is a preprint and its venue is deliberately absent from page one.",
+            "Only the arXiv identifier and its date can be found on the page.",
+        ],
+        ["arXiv:2303.08774v2 [cs.CL]"],
+    )
+    path = out_dir / "metadata-arxiv.pdf"
+    path.write_bytes(build_pdf([(arxiv_page, 0)]))
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, arXiv id only)")
 
     if long_pages > 0:
         pages = long_document(long_pages)

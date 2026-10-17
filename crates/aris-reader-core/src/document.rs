@@ -29,16 +29,47 @@ pub struct PageInfo {
     pub label: Option<String>,
 }
 
-/// Document metadata (an optional summary of `/Info` + XMP).
+/// The document information dictionary (`/Info`), as the engine reads it.
+///
+/// Entries are reported verbatim, trimmed: deciding whether `/Title` is a real title or a
+/// producer's placeholder ("Microsoft Word - paper.doc") is recognition, not extraction, and
+/// belongs to `aris-reader-metadata`. Every field is `None` when the key is absent or empty.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DocMetadata {
     pub title: Option<String>,
     pub author: Option<String>,
     pub subject: Option<String>,
     pub keywords: Option<String>,
+    pub creator: Option<String>,
     pub producer: Option<String>,
     /// ISO-8601 string (avoids passing a time type across FFI).
     pub creation_date: Option<String>,
+}
+
+/// The XMP properties this reader understands, read from the document's metadata stream.
+///
+/// XMP is the one source that carries publication facts the `/Info` dictionary cannot: a DOI,
+/// a venue and a publication date. Only properties with a defined meaning here are kept; the
+/// packet is not treated as a general-purpose RDF store.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct XmpMetadata {
+    /// `dc:title` (the `x-default` alternative).
+    pub title: Option<String>,
+    /// `dc:creator`, one entry per `rdf:li`.
+    pub authors: Vec<String>,
+    /// `prism:doi`.
+    pub doi: Option<String>,
+    /// `prism:publicationName` (journal or proceedings name).
+    pub venue: Option<String>,
+    /// `prism:coverDate` reduced to a four-digit year.
+    pub year: Option<String>,
+}
+
+/// Everything the file says about itself, before any layout-based recognition.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddedMetadata {
+    pub info: DocMetadata,
+    pub xmp: XmpMetadata,
 }
 
 /// Snapshot returned immediately after a document is opened (no page content or text).
