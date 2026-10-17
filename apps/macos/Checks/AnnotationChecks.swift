@@ -859,7 +859,7 @@ extension ReaderChecks {
     ///   alpha-over, carrying a bitmap that is not a 1×1 tint (i.e. a real icon);
     /// * a free-text annotation's quad does too, laid out at the size `/DA` states;
     /// * the hidden marker and the `/Ink` annotation get no quad at all;
-    /// * clicking a drawn note shows its text (the sidebar follows, and the status line repeats it);
+    /// * clicking a drawn note expands its text on the canvas;
     /// * and the composite of those quads — the same quads, the same blend modes, composited by
     ///   CoreGraphics instead of by Metal — has the note's colour where the note is and page white
     ///   where it is not. That is the pixel evidence a headless run can produce; it is written to
@@ -967,8 +967,11 @@ extension ReaderChecks {
         require(state.openDocumentNote(at: iconCentre), "a click on the note icon finds the note")
         require(state.selectedDocumentAnnotationID == colouredNote.id,
                 "the clicked note is the one the sidebar highlights")
-        require(state.sidebarTab == .annotations && state.sidebarVisible,
-                "the note list is brought up, which is where a note's text can be read")
+        require(state.openDocumentNote?.contents == colouredNote.contents,
+                "the clicked note expands its complete text on the canvas")
+        state.closeDocumentNote()
+        require(state.openDocumentNote == nil, "the note paper can be closed")
+        require(state.openDocumentNote(at: iconCentre), "the note can be reopened")
         require(state.statusMessage.contains("sticky note with a colour"),
                 "the note's own text is shown, got \"\(state.statusMessage)\"")
         require(!state.openDocumentNote(at: CGPoint(x: iconCentre.x - 200, y: iconCentre.y)),

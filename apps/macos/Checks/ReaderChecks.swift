@@ -39,6 +39,12 @@ struct ReaderChecks {
             try await measureScrollTrace()
             return
         }
+        if CommandLine.arguments.contains("--check-note-overlay") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+            return
+        }
         // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -199,6 +205,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
         try await annotationCanvasChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
+        try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await annotationNoteChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         placementIndexChecks()
