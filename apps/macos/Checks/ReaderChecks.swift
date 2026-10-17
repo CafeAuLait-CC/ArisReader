@@ -225,6 +225,7 @@ struct ReaderChecks {
         try scrollGlideChecks()
         scrollGlideTailChecks()
         try await scrollTailDriverChecks(url: b)
+        try await scrollIndicatorChecks(scrollable: b, singlePage: a)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
         // Registered before the frame-scheduling checks: those need a presentable surface and
