@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-reasoning-1","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":"The passage is about motion generation. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-reasoning-1","object":"chat.completion.chunk","created":1720000001,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":null,"reasoning_content":"I should translate it carefully, but the budget is consumed."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-reasoning-1","object":"chat.completion.chunk","created":1720000002,"model":"deepseek-reasoner","choices":[],"usage":{"prompt_tokens":300,"completion_tokens":900,"total_tokens":1200}}
+
+data: [DONE]
+

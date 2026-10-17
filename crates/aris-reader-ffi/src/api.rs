@@ -12,10 +12,13 @@
 
 use aris_reader_ai::MockProvider;
 use aris_reader_ai::chat::{
-    Action as AiAction, ChatPlan, ChatSettings, PageText, PlanRequest,
-    SelectionRange as AiSelectionRange, build_plan, inspect_base_url, validate_model,
+    Action as AiAction, ChatPlan, ChatSettings, MergePart, MergePlanRequest, PageChar, PageText,
+    PlanRequest, ReasoningEncoding, ReasoningMode, SelectionRange as AiSelectionRange,
+    build_merge_plan, build_plan, inspect_base_url, validate_model,
 };
-use aris_reader_ai::openai::{CancellationToken, RunEvent, TokenUsage, preview_headers, run_plan};
+use aris_reader_ai::openai::{
+    CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
+};
 use aris_reader_core::{
     AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
     PageIndex, Point, RasterRequest, Transform2D,
@@ -345,7 +348,7 @@ pub struct ArisDocument {
     /// Plain text per page, extracted once for AI context building. Text cannot change while
     /// the document is open (the annotation writer replaces the file, and then the shell
     /// reopens it), so this cache has the document's lifetime.
-    ai_text: Mutex<std::collections::HashMap<u32, String>>,
+    ai_text: Mutex<std::collections::HashMap<u32, (String, Vec<PageChar>)>>,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -614,7 +617,7 @@ impl ArisDocument {
         let raw = self.backend.raw_text_page(PageIndex(page))?;
         let geometry = self.backend.page_info(PageIndex(page))?.geometry;
 
-        let chars = raw
+        let chars: Vec<TextChar> = raw
             .chars
             .iter()
             .map(|character| {
@@ -1380,10 +1383,8 @@ impl ArisDocument {
         };
         let mut pages = Vec::with_capacity(page_list.len());
         for page in page_list {
-            pages.push(PageText {
-                page,
-                text: self.ai_page_text(page)?,
-            });
+            let (text, chars) = self.ai_page(page)?;
+            pages.push(PageText { page, text, chars });
         }
 
         let temperature = request.temperature.and_then(|value| {
@@ -1400,11 +1401,29 @@ impl ArisDocument {
         } else {
             temperature
         };
+        let reasoning_mode =
+            ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+                ArisFfiError::InvalidArgument {
+                    message: format!(
+                        "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                        request.reasoning_mode
+                    ),
+                }
+            })?;
+        let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
+            .ok_or_else(|| ArisFfiError::InvalidArgument {
+                message: format!(
+                    "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                    request.reasoning_encoding
+                ),
+            })?;
         let settings = ChatSettings {
             base_url: request.base_url,
             model: request.model,
             temperature,
             max_tokens: request.max_tokens,
+            reasoning_mode,
+            reasoning_encoding,
         };
         let document_title = Path::new(&self.path)
             .file_stem()
@@ -1466,28 +1485,49 @@ fn page_edit_report(report: aris_reader_pdfium::PageOperationReport) -> PageEdit
 }
 
 impl ArisDocument {
-    /// Plain text for one page, extracted once and kept for the document's lifetime.
-    fn ai_page_text(&self, page: u32) -> Result<String, ArisFfiError> {
+    /// Plain text and character boxes for one page, extracted once and kept for the
+    /// document's lifetime. The boxes and the text come from the same `raw.chars` sequence, so
+    /// the context builder's gutter rule and the canvas's selection indices agree.
+    fn ai_page(&self, page: u32) -> Result<(String, Vec<PageChar>), ArisFfiError> {
         if page >= self.backend.page_count() {
             return Err(ArisFfiError::InvalidArgument {
                 message: format!("page {page} is outside the document"),
             });
         }
-        if let Some(text) = self
+        if let Some(cached) = self
             .ai_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&page)
         {
-            return Ok(text.clone());
+            return Ok(cached.clone());
         }
         let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let chars: Vec<PageChar> = raw
+            .chars
+            .iter()
+            .map(|character| {
+                let top_left = Point::new(
+                    character.rect.origin.x,
+                    character.rect.origin.y + character.rect.size.height,
+                );
+                let view = geometry.page_to_view(1.0).apply(top_left);
+                PageChar {
+                    unicode: character.unicode,
+                    x_pt: view.x,
+                    y_pt: view.y,
+                    width_pt: character.rect.size.width,
+                    height_pt: character.rect.size.height,
+                }
+            })
+            .collect();
         let text = text_of(&raw);
         self.ai_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(page, text.clone());
-        Ok(text)
+            .insert(page, (text.clone(), chars.clone()));
+        Ok((text, chars))
     }
 
     fn save_annotations_to(
@@ -2442,6 +2482,32 @@ pub struct AiPlanRequestRecord {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// One of `default`, `off`, `low`, `high`, `max`.
+    pub reasoning_mode: String,
+    /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
+    pub reasoning_encoding: String,
+}
+
+/// One part summary used by the consolidation request.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiMergePartRecord {
+    pub index: u32,
+    pub total: u32,
+    pub pages: Vec<u32>,
+    pub summary: String,
+}
+
+/// The local input to the consolidation request. It carries part summaries, not page text.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiMergePlanRequestRecord {
+    pub document_title: String,
+    pub parts: Vec<AiMergePartRecord>,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub reasoning_mode: String,
+    pub reasoning_encoding: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2515,6 +2581,26 @@ pub fn validate_ai_model(model: String) -> Result<String, ArisFfiError> {
     Ok(validate_model(&model)?)
 }
 
+/// Per-request instrumentation. Counts and byte totals only; no content.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiStreamDiagnostics {
+    pub http_status: u16,
+    pub bytes: u64,
+    pub frames: u32,
+    pub data_frames: u32,
+    pub content_frames: u32,
+    pub reasoning_frames: u32,
+    pub role_only_frames: u32,
+    pub empty_frames: u32,
+    pub usage_frames: u32,
+    pub content_shape: String,
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
 /// One event from a running request. The shell polls a handle and renders these in order.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum AiEventRecord {
@@ -2526,10 +2612,19 @@ pub enum AiEventRecord {
     Delta {
         text: String,
     },
+    /// The provider's reasoning/thinking channel. The shell shows it separately and never
+    /// appends it to the answer.
+    ReasoningDelta {
+        text: String,
+    },
     Usage {
         prompt_tokens: Option<u64>,
         completion_tokens: Option<u64>,
         total_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+    },
+    Diagnostics {
+        diagnostics: AiStreamDiagnostics,
     },
     Done,
     Error {
@@ -2567,14 +2662,49 @@ impl AiJob {
                 label,
             },
             RunEvent::Delta(text) => AiEventRecord::Delta { text },
+            RunEvent::ReasoningDelta(text) => AiEventRecord::ReasoningDelta { text },
             RunEvent::Usage(TokenUsage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                reasoning_tokens,
             }) => AiEventRecord::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                reasoning_tokens,
+            },
+            RunEvent::Diagnostics(StreamDiagnostics {
+                http_status,
+                bytes,
+                frames,
+                data_frames,
+                content_frames,
+                reasoning_frames,
+                role_only_frames,
+                empty_frames,
+                usage_frames,
+                content_shape,
+                finish_reason,
+                usage,
+            }) => AiEventRecord::Diagnostics {
+                diagnostics: AiStreamDiagnostics {
+                    http_status,
+                    bytes,
+                    frames,
+                    data_frames,
+                    content_frames,
+                    reasoning_frames,
+                    role_only_frames,
+                    empty_frames,
+                    usage_frames,
+                    content_shape,
+                    finish_reason,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                },
             },
             RunEvent::Done => AiEventRecord::Done,
         };
@@ -2693,6 +2823,60 @@ pub fn start_ai_request(
             message: format!("could not start the AI request worker: {error}"),
         })?;
     Ok(Arc::new(ArisAiRequest { job }))
+}
+
+/// Build the previewable consolidation request from part summaries. This never touches the
+/// network; it is the same preview-before-send path as the part requests.
+#[uniffi::export]
+pub fn build_ai_merge_plan(
+    request: AiMergePlanRequestRecord,
+) -> Result<AiPlanRecord, ArisFfiError> {
+    let temperature = request.temperature.and_then(|value| {
+        if value.is_finite() {
+            Some(value as f32)
+        } else {
+            None
+        }
+    });
+    let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+        ArisFfiError::InvalidArgument {
+            message: format!(
+                "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                request.reasoning_mode
+            ),
+        }
+    })?;
+    let reasoning_encoding =
+        ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
+            ArisFfiError::InvalidArgument {
+                message: format!(
+                    "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                    request.reasoning_encoding
+                ),
+            }
+        })?;
+    let plan = build_merge_plan(MergePlanRequest {
+        document_title: request.document_title,
+        settings: ChatSettings {
+            base_url: request.base_url,
+            model: request.model,
+            temperature,
+            max_tokens: request.max_tokens,
+            reasoning_mode,
+            reasoning_encoding,
+        },
+        parts: request
+            .parts
+            .into_iter()
+            .map(|part| MergePart {
+                index: part.index,
+                total: part.total,
+                pages: part.pages,
+                summary: part.summary,
+            })
+            .collect(),
+    })?;
+    Ok(ai_plan_record(plan))
 }
 
 fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {

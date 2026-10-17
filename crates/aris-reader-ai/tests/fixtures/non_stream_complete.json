@@ -1,0 +1,1 @@
+{"id":"chatcmpl-complete","object":"chat.completion","created":1720000020,"model":"gateway-model","choices":[{"index":0,"message":{"role":"assistant","content":"Bonjour le monde"},"finish_reason":"stop"}],"usage":{"prompt_tokens":300,"completion_tokens":12,"total_tokens":312}}

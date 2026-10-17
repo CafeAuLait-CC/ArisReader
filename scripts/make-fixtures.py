@@ -863,6 +863,36 @@ def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def numbered_margin_page() -> str:
+    """A page with a real line-number gutter and body text that wraps.
+
+    The numbers are drawn as a separate text run before the body, matching the live manuscript
+    that exposed the selection-index bug: the page text layer starts with the gutter run, so a
+    selection in the body is at a non-zero character offset. The body lines carry trailing
+    spaces and the page has blank lines; the AI prompt must still slice with raw selection
+    indices rather than a normalised version of this text.
+    """
+    lines = [
+        ("001", "ABSTRACT"),
+        ("002", "Existing 3D motion generators face a trade-off between convenient but coarse   "),
+        ("003", "text-based control and precise but manually specified pose guidance. Moreover,   "),
+        ("004", "diffusion-based methods further incur substantial iterative sampling costs.   "),
+        ("005", "The next line exists so a selection can end inside a later word.   "),
+    ]
+    parts: list[str] = []
+    y = 760
+    for number, _ in lines:
+        parts.append(f"BT /F1 8 Tf 40 {y} Td ({number}) Tj ET")
+        y -= 18
+    y = 760
+    for _, line in lines:
+        parts.append(f"BT /F1 9 Tf 72 {y} Td ({escape_pdf_string(line)}) Tj ET")
+        y -= 18
+    # A trailing blank-line run, so the text layer has whitespace the normaliser would remove.
+    parts.append("BT /F1 9 Tf 72 650 Td ( ) Tj ET")
+    return "\n".join(parts)
+
+
 def metadata_page(
     title: str,
     authors: str,
@@ -1038,6 +1068,9 @@ def main() -> int:
                 0,
             )
         ],
+        # Selection indices versus prompt extraction: real line-number gutter characters,
+        # trailing spaces and CRLF line breaks. The AI prompt must slice the raw text layer.
+        "selection-numbered-margin.pdf": [(numbered_margin_page(), 0)],
         # 2) Three pages: page navigation, tile cache and prefetch behaviour.
         "multipage.pdf": [
             (

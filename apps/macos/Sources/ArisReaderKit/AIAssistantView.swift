@@ -30,7 +30,12 @@ public struct AIAssistantPanel: View {
                         if let note = model.statusNote, !note.isEmpty {
                             Text(note)
                                 .font(.caption)
-                                .foregroundStyle(model.phase == .failed ? Color.red : Color.secondary)
+                                .foregroundStyle(
+                                    model.phase == .failed
+                                        ? Color.red
+                                        : (model.phase == .finished && model.answer.isEmpty
+                                            ? Color.orange : Color.secondary)
+                                )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         if model.isPreparing {
@@ -44,7 +49,17 @@ public struct AIAssistantPanel: View {
                         if let plan = model.plan, model.phase != .preparing {
                             requestPreview(plan)
                         }
-                        if model.phase == .streaming || model.phase.isTerminal {
+                        if let mergePlan = model.mergePlan {
+                            requestPreview(mergePlan, isMerge: true)
+                        } else if model.phase == .mergePreview {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Building the consolidation preview…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if model.phase == .streaming || model.phase.isTerminal || model.phase == .mergePreview {
                             answerSection
                         }
                         controls
@@ -170,10 +185,10 @@ public struct AIAssistantPanel: View {
         Task { await model.prepare(action: action, context: context) }
     }
 
-    private func requestPreview(_ plan: AiPlanRecord) -> some View {
+    private func requestPreview(_ plan: AiPlanRecord, isMerge: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Request preview")
+                Text(isMerge ? "Consolidation request preview" : "Request preview")
                     .font(.caption.weight(.semibold))
                 Spacer()
                 Text("\(plan.estimatedTokens) est. tokens")
@@ -186,8 +201,17 @@ public struct AIAssistantPanel: View {
                 .font(.caption2)
                 .foregroundStyle(plan.isLocal ? Color.secondary : Color.orange)
                 .fixedSize(horizontal: false, vertical: true)
+            if isMerge {
+                Text("This consolidation is a separate request and has its own cost. The part summaries are not re-sent as page text.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if model.phase == .preview {
                 Text("Nothing has been sent yet.")
+                    .font(.caption2.weight(.semibold))
+            } else if model.phase == .mergePreview {
+                Text("The part requests are complete. This consolidation has not been sent.")
                     .font(.caption2.weight(.semibold))
             }
 
@@ -195,7 +219,12 @@ public struct AIAssistantPanel: View {
                 previewRow("Endpoint", plan.endpoint)
                 previewRow("Model", plan.model)
                 previewRow("Pages", plan.sourcePageLabel)
-                previewRow("Tokens", "\(plan.estimatedTokens) estimated")
+                previewRow("Prompt", "\(plan.estimatedTokens) estimated tokens")
+                previewRow("Completion budget", plan.maxTokens.map { String($0) } ?? "provider default")
+                previewRow("Reasoning", settings.reasoningSummary)
+                Text(settings.reasoningFieldDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
             if let note = plan.note {
                 Text(note)
@@ -292,18 +321,32 @@ public struct AIAssistantPanel: View {
     private var answerSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(model.phase == .streaming ? "Answer (streaming)" : "Answer")
+                Text(answerHeader)
                     .font(.caption.weight(.semibold))
                 Spacer()
                 if model.phase == .streaming {
                     ProgressView().controlSize(.small)
                 }
             }
-            if model.answer.isEmpty && model.phase == .streaming {
-                Text("Waiting for the first token…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if !model.answer.isEmpty {
+
+            if model.answer.isEmpty {
+                if !model.reasoning.isEmpty {
+                    reasoningBox(
+                        title: model.phase == .finished
+                            ? "The provider sent reasoning but no answer"
+                            : "Provider reasoning (not the answer)",
+                        prominent: true
+                    )
+                } else if model.phase == .streaming {
+                    Text("Waiting for the first token…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if model.phase == .finished {
+                    Label("The provider returned no answer text", systemImage: "exclamationmark.triangle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.orange)
+                }
+            } else {
                 // Page links are offered only for actions whose prompt asked for [p.N].
                 // A translation was told not to cite, so its numbers stay plain text.
                 AIAnswerView(
@@ -312,25 +355,100 @@ public struct AIAssistantPanel: View {
                         ? 0 : Int(model.plan?.pageCount ?? 0),
                     onJump: { page in state.gotoPage(page - 1) }
                 )
+                Text(model.plan?.action == .translateSelection
+                     ? "Rendered as paragraphs, headings, bullet and numbered lists. This action did not ask for page citations, so no numbers are linkified; other Markdown is shown literally."
+                     : "Rendered as paragraphs, headings, bullet and numbered lists. Only [p.N] citations are clickable; other Markdown is shown literally.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !model.reasoning.isEmpty {
+                    DisclosureGroup("Provider reasoning (not the answer)") {
+                        reasoningText
+                    }
+                    .font(.caption2)
+                }
             }
-            Text(model.plan?.action == .translateSelection
-                 ? "Rendered as paragraphs, headings, bullet and numbered lists. This action did not ask for page citations, so no numbers are linkified; other Markdown is shown literally."
-                 : "Rendered as paragraphs, headings, bullet and numbered lists. Only [p.N] citations are clickable; other Markdown is shown literally.")
+
+            if (model.plan?.parts.count ?? 0) > 1 && !model.partAnswers.isEmpty {
+                DisclosureGroup("Part summaries (\(model.partAnswers.count))") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.partAnswers.keys.sorted(), id: \.self) { index in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Part \(index + 1) · \(model.partLabels[index] ?? "")")
+                                    .font(.caption2.weight(.semibold))
+                                Text(model.partAnswers[index] ?? "")
+                                    .font(.caption)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // The usage line follows the answer/diagnostic and is deliberately small and muted.
+            // Under an empty answer it must never be the most prominent thing in the box.
             if let usage = model.usage {
                 Text(usage.summary)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else if model.phase == .finished {
+                    .foregroundStyle(model.answer.isEmpty ? Color.secondary.opacity(0.7) : Color.secondary)
+            } else if model.phase == .finished && !model.answer.isEmpty {
                 Text("No token usage was reported by the provider.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            if !model.answer.isEmpty && model.finishReason == "length" {
+                Label("The provider stopped at its token limit; this answer may be truncated.", systemImage: "exclamationmark.triangle")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.reasoningTokensIgnored {
+                Label(
+                    "The provider reported reasoning tokens even though thinking is off. It may have ignored the toggle.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption2)
+                .foregroundStyle(Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(8)
         .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var answerHeader: String {
+        if model.answer.isEmpty {
+            return model.phase == .streaming ? "No answer text yet" : "No answer text"
+        }
+        return model.phase == .streaming ? "Answer (streaming)" : "Answer"
+    }
+
+    private func reasoningBox(title: String, prominent: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(title, systemImage: "lightbulb")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(prominent ? Color.orange : Color.secondary)
+            reasoningText
+            Text("This is the model's reasoning, not the answer. It was not concatenated into the answer.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(6)
+        .background(
+            (prominent ? Color.orange : Color.secondary).opacity(prominent ? 0.08 : 0.05),
+            in: RoundedRectangle(cornerRadius: 5)
+        )
+    }
+
+    private var reasoningText: some View {
+        Text(model.reasoning)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -346,11 +464,23 @@ public struct AIAssistantPanel: View {
                 Button("Discard") { model.discard() }
                     .controlSize(.small)
             }
+        case .mergePreview:
+            HStack(spacing: 8) {
+                if model.canSendMerge {
+                    Button("Send consolidation") { model.sendMerge() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
+                Button("Keep part summaries") { model.keepPartSummaries() }
+                    .controlSize(.small)
+            }
         case .streaming:
             HStack(spacing: 8) {
                 Button("Cancel") { model.cancel() }
                     .controlSize(.small)
-                Text("\(model.answer.count) characters received")
+                Text(model.answer.isEmpty && !model.reasoning.isEmpty
+                     ? "Reasoning received; no answer text yet"
+                     : "\(model.answer.count) characters received")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

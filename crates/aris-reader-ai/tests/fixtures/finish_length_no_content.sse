@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-length","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The selected passage needs a careful translation. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-length","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"I am still reasoning when the budget ends."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-length","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":300,"completion_tokens":900,"total_tokens":1200,"completion_tokens_details":{"reasoning_tokens":900}}}
+
+data: [DONE]
+

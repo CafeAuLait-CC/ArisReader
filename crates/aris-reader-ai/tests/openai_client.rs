@@ -17,10 +17,12 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use ureq::tls::Certificate;
 
 use aris_reader_ai::AiError;
-use aris_reader_ai::chat::{Action, ChatSettings, PageText, PlanRequest, build_plan};
+use aris_reader_ai::chat::{
+    Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode, build_plan,
+};
 use aris_reader_ai::openai::{
-    CancellationToken, ClientConfig, RequestSpec, RunEvent, TokenUsage, UreqTransport,
-    run_plan_with_transport,
+    CancellationToken, ClientConfig, RequestSpec, RunEvent, StreamDiagnostics, TokenUsage,
+    UreqTransport, run_plan_with_transport,
 };
 
 #[derive(Clone, Debug)]
@@ -261,19 +263,23 @@ fn plan_for_base(base_url: &str) -> aris_reader_ai::ChatPlan {
                 page: 0,
                 text: "The method builds a local index and ranks document blocks before it streams an answer."
                     .to_string(),
-            },
+
+                chars: Vec::new(),},
             PageText {
                 page: 1,
                 text: "A different page discusses evaluation and measurements in enough detail."
                     .to_string(),
-            },
+
+                chars: Vec::new(),},
         ],
         settings: ChatSettings {
             base_url: base_url.to_string(),
             model: "test-model".to_string(),
             temperature: Some(0.2),
             max_tokens: Some(128),
-        },
+
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,},
     })
     .expect("plan")
 }
@@ -317,6 +323,7 @@ fn request_matches_the_preview_and_streams_split_sse() {
             RunEvent::Delta(delta) => text.push_str(&delta),
             RunEvent::Usage(values) => usage = Some(values),
             RunEvent::Done => done = true,
+            _ => {}
         }
     })
     .expect("stream");
@@ -329,7 +336,9 @@ fn request_matches_the_preview_and_streams_split_sse() {
         Some(TokenUsage {
             prompt_tokens: Some(12),
             completion_tokens: Some(4),
-            total_tokens: Some(16)
+            total_tokens: Some(16),
+
+            reasoning_tokens: None,
         })
     );
     assert!(done);
@@ -642,7 +651,9 @@ fn tls_streaming_round_trip_with_an_injected_ca() {
         Some(TokenUsage {
             prompt_tokens: Some(7),
             completion_tokens: Some(3),
-            total_tokens: Some(10)
+            total_tokens: Some(10),
+
+            reasoning_tokens: None,
         })
     );
     assert!(done);
@@ -738,6 +749,323 @@ fn tls_refuses_an_untrusted_certificate() {
     server.join();
 }
 
+fn run_fixture_stream(stream: &str) -> Vec<RunEvent> {
+    let chunks: Vec<Vec<u8>> = stream
+        .split_inclusive('\n')
+        .map(|line| line.as_bytes().to_vec())
+        .collect();
+    let mut server = Server::start(Behavior::Chunked {
+        chunks,
+        delay: Duration::from_millis(2),
+        watch_close: false,
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let mut events = Vec::new();
+    run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |event| {
+        events.push(event);
+    })
+    .expect("fixture stream");
+    server.join();
+    events
+}
+
+fn diagnostics(events: &[RunEvent]) -> StreamDiagnostics {
+    events
+        .iter()
+        .find_map(|event| match event {
+            RunEvent::Diagnostics(diagnostics) => Some(diagnostics.clone()),
+            _ => None,
+        })
+        .expect("diagnostics event")
+}
+
+#[test]
+fn a_content_stream_is_the_answer_and_diagnostics_say_so() {
+    let events = run_fixture_stream(include_str!("fixtures/content_only.sse"));
+    assert!(events.contains(&RunEvent::Delta("Bonjour".to_string())));
+    assert!(events.contains(&RunEvent::Delta(" le monde".to_string())));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunEvent::ReasoningDelta(_)))
+    );
+    let diagnostics = diagnostics(&events);
+    assert_eq!(diagnostics.content_frames, 2);
+    assert_eq!(diagnostics.reasoning_frames, 0);
+    assert_eq!(diagnostics.content_shape, "string");
+    assert_eq!(diagnostics.finish_reason.as_deref(), Some("stop"));
+    assert!(diagnostics.bytes > 0);
+    assert_eq!(diagnostics.usage.reasoning_tokens, None);
+}
+
+#[test]
+fn a_reasoning_then_content_stream_keeps_the_channels_separate() {
+    let events = run_fixture_stream(include_str!("fixtures/reasoning_then_content.sse"));
+    assert!(events.contains(&RunEvent::Delta("Bonjour le monde".to_string())));
+    assert!(events.contains(&RunEvent::ReasoningDelta(
+        "The passage is a greeting. ".to_string()
+    )));
+    let diagnostics = diagnostics(&events);
+    assert_eq!(diagnostics.content_frames, 1);
+    assert_eq!(diagnostics.reasoning_frames, 2);
+    assert_eq!(diagnostics.content_shape, "string");
+    assert_eq!(diagnostics.usage.reasoning_tokens, Some(30));
+}
+
+#[test]
+fn a_length_stop_with_no_content_is_reported_with_the_limit_reason() {
+    let events = run_fixture_stream(include_str!("fixtures/finish_length_no_content.sse"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Delta(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunEvent::ReasoningDelta(_)))
+    );
+    let diagnostics = diagnostics(&events);
+    assert_eq!(diagnostics.content_frames, 0);
+    assert_eq!(diagnostics.reasoning_frames, 2);
+    assert_eq!(diagnostics.content_shape, "none");
+    assert_eq!(diagnostics.finish_reason.as_deref(), Some("length"));
+    assert_eq!(diagnostics.usage.completion_tokens, Some(900));
+    assert_eq!(diagnostics.usage.reasoning_tokens, Some(900));
+}
+
+#[test]
+fn a_400_naming_an_unknown_reasoning_parameter_points_at_the_setting() {
+    let mut server = Server::start(Behavior::Error {
+        status: 400,
+        reason: "Bad Request",
+        body: br#"{"error":{"message":"Unsupported parameter: thinking","type":"invalid_request_error"}}"#
+            .to_vec(),
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let error = run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |_| {})
+        .expect_err("400 must fail");
+    server.join();
+    let message = error.to_string();
+    assert!(
+        message.contains("Unsupported parameter: thinking"),
+        "message: {message}"
+    );
+    assert!(message.contains("Settings > AI"), "message: {message}");
+    assert!(message.contains("reasoning encoding"), "message: {message}");
+}
+
+#[test]
+fn every_action_streams_the_same_content_fixture_through_the_same_runner() {
+    for action in [
+        Action::SummarizePage,
+        Action::SummarizeDocument,
+        Action::AskSelection,
+        Action::TranslateSelection,
+    ] {
+        let mut server = Server::start(Behavior::Chunked {
+            chunks: include_str!("fixtures/content_only.sse")
+                .split_inclusive('\n')
+                .map(|line| line.as_bytes().to_vec())
+                .collect(),
+            delay: Duration::from_millis(1),
+            watch_close: false,
+        });
+        let base_url = server.base_url.clone();
+        let selection =
+            action
+                .requires_selection()
+                .then_some(aris_reader_ai::chat::SelectionRange {
+                    page: 0,
+                    start: 0,
+                    end: 31,
+                });
+        let plan = build_plan(PlanRequest {
+            action,
+            document_title: "Action parity".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection,
+            question: (action == Action::AskSelection).then(|| "What is claimed?".to_string()),
+            language: (action == Action::TranslateSelection).then(|| "English".to_string()),
+            pages: vec![PageText {
+                page: 0,
+                text: "Page one has enough text to answer any of the four action prompts."
+                    .to_string(),
+                chars: Vec::new(),
+            }],
+            settings: ChatSettings {
+                base_url,
+                model: "test-model".to_string(),
+                temperature: Some(0.2),
+                max_tokens: Some(900),
+                reasoning_mode: ReasoningMode::Off,
+                reasoning_encoding: ReasoningEncoding::Thinking,
+            },
+        })
+        .unwrap();
+        let transport = UreqTransport::system(fast_config());
+        let cancel = CancellationToken::new();
+        let mut events = Vec::new();
+        run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |event| {
+            events.push(event);
+        })
+        .expect("content fixture for every action");
+        server.join();
+        let diagnostics = diagnostics(&events);
+        assert!(
+            events.contains(&RunEvent::Delta("Bonjour".to_string())),
+            "{action:?}"
+        );
+        assert!(
+            events.contains(&RunEvent::Delta(" le monde".to_string())),
+            "{action:?}"
+        );
+        assert_eq!(diagnostics.content_frames, 2, "{action:?}");
+        assert_eq!(diagnostics.reasoning_frames, 0, "{action:?}");
+        assert_eq!(diagnostics.content_shape, "string", "{action:?}");
+        assert_eq!(
+            diagnostics.finish_reason.as_deref(),
+            Some("stop"),
+            "{action:?}"
+        );
+        println!(
+            "action={action:?} frames={} data={} content={} reasoning={} role_only={} empty={} shape={} finish={:?} bytes={}",
+            diagnostics.frames,
+            diagnostics.data_frames,
+            diagnostics.content_frames,
+            diagnostics.reasoning_frames,
+            diagnostics.role_only_frames,
+            diagnostics.empty_frames,
+            diagnostics.content_shape,
+            diagnostics.finish_reason,
+            diagnostics.bytes
+        );
+    }
+}
+
+#[test]
+fn a_non_sse_json_answer_is_read_as_a_complete_response() {
+    let mut server = Server::start(Behavior::Error {
+        status: 200,
+        reason: "OK",
+        body: include_bytes!("fixtures/non_stream_complete.json").to_vec(),
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let mut events = Vec::new();
+    run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |event| {
+        events.push(event);
+    })
+    .expect("complete JSON answer");
+    server.join();
+
+    assert!(events.contains(&RunEvent::Delta("Bonjour le monde".to_string())));
+    assert!(events.contains(&RunEvent::Usage(TokenUsage {
+        prompt_tokens: Some(300),
+        completion_tokens: Some(12),
+        total_tokens: Some(312),
+
+        reasoning_tokens: None,
+    })));
+    assert!(events.contains(&RunEvent::Done));
+}
+
+#[test]
+fn a_json_body_with_an_sse_content_type_is_read_as_a_complete_response() {
+    // Some gateways label the response text/event-stream but send one JSON object. The raw
+    // fallback must parse it instead of failing for a missing [DONE].
+    let body = include_bytes!("fixtures/non_stream_complete.json");
+    let chunks: Vec<Vec<u8>> = body.chunks(37).map(|chunk| chunk.to_vec()).collect();
+    let mut server = Server::start(Behavior::Chunked {
+        chunks,
+        delay: Duration::from_millis(2),
+        watch_close: false,
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let mut events = Vec::new();
+    run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |event| {
+        events.push(event);
+    })
+    .expect("JSON body labelled as SSE");
+    server.join();
+    assert!(events.contains(&RunEvent::Delta("Bonjour le monde".to_string())));
+    assert!(events.contains(&RunEvent::Done));
+}
+
+#[test]
+fn a_200_error_object_is_surfaced_not_an_empty_answer() {
+    let mut server = Server::start(Behavior::Error {
+        status: 200,
+        reason: "OK",
+        body: include_bytes!("fixtures/http_200_error.json").to_vec(),
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let error = run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |_| {})
+        .expect_err("a 200 error object must be an error");
+    server.join();
+    assert!(error.to_string().contains("Model Not Exist"), "{error}");
+}
+
+#[test]
+fn reasoning_deltas_are_separate_from_the_answer() {
+    let stream = include_str!("fixtures/deepseek_reasoning_only.sse");
+    let chunks: Vec<Vec<u8>> = stream
+        .split_inclusive('\n')
+        .map(|line| line.as_bytes().to_vec())
+        .collect();
+    let mut server = Server::start(Behavior::Chunked {
+        chunks,
+        delay: Duration::from_millis(2),
+        watch_close: false,
+    });
+    let plan = plan_for(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let mut events = Vec::new();
+    run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |event| {
+        events.push(event);
+    })
+    .expect("reasoning stream");
+    server.join();
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Delta(_)))
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ReasoningDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "The passage is about motion generation. ",
+            "I should translate it carefully, but the budget is consumed."
+        ]
+    );
+    assert!(events.contains(&RunEvent::Usage(TokenUsage {
+        prompt_tokens: Some(300),
+        completion_tokens: Some(900),
+        total_tokens: Some(1200),
+
+        reasoning_tokens: None,
+    })));
+    assert!(events.contains(&RunEvent::Done));
+}
+
 #[test]
 fn the_request_spec_never_prints_its_key_or_body() {
     let plan = build_plan(PlanRequest {
@@ -751,12 +1079,17 @@ fn the_request_spec_never_prints_its_key_or_body() {
         pages: vec![PageText {
             page: 0,
             text: "A local index ranks document blocks before an answer is streamed.".to_string(),
+
+            chars: Vec::new(),
         }],
         settings: ChatSettings {
             base_url: "http://127.0.0.1:9/v1".to_string(),
             model: "test-model".to_string(),
             temperature: None,
             max_tokens: None,
+
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,
         },
     })
     .unwrap();

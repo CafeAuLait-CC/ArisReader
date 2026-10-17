@@ -72,6 +72,106 @@ pub struct ChatSettings {
     pub model: String,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Whether to ask the provider to think, and how hard. `Default` sends nothing.
+    pub reasoning_mode: ReasoningMode,
+    /// The request extension used to express `reasoning_mode`. One field only; a strict provider
+    /// rejects unknown parameters, and sending several "to be safe" would hide which one failed.
+    pub reasoning_encoding: ReasoningEncoding,
+}
+
+/// Reasoning request extensions. The provider is OpenAI-compatible for chat, but exposes these
+/// extensions instead of a standard "disable reasoning" field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningMode {
+    /// Send no reasoning field at all (the plain OpenAI-compatible request).
+    #[default]
+    Default,
+    Off,
+    Low,
+    High,
+    Max,
+}
+
+impl ReasoningMode {
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    fn effort(self) -> Option<&'static str> {
+        match self {
+            Self::Low => Some("low"),
+            Self::High => Some("high"),
+            Self::Max => Some("max"),
+            Self::Default | Self::Off => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningEncoding {
+    #[default]
+    None,
+    Thinking,
+    ReasoningEffort,
+    OutputConfig,
+    Reasoning,
+}
+
+impl ReasoningEncoding {
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "thinking" => Some(Self::Thinking),
+            "reasoning_effort" => Some(Self::ReasoningEffort),
+            "output_config" => Some(Self::OutputConfig),
+            "reasoning.effort" => Some(Self::Reasoning),
+            _ => None,
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Thinking => "thinking",
+            Self::ReasoningEffort => "reasoning_effort",
+            Self::OutputConfig => "output_config",
+            Self::Reasoning => "reasoning.effort",
+        }
+    }
+
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Thinking => "thinking",
+            Self::ReasoningEffort => "reasoning_effort",
+            Self::OutputConfig => "output_config",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ReasoningRequest {
+    field: &'static str,
+    value: serde_json::Value,
+    summary: String,
 }
 
 impl Default for ChatSettings {
@@ -81,8 +181,90 @@ impl Default for ChatSettings {
             model: "gpt-4o-mini".to_string(),
             temperature: Some(0.2),
             max_tokens: Some(900),
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,
         }
     }
+}
+
+fn reasoning_request(
+    mode: ReasoningMode,
+    encoding: ReasoningEncoding,
+) -> Result<Option<ReasoningRequest>, AiError> {
+    if mode == ReasoningMode::Default {
+        return Ok(None);
+    }
+    if encoding == ReasoningEncoding::None {
+        return Err(invalid(
+            "Choose a reasoning encoding, or set reasoning to default to send no reasoning field.",
+        ));
+    }
+    let (field, value, summary) = match (mode, encoding) {
+        (ReasoningMode::Off, ReasoningEncoding::Thinking) => (
+            "thinking",
+            serde_json::json!({ "type": "disabled" }),
+            "Thinking: disabled (thinking.type = disabled).".to_string(),
+        ),
+        (ReasoningMode::Off, ReasoningEncoding::Reasoning) => (
+            "reasoning",
+            serde_json::json!({ "effort": "none" }),
+            "Reasoning effort: none (reasoning.effort = none).".to_string(),
+        ),
+        (
+            ReasoningMode::Low | ReasoningMode::High | ReasoningMode::Max,
+            ReasoningEncoding::ReasoningEffort,
+        ) => {
+            let effort = mode.effort().expect("non-default mode");
+            (
+                "reasoning_effort",
+                serde_json::json!(effort),
+                format!("Reasoning effort: {effort} (reasoning_effort = {effort})."),
+            )
+        }
+        (
+            ReasoningMode::Low | ReasoningMode::High | ReasoningMode::Max,
+            ReasoningEncoding::OutputConfig,
+        ) => {
+            let effort = mode.effort().expect("non-default mode");
+            (
+                "output_config",
+                serde_json::json!({ "effort": effort }),
+                format!("Output effort: {effort} (output_config.effort = {effort})."),
+            )
+        }
+        (
+            ReasoningMode::Low | ReasoningMode::High | ReasoningMode::Max,
+            ReasoningEncoding::Reasoning,
+        ) => {
+            let effort = mode.effort().expect("non-default mode");
+            (
+                "reasoning",
+                serde_json::json!({ "effort": effort }),
+                format!("Reasoning effort: {effort} (reasoning.effort = {effort})."),
+            )
+        }
+        (_, ReasoningEncoding::Thinking) => {
+            return Err(invalid(
+                "The thinking encoding is a toggle: use reasoning off or default with it. For low, high or max choose reasoning_effort, output_config, or reasoning.effort.",
+            ));
+        }
+        (
+            ReasoningMode::Off,
+            ReasoningEncoding::ReasoningEffort | ReasoningEncoding::OutputConfig,
+        ) => {
+            return Err(invalid(
+                "That encoding has no documented off value. Use the thinking or reasoning.effort encoding for off, or choose default.",
+            ));
+        }
+        (ReasoningMode::Default, _) => unreachable!("handled before the match"),
+        (_, ReasoningEncoding::None) => unreachable!("checked above"),
+    };
+    debug_assert_eq!(field, encoding.field_name());
+    Ok(Some(ReasoningRequest {
+        field,
+        value,
+        summary,
+    }))
 }
 
 /// A validated endpoint. `base_url` and `endpoint` are normalised, not merely echoed.
@@ -95,12 +277,28 @@ pub struct EndpointInfo {
     pub is_local: bool,
 }
 
+/// One character's box on the page, in view-space points. `page` text and `chars` are the same
+/// sequence; the boxes let the context builder identify a line-number gutter without guessing
+/// from the string (a numbered list or a table's index column must survive).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageChar {
+    pub unicode: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
 /// One page's plain text. `page` is 0-based here, matching the engine; prompts and previews use
 /// 1-based page numbers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageText {
     pub page: u32,
     pub text: String,
+    /// One entry per `text` character, when the caller has layout geometry. Empty means the
+    /// caller only supplied text; gutter removal is then skipped (tests and callers without a
+    /// text layer use that path).
+    pub chars: Vec<PageChar>,
 }
 
 /// A selected character range on one page (inclusive, 0-based, aligned with the text layer).
@@ -185,6 +383,131 @@ impl ChatPlan {
         let characters: u64 = self.parts.iter().map(|part| part.request_characters).sum();
         characters.div_ceil(4)
     }
+}
+
+/// One finished part summary passed to the consolidation request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergePart {
+    /// 1-based part number, matching the preview.
+    pub index: u32,
+    pub total: u32,
+    /// 1-based pages covered by this part.
+    pub pages: Vec<u32>,
+    pub summary: String,
+}
+
+/// The local input to the consolidation request. It contains no API key and no page text beyond
+/// the part summaries the reader has already seen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergePlanRequest {
+    pub document_title: String,
+    pub settings: ChatSettings,
+    pub parts: Vec<MergePart>,
+}
+
+/// Build the one extra request that turns part summaries into the single document summary.
+/// This is previewed and sent as its own step, never merged silently into the part requests.
+pub fn build_merge_plan(request: MergePlanRequest) -> Result<ChatPlan, AiError> {
+    if request.parts.is_empty() {
+        return Err(empty_context("There are no part summaries to consolidate."));
+    }
+    let (endpoint, model, temperature, max_tokens, reasoning) =
+        validate_settings(&request.settings)?;
+    let mut parts = request.parts.clone();
+    parts.sort_by_key(|part| part.index);
+    let missing: Vec<String> = parts
+        .iter()
+        .filter(|part| part.summary.trim().is_empty())
+        .map(|part| {
+            format!(
+                "part {} of {} ({})",
+                part.index,
+                part.total,
+                page_label(&part.pages)
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(empty_context(format!(
+            "The consolidation was not sent because {} {} missing. The per-part summaries are kept.",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" }
+        )));
+    }
+    let total = parts
+        .iter()
+        .map(|part| part.total)
+        .max()
+        .unwrap_or(parts.len() as u32);
+    let mut pages: Vec<u32> = Vec::new();
+    let mut user = String::new();
+    let mut summary_chars = 0usize;
+    for part in &parts {
+        pages.extend(part.pages.iter().copied());
+        summary_chars += part.summary.chars().count();
+        user.push_str(&format!(
+            "[Part {} of {} · {}]\n{}\n\n",
+            part.index,
+            total,
+            page_label(&part.pages),
+            part.summary.trim()
+        ));
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    user.push_str(
+        "Consolidate the part summaries above into one coherent summary of the whole document. \
+         Remove repetition introduced by the part boundaries, keep the main claims, method and \
+         result, and do not invent anything absent from the summaries. Cite the pages you use as \
+         [p.N].",
+    );
+    let system = consolidation_system_prompt();
+    let label = format!("Consolidated summary · {}", page_label(&pages));
+    let page_characters = summary_chars as u64;
+    let request_characters = (system.chars().count() + user.chars().count()) as u64;
+    let wire_body = make_wire_body(
+        &model,
+        temperature,
+        max_tokens,
+        reasoning.as_ref(),
+        &system,
+        &user,
+    );
+    let note = Some(format!(
+        "This consolidation is a separate request built from {} part summaries. Nothing is sent until you press Send.",
+        parts.len()
+    ));
+    Ok(ChatPlan {
+        action: Action::SummarizeDocument,
+        document_title: request.document_title,
+        page_count: pages.iter().copied().max().unwrap_or(0),
+        base_url: endpoint.base_url,
+        endpoint: endpoint.endpoint,
+        host: endpoint.host,
+        is_local: endpoint.is_local,
+        model,
+        temperature,
+        max_tokens,
+        parts: vec![ChatPart {
+            index: 0,
+            total: 1,
+            label,
+            pages: pages.clone(),
+            primary_page: pages.first().copied().unwrap_or(0),
+            page_characters,
+            request_characters,
+            system_prompt: system,
+            user_prompt: user,
+            wire_body,
+            note: note.clone(),
+        }],
+        source_pages: pages,
+        note,
+    })
+}
+
+fn consolidation_system_prompt() -> String {
+    "You are Lyra, consolidating summaries of one long PDF into a single summary. Use only the part summaries in this request; do not add outside knowledge. Remove repetition caused by the part boundaries, keep the main claims, method and result, and cite pages in the exact form [p.12]. Do not claim to have read pages that are not covered by the part summaries. If the summaries conflict, say so plainly. Be concise.".to_string()
 }
 
 /// Inspect and normalise a base URL.
@@ -287,9 +610,15 @@ pub fn validate_model(raw: &str) -> Result<String, AiError> {
     Ok(model.to_string())
 }
 
-fn validate_settings(
-    settings: &ChatSettings,
-) -> Result<(EndpointInfo, String, Option<f32>, Option<u32>), AiError> {
+type ValidatedSettings = (
+    EndpointInfo,
+    String,
+    Option<f32>,
+    Option<u32>,
+    Option<ReasoningRequest>,
+);
+
+fn validate_settings(settings: &ChatSettings) -> Result<ValidatedSettings, AiError> {
     let endpoint = inspect_base_url(&settings.base_url)?;
     let model = validate_model(&settings.model)?;
     let temperature = match settings.temperature {
@@ -305,7 +634,8 @@ fn validate_settings(
         }
         value => value,
     };
-    Ok((endpoint, model, temperature, max_tokens))
+    let reasoning = reasoning_request(settings.reasoning_mode, settings.reasoning_encoding)?;
+    Ok((endpoint, model, temperature, max_tokens, reasoning))
 }
 
 fn split_authority(authority: &str) -> Result<(String, Option<u16>), AiError> {
@@ -393,12 +723,16 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
             request.current_page + 1
         )));
     }
-    let (endpoint, model, temperature, max_tokens) = validate_settings(&request.settings)?;
+    let (endpoint, model, temperature, max_tokens, reasoning) =
+        validate_settings(&request.settings)?;
 
-    let mut pages: Vec<Option<String>> = vec![None; request.page_count as usize];
+    // Keep the raw text layer. Selection ranges are character indices into this exact text;
+    // normalising it before slicing shifted every selection that followed whitespace the
+    // normaliser removed (line-number gutter, trailing spaces, collapsed blank lines).
+    let mut pages: Vec<Option<&PageText>> = vec![None; request.page_count as usize];
     for page in &request.pages {
         if let Some(slot) = pages.get_mut(page.page as usize) {
-            *slot = Some(normalize_text(&page.text));
+            *slot = Some(page);
         }
     }
 
@@ -407,6 +741,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
         model: &model,
         temperature,
         max_tokens,
+        reasoning,
     };
 
     let (parts, note) = match request.action {
@@ -455,30 +790,32 @@ struct PlanBuilder<'a> {
     model: &'a str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning: Option<ReasoningRequest>,
 }
 
 impl PlanBuilder<'_> {
     fn summarize_page(
         &mut self,
-        pages: &[Option<String>],
+        pages: &[Option<&PageText>],
     ) -> Result<(Vec<ChatPart>, Option<String>), AiError> {
         let page = self.request.current_page;
-        let text = pages
-            .get(page as usize)
-            .and_then(|text| text.as_deref())
-            .unwrap_or("");
-        if text.trim().is_empty() {
+        let page_data = pages.get(page as usize).and_then(|page| *page);
+        let raw_text = page_data.map(|page| page.text.as_str()).unwrap_or("");
+        if raw_text.trim().is_empty() {
             return Err(empty_context(format!(
                 "Page {} has no text layer, so there is nothing to send. Scanned pages need the image path, which this build does not implement.",
                 page + 1
             )));
         }
 
-        let (page_text, truncated) = truncate_chars(text, MAX_PAGE_CHARS);
+        // Page context removes a real margin line-number column. Selection text below never
+        // goes through this path; it is the raw sequence the canvas uses.
+        let text = page_data.map(page_context_text).unwrap_or_default();
+        let (page_text, truncated) = truncate_chars(&text, MAX_PAGE_CHARS);
         let blocks = document_blocks(pages);
         let retrieved = retrieve(
             &blocks,
-            text,
+            &text,
             Some(page),
             RETRIEVED_BLOCKS,
             MAX_RETRIEVED_CHARS,
@@ -540,28 +877,29 @@ impl PlanBuilder<'_> {
     fn ask(
         &mut self,
         selection: SelectionRange,
-        pages: &[Option<String>],
+        pages: &[Option<&PageText>],
     ) -> Result<(Vec<ChatPart>, Option<String>), AiError> {
         let page = selection.page;
         if page >= self.request.page_count {
             return Err(empty_context("The selected page is outside this document."));
         }
-        let page_text = pages
-            .get(page as usize)
-            .and_then(|text| text.as_deref())
-            .unwrap_or("");
-        let (selected, selected_truncated) = selection_text(page_text, selection);
+        let page_data = pages.get(page as usize).and_then(|page| *page);
+        let raw_text = page_data.map(|page| page.text.as_str()).unwrap_or("");
+        if selection.character_count() > MAX_SELECTION_CHARS {
+            return Err(empty_context(format!(
+                "The selection is {} characters; ask about at most {MAX_SELECTION_CHARS} characters at a time.",
+                selection.character_count()
+            )));
+        }
+        // The selection is sliced from the raw text layer with the same character indices the
+        // canvas uses. Only the surrounding page context is normalised. An out-of-range range
+        // is an error, never a silently clamped or trimmed answer.
+        let selected = selection_text(raw_text, selection)?;
         if selected.trim().is_empty() {
             return Err(empty_context(
                 "The selection is empty, so there is nothing to ask about.",
             ));
         }
-        let selection_note = selected_truncated.then(|| {
-            format!(
-                "The selection is {} characters; only the first {MAX_SELECTION_CHARS} characters were sent.",
-                selection.character_count()
-            )
-        });
         let question = self
             .request
             .question
@@ -569,7 +907,8 @@ impl PlanBuilder<'_> {
             .map(str::trim)
             .filter(|question| !question.is_empty())
             .unwrap_or("Explain this passage.");
-        let (page_context, page_truncated) = truncate_chars(page_text, MAX_PAGE_CHARS);
+        let normalized_page = page_data.map(page_context_text).unwrap_or_default();
+        let (page_context, page_truncated) = truncate_chars(&normalized_page, MAX_PAGE_CHARS);
         let blocks = document_blocks(pages);
         let query = format!("{selected} {question}");
         let retrieved = retrieve(
@@ -608,18 +947,12 @@ impl PlanBuilder<'_> {
         }
         user.push_str("\nAnswer in a few short paragraphs. Cite the pages you use as [p.N].");
 
-        let note = match (selection_note, page_truncated) {
-            (Some(selection_note), true) => Some(format!(
-                "{selection_note} Page {} was also truncated to {MAX_PAGE_CHARS} characters.",
-                page + 1
-            )),
-            (Some(selection_note), false) => Some(selection_note),
-            (None, true) => Some(format!(
+        let note = page_truncated.then(|| {
+            format!(
                 "Page {} was truncated to {MAX_PAGE_CHARS} characters in this request.",
                 page + 1
-            )),
-            (None, false) => None,
-        };
+            )
+        });
         let page_characters = selected.chars().count() as u64
             + page_context.chars().count() as u64
             + context.chars().count() as u64;
@@ -641,23 +974,21 @@ impl PlanBuilder<'_> {
     fn translate(
         &mut self,
         selection: SelectionRange,
-        pages: &[Option<String>],
+        pages: &[Option<&PageText>],
     ) -> Result<(Vec<ChatPart>, Option<String>), AiError> {
         let page = selection.page;
         if page >= self.request.page_count {
             return Err(empty_context("The selected page is outside this document."));
         }
-        let page_text = pages
-            .get(page as usize)
-            .and_then(|text| text.as_deref())
-            .unwrap_or("");
+        let page_data = pages.get(page as usize).and_then(|page| *page);
+        let page_text = page_data.map(|page| page.text.as_str()).unwrap_or("");
         let selected = if selection.character_count() > MAX_SELECTION_CHARS {
             return Err(empty_context(format!(
                 "The selection is {} characters; translate at most {MAX_SELECTION_CHARS} characters at a time.",
                 selection.character_count()
             )));
         } else {
-            selection_text(page_text, selection).0
+            selection_text(page_text, selection)?
         };
         if selected.trim().is_empty() {
             return Err(empty_context(
@@ -696,7 +1027,7 @@ impl PlanBuilder<'_> {
 
     fn summarize_document(
         &mut self,
-        pages: &[Option<String>],
+        pages: &[Option<&PageText>],
     ) -> Result<(Vec<ChatPart>, Option<String>), AiError> {
         let segments = page_segments(pages);
         if segments.is_empty() {
@@ -739,16 +1070,9 @@ impl PlanBuilder<'_> {
                 ));
                 page_characters += segment.text.chars().count();
             }
-            let label = if total == 1 {
-                page_label(&used_pages)
-            } else {
-                format!(
-                    "Part {} of {} · {}",
-                    index + 1,
-                    total,
-                    page_label(&used_pages)
-                )
-            };
+            // The label names pages only; the shell adds "Part i of n" exactly once. This
+            // prevents the live "Part 1 of 9 · Part 1 of 9 · Pages 1-3" duplication.
+            let label = page_label(&used_pages);
             let instruction = if total == 1 {
                 "Summarise this document. Give 4-8 bullet points covering the main claims, method and result. Cite the pages you use as [p.N].".to_string()
             } else {
@@ -779,7 +1103,7 @@ impl PlanBuilder<'_> {
 
         let note = if total > 1 {
             Some(format!(
-                "This document is split into {total} parts of at most {MAX_PART_CHARS} characters. The panel shows each part's summary separately; this build does not merge the parts."
+                "This document is split into {total} parts of at most {MAX_PART_CHARS} page characters each; each request also carries the system prompt and instructions. After the parts, a separate consolidation request turns them into one summary; it is previewed before it is sent."
             ))
         } else {
             None
@@ -806,6 +1130,7 @@ impl PlanBuilder<'_> {
             self.model,
             self.temperature,
             self.max_tokens,
+            self.reasoning.as_ref(),
             &system_prompt,
             &user_prompt,
         );
@@ -829,6 +1154,7 @@ fn make_wire_body(
     model: &str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning: Option<&ReasoningRequest>,
     system_prompt: &str,
     user_prompt: &str,
 ) -> String {
@@ -848,6 +1174,9 @@ fn make_wire_body(
     if let Some(max_tokens) = max_tokens {
         object.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
     }
+    if let Some(reasoning) = reasoning {
+        object.insert(reasoning.field.to_string(), reasoning.value.clone());
+    }
     serde_json::Value::Object(object).to_string()
 }
 
@@ -863,6 +1192,167 @@ fn translate_system_prompt(language: &str) -> String {
 
 fn retrieval_context_label() -> &'static str {
     "[Retrieved context]"
+}
+
+/// The character sequence the page context sends: the raw text with a real margin line-number
+/// column removed. The rule is geometric and deliberately narrow:
+///
+/// * the line consists only of digits (so a numbered list item or a table row, both of which
+///   carry other text on the same line, is never a candidate);
+/// * at least five such lines share an equal-width, left-aligned column;
+/// * their values increase by exactly one down the page;
+/// * the column sits left of the body's left edge with a visible gap, and at the page's
+///   leftmost text edge.
+///
+/// Selection text never goes through this function: it is sliced from the raw character
+/// sequence using the canvas's indices, so a reader can still select a gutter digit if they
+/// really highlight it.
+fn page_context_text(page: &PageText) -> String {
+    normalize_text(&page_without_margin_numbers(page))
+}
+
+fn page_without_margin_numbers(page: &PageText) -> String {
+    if page.chars.is_empty() {
+        return page.text.clone();
+    }
+    let glyph_text: String = page
+        .chars
+        .iter()
+        .map(|character| char::from_u32(character.unicode).unwrap_or('\u{FFFD}'))
+        .collect();
+    if glyph_text != page.text {
+        // The boxes and the text disagree; removing characters would corrupt the context.
+        return page.text.clone();
+    }
+
+    const MIN_GUTTER_LINES: usize = 5;
+    const MIN_BODY_GAP_PT: f64 = 10.0;
+    const MAX_COLUMN_WIDTH_PT: f64 = 40.0;
+    const X_ALIGNMENT_PT: f64 = 1.5;
+    const WIDTH_TOLERANCE_PT: f64 = 0.6;
+
+    let is_space = |index: usize| matches!(page.chars[index].unicode, 9 | 10 | 13 | 32);
+
+    // Split the raw sequence into lines, keeping original character indices so the removal is
+    // exact. A CRLF pair closes one line (the CR closes it, the LF sees an empty line).
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for (index, character) in page.chars.iter().enumerate() {
+        if character.unicode == 10 || character.unicode == 13 {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(index);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    let first_content_line = lines
+        .iter()
+        .position(|line| line.iter().any(|&index| !is_space(index)));
+    let Some(first_content_line) = first_content_line else {
+        return page.text.clone();
+    };
+
+    #[derive(Clone)]
+    struct GutterLine {
+        digits: Vec<usize>,
+        value: u64,
+        x_min: f64,
+        x_max: f64,
+    }
+
+    let mut block: Vec<GutterLine> = Vec::new();
+    let mut body_x: Option<f64> = None;
+    for line in &lines[first_content_line..] {
+        let content: Vec<usize> = line.iter().copied().filter(|&i| !is_space(i)).collect();
+        if content.is_empty() {
+            // Blank lines between the margin block and the body are harmless.
+            continue;
+        }
+        if content
+            .iter()
+            .all(|&i| (48..=57).contains(&page.chars[i].unicode))
+        {
+            let widths: Vec<f64> = content.iter().map(|&i| page.chars[i].width_pt).collect();
+            let width_min = widths.iter().copied().fold(f64::INFINITY, f64::min);
+            let width_max = widths.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let digits_text: String = content
+                .iter()
+                .map(|&i| char::from_u32(page.chars[i].unicode).unwrap_or('0'))
+                .collect();
+            let Ok(value) = digits_text.parse::<u64>() else {
+                break;
+            };
+            if content.len() < 2 || width_max - width_min > WIDTH_TOLERANCE_PT {
+                break;
+            }
+            let first = content[0];
+            let last = *content.last().expect("non-empty");
+            block.push(GutterLine {
+                digits: content,
+                value,
+                x_min: page.chars[first].x_pt,
+                x_max: page.chars[last].x_pt + page.chars[last].width_pt,
+            });
+        } else {
+            body_x = Some(page.chars[content[0]].x_pt);
+            break;
+        }
+    }
+
+    if block.len() < MIN_GUTTER_LINES {
+        return page.text.clone();
+    }
+    let digit_count = block[0].digits.len();
+    if !block.iter().all(|line| line.digits.len() == digit_count) {
+        return page.text.clone();
+    }
+    let Some(body_x) = body_x else {
+        return page.text.clone();
+    };
+    let column_x = block[0].x_min;
+    let column_width = block[0].x_max - column_x;
+    if block.iter().any(|line| {
+        (line.x_min - column_x).abs() > X_ALIGNMENT_PT
+            || ((line.x_max - line.x_min) - column_width).abs() > WIDTH_TOLERANCE_PT
+            || line.x_max + MIN_BODY_GAP_PT > body_x
+    }) {
+        return page.text.clone();
+    }
+    if column_width > MAX_COLUMN_WIDTH_PT {
+        return page.text.clone();
+    }
+    let page_min_x = page
+        .chars
+        .iter()
+        .filter(|character| character.width_pt > 0.0)
+        .map(|character| character.x_pt)
+        .fold(f64::INFINITY, f64::min);
+    if column_x > page_min_x + 2.0 {
+        return page.text.clone();
+    }
+    // Values must increase by exactly one down the page.
+    if block
+        .windows(2)
+        .any(|pair| pair[1].value != pair[0].value + 1)
+    {
+        return page.text.clone();
+    }
+
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for line in block {
+        remove.extend(line.digits);
+    }
+    page.chars
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !remove.contains(index))
+        .map(|(_, character)| char::from_u32(character.unicode).unwrap_or('\u{FFFD}'))
+        .collect()
 }
 
 fn normalize_text(text: &str) -> String {
@@ -894,18 +1384,16 @@ fn truncate_chars(text: &str, limit: usize) -> (String, bool) {
     (truncated, true)
 }
 
-fn selection_text(page_text: &str, selection: SelectionRange) -> (String, bool) {
+fn selection_text(page_text: &str, selection: SelectionRange) -> Result<String, AiError> {
     let characters: Vec<char> = page_text.chars().collect();
     let start = selection.start as usize;
     let end = selection.end as usize;
-    if start >= characters.len() || end < start {
-        return (String::new(), false);
+    if start >= characters.len() || end < start || end >= characters.len() {
+        return Err(empty_context(
+            "The selection does not match the page text anymore; nothing was sent. Select again and retry.",
+        ));
     }
-    let end = end.min(characters.len() - 1);
-    let slice = &characters[start..=end];
-    let truncated = slice.len() > MAX_SELECTION_CHARS;
-    let selected: String = slice.iter().take(MAX_SELECTION_CHARS).collect();
-    (selected, truncated)
+    Ok(characters[start..=end].iter().collect())
 }
 
 fn page_label(pages: &[u32]) -> String {
@@ -971,16 +1459,17 @@ impl RetrievalText {
     }
 }
 
-fn page_segments(pages: &[Option<String>]) -> Vec<Segment> {
+fn page_segments(pages: &[Option<&PageText>]) -> Vec<Segment> {
     let mut segments = Vec::new();
-    for (page, text) in pages.iter().enumerate() {
-        let Some(text) = text.as_deref() else {
+    for (page, page_text) in pages.iter().enumerate() {
+        let Some(page_text) = page_text else {
             continue;
         };
+        let text = page_context_text(page_text);
         if text.trim().is_empty() {
             continue;
         }
-        for segment in split_text_segments(text) {
+        for segment in split_text_segments(&text) {
             segments.push(Segment {
                 page: page as u32,
                 text: segment,
@@ -1022,12 +1511,13 @@ fn split_text_segments(text: &str) -> Vec<String> {
     chunks
 }
 
-fn document_blocks(pages: &[Option<String>]) -> Vec<Block> {
+fn document_blocks(pages: &[Option<&PageText>]) -> Vec<Block> {
     let mut blocks = Vec::new();
-    for (page, text) in pages.iter().enumerate() {
-        let Some(text) = text.as_deref() else {
+    for (page, page_text) in pages.iter().enumerate() {
+        let Some(page_text) = page_text else {
             continue;
         };
+        let text = page_context_text(page_text);
         for paragraph in text.split('\n') {
             let paragraph = paragraph.trim();
             if paragraph.chars().count() < 20 {
@@ -1209,6 +1699,8 @@ mod tests {
             model: "test-model".to_string(),
             temperature: Some(0.2),
             max_tokens: Some(256),
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,
         }
     }
 
@@ -1221,7 +1713,8 @@ mod tests {
                     page + 1,
                     page + 1
                 ),
-            })
+
+                chars: Vec::new(),})
             .collect()
     }
 
@@ -1293,6 +1786,214 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_settings_send_exactly_one_documented_field() {
+        let base = settings("https://api.deepseek.com");
+        let plan_for = |mode: ReasoningMode, encoding: ReasoningEncoding| {
+            let mut settings = base.clone();
+            settings.reasoning_mode = mode;
+            settings.reasoning_encoding = encoding;
+            build_plan(PlanRequest {
+                action: Action::SummarizePage,
+                document_title: "Reasoning".to_string(),
+                page_count: 1,
+                current_page: 0,
+                selection: None,
+                question: None,
+                language: None,
+                pages: vec![PageText {
+                    page: 0,
+                    text: "A page with enough text to build a context block for the request."
+                        .to_string(),
+                    chars: Vec::new(),
+                }],
+                settings,
+            })
+            .unwrap()
+            .parts
+            .remove(0)
+            .wire_body
+        };
+
+        let default_body = plan_for(ReasoningMode::Default, ReasoningEncoding::Thinking);
+        for field in ["thinking", "reasoning_effort", "output_config", "reasoning"] {
+            assert!(
+                !default_body.contains(&format!("\"{field}\"")),
+                "default mode must send no reasoning field: {default_body}"
+            );
+        }
+
+        let off_thinking = plan_for(ReasoningMode::Off, ReasoningEncoding::Thinking);
+        assert!(off_thinking.contains("\"thinking\":{\"type\":\"disabled\"}"));
+        assert!(!off_thinking.contains("reasoning_effort"));
+        assert!(!off_thinking.contains("output_config"));
+
+        let high_effort = plan_for(ReasoningMode::High, ReasoningEncoding::ReasoningEffort);
+        assert!(high_effort.contains("\"reasoning_effort\":\"high\""));
+        assert!(!high_effort.contains("\"thinking\""));
+        assert!(!high_effort.contains("\"reasoning\":{\"effort\""));
+
+        let low_output = plan_for(ReasoningMode::Low, ReasoningEncoding::OutputConfig);
+        assert!(low_output.contains("\"output_config\":{\"effort\":\"low\"}"));
+
+        let max_reasoning = plan_for(ReasoningMode::Max, ReasoningEncoding::Reasoning);
+        assert!(max_reasoning.contains("\"reasoning\":{\"effort\":\"max\"}"));
+
+        let off_reasoning = plan_for(ReasoningMode::Off, ReasoningEncoding::Reasoning);
+        assert!(off_reasoning.contains("\"reasoning\":{\"effort\":\"none\"}"));
+
+        for (mode, encoding) in [
+            (ReasoningMode::High, ReasoningEncoding::Thinking),
+            (ReasoningMode::Off, ReasoningEncoding::ReasoningEffort),
+            (ReasoningMode::Off, ReasoningEncoding::OutputConfig),
+            (ReasoningMode::Off, ReasoningEncoding::None),
+        ] {
+            let mut settings = base.clone();
+            settings.reasoning_mode = mode;
+            settings.reasoning_encoding = encoding;
+            let error = build_plan(PlanRequest {
+                action: Action::SummarizePage,
+                document_title: "Reasoning".to_string(),
+                page_count: 1,
+                current_page: 0,
+                selection: None,
+                question: None,
+                language: None,
+                pages: vec![PageText {
+                    page: 0,
+                    text: "A page with enough text to build a context block for the request."
+                        .to_string(),
+                    chars: Vec::new(),
+                }],
+                settings,
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("encoding") || error.to_string().contains("toggle"));
+        }
+    }
+
+    #[test]
+    fn document_summary_parts_respect_the_page_character_budget() {
+        let page_text = "word ".repeat(4_000);
+        let pages: Vec<PageText> = (0..6)
+            .map(|page| PageText {
+                page,
+                text: page_text.clone(),
+                chars: Vec::new(),
+            })
+            .collect();
+        let request = PlanRequest {
+            action: Action::SummarizeDocument,
+            document_title: "Long paper".to_string(),
+            page_count: 6,
+            current_page: 0,
+            selection: None,
+            question: None,
+            language: None,
+            pages,
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let plan = build_plan(request).unwrap();
+        assert!(plan.parts.len() > 1, "long pages should be split");
+        for part in &plan.parts {
+            assert!(
+                part.page_characters <= MAX_PART_CHARS as u64,
+                "part {} has {} page characters, budget {}",
+                part.index,
+                part.page_characters,
+                MAX_PART_CHARS
+            );
+        }
+        let note = plan.note.unwrap();
+        assert!(note.contains("page characters"));
+        assert!(note.contains("consolidation"));
+        assert!(!note.contains("does not merge"));
+    }
+
+    #[test]
+    fn consolidation_plan_contains_all_part_summaries_and_cost() {
+        let plan = build_merge_plan(MergePlanRequest {
+            document_title: "Long paper".to_string(),
+            settings: settings("https://api.deepseek.com"),
+            parts: vec![
+                MergePart {
+                    index: 1,
+                    total: 3,
+                    pages: vec![1, 2],
+                    summary: "Part one summary with a claim [p.1].".to_string(),
+                },
+                MergePart {
+                    index: 2,
+                    total: 3,
+                    pages: vec![3, 4],
+                    summary: "Part two summary with the method [p.3].".to_string(),
+                },
+                MergePart {
+                    index: 3,
+                    total: 3,
+                    pages: vec![5],
+                    summary: "Part three summary with the result [p.5].".to_string(),
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(plan.parts.len(), 1, "consolidation is one request");
+        let part = &plan.parts[0];
+        assert!(part.label.starts_with("Consolidated summary"));
+        assert!(part.user_prompt.contains("[Part 1 of 3 · Pages 1-2]"));
+        assert!(
+            part.user_prompt
+                .contains("Part two summary with the method")
+        );
+        assert!(part.user_prompt.contains("[Part 3 of 3 · Page 5]"));
+        assert!(part.wire_body.contains("\"stream\":true"));
+        assert!(
+            part.wire_body
+                .contains("\"thinking\":{\"type\":\"disabled\"}")
+        );
+        assert_eq!(part.pages, vec![1, 2, 3, 4, 5]);
+        assert!(part.page_characters > 0);
+        assert!(part.request_characters > part.page_characters);
+        assert!(plan.note.unwrap().contains("separate request"));
+    }
+
+    #[test]
+    fn consolidation_names_missing_parts_instead_of_summarising_the_rest() {
+        let error = build_merge_plan(MergePlanRequest {
+            document_title: "Long paper".to_string(),
+            settings: settings("https://api.deepseek.com"),
+            parts: vec![
+                MergePart {
+                    index: 1,
+                    total: 3,
+                    pages: vec![1],
+                    summary: "Part one [p.1].".to_string(),
+                },
+                MergePart {
+                    index: 2,
+                    total: 3,
+                    pages: vec![2],
+                    summary: String::new(),
+                },
+                MergePart {
+                    index: 3,
+                    total: 3,
+                    pages: vec![3],
+                    summary: "Part three [p.3].".to_string(),
+                },
+            ],
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("part 2 of 3"), "message: {message}");
+        assert!(message.contains("Page 2"), "message: {message}");
+        assert!(message.contains("missing"), "message: {message}");
+        assert!(
+            message.contains("per-part summaries are kept"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
     fn retrieval_prefers_the_page_that_mentions_the_query() {
         let mut page_texts = pages(4);
         page_texts[2].text =
@@ -1340,6 +2041,260 @@ mod tests {
     }
 
     #[test]
+    fn selection_prompt_is_the_exact_raw_character_range() {
+        // The numbered margin is a run of real characters at the start of the text layer, and
+        // the body lines carry trailing spaces and blank lines. Normalising the page before
+        // slicing shifted the range in the live manuscript; this pins the raw-index invariant.
+        let raw = "\r\n\r\n000\r\n001\r\n028\r\n029\r\n030\r\n\r\nExisting 3D motion generators face a trade-off between convenient but coarse   \r\ntext-based control and precise but manually specified pose guidance. Moreover,\r\ndiffusion-based methods further incur substantial iterative sampling costs.\r\n\r\n";
+        let characters: Vec<char> = raw.chars().collect();
+        let char_offset = |byte: usize| raw[..byte].chars().count();
+        // Start and end inside words on purpose: the model must receive the partial words the
+        // reader selected, not a cleaned-up phrase.
+        let start = char_offset(raw.find("motion").unwrap()) + 2;
+        let end = char_offset(raw.find("sampling").unwrap()) + 3;
+        let expected: String = characters[start..=end].iter().collect();
+        assert!(expected.starts_with("tion"));
+        assert!(expected.ends_with("samp"));
+
+        let request = PlanRequest {
+            action: Action::TranslateSelection,
+            document_title: "Numbered margin".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: Some(SelectionRange {
+                page: 0,
+                start: start as u32,
+                end: end as u32,
+            }),
+            question: None,
+            language: Some("English".to_string()),
+            pages: vec![PageText {
+                page: 0,
+                text: raw.to_string(),
+
+                chars: Vec::new(),
+            }],
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let plan = build_plan(request).unwrap();
+        let prompt = &plan.parts[0].user_prompt;
+        let marker = "[Selected text - page 1]\n";
+        let selected = prompt
+            .split_once(marker)
+            .map(|(_, rest)| rest.strip_suffix('\n').unwrap_or(rest))
+            .expect("the selection marker");
+        assert_eq!(
+            selected, expected,
+            "the prompt must contain the exact raw characters the canvas selected"
+        );
+        assert!(!selected.contains("028"));
+        assert!(!selected.contains("029"));
+        assert!(!selected.contains("030"));
+    }
+
+    fn push_page_run(
+        text: &mut String,
+        chars: &mut Vec<PageChar>,
+        value: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) {
+        for character in value.chars() {
+            text.push(character);
+            chars.push(PageChar {
+                unicode: character as u32,
+                x_pt: x,
+                y_pt: y,
+                width_pt: width,
+                height_pt: height,
+            });
+        }
+    }
+
+    fn numbered_margin_page_text() -> PageText {
+        let mut text = String::new();
+        let mut chars = Vec::new();
+        for line in 0..=10 {
+            push_page_run(
+                &mut text,
+                &mut chars,
+                &format!("{line:03}"),
+                10.0,
+                10.0 + line as f64 * 12.0,
+                4.0,
+                8.0,
+            );
+            push_page_run(
+                &mut text,
+                &mut chars,
+                "\r\n",
+                22.0,
+                10.0 + line as f64 * 12.0,
+                0.0,
+                0.0,
+            );
+        }
+        push_page_run(
+            &mut text,
+            &mut chars,
+            "Existing 3D motion generators face a trade-off between convenient but coarse",
+            60.0,
+            10.0,
+            5.0,
+            8.0,
+        );
+        push_page_run(&mut text, &mut chars, "\r\n", 500.0, 10.0, 0.0, 0.0);
+        push_page_run(
+            &mut text,
+            &mut chars,
+            "text-based control and precise but manually specified pose guidance.",
+            60.0,
+            22.0,
+            5.0,
+            8.0,
+        );
+        PageText {
+            page: 0,
+            text,
+            chars,
+        }
+    }
+
+    #[test]
+    fn page_context_removes_a_geometric_margin_run_but_keeps_the_body() {
+        let page = numbered_margin_page_text();
+        let request = PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "Numbered margin".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: None,
+            question: None,
+            language: None,
+            pages: vec![page],
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let plan = build_plan(request).unwrap();
+        let prompt = &plan.parts[0].user_prompt;
+        assert!(
+            !prompt.contains("000") && !prompt.contains("010"),
+            "the margin run is not document text: {prompt}"
+        );
+        assert!(
+            prompt.contains("Existing 3D motion generators face a trade-off"),
+            "the abstract survives gutter removal: {prompt}"
+        );
+        assert!(prompt.contains("pose guidance."));
+    }
+
+    #[test]
+    fn numbered_lists_and_table_rows_are_not_mistaken_for_a_gutter() {
+        let mut text = String::new();
+        let mut chars = Vec::new();
+        for (line, value) in [
+            "1. Introduction",
+            "2. Method",
+            "3. Results",
+            "4. Conclusion",
+            "5. References",
+            "10  Accuracy  0.93",
+            "11  Recall    0.88",
+            "12  F1        0.90",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 10.0 + line as f64 * 12.0;
+            push_page_run(&mut text, &mut chars, value, 10.0, y, 5.0, 8.0);
+            push_page_run(&mut text, &mut chars, "\r\n", 90.0, y, 0.0, 0.0);
+        }
+        let page = PageText {
+            page: 0,
+            text,
+            chars,
+        };
+        let request = PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "Lists".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: None,
+            question: None,
+            language: None,
+            pages: vec![page],
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let plan = build_plan(request).unwrap();
+        let prompt = &plan.parts[0].user_prompt;
+        for expected in ["1. Introduction", "2. Method", "10  Accuracy", "12  F1"] {
+            assert!(prompt.contains(expected), "missing {expected}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn a_selection_inside_a_gutter_page_is_still_raw_text() {
+        let page = numbered_margin_page_text();
+        let characters: Vec<char> = page.text.chars().collect();
+        let start = page.text.find("motion").unwrap();
+        let start = page.text[..start].chars().count() + 2;
+        let end = page.text.find("pose guidance").unwrap();
+        let end = page.text[..end].chars().count() + "pose guidance".chars().count() - 1;
+        let expected: String = characters[start..=end].iter().collect();
+        let request = PlanRequest {
+            action: Action::TranslateSelection,
+            document_title: "Numbered margin".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: Some(SelectionRange {
+                page: 0,
+                start: start as u32,
+                end: end as u32,
+            }),
+            question: None,
+            language: Some("English".to_string()),
+            pages: vec![page],
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let plan = build_plan(request).unwrap();
+        let prompt = &plan.parts[0].user_prompt;
+        let marker = "[Selected text - page 1]\n";
+        let selected = prompt
+            .split_once(marker)
+            .map(|(_, rest)| rest.strip_suffix('\n').unwrap_or(rest))
+            .expect("selection marker");
+        assert_eq!(selected, expected);
+        assert!(!selected.contains("000"));
+    }
+
+    #[test]
+    fn an_out_of_range_selection_is_refused_not_clamped() {
+        let request = PlanRequest {
+            action: Action::TranslateSelection,
+            document_title: "Bounds".to_string(),
+            page_count: 1,
+            current_page: 0,
+            selection: Some(SelectionRange {
+                page: 0,
+                start: 7,
+                end: 9,
+            }),
+            question: None,
+            language: Some("English".to_string()),
+            pages: vec![PageText {
+                page: 0,
+                text: "short".to_string(),
+
+                chars: Vec::new(),
+            }],
+            settings: settings("http://localhost:11434/v1"),
+        };
+        let error = build_plan(request).unwrap_err();
+        assert!(error.to_string().contains("does not match the page text"));
+    }
+
+    #[test]
     fn translation_refuses_a_selection_that_would_be_truncated() {
         let long = "word ".repeat(MAX_SELECTION_CHARS);
         let request = PlanRequest {
@@ -1357,6 +2312,8 @@ mod tests {
             pages: vec![PageText {
                 page: 0,
                 text: long,
+
+                chars: Vec::new(),
             }],
             settings: settings("http://localhost:11434/v1"),
         };
@@ -1374,6 +2331,8 @@ mod tests {
                     "{}. ",
                     "This page has a long explanation of the method. ".repeat(40)
                 ),
+
+                chars: Vec::new(),
             });
         }
         let request = PlanRequest {
@@ -1393,7 +2352,15 @@ mod tests {
             "expected parts, got {}",
             plan.parts.len()
         );
-        assert!(plan.note.as_deref().unwrap().contains("does not merge"));
+        assert!(plan.note.as_deref().unwrap().contains("consolidation"));
+        for part in &plan.parts {
+            assert!(
+                !part.label.contains("Part "),
+                "the shell adds the part number exactly once: {}",
+                part.label
+            );
+            assert!(part.label.starts_with("Page"));
+        }
         assert_eq!(
             plan.parts.iter().map(|part| part.index).collect::<Vec<_>>(),
             (0..plan.parts.len() as u32).collect::<Vec<_>>()

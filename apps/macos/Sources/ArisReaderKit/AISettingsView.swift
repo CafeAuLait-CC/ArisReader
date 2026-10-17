@@ -7,6 +7,8 @@ public struct AISettingsView: View {
     @State private var model = ""
     @State private var temperature = AISettingsStore.defaultTemperature
     @State private var maxTokens = AISettingsStore.defaultMaxTokens
+    @State private var reasoningMode = AISettingsStore.defaultReasoningMode
+    @State private var reasoningEncoding = AISettingsStore.defaultReasoningEncoding
     @State private var keyDraft = ""
     @State private var savedMessage: String?
 
@@ -74,6 +76,42 @@ public struct AISettingsView: View {
             }
 
             Section {
+                Picker("Reasoning", selection: $reasoningMode) {
+                    ForEach(AIReasoningMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                Picker("Encoding", selection: $reasoningEncoding) {
+                    ForEach(AIReasoningEncoding.allCases) { encoding in
+                        Text(encoding.title).tag(encoding)
+                    }
+                }
+                Text(previewSettings.reasoningSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(previewSettings.reasoningFieldDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let message = AISettingsStore.reasoningValidationMessage(
+                    mode: reasoningMode,
+                    encoding: reasoningEncoding
+                ) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(Color.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("Reasoning control")
+            } footer: {
+                Text("Plain OpenAI compatibility has no standard reasoning switch. This provider documents several encodings, so Lyra sends exactly the one selected here and nothing else. The default is off via thinking, because it changes cost and latency. A strict provider may reject an encoding; the error will name the parameter and point back to this setting.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
                 HStack {
                     Text("Temperature")
                     Slider(value: $temperature, in: 0...2, step: 0.1)
@@ -110,8 +148,21 @@ public struct AISettingsView: View {
         model = store.model
         temperature = store.temperature
         maxTokens = store.maxTokens
+        reasoningMode = store.reasoningMode
+        reasoningEncoding = store.reasoningEncoding
         keyDraft = ""
         savedMessage = nil
+    }
+
+    private var previewSettings: AIProviderSettings {
+        AIProviderSettings(
+            baseURL: baseURL,
+            model: model,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding
+        )
     }
 
     private func save() {
@@ -120,7 +171,9 @@ public struct AISettingsView: View {
             model: model,
             temperature: temperature,
             maxTokens: maxTokens,
-            apiKey: keyDraft
+            apiKey: keyDraft,
+            reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding
         )
         if succeeded {
             keyDraft = ""
