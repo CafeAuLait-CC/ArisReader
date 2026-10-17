@@ -136,6 +136,8 @@ public struct ReaderWindow: View {
                     .padding(.bottom, 16)
             }
 
+            DocumentNoteOverlay(state: state)
+
             if let hint = opener.dropHint {
                 FileDropOverlay(hint: hint)
             }

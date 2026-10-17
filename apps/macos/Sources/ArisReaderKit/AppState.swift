@@ -766,11 +766,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// where the click put it. `nil` until a note is clicked or a document is opened.
     @Published public private(set) var selectedDocumentAnnotationID: String?
 
+    /// The note currently expanded beside its glyph in the document.
+    @Published public private(set) var openDocumentNoteID: String?
+
+    public var openDocumentNote: DocumentAnnotation? {
+        documentNotes.first { $0.id == openDocumentNoteID }
+    }
+
+    public func closeDocumentNote() { openDocumentNoteID = nil }
+
     /// The document's own annotations that are notes rather than markup — what the sidebar lists.
     ///
-    /// Sticky notes and free text are the two kinds whose `/Contents` is the point of them, and
-    /// the sidebar is where that text can be read (and edited, for this reader's own annotations);
-    /// it is also what a click on a note icon on the page brings up.
+    /// Sticky notes and free text expose their `/Contents` in the sidebar and in a paper
+    /// beside the glyph when clicked on the page.
     public var documentNotes: [DocumentAnnotation] {
         documentAnnotations.filter { $0.visible && $0.isNote }
     }
@@ -1520,6 +1528,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         undoStack = []
         redoStack = []
         selectedDocumentAnnotationID = nil
+        openDocumentNoteID = nil
         noteGlyphTextures = [:]
         scrollYPt = 0
         contentHeightPt = 0
@@ -2408,6 +2417,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // preview used to leave the old selection highlighted behind the panel, which reads as
         // "the click did not take".
         clearSelection()
+        closeDocumentNote()
         previewEpoch &+= 1
 
         // A click tries four things, in this order:
@@ -2432,19 +2442,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             || openDocumentNote(at: point)
     }
 
-    /// Shows the note whose drawn glyph is under `point`, if one is there.
-    ///
-    /// A note used to have no marker on the page at all, so there was nothing to click; now that
-    /// its icon is drawn, clicking it has to do what clicking it in the sidebar does — put its
-    /// text where the reader can read it. Both halves exist already and are reused rather than
-    /// reinvented: the click selects the annotation in the "In this PDF" list (revealing the
-    /// sidebar and switching to it if the reader had them closed) and the status line repeats the
-    /// first line of the note, which is what is visible if the list is scrolled away from the row.
-    ///
-    /// True means a note was found. Deliberately does **not** scroll: the reader clicked something
-    /// they can already see, and moving the page under the pointer is the one thing a click on a
-    /// visible mark must not do (the sidebar's own jump does scroll, which is right there and
-    /// wrong here).
+    /// Expands a fixed-size paper beside the clicked glyph without moving the document.
     @discardableResult
     public func openDocumentNote(at point: CGPoint) -> Bool {
         for placement in visiblePagePlacements {
@@ -2471,12 +2469,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard hit.contains(local) else { continue }
 
                 selectedDocumentAnnotationID = annotation.id
-                sidebarVisible = true
-                sidebarTab = .annotations
+                openDocumentNoteID = annotation.id
                 let text = (annotation.contents ?? "").split(whereSeparator: \.isNewline)
                     .first.map(String.init) ?? ""
                 statusMessage = text.isEmpty
-                    ? "Page \(annotation.page + 1): a note with no text — see the sidebar"
+                    ? "Page \(annotation.page + 1): a note with no text"
                     : "Page \(annotation.page + 1): \(text.prefix(120))"
                 FileHandle.standardError.write(
                     Data("aris-annot: opened note \(annotation.id) (\(annotation.drawing.rawValue)) on page \(annotation.page + 1)\n".utf8)
