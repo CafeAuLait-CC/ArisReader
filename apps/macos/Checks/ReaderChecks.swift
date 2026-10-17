@@ -140,6 +140,15 @@ struct ReaderChecks {
             print("Page-operation checks passed")
             return
         }
+        // Lets the thumbnail drag/reorder checks run on their own
+        // (`ArisReaderChecks --check-thumbnail-drag .`).
+        if CommandLine.arguments.contains("--check-thumbnail-drag") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await thumbnailDragChecks(root: root)
+            print("Thumbnail-drag checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--measure-window-engine-cost") {
             try await measureWindowEngineCost()
             return
@@ -342,6 +351,7 @@ struct ReaderChecks {
         // Registered before the frame-scheduling checks: those need a presentable surface and
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)
+        try await thumbnailDragChecks(root: root)
         try await documentOpeningChecks(a: a, b: b)
         try await desktopInteractionChecks(
             a: a, b: b,

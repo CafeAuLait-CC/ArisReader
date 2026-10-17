@@ -27,6 +27,13 @@ public struct SidebarView: View {
     /// One assistant per window's sidebar. It outlives tab switches (so an answer is not lost
     /// when the reader checks the outline) but not the window.
     @StateObject private var aiAssistant = AIAssistantModel()
+    /// The visible thumbnail cells, in the strip's coordinate space. The AppKit drag overlay
+    /// uses these frames to decide which page a press is on and where an insertion line belongs;
+    /// the values only change when cells appear or disappear, not while the strip scrolls.
+    @State private var thumbnailFrames: [Int: CGRect] = [:]
+
+    /// The coordinate space that makes the SwiftUI cell frames and the AppKit overlay agree.
+    private static let thumbnailStripSpace = "LyraThumbnailStrip"
 
     public init(state: AppState, opener: DocumentOpenCoordinator? = nil) {
         self.state = state
@@ -262,14 +269,82 @@ public struct SidebarView: View {
                                 lineWidth: 2
                             )
                     )
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: ThumbnailCellFramesKey.self,
+                                value: [ThumbnailCellFrame(
+                                    page: page,
+                                    rect: proxy.frame(in: .named(Self.thumbnailStripSpace))
+                                )]
+                            )
+                        }
+                    )
                     .contextMenu {
                         pageContextMenu(for: page)
                     }
                 }
             }
             .padding(10)
+            .coordinateSpace(name: Self.thumbnailStripSpace)
+            // One AppKit view owns the strip's pointer: it keeps a press under the drag
+            // threshold a click (navigating exactly as the Button does), turns a longer press
+            // into a native page drag, and draws the insertion line.
+            .overlay {
+                thumbnailDragOverlay
+            }
+            .onPreferenceChange(ThumbnailCellFramesKey.self) { cells in
+                var next: [Int: CGRect] = [:]
+                for cell in cells where next[cell.page] == nil {
+                    next[cell.page] = cell.rect
+                }
+                if next != thumbnailFrames { thumbnailFrames = next }
+            }
         }
         .onAppear { state.loadThumbnails() }
+    }
+
+    private var thumbnailDragOverlay: some View {
+        ThumbnailDragOverlay(
+            pageCount: state.document?.pageCount ?? 0,
+            frames: thumbnailFrames,
+            dragBlock: { [weak state] page in
+                state?.thumbnailDragBlock(startingAt: page) ?? .refused(.noDocument)
+            },
+            payloadIdentity: { [weak state] in
+                guard let state, let url = state.document?.url else { return nil }
+                return ThumbnailDragIdentity(
+                    path: url.standardizedFileURL.path,
+                    pageCount: state.document?.pageCount ?? 0
+                )
+            },
+            dragImage: { [weak state] page, count in
+                guard let state else { return nil }
+                return Self.dragImage(state: state, page: page, count: count)
+            },
+            onClick: { [weak state] page, modifiers in
+                state?.handleThumbnailClick(page, modifiers: modifiers)
+            },
+            onDrop: { [weak state] request in
+                Task { @MainActor [weak state] in
+                    _ = await state?.performThumbnailDrop(request)
+                }
+            },
+            onRefusal: { [weak state] refusal in
+                state?.statusMessage = refusal.message
+            },
+            menu: { [weak state] page in
+                guard let state else { return nil }
+                return PageContextMenu.menu(
+                    state: state,
+                    page: page,
+                    canOpenNewWindow: opener?.canOpenInNewWindow == true,
+                    newWindow: { url, targetPage in
+                        opener?.openInNewWindow([url], page: targetPage) ?? false
+                    }
+                )
+            }
+        )
     }
 
     /// The thumbnail's right-click menu, built from the same page/window commands the Pages menu
@@ -325,30 +400,96 @@ public struct SidebarView: View {
 
     /// Wraps a BGRA bitmap in a `CGImage`. The format matches what PDFium produced
     /// (premultiplied first, little endian), so no channel shuffling is needed.
-    private static func image(from page: PageImage) -> Image? {
+    private static func cgImage(from page: PageImage) -> CGImage? {
         guard page.pixelWidth > 0, page.pixelHeight > 0 else { return nil }
 
         let bitmapInfo = CGBitmapInfo(
             rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
                 | CGBitmapInfo.byteOrder32Little.rawValue
         )
-        guard let provider = CGDataProvider(data: page.bgra as CFData),
-              let cgImage = CGImage(
-                  width: page.pixelWidth,
-                  height: page.pixelHeight,
-                  bitsPerComponent: 8,
-                  bitsPerPixel: 32,
-                  bytesPerRow: page.pixelWidth * 4,
-                  space: CGColorSpaceCreateDeviceRGB(),
-                  bitmapInfo: bitmapInfo,
-                  provider: provider,
-                  decode: nil,
-                  shouldInterpolate: true,
-                  intent: .defaultIntent
-              )
-        else { return nil }
+        guard let provider = CGDataProvider(data: page.bgra as CFData) else { return nil }
+        return CGImage(
+            width: page.pixelWidth,
+            height: page.pixelHeight,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: page.pixelWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        )
+    }
 
+    private static func image(from page: PageImage) -> Image? {
+        guard let cgImage = cgImage(from: page) else { return nil }
         return Image(decorative: cgImage, scale: 1)
+    }
+
+    /// The image the drag session carries: the grabbed page, with the cards behind it and a
+    /// count badge when a multi-page selection is moving. It is a still of the page, not a
+    /// snapshot of the live button, so the drag image looks the same whatever the reader's
+    /// hover state was.
+    @MainActor
+    private static func dragImage(state: AppState, page: Int, count: Int) -> NSImage? {
+        guard let pageImage = state.thumbnails[page],
+              let cgImage = cgImage(from: pageImage) else { return nil }
+        let width = max(48, state.thumbnailWidthPt)
+        let aspect = CGFloat(pageImage.pixelHeight) / CGFloat(max(pageImage.pixelWidth, 1))
+        let height = max(56, width * aspect)
+        let depth: CGFloat = count > 1 ? 7 : 0
+        let badgeHeight: CGFloat = count > 1 ? 21 : 0
+        let size = NSSize(width: width + depth * 2, height: height + depth * 2 + badgeHeight)
+        let pageCard = NSImage(cgImage: cgImage, size: NSSize(width: width, height: height))
+        return NSImage(size: size, flipped: true) { rect in
+            let sheets = count > 1 ? min(count, 3) : 0
+            for index in stride(from: sheets - 1, through: 1, by: -1) {
+                let offset = CGFloat(index) * depth
+                let sheet = NSRect(x: offset, y: offset, width: width, height: height)
+                let path = NSBezierPath(roundedRect: sheet, xRadius: 4, yRadius: 4)
+                NSColor.windowBackgroundColor.setFill()
+                path.fill()
+                NSColor.separatorColor.setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
+            let card = NSRect(x: 0, y: 0, width: width, height: height)
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: card, xRadius: 4, yRadius: 4).fill()
+            pageCard.draw(
+                in: card.insetBy(dx: 1, dy: 1),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1
+            )
+            let border = NSBezierPath(roundedRect: card.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4)
+            NSColor.separatorColor.setStroke()
+            border.lineWidth = 1
+            border.stroke()
+            if count > 1 {
+                let text = "\(count) pages" as NSString
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.white,
+                ]
+                let textSize = text.size(withAttributes: attributes)
+                let pill = NSRect(
+                    x: (rect.width - textSize.width - 14) / 2,
+                    y: height + depth + 1,
+                    width: textSize.width + 14,
+                    height: 18
+                )
+                NSColor.controlAccentColor.setFill()
+                NSBezierPath(roundedRect: pill, xRadius: 9, yRadius: 9).fill()
+                text.draw(
+                    at: NSPoint(x: pill.minX + 7, y: pill.midY - textSize.height / 2),
+                    withAttributes: attributes
+                )
+            }
+            return true
+        }
     }
 
     // MARK: - Outline
