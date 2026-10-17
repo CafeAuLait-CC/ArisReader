@@ -43,6 +43,7 @@ def build_pdf(
     pages: list[tuple[str, int]],
     annotations: dict[int, list[bytes]] | None = None,
     extra_objects: list[bytes] | None = None,
+    outline: list[dict] | None = None,
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -54,9 +55,14 @@ def build_pdf(
     `/AP` appearance stream and its `/ExtGState`). Their object numbers follow the
     annotations and are returned by `first_extra_object_id`, which is the only way a
     caller can write the reference without duplicating the numbering rules.
+
+    `outline` is a nested tree of `{"title", "page", "children"}` dictionaries. Its objects
+    come after every extra object, and only a file that passes it gains an `/Outlines` entry
+    in the catalog, so the existing fixtures stay byte-identical.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
+    outline = outline or []
     objects: list[bytes] = []
 
     # Object numbering: 1 = catalog, 2 = page tree, 3 = font, then per page
@@ -70,7 +76,13 @@ def build_pdf(
         annot_ids[index] = ids
         next_annot_id += len(ids)
 
-    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    # The outline root follows the annotations and the extras. Its item ids follow it.
+    outline_root_id = next_annot_id + len(extra_objects)
+    catalog = b"<< /Type /Catalog /Pages 2 0 R"
+    if outline:
+        catalog += f" /Outlines {outline_root_id} 0 R /PageMode /UseOutlines".encode("ascii")
+    catalog += b" >>"
+    objects.append(catalog)
     kids = " ".join(f"{pid} 0 R" for pid in page_object_ids)
     objects.append(
         f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode("ascii")
@@ -106,6 +118,8 @@ def build_pdf(
         objects.extend(annotations.get(index, []))
 
     objects.extend(extra_objects)
+    if outline:
+        objects.extend(outline_objects(outline, outline_root_id, page_object_ids))
 
     # Serialize with a correct cross-reference table: every offset is measured
     # from the start of the file, so build the body first and then measure.
@@ -125,6 +139,65 @@ def build_pdf(
         f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
     ).encode("ascii")
     return bytes(out)
+
+
+def outline_objects(
+    nodes: list[dict], root_id: int, page_object_ids: list[int]
+) -> list[bytes]:
+    """The `/Outlines` root and its bookmark dictionaries, in object-number order.
+
+    A bookmark's `/Count` is the number of descendants that should be displayed when its
+    subtree is open; this generator writes the full descendant count, so PDFium sees the
+    same hierarchy the fixture documents. Items without a `page` get no `/Dest`, which is
+    the "section heading with no destination but with children" case the sidebar must number
+    and indent.
+    """
+    next_id = root_id + 1
+
+    def assign(items: list[dict]) -> int:
+        nonlocal next_id
+        total = 0
+        for item in items:
+            item["_id"] = next_id
+            next_id += 1
+            total += 1 + assign(item.get("children", []))
+        return total
+
+    total = assign(nodes)
+
+    def descendants(items: list[dict]) -> int:
+        return sum(1 + descendants(item.get("children", [])) for item in items)
+
+    root = f"<< /Type /Outlines /First {nodes[0]['_id']} 0 R /Last {nodes[-1]['_id']} 0 R /Count {total} >>"
+
+    bodies: list[bytes] = []
+
+    def emit(items: list[dict], parent_id: int) -> None:
+        for index, item in enumerate(items):
+            node_id = item["_id"]
+            children = item.get("children", [])
+            body = (
+                f"<< /Title ({escape_pdf_string(item['title'])}) "
+                f"/Parent {parent_id} 0 R"
+            )
+            if index > 0:
+                body += f" /Prev {items[index - 1]['_id']} 0 R"
+            if index + 1 < len(items):
+                body += f" /Next {items[index + 1]['_id']} 0 R"
+            if children:
+                body += (
+                    f" /First {children[0]['_id']} 0 R "
+                    f"/Last {children[-1]['_id']} 0 R /Count {descendants(children)}"
+                )
+            page = item.get("page")
+            if page is not None:
+                body += f" /Dest [{page_object_ids[page]} 0 R /Fit]"
+            body += " >>"
+            bodies.append(body.encode("ascii"))
+            emit(children, node_id)
+
+    emit(nodes, root_id)
+    return [root.encode("ascii")] + bodies
 
 
 def first_extra_object_id(page_count: int, annotation_count: int) -> int:
@@ -217,6 +290,7 @@ def annotation(
     author: str | None = None,
     modified: str | None = None,
     flags: int = 4,
+    name: str | None = None,
 ) -> bytes:
     """One annotation dictionary. `/F 4` is the Print flag, the value every producer writes.
 
@@ -235,6 +309,8 @@ def annotation(
         body += f" /T ({escape_pdf_string(author)})"
     if modified is not None:
         body += f" /M ({modified})"
+    if name is not None:
+        body += f" /NM ({escape_pdf_string(name)})"
     body += f" /F {flags} >>"
     return body.encode("cp1252")
 
@@ -558,6 +634,159 @@ def annotated_notes_fixture(pages: int) -> tuple[dict[int, list[bytes]], list[by
     return annotations, extras
 
 
+def annotated_replies_fixture(pages: int) -> dict[int, list[bytes]]:
+    """Adobe-style `/IRT` reply threads, including every awkward shape the sidebar must handle.
+
+    The review PDFs in `pdf-samples/with_annotations/` carry exact Adobe review replies: a
+    `/Text` annotation with `/IRT` pointing at another annotation's object. The shell cannot
+    see object numbers, so the reader identifies annotations by `/NM` and follows `/IRT` with
+    `FPDFAnnot_GetLinkedAnnot`. This fixture pins the shapes that are easy to get wrong:
+
+    * two replies under one visible highlight, and a reply to a reply (depth 2);
+    * a hidden reply, and a hidden reply with no `/Contents` — both are still part of the
+      conversation and must be listed, not silently dropped;
+    * a reply on page 2 whose parent is on page 1;
+    * a reply whose parent is a hidden note (the reader skips it on the page, so the reply is
+      an orphan and must say why);
+    * two annotations pointing at each other — a malformed file must not make the sidebar hang;
+    * a reply whose `/IRT` targets a `/Link` annotation, which the reader does not list at all.
+
+    The `/NM` values double as the fixture's readable identities: `parent-highlight`,
+    `reply-one`, `reply-two`, `reply-empty`, `parent-note`, `reply-cross-page`, `hidden-parent`,
+    `reply-to-hidden`, `cycle-a`, `cycle-b`, `structural-parent` and `reply-to-link`.
+    """
+    base = 4 + 2 * pages
+    highlight_box = body_line_box(0, 460)
+    note_box = (500, 690, 526, 716)
+    second_note_box = (500, 650, 526, 676)
+    reply_box = (500, 610, 526, 636)
+    empty_reply_box = (500, 570, 526, 596)
+    hidden_parent_box = (0, 0, 1, 1)
+    cross_reply_box = (500, 500, 526, 526)
+    cycle_a_box = (72, 450, 96, 474)
+    cycle_b_box = (72, 410, 96, 434)
+    link_box = body_line_box(2, 280)
+    link_reply_box = (500, 370, 526, 396)
+
+    return {
+        0: [
+            annotation(
+                "Highlight",
+                highlight_box,
+                extra=f"/QuadPoints {quad_points([highlight_box])} /C [0.2 0.6 1] /CA 0.5",
+                contents="A highlighted sentence with a review thread.",
+                author="Reviewer A",
+                modified="D:20240102030405Z",
+                name="parent-highlight",
+            ),
+            annotation(
+                "Text",
+                note_box,
+                extra=f"/IRT {base} 0 R",
+                contents="First reply, in a thread on the highlight.",
+                author="Reviewer B",
+                modified="D:20240102031000Z",
+                flags=26,  # Hidden | NoZoom | NoRotate: the review workflow's "completed" shape.
+                name="reply-one",
+            ),
+            annotation(
+                "Text",
+                second_note_box,
+                extra=f"/IRT {base + 1} 0 R",
+                contents="Second-level reply, answering the first reply.",
+                author="Reviewer C",
+                modified="D:20240102032000Z",
+                flags=26,
+                name="reply-two",
+            ),
+            annotation(
+                "Text",
+                empty_reply_box,
+                extra=f"/IRT {base} 0 R",
+                author="Reviewer D",
+                modified="D:20240102033000Z",
+                flags=26,
+                name="reply-empty",
+            ),
+        ],
+        1: [
+            annotation(
+                "Text",
+                note_box,
+                extra="/Name /Comment",
+                contents="A visible note on page two.",
+                author="Reviewer E",
+                modified="D:20240103040506Z",
+                name="parent-note",
+            ),
+            annotation(
+                "Text",
+                cross_reply_box,
+                extra=f"/IRT {base} 0 R",
+                contents="Reply written on page two to the page-one highlight.",
+                author="Reviewer F",
+                modified="D:20240103041000Z",
+                flags=26,
+                name="reply-cross-page",
+            ),
+            annotation(
+                "Text",
+                hidden_parent_box,
+                extra="/Name /Comment",
+                contents="A note the file hides; its reply is still in the conversation.",
+                author="Reviewer G",
+                modified="D:20240103042000Z",
+                flags=26,
+                name="hidden-parent",
+            ),
+            annotation(
+                "Text",
+                reply_box,
+                extra=f"/IRT {base + 6} 0 R",
+                contents="Reply under a hidden parent note.",
+                author="Reviewer H",
+                modified="D:20240103043000Z",
+                flags=26,
+                name="reply-to-hidden",
+            ),
+            annotation(
+                "Text",
+                cycle_a_box,
+                extra=f"/IRT {base + 9} 0 R",
+                contents="Malformed cycle A points at B, and B points back.",
+                author="Reviewer I",
+                modified="D:20240103044000Z",
+                name="cycle-a",
+            ),
+            annotation(
+                "Text",
+                cycle_b_box,
+                extra=f"/IRT {base + 8} 0 R",
+                contents="Malformed cycle B points at A.",
+                author="Reviewer J",
+                modified="D:20240103045000Z",
+                name="cycle-b",
+            ),
+            annotation(
+                "Link",
+                link_box,
+                extra="/A << /S /URI /URI (https://example.org/replies) >> /Border [0 0 0]",
+                name="structural-parent",
+            ),
+            annotation(
+                "Text",
+                link_reply_box,
+                extra=f"/IRT {base + 10} 0 R",
+                contents="Reply to a link, which the annotation reader does not list.",
+                author="Reviewer K",
+                modified="D:20240103046000Z",
+                flags=26,
+                name="reply-to-link",
+            ),
+        ],
+    }
+
+
 def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     """A page with a heading, body text measured in points, and a vector box.
 
@@ -843,6 +1072,91 @@ def main() -> int:
     path = out_dir / "annotated-notes.pdf"
     path.write_bytes(build_pdf(notes_pages, notes_annotations, notes_extras))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(notes_pages)} page(s))")
+
+    # 8) Replies: `/IRT` threads across two pages, including a second-level reply, a cross-page
+    #    reply, a hidden parent, and a malformed cycle. This is the evidence the sidebar's
+    #    nesting and orphan accounting run against.
+    replies_pages = [
+        (
+            text_page(
+                "Annotated with replies",
+                "a review thread whose replies are ordinary /IRT annotations",
+                [f"Line {number}: the highlighted sentence and its replies." for number in range(1, 9)],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "Replies continued",
+                "a reply on this page answers one on the previous page",
+                [f"Line {number}: a second page of conversation." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    replies_annotations = annotated_replies_fixture(len(replies_pages))
+    path = out_dir / "annotated-replies.pdf"
+    path.write_bytes(build_pdf(replies_pages, replies_annotations))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(replies_pages)} page(s))")
+
+    # 9) An outline three levels deep, with a top-level section that has children but no page of
+    #    its own. The sidebar numbers the hierarchy (`1`, `1.1`, `1.1.1`) and indents by depth;
+    #    the nesting is only testable if the fixture's /Outlines tree survives PDFium intact.
+    outline_pages = [
+        (
+            text_page(
+                "Chapter One",
+                "a three-level outline fixture",
+                ["1 Introduction", "1.1 Background", "1.1.1 Prior work"],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "Chapter Two",
+                "the section without a destination still has children",
+                ["2 Methods", "2.1 Method", "2.1.1 Detail"],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "Chapter Three",
+                "the last leaf of the outline",
+                ["3 Results"],
+            ),
+            0,
+        ),
+    ]
+    outline = [
+        {
+            "title": "Chapter One",
+            "page": 0,
+            "children": [
+                {
+                    "title": "Background",
+                    "page": 0,
+                    "children": [{"title": "Prior work", "page": 1, "children": []}],
+                }
+            ],
+        },
+        {
+            "title": "Chapter Two",
+            "page": None,
+            "children": [
+                {
+                    "title": "Method",
+                    "page": 1,
+                    "children": [{"title": "Detail", "page": 2, "children": []}],
+                },
+                {"title": "Setup", "page": 2, "children": []},
+            ],
+        },
+        {"title": "Chapter Three", "page": 2, "children": []},
+    ]
+    path = out_dir / "outlined.pdf"
+    path.write_bytes(build_pdf(outline_pages, outline=outline))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(outline_pages)} page(s), 8 outline entries)")
 
     if long_pages > 0:
         pages = long_document(long_pages)

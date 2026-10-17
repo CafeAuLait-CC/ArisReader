@@ -1,0 +1,158 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R 10 0 R 11 0 R] >>
+endobj
+5 0 obj
+<< /Length 1156 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated with replies) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (a review thread whose replies are ordinary /IRT annotations) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: the highlighted sentence and its replies.) Tj T*
+(Line 2: the highlighted sentence and its replies.) Tj T*
+(Line 3: the highlighted sentence and its replies.) Tj T*
+(Line 4: the highlighted sentence and its replies.) Tj T*
+(Line 5: the highlighted sentence and its replies.) Tj T*
+(Line 6: the highlighted sentence and its replies.) Tj T*
+(Line 7: the highlighted sentence and its replies.) Tj T*
+(Line 8: the highlighted sentence and its replies.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R /Annots [12 0 R 13 0 R 14 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R] >>
+endobj
+7 0 obj
+<< /Length 1057 >>
+stream
+BT /F1 28 Tf 72 760 Td (Replies continued) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (a reply on this page answers one on the previous page) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: a second page of conversation.) Tj T*
+(Line 2: a second page of conversation.) Tj T*
+(Line 3: a second page of conversation.) Tj T*
+(Line 4: a second page of conversation.) Tj T*
+(Line 5: a second page of conversation.) Tj T*
+(Line 6: a second page of conversation.) Tj T*
+(Line 7: a second page of conversation.) Tj T*
+(Line 8: a second page of conversation.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 686 460 701] /QuadPoints [72 686 460 686 460 701 72 701] /C [0.2 0.6 1] /CA 0.5 /Contents (A highlighted sentence with a review thread.) /T (Reviewer A) /M (D:20240102030405Z) /NM (parent-highlight) /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 690 526 716] /IRT 8 0 R /Contents (First reply, in a thread on the highlight.) /T (Reviewer B) /M (D:20240102031000Z) /NM (reply-one) /F 26 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 650 526 676] /IRT 9 0 R /Contents (Second-level reply, answering the first reply.) /T (Reviewer C) /M (D:20240102032000Z) /NM (reply-two) /F 26 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 570 526 596] /IRT 8 0 R /T (Reviewer D) /M (D:20240102033000Z) /NM (reply-empty) /F 26 >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 690 526 716] /Name /Comment /Contents (A visible note on page two.) /T (Reviewer E) /M (D:20240103040506Z) /NM (parent-note) /F 4 >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 500 526 526] /IRT 8 0 R /Contents (Reply written on page two to the page-one highlight.) /T (Reviewer F) /M (D:20240103041000Z) /NM (reply-cross-page) /F 26 >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Text /Rect [0 0 1 1] /Name /Comment /Contents (A note the file hides; its reply is still in the conversation.) /T (Reviewer G) /M (D:20240103042000Z) /NM (hidden-parent) /F 26 >>
+endobj
+15 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 610 526 636] /IRT 14 0 R /Contents (Reply under a hidden parent note.) /T (Reviewer H) /M (D:20240103043000Z) /NM (reply-to-hidden) /F 26 >>
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Text /Rect [72 450 96 474] /IRT 17 0 R /Contents (Malformed cycle A points at B, and B points back.) /T (Reviewer I) /M (D:20240103044000Z) /NM (cycle-a) /F 4 >>
+endobj
+17 0 obj
+<< /Type /Annot /Subtype /Text /Rect [72 410 96 434] /IRT 16 0 R /Contents (Malformed cycle B points at A.) /T (Reviewer J) /M (D:20240103045000Z) /NM (cycle-b) /F 4 >>
+endobj
+18 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 656 280 671] /A << /S /URI /URI (https://example.org/replies) >> /Border [0 0 0] /NM (structural-parent) /F 4 >>
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Text /Rect [500 370 526 396] /IRT 18 0 R /Contents (Reply to a link, which the annotation reader does not list.) /T (Reviewer K) /M (D:20240103046000Z) /NM (reply-to-link) /F 26 >>
+endobj
+xref
+0 20
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000386 00000 n 
+0000001594 00000 n 
+0000001786 00000 n 
+0000002895 00000 n 
+0000003163 00000 n 
+0000003363 00000 n 
+0000003568 00000 n 
+0000003716 00000 n 
+0000003907 00000 n 
+0000004125 00000 n 
+0000004346 00000 n 
+0000004545 00000 n 
+0000004749 00000 n 
+0000004934 00000 n 
+0000005104 00000 n 
+trailer
+<< /Size 20 /Root 1 0 R >>
+startxref
+5327
+%%EOF

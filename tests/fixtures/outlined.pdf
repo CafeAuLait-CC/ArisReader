@@ -1,0 +1,173 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /PageMode /UseOutlines >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 722 >>
+stream
+BT /F1 28 Tf 72 760 Td (Chapter One) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (a three-level outline fixture) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(1 Introduction) Tj T*
+(1.1 Background) Tj T*
+(1.1.1 Prior work) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 732 >>
+stream
+BT /F1 28 Tf 72 760 Td (Chapter Two) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (the section without a destination still has children) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(2 Methods) Tj T*
+(2.1 Method) Tj T*
+(2.1.1 Detail) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 670 >>
+stream
+BT /F1 28 Tf 72 760 Td (Chapter Three) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (the last leaf of the outline) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(3 Results) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+10 0 obj
+<< /Type /Outlines /First 11 0 R /Last 18 0 R /Count 8 >>
+endobj
+11 0 obj
+<< /Title (Chapter One) /Parent 10 0 R /Next 14 0 R /First 12 0 R /Last 12 0 R /Count 2 /Dest [4 0 R /Fit] >>
+endobj
+12 0 obj
+<< /Title (Background) /Parent 11 0 R /First 13 0 R /Last 13 0 R /Count 1 /Dest [4 0 R /Fit] >>
+endobj
+13 0 obj
+<< /Title (Prior work) /Parent 12 0 R /Dest [6 0 R /Fit] >>
+endobj
+14 0 obj
+<< /Title (Chapter Two) /Parent 10 0 R /Prev 11 0 R /Next 18 0 R /First 15 0 R /Last 17 0 R /Count 3 >>
+endobj
+15 0 obj
+<< /Title (Method) /Parent 14 0 R /Next 17 0 R /First 16 0 R /Last 16 0 R /Count 1 /Dest [6 0 R /Fit] >>
+endobj
+16 0 obj
+<< /Title (Detail) /Parent 15 0 R /Dest [8 0 R /Fit] >>
+endobj
+17 0 obj
+<< /Title (Setup) /Parent 14 0 R /Prev 15 0 R /Dest [8 0 R /Fit] >>
+endobj
+18 0 obj
+<< /Title (Chapter Three) /Parent 10 0 R /Prev 14 0 R /Dest [8 0 R /Fit] >>
+endobj
+xref
+0 19
+0000000000 65535 f 
+0000000015 00000 n 
+0000000104 00000 n 
+0000000173 00000 n 
+0000000270 00000 n 
+0000000396 00000 n 
+0000001169 00000 n 
+0000001295 00000 n 
+0000002078 00000 n 
+0000002204 00000 n 
+0000002925 00000 n 
+0000002999 00000 n 
+0000003125 00000 n 
+0000003237 00000 n 
+0000003313 00000 n 
+0000003433 00000 n 
+0000003554 00000 n 
+0000003626 00000 n 
+0000003710 00000 n 
+trailer
+<< /Size 19 /Root 1 0 R >>
+startxref
+3802
+%%EOF
