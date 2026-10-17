@@ -10,6 +10,7 @@ use aris_reader_core::{
     RawAnnotation, RawCharBox, RawTextPage, Rect, Result, Rotation, Size,
 };
 use pdfium_render::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -220,6 +221,15 @@ pub struct PdfiumBackend {
     /// failure is cached too, because it cannot change while the file is open. See
     /// [`crate::annotations`] for why the annotation API needs its own handle.
     annotation_reader: std::sync::OnceLock<std::result::Result<AnnotationReader, String>>,
+    /// Rendering keeps navigation borders native while the shell draws content annotations.
+    /// Only the raster document is changed in memory; annotation reads and saves use other handles.
+    annotation_rendering: std::sync::Mutex<HashMap<PageIndex, AnnotationRenderState>>,
+    link_borders: OnceLock<HashMap<PageIndex, Vec<crate::link_borders::LinkBorder>>>,
+}
+
+struct AnnotationRenderState {
+    visible_non_links: Vec<usize>,
+    all_annotations: bool,
 }
 
 impl PdfiumBackend {
@@ -246,6 +256,8 @@ impl PdfiumBackend {
                 password_protected: password.is_some(),
                 raster_lock: std::sync::Mutex::new(()),
                 annotation_reader: std::sync::OnceLock::new(),
+                annotation_rendering: std::sync::Mutex::new(HashMap::new()),
+                link_borders: OnceLock::new(),
             }),
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(
@@ -587,6 +599,75 @@ impl PdfiumBackend {
     ///
     /// Region rendering is what makes a tile pipeline affordable at all: rendering the
     /// whole page and cropping would re-interpret the content stream once per tile.
+    fn paint_link_borders(
+        &self,
+        page: &PdfPage<'_>,
+        request: &RasterRequest,
+        tile: &mut RasterTile,
+    ) {
+        let borders = self
+            .link_borders
+            .get_or_init(|| crate::link_borders::read(&self.path, self.password.as_deref()));
+        if let Some(borders) = borders.get(&request.page) {
+            crate::link_borders::paint(borders, page_geometry(page), request, tile);
+        }
+    }
+
+    /// Let PDFium paint link borders with their original /Border, /BS, colour and appearance.
+    /// Hide the other annotations when the shell will draw them itself. The first call records
+    /// only originally visible non-link slots; subsequent tiles in the same mode cost one lookup.
+    /// Call only while both PDFIUM_LOCK and raster_lock are held.
+    fn prepare_annotation_rendering(
+        &self,
+        page: &PdfPage<'_>,
+        index: PageIndex,
+        include_content: bool,
+    ) -> Result<()> {
+        let mut modes = self
+            .annotation_rendering
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let state = modes.entry(index).or_insert_with(|| AnnotationRenderState {
+            visible_non_links: page
+                .annotations()
+                .iter()
+                .enumerate()
+                .filter(|(_, annotation)| {
+                    annotation.annotation_type() != PdfPageAnnotationType::Link
+                        && !annotation.is_hidden()
+                })
+                .map(|(slot, _)| slot)
+                .collect(),
+            all_annotations: true,
+        });
+        if state.all_annotations == include_content {
+            return Ok(());
+        }
+        for (changed, &slot) in state.visible_non_links.iter().enumerate() {
+            let result = page
+                .annotations()
+                .get(slot as PdfPageAnnotationIndex)
+                .and_then(|mut annotation| annotation.set_is_hidden(!include_content));
+            if let Err(error) = result {
+                // Restore the prior mode if a malformed annotation cannot be updated.
+                for &previous in state.visible_non_links.iter().take(changed) {
+                    if let Ok(mut annotation) =
+                        page.annotations().get(previous as PdfPageAnnotationIndex)
+                    {
+                        let _ = annotation.set_is_hidden(include_content);
+                    }
+                }
+                return Err(ArisError::new(
+                    ErrorCode::RenderFailed,
+                    "could not prepare annotation rendering",
+                )
+                .with_detail(error.to_string()));
+            }
+        }
+        state.all_annotations = include_content;
+        Ok(())
+    }
+
     fn rasterize_region(
         &self,
         page: &PdfPage<'_>,
@@ -697,26 +778,11 @@ impl DocumentBackend for PdfiumBackend {
 
         let page = self.page(index)?;
 
-        // Boundary boxes are returned in unrotated PDF user space, which is
-        // exactly what `PageGeometry` expects: it applies `/Rotate` itself.
-        let media = page
-            .boundaries()
-            .media()
-            .map(|boundary| rect_from_pdf(boundary.bounds))
-            .unwrap_or_else(|_| rect_from_pdf(page.page_size()));
-        let crop = page
-            .boundaries()
-            .get(PdfPageBoundaryBoxType::Crop)
-            .map(|boundary| rect_from_pdf(boundary.bounds))
-            .unwrap_or(media);
-
-        let rotation = rotation_from_pdf(page.rotation().unwrap_or(PdfPageRenderRotation::None));
-
         Ok(PageInfo {
             index,
             // TODO(T1.1): `/UserUnit` is not exposed by pdfium-render; read it from
             // the page dictionary once we have a raw-bindings escape hatch.
-            geometry: PageGeometry::new(media, crop, rotation, 1.0),
+            geometry: page_geometry(&page),
             label: page.label().map(str::to_string),
         })
     }
@@ -930,9 +996,12 @@ impl DocumentBackend for PdfiumBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let page = self.page(request.page)?;
+        self.prepare_annotation_rendering(&page, request.page, request.flags.annotations)?;
 
         if let Some(region) = request.region {
-            return self.rasterize_region(&page, request, region);
+            let mut tile = self.rasterize_region(&page, request, region)?;
+            self.paint_link_borders(&page, request, &mut tile);
+            return Ok(tile);
         }
 
         // `FPDF_GetPageWidthF/HeightF` already account for `/Rotate`, and
@@ -955,7 +1024,9 @@ impl DocumentBackend for PdfiumBackend {
             )
         })?;
 
-        Ok(tile_from_bitmap(&bitmap))
+        let mut tile = tile_from_bitmap(&bitmap);
+        self.paint_link_borders(&page, request, &mut tile);
+        Ok(tile)
     }
 
     fn is_encrypted(&self) -> bool {
@@ -967,6 +1038,25 @@ impl DocumentBackend for PdfiumBackend {
         // be used for a reliable reading order; pdfium-render does not expose it yet.
         false
     }
+}
+
+fn page_geometry(page: &PdfPage<'_>) -> PageGeometry {
+    // Boundary boxes are returned in unrotated PDF user space, which is
+    // exactly what `PageGeometry` expects: it applies `/Rotate` itself.
+    let media = page
+        .boundaries()
+        .media()
+        .map(|boundary| rect_from_pdf(boundary.bounds))
+        .unwrap_or_else(|_| rect_from_pdf(page.page_size()));
+    let crop = page
+        .boundaries()
+        .get(PdfPageBoundaryBoxType::Crop)
+        .map(|boundary| rect_from_pdf(boundary.bounds))
+        .unwrap_or(media);
+
+    let rotation = rotation_from_pdf(page.rotation().unwrap_or(PdfPageRenderRotation::None));
+
+    PageGeometry::new(media, crop, rotation, 1.0)
 }
 
 /// Builds the render configuration shared by the whole-page and tile paths.
@@ -982,7 +1072,7 @@ fn render_config(request: &RasterRequest) -> PdfRenderConfig {
         // the `rasterize_keeps_native_bgra_channel_order` test.
         .set_format(PdfBitmapFormat::BGRA)
         .set_reverse_byte_order(false)
-        .render_annotations(request.flags.annotations)
+        .render_annotations(true)
         .render_form_data(request.flags.annotations)
         .use_lcd_text_rendering(request.flags.lcd_text)
         .limit_render_image_cache_size(request.flags.limit_image_cache)
