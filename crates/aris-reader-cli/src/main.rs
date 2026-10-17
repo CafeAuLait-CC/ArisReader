@@ -17,6 +17,7 @@
 //! aris-reader-cli cite <file.pdf> [--body-pages N]
 //! aris-reader-cli figures <file.pdf> [--pages N]
 //! aris-reader-cli tables <file.pdf>... [--pages N] [--all]
+//! aris-reader-cli metadata <file.pdf> [--bibtex]
 //! ```
 
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
@@ -40,6 +41,10 @@ Usage:
                  [--pages N]                    (grid / image / page per caption)
   aris-reader-cli tables <file.pdf>...           table previews: grid-derived or full-page fallback
                  [--pages N] [--all]
+  aris-reader-cli metadata <file.pdf>            recognised metadata (title, authors, venue, year,
+                 [--bibtex]                      DOI, arXiv id) with the source of every field, and
+                                                 the BibTeX entry those values generate; --bibtex
+                                                 prints only the entry
   aris-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   aris-reader-cli render <file.pdf>              render one page to PNG
@@ -126,6 +131,7 @@ fn main() -> ExitCode {
         Some("blocks") => cmd_blocks(rest(&args)),
         Some("region") => cmd_region(rest(&args)),
         Some("tables") => cmd_tables(rest(&args)),
+        Some("metadata") => cmd_metadata(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -155,6 +161,7 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--skip-search"
                 | "--skip-baseline"
                 | "--prefetch-all-columns"
+                | "--bibtex"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;
@@ -194,6 +201,82 @@ fn open_document(path: &str) -> Result<PdfiumBackend, ExitCode> {
             Err(ExitCode::from(1))
         }
     }
+}
+
+fn cmd_metadata(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!("usage: aris-reader-cli metadata <file.pdf> [--bibtex]");
+        return ExitCode::from(64);
+    };
+    let backend = match open_document(path) {
+        Ok(backend) => backend,
+        Err(code) => return code,
+    };
+
+    let embedded = match backend.embedded_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!("cannot read embedded metadata from {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let first_page = backend.raw_text_page(PageIndex(0)).ok();
+    // Text boxes are in unrotated PDF user space, so the recogniser's 20% footer band must be
+    // measured against the unrotated crop box, not the rotated view size.
+    let page_height = backend
+        .page_info(PageIndex(0))
+        .map(|info| info.geometry.crop_box.size.height)
+        .unwrap_or(842.0);
+    let metadata = aris_reader_metadata::recognize(&embedded, first_page.as_ref(), page_height);
+
+    if options.iter().any(|(key, _)| key == "--bibtex") {
+        print!("{}", metadata.bibtex());
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{path}");
+    println!("  {:<10} {:<11} value", "field", "source");
+    for (name, field) in [
+        ("title", &metadata.title),
+        ("authors", &metadata.authors),
+        ("venue", &metadata.venue),
+        ("year", &metadata.year),
+        ("doi", &metadata.doi),
+        ("arxiv", &metadata.arxiv_id),
+    ] {
+        let value = if field.is_empty() {
+            "(empty)".to_string()
+        } else {
+            field.text()
+        };
+        println!(
+            "  {:<10} {:<11} {}",
+            name,
+            field.source_code(),
+            preview(&value, 160)
+        );
+        println!(
+            "  {:<10} {:<11} {}{}",
+            "",
+            field.trust(),
+            field.source_label(),
+            if field.is_guessed() {
+                " · guessed"
+            } else {
+                ""
+            }
+        );
+    }
+
+    let entry = metadata.bib_entry();
+    println!(
+        "\n  bibtex     @{} {{{}}}",
+        entry.kind().as_str(),
+        entry.key()
+    );
+    print!("{}", metadata.bibtex());
+    ExitCode::SUCCESS
 }
 
 fn cmd_info(args: &[String]) -> ExitCode {

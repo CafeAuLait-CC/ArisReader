@@ -1,0 +1,43 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 425 >>
+stream
+0 0 0 rg
+BT /F1 26 Tf 72 760 Td (Page One Text Title) Tj ET
+BT /F1 12 Tf 72 722 Td (Grace Hopper) Tj ET
+BT /F1 9 Tf 72 702 Td (Department of Testing, Example University) Tj ET
+BT /F1 10 Tf 72 662 Td (Abstract) Tj ET
+BT /F1 10 Tf 72 642 Td (This body paragraph is long enough to establish the page's body text size.) Tj ET
+BT /F1 10 Tf 72 629 Td (The embedded dictionary below is the only source of a title and authors.) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Title (Information Dictionary Title) /Author (Info Author; Second Author) /Subject (A subject with no identifier in it) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+0000000820 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R >>
+startxref
+962
+%%EOF
