@@ -727,29 +727,21 @@ impl DocumentBackend for PdfiumBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let bookmarks = self.document.as_ref().expect("live document").bookmarks();
+        let mut visited = std::collections::HashSet::new();
         let mut nodes = Vec::new();
-        for bookmark in self
-            .document
-            .as_ref()
-            .expect("live document")
-            .bookmarks()
-            .iter()
-        {
-            // A bookmark without a resolvable page is still shown (its title is useful in
-            // the sidebar) but cannot be navigated to.
-            let page = bookmark
-                .destination()
-                .and_then(|destination| destination.page_index().ok())
-                .map(|index| PageIndex(index.max(0) as u32));
-
-            nodes.push(OutlineNode {
-                title: bookmark.title().unwrap_or_default(),
-                // TODO(T2.3): resolve the destination view mode (`FPDFDest_GetView`) so the
-                // sidebar can restore the exact scroll position, not just the page.
-                dest: None,
-                page,
-                children: Vec::new(),
-            });
+        let mut sibling = bookmarks.root();
+        let mut level_seen = std::collections::HashSet::new();
+        while let Some(bookmark) = sibling {
+            // A malformed outline can make `next_sibling` loop back to a bookmark already
+            // visited at this level. Stop the level rather than walking it forever.
+            if !level_seen.insert(bookmark.clone()) {
+                break;
+            }
+            if let Some(node) = outline_node(&bookmark, &mut visited) {
+                nodes.push(node);
+            }
+            sibling = bookmark.next_sibling();
         }
 
         Ok(nodes)
@@ -1177,6 +1169,50 @@ fn rect_from_quad(quad: PdfQuadPoints) -> Rect {
         f64::from(quad.right().value - quad.left().value),
         f64::from(quad.top().value - quad.bottom().value),
     )
+}
+
+/// One outline bookmark and its descendants.
+///
+/// `pdfium-render`'s bookmark iterator walks the tree depth-first but does not say at which
+/// depth it is, and a flat list cannot be numbered (`1`, `1.1`, `1.1.1`). Recursing over
+/// `first_child`/`next_sibling` recovers the hierarchy. `visited` guards a malformed file whose
+/// bookmark graph loops; a duplicate node is skipped rather than repeated forever.
+fn outline_node<'a>(
+    bookmark: &PdfBookmark<'a>,
+    visited: &mut std::collections::HashSet<PdfBookmark<'a>>,
+) -> Option<OutlineNode> {
+    if !visited.insert(bookmark.clone()) {
+        return None;
+    }
+
+    // A bookmark without a resolvable page is still shown (its title is useful in the sidebar)
+    // but cannot be navigated to. Its children still get their own pages and nesting.
+    let page = bookmark
+        .destination()
+        .and_then(|destination| destination.page_index().ok())
+        .map(|index| PageIndex(index.max(0) as u32));
+
+    let mut children = Vec::new();
+    let mut child = bookmark.first_child();
+    let mut level_seen = std::collections::HashSet::new();
+    while let Some(node) = child {
+        if !level_seen.insert(node.clone()) {
+            break;
+        }
+        if let Some(outline) = outline_node(&node, visited) {
+            children.push(outline);
+        }
+        child = node.next_sibling();
+    }
+
+    Some(OutlineNode {
+        title: bookmark.title().unwrap_or_default(),
+        // TODO(T2.3): resolve the destination view mode (`FPDFDest_GetView`) so the
+        // sidebar can restore the exact scroll position, not just the page.
+        dest: None,
+        page,
+        children,
+    })
 }
 
 /// Converts a PDFium rectangle (PDF user space, origin bottom-left) into our [`Rect`].
