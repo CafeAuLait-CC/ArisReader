@@ -43,6 +43,11 @@ struct ReaderChecks {
             try await metadataChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-ai-assistant") {
+            try await aiAssistantChecks(root: fastRoot)
+            print("AI assistant checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-facing-layout") {
             try await facingLayoutChecks(
                 url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
@@ -312,6 +317,7 @@ struct ReaderChecks {
         try await scrollIndicatorChecks(scrollable: b, singlePage: a)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
+        try await aiAssistantChecks(root: root)
         // Registered before the frame-scheduling checks: those need a presentable surface and
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)

@@ -201,6 +201,80 @@ with the produced fields, and the fixtures `metadata-embedded.pdf`, `metadata-in
 fallback, page-one fallback, arXiv-only) in `crates/aris-reader-cli/tests/metadata_fixtures.rs` and
 `apps/macos/Checks/MetadataChecks.swift`.
 
+## AI assistant (OpenAI-compatible)
+
+The AI sidebar tab is a working, deliberately small assistant. It speaks only the
+OpenAI-compatible `chat/completions` protocol — a base URL, a model name, and an API key — so the
+same code works with OpenAI, DeepSeek, and a local Ollama
+(`http://localhost:11434/v1`, any non-empty key). No vendor SDK is used.
+
+**What it does.** Summarise the current page, summarise the whole document (split into parts for
+long documents, displayed as separate part summaries), ask a question about the current
+selection, and translate the selection. Every answer streams. While streaming, Cancel aborts the
+HTTP request and keeps the partial answer; Retry re-sends the plan that was already previewed.
+Token usage is shown when the provider reports it. Answers are rendered as paragraphs, headings,
+bullet lists and numbered lists; the model is instructed to cite sources as `[p.N]`, and only
+that exact form with an in-range page becomes a clickable page jump. Bare numbers, `[12]`,
+`[p.12–14]` and out-of-range pages stay plain text.
+
+**What it does not do, and says so.** No document chat, no region screenshots/vision, no
+auto-retry, no background requests, and no merging of part summaries. A scanned PDF with no text
+layer gets a clear message rather than a fabricated answer. The panel renders only the small
+Markdown subset above; other Markdown is shown literally.
+
+**Where the code lives.** The platform-independent half is Rust (`crates/aris-reader-ai`):
+settings validation, page/block selection and BM25-style retrieval, prompt assembly, the exact
+request body, the HTTP request, incremental SSE parsing, timeouts, cancellation and HTTP
+status/API-error-body parsing. It is tested with a real loopback mock HTTP server. A
+deterministic mock provider (preset strings, no socket) lets the Swift panel checks run without a
+network. The Swift shell (`apps/macos`) owns the panel, the settings form, the request preview,
+the Keychain, the answer renderer, and a polling handle over UniFFI (`startAiRequest` returns an
+`ArisAiRequest`; `poll()` returns delta/usage/done/error events and `cancel()` stops the worker).
+
+**Credential storage is the one per-platform piece.** The macOS shell implements this four-method
+protocol (`AIAPIKeyStore` in `AIAssistantTypes.swift`):
+
+```swift
+readKey() -> String?
+saveKey(_ key: String)
+deleteKey()
+hasKey() -> Bool
+```
+
+macOS uses a generic-password item in the login Keychain (service `com.alex.lyra.ai`, account
+`openai-compatible-api-key`). A Windows shell should implement the same four methods with
+Credential Manager/DPAPI; a Linux shell with the Secret Service. The key is read from the store
+only when the reader presses Send, passed across the FFI for that one request, moved into the
+worker thread, and dropped when the request ends. Rust does not store, persist, or log it, and
+the plan/record types cannot carry it. Error bodies and debug output redact the key. The request
+preview shows every system/user message and the exact JSON body (plus a redacted
+`Authorization: Bearer <redacted until you press Send>`), so the reader can see what would leave
+the machine before anything is sent.
+
+**Transport note.** `http://` endpoints use an in-process HTTP/1.1 client (Ollama and the tests).
+`https://` endpoints use the system `curl` program; the whole request configuration, including
+the `Authorization` header, is written to curl's stdin, never to its argv. This is a deliberate
+consequence of the pinned dependency set not containing a TLS client crate. A future native TLS
+transport can replace it without touching the protocol, prompt, retrieval or SSE code.
+
+**Protocol.** `POST {base}/chat/completions` with
+`Content-Type: application/json`, `Accept: text/event-stream`,
+`Authorization: Bearer <key>` and `User-Agent: Lyra/0.0`. The body contains `model`, `messages`
+(system + user), `stream: true`, and optionally `temperature` and `max_tokens`. The response is
+parsed as SSE: each `data:` line is JSON, `choices[0].delta.content` is appended, an optional
+`usage` object is shown, `[DONE]` ends the request, and EOF without `[DONE]` is an error. HTTP
+status and the provider's JSON error message are surfaced as readable text; 401 points at the
+Keychain setting. `stream_options` is not sent, so token usage appears only when a provider
+reports it in its stream.
+
+**Tests.** `cargo test -p aris-reader-ai` covers split JSON across SSE chunks, `[DONE]`, HTTP
+401 with an error body, a mid-stream disconnect, cancellation (the loopback server observes the
+connection closing), idle timeouts, and that the wire body equals the previewed body.
+`ArisReaderChecks --check-ai-assistant .` covers settings validation, Keychain-hygiene (the key
+never appears in UserDefaults or captured stdout/stderr; a real Keychain round-trip runs when the
+login Keychain is available and is skipped, not faked, when it is not), the citation rules, and
+the panel state machine with the Rust mock provider. No check makes a real API call.
+
 ## Development workflow
 
 This repository is trunk-based. A push to `master` runs CI; a **pull request** is used when a gate
@@ -419,7 +493,7 @@ resolve locally.
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
 | M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Ink, free text, page operations, AcroForm forms and export remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 41 table captions in the twelve sample papers, the rest falling back to the page. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. On the **twenty-paper arXiv corpus**, 94.7% of 1979 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations and short parenthesised numerals remain unsupported. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning and index persistence remain. Document metadata (title, authors, venue, year, DOI, arXiv id) is recognised from XMP, `/Info` and page one, shown with per-field provenance in a sidebar section, editable, and exported as BibTeX with an offline generator. |
-| M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | ⬜ |
+| M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | Partial: OpenAI-compatible streaming page/document summaries, selection Q&A and translation, local/remote visibility, request preview, Keychain, cancel/retry, usage and `[p.N]` page links. Document chat, vision/region discussion, summary merging and cross-platform credential stores remain. |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
 | M7 | Polish: performance, accessibility, internationalization, auto-update, notarized distribution | ⬜ |
 

@@ -32,7 +32,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ArisReaderChecks",
-            dependencies: ["ArisReaderKit"],
+            dependencies: ["ArisReaderKit", "ArisReaderBindings"],
             path: "Checks"
         ),
         .target(
