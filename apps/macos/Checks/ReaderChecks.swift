@@ -227,6 +227,16 @@ struct ReaderChecks {
             print("Placed-text checks passed")
             return
         }
+        // The text-box creation flow on its own
+        // (`ArisReaderChecks --check-textbox-placement .`).
+        if CommandLine.arguments.contains("--check-textbox-placement") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await textBoxPlacementChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
+            return
+        }
         // The annotation text export on its own (`ArisReaderChecks --check-annotation-export .`).
         if CommandLine.arguments.contains("--check-annotation-export") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -504,6 +514,9 @@ struct ReaderChecks {
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
             external: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+        try await textBoxPlacementChecks(
+            drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await inlineNoteChecks(root: root)
         try await annotationNoteChecks(
