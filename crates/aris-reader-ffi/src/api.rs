@@ -29,8 +29,9 @@ use aris_reader_core::{
 };
 use aris_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::{
-    PageOperation, PdfiumBackend, SaveMode, WriteAnnotation, WriteAnnotationKind,
-    backend_description,
+    PageOperation, PdfiumBackend, RedactionArea, RedactionMode, SaveMode, WriteAnnotation,
+    WriteAnnotationKind, backend_description, preview_redactions, redact_pdf,
+    suggested_redaction_copy_path,
 };
 use aris_reader_session::{DocumentLayout, LayoutMode};
 use std::path::{Path, PathBuf};
@@ -1645,6 +1646,84 @@ impl ArisDocument {
             .into_owned()
     }
 
+    /// Reports what applying `areas` would remove, without writing anything.
+    ///
+    /// The confirmation uses this to say what will be lost: the number of characters under the
+    /// marks, an excerpt of them, and how many vector/image objects the marks touch.
+    pub fn preview_redactions(
+        &self,
+        areas: Vec<RedactionAreaRecord>,
+    ) -> Result<RedactionPreviewRecord, ArisFfiError> {
+        let areas = redaction_areas_for(&self.backend, &areas)?;
+        let preview = preview_redactions(Path::new(&self.path), &areas)?;
+        Ok(RedactionPreviewRecord {
+            removed_characters: preview.removed_characters as u32,
+            pages: preview
+                .pages
+                .into_iter()
+                .map(|page| RedactionPagePreviewRecord {
+                    page: page.page,
+                    characters: page.characters as u32,
+                    text_preview: page.text_preview,
+                    graphics: page.graphics as u32,
+                })
+                .collect(),
+        })
+    }
+
+    /// Removes the content under `areas` and writes the result to a **new PDF**.
+    ///
+    /// The open document is not modified. Glyphs, vector paths, images and form XObjects that
+    /// intersect a mark are removed from the page content; a page whose graphics or text cannot
+    /// be attributed is rasterised (losing its text layer), which the writer verifies. The output
+    /// is written to a temporary file beside `destination`, reopened, verified (no extractable
+    /// text in any mark, outside text preserved, every mark black) and only then atomically
+    /// renamed.
+    pub fn redact_to_copy(
+        &self,
+        destination: String,
+        areas: Vec<RedactionAreaRecord>,
+    ) -> Result<RedactionReportRecord, ArisFfiError> {
+        let areas = redaction_areas_for(&self.backend, &areas)?;
+        let report = redact_pdf(
+            Path::new(&self.path),
+            Path::new(&destination),
+            &areas,
+            self.password.as_deref(),
+            RedactionMode::Copy,
+        )?;
+        Ok(redaction_report(report))
+    }
+
+    /// Replaces the open document with a redacted version, after a verified backup.
+    ///
+    /// This is the explicitly destructive command. A byte-identical backup of the file is written
+    /// and verified first; if it cannot be written, nothing is replaced. The in-memory handle is
+    /// marked stale so the shell must reopen the file rather than quietly reading the old bytes.
+    pub fn replace_with_redactions(
+        &self,
+        areas: Vec<RedactionAreaRecord>,
+    ) -> Result<RedactionReportRecord, ArisFfiError> {
+        let areas = redaction_areas_for(&self.backend, &areas)?;
+        let report = redact_pdf(
+            Path::new(&self.path),
+            Path::new(&self.path),
+            &areas,
+            self.password.as_deref(),
+            RedactionMode::ReplaceOriginal,
+        )?;
+        self.replaced
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(redaction_report(report))
+    }
+
+    /// The name to offer when saving a redacted copy: `<name> (redacted).pdf`.
+    pub fn suggested_redaction_copy_path(&self) -> String {
+        suggested_redaction_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Writes `annotations` into a **new PDF** at `destination`.
     ///
     /// The document that is open is not modified, and neither is its sidecar. `annotations`
@@ -2166,6 +2245,94 @@ fn page_operation(record: PageOperationRecord) -> PageOperation {
             PageOperation::Move { pages, destination }
         }
         PageOperationRecord::InsertBlank { index } => PageOperation::InsertBlank { index },
+    }
+}
+
+/// Converts the shell's view-space rectangles to PDF user space.
+///
+/// Every page is validated before any rectangle is converted, so a bad page index in the
+/// middle of a list cannot leave a partially accepted request.
+fn redaction_areas_for(
+    backend: &PdfiumBackend,
+    records: &[RedactionAreaRecord],
+) -> Result<Vec<RedactionArea>, ArisFfiError> {
+    if records.is_empty() {
+        return Err(ArisFfiError::InvalidArgument {
+            message: "there are no redaction areas to apply".to_string(),
+        });
+    }
+    let page_count = backend.page_count();
+    let mut areas = Vec::with_capacity(records.len());
+    for record in records {
+        if record.page >= page_count {
+            return Err(ArisFfiError::InvalidArgument {
+                message: format!(
+                    "redaction names page {} but the document has {} page(s)",
+                    record.page + 1,
+                    page_count
+                ),
+            });
+        }
+        let values = [record.x_pt, record.y_pt, record.width_pt, record.height_pt];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ArisFfiError::InvalidArgument {
+                message: "a redaction rectangle has a non-finite coordinate".to_string(),
+            });
+        }
+        if record.width_pt < 0.5 || record.height_pt < 0.5 {
+            return Err(ArisFfiError::InvalidArgument {
+                message: "a redaction rectangle is smaller than half a point".to_string(),
+            });
+        }
+        let geometry = backend
+            .page_info(PageIndex(record.page))
+            .map_err(ArisFfiError::from)?
+            .geometry;
+        let transform =
+            geometry
+                .view_to_page(1.0)
+                .ok_or_else(|| ArisFfiError::InvalidArgument {
+                    message: "the page geometry cannot be inverted for redaction".to_string(),
+                })?;
+        let top_left = transform.apply(Point::new(record.x_pt, record.y_pt));
+        let bottom_right = transform.apply(Point::new(
+            record.x_pt + record.width_pt,
+            record.y_pt + record.height_pt,
+        ));
+        let left = top_left.x.min(bottom_right.x);
+        let right = top_left.x.max(bottom_right.x);
+        let bottom = top_left.y.min(bottom_right.y);
+        let top = top_left.y.max(bottom_right.y);
+        areas.push(RedactionArea::new(
+            record.page,
+            aris_reader_core::Rect::new(left, bottom, right - left, top - bottom),
+        ));
+    }
+    Ok(areas)
+}
+
+fn redaction_report(report: aris_reader_pdfium::RedactionReport) -> RedactionReportRecord {
+    RedactionReportRecord {
+        destination_path: report.destination.to_string_lossy().into_owned(),
+        backup_path: report
+            .backup_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        pages: report
+            .pages
+            .into_iter()
+            .map(|page| RedactionPageReportRecord {
+                page: page.page,
+                removed_characters: page.removed_characters as u32,
+                removed_graphics: page.removed_graphics as u32,
+                rasterized: page.rasterized,
+                fill_marks: page.fill_marks as u32,
+            })
+            .collect(),
+        removed_characters: report.removed_characters as u32,
+        output_bytes: report.output_bytes,
+        cleaned_temporary_files: report.cleaned_temporaries as u32,
+        verified: report.verified,
+        original_unchanged: report.original_unchanged,
     }
 }
 
@@ -3334,6 +3501,64 @@ pub struct AnnotationSaveReport {
     pub cleaned_temporary_files: u32,
     /// True when the written file's prefix equals the source byte-for-byte.
     pub source_bytes_preserved: bool,
+}
+
+/// One rectangle the reader marked for redaction, in **view space** at 100% zoom (points,
+/// top-left origin). The engine converts it to PDF user space with the page's own crop box and
+/// rotation, so the same mark saved at any zoom lands on the same content.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct RedactionAreaRecord {
+    pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// What one page would lose if the marks were applied.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RedactionPagePreviewRecord {
+    pub page: u32,
+    pub characters: u32,
+    /// A short excerpt of the text under the marks (whitespace collapsed, at most ~220 chars).
+    pub text_preview: String,
+    /// Vector paths, images, shadings and form XObjects whose bounds intersect a mark.
+    pub graphics: u32,
+}
+
+/// What applying the marks would lose, for the confirmation dialog.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RedactionPreviewRecord {
+    pub pages: Vec<RedactionPagePreviewRecord>,
+    pub removed_characters: u32,
+}
+
+/// What one page lost when the redaction was applied.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RedactionPageReportRecord {
+    pub page: u32,
+    pub removed_characters: u32,
+    pub removed_graphics: u32,
+    /// True when the page was rasterised and its whole text layer is gone.
+    pub rasterized: bool,
+    pub fill_marks: u32,
+}
+
+/// What a successful redaction write did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RedactionReportRecord {
+    pub destination_path: String,
+    /// Present only when the original was replaced; the file is verified byte-identical.
+    pub backup_path: Option<String>,
+    pub pages: Vec<RedactionPageReportRecord>,
+    pub removed_characters: u32,
+    pub output_bytes: u64,
+    pub cleaned_temporary_files: u32,
+    /// The writer reopened its output and proved text is gone, outside text survived, marks are
+    /// black. Always true on success.
+    pub verified: bool,
+    /// True for a copy: the source file was not modified.
+    pub original_unchanged: bool,
 }
 
 /// A destructive-ish page operation requested by the shell.

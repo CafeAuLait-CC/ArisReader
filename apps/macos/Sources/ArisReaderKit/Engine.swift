@@ -810,6 +810,59 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
 }
 
 /// What a successful PDF write did.
+
+/// One rectangle the reader marked for redaction, in page-local view space (points, top-left
+/// origin, 100% zoom). The engine converts it to PDF user space with the page's own crop box and
+/// rotation.
+public struct RedactionArea: Sendable, Equatable {
+    public let page: Int
+    public let rect: CGRect
+
+    public init(page: Int, rect: CGRect) {
+        self.page = page
+        self.rect = rect
+    }
+}
+
+/// What one page would lose if the redaction were applied.
+public struct RedactionPagePreview: Sendable, Equatable {
+    public let page: Int
+    public let characters: Int
+    /// A short excerpt of the covered text, for the confirmation dialog.
+    public let textPreview: String
+    /// Vector paths, images, shadings and form XObjects intersecting a mark.
+    public let graphics: Int
+}
+
+/// What applying the marked areas would lose, gathered before the confirmation.
+public struct RedactionPreview: Sendable, Equatable {
+    public let pages: [RedactionPagePreview]
+    public let removedCharacters: Int
+}
+
+/// What one page lost when the redaction was applied.
+public struct RedactionPageReport: Sendable, Equatable {
+    public let page: Int
+    public let removedCharacters: Int
+    public let removedGraphics: Int
+    /// True when the page was rasterised; its whole text layer is gone.
+    public let rasterized: Bool
+    public let fillMarks: Int
+}
+
+/// What a successful redaction write did. `verified` is the writer's own reopen-and-prove step.
+public struct RedactionReport: Sendable, Equatable {
+    public let destinationPath: String
+    /// Present only for a replacement; the backup is verified byte-identical.
+    public let backupPath: String?
+    public let pages: [RedactionPageReport]
+    public let removedCharacters: Int
+    public let outputBytes: UInt64
+    public let cleanedTemporaryFiles: Int
+    public let verified: Bool
+    public let originalUnchanged: Bool
+}
+
 public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
     /// The `/NM` values written, so the sidecar can remove exactly those entries.
@@ -1306,6 +1359,15 @@ public protocol PDFEngine: AnyObject {
     /// Implementations that cannot do the annotated raster fall back to the plain page; the
     /// real engine overrides this so marks from another viewer appear in the strip.
     func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage
+    /// Rasterizes a page **synchronously** at print resolution, for `NSPrintOperation`'s
+    /// synchronous `draw` call.
+    ///
+    /// This is the one deliberately blocking render path: the print system draws on the main
+    /// thread, and a page must be ready when it asks for it. The real engine runs the raster on
+    /// its own serial queue and waits for it, so the main thread blocks (with the print
+    /// progress panel visible) instead of deadlocking. Test doubles return nil, which the print
+    /// view draws as a missing-page notice.
+    func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage?
     /// Rasterizes one tile of a page at a discrete LOD (`scale = 2^lod`).
     func rasterizeTile(
         page: Int,
@@ -1387,6 +1449,14 @@ public protocol PDFEngine: AnyObject {
     func interruptedSaveNote(at url: URL) -> String?
     /// The name to offer for an annotated copy of `url`.
     func suggestedAnnotatedCopyURL(for url: URL) -> URL
+    /// Reports what applying `areas` would remove, without writing. Used by the confirmation.
+    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview
+    /// Removes the content under `areas` and writes a new PDF; the open document is untouched.
+    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport
+    /// Replaces the open document with a redacted version, after a verified backup.
+    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport
+    /// The name to offer for a redacted copy: `<name> (redacted).pdf`.
+    func suggestedRedactionCopyURL(for url: URL) -> URL
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
     /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
@@ -1457,6 +1527,40 @@ public extension PDFEngine {
     func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale)
     }
+
+    /// Engines with no synchronous renderer let the print view show a missing-page notice.
+    func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? { nil }
+
+    /// Engines without a redaction writer refuse instead of pretending to remove content.
+    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
+        )
+    }
+
+    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
+        )
+    }
+
+    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
+        )
+    }
+
+    func suggestedRedactionCopyURL(for url: URL) -> URL {
+        url.deletingLastPathComponent()
+            .appendingPathComponent("\(url.deletingPathExtension().lastPathComponent) (redacted).pdf")
+    }
+
 
     /// Engines without a PDF writer refuse the operation instead of pretending to save.
     func saveAnnotatedCopy(
@@ -1639,6 +1743,16 @@ public extension PDFEngine {
     }
 }
 
+/// A mutable slot for the synchronous print renderer's background result.
+///
+/// The raster queue writes it and the waiting main thread reads it after the semaphore, so the
+/// access is ordered by the semaphore; the class is the smallest way to move one optional across
+/// that boundary without making `PageImage` itself reference-typed.
+private final class PageImageBox: @unchecked Sendable {
+    var image: PageImage?
+    var error: String?
+}
+
 /// The real engine: the UniFFI control plane described in `docs/05-ffi.md`.
 @MainActor
 public final class RustEngine: PDFEngine {
@@ -1757,6 +1871,37 @@ public final class RustEngine: PDFEngine {
     /// multiply pipeline; a thumbnail is a preview of where the file's marks are.
     public func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale, withAnnotations: true)
+    }
+
+    public func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? {
+        guard let document else { return nil }
+        // The print system calls this from `draw` on the main thread. The raster runs on the
+        // engine's serial raster queue, which never dispatches back to the main thread, so
+        // waiting for it here is a block with progress shown, not a deadlock.
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = PageImageBox()
+        rasterQueue.async {
+            do {
+                let bitmap = try document.rasterizePageWithAnnotations(
+                    page: UInt32(page), scale: Double(scale))
+                box.image = PageImage(
+                    pixelWidth: Int(bitmap.widthPx),
+                    pixelHeight: Int(bitmap.heightPx),
+                    pointSize: CGSize(width: bitmap.widthPt, height: bitmap.heightPt),
+                    bgra: bitmap.pixels,
+                    generation: UInt64(page) &+ 1
+                )
+            } catch {
+                box.error = error.localizedDescription
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        if let error = box.error {
+            FileHandle.standardError.write(Data(
+                "aris-print: page \(page + 1) could not be rendered: \(error)\n".utf8))
+        }
+        return box.image
     }
 
     private func renderPage(
@@ -2489,6 +2634,139 @@ public final class RustEngine: PDFEngine {
         }
         return URL(fileURLWithPath: document.suggestedCopyPath())
     }
+
+    // MARK: - Redaction
+
+    public func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = Self.redactionRecords(areas)
+        let record: RedactionPreviewRecord = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.previewRedactions(areas: records))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.redactionPreview(record)
+    }
+
+    public func redactToCopy(
+        to url: URL,
+        areas: [RedactionArea]
+    ) async throws -> RedactionReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = Self.redactionRecords(areas)
+        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.redactToCopy(
+                        destination: url.path, areas: records))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        invalidateCachedCopy(at: url)
+        return Self.redactionReport(record)
+    }
+
+    public func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = Self.redactionRecords(areas)
+        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.replaceWithRedactions(areas: records))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        // The active handle now describes the pre-replacement bytes and must not be handed out
+        // by a later open. The caller immediately reopens the file.
+        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
+        return Self.redactionReport(record)
+    }
+
+    public func suggestedRedactionCopyURL(for url: URL) -> URL {
+        guard let document else {
+            let stem = url.deletingPathExtension().lastPathComponent
+            return url.deletingLastPathComponent()
+                .appendingPathComponent("\(stem) (redacted).pdf")
+        }
+        return URL(fileURLWithPath: document.suggestedRedactionCopyPath())
+    }
+
+    private static func redactionRecords(_ areas: [RedactionArea]) -> [RedactionAreaRecord] {
+        areas.map { area in
+            RedactionAreaRecord(
+                page: UInt32(max(area.page, 0)),
+                xPt: Double(area.rect.minX),
+                yPt: Double(area.rect.minY),
+                widthPt: Double(area.rect.width),
+                heightPt: Double(area.rect.height)
+            )
+        }
+    }
+
+    private static func redactionPreview(_ record: RedactionPreviewRecord) -> RedactionPreview {
+        RedactionPreview(
+            pages: record.pages.map { page in
+                RedactionPagePreview(
+                    page: Int(page.page),
+                    characters: Int(page.characters),
+                    textPreview: page.textPreview,
+                    graphics: Int(page.graphics)
+                )
+            },
+            removedCharacters: Int(record.removedCharacters)
+        )
+    }
+
+    private static func redactionReport(_ record: RedactionReportRecord) -> RedactionReport {
+        RedactionReport(
+            destinationPath: record.destinationPath,
+            backupPath: record.backupPath,
+            pages: record.pages.map { page in
+                RedactionPageReport(
+                    page: Int(page.page),
+                    removedCharacters: Int(page.removedCharacters),
+                    removedGraphics: Int(page.removedGraphics),
+                    rasterized: page.rasterized,
+                    fillMarks: Int(page.fillMarks)
+                )
+            },
+            removedCharacters: Int(record.removedCharacters),
+            outputBytes: record.outputBytes,
+            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
+            verified: record.verified,
+            originalUnchanged: record.originalUnchanged
+        )
+    }
+
 
     /// One shell request, as the FFI record.
     private static func writeRecords(from requests: [AnnotationWriteRequest]) -> [WriteAnnotationRecord] {

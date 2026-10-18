@@ -20,8 +20,12 @@
 //! aris-reader-cli metadata <file.pdf> [--bibtex]
 //! ```
 
+use aris_reader_core::Rect;
 use aris_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
-use aris_reader_pdfium::{PdfiumBackend, backend_description};
+use aris_reader_pdfium::{
+    PdfiumBackend, RedactionArea, RedactionMode, backend_description, preview_redactions,
+    redact_pdf, suggested_redaction_copy_path,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -55,6 +59,10 @@ Usage:
                  [--page N] [--dpi D] [-o out.png]
   aris-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
                  [--max-mae F]                   exit non-zero when MAE exceeds F
+  aris-reader-cli redact <file.pdf>              remove the content under rectangles from a copy
+                 --rect X,Y,W,H [--rect ...]     (PDF user space, origin bottom-left); --replace
+                 [--replace] [-o out.pdf]        rewrites the file after a verified backup;
+                 [--preview]                     --preview only reports what would be removed
   aris-reader-cli text <file.pdf> [--page N]     export the text of one page
   aris-reader-cli annotations <file.pdf>...      dump what the annotation reader found, per page:
                  [--page N] [--pages N] [--all]  subtype, /Rect, /C, /CA, /BM, quad count,
@@ -126,6 +134,7 @@ fn main() -> ExitCode {
         Some("render") => cmd_render(rest(&args)),
         Some("compare") => cmd_compare(rest(&args)),
         Some("text") => cmd_text(rest(&args)),
+        Some("redact") => cmd_redact(rest(&args)),
         Some("annotations") => cmd_annotations(rest(&args)),
         Some("bench") => cmd_bench(rest(&args)),
         Some("corpus") => cmd_corpus(rest(&args)),
@@ -166,6 +175,8 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--skip-baseline"
                 | "--prefetch-all-columns"
                 | "--bibtex"
+                | "--replace"
+                | "--preview"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;
@@ -972,6 +983,122 @@ fn cmd_compare(args: &[String]) -> ExitCode {
         println!("OK: within --max-mae {threshold:.4}");
     }
     ExitCode::SUCCESS
+}
+
+fn cmd_redact(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(path) = positional.first() else {
+        eprintln!(
+            "usage: aris-reader-cli redact <file.pdf> --rect X,Y,W,H [--rect ...] [--replace] [-o out.pdf] [--preview]"
+        );
+        return ExitCode::from(64);
+    };
+    let replace = options.iter().any(|(key, _)| key == "--replace");
+    let preview = options.iter().any(|(key, _)| key == "--preview");
+    let mut areas: Vec<RedactionArea> = Vec::new();
+    for (key, value) in &options {
+        if key != "--rect" {
+            continue;
+        }
+        let values: Vec<f64> = value
+            .split(',')
+            .filter_map(|part| part.trim().parse::<f64>().ok())
+            .collect();
+        if values.len() != 4 {
+            eprintln!("--rect needs four comma-separated numbers: X,Y,W,H (got {value:?})");
+            return ExitCode::from(64);
+        }
+        areas.push(RedactionArea::new(
+            opt_usize(&options, &["--page"], 0) as u32,
+            Rect::new(values[0], values[1], values[2], values[3]),
+        ));
+    }
+    if areas.is_empty() {
+        eprintln!("at least one --rect X,Y,W,H is required (PDF user space, origin bottom-left)");
+        return ExitCode::from(64);
+    }
+
+    if preview {
+        match preview_redactions(Path::new(path), &areas) {
+            Ok(preview) => {
+                println!(
+                    "{path}: {} character(s) under {} area(s)",
+                    preview.removed_characters,
+                    areas.len()
+                );
+                for page in &preview.pages {
+                    println!(
+                        "  page {}: {} character(s), {} graphic object(s) intersecting",
+                        page.page + 1,
+                        page.characters,
+                        page.graphics
+                    );
+                    if !page.text_preview.is_empty() {
+                        println!("    \"{}\"", page.text_preview);
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("cannot preview redactions on {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let destination = if replace {
+        std::path::PathBuf::from(path)
+    } else {
+        opt(&options, &["-o", "--output"])
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| suggested_redaction_copy_path(Path::new(path)))
+    };
+    let mode = if replace {
+        RedactionMode::ReplaceOriginal
+    } else {
+        RedactionMode::Copy
+    };
+    match redact_pdf(Path::new(path), &destination, &areas, None, mode) {
+        Ok(report) => {
+            println!(
+                "{}{}: {} character(s) removed on {} page(s), {} byte(s) written, verified",
+                if replace { "replaced " } else { "wrote " },
+                report.destination.display(),
+                report.removed_characters,
+                report.pages.len(),
+                report.output_bytes
+            );
+            for page in &report.pages {
+                println!(
+                    "  page {}: {} character(s), {} graphic object(s), {}{}",
+                    page.page + 1,
+                    page.removed_characters,
+                    page.removed_graphics,
+                    if page.rasterized {
+                        "rasterised (its text layer is gone)"
+                    } else {
+                        "text rewritten"
+                    },
+                    if page.fill_marks > 0 {
+                        format!(", {} black mark(s)", page.fill_marks)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            if let Some(backup) = &report.backup_path {
+                println!("  backup: {}", backup.display());
+            }
+            if report.original_unchanged {
+                println!("  the original was not modified");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("redaction failed; nothing was replaced: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_text(args: &[String]) -> ExitCode {

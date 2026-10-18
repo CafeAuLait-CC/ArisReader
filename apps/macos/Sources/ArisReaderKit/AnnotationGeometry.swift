@@ -20,6 +20,10 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     case ellipse
     case note
     case textBox
+    /// A mode rather than an ink tool: a drag marks a rectangle for redaction instead of
+    /// creating an annotation. Nothing is removed until the reader confirms the explicit apply
+    /// command; the marks are pending until then.
+    case redact
     /// A sticky text-markup mode: every finished text selection is marked with this kind.
     case highlight
     case underline
@@ -28,7 +32,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select, .eraser, .note, .textBox, .highlight, .underline, .strikeout: return nil
+        case .select, .eraser, .note, .textBox, .redact, .highlight, .underline, .strikeout:
+            return nil
         case .pen: return .ink
         case .line: return .line
         case .arrow: return .arrow
@@ -46,7 +51,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .highlight: return .highlight
         case .underline: return .underline
         case .strikeout: return .strikeout
-        case .select, .pen, .eraser, .line, .arrow, .rectangle, .ellipse, .note, .textBox:
+        case .select, .pen, .eraser, .line, .arrow, .rectangle, .ellipse, .note, .textBox,
+             .redact:
             return nil
         }
     }
@@ -93,6 +99,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "Ellipse"
         case .note: return "Sticky Note"
         case .textBox: return "Text Box"
+        case .redact: return "Redact"
         case .highlight: return "Highlight"
         case .underline: return "Underline"
         case .strikeout: return "Strikethrough"
@@ -110,6 +117,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "circle"
         case .note: return "note.text"
         case .textBox: return "textbox"
+        case .redact: return "rectangle.dashed"
         case .highlight: return "highlighter"
         case .underline: return "underline"
         case .strikeout: return "strikethrough"
@@ -150,6 +158,23 @@ public enum TextBoxResizeHandle: CaseIterable, Sendable {
 /// Coordinates are **page-local view space** (points at 100%, origin at the page's top-left),
 /// which is exactly what the sidecar stores and what the write-back path converts once. The
 /// canvas maps them to the view with the page's placement and the current zoom.
+/// A rectangle the reader marked for redaction, drawn while it is still pending.
+///
+/// It is deliberately not a `CanvasAnnotationMark`: nothing about it is an annotation, it cannot
+/// be selected or moved, and it is painted in the warning language (dark fill, dashed red edge)
+/// so a page with pending redactions never looks like a finished one.
+public struct CanvasRedactionMark: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let page: Int
+    public let rect: CGRect
+
+    public init(id: String, page: Int, rect: CGRect) {
+        self.id = id
+        self.page = page
+        self.rect = rect
+    }
+}
+
 public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
     public let id: String
     public let page: Int

@@ -400,6 +400,12 @@ struct ReaderSecondaryToolbar: View {
                  selected: state.annotationTool == .textBox) {
                 state.annotationTool = state.annotationTool == .textBox ? .select : .textBox
             }.disabled(state.document == nil)
+            separator
+            tool("Redact", "rectangle.dashed",
+                 selected: state.annotationTool == .redact,
+                 help: "Redact: drag over content to mark it (or mark the selected text); nothing is removed until you apply") {
+                state.toggleRedactionTool()
+            }.disabled(!state.canMarkRedactions)
 
             pending("Stamps", "seal")
             pending("Signature", "signature")
