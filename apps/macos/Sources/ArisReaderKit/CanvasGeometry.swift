@@ -140,6 +140,14 @@ public enum PlacementIndex {
     // these instead of by bitmap size, which stopped being a usable proxy the moment a free-text
     // annotation's text raster could be wider than a small page raster.
 
+    /// Whether `index` names one box of the text-selection overlay.
+    ///
+    /// The overlay carries the ordinary blue selection when no tool is armed, and the live
+    /// markup preview when one is; both are one quad per selected line in this block.
+    public static func isSelection(_ index: Int) -> Bool {
+        index >= -block && index < 0
+    }
+
     /// Whether `index` names a whole-page raster (or a preview backdrop).
     ///
     /// Bounded at both ends: `pageRaster` grows downwards from `-3·block` for its whole documented

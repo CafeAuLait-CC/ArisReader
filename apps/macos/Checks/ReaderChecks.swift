@@ -141,6 +141,17 @@ struct ReaderChecks {
             try await checkSelectionPath()
             return
         }
+        // The live text-markup preview on its own
+        // (`ArisReaderChecks --check-live-markup .`).
+        if CommandLine.arguments.contains("--check-live-markup") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await liveMarkupChecks(
+                textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                twoColumn: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
+            print("Live markup checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--measure-page-rasters") {
             try await measurePageRasters()
             return
@@ -454,6 +465,9 @@ struct ReaderChecks {
         try await annotationChecks(a: a, b: b)
         try await stickyMarkupChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await liveMarkupChecks(
+            textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            twoColumn: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
         try await strikeoutChecks(
             textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))

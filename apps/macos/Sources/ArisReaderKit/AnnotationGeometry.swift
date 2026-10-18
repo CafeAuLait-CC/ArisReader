@@ -4,9 +4,10 @@ import CoreGraphics
 /// The tool the canvas is in.
 ///
 /// One value selects exactly one tool. The text-markup cases (`highlight`, `underline`,
-/// `strikeout`) do not change what a drag *draws*: a drag still selects text, and the selection
-/// is turned into that kind of mark when it is released. Keeping them in this enum is what makes
-/// "pen, then highlight" leave one tool active rather than two modes that could both apply.
+/// `strikeout`) change both what a drag *looks like* and what it commits: the swept text is
+/// drawn as the target mark while the pointer is down, and that same selection becomes the
+/// annotation on release. Keeping them in this enum is what makes "pen, then highlight" leave
+/// one tool active rather than two modes that could both apply.
 public enum AnnotationTool: String, CaseIterable, Sendable {
     case select
     case pen

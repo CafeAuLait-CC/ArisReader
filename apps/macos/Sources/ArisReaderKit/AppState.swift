@@ -1455,6 +1455,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     eraserHoverMarkID = nil
                     cancelEraserGesture()
                 }
+                // A selection on screen is drawn as the mark the tool will commit, or as the
+                // ordinary blue selection when no markup tool is armed. Leaving the tool has to
+                // restore that look immediately, even if no pointer sample follows.
+                if selection != nil {
+                    refreshSelectionOverlay()
+                }
             }
         }
     }
@@ -1473,7 +1479,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The highlight palette's presets are translucent because a highlight sits over text. Pen
     /// and shape marks use the same hue at full opacity: a stroke is the reader's ink, not a
     /// wash over the page.
-    @Published public var annotationColor: AnnotationColor = AppState.annotationPalette[0].color
+    @Published public var annotationColor: AnnotationColor = AppState.annotationPalette[0].color {
+        didSet {
+            // The live markup preview is drawn in this colour, so a palette change while a
+            // selection is on screen has to repaint it in place.
+            guard annotationColor != oldValue, annotationTool.isTextMarkup,
+                  selection != nil else { return }
+            refreshSelectionOverlay()
+        }
+    }
     /// The annotation the reader last clicked, if any. Only sidecar annotations can be selected:
     /// a PDF's own ink, shapes, notes and text are drawn but not editable, because moving them
     /// would mean rewriting somebody else's annotation.
@@ -3023,6 +3037,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func cancelTextMarkupTool() -> Bool {
         guard annotationTool.isTextMarkup else { return false }
+        // Escape during a drag abandons the gesture: the words under the pointer are not a
+        // finished selection, and leaving them blue would hand the reader a selection they
+        // never asked for. A selection that is not being dragged belongs to reading and keeps
+        // its ordinary look when the tool is left.
+        cancelMarkupDragSelection()
         annotationTool = .select
         return true
     }
@@ -9217,33 +9236,42 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
-        if let selection {
-            appendHighlight(
-                page: selection.page,
-                range: selection.range,
-                image: selectionImage,
-                idBase: PlacementIndex.selection(0),
-                to: &pages
-            )
+        if let selection, !isMarkingTextSelection {
+            // While a markup tool is armed the selection *is* the mark about to be committed:
+            // it is drawn with the same quads, colour and blend as the finished annotation, so
+            // the gesture reads as annotation rather than as selection. The ordinary blue
+            // selection is used for every other tool, exactly as before.
+            if let kind = annotationTool.textMarkupKind {
+                let bar = Self.textMarkupBar(for: kind)
+                appendHighlight(
+                    page: selection.page,
+                    range: selection.range,
+                    // The same tint the committed mark uses: `addAnnotationFromSelection`
+                    // stores `annotationColor`, and the own-annotation pass below draws it
+                    // through this same call.
+                    image: annotationTexture(for: annotationColor, opacity: 1.0, blend: .multiply),
+                    idBase: PlacementIndex.selection(0),
+                    verticalScale: bar.scale,
+                    verticalOffset: bar.offset,
+                    blend: .multiply,
+                    to: &pages
+                )
+            } else {
+                appendHighlight(
+                    page: selection.page,
+                    range: selection.range,
+                    image: selectionImage,
+                    idBase: PlacementIndex.selection(0),
+                    to: &pages
+                )
+            }
         }
 
         for (annotationIndex, annotation) in annotations.enumerated() {
             // Geometry marks are drawn by the annotation overlay, and placed text is drawn from
             // its own glyph below; neither is a tinted text box.
             guard !annotation.kind.isGeometry, !annotation.kind.isPlacedText else { continue }
-            // A highlight fills the quad; an underline is a thin bar on the baseline and a
-            // strikeout is the same bar through the middle of the glyphs.
-            let verticalScale: CGFloat = switch annotation.kind {
-            case .highlight: 1.0
-            case .underline: 0.1
-            case .strikeout: 0.12
-            default: 1.0
-            }
-            let verticalOffset: CGFloat = switch annotation.kind {
-            case .underline: 0.9
-            case .strikeout: 0.45
-            default: 0.0
-            }
+            let bar = Self.textMarkupBar(for: annotation.kind)
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
@@ -9253,8 +9281,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // this quad's texture under, so it must not collide with a page raster or with a
                 // loaded annotation (see `PlacementIndex`).
                 idBase: PlacementIndex.ownAnnotation(annotationIndex),
-                verticalScale: verticalScale,
-                verticalOffset: verticalOffset,
+                verticalScale: bar.scale,
+                verticalOffset: bar.offset,
                 blend: .multiply,
                 to: &pages
             )
@@ -9631,6 +9659,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    /// The thin bar that represents a selected line in an underline or a strikeout.
+    ///
+    /// `offset` is the fraction of the selection rect's height where the bar starts and `scale`
+    /// is its height as a fraction of the line. Both the live preview and the committed mark
+    /// call this, so releasing the pointer cannot move or resize the mark that was under it.
+    private static func textMarkupBar(for kind: Annotation.Kind) -> (scale: CGFloat, offset: CGFloat) {
+        switch kind {
+        case .underline: return (0.1, 0.9)
+        case .strikeout: return (0.12, 0.45)
+        // A highlight fills the whole quad; anything else is not a text mark and never reaches
+        // here, so it gets the harmless fill style rather than an invented line.
+        default: return (1.0, 0.0)
+        }
+    }
+
     /// Fetches the text layer of every visible page (once), so hit-testing is instant.
     private func prefetchTextLayers(for placements: [PagePlacement]) {
         for placement in placements where textPages[placement.index] == nil {
@@ -9756,14 +9799,43 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         guard let anchor = selectionAnchor,
-              let current = selection,
-              let hit = characterIndex(at: point, extendingSelection: true),
-              hit.page == current.page
+              let current = selection
         else { return }
+        guard let hit = characterIndex(at: point, extendingSelection: true),
+              hit.page == current.page
+        else {
+            // A markup drag that leaves the page it started on is abandoned rather than
+            // clamped: the reader pointed away from those words, and committing the last
+            // in-page sample on release would mark words the gesture had left behind.
+            if annotationTool.isTextMarkup, !isOnSelectionPage(point, page: current.page) {
+                cancelMarkupDragSelection()
+            }
+            return
+        }
 
         let range = min(anchor, hit.index)...max(anchor, hit.index)
         guard range != current.range else { return }
         selection = Selection(page: current.page, range: range)
+        refreshSelectionOverlay()
+    }
+
+    /// Whether a content point is inside the page a text selection belongs to.
+    private func isOnSelectionPage(_ point: CGPoint, page: Int) -> Bool {
+        visiblePagePlacements.contains { placement in
+            placement.index == page
+                && CGRect(x: placement.leftPt, y: placement.topPt,
+                          width: placement.widthPt, height: placement.heightPt).contains(point)
+        }
+    }
+
+    /// Drops a text selection that a markup drag is still extending, without committing it.
+    ///
+    /// Only a drag has an anchor; a selection that is merely on screen (a search hit, or one
+    /// that survived leaving the tool) is reading state and is left alone.
+    private func cancelMarkupDragSelection() {
+        guard selectionAnchor != nil else { return }
+        selection = nil
+        selectionAnchor = nil
         refreshSelectionOverlay()
     }
 
