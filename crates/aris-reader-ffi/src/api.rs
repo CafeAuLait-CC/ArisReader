@@ -24,8 +24,8 @@ use aris_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
 };
 use aris_reader_core::{
-    AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
-    PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
+    AnnotationAlignment, AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig,
+    ErrorCode, PageGeometry, PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
 };
 use aris_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::{
@@ -1894,7 +1894,17 @@ impl ArisDocument {
             let view_point = |point: &AnnotationPoint| -> Point {
                 inverse.apply(Point::new(point.x_pt, point.y_pt))
             };
-            let (kind, rect, quads, ink_paths, line, line_arrow, border_width) = match record.kind {
+            let (
+                kind,
+                rect,
+                quads,
+                ink_paths,
+                line,
+                line_arrow,
+                border_width,
+                font_size,
+                alignment,
+            ) = match record.kind {
                 AnnotationWriteKind::Note => (
                     WriteAnnotationKind::Text,
                     supplied_rect,
@@ -1903,7 +1913,46 @@ impl ArisDocument {
                     None,
                     false,
                     0.0,
+                    0.0,
+                    AnnotationAlignment::Left,
                 ),
+                AnnotationWriteKind::FreeText => {
+                    if !record.font_size_pt.is_finite()
+                        || record.font_size_pt < 1.0
+                        || record.font_size_pt > 400.0
+                    {
+                        return Err(ArisFfiError::InvalidArgument {
+                            message: format!(
+                                "annotation {:?} has a font size outside 1…400 pt",
+                                record.id
+                            ),
+                        });
+                    }
+                    let alignment = match record.text_alignment.as_str() {
+                        "left" => AnnotationAlignment::Left,
+                        "center" => AnnotationAlignment::Center,
+                        "right" => AnnotationAlignment::Right,
+                        other => {
+                            return Err(ArisFfiError::InvalidArgument {
+                                message: format!(
+                                    "annotation {:?} has an alignment {other:?}; expected left, center or right",
+                                    record.id
+                                ),
+                            });
+                        }
+                    };
+                    (
+                        WriteAnnotationKind::FreeText,
+                        supplied_rect,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        0.0,
+                        record.font_size_pt,
+                        alignment,
+                    )
+                }
                 AnnotationWriteKind::Highlight | AnnotationWriteKind::Underline => {
                     if quads.is_empty() {
                         return Err(ArisFfiError::InvalidArgument {
@@ -1927,7 +1976,17 @@ impl ArisDocument {
                         AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
                         _ => unreachable!("handled by the outer match"),
                     };
-                    (kind, union, quads, Vec::new(), None, false, 0.0)
+                    (
+                        kind,
+                        union,
+                        quads,
+                        Vec::new(),
+                        None,
+                        false,
+                        0.0,
+                        0.0,
+                        AnnotationAlignment::Left,
+                    )
                 }
                 AnnotationWriteKind::Ink => {
                     if record.ink_paths.is_empty() {
@@ -1952,6 +2011,8 @@ impl ArisDocument {
                         None,
                         false,
                         border,
+                        0.0,
+                        AnnotationAlignment::Left,
                     )
                 }
                 AnnotationWriteKind::Square | AnnotationWriteKind::Circle => {
@@ -1969,6 +2030,8 @@ impl ArisDocument {
                         None,
                         false,
                         border,
+                        0.0,
+                        AnnotationAlignment::Left,
                     )
                 }
                 AnnotationWriteKind::Line => {
@@ -1992,6 +2055,8 @@ impl ArisDocument {
                         }),
                         record.line_arrow,
                         border,
+                        0.0,
+                        AnnotationAlignment::Left,
                     )
                 }
             };
@@ -2005,6 +2070,8 @@ impl ArisDocument {
                 line,
                 line_arrow,
                 border_width,
+                font_size,
+                alignment,
                 color: [record.color.red, record.color.green, record.color.blue],
                 opacity: record.opacity,
                 contents: text_or_none(&record.contents),
@@ -2706,6 +2773,9 @@ pub enum AnnotationWriteKind {
     Highlight,
     Underline,
     Note,
+    /// `/FreeText`: text in `rect`, at `font_size_pt`, aligned by `text_alignment`, with
+    /// `/DA` and an appearance stream.
+    FreeText,
     /// `/Ink`: `ink_paths` are the strokes, in view space.
     Ink,
     /// `/Square`: `rect` is the stroked rectangle.
@@ -2751,6 +2821,12 @@ pub struct WriteAnnotationRecord {
     pub author: String,
     /// `/M`, PDF date format (`D:YYYYMMDDHHmmSSOHH'mm'`).
     pub modified: String,
+    /// `/DA` font size, in points. Used by [`AnnotationWriteKind::FreeText`]; ignored for every
+    /// other kind.
+    pub font_size_pt: f64,
+    /// `/Q` text alignment for [`AnnotationWriteKind::FreeText`]: `left`, `center` or `right`.
+    /// Any other value is refused rather than silently becoming left.
+    pub text_alignment: String,
 }
 
 /// What a successful write did. Every value is about the *file that was written*, not about the
@@ -4739,6 +4815,8 @@ mod tests {
             contents: "Saved at an arbitrary zoom.".to_string(),
             author: "Lyra".to_string(),
             modified: "D:20261016213000-07'00'".to_string(),
+            font_size_pt: 0.0,
+            text_alignment: "left".to_string(),
         }
     }
 
@@ -4780,6 +4858,8 @@ mod tests {
             contents: "Stroked at an arbitrary zoom.".to_string(),
             author: "Lyra".to_string(),
             modified: "D:20261017120000-07'00'".to_string(),
+            font_size_pt: 0.0,
+            text_alignment: "left".to_string(),
         }
     }
 

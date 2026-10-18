@@ -45,11 +45,14 @@
 //! requires an explicit `/AP` (some older readers do) will show nothing; the alternative was to
 //! write a state that is knowingly wrong. See the task report and `README.md` for the measurement.
 //!
-//! Ink and shapes are different: a stroke has no blend mode to get wrong, so they are written by
-//! [`crate::geometry_write`] with a real `/AP /N` Form XObject **and** the geometry (`/InkList`
-//! or `/L`/`/LE`) and `/BS` width. The appearance objects are appended by the same save as the
-//! annotation dictionaries and are verified before the rename. A viewer that ignores the
-//! appearance can still synthesize the stroke; a viewer that ignores both shows nothing, which
+//! Ink, shapes, sticky notes and free text are different: they have no blend mode to get wrong,
+//! and PDFium's C API cannot write the keys they need (`/BS`, `/L`, `/Name`, `/DA`, `/Q`, or a
+//! real `/AP` form XObject). They are written by [`crate::geometry_write`] (the direct lopdf
+//! writer, named for the first kinds it handled): a stroked mark gets a real `/AP /N` **and** its
+//! geometry, a sticky note gets `/Name /Comment`, and a text box gets `/DA`, `/Q` **and** an
+//! appearance stream. The appearance objects are appended by the same save as the annotation
+//! dictionaries and are verified before the rename. A viewer that ignores the appearance can
+//! still synthesize the stroke or the free text; a viewer that ignores both shows nothing, which
 //! no such viewer in this environment did.
 //!
 //! # Threading
@@ -61,7 +64,7 @@
 use crate::annotations::{
     AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind,
 };
-use crate::geometry_write::{append_geometry_annotations, verify_geometry_annotations};
+use crate::geometry_write::{append_direct_annotations, verify_direct_annotations};
 use aris_reader_core::{
     ArisError, ErrorCode, PageIndex, Point, RawAnnotation, RawAnnotationKind, Result,
 };
@@ -214,11 +217,11 @@ pub fn save_annotated_pdf(
     let mut appender = AnnotationAppender::open(&source, password)?;
     let page_count = appender.page_count();
     validate(annotations, page_count)?;
-    // Two writers, one save contract. PDFium creates the quad-based kinds; the stroked kinds
-    // need `/BS`, `/L` and a real appearance XObject, none of which its C API can write (see
-    // `geometry_write`). Both write into the same temporary file and are verified together
-    // before the rename.
-    let (pdfium_annotations, geometry_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
+    // Two writers, one save contract. PDFium creates the quad-based markup kinds; the rest need
+    // `/BS`, `/L`, `/Name`, `/DA`, `/Q` or a real appearance XObject, none of which its C API can
+    // write (see `geometry_write`). Both write into the same temporary file and are verified
+    // together before the rename.
+    let (pdfium_annotations, direct_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
         annotations
             .iter()
             .cloned()
@@ -246,16 +249,16 @@ pub fn save_annotated_pdf(
         } else {
             appender.save_incremental(file)?
         };
-        if !geometry_annotations.is_empty() {
-            // With no PDFium update the temporary file is still empty; the geometry writer
-            // starts from the source. With one, it starts from the already-appended file, so
-            // the final document has the source and the PDFium update as its prefix.
+        if !direct_annotations.is_empty() {
+            // With no PDFium update the temporary file is still empty; the direct writer starts
+            // from the source. With one, it starts from the already-appended file, so the final
+            // document has the source and the PDFium update as its prefix.
             let base = if pdfium_annotations.is_empty() {
                 source.as_path()
             } else {
                 temp.path()
             };
-            append_geometry_annotations(base, temp.path(), &geometry_annotations, password)?;
+            append_direct_annotations(base, temp.path(), &direct_annotations, password)?;
             written_bytes = fs::metadata(temp.path())
                 .map_err(|error| io_error("could not measure the saved file", temp.path(), error))?
                 .len();
@@ -275,7 +278,7 @@ pub fn save_annotated_pdf(
 
         let saved = read_annotations(temp.path(), password, page_count)?;
         verify_all(&preexisting, &saved, annotations)?;
-        verify_geometry_annotations(temp.path(), annotations, password)?;
+        verify_direct_annotations(temp.path(), annotations, password)?;
 
         if written_bytes < source_len {
             return Err(ArisError::new(
@@ -635,6 +638,23 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                     ));
                 }
             }
+            WriteAnnotationKind::FreeText => {
+                if !annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("free-text annotation {id:?} must not carry /QuadPoints"),
+                    ));
+                }
+                if !annotation.font_size.is_finite()
+                    || annotation.font_size < 1.0
+                    || annotation.font_size > 400.0
+                {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("free-text annotation {id:?} has a font size outside 1…400 pt"),
+                    ));
+                }
+            }
             WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
                 if annotation.quads.is_empty() {
                     return Err(ArisError::new(
@@ -978,6 +998,7 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
         WriteAnnotationKind::Highlight => RawAnnotationKind::Highlight,
         WriteAnnotationKind::Underline => RawAnnotationKind::Underline,
         WriteAnnotationKind::Text => RawAnnotationKind::Text,
+        WriteAnnotationKind::FreeText => RawAnnotationKind::FreeText,
         WriteAnnotationKind::Ink => RawAnnotationKind::Ink,
         WriteAnnotationKind::Square => RawAnnotationKind::Square,
         WriteAnnotationKind::Circle => RawAnnotationKind::Circle,
@@ -1013,12 +1034,14 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
             return Err(mismatch(
                 "quads",
                 format!(
-                    "a stroked annotation must not write /QuadPoints, found {:?}",
+                    "a note or stroked annotation must not write /QuadPoints, found {:?}",
                     record.quads
                 ),
             ));
         }
-        verify_geometry(record, expected, &mismatch)?;
+        if expected.kind.is_geometry() {
+            verify_geometry(record, expected, &mismatch)?;
+        }
     }
     let color = record
         .color
@@ -1053,6 +1076,7 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
             aris_reader_core::AnnotationBlend::Multiply
         }
         WriteAnnotationKind::Text
+        | WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Ink
         | WriteAnnotationKind::Square
         | WriteAnnotationKind::Circle
@@ -1087,6 +1111,29 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
                 expected.modified, record.modified
             ),
         ));
+    }
+    if expected.kind == WriteAnnotationKind::FreeText {
+        let Some(size) = record.font_size_pt else {
+            return Err(mismatch(
+                "font size",
+                "the saved file reports no /DA font size".into(),
+            ));
+        };
+        if (size - expected.font_size).abs() > 0.02 {
+            return Err(mismatch(
+                "font size",
+                format!("expected {}, got {size}", expected.font_size),
+            ));
+        }
+        if record.alignment != expected.alignment {
+            return Err(mismatch(
+                "alignment",
+                format!(
+                    "expected {:?}, got {:?}",
+                    expected.alignment, record.alignment
+                ),
+            ));
+        }
     }
     if !record.visible {
         return Err(mismatch(
@@ -1156,7 +1203,8 @@ fn verify_geometry(
         WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {}
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
-        | WriteAnnotationKind::Text => {
+        | WriteAnnotationKind::Text
+        | WriteAnnotationKind::FreeText => {
             unreachable!("only called for a stroked kind")
         }
     }
@@ -1479,7 +1527,7 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> ArisError {
 mod tests {
     use super::*;
     use crate::test_support::scratch;
-    use aris_reader_core::Rect;
+    use aris_reader_core::{AnnotationAlignment, Rect};
     use std::os::unix::fs::PermissionsExt;
 
     fn copy_fixture(directory: &Path, name: &str) -> PathBuf {
@@ -1497,6 +1545,8 @@ mod tests {
             line: None,
             line_arrow: false,
             border_width: 0.0,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
             color: [255, 216, 64],
             opacity: 0.4,
             contents: Some("Lyra round-trip highlight.".to_string()),
@@ -1516,11 +1566,34 @@ mod tests {
             line: None,
             line_arrow: false,
             border_width: 0.0,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
             color: [255, 216, 64],
             opacity: 1.0,
             contents: Some("Lyra round-trip note.".to_string()),
             author: Some("Lyra Test".to_string()),
             modified: Some("D:20261016213000-07'00'".to_string()),
+        }
+    }
+
+    fn free_text() -> WriteAnnotation {
+        WriteAnnotation {
+            id: "44444444-4444-4444-4444-444444444444".to_string(),
+            page: PageIndex(0),
+            kind: WriteAnnotationKind::FreeText,
+            rect: Rect::new(72.0, 500.0, 380.0, 60.0),
+            quads: Vec::new(),
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 0.0,
+            font_size: 14.0,
+            alignment: AnnotationAlignment::Center,
+            color: [20, 20, 20],
+            opacity: 1.0,
+            contents: Some("Lyra round-trip free text.\nA second line.".to_string()),
+            author: Some("Lyra Test".to_string()),
+            modified: Some("D:20261017120000-07'00'".to_string()),
         }
     }
 
@@ -1540,6 +1613,8 @@ mod tests {
             line: None,
             line_arrow: false,
             border_width: 2.5,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
             color: [220, 40, 40],
             opacity: 0.75,
             contents: Some("Lyra round-trip ink.".to_string()),
@@ -1559,6 +1634,8 @@ mod tests {
             line: None,
             line_arrow: false,
             border_width: 3.0,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
             color: [30, 90, 200],
             opacity: 1.0,
             contents: None,
@@ -1581,6 +1658,8 @@ mod tests {
             }),
             line_arrow: true,
             border_width: 2.0,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
             color: [20, 140, 60],
             opacity: 1.0,
             contents: Some("An arrow.".to_string()),
@@ -1731,6 +1810,98 @@ mod tests {
                 .any(|window| window == b"/ClosedArrow"),
             "a line with an arrow writes /LE"
         );
+    }
+
+    #[test]
+    fn sticky_note_and_free_text_carry_name_da_q_and_an_appearance() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("note-free-text");
+        let source = copy_fixture(&directory, "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let original_bytes = fs::read(&source).expect("read fixture");
+
+        let report = save_annotated_pdf(
+            &source,
+            &destination,
+            &[note(), free_text()],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save a note and a text box");
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(report.source_bytes_preserved);
+
+        let saved_bytes = fs::read(&destination).expect("saved readable");
+        assert!(saved_bytes.starts_with(&original_bytes));
+        for needle in [
+            b"/Name /Comment".as_slice(),
+            b"/DA".as_slice(),
+            b"/FreeText".as_slice(),
+            b"/Q 1".as_slice(),
+            b"/AP".as_slice(),
+        ] {
+            assert!(
+                saved_bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle),
+                "the saved file carries {}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        assert!(
+            saved_bytes
+                .windows(b"/Helv".len())
+                .any(|window| window == b"/Helv"),
+            "the free-text /DA and appearance name the Helvetica resource"
+        );
+
+        let saved = read_annotations(&destination, None, 2).expect("read saved");
+        let records: Vec<&RawAnnotation> = saved.iter().flatten().collect();
+        assert_eq!(records.len(), 9, "seven pre-existing plus the two written");
+
+        let saved_note = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", note().id))
+            .expect("note in saved file");
+        assert_eq!(saved_note.kind, RawAnnotationKind::Text);
+        assert_eq!(saved_note.rect, note().rect);
+        assert_eq!(
+            saved_note.contents.as_deref(),
+            Some("Lyra round-trip note.")
+        );
+
+        let saved_text = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", free_text().id))
+            .expect("free text in saved file");
+        assert_eq!(saved_text.kind, RawAnnotationKind::FreeText);
+        assert_eq!(saved_text.rect, free_text().rect);
+        assert_eq!(saved_text.font_size_pt, Some(14.0));
+        assert_eq!(saved_text.alignment, AnnotationAlignment::Center);
+        assert_eq!(
+            saved_text.contents.as_deref(),
+            Some("Lyra round-trip free text.\nA second line.")
+        );
+
+        // The source's own annotations are unchanged and nothing was duplicated.
+        let mut ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique);
+        let before = read_annotations(&source, None, 2).expect("read source");
+        for (page, page_records) in before.iter().enumerate() {
+            for original in page_records {
+                assert!(
+                    saved[page].contains(original),
+                    "pre-existing annotation {} on page {page} changed",
+                    original.id
+                );
+            }
+        }
     }
 
     #[test]
