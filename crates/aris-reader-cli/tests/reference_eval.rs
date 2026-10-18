@@ -232,10 +232,6 @@ const ENTRY_LENGTH_CEILINGS: &[(&str, usize, usize)] = &[
     ("2403.04370", 750, 0), // measured max 469
 ];
 
-/// Pages extracted per paper. The reader caps its own index at 120 pages (T4.13), so a longer
-/// document is measured exactly as the app would see it.
-const MAX_PAGES: u32 = 120;
-
 /// Entries the bibliography parser may return, matching the callers in the app and the CLI.
 const MAX_ENTRIES: usize = 2000;
 
@@ -427,9 +423,11 @@ fn measure(id: &str, path: &Path) -> Paper {
 
     let total = backend.page_count();
     paper.pages = total;
-    let scan_end = total.min(MAX_PAGES);
+    // Every page, like the reader's own index (T4.13 removed the 120-page cap); the arXiv
+    // corpus's longest paper is 75 pages, so this matches the old bound on this corpus while a
+    // longer document would be measured whole.
     let mut pages: Vec<(u32, RawTextPage)> = Vec::new();
-    for index in 0..scan_end {
+    for index in 0..total {
         match backend.raw_text_page(PageIndex(index)) {
             Ok(text) => pages.push((text.page.get(), text)),
             Err(error) => {
@@ -448,7 +446,7 @@ fn measure(id: &str, path: &Path) -> Paper {
     let first_entry_page = provisional.iter().map(|entry| entry.page).min();
     let mut landings: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
     if let Some(first) = first_entry_page {
-        for page in 0..first.min(scan_end) {
+        for page in 0..first {
             let Ok(links) = backend.link_targets(PageIndex(page)) else {
                 continue;
             };
@@ -1784,7 +1782,7 @@ fn gpt4_main_text_resolves_into_the_reports_own_bibliography() {
         return;
     }
     let backend = PdfiumBackend::open(&path, None).expect("locked GPT-4 PDF must be readable");
-    let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count().min(MAX_PAGES))
+    let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count())
         .map(|page| {
             (
                 page,

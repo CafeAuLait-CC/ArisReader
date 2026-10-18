@@ -65,7 +65,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Bump this whenever a persisted field changes meaning, is removed, or a fresh parse would
 /// return different values for the same bytes (for example a caption detector change). The
 /// version is the cache's whole compatibility contract; `ENGINE_VERSION` is informational.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+///
+/// # 2 (T4.12 / T4.13)
+///
+/// Version 1 caches were written by the caption detector that read a wrapped prose line as a
+/// caption, and by the index that stopped at page 120. Both defects are fixed by *deleting*
+/// entries from the persisted `figures` list and by *adding* pages to `citations`; a version-1
+/// sidecar for unchanged PDF bytes would therefore be a hit and the fix would stay invisible —
+/// the old false positives would keep entering the index and page 121+ would stay empty. The
+/// version is bumped so every version-1 cache is re-derived from the document. The layout is
+/// otherwise unchanged; the bump is about the values, which is exactly what this constant
+/// documents.
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// Tag that identifies our sidecar (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-document-index";
@@ -388,6 +399,33 @@ mod tests {
         let second = identity(b"%PDF-1.7 second\n");
         assert_ne!(first, second);
         assert_eq!(first, identity(b"%PDF-1.7 first\n"));
+    }
+
+    #[test]
+    fn a_version_one_cache_is_not_read_after_the_caption_and_page_fixes() {
+        // T4.12/T4.13 changed what a parse derives for the same bytes (fewer captions, and
+        // citations for every page), so a version-1 sidecar would be a plausible-looking hit
+        // with the old, wrong values. It is re-derived instead; see `FORMAT_VERSION`.
+        let directory =
+            std::env::temp_dir().join(format!("aris-index-cache-v1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch");
+        let path = directory.join("version-one.json");
+        let mut value =
+            serde_json::to_value(minimal_file(identity(b"same bytes"))).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("cache object")
+            .insert("format_version".to_string(), serde_json::Value::from(1u32));
+        fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("write cache");
+        let cache = read_cache(&path, &identity(b"same bytes"), 1);
+        match cache {
+            CacheRead::Corrupt { detail } => {
+                assert_eq!(detail, "format version 1 is not current", "{detail}");
+            }
+            _ => panic!("a version-1 cache must not be handed back as a hit"),
+        }
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

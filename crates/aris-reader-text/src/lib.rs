@@ -716,6 +716,19 @@ const CAPTION_INK_GAP_SHARE: f64 = 2.0;
 /// would cut the caption at the first formula it contains.
 const CAPTION_TYPE_TOLERANCE_PT: f64 = 0.75;
 
+/// How wide the line above a label must be, as a share of the label line's width, for the label
+/// to be read as the continuation of that line rather than as the start of its own block.
+///
+/// A line that runs into a label at the next printed line is a full paragraph line: measured on
+/// the corpus it is 0.95–11 times as wide as the label line, because a wrapped sentence routinely
+/// ends with a short line (`Figure 11.` alone). A figure's own text label or a formula fragment
+/// above a caption is a different thing: on `Zhang et al. 2025` page 4 the `Figure 3` caption is
+/// preceded by the diagram label `φ, β, Γ,τ`, 31 pt wide against the caption's 495 pt, and on
+/// `1909.05722` page 3 the `Fig. 2` caption follows a formula fragment 84 pt wide against its
+/// 246 pt. The two artwork labels are 0.06 and 0.34 of their caption line's width; half sits in
+/// the empty band between those and the smallest prose continuation.
+const CAPTION_CONTINUATION_WIDTH_SHARE: f64 = 0.5;
+
 /// One line of the text layer, as the caption scanner needs it.
 ///
 /// The scanner works on the extraction order of the character array (lines split at `\n`), because
@@ -853,6 +866,71 @@ fn caption_label(line: &str) -> Option<(&'static str, String)> {
     Some((kind, label))
 }
 
+/// Whether a line that starts with a caption label is really the continuation of running text.
+///
+/// "A caption starts its own block" is the part of a caption that punctuation cannot express. The
+/// label grammar (`Figure 3:`, `Table 2.`, `Fig. 5.`) also matches a sentence that only *ends* at
+/// the start of a printed line: the extractor splits a paragraph at the printer's line break, so
+/// `… we employ a collision detection module to analyse the number of` / `Table 3. Our correction
+/// reduces …` arrives as a line beginning with a label, and the label is the tail of the sentence
+/// above, not a caption at all. The corpus pages where this happened are named in
+/// [`crate::find_captions`].
+///
+/// The test reads the line above, in the same column, and asks whether it runs into this line:
+///
+/// * **same leading** — the white space between the two lines' ink is no more than
+///   [`CAPTION_LINE_GAP_SHARE`] of this line's glyph height. A paragraph break, a figure or a
+///   table puts more space there;
+/// * **same type size** — within [`CAPTION_TYPE_TOLERANCE_PT`]. A different size above is a
+///   heading, a superscript, or a caption's neighbour, i.e. a block boundary;
+/// * **not the end of a sentence** — a line ending in `.`, `:`, `;`, `?`, `!` or a closing
+///   bracket/quote ends a block even at the same leading;
+/// * **wide enough to be running text** — at least [`CAPTION_CONTINUATION_WIDTH_SHARE`] of this
+///   line's width (see that constant for the measured artwork labels this keeps).
+///
+/// The last two conditions are what separate a prose continuation from a caption that merely
+/// follows artwork text at the same leading: on `Zhang et al. 2025` page 4 the `Figure 3` caption
+/// follows a 31 pt diagram label, and on `1909.05722` page 3 `Fig. 2` follows a formula fragment.
+/// Both are narrower than half the caption, so neither is running prose and the caption survives.
+///
+/// When the line above is in the other column it does not overlap this line horizontally and the
+/// search steps over it, because a line in another column cannot continue this one.
+fn continues_running_text(lines: &[CaptionLine], anchor: usize) -> bool {
+    let line = &lines[anchor];
+    if line.rect.size.width <= 0.0 || line.height <= 0.0 {
+        return false;
+    }
+    let Some(above) = (0..anchor).rev().find(|index| {
+        let candidate = &lines[*index];
+        !candidate.compact.is_empty()
+            && candidate.rect.size.width > 0.0
+            && crate::figures::overlaps_horizontally(candidate.rect, line.rect)
+    }) else {
+        return false;
+    };
+    let above = &lines[above];
+    let gap = above.rect.origin.y - line.rect.max_y();
+    if gap > CAPTION_LINE_GAP_SHARE * line.height
+        || (above.height - line.height).abs() > CAPTION_TYPE_TOLERANCE_PT
+        || ends_a_sentence(&above.compact)
+    {
+        return false;
+    }
+    above.rect.size.width >= CAPTION_CONTINUATION_WIDTH_SHARE * line.rect.size.width
+}
+
+/// Whether `text` ends a sentence (or at least a clause), so a following line starts a new block.
+///
+/// A comma, a hyphen or a plain word means the sentence continues; a full stop, a colon or a
+/// closing bracket means it has finished. The question is only whether the *line* is a block
+/// boundary, not whether the grammar is complete.
+fn ends_a_sentence(text: &str) -> bool {
+    matches!(
+        text.trim_end().chars().last(),
+        Some('.' | ':' | ';' | '?' | '!' | ')' | ']' | '\u{201d}' | '\u{2019}' | '"')
+    )
+}
+
 /// The lines a caption covers: the line its label opens, and every line under it that repeats the
 /// caption's leading and its type size within the caption's own column.
 ///
@@ -923,6 +1001,32 @@ fn caption_block(lines: &[CaptionLine], anchor: usize) -> (Vec<usize>, Rect) {
 /// before its title. That separator keeps a line-start sentence such as `Figure 3 shows ...` in
 /// the mention stream. This text-layer cue is also our only handle on vector figures, tables, and
 /// algorithms that lack image objects.
+///
+/// The separator is not enough on its own, because the extractor breaks paragraphs at printed line
+/// ends: a sentence such as `… the number of penetration frames before and after correction in` /
+/// `Table 3. Our correction reduces …` begins a line with `Table 3.` while being running text.
+/// [`continues_running_text`] is the second half of the rule and rejects exactly those lines. On
+/// the corpora (twelve sample papers and twenty evaluation papers, 2026-10-17) it removes thirteen
+/// such lines and no real caption:
+///
+/// | Paper | Page | Label | Line it was |
+/// | --- | --- | --- | --- |
+/// | InstructAvatar | 7 | `Figure 5` | `… as reflected in the examples shown in / Fig. 5. It is also worth noting …` |
+/// | Leader | 9 | `Table 3` | `… before and after correction in / Table 3. Our correction reduce …` |
+/// | Ye et al. | 14 | `Algorithm 1` | `… This process is detailed in / Algorithm 1.` (the real caption follows) |
+/// | Ye et al. | 17 | `Figure 11` | `… please refer to / Figure 11.` |
+/// | Ye et al. | 17 | `Figure 13` | `… in Figure12 and / Figure13. The results …` |
+/// | ResNet | 5 | `Figure 4` | `… observations from Table 2 and / Fig. 4. First, the situation …` |
+/// | GW170817 | 17 | `Table 4` | `… are summarized in / Table 4.` |
+/// | Planck | 47 | `Figure 33` | `… is shown in / Fig. 33. The ΛCDM limit lies at …` |
+/// | Planck | 56 | `Figure 43` | `… as illustrated in / Fig. 43.` |
+/// | BERT | 8 | `Table 6` | `… GLUE tasks are shown in / Table 6. In this table, we report …` |
+/// | 1909.05722 | 8 | `Algorithm 1` | `… computationally reasonable, see / Algorithm 1. The cross-covariance term …` |
+/// | ViT | 17 | `Figure 9` | `… different learning-rate, see / Figure 9.` |
+/// | CLIP | 37 | `Table 9` | `… metrics are provided in / Table 9.` |
+///
+/// A label followed by a comma (`Table 3, we observe …`) never reached this scanner: the comma is
+/// not one of the separators above, so it was always a mention.
 pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
     let chars: Vec<char> = text
         .chars
@@ -936,6 +1040,11 @@ pub fn find_captions(text: &RawTextPage) -> Vec<Caption> {
         let Some((kind, label)) = caption_label(&line.raw) else {
             continue;
         };
+        // A label that continues the running text above it is a mention at the end of a sentence,
+        // not the start of a caption block.
+        if continues_running_text(&lines, position) {
+            continue;
+        }
         let trimmed = line.raw.trim_start();
         let offset = line.raw.chars().count() - trimmed.chars().count();
         let (block_lines, mut rect) = caption_block(&lines, position);
@@ -1264,8 +1373,9 @@ pub fn resolve_references<'a>(
 /// Finds the reference list across a document's pages.
 ///
 /// `pages` must be `(page index, raw text)` in reading order and may cover only part of the
-/// document. All supplied pages are scored; `max_entries` caps the returned list.
-/// Callers bound extraction separately (currently 120 pages in CLI and FFI).
+/// document. All supplied pages are scored; `max_entries` caps the returned list. Callers bound
+/// extraction separately: the FFI's reference locator reads the first 120 pages (the citation
+/// index reads every page), and the CLI's `cite`/`region` diagnostics mirror that locator.
 pub fn find_references<'a>(
     pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
     max_entries: usize,
@@ -1363,6 +1473,95 @@ mod caption_tests {
         // "as Figure 3 shows" is mid-line, not a caption: captions start their line.
         let captions = find_captions(&crate::test_page("As Figure 3 shows, the method works.\n"));
         assert!(captions.is_empty(), "{captions:?}");
+    }
+
+    #[test]
+    fn a_wrapped_prose_line_that_starts_with_a_label_is_not_a_caption() {
+        // The extractor breaks a paragraph at the printer's line end, so a sentence that mentions
+        // its table just before the break begins the next line with `Table 3.`. The line above is
+        // set at the same leading and type size, does not finish its sentence and runs into this
+        // line: this is prose, not a caption block (Leader et al. page 9).
+        let page = page_of(&[
+            (
+                50.0,
+                700.0,
+                8.0,
+                "We analyse the number of penetration frames before and after",
+            ),
+            (
+                50.0,
+                688.0,
+                8.0,
+                "Table 3. We observe that our correction halves the error.",
+            ),
+            (
+                50.0,
+                676.0,
+                8.0,
+                "The paragraph continues with a second observation.",
+            ),
+        ]);
+        assert!(
+            find_captions(&page).is_empty(),
+            "{:?}",
+            find_captions(&page)
+        );
+        // And the occurrence returns to the mention stream: a click target in the body.
+        let mentions = crate::find_caption_mentions(&page);
+        assert_eq!(mentions.len(), 1, "{mentions:?}");
+        assert_eq!(
+            (mentions[0].kind.as_str(), mentions[0].label.as_str()),
+            ("Table", "3")
+        );
+    }
+
+    #[test]
+    fn a_caption_after_a_finished_sentence_is_still_a_caption_at_the_same_leading() {
+        // Same leading and type size, but the line above ends a sentence, so the label starts its
+        // own block. This is the guard against over-applying the prose-continuation rule.
+        let page = page_of(&[
+            (50.0, 700.0, 8.0, "The method has three stages."),
+            (50.0, 688.0, 8.0, "Figure 1: Overview of the method."),
+        ]);
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].text, "1: Overview of the method.");
+    }
+
+    #[test]
+    fn a_caption_below_narrow_figure_text_is_still_a_caption() {
+        // Zhang et al. page 4: the Figure 3 caption follows the diagram's own `φ, β, Γ,τ` label at
+        // the same leading. A 31 pt artwork label is not running prose; the caption stays.
+        let page = page_of(&[
+            (330.0, 700.0, 8.0, "φ, β, Γ,τ"),
+            (
+                50.0,
+                688.0,
+                8.0,
+                "Figure 3. The overview of HumanMM. HumanMM processes multi-shot video sequences by first extracting motion feature such as",
+            ),
+        ]);
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].label, "3");
+    }
+
+    #[test]
+    fn a_caption_below_a_heading_is_still_a_caption() {
+        // A heading above the caption is a different type size, so it is a block boundary even
+        // though its last word carries no full stop.
+        let page = page_of(&[
+            (50.0, 700.0, 12.0, "5.1 Effect of Pre-training Tasks"),
+            (
+                50.0,
+                688.0,
+                8.0,
+                "Table 5: Ablation over the pre-training tasks.",
+            ),
+        ]);
+        let captions = find_captions(&page);
+        assert_eq!(captions.len(), 1, "{captions:?}");
+        assert_eq!(captions[0].label, "5");
     }
 
     #[test]

@@ -30,7 +30,8 @@
 use aris_reader_core::{DocumentBackend, PageIndex, RawCharBox, RawTextPage, Rect};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{
-    PageEvidence, caption_region_from, caption_region_without_margin, find_captions, lines_from,
+    Caption, PageEvidence, caption_region_from, caption_region_without_margin,
+    find_caption_mentions, find_captions, lines_from,
 };
 use std::path::{Path, PathBuf};
 
@@ -257,7 +258,7 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
         let name = short_name(path);
         let backend = PdfiumBackend::open(path, None).expect("open PDF");
         let (mut file_captions, mut file_multi) = (0usize, 0usize);
-        for index in 0..backend.page_count().min(120) {
+        for index in 0..backend.page_count() {
             let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
                 continue;
             };
@@ -422,11 +423,20 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
         println!("  ! {line}");
     }
 
-    // Measured 2026-10-15 on the twelve sample papers and the twenty evaluation papers: every
-    // caption's run is inside its range, every continuation line's words are in its text, and 384
-    // of the 429 captions close a sentence (the rest are listed above and are either captions the
-    // papers print without final punctuation or the line-start prose `find_captions` still
-    // mistakes for a caption, T4.12 — both are questions about the *label*, not about the run).
+    // Measured 2026-10-17, after T4.12, on the twelve sample papers and the twenty evaluation
+    // papers: 416 captions, 324 of them multi-line, 389 closing a sentence, 0 dropped lines,
+    // 0 dropped text, 185 white-edge regions, 0 lines taken in by one. Every caption's run is
+    // inside its range and every continuation line's words are in its text.
+    //
+    // Before T4.12 the same instrument counted 429 / 330 / 399 / 185: 13 lines were prose that
+    // began at a printed line break with a label (`Table 3. We observe …`), and they are gone,
+    // not lost — the set difference between the two runs is exactly the 13 cases asserted by
+    // `wrapped_prose_lines_are_mentions_and_the_real_captions_survive` below, with no real
+    // caption added or removed. Six of the 13 had a continuation line and ten closed a sentence,
+    // which is why those two counts moved by 6 and 10 while the white-edge count did not move at
+    // all: all 13 were body lines whose previews were the full-page fallback, not figures.
+    // The captions that still do not close are the papers' own captions without final
+    // punctuation (GPT-4's appendix titles, Elsevier's captions), not label questions.
     assert_eq!(dropped_lines, 0, "a caption lost a line of its own run");
     assert_eq!(
         swallowed, 0,
@@ -444,6 +454,209 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
     assert!(
         closed * 100 >= captions * 85,
         "only {closed} of {captions} captions close a sentence"
+    );
+}
+
+/// The captions `find_captions` reports on one page of one corpus paper.
+fn captions_on(files: &[PathBuf], prefix: &str, page_one_based: u32) -> Vec<Caption> {
+    let path = files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(prefix)
+        })
+        .unwrap_or_else(|| panic!("corpus paper {prefix:?} not found"));
+    let backend = PdfiumBackend::open(path, None).expect("open PDF");
+    let text = backend
+        .raw_text_page(PageIndex(page_one_based - 1))
+        .expect("page text");
+    find_captions(&text)
+}
+
+/// T4.12 on the real pages that showed the defect, not on a synthetic sentence.
+///
+/// Each case was read on the rendered page: the label line is the tail of the sentence in the
+/// line above, and the same number's real caption is either on another page or elsewhere on the
+/// same page. Before the fix all of these were reported as captions (the count went 429 -> 416);
+/// the case list is the measurement that says which ones disappeared, so a future change that
+/// removes a real caption here fails with the page named.
+#[test]
+#[ignore = "requires the local PDF corpora and a PDFium shared library"]
+fn wrapped_prose_lines_are_mentions_and_the_real_captions_survive() {
+    let files = corpus_files();
+    assert!(!files.is_empty(), "point the corpus variables at the PDFs");
+
+    // ResNet page 5: `… observations from Table 2 and / Fig. 4. First, …` — one real Figure 4
+    // ("Training on ImageNet") and a prose line that used to be a second one.
+    let resnet = captions_on(&files, "1512.03385", 5);
+    let figure_fours: Vec<&Caption> = resnet
+        .iter()
+        .filter(|caption| caption.kind == "Figure" && caption.label == "4")
+        .collect();
+    assert_eq!(figure_fours.len(), 1, "{figure_fours:?}");
+    assert!(figure_fours[0].text.contains("Training on ImageNet"));
+    let page = PdfiumBackend::open(
+        files
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("1512.03385")
+            })
+            .expect("ResNet paper"),
+        None,
+    )
+    .expect("open PDF")
+    .raw_text_page(PageIndex(4))
+    .expect("page text");
+    let mentions = find_caption_mentions(&page);
+    assert!(
+        mentions
+            .iter()
+            .any(|mention| mention.kind == "Figure" && mention.label == "4"),
+        "the prose `Fig. 4.` is now a mention: {mentions:?}"
+    );
+
+    // BERT page 8: the real Table 6 is on page 9; page 8's `Table 6. In this table …` is prose.
+    assert!(
+        captions_on(&files, "1810.04805", 8)
+            .iter()
+            .all(|caption| !(caption.kind == "Table" && caption.label == "6")),
+        "the wrapped prose Table 6 on BERT page 8 is still a caption"
+    );
+    assert!(
+        captions_on(&files, "1810.04805", 9)
+            .iter()
+            .any(|caption| caption.kind == "Table" && caption.label == "6"),
+        "the real Table 6 on BERT page 9 was lost"
+    );
+
+    // Leader page 9: one real Table 3 (above its table); the sentence finishing in `Table 3.`
+    // after the table is a mention.
+    let leader = captions_on(&files, "Wang et al. - 2025 - Leader", 9);
+    let table_threes: Vec<&Caption> = leader
+        .iter()
+        .filter(|caption| caption.kind == "Table" && caption.label == "3")
+        .collect();
+    assert_eq!(table_threes.len(), 1, "{table_threes:?}");
+    assert!(
+        table_threes[0]
+            .text
+            .contains("Comparison of interpenetration frames")
+    );
+
+    // InstructAvatar page 7: real Figure 5 is on page 6; page 7's `Fig. 5. It is also worth
+    // noting …` is prose.
+    assert!(
+        captions_on(&files, "Wang et al. - 2025 - InstructAvatar", 7)
+            .iter()
+            .all(|caption| !(caption.kind == "Figure" && caption.label == "5")),
+        "the wrapped prose Figure 5 on InstructAvatar page 7 is still a caption"
+    );
+    assert!(
+        captions_on(&files, "Wang et al. - 2025 - InstructAvatar", 6)
+            .iter()
+            .any(|caption| caption.kind == "Figure" && caption.label == "5"),
+        "the real Figure 5 on InstructAvatar page 6 was lost"
+    );
+
+    // Ye et al. page 14: the real Algorithm 1 follows the prose sentence `… detailed in
+    // Algorithm 1.`; only the former survives. Pages 17: both `Figure 11.` and `Figure13.` are
+    // sentences, and their real captions are on pages 18 and 19.
+    let algorithm_page = captions_on(&files, "Ye et al.", 14);
+    let algorithm_ones: Vec<&Caption> = algorithm_page
+        .iter()
+        .filter(|caption| caption.kind == "Algorithm" && caption.label == "1")
+        .collect();
+    assert_eq!(algorithm_ones.len(), 1, "{algorithm_ones:?}");
+    assert!(
+        algorithm_ones[0]
+            .text
+            .contains("Derive Semantically Consistent Sensors")
+    );
+    for label in ["11", "13"] {
+        assert!(
+            captions_on(&files, "Ye et al.", 17)
+                .iter()
+                .all(|caption| !(caption.kind == "Figure" && caption.label == label)),
+            "the prose Figure {label} on Ye page 17 is still a caption"
+        );
+    }
+
+    // Planck: page 47's second `Fig. 33.` is the sentence `… is shown in / Fig. 33. The ΛCDM
+    // limit …`; page 56's `Fig. 43.` is a sentence tail and the real Fig. 43 is on page 57.
+    let planck_thirty_threes: Vec<Caption> = captions_on(&files, "1807.06209", 47)
+        .into_iter()
+        .filter(|caption| caption.kind == "Figure" && caption.label == "33")
+        .collect();
+    assert_eq!(planck_thirty_threes.len(), 1, "{planck_thirty_threes:?}");
+    assert!(
+        planck_thirty_threes[0]
+            .text
+            .contains("Marginalized posterior distribution")
+    );
+    assert!(
+        captions_on(&files, "1807.06209", 56)
+            .iter()
+            .all(|caption| !(caption.kind == "Figure" && caption.label == "43")),
+        "the wrapped prose Fig. 43 on Planck page 56 is still a caption"
+    );
+    assert!(
+        captions_on(&files, "1807.06209", 57)
+            .iter()
+            .any(|caption| caption.kind == "Figure" && caption.label == "43"),
+        "the real Fig. 43 on Planck page 57 was lost"
+    );
+
+    // 1909.05722 page 8: `… see Algorithm 1. The cross-covariance term …` is prose; the real
+    // algorithm is on page 5.
+    assert!(
+        captions_on(&files, "1909.05722", 8)
+            .iter()
+            .all(|caption| !(caption.kind == "Algorithm" && caption.label == "1")),
+        "the wrapped prose Algorithm 1 on 1909.05722 page 8 is still a caption"
+    );
+    assert!(
+        captions_on(&files, "1909.05722", 5)
+            .iter()
+            .any(|caption| caption.kind == "Algorithm" && caption.label == "1"),
+        "the real Algorithm 1 on 1909.05722 page 5 was lost"
+    );
+
+    // ViT page 17 and CLIP page 37: `Figure 9.` / `Table 9.` end a sentence; their real captions
+    // are earlier on ViT page 17 and on CLIP page 39.
+    let vit_nines: Vec<Caption> = captions_on(&files, "2010.11929", 17)
+        .into_iter()
+        .filter(|caption| caption.kind == "Figure" && caption.label == "9")
+        .collect();
+    assert_eq!(vit_nines.len(), 1, "{vit_nines:?}");
+    assert!(
+        vit_nines[0]
+            .text
+            .contains("Comparison of class-token and global average pooling")
+    );
+    assert!(
+        captions_on(&files, "2103.00020", 37)
+            .iter()
+            .all(|caption| !(caption.kind == "Table" && caption.label == "9")),
+        "the wrapped prose Table 9 on CLIP page 37 is still a caption"
+    );
+    assert!(
+        captions_on(&files, "2103.00020", 39)
+            .iter()
+            .any(|caption| caption.kind == "Table" && caption.label == "9"),
+        "the real Table 9 on CLIP page 39 was lost"
+    );
+
+    // GW170817 page 17: the table is printed later; `… summarized in / Table 4.` is prose.
+    assert!(
+        captions_on(&files, "1710.05833", 17)
+            .iter()
+            .all(|caption| !(caption.kind == "Table" && caption.label == "4")),
+        "the wrapped prose Table 4 on GW170817 page 17 is still a caption"
     );
 }
 
