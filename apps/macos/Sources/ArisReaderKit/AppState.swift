@@ -573,18 +573,73 @@ public final class AppState: ObservableObject {
 /// `FPDF_SaveAsCopy`), and a sidecar keeps the original untouched until that lands. The
 /// durable model and its undo/redo transactions belong in `aris-reader-edit` (T3.1).
 public struct Annotation: Identifiable, Codable, Equatable, Sendable {
-    /// How the annotation is drawn. Highlights fill the character box, underlines sit on the
-    /// baseline; both address the same character range.
+    /// How the annotation is drawn.
+    ///
+    /// The first two kinds address a character range in the page's text layer. `ink`, `square`,
+    /// `circle`, `line` and `arrow` are geometry annotations stored in **page space** (points,
+    /// origin at the page's top-left corner at 100% zoom), so a mark lands on the same place at
+    /// every zoom. The four shapes are stroked, never filled: they are outlines, and keeping the
+    /// interior transparent is what lets the text behind them stay selectable.
     public enum Kind: String, Codable, Sendable {
         case highlight
         case underline
+        case ink
+        case square
+        case circle
+        case line
+        case arrow
+
+        /// Whether this kind is stored as geometry rather than as a character range.
+        public var isGeometry: Bool {
+            switch self {
+            case .highlight, .underline: return false
+            case .ink, .square, .circle, .line, .arrow: return true
+            }
+        }
     }
+
+    /// One point of a stored ink stroke or line, as the sidecar writes it.
+    ///
+    /// Deliberately not `CGPoint`: the JSON shape is part of the sidecar's compatibility story
+    /// (a newer build reads it, an older build preserves the whole entry), and spelling out
+    /// `x`/`y` keeps that shape independent of a platform type's Codable representation.
+    public struct StoredPoint: Codable, Equatable, Sendable {
+        public var x: Double
+        public var y: Double
+
+        public init(x: Double, y: Double) {
+            self.x = x
+            self.y = y
+        }
+    }
+
+    /// One rectangle, in the same page space as `inkPaths`.
+    public struct StoredRect: Codable, Equatable, Sendable {
+        public var x: Double
+        public var y: Double
+        public var width: Double
+        public var height: Double
+
+        public init(x: Double, y: Double, width: Double, height: Double) {
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+        }
+    }
+
+    /// The sidecar schema version of a geometry entry.
+    ///
+    /// Text-markup entries have no version: they are the shape every older build already knows.
+    /// Geometry entries do, so a newer build can change them without an older one guessing at
+    /// the new meaning. `AnnotationSidecar` preserves any entry it cannot interpret verbatim.
+    public static let geometryVersion = 1
 
     public let id: UUID
     /// Defaults to `.highlight` for sidecars written before kinds existed.
     public var kind: Kind = .highlight
     public var page: Int
-    /// Inclusive character range in the page's text layer.
+    /// Inclusive character range in the page's text layer; zero for geometry annotations.
     public var start: Int
     public var end: Int
     /// The colour to draw, as it will be drawn.
@@ -596,9 +651,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var color: AnnotationColor
     public var note: String
     public var createdAt: Date
+    /// Ink strokes, page space. Empty for every kind except `.ink`.
+    public var inkPaths: [[CGPoint]] = []
+    /// The stroked rectangle, page space. `nil` for every kind except `.square` and `.circle`.
+    public var shapeRect: CGRect?
+    /// Line endpoints, page space. `nil` for every kind except `.line` and `.arrow`.
+    public var lineStart: CGPoint?
+    public var lineEnd: CGPoint?
+    /// The stroke width in points. Constant for the whole mark; zero for text markup.
+    public var strokeWidth: CGFloat = 0
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, page, start, end, color, colorIndex, note, createdAt
+        case version, paths, rect, lineStart, lineEnd, strokeWidth
     }
 
     public init(
@@ -609,7 +674,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         end: Int,
         color: AnnotationColor,
         note: String,
-        createdAt: Date
+        createdAt: Date,
+        inkPaths: [[CGPoint]] = [],
+        shapeRect: CGRect? = nil,
+        lineStart: CGPoint? = nil,
+        lineEnd: CGPoint? = nil,
+        strokeWidth: CGFloat = 0
     ) {
         self.id = id
         self.kind = kind
@@ -619,6 +689,77 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         self.color = color
         self.note = note
         self.createdAt = createdAt
+        self.inkPaths = inkPaths
+        self.shapeRect = shapeRect
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
+        self.strokeWidth = strokeWidth
+    }
+
+    /// Whether the annotation's geometry is complete and finite.
+    ///
+    /// The sidecar encoder and the write-back path both rely on this: a mark that cannot be
+    /// drawn or written must be refused before it reaches a file, not turned into an empty
+    /// annotation on the page.
+    public var hasValidGeometry: Bool {
+        guard strokeWidth.isFinite, strokeWidth > 0, strokeWidth <= 200 else { return false }
+        switch kind {
+        case .ink:
+            return !inkPaths.isEmpty && inkPaths.allSatisfy { path in
+                path.count >= 2 && path.allSatisfy { $0.x.isFinite && $0.y.isFinite }
+            }
+        case .square, .circle:
+            guard let rect = shapeRect else { return false }
+            return rect.minX.isFinite && rect.minY.isFinite
+                && rect.width.isFinite && rect.height.isFinite
+                && rect.width > 0 && rect.height > 0
+        case .line, .arrow:
+            guard let start = lineStart, let end = lineEnd else { return false }
+            return start.x.isFinite && start.y.isFinite && end.x.isFinite && end.y.isFinite
+                && hypot(end.x - start.x, end.y - start.y) > 0.01
+        case .highlight, .underline:
+            return false
+        }
+    }
+
+    /// The page-space box the geometry occupies, for hit testing and the canvas overlay.
+    public var geometryBounds: CGRect? {
+        switch kind {
+        case .ink:
+            let points = inkPaths.flatMap { $0 }
+            guard let first = points.first else { return nil }
+            var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+            for point in points.dropFirst() {
+                minX = min(minX, point.x); maxX = max(maxX, point.x)
+                minY = min(minY, point.y); maxY = max(maxY, point.y)
+            }
+            return CGRect(x: minX, y: minY, width: max(maxX - minX, 0.01),
+                          height: max(maxY - minY, 0.01))
+        case .square, .circle:
+            return shapeRect
+        case .line, .arrow:
+            guard let start = lineStart, let end = lineEnd else { return nil }
+            return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                          width: max(abs(end.x - start.x), 0.01),
+                          height: max(abs(end.y - start.y), 0.01))
+        case .highlight, .underline:
+            return nil
+        }
+    }
+
+    /// A copy moved by `dx`/`dy` in page points.
+    public func translated(by dx: CGFloat, dy: CGFloat) -> Annotation {
+        guard kind.isGeometry else { return self }
+        var copy = self
+        copy.inkPaths = inkPaths.map { path in
+            path.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }
+        }
+        if let rect = shapeRect {
+            copy.shapeRect = rect.offsetBy(dx: dx, dy: dy)
+        }
+        if let start = lineStart { copy.lineStart = CGPoint(x: start.x + dx, y: start.y + dy) }
+        if let end = lineEnd { copy.lineEnd = CGPoint(x: end.x + dx, y: end.y + dy) }
+        return copy
     }
 
     /// Older sidecars predate `kind`; decode them as highlights while preserving all
@@ -633,8 +774,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         id = try values.decode(UUID.self, forKey: .id)
         kind = try values.decodeIfPresent(Kind.self, forKey: .kind) ?? .highlight
         page = try values.decode(Int.self, forKey: .page)
-        start = try values.decode(Int.self, forKey: .start)
-        end = try values.decode(Int.self, forKey: .end)
+        if kind.isGeometry {
+            let version = try values.decodeIfPresent(Int.self, forKey: .version)
+            guard version == Self.geometryVersion else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .version,
+                    in: values,
+                    debugDescription: "geometry annotation schema \(version.map(String.init) ?? "missing") is not supported"
+                )
+            }
+            start = try values.decodeIfPresent(Int.self, forKey: .start) ?? 0
+            end = try values.decodeIfPresent(Int.self, forKey: .end) ?? 0
+            note = try values.decodeIfPresent(String.self, forKey: .note) ?? ""
+            strokeWidth = CGFloat(try values.decode(Double.self, forKey: .strokeWidth))
+            let storedPaths = try values.decodeIfPresent([[StoredPoint]].self, forKey: .paths) ?? []
+            inkPaths = storedPaths.map { path in
+                path.map { CGPoint(x: $0.x, y: $0.y) }
+            }
+            if let rect = try values.decodeIfPresent(StoredRect.self, forKey: .rect) {
+                shapeRect = CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+            }
+            if let point = try values.decodeIfPresent(StoredPoint.self, forKey: .lineStart) {
+                lineStart = CGPoint(x: point.x, y: point.y)
+            }
+            if let point = try values.decodeIfPresent(StoredPoint.self, forKey: .lineEnd) {
+                lineEnd = CGPoint(x: point.x, y: point.y)
+            }
+        } else {
+            start = try values.decode(Int.self, forKey: .start)
+            end = try values.decode(Int.self, forKey: .end)
+            note = try values.decode(String.self, forKey: .note)
+        }
         if let stored = try values.decodeIfPresent(AnnotationColor.self, forKey: .color) {
             color = stored
         } else {
@@ -648,8 +818,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             color = AppState.highlightPalette[index].color
         }
-        note = try values.decode(String.self, forKey: .note)
         createdAt = try values.decode(Date.self, forKey: .createdAt)
+        if kind.isGeometry, !hasValidGeometry {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: values,
+                debugDescription: "geometry annotation \(kind.rawValue) has incomplete or non-finite geometry"
+            )
+        }
     }
 
     /// Writes a palette colour as `colorIndex` and anything else as `color`.
@@ -664,8 +840,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         try values.encode(id, forKey: .id)
         try values.encode(kind, forKey: .kind)
         try values.encode(page, forKey: .page)
-        try values.encode(start, forKey: .start)
-        try values.encode(end, forKey: .end)
+        if kind.isGeometry {
+            try values.encode(Self.geometryVersion, forKey: .version)
+            try values.encode(strokeWidth, forKey: .strokeWidth)
+            switch kind {
+            case .ink:
+                try values.encode(inkPaths.map { path in
+                    path.map { StoredPoint(x: Double($0.x), y: Double($0.y)) }
+                }, forKey: .paths)
+            case .square, .circle:
+                if let rect = shapeRect {
+                    try values.encode(StoredRect(x: Double(rect.minX), y: Double(rect.minY),
+                                                 width: Double(rect.width), height: Double(rect.height)),
+                                      forKey: .rect)
+                }
+            case .line, .arrow:
+                if let start = lineStart {
+                    try values.encode(StoredPoint(x: Double(start.x), y: Double(start.y)),
+                                      forKey: .lineStart)
+                }
+                if let end = lineEnd {
+                    try values.encode(StoredPoint(x: Double(end.x), y: Double(end.y)),
+                                      forKey: .lineEnd)
+                }
+            case .highlight, .underline:
+                break
+            }
+        } else {
+            try values.encode(start, forKey: .start)
+            try values.encode(end, forKey: .end)
+        }
         if let index = AppState.highlightPalette.firstIndex(where: { $0.color == color }) {
             try values.encode(index, forKey: .colorIndex)
         } else {
@@ -954,6 +1158,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
     /// `AnnotationSidecar`).
     @Published public private(set) var annotations: [Annotation] = []
+    /// The tool the canvas is in. Text markup is still selection-based; the tools here are the
+    /// ones that change what a pointer drag on the page means.
+    @Published public var annotationTool: AnnotationTool = .select
+    /// The colour a newly created mark is stored in.
+    ///
+    /// The highlight palette's presets are translucent because a highlight sits over text. Pen
+    /// and shape marks use the same hue at full opacity: a stroke is the reader's ink, not a
+    /// wash over the page.
+    @Published public var annotationColor: AnnotationColor = AppState.annotationPalette[0].color
+    /// The geometry annotation the reader last clicked, if any. Only sidecar annotations can be
+    /// selected: a PDF's own ink and shapes are drawn but not editable, because moving them
+    /// would mean rewriting somebody else's annotation.
+    @Published public private(set) var selectedAnnotationID: UUID?
+    /// The mark being dragged, and where the drag started in its page's space.
+    private var moveOriginalAnnotation: Annotation?
+    private var moveStartPagePoint: CGPoint?
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
     /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
@@ -1754,6 +1974,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isSearching = false
         selection = nil
         selectionAnchor = nil
+        selectedAnnotationID = nil
+        moveOriginalAnnotation = nil
+        moveStartPagePoint = nil
+        annotationTool = .select
         annotations = []
         bookmarks = []
         pageSelection = []
@@ -2143,8 +2367,267 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         addAnnotationFromSelection(kind: .highlight, note: note)
     }
 
+    // MARK: - Ink and shapes (T3.4)
+
+    /// The opaque colour a pen or shape is drawn in: the current annotation colour's hue at full
+    /// opacity.
+    public var annotationStrokeColor: AnnotationColor {
+        AnnotationColor(red: annotationColor.red, green: annotationColor.green,
+                        blue: annotationColor.blue, alpha: 255)
+    }
+
+    /// The width every newly drawn stroke uses, in points. A constant width is what makes a
+    /// freehand line look like one stroke rather than a pressure-sensitive brush this reader
+    /// does not model; `strokeWidth` is stored per annotation so a future width control can
+    /// change it without changing the schema.
+    public static let defaultAnnotationStrokeWidth: CGFloat = 2
+
+    /// Adds a geometry mark whose coordinates are already **page space** (page-local, top-left,
+    /// 100% points). This is the one creation entry point the canvas uses; all validation and
+    /// persistence happens here.
+    @discardableResult
+    public func addGeometryAnnotation(
+        kind: Annotation.Kind,
+        page: Int,
+        inkPaths: [[CGPoint]] = [],
+        shapeRect: CGRect? = nil,
+        lineStart: CGPoint? = nil,
+        lineEnd: CGPoint? = nil,
+        color: AnnotationColor? = nil,
+        strokeWidth: CGFloat = AppState.defaultAnnotationStrokeWidth
+    ) -> Bool {
+        guard kind.isGeometry, let document, page >= 0, page < document.pageCount,
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+
+        var normalizedPaths = inkPaths
+        var normalizedRect = shapeRect
+        switch kind {
+        case .ink:
+            normalizedPaths = normalizedPaths.filter { !$0.isEmpty }
+            guard normalizedPaths.contains(where: { $0.count >= 2 }) else { return false }
+        case .square, .circle:
+            guard var rect = shapeRect else { return false }
+            rect = rect.standardized
+            guard rect.width >= 1, rect.height >= 1 else { return false }
+            normalizedRect = rect
+        case .line, .arrow:
+            guard let start = lineStart, let end = lineEnd,
+                  hypot(end.x - start.x, end.y - start.y) >= 1 else { return false }
+        case .highlight, .underline:
+            return false
+        }
+
+        let annotation = Annotation(
+            id: UUID(),
+            kind: kind,
+            page: page,
+            start: 0,
+            end: 0,
+            color: color ?? annotationStrokeColor,
+            note: "",
+            createdAt: Date(),
+            inkPaths: normalizedPaths,
+            shapeRect: normalizedRect,
+            lineStart: lineStart,
+            lineEnd: lineEnd,
+            strokeWidth: strokeWidth
+        )
+        guard annotation.hasValidGeometry else { return false }
+
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated, trigger: "add-\(kind.rawValue)") else { return false }
+        undoStack.append(.added(annotation))
+        redoStack.removeAll()
+        selectedAnnotationID = annotation.id
+        refreshSelectionOverlay()
+        statusMessage = "Added \(kind.rawValue) annotation"
+        return true
+    }
+
+    /// A pen stroke from page-space points.
+    @discardableResult
+    public func addInkAnnotation(
+        page: Int,
+        points: [CGPoint],
+        color: AnnotationColor? = nil,
+        strokeWidth: CGFloat = AppState.defaultAnnotationStrokeWidth
+    ) -> Bool {
+        addGeometryAnnotation(kind: .ink, page: page, inkPaths: [points], color: color,
+                              strokeWidth: strokeWidth)
+    }
+
+    /// A shape dragged from `start` to `end` in page space. Line and arrow keep the drag
+    /// direction; rectangle and ellipse use the normalized box the two corners describe.
+    @discardableResult
+    public func addShapeAnnotation(
+        kind: Annotation.Kind,
+        page: Int,
+        start: CGPoint,
+        end: CGPoint,
+        color: AnnotationColor? = nil,
+        strokeWidth: CGFloat = AppState.defaultAnnotationStrokeWidth
+    ) -> Bool {
+        switch kind {
+        case .square, .circle:
+            let rect = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                              width: abs(end.x - start.x), height: abs(end.y - start.y))
+            return addGeometryAnnotation(kind: kind, page: page, shapeRect: rect, color: color,
+                                         strokeWidth: strokeWidth)
+        case .line, .arrow:
+            return addGeometryAnnotation(kind: kind, page: page, lineStart: start, lineEnd: end,
+                                         color: color, strokeWidth: strokeWidth)
+        case .ink:
+            return addInkAnnotation(page: page, points: [start, end], color: color,
+                                    strokeWidth: strokeWidth)
+        case .highlight, .underline:
+            return false
+        }
+    }
+
+    /// The page under a **content point** and the point in that page's own space (top-left,
+    /// 100% points).
+    ///
+    /// The canvas converts a view point to content points once, at the event boundary, the same
+    /// way text selection does; this subtraction is therefore zoom-independent by construction.
+    public func pagePoint(atContentPoint point: CGPoint) -> (page: Int, point: CGPoint)? {
+        for placement in visiblePagePlacements {
+            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
+                              width: placement.widthPt, height: placement.heightPt)
+            guard rect.contains(point) else { continue }
+            return (placement.index, CGPoint(x: point.x - placement.leftPt,
+                                             y: point.y - placement.topPt))
+        }
+        return nil
+    }
+
+    /// Every geometry mark the overlay should draw, in sidecar order followed by the file's own.
+    public var canvasAnnotationMarks: [CanvasAnnotationMark] {
+        var marks: [CanvasAnnotationMark] = annotations.compactMap { annotation in
+            guard annotation.kind.isGeometry else { return nil }
+            return CanvasAnnotationMark(
+                id: annotation.id.uuidString,
+                page: annotation.page,
+                kind: annotation.kind,
+                inkPaths: annotation.inkPaths,
+                shapeRect: annotation.shapeRect,
+                lineStart: annotation.lineStart,
+                lineEnd: annotation.lineEnd,
+                color: annotation.color,
+                strokeWidth: annotation.strokeWidth,
+                isSelected: annotation.id == selectedAnnotationID,
+                isEditable: true
+            )
+        }
+        for annotation in documentAnnotations where annotation.visible && annotation.isGeometry {
+            guard let kind = Annotation.Kind(rawValue: annotation.kind) else { continue }
+            let opacity = annotation.opacity ?? 1.0
+            let alpha = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
+            let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80,
+                                                           blue: 0x80, alpha: alpha)
+            let width = annotation.borderWidthPt ?? 1
+            // A PDF shape's `/Rect` is the *outer* edge of its stroke. The canvas draws the
+            // path down the centre line, so the box it draws is inset by half the border.
+            let shapeRect: CGRect? = if kind == .square || kind == .circle {
+                CGRect(x: annotation.xPt, y: annotation.yPt,
+                       width: annotation.widthPt, height: annotation.heightPt)
+                    .insetBy(dx: width / 2, dy: width / 2)
+            } else {
+                nil
+            }
+            marks.append(CanvasAnnotationMark(
+                id: "pdf:" + annotation.id,
+                page: annotation.page,
+                kind: kind,
+                inkPaths: annotation.inkPaths,
+                shapeRect: shapeRect,
+                lineStart: annotation.lineStart,
+                lineEnd: annotation.lineEnd,
+                color: color,
+                strokeWidth: width,
+                isSelected: false,
+                isEditable: false
+            ))
+        }
+        return marks
+    }
+
+    /// The page frames the canvas needs to map page-local marks into the view.
+    public var canvasPageFrames: [PagePlacement] { visiblePagePlacements }
+
+    /// The sidecar annotation whose stroke is within `tolerance` points of `point` (page space).
+    public func hitTestGeometryAnnotation(page: Int, point: CGPoint,
+                                          tolerance: CGFloat) -> UUID? {
+        for annotation in annotations.reversed() where annotation.kind.isGeometry {
+            guard annotation.page == page else { continue }
+            let mark = CanvasAnnotationMark(
+                id: annotation.id.uuidString, page: page, kind: annotation.kind,
+                inkPaths: annotation.inkPaths, shapeRect: annotation.shapeRect,
+                lineStart: annotation.lineStart, lineEnd: annotation.lineEnd,
+                color: annotation.color, strokeWidth: annotation.strokeWidth,
+                isSelected: false, isEditable: true)
+            if AnnotationGeometry.hitTest(mark, at: point, tolerance: tolerance) {
+                return annotation.id
+            }
+        }
+        return nil
+    }
+
+    /// The sidecar annotation under a content point, with the point in its page space.
+    ///
+    /// `toleranceViewPt` is converted to page points with the current zoom: a 4 pt allowance on
+    /// screen is 4/zoom points on the page, so a hairline stays easy to hit at 300% without
+    /// becoming a click magnet at 25%.
+    public func geometryAnnotationHit(
+        atContentPoint point: CGPoint,
+        toleranceViewPt: CGFloat = AnnotationGeometry.hitTolerancePt
+    ) -> (id: UUID, page: Int, point: CGPoint)? {
+        guard let hit = pagePoint(atContentPoint: point) else { return nil }
+        let tolerance = toleranceViewPt / max(zoomFactor, 0.01)
+        guard let id = hitTestGeometryAnnotation(page: hit.page, point: hit.point,
+                                                tolerance: tolerance) else { return nil }
+        return (id, hit.page, hit.point)
+    }
+
+    public func selectAnnotation(_ id: UUID?) {
+        guard selectedAnnotationID != id else { return }
+        selectedAnnotationID = id
+        refreshSelectionOverlay()
+    }
+
+    /// Deletes the selected geometry annotation. Returns whether anything was deleted.
+    @discardableResult
+    public func deleteSelectedAnnotation() -> Bool {
+        guard let id = selectedAnnotationID else { return false }
+        selectedAnnotationID = nil
+        removeAnnotation(id)
+        return true
+    }
+
+    /// Moves a geometry annotation by a page-space delta and persists it as one undo step.
+    @discardableResult
+    public func moveAnnotation(_ id: UUID, by delta: CGPoint) -> Bool {
+        guard delta.x != 0 || delta.y != 0,
+              let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
+        let before = annotations[index]
+        guard before.kind.isGeometry else { return false }
+        let after = before.translated(by: delta.x, dy: delta.y)
+        guard after.hasValidGeometry else { return false }
+        var updated = annotations
+        updated[index] = after
+        guard saveAnnotations(updated, trigger: "move-\(after.kind.rawValue)") else { return false }
+        undoStack.append(.replaced(before: before, after: after))
+        redoStack.removeAll()
+        selectedAnnotationID = id
+        refreshSelectionOverlay()
+        statusMessage = "Moved \(after.kind.rawValue) annotation"
+        return true
+    }
+
     public func removeAnnotation(_ id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        if selectedAnnotationID == id { selectedAnnotationID = nil }
         let removed = annotations[index]
         var updated = annotations
         updated.remove(at: index)
@@ -2296,6 +2779,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public enum UndoableAction: Sendable {
         case added(Annotation)
         case removed(Annotation)
+        /// A geometry mark moved, resized or otherwise replaced. The whole annotation is stored
+        /// before and after, so undo/redo does not have to know which field the gesture touched.
+        case replaced(before: Annotation, after: Annotation)
         case noteChanged(id: UUID, oldNote: String, newNote: String)
     }
 
@@ -2341,6 +2827,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if !updated.contains(where: { $0.id == annotation.id }) { updated.append(annotation) }
             } else {
                 updated.removeAll { $0.id == annotation.id }
+            }
+        case .replaced(let before, let after):
+            let target = undoing ? before : after
+            if let index = updated.firstIndex(where: { $0.id == target.id }) {
+                updated[index] = target
+            } else if !undoing {
+                updated.append(target)
             }
         case .noteChanged(let id, let oldNote, let newNote):
             if let index = updated.firstIndex(where: { $0.id == id }) {
@@ -2466,15 +2959,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         FileHandle.standardError.write(Data("aris-annotate: flushed pending \(written)\n".utf8))
     }
 
-    /// Shows an annotation: selects its range and scrolls it into view.
+    /// Shows an annotation: selects its range (or its mark) and scrolls it into view.
     public func jump(to annotation: Annotation) {
+        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
+        if annotation.kind.isGeometry {
+            // A geometry mark has no character range. Select it so the overlay shows the
+            // selection halo, and scroll to the mark rather than to the page's first character.
+            selectedAnnotationID = annotation.id
+            selection = nil
+            selectionAnchor = nil
+            let y = top + (annotation.geometryBounds?.midY ?? 0) - viewportHeightContentPt / 3
+            if y < scrollYPt || y > scrollYPt + viewportHeightContentPt {
+                scrollYPt = max(0, y)
+            }
+            reloadVisiblePages()
+            return
+        }
         selection = Selection(
             page: annotation.page,
             range: annotation.start...max(annotation.start, annotation.end)
         )
         selectionAnchor = nil
-
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
+        selectedAnnotationID = nil
         if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
             scrollYPt = top
         }
@@ -2762,6 +3268,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         "Annotation \(annotation.id.uuidString) names page \(annotation.page + 1), which is outside this document"]
                 )
             }
+            if annotation.kind.isGeometry {
+                requests.append(try geometryWriteRequest(annotation, zoom: zoom, modified: modified))
+                continue
+            }
             let text: TextPage
             if let cached = textPages[annotation.page] {
                 text = cached
@@ -2813,6 +3323,87 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ))
         }
         return requests
+    }
+
+    /// One stroked annotation as a write request.
+    ///
+    /// The sidecar stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
+    /// space scaled to the zoom the canvas is at. That multiplication and the engine's inverse
+    /// are the pair the zoom-independence check exercises: the PDF's coordinates come back
+    /// identical whichever zoom this ran at.
+    ///
+    /// `/Rect` is the **outer** box of the stroke: a centred stroke extends half a width past
+    /// the path, and an arrowhead extends past its endpoint. Writing the outer box is what makes
+    /// the annotation's own `/AP` clip nothing, and reading it back insets shapes by half the
+    /// border width again so the stroke is the same width in the PDF as on the page.
+    private func geometryWriteRequest(
+        _ annotation: Annotation,
+        zoom: CGFloat,
+        modified: String
+    ) throws -> AnnotationWriteRequest {
+        guard annotation.hasValidGeometry, let bounds = annotation.geometryBounds else {
+            throw NSError(
+                domain: "Lyra",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has incomplete geometry and cannot be written"]
+            )
+        }
+        let width = annotation.strokeWidth
+        var outer = bounds
+        switch annotation.kind {
+        case .ink:
+            outer = outer.insetBy(dx: -width / 2 - 1, dy: -width / 2 - 1)
+        case .square, .circle:
+            outer = outer.insetBy(dx: -width / 2 - 0.5, dy: -width / 2 - 0.5)
+        case .line:
+            outer = outer.insetBy(dx: -width / 2 - 1, dy: -width / 2 - 1)
+        case .arrow:
+            let head = max(width * 5, 8)
+            outer = outer.insetBy(dx: -(width / 2 + head), dy: -(width / 2 + head))
+        case .highlight, .underline:
+            break
+        }
+        guard outer.width > 0.5, outer.height > 0.5 else {
+            throw NSError(
+                domain: "Lyra",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has a box too small to write"]
+            )
+        }
+        func scaled(_ rect: CGRect) -> CGRect {
+            CGRect(x: rect.minX * zoom, y: rect.minY * zoom,
+                   width: rect.width * zoom, height: rect.height * zoom)
+        }
+        func scaled(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: point.x * zoom, y: point.y * zoom)
+        }
+        let kind: AnnotationWriteRequest.Kind
+        switch annotation.kind {
+        case .ink: kind = .ink
+        case .square: kind = .square
+        case .circle: kind = .circle
+        case .line, .arrow: kind = .line
+        case .highlight, .underline: kind = .highlight
+        }
+        return AnnotationWriteRequest(
+            id: annotation.id.uuidString,
+            page: annotation.page,
+            kind: kind,
+            rect: scaled(outer),
+            quads: [],
+            inkPaths: annotation.inkPaths.map { $0.map(scaled) },
+            lineStart: annotation.lineStart.map(scaled),
+            lineEnd: annotation.lineEnd.map(scaled),
+            lineArrow: annotation.kind == .arrow,
+            borderWidthPt: width,
+            color: annotation.color,
+            opacity: Double(annotation.color.alpha) / 255.0,
+            contents: annotation.note,
+            author: Self.annotationAuthor,
+            modified: modified
+        )
     }
 
     /// Removes exactly `ids` from the sidecar, keeping every other entry, foreign entry, bookmark
@@ -3150,7 +3741,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         for annotation in annotations {
             var quote: String?
             var yPt = CGFloat.greatestFiniteMagnitude
-            if let page = textByPage[annotation.page],
+            if annotation.kind.isGeometry {
+                // A stroke has no character range; exporting the first character of the page as
+                // its "quote" would invent a relationship the mark does not have.
+                yPt = annotation.geometryBounds?.minY ?? yPt
+            } else if let page = textByPage[annotation.page],
                annotation.start >= 0,
                annotation.end >= annotation.start,
                annotation.end < page.chars.count {
@@ -4339,14 +4934,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// except by selecting something else. A press that moved past the canvas' slop never reaches
     /// here: that gesture is a drag, and a drag selects (see `MetalCanvasView.clickSlopPt`).
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
+        if let original = moveOriginalAnnotation, let start = moveStartPagePoint {
+            finishAnnotationMove(original: original, start: start, at: point, wasClick: wasClick)
+            return
+        }
         guard wasClick else {
             extendSelection(to: point)
             return
         }
         // Before the target is resolved, not after: a click that opens a citation or a figure
         // preview used to leave the old selection highlighted behind the panel, which reads as
-        // "the click did not take".
+        // "the click did not take". A click elsewhere also drops a selected mark; a click *on*
+        // a mark returned above, before this point, so it keeps its selection.
         clearSelection()
+        clearAnnotationSelection()
         closeDocumentNote()
         previewEpoch &+= 1
 
@@ -4357,6 +4958,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             || openCitation(at: point)
             || openFigureMention(at: point)
             || openDocumentNote(at: point)
+    }
+
+    /// Commits or cancels the drag begun by `beginSelection`.
+    ///
+    /// A drag that moved the mark writes the sidecar once and records a single `.replaced`
+    /// operation; a click (or a drag below one point) only selects it. A failed write puts the
+    /// original geometry back, so the page never shows a position that is not on disk.
+    private func finishAnnotationMove(original: Annotation, start: CGPoint,
+                                      at point: CGPoint, wasClick: Bool) {
+        defer {
+            moveOriginalAnnotation = nil
+            moveStartPagePoint = nil
+        }
+        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        else { return }
+        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        let dx = current.x - start.x
+        let dy = current.y - start.y
+        if wasClick || hypot(dx, dy) < 0.5 {
+            if wasClick { selectedAnnotationID = original.id }
+            return
+        }
+        guard let moved = annotations.first(where: { $0.id == original.id }),
+              moved.hasValidGeometry else { return }
+        guard saveAnnotations(annotations, trigger: "move-\(original.kind.rawValue)") else {
+            if let index = annotations.firstIndex(where: { $0.id == original.id }) {
+                var restored = annotations
+                restored[index] = original
+                annotations = restored
+            }
+            selectedAnnotationID = original.id
+            return
+        }
+        undoStack.append(.replaced(before: original, after: moved))
+        redoStack.removeAll()
+        selectedAnnotationID = original.id
+        refreshSelectionOverlay()
+        statusMessage = "Moved \(moved.kind.rawValue) annotation"
     }
 
     private func showDocumentNote(_ annotation: DocumentAnnotation) {
@@ -5947,6 +6586,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         for (annotationIndex, annotation) in annotations.enumerated() {
+            // Geometry marks are drawn by the annotation overlay, not as tinted text boxes.
+            guard !annotation.kind.isGeometry else { continue }
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
@@ -6029,6 +6670,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     annotation: annotation,
                     to: &pages
                 )
+
+            case .geometry:
+                // The canvas overlay draws ink and shapes from their page-space geometry; a
+                // textured quad would be the wrong shape and the wrong width.
+                continue
 
             case .freeText:
                 guard let box = annotation.boxes.first,
@@ -6187,7 +6833,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         case .markup:
             NoteGlyph.inlineComment(color: color, boxPt: boxPt, scale: scale, generation: generation)
-        case .skipped:
+        case .geometry, .skipped:
             nil
         }
         if let image { noteGlyphTextures[key] = image }
@@ -6257,7 +6903,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // MARK: - Selection
 
     /// Starts a selection at a point in content space.
+    ///
+    /// A click on one of the reader's own ink or shape strokes selects that mark and starts a
+    /// move, and does **not** start a text selection. The hit test is geometric and tight — a
+    /// few points around the stroke — so text a line away from a thin pen line is untouched and
+    /// a click on the text goes on to select it. A PDF's own ink is deliberately not hit tested
+    /// here: it can be seen, not edited.
     public func beginSelection(at point: CGPoint) {
+        if annotationTool == .select,
+           let hit = geometryAnnotationHit(atContentPoint: point),
+           let annotation = annotations.first(where: { $0.id == hit.id }) {
+            selectedAnnotationID = hit.id
+            moveOriginalAnnotation = annotation
+            moveStartPagePoint = hit.point
+            selection = nil
+            selectionAnchor = nil
+            refreshSelectionOverlay()
+            return
+        }
+        selectedAnnotationID = nil
+        moveOriginalAnnotation = nil
+        moveStartPagePoint = nil
         guard let hit = characterIndex(at: point) else {
             clearSelection()
             return
@@ -6269,6 +6935,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Extends the selection to a point in content space.
     public func extendSelection(to point: CGPoint) {
+        if let original = moveOriginalAnnotation,
+           let start = moveStartPagePoint,
+           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
+            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            let moved = original.translated(by: current.x - start.x, dy: current.y - start.y)
+            guard moved.hasValidGeometry,
+                  let index = annotations.firstIndex(where: { $0.id == original.id }) else { return }
+            var updated = annotations
+            updated[index] = moved
+            // In memory only: one drag is one sidecar write, on mouse-up. Writing per pointer
+            // event would turn a single gesture into hundreds of disk writes.
+            annotations = updated
+            return
+        }
         guard let anchor = selectionAnchor,
               let current = selection,
               let hit = characterIndex(at: point, extendingSelection: true),
@@ -6285,6 +6965,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard selection != nil || selectionAnchor != nil else { return }
         selection = nil
         selectionAnchor = nil
+        refreshSelectionOverlay()
+    }
+
+    /// Clears the selected geometry mark without touching a text selection.
+    public func clearAnnotationSelection() {
+        guard selectedAnnotationID != nil else { return }
+        selectedAnnotationID = nil
         refreshSelectionOverlay()
     }
 

@@ -898,10 +898,7 @@ public struct SidebarView: View {
                                 .focused($focusedNote, equals: annotation.id)
                                 .onSubmit { state.commitNoteEdits() }
 
-                                Text(
-                                    "Page \(annotation.page + 1) · \(annotation.kind.rawValue) · "
-                                        + "\(annotation.end - annotation.start + 1) characters"
-                                )
+                                Text(ownAnnotationSubtitle(annotation))
                                 .font(.caption2)
                                 .foregroundStyle(LyraTheme.textSecondary)
                             }
@@ -922,6 +919,17 @@ public struct SidebarView: View {
                 }
             }
         }
+    }
+
+    /// The one line under a sidecar annotation's note field.
+    private func ownAnnotationSubtitle(_ annotation: AppState.Annotation) -> String {
+        let kind = annotation.kind.rawValue
+        if annotation.kind.isGeometry {
+            let width = String(format: "%.1f pt", annotation.strokeWidth)
+            return "Page \(annotation.page + 1) · \(kind) · \(width) stroke"
+        }
+        return "Page \(annotation.page + 1) · \(kind) · "
+            + "\(annotation.end - annotation.start + 1) characters"
     }
 
     /// What an annotation found in the PDF is called in the list.

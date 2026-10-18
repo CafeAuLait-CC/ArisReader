@@ -80,6 +80,10 @@ enum AnnotationSidecar {
     /// back a half-understood entry.
     private static let knownAnnotationKeys: Set<String> = [
         "id", "kind", "page", "start", "end", "color", "colorIndex", "note", "createdAt",
+        // Geometry entries (`ink`, `square`, `circle`, `line`, `arrow`) carry a schema version
+        // and page-space geometry. A build that does not know those keys — or that knows the
+        // kind but not this version — preserves the entry verbatim instead of guessing.
+        "version", "paths", "rect", "lineStart", "lineEnd", "strokeWidth",
     ]
 
     /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
@@ -137,16 +141,24 @@ enum AnnotationSidecar {
             // interpret is kept verbatim and skipped while rendering — never dropped, and
             // never a reason to reject the whole file.
             let unknownKeys = Set(object.keys).subtracting(knownAnnotationKeys)
-            let kindUnderstood = kindText == nil
-                || AppState.Annotation.Kind(rawValue: kindText ?? "") != nil
+            let kind = kindText.flatMap(AppState.Annotation.Kind.init(rawValue:))
+            let kindUnderstood = kindText == nil || kind != nil
             // Either colour shape counts as understood: this version's `color`, or the older
             // `colorIndex` when it names a palette entry. An entry with neither, or with an
             // index outside the palette, is preserved rather than guessed at.
             let colorUnderstood = (object["color"] as? String).map { AnnotationColor(hex: $0) != nil }
                 ?? (object["colorIndex"] as? Int).map { $0 >= 0 && $0 < paletteCount }
                 ?? false
+            // A geometry entry is versioned. Text entries are the shape every older build
+            // knows and carry no version; if one appears, a newer build wrote it and this one
+            // must preserve it rather than interpret fields it does not know.
+            let versionUnderstood: Bool = if let kind, kind.isGeometry {
+                (object["version"] as? Int) == AppState.Annotation.geometryVersion
+            } else {
+                object["version"] == nil
+            }
 
-            guard unknownKeys.isEmpty, kindUnderstood, colorUnderstood else {
+            guard unknownKeys.isEmpty, kindUnderstood, colorUnderstood, versionUnderstood else {
                 slots.append(.opaque(element))
                 continue
             }
@@ -160,8 +172,15 @@ enum AnnotationSidecar {
             guard annotation.page >= 0, annotation.page < pageCount else {
                 throw SidecarError.structure("page \(annotation.page + 1) is outside the document")
             }
-            guard annotation.start >= 0, annotation.end >= annotation.start else {
-                throw SidecarError.structure("invalid character range \(annotation.start)…\(annotation.end)")
+            if annotation.kind.isGeometry {
+                guard annotation.hasValidGeometry else {
+                    throw SidecarError.structure(
+                        "an \(annotation.kind.rawValue) entry has incomplete or non-finite geometry")
+                }
+            } else {
+                guard annotation.start >= 0, annotation.end >= annotation.start else {
+                    throw SidecarError.structure("invalid character range \(annotation.start)…\(annotation.end)")
+                }
             }
             guard seenIDs.insert(annotation.id).inserted else {
                 throw SidecarError.structure("duplicate annotation identity")

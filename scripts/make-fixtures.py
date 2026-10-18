@@ -480,6 +480,134 @@ def annotated_page_fixture() -> dict[int, list[bytes]]:
     }
 
 
+def stroke_appearance(bbox: tuple[float, float, float, float], content: str) -> bytes:
+    """A `/AP /N` Form XObject that strokes `content` in page coordinates.
+
+    The content is written in page space and the `/Matrix` moves the page origin to the
+    annotation's bottom-left, so the form's `/BBox` is its annotation's `/Rect` — the same
+    construction a PDF editor uses for a pen stroke or a shape. There is no `/ExtGState`:
+    these kinds have no blend-mode problem, and a viewer that synthesises from the geometry
+    draws the same thing.
+    """
+    left, bottom, _, _ = bbox
+    stream = content.encode("ascii") + b"\n"
+    body = (
+        f"<< /Type /XObject /Subtype /Form /FormType 1 "
+        f"/BBox [{bbox[0]:g} {bbox[1]:g} {bbox[2]:g} {bbox[3]:g}] "
+        f"/Matrix [1 0 0 1 {-left:g} {-bottom:g}] "
+        f"/Resources << >> "
+        f"/Length {len(stream)} >>\nstream\n"
+    ).encode("ascii") + stream + b"endstream"
+    return body
+
+
+def annotated_strokes_fixture() -> tuple[dict[int, list[bytes]], list[bytes]]:
+    """Ink and shape annotations written by another producer, not by Lyra.
+
+    This is the reader-side half of T3.4: a file whose `/InkList`, `/L`, `/LE`, `/BS` and
+    `/C` were written by something else. The ink is a real path list (not the malformed flat
+    form `annotated-notes.pdf` carries), the square and circle are stroked, one line has
+    `/LE [/None /ClosedArrow]`, and every annotation carries an `/AP`. The reader must report
+    the geometry and draw it from the dictionary even though the appearance stream is there.
+
+    Object numbering: one A4 page, five annotations (ids 6–10), and their appearance streams
+    are the five objects `first_extra_object_id(1, 5) …`.
+    """
+    boxes = {
+        "ink": (80, 620, 260, 710),
+        "square": (300, 620, 480, 700),
+        "circle": (80, 480, 240, 580),
+        "arrow": (300, 480, 480, 580),
+        "line": (80, 380, 280, 440),
+    }
+    base = first_extra_object_id(1, len(boxes))
+    ref = lambda index: base + index  # noqa: E731
+    # The five ids follow the five annotations in page order.
+    annotations = {
+        0: [
+            annotation(
+                "Ink",
+                boxes["ink"],
+                extra=f"/C [0.85 0.15 0.1] /CA 0.8 "
+                f"/BS << /W 3 /S /S >> "
+                f"/InkList [[90 650 120 680 160 640 240 700]] "
+                f"/AP << /N {ref(0)} 0 R >>",
+                contents="Ink written by another producer.",
+                author="Another Writer",
+                modified="D:20240202020202Z",
+                name="external-ink",
+            ),
+            annotation(
+                "Square",
+                boxes["square"],
+                extra=f"/C [0.1 0.4 0.9] /CA 1 "
+                f"/BS << /W 2 /S /S >> /AP << /N {ref(1)} 0 R >>",
+                contents="A stroked rectangle.",
+                author="Another Writer",
+                modified="D:20240202020202Z",
+                name="external-square",
+            ),
+            annotation(
+                "Circle",
+                boxes["circle"],
+                extra=f"/C [0.15 0.6 0.2] /CA 1 "
+                f"/BS << /W 1.5 /S /S >> /AP << /N {ref(2)} 0 R >>",
+                contents="A stroked ellipse.",
+                author="Another Writer",
+                modified="D:20240202020202Z",
+                name="external-circle",
+            ),
+            annotation(
+                "Line",
+                boxes["arrow"],
+                extra=f"/C [0.6 0.2 0.7] /CA 1 /L [310 490 470 570] "
+                f"/LE [/None /ClosedArrow] /Subj (Arrow) "
+                f"/BS << /W 2.5 /S /S >> /AP << /N {ref(3)} 0 R >>",
+                contents="An arrow.",
+                author="Another Writer",
+                modified="D:20240202020202Z",
+                name="external-arrow",
+            ),
+            annotation(
+                "Line",
+                boxes["line"],
+                extra=f"/C [0.2 0.2 0.2] /CA 1 /L [90 390 270 430] "
+                f"/LE [/None /None] /BS << /W 1 /S /S >> /AP << /N {ref(4)} 0 R >>",
+                contents="A plain line.",
+                author="Another Writer",
+                modified="D:20240202020202Z",
+                name="external-line",
+            ),
+        ]
+    }
+    extras = [
+        stroke_appearance(
+            boxes["ink"],
+            "0.85 0.15 0.1 RG 3 w 1 J 1 j 90 650 m 120 680 l 160 640 l 240 700 l S",
+        ),
+        stroke_appearance(
+            boxes["square"],
+            "0.1 0.4 0.9 RG 2 w 301 621 178 78 re S",
+        ),
+        stroke_appearance(
+            boxes["circle"],
+            "0.15 0.6 0.2 RG 1.5 w 160 579 m 203.6 579 239 557.1 239 530 c "
+            "239 502.9 203.6 481 160 481 c 116.4 481 81 502.9 81 530 c "
+            "81 557.1 116.4 579 160 579 c S",
+        ),
+        stroke_appearance(
+            boxes["arrow"],
+            "0.6 0.2 0.7 RG 2.5 w 310 490 m 470 570 l S "
+            "0.6 0.2 0.7 rg 470 570 m 456 560 l 462 574 l f",
+        ),
+        stroke_appearance(
+            boxes["line"],
+            "0.2 0.2 0.2 RG 1 w 90 390 m 270 430 l S",
+        ),
+    ]
+    return annotations, extras
+
+
 def annotated_appearance_fixture(pages: int) -> tuple[dict[int, list[bytes]], list[bytes]]:
     """Annotations that carry an `/AP`, the shape Preview and Acrobat actually write.
 
@@ -1415,6 +1543,23 @@ def main() -> int:
     path = out_dir / "annotated-appearance.pdf"
     path.write_bytes(build_pdf(appearance_pages, appearance_annotations, appearance_extras))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(appearance_pages)} page(s))")
+
+    # Ink and shapes written by another producer: the reading half of T3.4. Kept separate from
+    # annotated.pdf so the existing annotation corpus' counts and fixture bytes do not move.
+    stroke_pages = [
+        (
+            text_page(
+                "Annotated with ink and shapes",
+                "strokes and shapes written by another producer",
+                [f"Line {number}: another writer's ink and shapes." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    stroke_annotations, stroke_extras = annotated_strokes_fixture()
+    path = out_dir / "annotated-strokes.pdf"
+    path.write_bytes(build_pdf(stroke_pages, stroke_annotations, stroke_extras))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(stroke_pages)} page(s))")
 
     # Navigation borders must render even when content annotations are drawn by the shell.
     link_borders = [

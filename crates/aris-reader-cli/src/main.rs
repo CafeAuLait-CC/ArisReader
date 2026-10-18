@@ -474,6 +474,7 @@ struct DrawAccount {
     markup: usize,
     notes: usize,
     free_text: usize,
+    geometry: usize,
     skipped: usize,
     /// How many skips each reason accounts for, in the order the reasons are first seen.
     reasons: Vec<(&'static str, usize)>,
@@ -485,6 +486,7 @@ impl DrawAccount {
             aris_reader_core::AnnotationDrawing::Markup => self.markup += 1,
             aris_reader_core::AnnotationDrawing::NoteIcon => self.notes += 1,
             aris_reader_core::AnnotationDrawing::FreeText => self.free_text += 1,
+            aris_reader_core::AnnotationDrawing::Geometry => self.geometry += 1,
             aris_reader_core::AnnotationDrawing::Skipped(reason) => {
                 self.skipped += 1;
                 let name = reason.as_str();
@@ -499,12 +501,13 @@ impl DrawAccount {
     /// The file's accounting on one line: what is drawn, and every annotation that is not.
     fn summary(&self) -> String {
         let mut line = format!(
-            "{} content annotation(s): {} markup + {} note icon(s) + {} free text drawn, \
-             {} skipped",
+            "{} content annotation(s): {} markup + {} note icon(s) + {} free text + {} ink/shape \
+             drawn, {} skipped",
             self.total(),
             self.markup,
             self.notes,
             self.free_text,
+            self.geometry,
             self.skipped
         );
         if !self.reasons.is_empty() {
@@ -657,6 +660,7 @@ fn describe_draw(annotation: &aris_reader_core::RawAnnotation) -> String {
                 AnnotationSkipReason::Unmodelled => {
                     "this build has no drawing rule for that /Subtype"
                 }
+                AnnotationSkipReason::EmptyGeometry => "it carries no /InkList or /L to draw",
             };
             format!(
                 "skipped ({}: {because}) — the sidebar still lists it",
@@ -686,6 +690,51 @@ fn describe_draw(annotation: &aris_reader_core::RawAnnotation) -> String {
                 "free text, {} character(s) at {size}, {}-aligned, in {}",
                 text.chars().count(),
                 annotation.alignment.as_str(),
+                ink(
+                    red,
+                    green,
+                    blue,
+                    (opacity * 255.0).round().clamp(0.0, 255.0) as u8
+                )
+            )
+        }
+        AnnotationDrawing::Geometry => {
+            let width = annotation.border_width.map_or_else(
+                || "1 pt (the PDF default)".to_string(),
+                |w| format!("{w:.2} pt"),
+            );
+            let points: usize = annotation.ink_paths.iter().map(Vec::len).sum();
+            let geometry = match annotation.kind {
+                aris_reader_core::RawAnnotationKind::Ink => {
+                    format!(
+                        "ink, {} stroke(s) / {points} point(s)",
+                        annotation.ink_paths.len()
+                    )
+                }
+                aris_reader_core::RawAnnotationKind::Line => match annotation.line {
+                    Some(line) => format!(
+                        "line from ({:.1},{:.1}) to ({:.1},{:.1}){}",
+                        line.start.x,
+                        line.start.y,
+                        line.end.x,
+                        line.end.y,
+                        if annotation.line_arrow {
+                            " with an arrowhead"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => "line without /L".to_string(),
+                },
+                aris_reader_core::RawAnnotationKind::Square => "rectangle".to_string(),
+                aris_reader_core::RawAnnotationKind::Circle => "ellipse".to_string(),
+                _ => "stroked geometry".to_string(),
+            };
+            let (red, green, blue) = annotation
+                .color
+                .map_or((0x80, 0x80, 0x80), |c| (c.red, c.green, c.blue));
+            format!(
+                "{geometry}, stroked {width} in {}",
                 ink(
                     red,
                     green,

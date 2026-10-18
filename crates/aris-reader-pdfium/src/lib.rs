@@ -47,6 +47,8 @@ mod annotations;
 #[cfg(feature = "pdfium")]
 mod backend;
 #[cfg(feature = "pdfium")]
+mod geometry_write;
+#[cfg(feature = "pdfium")]
 mod page_ops;
 #[cfg(not(feature = "pdfium"))]
 mod stub;

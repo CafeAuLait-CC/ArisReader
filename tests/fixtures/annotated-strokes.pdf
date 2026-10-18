@@ -1,0 +1,121 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>
+endobj
+5 0 obj
+<< /Length 1078 >>
+stream
+BT /F1 28 Tf 72 760 Td (Annotated with ink and shapes) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (strokes and shapes written by another producer) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Line 1: another writer's ink and shapes.) Tj T*
+(Line 2: another writer's ink and shapes.) Tj T*
+(Line 3: another writer's ink and shapes.) Tj T*
+(Line 4: another writer's ink and shapes.) Tj T*
+(Line 5: another writer's ink and shapes.) Tj T*
+(Line 6: another writer's ink and shapes.) Tj T*
+(Line 7: another writer's ink and shapes.) Tj T*
+(Line 8: another writer's ink and shapes.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Ink /Rect [80 620 260 710] /C [0.85 0.15 0.1] /CA 0.8 /BS << /W 3 /S /S >> /InkList [[90 650 120 680 160 640 240 700]] /AP << /N 11 0 R >> /Contents (Ink written by another producer.) /T (Another Writer) /M (D:20240202020202Z) /NM (external-ink) /F 4 >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Square /Rect [300 620 480 700] /C [0.1 0.4 0.9] /CA 1 /BS << /W 2 /S /S >> /AP << /N 12 0 R >> /Contents (A stroked rectangle.) /T (Another Writer) /M (D:20240202020202Z) /NM (external-square) /F 4 >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Circle /Rect [80 480 240 580] /C [0.15 0.6 0.2] /CA 1 /BS << /W 1.5 /S /S >> /AP << /N 13 0 R >> /Contents (A stroked ellipse.) /T (Another Writer) /M (D:20240202020202Z) /NM (external-circle) /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Line /Rect [300 480 480 580] /C [0.6 0.2 0.7] /CA 1 /L [310 490 470 570] /LE [/None /ClosedArrow] /Subj (Arrow) /BS << /W 2.5 /S /S >> /AP << /N 14 0 R >> /Contents (An arrow.) /T (Another Writer) /M (D:20240202020202Z) /NM (external-arrow) /F 4 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Line /Rect [80 380 280 440] /C [0.2 0.2 0.2] /CA 1 /L [90 390 270 430] /LE [/None /None] /BS << /W 1 /S /S >> /AP << /N 15 0 R >> /Contents (A plain line.) /T (Another Writer) /M (D:20240202020202Z) /NM (external-line) /F 4 >>
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [80 620 260 710] /Matrix [1 0 0 1 -80 -620] /Resources << >> /Length 70 >>
+stream
+0.85 0.15 0.1 RG 3 w 1 J 1 j 90 650 m 120 680 l 160 640 l 240 700 l S
+endstream
+endobj
+12 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [300 620 480 700] /Matrix [1 0 0 1 -300 -620] /Resources << >> /Length 39 >>
+stream
+0.1 0.4 0.9 RG 2 w 301 621 178 78 re S
+endstream
+endobj
+13 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [80 480 240 580] /Matrix [1 0 0 1 -80 -480] /Resources << >> /Length 151 >>
+stream
+0.15 0.6 0.2 RG 1.5 w 160 579 m 203.6 579 239 557.1 239 530 c 239 502.9 203.6 481 160 481 c 116.4 481 81 502.9 81 530 c 81 557.1 116.4 579 160 579 c S
+endstream
+endobj
+14 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [300 480 480 580] /Matrix [1 0 0 1 -300 -480] /Resources << >> /Length 90 >>
+stream
+0.6 0.2 0.7 RG 2.5 w 310 490 m 470 570 l S 0.6 0.2 0.7 rg 470 570 m 456 560 l 462 574 l f
+endstream
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [80 380 280 440] /Matrix [1 0 0 1 -80 -380] /Resources << >> /Length 40 >>
+stream
+0.2 0.2 0.2 RG 1 w 90 390 m 270 430 l S
+endstream
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000385 00000 n 
+0000001515 00000 n 
+0000001810 00000 n 
+0000002052 00000 n 
+0000002294 00000 n 
+0000002584 00000 n 
+0000002853 00000 n 
+0000003082 00000 n 
+0000003282 00000 n 
+0000003593 00000 n 
+0000003844 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+4043
+%%EOF

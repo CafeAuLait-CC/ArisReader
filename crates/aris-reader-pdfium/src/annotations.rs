@@ -78,12 +78,14 @@
 #![allow(unsafe_code)]
 
 use aris_reader_core::{
-    AnnotationAlignment, AnnotationBlend, ArisError, ErrorCode, PageIndex, RawAnnotation,
-    RawAnnotationColor, RawAnnotationKind, Rect, Result,
+    AnnotationAlignment, AnnotationBlend, ArisError, ErrorCode, PageIndex, Point, RawAnnotation,
+    RawAnnotationColor, RawAnnotationKind, RawAnnotationLine, Rect, Result,
 };
 use libloading::Library;
+use lopdf::{Document, LoadOptions, Object};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Opaque PDFium handles (see `fpdfview.h`).
@@ -114,6 +116,14 @@ pub(crate) struct FsQuadPointsF {
     y3: f32,
     x4: f32,
     y4: f32,
+}
+
+/// `FS_POINTF`: one point in page space, used by `/InkList` paths and `/L` endpoints.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FsPointF {
+    x: f32,
+    y: f32,
 }
 
 // `FPDF_ANNOTATION_SUBTYPE` values (fpdf_annot.h). Named because the numbers are meaningless at
@@ -220,6 +230,15 @@ impl StableHash {
 /// takes over. 200 pt is larger than any page heading a reader would annotate with free text.
 const MAX_FONT_SIZE_PT: f64 = 200.0;
 
+/// The largest `/BS /W` this reader reports, in points. A border wider than a page is not a
+/// stroke a reader should draw, and PDFium would otherwise hand its value straight through.
+const MAX_BORDER_WIDTH_PT: f64 = 200.0;
+
+/// A hostile `/InkList` entry cannot make the reader allocate without bound. 100 000 points is
+/// far more than a real freehand stroke (measured: a dense signature-sized stroke is a few
+/// thousand), and less than a page-sized bitmap.
+const MAX_INK_POINTS_PER_PATH: c_ulong = 100_000;
+
 /// The PDFium entry points this module uses, resolved once per process.
 struct Api {
     /// Keeps the dynamic library loaded for as long as the function pointers live.
@@ -249,6 +268,14 @@ struct Api {
         unsafe extern "C" fn(FpdfAnnotation, *const c_char, *mut u16, c_ulong) -> c_ulong,
     get_number_value: unsafe extern "C" fn(FpdfAnnotation, *const c_char, *mut f32) -> c_int,
     get_flags: unsafe extern "C" fn(FpdfAnnotation) -> c_int,
+    /// `/InkList` and `/L` accessors (fpdf_annot.h, experimental but exported by the vendored
+    /// build): the geometry of the two stroked kinds PDFium will not create itself.
+    get_ink_list_count: unsafe extern "C" fn(FpdfAnnotation) -> c_ulong,
+    get_ink_list_path:
+        unsafe extern "C" fn(FpdfAnnotation, c_ulong, *mut FsPointF, c_ulong) -> c_ulong,
+    get_line: unsafe extern "C" fn(FpdfAnnotation, *mut FsPointF, *mut FsPointF) -> c_int,
+    /// `/BS /W`, or the legacy `/Border` width when there is no `/BS`.
+    get_border: unsafe extern "C" fn(FpdfAnnotation, *mut f32, *mut f32, *mut f32) -> c_int,
     set_ap: unsafe extern "C" fn(FpdfAnnotation, c_int, *const u16) -> c_int,
     /// `FPDFAnnot_GetLinkedAnnot`: follows `/IRT` or `/Popup` to another annotation.
     get_linked_annot: unsafe extern "C" fn(FpdfAnnotation, *const c_char) -> FpdfAnnotation,
@@ -290,8 +317,18 @@ pub struct WriteAnnotation {
     pub kind: WriteAnnotationKind,
     /// Outer box, page space. For a markup annotation this is the union of `quads`.
     pub rect: Rect,
-    /// `/QuadPoints`, page space. Empty for a note.
+    /// `/QuadPoints`, page space. Empty for a note and for every stroked geometry kind.
     pub quads: Vec<Rect>,
+    /// `/InkList`, page space. One stroke per entry; empty for every kind except ink.
+    pub ink_paths: Vec<Vec<Point>>,
+    /// `/L`, page space. `Some` for a line or arrow and `None` for every other kind.
+    pub line: Option<RawAnnotationLine>,
+    /// Whether a line carries an arrowhead (`/LE`, plus `/Subj (Arrow)` for readers that only
+    /// look there).
+    pub line_arrow: bool,
+    /// `/BS /W`, in points. Always positive; written for every stroked geometry kind and
+    /// ignored for the quad-based kinds.
+    pub border_width: f64,
     pub color: [u8; 3],
     /// `/CA`; 1.0 means fully opaque and is still written, because the shell's model carries
     /// an opacity for every annotation.
@@ -312,6 +349,14 @@ pub enum WriteAnnotationKind {
     Underline,
     /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
     Text,
+    /// `/Ink`: a freehand stroke list. Written with `/InkList` and `/BS`.
+    Ink,
+    /// `/Square`: a stroked rectangle. Written with `/Rect` and `/BS`.
+    Square,
+    /// `/Circle`: a stroked ellipse. Written with `/Rect` and `/BS`.
+    Circle,
+    /// `/Line`: a line from `/L`, optionally with an arrowhead (`/LE`, `line_arrow`).
+    Line,
 }
 
 impl WriteAnnotationKind {
@@ -320,16 +365,48 @@ impl WriteAnnotationKind {
             Self::Highlight => ANNOT_HIGHLIGHT,
             Self::Underline => ANNOT_UNDERLINE,
             Self::Text => ANNOT_TEXT,
+            Self::Ink => ANNOT_INK,
+            Self::Square => ANNOT_SQUARE,
+            Self::Circle => ANNOT_CIRCLE,
+            Self::Line => ANNOT_LINE,
+        }
+    }
+
+    /// The PDF `/Subtype` name for this kind.
+    pub(crate) fn pdf_name(self) -> &'static str {
+        match self {
+            Self::Highlight => "Highlight",
+            Self::Underline => "Underline",
+            Self::Text => "Text",
+            Self::Ink => "Ink",
+            Self::Square => "Square",
+            Self::Circle => "Circle",
+            Self::Line => "Line",
         }
     }
 
     /// `/Subj` (the subject line a viewer shows in the annotation list).
-    fn subject(self) -> &'static str {
+    pub(crate) fn subject(self) -> &'static str {
         match self {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::Text => "Note",
+            Self::Ink => "Ink",
+            Self::Square => "Square",
+            Self::Circle => "Circle",
+            Self::Line => "Line",
         }
+    }
+
+    /// Whether this kind is written through PDFium's `FPDFPage_CreateAnnot`.
+    ///
+    /// PDFium will not create `/Line` at all (`FPDFPage_CreateAnnot` returns null), and none of
+    /// the stroked kinds can carry `/BS` or an appearance stream through its C API: the only
+    /// border setter writes `/Border`, and the only appearance setter stores a text string
+    /// rather than a form XObject. Those three facts are why the stroked kinds go through the
+    /// dictionary writer in `geometry_write` and the quad-based kinds keep the PDFium path.
+    pub(crate) fn uses_pdfium(self) -> bool {
+        matches!(self, Self::Highlight | Self::Underline | Self::Text)
     }
 }
 
@@ -438,6 +515,10 @@ unsafe fn resolve(library: Library) -> Option<Api> {
         get_string_value: unsafe { symbol(&library, b"FPDFAnnot_GetStringValue\0")? },
         get_number_value: unsafe { symbol(&library, b"FPDFAnnot_GetNumberValue\0")? },
         get_flags: unsafe { symbol(&library, b"FPDFAnnot_GetFlags\0")? },
+        get_ink_list_count: unsafe { symbol(&library, b"FPDFAnnot_GetInkListCount\0")? },
+        get_ink_list_path: unsafe { symbol(&library, b"FPDFAnnot_GetInkListPath\0")? },
+        get_line: unsafe { symbol(&library, b"FPDFAnnot_GetLine\0")? },
+        get_border: unsafe { symbol(&library, b"FPDFAnnot_GetBorder\0")? },
         set_ap: unsafe { symbol(&library, b"FPDFAnnot_SetAP\0")? },
         get_linked_annot: unsafe { symbol(&library, b"FPDFAnnot_GetLinkedAnnot\0")? },
         _library: library,
@@ -845,6 +926,16 @@ fn set_string(
 pub struct AnnotationReader {
     api: &'static Api,
     document: FpdfDocument,
+    /// The file this reader opened. Kept for the two dictionary facts PDFium's C ABI does not
+    /// expose: a line's `/LE` endings are read with lopdf, keyed by `/NM`.
+    path: PathBuf,
+    password: Option<String>,
+    /// Annotation name → "has an arrowhead", built once on the first `/Line` read.
+    line_endings: OnceLock<HashMap<String, bool>>,
+    /// Annotation name → `/BS /W` (or the legacy `/Border` width), built on the first stroked
+    /// read. PDFium's `FPDFAnnot_GetBorder` reads `/Border` but not the `/BS` dictionary this
+    /// writer uses, so the dictionary itself is the authority here.
+    border_widths: OnceLock<HashMap<String, f64>>,
 }
 
 // SAFETY: raw PDFium handles are not thread-safe, and these markers are only sound because every
@@ -867,6 +958,8 @@ impl AnnotationReader {
             .with_detail("missing one of the FPDFAnnot_* / FPDFPage_*Annot* entry points"));
         };
 
+        let source_path = path.to_path_buf();
+        let source_password = password.map(str::to_owned);
         let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             ArisError::new(
                 ErrorCode::InvalidArgument,
@@ -898,7 +991,14 @@ impl AnnotationReader {
             .with_detail(format!("path: {}", path.to_string_lossy())));
         }
 
-        Ok(Self { api, document })
+        Ok(Self {
+            api,
+            document,
+            path: source_path,
+            password: source_password,
+            line_endings: OnceLock::new(),
+            border_widths: OnceLock::new(),
+        })
     }
 
     /// Every content annotation on `page`, in the order the document stores them.
@@ -969,7 +1069,32 @@ impl AnnotationReader {
         );
 
         let kind = subtype_kind(subtype);
+        // The identity is needed before the line geometry: `/LE` is read through lopdf, which
+        // keys the answer by `/NM`. Reading it here also keeps one identity derivation.
+        let id = self.identity(handle, subtype);
         let quads = self.quad_points(handle);
+        let ink_paths = if kind == RawAnnotationKind::Ink {
+            self.ink_paths(handle)
+        } else {
+            Vec::new()
+        };
+        let line = if kind == RawAnnotationKind::Line {
+            self.line(handle)
+        } else {
+            None
+        };
+        let line_arrow = kind == RawAnnotationKind::Line && self.line_is_arrow(&id, handle);
+        let border_width = if matches!(
+            kind,
+            RawAnnotationKind::Ink
+                | RawAnnotationKind::Square
+                | RawAnnotationKind::Circle
+                | RawAnnotationKind::Line
+        ) {
+            self.border_width(handle, &id)
+        } else {
+            None
+        };
         let color = self.color(handle);
         let opacity = self.opacity(handle);
         // The file's own `/BM` wins; when it states none, the kind's measured default does (a
@@ -987,7 +1112,6 @@ impl AnnotationReader {
         // Finish reading the child before following `/IRT`: closing the linked handle must not
         // be able to invalidate a field this annotation still has to report, even if a malformed
         // file links an annotation to itself.
-        let id = self.identity(handle, subtype);
         let contents = self.string(handle, c"Contents");
         let author = self.string(handle, c"T");
         let modified = self.string(handle, c"M");
@@ -1013,6 +1137,10 @@ impl AnnotationReader {
             kind,
             rect,
             quads,
+            ink_paths,
+            line,
+            line_arrow,
+            border_width,
             color,
             opacity,
             blend,
@@ -1100,6 +1228,119 @@ impl AnnotationReader {
             ));
         }
         quads
+    }
+
+    /// `/InkList`, one page-space polyline per stroke.
+    ///
+    /// PDFium's two-step pattern: a null buffer returns the point count, then a buffer of that
+    /// size is filled. A malformed entry is skipped rather than failing the whole annotation —
+    /// the sidebar should still be able to say "an ink annotation is here".
+    fn ink_paths(&self, handle: FpdfAnnotation) -> Vec<Vec<Point>> {
+        // SAFETY: `handle` is live; the count is the number of paths in the ink list.
+        let count = unsafe { (self.api.get_ink_list_count)(handle) };
+        let mut paths = Vec::new();
+        for index in 0..count {
+            // SAFETY: `index` is inside the count just read. A null buffer with length 0 asks
+            // for the point count and touches no memory.
+            let length =
+                unsafe { (self.api.get_ink_list_path)(handle, index, std::ptr::null_mut(), 0) };
+            // A path larger than a whole page's worth of samples is malformed; the limit also
+            // keeps a hostile file from making the reader allocate without bound.
+            if length == 0 || length > MAX_INK_POINTS_PER_PATH {
+                continue;
+            }
+            let mut points = vec![FsPointF::default(); length as usize];
+            // SAFETY: `points` has room for `length` points, which is what the call writes.
+            let written =
+                unsafe { (self.api.get_ink_list_path)(handle, index, points.as_mut_ptr(), length) };
+            let points: Vec<Point> = points
+                .into_iter()
+                .take(written as usize)
+                .filter(|point| point.x.is_finite() && point.y.is_finite())
+                .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
+                .collect();
+            if !points.is_empty() {
+                paths.push(points);
+            }
+        }
+        paths
+    }
+
+    /// `/L`, the two endpoints of a `/Line` annotation, in page space.
+    fn line(&self, handle: FpdfAnnotation) -> Option<RawAnnotationLine> {
+        let mut start = FsPointF::default();
+        let mut end = FsPointF::default();
+        // SAFETY: `handle` is live and both out-pointers are valid.
+        let ok = unsafe { (self.api.get_line)(handle, &mut start, &mut end) };
+        if ok == 0
+            || ![start.x, start.y, end.x, end.y]
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        Some(RawAnnotationLine {
+            start: Point::new(f64::from(start.x), f64::from(start.y)),
+            end: Point::new(f64::from(end.x), f64::from(end.y)),
+        })
+    }
+
+    /// `/BS /W` (or the legacy `/Border` width) in points, when it is usable.
+    ///
+    /// The map read from the dictionary wins: it sees `/BS`, which PDFium's accessor does not.
+    /// PDFium's answer is the fallback for a file whose dictionary could not be read a second
+    /// time (a damaged file still has its geometry through PDFium).
+    fn border_width(&self, handle: FpdfAnnotation, id: &str) -> Option<f64> {
+        if let Some(name) = id.strip_prefix("nm:")
+            && let Some(width) = self.border_widths().get(name).copied()
+        {
+            return Some(width);
+        }
+        let (mut horizontal, mut vertical, mut width) = (0.0f32, 0.0f32, 0.0f32);
+        // SAFETY: `handle` is live and the three out-pointers are valid.
+        let ok =
+            unsafe { (self.api.get_border)(handle, &mut horizontal, &mut vertical, &mut width) };
+        if ok == 0 || !horizontal.is_finite() || !vertical.is_finite() {
+            return None;
+        }
+        let width = f64::from(width);
+        (width.is_finite() && width > 0.0 && width <= MAX_BORDER_WIDTH_PT).then_some(width)
+    }
+
+    /// Whether a `/Line` annotation says it has an arrowhead.
+    ///
+    /// Two sources, because producers disagree: this writer puts `/Subj (Arrow)` beside a
+    /// standard `/LE`, while other writers only put `/LE`. PDFium exposes neither array nor
+    /// name list, so `/LE` comes from a lopdf read of the same file, keyed by `/NM`.
+    fn line_is_arrow(&self, id: &str, handle: FpdfAnnotation) -> bool {
+        if self
+            .string(handle, c"Subj")
+            .is_some_and(|subject| subject.to_ascii_lowercase().contains("arrow"))
+        {
+            return true;
+        }
+        let Some(name) = id.strip_prefix("nm:") else {
+            return false;
+        };
+        self.line_endings().get(name).copied().unwrap_or(false)
+    }
+
+    /// The `/BS` map for this document, read once.
+    fn border_widths(&self) -> &HashMap<String, f64> {
+        self.border_widths.get_or_init(|| {
+            read_border_widths(&self.path, self.password.as_deref()).unwrap_or_default()
+        })
+    }
+
+    /// The `/LE` map for this document, read once.
+    ///
+    /// A failure to parse the file a second time is not an error here: the annotation is still
+    /// a line, and drawing it without an arrowhead is better than turning "PDFium could read the
+    /// geometry but lopdf could not re-open the file" into a failed page.
+    fn line_endings(&self) -> &HashMap<String, bool> {
+        self.line_endings.get_or_init(|| {
+            read_line_endings(&self.path, self.password.as_deref()).unwrap_or_default()
+        })
     }
 
     /// `/C`, but only when the file actually carries it.
@@ -1327,6 +1568,183 @@ fn is_content_annotation(subtype: c_ulong) -> bool {
 /// Subtypes outside the four text-markup kinds, sticky notes and free text keep their PDF name:
 /// an `Ink` or `Stamp` annotation is still worth listing for the user even though this build does
 /// not draw it.
+/// The `/BS /W` (else `/Border`) width of every annotation, keyed by `/NM`.
+///
+/// `/BS` supersedes `/Border` when both are present (PDF 32000-1 12.5.4). The value is read
+/// from the dictionary rather than through PDFium because the vendored build's
+/// `FPDFAnnot_GetBorder` reports the `/Border` default of 1 pt for an annotation that only
+/// states `/BS` — measured on the write-back round trip, where a 3 pt ink border came back as
+/// 1 pt.
+fn read_border_widths(path: &Path, password: Option<&str>) -> Option<HashMap<String, f64>> {
+    let options = LoadOptions {
+        password: password.map(str::to_owned),
+        max_decompressed_size: Some(64 * 1024 * 1024),
+        ..LoadOptions::default()
+    };
+    let document = Document::load_with_options(path, options).ok()?;
+    let mut widths = HashMap::new();
+    for (_, page_id) in document.get_pages() {
+        let Ok(page) = document.get_dictionary(page_id) else {
+            continue;
+        };
+        let Some(annots) =
+            deref(&document, page.get(b"Annots").ok()?).and_then(|object| object.as_array().ok())
+        else {
+            continue;
+        };
+        for object in annots {
+            let Some(annotation) =
+                deref(&document, object).and_then(|object| object.as_dict().ok())
+            else {
+                continue;
+            };
+            let Some(name) = annotation
+                .get(b"NM")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(pdf_string)
+            else {
+                continue;
+            };
+            let width = annotation
+                .get(b"BS")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(|object| object.as_dict().ok())
+                .and_then(|bs| {
+                    bs.get(b"W")
+                        .ok()
+                        .and_then(|object| deref(&document, object))
+                        .and_then(number)
+                })
+                .or_else(|| {
+                    annotation
+                        .get(b"Border")
+                        .ok()
+                        .and_then(|object| deref(&document, object))
+                        .and_then(|object| object.as_array().ok())
+                        .and_then(|array| array.get(2))
+                        .and_then(|object| deref(&document, object))
+                        .and_then(number)
+                });
+            if let Some(width) = width
+                && width.is_finite()
+                && width > 0.0
+                && f64::from(width) <= MAX_BORDER_WIDTH_PT
+            {
+                widths.insert(name, f64::from(width));
+            }
+        }
+    }
+    Some(widths)
+}
+
+/// The `/LE` line-ending map of a PDF, keyed by `/NM`.
+/// The `/LE` line-ending map of a PDF, keyed by `/NM`.
+///
+/// PDF 32000-1 table 184 stores line endings as names (`/ClosedArrow`, `/OpenArrow`, …) in an
+/// array that starts with the start ending. This reader only needs "does either end name an
+/// arrow", not the shape: the canvas draws the one arrow this application creates. `/Subj` and
+/// `/IT /LineArrow` are accepted because producers use them too, and because our own writer
+/// states `/Subj (Arrow)` beside the standard `/LE`.
+fn read_line_endings(path: &Path, password: Option<&str>) -> Option<HashMap<String, bool>> {
+    let options = LoadOptions {
+        password: password.map(str::to_owned),
+        max_decompressed_size: Some(64 * 1024 * 1024),
+        ..LoadOptions::default()
+    };
+    let document = Document::load_with_options(path, options).ok()?;
+    let mut endings = HashMap::new();
+    for (_, page_id) in document.get_pages() {
+        let Ok(page) = document.get_dictionary(page_id) else {
+            continue;
+        };
+        let Some(annots) =
+            deref(&document, page.get(b"Annots").ok()?).and_then(|o| o.as_array().ok())
+        else {
+            continue;
+        };
+        for object in annots {
+            let Some(annotation) = deref(&document, object).and_then(|o| o.as_dict().ok()) else {
+                continue;
+            };
+            if annotation.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Line") {
+                continue;
+            }
+            let Some(name) = annotation
+                .get(b"NM")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(pdf_string)
+            else {
+                continue;
+            };
+            let mut arrow = annotation
+                .get(b"Subj")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(pdf_string)
+                .is_some_and(|subject| subject.to_ascii_lowercase().contains("arrow"));
+            arrow |= annotation
+                .get(b"IT")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(|object| object.as_name().ok())
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"LineArrow"));
+            if let Some(le) = annotation
+                .get(b"LE")
+                .ok()
+                .and_then(|object| deref(&document, object))
+                .and_then(|object| object.as_array().ok())
+            {
+                arrow |= le.iter().any(|object| {
+                    deref(&document, object)
+                        .and_then(|object| object.as_name().ok())
+                        .is_some_and(|name| {
+                            !name.eq_ignore_ascii_case(b"None")
+                                && name
+                                    .windows(5)
+                                    .any(|window| window.eq_ignore_ascii_case(b"arrow"))
+                        })
+                });
+            }
+            endings.insert(name, arrow);
+        }
+    }
+    Some(endings)
+}
+
+fn number(object: &Object) -> Option<f32> {
+    match object {
+        Object::Integer(value) => Some(*value as f32),
+        Object::Real(value) if value.is_finite() => Some(*value),
+        _ => None,
+    }
+}
+
+fn deref<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
+    document.dereference(object).ok().map(|(_, object)| object)
+}
+
+/// A PDF string as text: UTF-16BE with a BOM when it has one, UTF-8/Latin-1 otherwise.
+///
+/// `/NM` is an ASCII annotation name in every file this reader is tested against, but `/Subj`
+/// is human text and may be a PDFDocEncoding or UTF-16 string. A lossy decode is the honest
+/// answer here: the only consumer is an arrowhead flag.
+fn pdf_string(object: &Object) -> Option<String> {
+    let bytes = object.as_str().ok()?;
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .filter(|pair| pair.len() == 2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    } else {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 fn subtype_kind(subtype: c_ulong) -> RawAnnotationKind {
     match subtype {
         ANNOT_HIGHLIGHT => RawAnnotationKind::Highlight,
@@ -1341,14 +1759,14 @@ fn subtype_kind(subtype: c_ulong) -> RawAnnotationKind {
         // PDFium reports 0 for a `/Subtype` name it does not recognise, which is also the right
         // answer for us: the annotation stays readable (rect, contents, author) but unclassified.
         0 => RawAnnotationKind::Other("Unknown".to_string()),
-        ANNOT_LINE => RawAnnotationKind::Other("Line".to_string()),
-        ANNOT_SQUARE => RawAnnotationKind::Other("Square".to_string()),
-        ANNOT_CIRCLE => RawAnnotationKind::Other("Circle".to_string()),
+        ANNOT_LINE => RawAnnotationKind::Line,
+        ANNOT_SQUARE => RawAnnotationKind::Square,
+        ANNOT_CIRCLE => RawAnnotationKind::Circle,
         ANNOT_POLYGON => RawAnnotationKind::Other("Polygon".to_string()),
         ANNOT_POLYLINE => RawAnnotationKind::Other("Polyline".to_string()),
         ANNOT_STAMP => RawAnnotationKind::Other("Stamp".to_string()),
         ANNOT_CARET => RawAnnotationKind::Other("Caret".to_string()),
-        ANNOT_INK => RawAnnotationKind::Other("Ink".to_string()),
+        ANNOT_INK => RawAnnotationKind::Ink,
         ANNOT_POPUP => RawAnnotationKind::Other("Popup".to_string()),
         ANNOT_FILEATTACHMENT => RawAnnotationKind::Other("FileAttachment".to_string()),
         ANNOT_SOUND => RawAnnotationKind::Other("Sound".to_string()),
@@ -1454,10 +1872,10 @@ mod tests {
         assert_eq!(subtype_kind(ANNOT_SQUIGGLY), RawAnnotationKind::Squiggly);
         assert_eq!(subtype_kind(ANNOT_TEXT), RawAnnotationKind::Text);
         assert_eq!(subtype_kind(ANNOT_FREETEXT), RawAnnotationKind::FreeText);
-        assert_eq!(
-            subtype_kind(ANNOT_INK),
-            RawAnnotationKind::Other("Ink".to_string())
-        );
+        assert_eq!(subtype_kind(ANNOT_INK), RawAnnotationKind::Ink);
+        assert_eq!(subtype_kind(ANNOT_SQUARE), RawAnnotationKind::Square);
+        assert_eq!(subtype_kind(ANNOT_CIRCLE), RawAnnotationKind::Circle);
+        assert_eq!(subtype_kind(ANNOT_LINE), RawAnnotationKind::Line);
         // An unrecognised subtype stays readable, with the number in its name.
         assert_eq!(
             subtype_kind(999),
