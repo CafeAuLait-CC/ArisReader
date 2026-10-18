@@ -1,7 +1,7 @@
 import ArisReaderBindings
 import SwiftUI
 
-/// The editor for a sticky note or text box this reader placed.
+/// The editor for an editable note or text box.
 ///
 /// A PDF's own notes keep the read-only `DocumentNoteOverlay`; this is the editable counterpart
 /// for entries in the sidecar. A sticky note opens a paper beside its icon, the way a reader
@@ -9,8 +9,8 @@ import SwiftUI
 /// text is drawn at, so typing shows the line breaks and size the page will show.
 ///
 /// The text reaches `AppState` on every keystroke so the canvas can lay it out live, but the
-/// sidecar write is coalesced and the whole session becomes one undoable change. `Done` commits,
-/// `Escape` cancels (restoring the text the editor started with).
+/// sidecar write is coalesced and the whole session becomes one undoable change. Notes have a
+/// Done button; text boxes finish on a page click or Command-Return. Escape restores the session.
 struct PlacedTextEditorOverlay: View {
     @ObservedObject var state: AppState
     @State private var text = ""
@@ -21,33 +21,46 @@ struct PlacedTextEditorOverlay: View {
     var body: some View {
         GeometryReader { geometry in
             if let annotation = state.editingAnnotation,
-               let anchor = state.anchorViewRect(page: annotation.page, region: annotation.shapeRect) {
-                let isNote = annotation.kind == .stickyNote
+               let anchor = state.editingAnnotationAnchor {
+                let isNote = annotation.kind != .textBox
                 let frame = isNote
                     ? DocumentNoteLayout.frame(anchor: anchor, viewport: geometry.size)
-                    : textBoxEditorFrame(anchor: anchor, viewport: geometry.size)
-                VStack(spacing: 0) {
-                    header(for: annotation)
-                    Divider()
-                    TextEditor(text: $text)
-                        .focused($focused)
-                        .font(.system(size: isNote ? 13 : max(annotation.fontSize * state.zoomFactor, 9)))
-                        .scrollContentBackground(.hidden)
+                    : anchor
+                Group {
+                    if isNote {
+                        VStack(spacing: 0) {
+                            header(for: annotation)
+                            Divider()
+                            if !missingGlyphs.isEmpty { appearanceWarning }
+                            TextEditor(text: $text)
+                                .focused($focused).font(.system(size: 13))
+                                .scrollContentBackground(.hidden)
+                                .background(LyraTheme.noteBg).foregroundStyle(LyraTheme.noteFg)
+                                .padding(6)
+                                .onExitCommand { state.cancelTextEditing() }
+                        }
                         .background(LyraTheme.noteBg)
-                        .foregroundStyle(LyraTheme.noteFg)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 4)
-                        .onExitCommand { state.cancelTextEditing() }
-                    if !isNote, !missingGlyphs.isEmpty {
-                        Divider()
-                        appearanceWarning
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(LyraTheme.border))
+                        .shadow(color: .black.opacity(0.15), radius: 7, y: 3)
+                    } else {
+                        InlineTextBoxEditor(text: $text,
+                            fontSize: annotation.fontSize * state.zoomFactor,
+                            color: ReadingAppearanceStore.shared.mode.displayColor(annotation.color.nsColor),
+                            onCommit: { state.commitTextEditing() }, onCancel: { state.cancelTextEditing() })
+                            .padding(AnnotationTextFont.padding(size: annotation.fontSize) * state.zoomFactor)
+                            .help("Click the page or press ⌘Return to finish; Esc cancels")
+                            .overlay(alignment: .topLeading) {
+                                if !missingGlyphs.isEmpty {
+                                    appearanceWarning.frame(width: max(220, frame.width))
+                                        .background(LyraTheme.panelBg).offset(y: frame.height + 4)
+                                }
+                            }
+                            .overlay(Rectangle().stroke(LyraTheme.focusRing,
+                                style: StrokeStyle(lineWidth: 1, dash: [4, 3])).allowsHitTesting(false))
                     }
                 }
                 .frame(width: frame.width, height: frame.height)
-                .background(LyraTheme.noteBg)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(LyraTheme.border))
-                .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
                 .position(x: frame.midX, y: frame.midY)
                 .id(annotation.id)
                 .onAppear {
@@ -102,7 +115,8 @@ struct PlacedTextEditorOverlay: View {
     }
 
     private func refreshAppearanceCoverage(_ value: String) {
-        guard !value.isEmpty, let coverage = try? appearanceFontCoverage(text: value) else {
+        guard state.editingAnnotation?.kind.isPlacedText == true,
+              !value.isEmpty, let coverage = try? appearanceFontCoverage(text: value) else {
             missingGlyphs = []
             return
         }
@@ -111,9 +125,9 @@ struct PlacedTextEditorOverlay: View {
 
     private func header(for annotation: AppState.Annotation) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: annotation.kind == .stickyNote ? "note.text" : "textbox")
+            Image(systemName: annotation.kind == .textBox ? "textbox" : "text.bubble")
                 .font(.system(size: 11))
-            Text(annotation.kind == .stickyNote ? "Sticky Note" : "Text Box")
+            Text(annotation.kind == .stickyNote ? "Sticky Note" : "Note")
                 .font(.system(size: 11, weight: .semibold))
             Spacer()
             Button("Cancel") { state.cancelTextEditing() }
@@ -128,16 +142,5 @@ struct PlacedTextEditorOverlay: View {
         .foregroundStyle(LyraTheme.noteFg)
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-    }
-
-    /// A text box's editor sits on the box, but is never smaller than a usable field: a reader
-    /// may create a two-line box and still needs to see what they type.
-    private func textBoxEditorFrame(anchor: CGRect, viewport: CGSize) -> CGRect {
-        let width = max(anchor.width, 120)
-        let height = max(anchor.height, 64)
-        let margin: CGFloat = 6
-        let x = min(max(margin, anchor.minX), max(margin, viewport.width - width - margin))
-        let y = min(max(margin, anchor.minY), max(margin, viewport.height - height - margin))
-        return CGRect(x: x, y: y, width: width, height: height)
     }
 }

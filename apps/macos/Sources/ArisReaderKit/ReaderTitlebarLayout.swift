@@ -113,6 +113,9 @@ public enum TabRowLayout {
 @MainActor public final class ReaderTitlebarLayout {
     private weak var window: NSWindow?
     private var alignmentPending = false
+    private var aligning = false
+    private var frameObservers: [NSObjectProtocol] = []
+    private var observedViews: [NSView] = []
     private var appearanceObservation: NSKeyValueObservation?
 
     public init(window: NSWindow) {
@@ -125,18 +128,39 @@ public enum TabRowLayout {
         // AppKit headers recommend it for appearance observation); it fires for a per-window
         // appearance and for the inherited application/system one, including a theme change that
         // leaves the resolved appearance the same (it is a new `NSAppearance` either way). The
-        // placement itself is scheduled for the next main-queue turn, after AppKit has finished
-        // the titlebar layout that comes with the appearance.
+        // frame observers keep the controls aligned during the appearance transaction, with
+        // a queued pass covering AppKit hierarchy replacements after that transaction.
         appearanceObservation = window.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
             // KVO delivers on the thread that changed the appearance, and a window's
             // appearance is changed on the main thread.
-            MainActor.assumeIsolated { self?.scheduleAlignment() }
+            MainActor.assumeIsolated {
+                self?.alignButtons()
+                self?.scheduleAlignment()
+            }
         }
         scheduleAlignment()
     }
 
-    deinit {
+    isolated deinit {
         appearanceObservation?.invalidate()
+        frameObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    /// AppKit may restore its native frames during the appearance transaction. Correct those
+    /// writes synchronously, before the compositor can display the intermediate 28 pt row.
+    private func observeFrames(_ views: [NSView]) {
+        guard observedViews.count != views.count || !zip(observedViews, views).allSatisfy({ $0 === $1 }) else { return }
+        frameObservers.forEach(NotificationCenter.default.removeObserver)
+        frameObservers = []
+        observedViews = views
+        for view in views {
+            view.postsFrameChangedNotifications = true
+            frameObservers.append(NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification, object: view, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.alignButtons() }
+            })
+        }
     }
 
     public func scheduleAlignment() {
@@ -156,9 +180,15 @@ public enum TabRowLayout {
     public func alignNow() { alignButtons() }
 
     private func alignButtons() {
+        guard !aligning else { return }
+        aligning = true
+        defer { aligning = false }
         guard let window, !window.styleMask.contains(.fullScreen),
               let titlebar = window.standardWindowButton(.closeButton)?.superview,
               let container = titlebar.superview, let frameView = container.superview else { return }
+
+        observeFrames([container, titlebar] + [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+            .compactMap { window.standardWindowButton($0) })
 
         // Extend the native hit area to include the whole tab row. Moving only the buttons
         // would leave their lower edges outside the original, shorter native titlebar. The top

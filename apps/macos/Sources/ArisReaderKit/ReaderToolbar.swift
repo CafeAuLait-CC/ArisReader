@@ -388,7 +388,7 @@ struct ReaderSecondaryToolbar: View {
                 Image(systemName: "square.on.circle")
             }.disabled(state.document == nil)
             pending("Eraser", "eraser")
-            tool("Place a sticky note", "note.text",
+            tool("Place a sticky note", "text.bubble",
                  selected: state.annotationTool == .note) {
                 state.annotationTool = state.annotationTool == .note ? .select : .note
             }.disabled(state.document == nil)
@@ -396,11 +396,7 @@ struct ReaderSecondaryToolbar: View {
                  selected: state.annotationTool == .textBox) {
                 state.annotationTool = state.annotationTool == .textBox ? .select : .textBox
             }.disabled(state.document == nil)
-            tool("Add a note to selected text", "text.bubble") {
-                if let note = ReaderWindow.promptForNote() {
-                    state.addAnnotationFromSelection(kind: .highlight, color: annotationColor, note: note)
-                }
-            }.disabled(state.selection == nil)
+
             pending("Stamps", "seal")
             pending("Signature", "signature")
             separator

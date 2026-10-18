@@ -66,6 +66,10 @@ struct ReaderChecks {
             try await metadataChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-annotation-editing") {
+            try await annotationEditingChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-forms") {
             try await formChecks(root: fastRoot)
             return
@@ -454,6 +458,7 @@ struct ReaderChecks {
         try await bookmarkChecks(url: a)
         try await metadataChecks(root: root)
         try await formChecks(root: root)
+        try await annotationEditingChecks(root: root)
         try await facingLayoutChecks(url: b)
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)

@@ -45,3 +45,24 @@ public struct InlineNoteMarker: Identifiable {
         return markers
     }
 }
+
+extension InlineNoteMarker {
+    @MainActor static func layoutOwn(annotations: [AppState.Annotation], textPages: [Int: TextPage],
+                                    editingID: UUID?, occupied: [InlineNoteMarker]) -> [Self] {
+        var used = Dictionary(grouping: occupied, by: \.page).mapValues { $0.map(\.rect) }
+        return annotations.enumerated().compactMap { index, annotation in
+            guard annotation.kind.isTextMarkup,
+                  !annotation.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || editingID == annotation.id,
+                  let text = textPages[annotation.page],
+                  let first = text.selectionRects(in: annotation.start...max(annotation.start, annotation.end)).first
+            else { return nil }
+            let line = text.lineBounds(overlapping: first) ?? first
+            var rect = CGRect(x: max(2, line.minX - 30), y: max(2, first.midY - 8), width: 24, height: 16)
+            while used[annotation.page, default: []].contains(where: { $0.insetBy(dx: -1, dy: -1).intersects(rect) }) {
+                if rect.minX >= 28 { rect.origin.x -= 28 } else { rect.origin.y += 20 }
+            }
+            used[annotation.page, default: []].append(rect)
+            return Self(id: annotation.id.uuidString, annotationIndex: index, page: annotation.page, rect: rect)
+        }
+    }
+}

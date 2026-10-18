@@ -107,6 +107,12 @@ extension ReaderChecks {
         require(baseFrames.map(\.origin.x) == TabRowLayout.trafficLightOriginsX,
                 "the base theme puts the group at 20 / 40 / 60 pt")
 
+        if let nativeTitlebar = window.standardWindowButton(.closeButton)?.superview {
+            nativeTitlebar.setFrameSize(NSSize(width: nativeTitlebar.frame.width, height: 28))
+            require(titlebarHeight() == TabRowLayout.height && buttonFrames() == baseFrames,
+                    "an AppKit titlebar reset is corrected synchronously before the next displayed frame")
+        }
+
         func requirePlacement(_ label: String, frames: [NSRect], base: [NSRect]) {
             require(frames.count == 3, "\(label): all three traffic lights are present")
             require(frames == base,

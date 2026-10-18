@@ -185,7 +185,7 @@ extension ReaderChecks {
             require(false, "the fixture has a text line for the box to cover")
             return
         }
-        let box = CGRect(x: 120, y: 430, width: 230, height: 70)
+        var box = CGRect(x: 120, y: 430, width: 230, height: 70)
         require(state.addTextBox(page: 0, rect: box), "a text box is created")
         guard let boxID = state.editingAnnotationID,
               let textBox = state.annotations.first(where: { $0.id == boxID }) else {
@@ -198,6 +198,9 @@ extension ReaderChecks {
         let boxText = "A placed text box.\nIt wraps in the box."
         state.updateEditingText(boxText)
         state.commitTextEditing()
+        box = state.annotations.first(where: { $0.id == boxID })!.shapeRect!
+        require(box.width <= 230 && box.height <= 70 && state.selectedAnnotationID == nil,
+                "finishing a text box fits its contents and removes its editing outline")
         let textSidecar = try sidecarText(document)
         require(textSidecar.contains("\"kind\" : \"textBox\""),
                 "the sidecar stores the text-box kind")
@@ -221,8 +224,8 @@ extension ReaderChecks {
 
         // An unselected box must not swallow a click meant for the text under it.
         let textHit = contentPoint(state, page: 0,
-                                   point: CGPoint(x: bodyLine.midX, y: bodyLine.midY))
-        let coverRect = CGRect(x: bodyLine.minX - 4, y: bodyLine.minY - 4,
+                                   point: CGPoint(x: bodyLine.minX + 10, y: bodyLine.midY))
+        var coverRect = CGRect(x: bodyLine.minX - 4, y: bodyLine.minY - 4,
                                width: max(bodyLine.width + 8, 120), height: 60)
         require(state.addTextBox(page: 0, rect: coverRect), "a text box is placed over body text")
         guard let coverID = state.editingAnnotationID else {
@@ -231,6 +234,7 @@ extension ReaderChecks {
         }
         state.updateEditingText("Covering text.")
         state.commitTextEditing()
+        coverRect = state.annotations.first(where: { $0.id == coverID })!.shapeRect!
         state.clearSelection()
         state.clearAnnotationSelection()
         try await eventually("a single click inside an unselected text box selects the text under it", {

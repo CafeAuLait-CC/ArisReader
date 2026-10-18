@@ -85,7 +85,8 @@ public struct SidebarView: View {
         .frame(minWidth: 180)
         .scrollContentBackground(.hidden)
         .background(pageOverview ? LyraTheme.canvasBg : LyraTheme.sidebarBg)
-        .background(SidebarScrollTheme().id(state.sidebarTab).id(state.document?.url))
+        .background(SidebarScrollTheme().id(state.sidebarTab).id(state.document?.url)
+            .id(state.annotationSidebarPages.isEmpty))
         .foregroundStyle(LyraTheme.textPrimary)
         .tint(LyraTheme.accent)
         // Dropping a file here opens a new window (the canvas keeps opening tabs in this one).
@@ -536,88 +537,112 @@ public struct SidebarView: View {
 
     /// Everything annotation-shaped about this document, in one list.
     ///
-    /// Two sources, deliberately kept apart: the notes and highlights **inside the PDF** (read
-    /// from the file, not editable here) and the reader's **own** highlights (kept in the sidecar).
-    /// Sticky notes are why this list exists at all — a `/Text` annotation has no geometry worth
-    /// drawing on the canvas, so without a list it stays invisible and the reader never learns
-    /// that somebody left a comment on the page.
+    /// PDF and sidecar markup share sentence excerpts; non-text annotations and threaded
+    /// replies retain their individual rows. Only sidecar entries are editable here.
     private var annotationList: some View {
         Group {
-            if state.annotations.isEmpty && state.documentAnnotations.isEmpty
-                && !state.documentAnnotationsLoading {
-                emptyState("No highlights yet", "highlighter", task: "T3.6")
+            if state.annotations.isEmpty && state.documentAnnotations.isEmpty && !state.documentAnnotationsLoading {
+                emptyState("No annotations yet", "highlighter", task: "T3.6")
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        documentAnnotationSection
-                        ownAnnotationSection
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            if state.documentAnnotationsLoading { ProgressView().padding(12) }
+                            if let failure = state.documentAnnotationsError {
+                                Text(failure).font(.caption).foregroundStyle(LyraTheme.warningFg).padding(12)
+                            }
+                            ForEach(state.annotationSidebarPages) { page in
+                                VStack(spacing: 0) {
+                                    annotationPageHeader(page)
+                                    if !collapsedAnnotationPages.contains(page.id) {
+                                        ForEach(page.rows) { row in
+                                            VStack(spacing: 0) {
+                                                switch row {
+                                                case .passage(let passage): passageRow(passage)
+                                                case .document(let annotation): documentAnnotationRow(annotation)
+                                                case .own(let annotation): ownAnnotationRow(annotation)
+                                                }
+                                                LyraTheme.separator.frame(height: 1)
+                                            }.id(row.id)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .onChange(of: state.editingAnnotationID) { _, id in
+                        if let id { revealAnnotation(.own(id), scroll: scroll) }
+                    }
+                    .onChange(of: state.selectedDocumentAnnotationID) { _, id in
+                        if let id { revealAnnotation(.document(id), scroll: scroll) }
                     }
                 }
+                .task(id: "\(state.document?.url?.absoluteString ?? ""):\(state.documentAnnotations.count):\(state.annotations.count)") {
+                    await state.loadAnnotationPassages()
+                }
                 .onChange(of: focusedNote) { previous, current in
-                    // Blur (or moving to another note) commits what was typed.
                     if previous != nil, previous != current { state.commitNoteEdits() }
                 }
             }
         }
     }
 
-    /// The annotations the file itself carries, grouped by page and threaded by `/IRT`.
-    @ViewBuilder
-    private var documentAnnotationSection: some View {
-        if state.documentAnnotationsLoading {
-            annotationSourceHeader("In this PDF")
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Reading annotations…").font(.caption).foregroundStyle(LyraTheme.textSecondary)
-            }.padding(12)
-        } else if let failure = state.documentAnnotationsError {
-            annotationSourceHeader("In this PDF")
-            Label(failure, systemImage: "exclamationmark.triangle")
-                .font(.caption).foregroundStyle(LyraTheme.textSecondary).padding(12)
-        } else if !state.documentAnnotations.isEmpty {
-            let panel = AnnotationPanelModel.build(from: state.documentAnnotations)
-            annotationSourceHeader("In this PDF")
-            ForEach(panel.sections) { section in
-                VStack(spacing: 0) {
-                    Button {
-                        if !collapsedAnnotationPages.insert(section.page).inserted {
-                            collapsedAnnotationPages.remove(section.page)
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: collapsedAnnotationPages.contains(section.page) ? "chevron.right" : "chevron.down")
-                                .font(.system(size: 9, weight: .semibold)).frame(width: 10)
-                            Text("Page \(section.page + 1)").fontWeight(.semibold)
-                            Spacer(minLength: 2)
-                            Text("\(section.annotationCount)")
-                                .foregroundStyle(LyraTheme.textSecondary)
-                        }
-                        .font(.caption).padding(.horizontal, 12).padding(.vertical, 10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(LyraTheme.panelBg).contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityValue(collapsedAnnotationPages.contains(section.page) ? "Collapsed" : "Expanded")
-                    LyraTheme.separator.frame(height: 1)
-                }
-                if !collapsedAnnotationPages.contains(section.page) {
-                    ForEach(section.rows) { row in
-                        VStack(spacing: 0) {
-                            documentAnnotationRow(row)
-                            LyraTheme.separator.frame(height: 1)
-                        }
-                    }
-                }
+    private func revealAnnotation(_ source: AnnotationSource, scroll: ScrollViewProxy) {
+        for page in state.annotationSidebarPages {
+            if let row = page.rows.first(where: { $0.contains(source) }) {
+                collapsedAnnotationPages.remove(page.id)
+                scroll.scrollTo(row.id)
+                return
             }
         }
     }
 
-    private func annotationSourceHeader(_ title: String) -> some View {
-        Text(title).font(.caption.weight(.semibold)).foregroundStyle(LyraTheme.textSecondary)
-            .padding(.horizontal, 12).padding(.vertical, 9)
+    private func annotationPageHeader(_ page: AnnotationSidebarPage) -> some View {
+        Button {
+            if !collapsedAnnotationPages.insert(page.id).inserted { collapsedAnnotationPages.remove(page.id) }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: collapsedAnnotationPages.contains(page.id) ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold)).frame(width: 10)
+                Text("Page \(page.id + 1)").fontWeight(.semibold)
+                Spacer(minLength: 2)
+                Text("\(page.annotationCount)").foregroundStyle(LyraTheme.textSecondary)
+            }
+            .font(.caption).padding(.horizontal, 12).padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(LyraTheme.panelBg)
-            .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
+            .background(LyraTheme.panelBg).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(collapsedAnnotationPages.contains(page.id) ? "Collapsed" : "Expanded")
+        .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
+    }
+
+    private func passageRow(_ passage: AnnotationPassage) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                if let mark = passage.marks.first { state.jump(to: mark.source) }
+            } label: {
+                Text(passage.attributed(appearance: appearance.mode))
+                    .font(.system(size: 12)).lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityLabel(passage.text)
+            ForEach(passage.marks.filter { !$0.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) { mark in
+                Button { state.openPassageNote(mark.source) } label: {
+                    Text(mark.note).font(.system(size: 12))
+                        .foregroundStyle(LyraTheme.noteFg)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(7)
+                        .background(LyraTheme.noteBg, in: RoundedRectangle(cornerRadius: 3))
+                }.buttonStyle(.plain)
+            }
+            let authors = Array(Set(passage.marks.compactMap(\.author))).sorted().joined(separator: ", ")
+            let date = passage.marks.compactMap(\.date).first ?? ""
+            if !authors.isEmpty || !date.isEmpty {
+                Text([authors, date].filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.caption2).foregroundStyle(LyraTheme.textTertiary)
+            }
+        }.padding(12)
     }
 
     /// One row, at its depth in the thread. A reply shows its author, date and its own text; an
@@ -702,60 +727,47 @@ public struct SidebarView: View {
         return contents
     }
 
-    /// The highlights this reader added, with their editable notes.
-    @ViewBuilder
-    private var ownAnnotationSection: some View {
-        if !state.annotations.isEmpty {
-            annotationSourceHeader("My annotations")
-            ForEach(state.annotations) { annotation in
-                VStack(spacing: 0) {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color(
-                                red: Double(annotation.color.red) / 255,
-                                green: Double(annotation.color.green) / 255,
-                                blue: Double(annotation.color.blue) / 255
-                            ))
-                            .frame(width: 8, height: 8)
+    /// Geometry annotations and text that could not be matched to an extracted passage.
+    private func ownAnnotationRow(_ annotation: AppState.Annotation) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color(red: Double(annotation.color.red) / 255,
+                            green: Double(annotation.color.green) / 255,
+                            blue: Double(annotation.color.blue) / 255))
+                .frame(width: 8, height: 8)
 
-                        Button {
-                            state.jump(to: annotation)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                TextField(
-                                    "Note",
-                                    text: Binding(
-                                        get: { annotation.note },
-                                        set: { state.updateNote($0, for: annotation.id) }
-                                    )
-                                )
-                                .textFieldStyle(.plain)
-                                .font(.caption)
-                                .focused($focusedNote, equals: annotation.id)
-                                .onSubmit { state.commitNoteEdits() }
-
-                                Text(ownAnnotationSubtitle(annotation))
-                                .font(.caption2)
-                                .foregroundStyle(LyraTheme.textSecondary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            state.removeAnnotation(annotation.id)
-                        } label: {
-                            Image(systemName: "trash")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Delete annotation")
-                    }.padding(12)
-                    LyraTheme.separator.frame(height: 1)
+            Button {
+                state.jump(to: annotation)
+                if annotation.kind.isPlacedText { state.beginEditingAnnotation(annotation.id) }
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    if annotation.kind.isPlacedText {
+                        Text(annotation.note.isEmpty ? (annotation.kind == .textBox ? "Text Box" : "Sticky Note") : annotation.note)
+                            .font(.caption)
+                    } else {
+                        TextField("Note", text: Binding(
+                            get: { annotation.note },
+                            set: { state.updateNote($0, for: annotation.id) }))
+                            .textFieldStyle(.plain)
+                            .font(.caption)
+                            .focused($focusedNote, equals: annotation.id)
+                            .onSubmit { state.commitNoteEdits() }
+                    }
+                    Text(ownAnnotationSubtitle(annotation))
+                        .font(.caption2)
+                        .foregroundStyle(LyraTheme.textSecondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-        }
+            .buttonStyle(.plain)
+
+            Button { state.removeAnnotation(annotation.id) } label: {
+                Image(systemName: "trash").font(.caption)
+            }
+            .buttonStyle(.plain)
+            .help("Delete annotation")
+        }.padding(12)
     }
 
     /// The one line under a sidecar annotation's note field.
@@ -794,7 +806,7 @@ public struct SidebarView: View {
     private func documentAnnotationSubtitle(_ annotation: DocumentAnnotation) -> String {
         var parts = ["Page \(annotation.page + 1)"]
         if let author = annotation.author, !author.isEmpty { parts.append(author) }
-        if annotation.blend == "multiply" { parts.append("multiplied") }
+        if let date = annotation.displayDate { parts.append(date) }
         return parts.joined(separator: " · ")
     }
 
