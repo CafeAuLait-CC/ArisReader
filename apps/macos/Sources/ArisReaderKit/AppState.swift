@@ -4978,9 +4978,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Whether the two PDF-writing commands can run.
     ///
     /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
-    /// command from the reader, and it is disabled when there is nothing to write.
+    /// command from the reader, and it is disabled when there is nothing to write. A pending
+    /// erasure counts even when it removed the last annotation: the copy must still be
+    /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
-        document != nil && !annotations.isEmpty && !annotationSaveInProgress
+        document != nil && (!annotations.isEmpty || hasPendingInkErasure)
+            && !annotationSaveInProgress
+    }
+
+    /// Replacing the original has something to write only when an annotation remains. A copy is
+    /// still offered after the eraser removed the last one (it is the source bytes), but
+    /// replacing a file with an identical copy would be a destructive no-op with a backup.
+    public var canReplaceOriginalWithAnnotations: Bool {
+        canSaveAnnotationsToPDF && !annotations.isEmpty
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -5011,7 +5021,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The clearly-labelled second choice: replace the original. The alert spells out the backup;
     /// the engine refuses the replacement if that backup cannot be written and verified.
     public func presentReplaceOriginalConfirmation() {
-        guard let url = document?.url else { return }
+        guard canReplaceOriginalWithAnnotations, let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Replace “\(url.lastPathComponent)” with the annotated version?"
@@ -5030,7 +5040,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The original document is not touched, and its sidecar is not changed: the copy carries
     /// the annotations itself, so a fresh Lyra opening that copy sees them from the PDF and no
-    /// sidecar duplicates them. Returns `false` when nothing was written.
+    /// sidecar duplicates them. When an eraser gesture removed the last annotation there is
+    /// nothing to append, and the copy is the source file byte for byte. Returns `false` when
+    /// nothing was written.
     @discardableResult
     public func saveAnnotatedCopy(to destination: URL) async -> Bool {
         guard !annotationSaveInProgress else { return false }
@@ -5038,7 +5050,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before saving annotations"
             return false
         }
-        guard !annotations.isEmpty else {
+        guard !annotations.isEmpty || hasPendingInkErasure else {
             statusMessage = "There are no annotations to save"
             return false
         }
@@ -5067,6 +5079,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let requests = try await pendingAnnotationWrites()
+            if requests.isEmpty {
+                // The eraser removed the last annotation: there is nothing to append, and the
+                // engine deliberately refuses an empty annotation list. The honest copy is the
+                // source bytes. It still matters: the pending banner offers "Save Copy…" and
+                // that action must work precisely in this case.
+                let source = try Data(contentsOf: documentURL, options: .mappedIfSafe)
+                try source.write(to: destination, options: .atomic)
+                lastAnnotationWriteReport = AnnotationWriteReport(
+                    destinationPath: destination.path,
+                    writtenIDs: [],
+                    appendedBytes: 0,
+                    backupPath: nil,
+                    preexistingAnnotationCount: documentAnnotations.count,
+                    cleanedTemporaryFiles: 0,
+                    sourceBytesPreserved: true
+                )
+                erasedInkStrokeIDs.removeAll()
+                statusMessage =
+                    "Saved a copy without annotations to \(destination.lastPathComponent)"
+                    + " · the original is unchanged"
+                FileHandle.standardError.write(Data((
+                    "aris-annotate: saved a byte copy without annotations to \(destination.path)\n"
+                ).utf8))
+                return true
+            }
             let report = try await engine.saveAnnotatedCopy(
                 to: destination,
                 annotations: requests,

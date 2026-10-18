@@ -463,6 +463,39 @@ extension ReaderChecks {
             require(false, "a kept stroke is still selectable after erasing")
         }
 
+        // ── 13. Erasing the last annotation still produces a saveable copy ────────────────
+        // The pending banner's "Save Copy…" must not become a disabled promise when the last
+        // stroke was the last annotation: the copy is the source bytes, without any /Ink.
+        let loneDocument = try copy(drawing, "lone-stroke.pdf")
+        let lone = try makeState(loneDocument)
+        require(lone.addInkAnnotation(page: 0,
+                                      points: [CGPoint(x: 120, y: 220), CGPoint(x: 260, y: 220)],
+                                      color: red, strokeWidth: 2),
+                "the lone stroke is created")
+        lone.toggleEraserTool()
+        let loneCanvas = makeCanvas(lone)
+        drag(loneCanvas, from: content(lone, page: 0, CGPoint(x: 110, y: 220)),
+             through: [content(lone, page: 0, CGPoint(x: 190, y: 220))],
+             to: content(lone, page: 0, CGPoint(x: 270, y: 220)))
+        require(lone.annotations.isEmpty, "the lone stroke was the last annotation")
+        require(lone.hasPendingInkErasure, "the erasure is pending even with no annotations left")
+        require(lone.canSaveAnnotationsToPDF,
+                "the pending banner's Save Copy is enabled after the last stroke is erased")
+        require(!lone.canReplaceOriginalWithAnnotations,
+                "replacing the original is not offered when there is nothing to append")
+        let loneCopyURL = scratch.appendingPathComponent("lone-stroke-copy.pdf")
+        let savedLone = await lone.saveAnnotatedCopy(to: loneCopyURL)
+        require(savedLone, "a copy can be saved with no annotations left")
+        require(!lone.hasPendingInkErasure, "the successful copy clears the pending-erasure state")
+        let loneBytes = try Data(contentsOf: loneDocument)
+        let loneCopyBytes = try Data(contentsOf: loneCopyURL)
+        require(loneCopyBytes == loneBytes,
+                "with nothing to append, the copy is the original PDF byte for byte (no /Ink)")
+        require(lone.lastAnnotationWriteReport?.writtenIDs.isEmpty == true,
+                "the report says nothing was appended")
+        require(lone.lastAnnotationWriteReport?.sourceBytesPreserved == true,
+                "the report says the source bytes were preserved")
+
         print("Eraser checks passed")
     }
 }

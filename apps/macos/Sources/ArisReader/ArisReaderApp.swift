@@ -131,7 +131,7 @@ struct ReaderCommands: Commands {
                 session?.state.presentReplaceOriginalConfirmation()
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
-            .disabled(session?.state.canSaveAnnotationsToPDF != true)
+            .disabled(session?.state.canReplaceOriginalWithAnnotations != true)
 
             Divider()
 
