@@ -216,6 +216,18 @@ struct ReaderChecks {
             print("Placed-text checks passed")
             return
         }
+        // Click-to-select for text markup and text boxes on its own
+        // (`ArisReaderChecks --check-mark-selection .`).
+        if CommandLine.arguments.contains("--check-mark-selection") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await markSelectionChecks(
+                fixtures: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
+                multipage: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Mark-selection checks passed")
+            return
+        }
         // The annotation text export on its own (`ArisReaderChecks --check-annotation-export .`).
         if CommandLine.arguments.contains("--check-annotation-export") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -478,6 +490,10 @@ struct ReaderChecks {
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
             external: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+        try await markSelectionChecks(
+            fixtures: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
+            multipage: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
         try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await inlineNoteChecks(root: root)
         try await annotationNoteChecks(

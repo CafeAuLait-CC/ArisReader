@@ -248,11 +248,15 @@ public struct ReaderWindow: View {
             }
 
             if state.pageEditSessionActive || state.formHasPendingChanges
-                || state.hasPendingInkErasure || state.eraserRefusalNotice != nil {
+                || state.hasPendingInkErasure || state.eraserRefusalNotice != nil
+                || state.markSelectionRefusalNotice != nil {
                 VStack(spacing: 8) {
                     if state.pageEditSessionActive { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
-                    if state.eraserRefusalNotice != nil { eraserRefusalBanner }
+                    if state.eraserRefusalNotice != nil
+                        || state.markSelectionRefusalNotice != nil {
+                        annotationRefusalBanner
+                    }
                     if state.hasPendingInkErasure { eraserPendingBanner }
                     Spacer()
                 }
@@ -449,23 +453,33 @@ public struct ReaderWindow: View {
         )
     }
 
-    /// The eraser's refusal: the stroke under the pointer belongs to the PDF itself, so this
-    /// version's writer cannot remove it. Stated explicitly instead of leaving a press that
-    /// looks broken.
-    private var eraserRefusalBanner: some View {
-        HStack(spacing: 10) {
+    /// The eraser's or the selection's refusal: the mark under the pointer belongs to the PDF
+    /// itself, so this version's writer cannot remove it. Stated explicitly instead of leaving a
+    /// press that looks broken.
+    ///
+    /// Both refusals share one banner because they are one policy; only the subject changes.
+    private var annotationRefusalBanner: some View {
+        let isSelection = state.markSelectionRefusalNotice != nil
+        let title = isSelection ? "This markup belongs to the PDF" : "This ink belongs to the PDF"
+        let message = isSelection
+            ? (state.markSelectionRefusalNotice ?? AppState.markSelectionFileOwnedMessage)
+            : (state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
+        return HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(LyraTheme.warningFg)
             VStack(alignment: .leading, spacing: 1) {
-                Text("This ink belongs to the PDF")
+                Text(title)
                     .font(.callout.weight(.semibold))
-                Text(state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
+                Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: 520, alignment: .leading)
             }
             Divider().frame(height: 24)
-            Button("Dismiss") { state.dismissEraserRefusal() }
+            Button("Dismiss") {
+                if isSelection { state.dismissMarkSelectionRefusal() }
+                else { state.dismissEraserRefusal() }
+            }
         }
         .controlSize(.small)
         .padding(.horizontal, 14)
@@ -477,7 +491,7 @@ public struct ReaderWindow: View {
         )
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
+        .accessibilityLabel(message)
     }
 
     private var emptyState: some View {

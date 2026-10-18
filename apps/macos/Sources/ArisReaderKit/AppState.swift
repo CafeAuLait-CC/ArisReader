@@ -310,7 +310,16 @@ public final class AppState: ObservableObject {
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false
     @Published public var zoomPercent: Int = 100
-    @Published public var currentPage: Int = 1
+    @Published public var currentPage: Int = 1 {
+        didSet {
+            // A selected mark belongs to the page it is on. Turning to another page drops it,
+            // so Delete can never remove a mark the reader can no longer see.
+            if currentPage != oldValue {
+                cancelPendingMarkSelection()
+                if selectedAnnotationID != nil { selectedAnnotationID = nil }
+            }
+        }
+    }
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"
     @Published public var lastError: String?
     @Published public var showFileImporter: Bool = false
@@ -1455,6 +1464,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     eraserHoverMarkID = nil
                     cancelEraserGesture()
                 }
+                // Selection is the Select tool's business: arming a pen, shape, markup or the
+                // eraser drops the halo instead of leaving a mark that Delete would still act on.
+                cancelPendingMarkSelection()
+                if selectedAnnotationID != nil { selectedAnnotationID = nil }
             }
         }
     }
@@ -1468,6 +1481,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Why the eraser refused its last gesture. A PDF's own ink cannot be removed by this
     /// version's append-only writer, so the refusal is stated rather than silently ignored.
     @Published public private(set) var eraserRefusalNotice: String?
+    /// Why a plain click last refused to select a mark the PDF itself carries.
+    ///
+    /// The same policy as the eraser's: a file-owned mark can be read but not removed by this
+    /// version's append-only writer, so clicking it says so in a banner instead of acting as if
+    /// the click were never made.
+    @Published public private(set) var markSelectionRefusalNotice: String?
     /// The colour a newly created mark is stored in.
     ///
     /// The highlight palette's presets are translucent because a highlight sits over text. Pen
@@ -1478,6 +1497,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// a PDF's own ink, shapes, notes and text are drawn but not editable, because moving them
     /// would mean rewriting somebody else's annotation.
     @Published public private(set) var selectedAnnotationID: UUID?
+    /// A press that may still turn out to be a plain click on a text mark or an unselected text
+    /// box.
+    ///
+    /// The selection is decided on mouse-up, not on the press: a drag that starts on top of a
+    /// highlight must still select the text under it, and a drag inside an unselected text box
+    /// must still select the text underneath. Only a press that stays inside the canvas' click
+    /// slop selects the mark. The text anchor is resolved on the press so the deferred text
+    /// selection starts exactly where the reader aimed.
+    private struct PendingMarkSelection {
+        let id: UUID
+        /// The character a drag from the press point would anchor a text selection at.
+        let textAnchor: (page: Int, index: Int)?
+    }
+    private var pendingMarkSelection: PendingMarkSelection?
     /// The mark being dragged, and where the drag started in its page's space.
     private var moveOriginalAnnotation: Annotation?
     private var moveStartPagePoint: CGPoint?
@@ -2491,6 +2524,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = nil
         selectionAnchor = nil
         selectedAnnotationID = nil
+        pendingMarkSelection = nil
         moveOriginalAnnotation = nil
         moveStartPagePoint = nil
         resizeOriginalAnnotation = nil
@@ -2506,6 +2540,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         erasedInkStrokeIDs = []
         eraserHoverMarkID = nil
         eraserRefusalNotice = nil
+        markSelectionRefusalNotice = nil
         eraserGestureBase = nil
         eraserGestureRemoved = [:]
         pageSelection = []
@@ -3003,15 +3038,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Escape and the Select button leave every mode that has no finished draft to keep.
     ///
-    /// Returns whether a mode was actually left, so the canvas consumes Escape only when it did
-    /// something. Text markup and the eraser are left; the pen and shape tools keep their
-    /// existing behaviour (only the live draft is cancelled).
+    /// Returns whether anything was left or cleared, so the canvas consumes Escape only when it
+    /// did something. A selected mark is dropped even in plain Select mode: Escape is the
+    /// platform-wide way to end a selection, and Delete must not still have a target afterwards.
+    /// Text markup and the eraser are left; the pen and shape tools keep their existing
+    /// behaviour (only the live draft is cancelled).
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
-        if cancelTextMarkupTool() { return true }
-        guard annotationTool == .eraser else { return false }
-        cancelEraserGesture()
-        annotationTool = .select
+        let hadMarkSelection = selectedAnnotationID != nil || pendingMarkSelection != nil
+        if cancelTextMarkupTool() {
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
+        if annotationTool == .eraser {
+            cancelEraserGesture()
+            annotationTool = .select
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
+        guard hadMarkSelection else { return false }
+        clearAnnotationSelection()
         return true
     }
 
@@ -3254,9 +3300,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The sticky-note or text-box annotation under a content point.
     ///
     /// A note is hit anywhere inside its icon (plus the same small slack a pointer deserves). A
-    /// text box is hit on its frame when it is not selected and anywhere inside when it is:
-    /// that is what keeps an unselected box from stealing a click meant for the text under it,
-    /// while making a selected box draggable by its interior.
+    /// text box is hit anywhere on the box, frame or interior. That is only a *candidate* for a
+    /// click: `beginSelection` defers the actual selection to mouse-up, so a drag that starts on
+    /// an unselected box still selects the text underneath, while a plain click selects the box.
+    /// Once the box is selected, dragging its interior moves it and its handles resize it.
     public func placedTextHit(
         atContentPoint point: CGPoint,
         toleranceViewPt: CGFloat = AppState.noteClickSlackPt
@@ -3278,12 +3325,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                          handle: handle)
                 }
-                if AnnotationGeometry.distance(local, toRectOutline: rect) <= tolerance {
-                    let handle = selected ? textBoxEdge(at: local, in: rect) : nil
+                if selected, AnnotationGeometry.distance(local, toRectOutline: rect) <= tolerance {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
-                                         handle: handle)
+                                         handle: textBoxEdge(at: local, in: rect))
                 }
-                if selected, rect.contains(local) {
+                if rect.insetBy(dx: -tolerance, dy: -tolerance).contains(local) {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                          handle: nil)
                 }
@@ -3457,8 +3503,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let annotation = annotations.first(where: { $0.id == id }),
               annotation.kind.isPlacedText || annotation.kind.isTextMarkup else { return }
         guard commitTextEditing() else { return }
-        selectedAnnotationID = id
+        // Leaving the text-box tool first: changing the tool clears a mark selection, and the
+        // editor needs the selection it is about to restore to win. Order matters.
         if annotation.kind == .textBox { annotationTool = .select }
+        selectedAnnotationID = id
+        cancelPendingMarkSelection()
         selection = nil
         selectionAnchor = nil
         closeDocumentNote()
@@ -3669,9 +3718,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Every geometry mark the overlay should draw, in sidecar order followed by the file's own.
+    ///
+    /// Text marks travel here too, carrying the quads of the character range they cover. They
+    /// are not stroked by the overlay (the canvas draws their tint), but the quads are what the
+    /// overlay hit-tests and what its dashed selection halo follows.
     public var canvasAnnotationMarks: [CanvasAnnotationMark] {
         var marks: [CanvasAnnotationMark] = annotations.compactMap { annotation in
-            guard annotation.kind.isGeometry || annotation.kind.isPlacedText else { return nil }
+            guard annotation.kind.isGeometry || annotation.kind.isPlacedText
+                    || annotation.kind.isTextMarkup else { return nil }
             return CanvasAnnotationMark(
                 id: annotation.id.uuidString,
                 page: annotation.page,
@@ -3680,6 +3734,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 shapeRect: annotation.shapeRect,
                 lineStart: annotation.lineStart,
                 lineEnd: annotation.lineEnd,
+                textQuads: textQuads(for: annotation),
                 color: annotation.color,
                 strokeWidth: annotation.strokeWidth,
                 isSelected: annotation.id == selectedAnnotationID
@@ -3723,6 +3778,64 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The page frames the canvas needs to map page-local marks into the view.
     public var canvasPageFrames: [PagePlacement] { visiblePagePlacements }
+
+    /// The page-space quads a text mark covers, one per visual line.
+    ///
+    /// Empty until the page's text layer has been extracted: a text mark is a character range,
+    /// so it has no geometry of its own. Callers treat an empty list as "not hit-testable yet"
+    /// rather than falling back to a bounding box, which would claim text the mark does not
+    /// cover.
+    public func textQuads(for annotation: Annotation) -> [CGRect] {
+        guard annotation.kind.isTextMarkup,
+              let textPage = textPages[annotation.page] else { return [] }
+        let lower = min(annotation.start, annotation.end)
+        let upper = max(annotation.start, annotation.end)
+        guard lower >= 0, upper >= lower else { return [] }
+        return textPage.selectionRects(in: lower...upper)
+    }
+
+    /// The reader's own text mark under a content point, with the point in its page space.
+    ///
+    /// Only sidecar marks are considered: a highlight the PDF itself carries is reported by
+    /// `fileOwnedMarkupHit` so the click can be refused with an explanation. The hit is the
+    /// marked words themselves, including a few points of hand tolerance.
+    public func textMarkupHit(
+        atContentPoint point: CGPoint,
+        toleranceViewPt: CGFloat = AnnotationGeometry.hitTolerancePt
+    ) -> (id: UUID, page: Int, point: CGPoint)? {
+        guard let hit = pagePoint(atContentPoint: point) else { return nil }
+        let tolerance = toleranceViewPt / max(zoomFactor, 0.01)
+        for annotation in annotations.reversed()
+            where annotation.kind.isTextMarkup && annotation.page == hit.page {
+            let quads = textQuads(for: annotation)
+            if quads.contains(where: {
+                $0.insetBy(dx: -tolerance, dy: -tolerance).contains(hit.point)
+            }) {
+                return (annotation.id, hit.page, hit.point)
+            }
+        }
+        return nil
+    }
+
+    /// A text mark the PDF itself carries under a content point.
+    ///
+    /// Used only to explain the refusal: the file's markup is not selectable here because this
+    /// version's writer cannot remove it, the same reason the eraser refuses file-owned ink.
+    public func fileOwnedMarkupHit(atContentPoint point: CGPoint) -> DocumentAnnotation? {
+        guard let hit = pagePoint(atContentPoint: point) else { return nil }
+        let slack = Self.noteClickSlackPt
+        for annotation in documentAnnotations.reversed()
+            where annotation.visible && annotation.drawing == .markup
+                && annotation.page == hit.page {
+            for box in annotation.boxes {
+                let rect = CGRect(x: box.xPt, y: box.yPt,
+                                  width: box.widthPt, height: box.heightPt)
+                    .insetBy(dx: -slack, dy: -slack)
+                if rect.contains(hit.point) { return annotation }
+            }
+        }
+        return nil
+    }
 
     /// The sidecar annotation whose stroke is within `tolerance` points of `point` (page space).
     public func hitTestGeometryAnnotation(page: Int, point: CGPoint,
@@ -3927,6 +4040,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         eraserRefusalNotice = nil
     }
 
+    /// Why file-owned text markup cannot be selected for deletion, in the same language as the
+    /// eraser's file-owned refusal. Stated once and reused by the banner and the checks.
+    public static let markSelectionFileOwnedMessage =
+        "This markup belongs to the PDF file, not to Lyra's annotations. "
+        + "Select can only select marks in Lyra's annotation list; markup the file itself "
+        + "carries cannot be deleted without rewriting the PDF."
+
+    /// The selection refusal banner's Dismiss button.
+    public func dismissMarkSelectionRefusal() {
+        markSelectionRefusalNotice = nil
+    }
+
     /// The strokes the current gesture removed, in their pre-gesture array order.
     private func erasedGestureStrokes() -> [ErasedInkStroke] {
         eraserGestureRemoved.keys.sorted().compactMap { index in
@@ -4023,15 +4148,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func selectAnnotation(_ id: UUID?) {
+        cancelPendingMarkSelection()
         guard selectedAnnotationID != id else { return }
         selectedAnnotationID = id
         refreshSelectionOverlay()
     }
 
-    /// Deletes the selected geometry annotation. Returns whether anything was deleted.
+    /// Deletes the selected annotation (ink, shape, text mark, note or text box). Returns
+    /// whether anything was deleted.
+    ///
+    /// Every kind goes through the same removal: one sidecar write, one undo step, one reload.
     @discardableResult
     public func deleteSelectedAnnotation() -> Bool {
         guard let id = selectedAnnotationID else { return false }
+        cancelPendingMarkSelection()
         selectedAnnotationID = nil
         removeAnnotation(id)
         return true
@@ -7131,11 +7261,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// keeping the selection alive under the pointer — leaves the reader with no way to drop it
     /// except by selecting something else. A press that moved past the canvas' slop never reaches
     /// here: that gesture is a drag, and a drag selects (see `MetalCanvasView.clickSlopPt`).
+    ///
+    /// A click that stayed on a text mark or an unselected text box selects that mark here,
+    /// before the ordinary click path can clear it. This is the other half of the deferred
+    /// decision `beginSelection` starts: the press only remembered a candidate.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
         // A click on the page (outside the editor) ends an open editing session. A press that
         // begins a drag has already committed in `beginSelection`; this covers the plain click
         // that never passes the drag slop.
         if editingAnnotationID != nil { commitTextEditing() }
+        markSelectionRefusalNotice = nil
         if let original = resizeOriginalAnnotation, let handle = resizeHandle,
            let start = resizeStartPagePoint {
             finishAnnotationResize(original: original, handle: handle, start: start,
@@ -7146,6 +7281,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             finishAnnotationMove(original: original, start: start, at: point, wasClick: wasClick)
             return
         }
+        if wasClick, let pending = pendingMarkSelection {
+            pendingMarkSelection = nil
+            finishPendingMarkSelection(pending)
+            return
+        }
+        pendingMarkSelection = nil
         guard wasClick else {
             extendSelection(to: point)
             // A drag is a finished text selection. When a sticky markup tool is active, the
@@ -7165,11 +7306,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         // A visible inline-comment label wins over text underneath it. Elsewhere, preserve
         // navigation priority: the PDF's link, a citation, a caption mention, then a note glyph.
-        _ = openInlineNote(at: point)
+        let resolved = openInlineNote(at: point)
             || followLink(at: point)
             || openCitation(at: point)
             || openFigureMention(at: point)
             || openDocumentNote(at: point)
+        // Nothing above claimed the click, and it landed on markup the file itself carries.
+        // Report the same refusal the eraser states for file-owned ink instead of no-opping.
+        // Only the Select tool owns mark selection; the armed markup tools keep their old
+        // click behaviour.
+        if annotationTool == .select, !resolved,
+           fileOwnedMarkupHit(atContentPoint: point) != nil {
+            markSelectionRefusalNotice = Self.markSelectionFileOwnedMessage
+            statusMessage = Self.markSelectionFileOwnedMessage
+        }
+    }
+
+    /// Selects the mark whose press was waiting for the click-versus-drag decision.
+    private func finishPendingMarkSelection(_ pending: PendingMarkSelection) {
+        guard let annotation = annotations.first(where: { $0.id == pending.id }) else {
+            selection = nil
+            selectionAnchor = nil
+            clearAnnotationSelection()
+            return
+        }
+        selection = nil
+        selectionAnchor = nil
+        selectedAnnotationID = annotation.id
+        refreshSelectionOverlay()
+        let noun = annotation.kind == .textBox ? "text box" : annotation.kind.rawValue
+        statusMessage = "Selected a \(noun) · Delete removes it"
     }
 
     /// Commits or cancels the drag begun by `beginSelection`.
@@ -9656,19 +9822,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Starts a selection at a point in content space.
     ///
-    /// A click on one of the reader's own ink or shape strokes selects that mark and starts a
+    /// A press on one of the reader's own ink or shape strokes selects that mark and starts a
     /// move, and does **not** start a text selection. The hit test is geometric and tight — a
     /// few points around the stroke — so text a line away from a thin pen line is untouched and
     /// a click on the text goes on to select it. A PDF's own ink is deliberately not hit tested
     /// here: it can be seen, not edited.
+    ///
+    /// A press on a text mark or an unselected text box is only a **candidate** for selection:
+    /// it is remembered and decided on mouse-up (see `endPointerInteraction`). That is what lets
+    /// a drag starting on a highlight, or inside an unselected text box, select the text under
+    /// it instead of the mark.
     public func beginSelection(at point: CGPoint) {
         // A click that reached the canvas is outside every field (the form overlay consumes
         // field clicks), so it ends field editing and lets the press become a text selection.
         if formFocusedFieldID != nil { blurFormField() }
         if editingAnnotationID != nil { commitTextEditing() }
+        pendingMarkSelection = nil
         if annotationTool == .select {
             if let hit = placedTextHit(atContentPoint: point),
                let annotation = annotations.first(where: { $0.id == hit.id }) {
+                if annotation.kind == .textBox, annotation.id != selectedAnnotationID {
+                    // A plain click selects the box; a drag still selects the text under it.
+                    beginPendingMarkSelection(annotation, at: point)
+                    return
+                }
                 selectedAnnotationID = hit.id
                 selection = nil
                 selectionAnchor = nil
@@ -9701,6 +9878,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 refreshSelectionOverlay()
                 return
             }
+            if let hit = textMarkupHit(atContentPoint: point),
+               let annotation = annotations.first(where: { $0.id == hit.id }) {
+                // Text reading wins over mark selection for as long as the pointer is moving;
+                // only a click that stays inside the slop selects the mark on release.
+                beginPendingMarkSelection(annotation, at: point)
+                return
+            }
         }
         selectedAnnotationID = nil
         moveOriginalAnnotation = nil
@@ -9717,8 +9901,51 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
+    /// Remembers a press that a plain click would turn into a mark selection.
+    ///
+    /// The character under the press is resolved now, while the point is known, so a drag can
+    /// begin exactly where the reader aimed without asking the canvas to re-report the press.
+    private func beginPendingMarkSelection(_ annotation: Annotation, at point: CGPoint) {
+        cancelPendingMarkSelection()
+        pendingMarkSelection = PendingMarkSelection(
+            id: annotation.id,
+            textAnchor: characterIndex(at: point)
+        )
+        moveOriginalAnnotation = nil
+        moveStartPagePoint = nil
+        resizeOriginalAnnotation = nil
+        resizeStartPagePoint = nil
+        resizeHandle = nil
+    }
+
+    private func cancelPendingMarkSelection() {
+        pendingMarkSelection = nil
+    }
+
+    /// Turns a pending press into the text selection a drag means.
+    ///
+    /// Called by `extendSelection` the first time the pointer has actually moved past the
+    /// canvas' click slop: the mark has not been selected, and the drag becomes an ordinary
+    /// text selection anchored on the character the reader pressed.
+    private func beginDeferredTextSelection() {
+        guard let pending = pendingMarkSelection else { return }
+        pendingMarkSelection = nil
+        selectedAnnotationID = nil
+        if let anchor = pending.textAnchor {
+            selectionAnchor = anchor.index
+            selection = Selection(page: anchor.page, range: anchor.index...anchor.index)
+        } else {
+            selectionAnchor = nil
+            selection = nil
+        }
+        refreshSelectionOverlay()
+    }
+
     /// Extends the selection to a point in content space.
     public func extendSelection(to point: CGPoint) {
+        if pendingMarkSelection != nil {
+            beginDeferredTextSelection()
+        }
         if let original = resizeOriginalAnnotation, let handle = resizeHandle,
            let start = resizeStartPagePoint,
            let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
@@ -9774,8 +10001,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
-    /// Clears the selected geometry mark without touching a text selection.
+    /// Clears the selected mark without touching a text selection.
     public func clearAnnotationSelection() {
+        cancelPendingMarkSelection()
         guard selectedAnnotationID != nil else { return }
         selectedAnnotationID = nil
         refreshSelectionOverlay()

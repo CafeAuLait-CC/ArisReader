@@ -350,14 +350,15 @@ final class AnnotationOverlayView: NSView {
         return AnnotationGeometry.path(for: mark)
     }
 
-    private func contentBounds(of mark: CanvasAnnotationMark, frame: PagePlacement) -> CGRect {
-        (mark.bounds ?? .zero).offsetBy(dx: frame.leftPt, dy: frame.topPt)
-    }
-
+    /// The page-local halo path moved into content space.
+    ///
+    /// The shape is built by `AnnotationGeometry` so the checks can assert it against a text
+    /// mark's quads; this method only applies the page's placement.
     private func haloPath(for mark: CanvasAnnotationMark, frame: PagePlacement) -> CGPath {
-        let bounds = contentBounds(of: mark, frame: frame).insetBy(dx: -6, dy: -6)
         let path = CGMutablePath()
-        path.addRoundedRect(in: bounds, cornerWidth: 4, cornerHeight: 4)
+        path.addPath(AnnotationGeometry.haloPath(for: mark),
+                     transform: CGAffineTransform(translationX: frame.leftPt,
+                                                  y: frame.topPt))
         return path
     }
 

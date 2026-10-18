@@ -71,9 +71,16 @@ extension ReaderChecks {
         }, "a right-click on a page offers page extraction")
 
         // 2. A selection: the three text commands are there and enabled.
+        //
+        // A drag, not a bare press: the first character of the fixture may sit under a mark
+        // left by an earlier check in the full suite, and a plain press on a mark is a pending
+        // mark click now. Extending once is exactly what a hand does when it means to select
+        // text, and it is what makes the selection independent of what is drawn over it.
         var attempts = 0
+        let dragEnd = CGPoint(x: point.x + 1, y: point.y)
         while state.selection == nil && attempts < 100 {
             state.beginSelection(at: point)
+            state.extendSelection(to: dragEnd)
             attempts += 1
             if state.selection == nil { try await Task.sleep(for: .milliseconds(20)) }
         }

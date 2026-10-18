@@ -222,7 +222,8 @@ extension ReaderChecks {
                 "the reloaded text box keeps its font size")
         require(reloadedBox.note == boxText, "the reloaded text box keeps its text")
 
-        // An unselected box must not swallow a click meant for the text under it.
+        // A plain click inside an unselected box selects the box: the box is a mark the reader
+        // can click once. A drag that starts there still selects the text underneath.
         let textHit = contentPoint(state, page: 0,
                                    point: CGPoint(x: bodyLine.minX + 10, y: bodyLine.midY))
         var coverRect = CGRect(x: bodyLine.minX - 4, y: bodyLine.minY - 4,
@@ -237,12 +238,24 @@ extension ReaderChecks {
         coverRect = state.annotations.first(where: { $0.id == coverID })!.shapeRect!
         state.clearSelection()
         state.clearAnnotationSelection()
-        try await eventually("a single click inside an unselected text box selects the text under it", {
+        state.beginSelection(at: textHit)
+        state.endPointerInteraction(at: textHit, wasClick: true)
+        require(state.selectedAnnotationID == coverID,
+                "a plain click inside an unselected text box selects it")
+        state.clearAnnotationSelection()
+        state.clearSelection()
+        // A drag inside the unselected box is a text selection, even though the press landed on
+        // the box. The page's text layer arrives asynchronously, so retry the real gesture until
+        // it can resolve a character instead of sleeping.
+        let dragEnd = CGPoint(x: textHit.x + 40, y: textHit.y)
+        try await eventually("a drag inside an unselected text box still selects the text under it", {
+            state.clearSelection()
+            state.clearAnnotationSelection()
             state.beginSelection(at: textHit)
+            state.extendSelection(to: dragEnd)
+            state.endPointerInteraction(at: dragEnd, wasClick: false)
             return state.selection != nil && state.selectedAnnotationID == nil
         })
-        require(state.selectedAnnotationID != coverID,
-                "a single click inside an unselected text box does not select the box")
         state.clearSelection()
 
         // Its frame is the way in: click the edge to select, then resize by a handle.
@@ -250,6 +263,7 @@ extension ReaderChecks {
                                    point: CGPoint(x: coverRect.minX + 0.5,
                                                   y: coverRect.midY))
         state.beginSelection(at: edgeHit)
+        state.endPointerInteraction(at: edgeHit, wasClick: true)
         require(state.selectedAnnotationID == coverID,
                 "clicking a text box's frame selects it")
         let writesBeforeResize = state.annotationWriteCount

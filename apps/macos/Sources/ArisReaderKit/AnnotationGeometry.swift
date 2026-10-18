@@ -157,6 +157,12 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
     public let shapeRect: CGRect?
     public let lineStart: CGPoint?
     public let lineEnd: CGPoint?
+    /// The page-space quads a text mark covers, one per visual line.
+    ///
+    /// Empty for every kind drawn from its own geometry. For a highlight, underline or strikeout
+    /// the quads come from the page's text layer: they are the mark's actual shape, so the
+    /// selection halo can follow all of a multi-line mark instead of boxing the paragraph.
+    public let textQuads: [CGRect]
     public let color: AnnotationColor
     public let strokeWidth: CGFloat
     public let isSelected: Bool
@@ -174,6 +180,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
         shapeRect: CGRect? = nil,
         lineStart: CGPoint? = nil,
         lineEnd: CGPoint? = nil,
+        textQuads: [CGRect] = [],
         color: AnnotationColor,
         strokeWidth: CGFloat,
         isSelected: Bool,
@@ -187,6 +194,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
         self.shapeRect = shapeRect
         self.lineStart = lineStart
         self.lineEnd = lineEnd
+        self.textQuads = textQuads
         self.color = color
         self.strokeWidth = strokeWidth
         self.isSelected = isSelected
@@ -215,7 +223,8 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
                           width: max(abs(end.x - start.x), 0.01),
                           height: max(abs(end.y - start.y), 0.01))
         case .highlight, .underline, .strikeout:
-            return nil
+            guard let first = textQuads.first else { return nil }
+            return textQuads.dropFirst().reduce(first) { $0.union($1) }
         }
     }
 }
@@ -245,6 +254,17 @@ public enum AnnotationGeometry {
     /// stroke's width there, so the distance a hand must miss by is the same at every zoom:
     /// `8 view pt + half the stroke's on-screen width`.
     public static let eraserToleranceViewPt: CGFloat = 8
+
+    /// How much room the dashed selection halo leaves around an ink stroke, shape or placed
+    /// text box, in page points. The halo is a signpost, not a fill: it should read as "this
+    /// mark is selected" without covering the mark or its neighbours.
+    public static let haloPaddingPt: CGFloat = 6
+
+    /// How much room the dashed selection halo leaves around a text mark's quads, in page points.
+    ///
+    /// Half the box padding: a text mark is selected as text, so the outline follows the words
+    /// themselves. Six points around every line would read as a box around the paragraph.
+    public static let markupHaloPaddingPt: CGFloat = 3
 
     /// The page-space distance within which the eraser removes a `strokeWidth`-wide ink stroke at
     /// `zoom`. See ``eraserToleranceViewPt`` for the number and why it was chosen.
@@ -348,18 +368,51 @@ public enum AnnotationGeometry {
             guard let rect = mark.shapeRect else { return false }
             return distance(point, toEllipseIn: rect) <= reach
         case .highlight, .underline, .strikeout:
-            return false
+            // A text mark is hit on the words it covers, not on a paragraph box: the quads are
+            // the lines of the marked range, so the text either side is unaffected.
+            return mark.textQuads.contains {
+                $0.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
+            }
         case .stickyNote:
             guard let rect = mark.shapeRect else { return false }
             return rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
         case .textBox:
             guard let rect = mark.shapeRect else { return false }
-            // A text box is selected by its frame, never by its interior while it is not
-            // selected: the text under it must stay selectable. Once selected, dragging its
-            // inside moves it, which is why the interior counts only then.
-            if distance(point, toRectOutline: rect) <= reach { return true }
-            return mark.isSelected && rect.contains(point)
+            // A press anywhere on the box (frame or interior) is a candidate for a plain-click
+            // selection; the canvas and `AppState` then use click-versus-drag to decide whether
+            // it selects the box or selects the text underneath. Once the box is selected,
+            // dragging its interior moves it.
+            return rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
         }
+    }
+
+    /// The page-space rectangles the dashed selection halo is drawn around.
+    ///
+    /// One rectangle per text line for a text mark, so a multi-line highlight is outlined as the
+    /// lines of text it covers rather than as one box around the whole paragraph. Every other
+    /// editable mark keeps the single padded box it has always had.
+    public static func haloRects(for mark: CanvasAnnotationMark) -> [CGRect] {
+        if !mark.textQuads.isEmpty {
+            return mark.textQuads.map {
+                $0.insetBy(dx: -markupHaloPaddingPt, dy: -markupHaloPaddingPt)
+            }
+        }
+        guard let bounds = mark.bounds else { return [] }
+        return [bounds.insetBy(dx: -haloPaddingPt, dy: -haloPaddingPt)]
+    }
+
+    /// The dashed halo path for a mark, in page-local points.
+    ///
+    /// The overlay offsets this path by the page placement and strokes it with the 4-3 dash the
+    /// ink and shape selection has always used; the checks compare the rectangles above with the
+    /// mark's quads so the two cannot drift apart.
+    public static func haloPath(for mark: CanvasAnnotationMark) -> CGPath {
+        let path = CGMutablePath()
+        for rect in haloRects(for: mark) {
+            let radius = min(4, max(0, min(rect.width, rect.height) / 2))
+            path.addRoundedRect(in: rect, cornerWidth: radius, cornerHeight: radius)
+        }
+        return path
     }
 
     /// Distance from a point to a polyline, or infinity for an empty one.
