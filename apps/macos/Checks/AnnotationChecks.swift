@@ -883,6 +883,7 @@ extension ReaderChecks {
         var drawnNotes = 0
         var drawnText = 0
         var drawnMarkup = 0
+        var drawnGeometry = 0
         var skipReasons: [String] = []
         for annotation in state.documentAnnotations {
             switch annotation.drawing {
@@ -892,19 +893,23 @@ extension ReaderChecks {
                 drawnNotes += 1
             case .freeText:
                 drawnText += 1
+            case .geometry:
+                drawnGeometry += 1
             case .skipped:
                 require(annotation.skipReason != nil,
                         "a skipped annotation says why (\(annotation.kind))")
                 skipReasons.append(annotation.skipReason?.rawValue ?? "?")
             }
         }
-        require(drawnMarkup + drawnNotes + drawnText + skipReasons.count
+        require(drawnMarkup + drawnNotes + drawnText + drawnGeometry + skipReasons.count
                     == state.documentAnnotations.count,
                 "every content annotation is accounted for exactly once")
         require(drawnMarkup == 0, "this fixture carries no text markup at all")
         require(drawnNotes == 2, "both sticky notes are classified as drawn")
         require(drawnText == 2, "both readable free texts are classified as drawn")
-        require(skipReasons == ["no-text", "hidden", "unmodelled"],
+        require(drawnGeometry == 0,
+                "the fixture's /InkList is the malformed flat form, so no stroke is drawn")
+        require(skipReasons == ["no-text", "hidden", "empty-geometry"],
                 "the three undrawn annotations say why, got \(skipReasons)")
 
         // A note that is classified as drawn has to *reach the canvas*, in the note index block.
@@ -949,7 +954,10 @@ extension ReaderChecks {
         require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(5) },
                 "a hidden note gets no quad, so the page cannot contradict the file")
         require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(6) },
-                "an /Ink annotation gets no quad — it is reported, not invented")
+                "a malformed /Ink annotation gets no quad — it is reported, not invented")
+        require(ink.kind == "ink" && ink.drawing == .skipped
+                    && ink.skipReason == .emptyGeometry,
+                "the /Ink is still named, with the reason it has no path to draw")
         // Five, not four: the sidebar lists what a note *is*, so the empty free-text annotation
         // (undrawn, `no-text`) is in the list even though it puts nothing on the page.
         require(state.documentNotes.count == 5,

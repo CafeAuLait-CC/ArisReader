@@ -89,9 +89,45 @@ public final class MetalCanvasView: NSView {
     public var scrollYPt: CGFloat = 0 {
         didSet {
             guard scrollYPt != oldValue else { return }
+            syncAnnotationOverlay()
             markNeedsRender()
         }
     }
+
+    /// The reader's ink and shape marks, in page-local view space.
+    public var annotationMarks: [CanvasAnnotationMark] = [] {
+        didSet {
+            guard annotationMarks != oldValue else { return }
+            syncAnnotationOverlay()
+        }
+    }
+
+    /// Where each visible page sits in content points, for mapping page-local marks.
+    public var annotationPageFrames: [PagePlacement] = [] {
+        didSet {
+            guard annotationPageFrames != oldValue else { return }
+            syncAnnotationOverlay()
+        }
+    }
+
+    /// The tool a pointer drag uses. `.select` leaves text selection and mark selection intact.
+    public var annotationTool: AnnotationTool = .select
+
+    /// Colour and width of the mark a drag creates. `AppState` owns both; the canvas only draws.
+    public var annotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255)
+    public var annotationStrokeWidth: CGFloat = 2 {
+        didSet { syncAnnotationOverlay() }
+    }
+
+    /// A finished stroke or shape, handed to the shell once, on mouse-up.
+    public var onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    /// Delete the selected mark (Delete/Backspace). Returns whether something was deleted.
+    public var onDeleteAnnotation: (() -> Bool)?
+
+    private var annotationOverlay: AnnotationOverlayView?
+    private var drawingPage: Int?
+    private var drawingKind: AppState.Annotation.Kind?
+    private var annotationSelectGesture = false
 
     /// Scroll gestures, reported as deltas in screen points.
     ///
@@ -167,6 +203,7 @@ public final class MetalCanvasView: NSView {
     public var contentWidthPt: CGFloat = 0 {
         didSet {
             guard contentWidthPt != oldValue else { return }
+            syncAnnotationOverlay()
             markNeedsRender()
         }
     }
@@ -175,6 +212,7 @@ public final class MetalCanvasView: NSView {
     public var zoom: CGFloat = 1.0 {
         didSet {
             guard zoom != oldValue else { return }
+            syncAnnotationOverlay()
             markNeedsRender()
         }
     }
@@ -250,6 +288,13 @@ public final class MetalCanvasView: NSView {
         layerContentsRedrawPolicy = .duringViewResize
         // Files dragged in from Finder, the Dock or a browser download shelf (T2.12).
         registerForDraggedTypes(Self.fileDropTypes)
+        // Ink and shapes are vector overlays above the Metal surface: a `CAShapeLayer` path is
+        // re-used across zoom and scroll, and the live pen is updated from the pointer event
+        // itself rather than through a SwiftUI pass.
+        let overlay = AnnotationOverlayView(frame: bounds)
+        overlay.autoresizingMask = [.width, .height]
+        addSubview(overlay)
+        annotationOverlay = overlay
     }
 
     @available(*, unavailable)
@@ -277,6 +322,8 @@ public final class MetalCanvasView: NSView {
 
     public override func layout() {
         super.layout()
+        annotationOverlay?.frame = bounds
+        syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
     }
@@ -458,17 +505,57 @@ public final class MetalCanvasView: NSView {
         )
     }
 
+    /// The page under a content point and the point in that page's top-left space.
+    private func pageLocalPoint(atContent point: CGPoint) -> (page: Int, point: CGPoint,
+                                                              frame: PagePlacement)? {
+        for frame in annotationPageFrames {
+            let rect = CGRect(x: frame.leftPt, y: frame.topPt,
+                              width: frame.widthPt, height: frame.heightPt)
+            guard rect.contains(point) else { continue }
+            return (frame.index, CGPoint(x: point.x - frame.leftPt, y: point.y - frame.topPt),
+                    frame)
+        }
+        return nil
+    }
+
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         wheelMotion.reset()
-        // Selection waits: see `clickSlopPt`. Nothing about the model changes until the pointer
-        // has moved far enough to mean a drag.
         pressLocation = convert(event.locationInWindow, from: nil)
         pointerMoved = false
+        let content = contentPoint(for: event)
+
+        // A drawing tool owns the gesture from press to release. The live preview lives entirely
+        // inside the overlay: nothing reaches AppState until mouse-up.
+        if annotationTool.draws, let kind = annotationTool.kind,
+           let hit = pageLocalPoint(atContent: content) {
+            drawingPage = hit.page
+            drawingKind = kind
+            annotationOverlay?.beginLiveStroke(kind: kind, page: hit.page, at: hit.point)
+            return
+        }
+
+        // Selecting a mark is decided on the press, not after the drag slop: the mark is what
+        // the reader aimed at, and waiting would let the text under it start a text selection.
+        // Only an editable mark (one in the sidecar) qualifies.
+        if annotationTool == .select,
+           annotationOverlay?.hitTestMark(atContentPoint: content,
+                                         toleranceViewPt: AnnotationGeometry.hitTolerancePt) != nil {
+            annotationSelectGesture = true
+            onPointerDown?(content)
+            return
+        }
+
+        // Text selection waits: see `clickSlopPt`. Nothing about the model changes until the
+        // pointer has moved far enough to mean a drag.
         syncInteraction()
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if drawingKind != nil, drawingPage != nil {
+            annotationOverlay?.extendLiveStroke(atContentPoint: contentPoint(for: event))
+            return
+        }
         let location = convert(event.locationInWindow, from: nil)
         guard pointerMoved
             || hypot(location.x - (pressLocation?.x ?? location.x),
@@ -481,8 +568,9 @@ public final class MetalCanvasView: NSView {
         if !pointerMoved {
             pointerMoved = true
             // The anchor is where the press landed, not where the threshold was crossed: the
-            // reader aims at the character they pressed on.
-            if let press = pressLocation {
+            // reader aims at the character they pressed on. A mark selection already sent its
+            // press (so AppState's move began there); only text selection needs this anchor.
+            if !annotationSelectGesture, let press = pressLocation {
                 onPointerDown?(contentPoint(forViewPoint: press))
             }
         }
@@ -491,14 +579,31 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if drawingKind != nil {
+            let draft = annotationOverlay?.finishLiveStroke(in: annotationPageFrames)
+            drawingKind = nil
+            drawingPage = nil
+            if let draft { onAnnotationDraft?(draft) }
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
         // A press that never left the slop is a click even if the release lands a little off it.
         onPointerUp?(contentPoint(for: event), !pointerMoved)
         pressLocation = nil
         pointerMoved = false
+        annotationSelectGesture = false
         syncInteraction()
     }
 
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Delete removes the selected ink/shape mark. It is consumed only when there is one, so
+        // a Delete meant for a text field still reaches it.
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
+           event.keyCode == 51 || event.keyCode == 117,
+           onDeleteAnnotation?() == true {
+            return true
+        }
         // ⌘C without a menu item: the canvas is the first responder while reading.
         if event.modifierFlags.contains(.command),
            let key = event.charactersIgnoringModifiers?.lowercased() {
@@ -527,6 +632,14 @@ public final class MetalCanvasView: NSView {
         // shell has one (AppState.scrollByKeyboardStep) and falls back to the wheel step otherwise.
         let step = onKeyboardStep ?? onScrollStep
         switch event.charactersIgnoringModifiers {
+        case "\u{7F}", "\u{8}":
+            if onDeleteAnnotation?() == true { return }
+            super.keyDown(with: event)
+        case "\u{1B}":
+            annotationOverlay?.cancelLiveStroke()
+            drawingKind = nil
+            drawingPage = nil
+            super.keyDown(with: event)
         case " ":
             // Keyboard paging animates to its destination.
             step?(event.modifierFlags.contains(.shift) ? -page : page)
@@ -834,6 +947,25 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// Hands the current marks, page frames and view transform to the overlay.
+    ///
+    /// Called from every setter that changes the view mapping and from the event path after a
+    /// live gesture. The overlay owns the actual layer tree; this method contains no drawing.
+    private func syncAnnotationOverlay() {
+        guard let overlay = annotationOverlay else { return }
+        let color = annotationColor.nsColor
+        overlay.update(
+            marks: annotationMarks,
+            frames: annotationPageFrames,
+            zoom: zoom,
+            scrollYPt: scrollYPt,
+            contentWidthPt: contentWidthPt,
+            color: color,
+            strokeWidth: annotationStrokeWidth,
+            themeColor: NSColor.controlAccentColor
+        )
+    }
+
     // MARK: - Geometry
 
     private func backingScale() -> CGFloat {
@@ -879,6 +1011,13 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let scrollYPt: CGFloat
     private let zoom: CGFloat
     private let contentWidthPt: CGFloat
+    private let annotationMarks: [CanvasAnnotationMark]
+    private let annotationPageFrames: [PagePlacement]
+    private let annotationTool: AnnotationTool
+    private let annotationColor: AnnotationColor
+    private let annotationStrokeWidth: CGFloat
+    private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    private let onDeleteAnnotation: (() -> Bool)?
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
@@ -906,6 +1045,13 @@ public struct PDFCanvasView: NSViewRepresentable {
         scrollYPt: CGFloat = 0,
         zoom: CGFloat = 1.0,
         contentWidthPt: CGFloat = 0,
+        annotationMarks: [CanvasAnnotationMark] = [],
+        annotationPageFrames: [PagePlacement] = [],
+        annotationTool: AnnotationTool = .select,
+        annotationColor: AnnotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255),
+        annotationStrokeWidth: CGFloat = 2,
+        onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
+        onDeleteAnnotation: (() -> Bool)? = nil,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
@@ -929,6 +1075,13 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.scrollYPt = scrollYPt
         self.zoom = zoom
         self.contentWidthPt = contentWidthPt
+        self.annotationMarks = annotationMarks
+        self.annotationPageFrames = annotationPageFrames
+        self.annotationTool = annotationTool
+        self.annotationColor = annotationColor
+        self.annotationStrokeWidth = annotationStrokeWidth
+        self.onAnnotationDraft = onAnnotationDraft
+        self.onDeleteAnnotation = onDeleteAnnotation
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
@@ -980,6 +1133,13 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
+        view.annotationMarks = annotationMarks
+        view.annotationPageFrames = annotationPageFrames
+        view.annotationTool = annotationTool
+        view.annotationColor = annotationColor
+        view.annotationStrokeWidth = annotationStrokeWidth
+        view.onAnnotationDraft = onAnnotationDraft
+        view.onDeleteAnnotation = onDeleteAnnotation
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
         // coordinator is the one long-lived object (it also serves the Dock and Finder paths).

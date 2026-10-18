@@ -111,6 +111,17 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // Ink and shapes on their own (`ArisReaderChecks --check-ink-annotations .`).
+        if CommandLine.arguments.contains("--check-ink-annotations") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await inkAnnotationChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
+                strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+            print("Ink and shape checks passed")
+            return
+        }
         // The annotation text export on its own (`ArisReaderChecks --check-annotation-export .`).
         if CommandLine.arguments.contains("--check-annotation-export") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -336,6 +347,10 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await inkAnnotationChecks(
+            drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
+            strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
         try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await inlineNoteChecks(root: root)
         try await annotationNoteChecks(

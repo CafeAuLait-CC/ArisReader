@@ -17,11 +17,12 @@ The goal is PDF Expert-level simplicity and fluidity, with two advanced capabili
 
 Current status: **M1–M5 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
-tabs, sidecar highlights/underlines/notes, citation/figure/table/algorithm previews, and document
-metadata recognition with per-field provenance plus BibTeX export.
+tabs, sidecar highlights/underlines/notes/ink/shapes, citation/figure/table/algorithm previews, and
+document metadata recognition with per-field provenance plus BibTeX export.
 Those annotations can be written back into a PDF: saving an annotated copy, or replacing the
-original after a verified backup, appends real PDF annotations with quads, colour, opacity, author
-and date through an incremental save that leaves every pre-existing annotation byte-identical.
+original after a verified backup, appends real PDF annotations with quads or stroke geometry,
+colour, opacity, author and date through an incremental save that leaves every pre-existing
+annotation byte-identical.
 Replacing the original also removes exactly the sidecar entries it saved, so nothing appears twice;
 a saved copy carries no sidecar and shows each annotation once, from the file. Pages can be rotated,
 deleted, reordered, inserted and extracted through a staged session whose undo covers the whole
@@ -50,12 +51,12 @@ background execution does not imply parallel PDFium rendering.
 
 Capabilities, each backed by a check rather than a claim: selection and click-precise text, search,
 tabs and independent windows, outline with section numbers and levels, page and annotation sidebars
-with reply threads, highlight/underline/note creation with a colour and blend, saved annotations
-inside the PDF, staged page editing, facing pages and bookmarks, citation/figure/table/algorithm
-previews with draggable panels, paper metadata and BibTeX export, and the AI assistant described
-above. Known gaps are listed in the project's design notes: ink and shape annotations, standalone
-sticky notes and text boxes, form filling, redaction and printing, an index cache, thumbnail drag
-reordering, and cross-platform shells.
+with reply threads, highlight/underline/note/ink/shape creation with a colour and blend, saved
+annotations inside the PDF, staged page editing, facing pages and bookmarks,
+citation/figure/table/algorithm previews with draggable panels, paper metadata and BibTeX export,
+and the AI assistant described above. Known gaps are listed in the project's design notes:
+standalone sticky notes and text boxes, form filling, redaction and printing, and the Linux and
+Windows shells.
 
 ---
 
@@ -183,6 +184,30 @@ highlight; that is the honest cost of not writing a knowingly wrong blend mode. 
 written with `/Subtype /Text`, contents, author, date and colour, but PDFium exposes no setter for
 the `/Name` icon, so viewers show their default note icon rather than `/Comment`. An opaque `/CA`
 (1.0) is omitted by PDFium because absence already means fully opaque.
+
+Ink, square, circle and line/arrow annotations are different: they have no blend-mode problem, so
+Lyra writes a real `/AP /N` Form XObject for them (the stroke path in the annotation's colour and
+`/BS` width, with `/BS` matching what the stream draws) in addition to `/InkList` or `/L`/`/LE`.
+PDFKit renders both the stroke and the shape from that file — the regression suite samples the
+saved page and requires the ink's red pixels and the square's blue pixels inside their marks and
+none away from them — and a viewer that ignores the appearance stream can still synthesize from
+the geometry. A viewer that ignores **both** `/AP` and the geometry will show nothing; no such
+viewer was observed here. Preview and Acrobat were not run for these kinds; PDFKit is the engine
+named in the evidence.
+
+`tests/fixtures/annotated-strokes.pdf` is the committed fixture for the reading side: its
+`/InkList`, `/L`, `/LE`, `/BS` and `/AP` were hand-written by `scripts/make-fixtures.py`, not by
+Lyra. The reader must report the five marks as `ink`, `square`, `circle`, `line` and `arrow`, read
+the ink's four points and the 3 pt `/BS`, treat `/LE [/None /ClosedArrow]` as an arrow, and draw
+each from the dictionary (the appearance stream is there, but it is not the reader's source). The
+native checks assert exactly that, including the Y flip.
+
+**Ink and shape storage.** Their sidecar entries carry `"version": 1` and page-space geometry
+(`paths`, `rect`, `lineStart`/`lineEnd`, `strokeWidth`). The page-space rule is what makes a mark
+land in the same place at every zoom, and it is checked by drawing the same gesture at 100% and
+300%. A build that does not know the geometry schema — an older Lyra, or a newer build with a
+higher version — preserves the entry verbatim instead of misreading it; that is the same
+per-entry rule the sidecar has always used for colours and bookmarks.
 
 **Crash recovery.** A save writes `<destination>.lyra-save-<pid>-<n>.tmp` in the destination's
 directory and removes the temporary on every error. On the next open, the reader reports any
@@ -669,7 +694,7 @@ resolve locally.
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: resolved in PR #6 |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink, free text, page operations and AcroForm forms remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/notes with undo/redo, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink and shape annotations are drawn in a vector overlay, stored as versioned page-space sidecar entries and written back as `/Ink`, `/Square`, `/Circle` and `/Line` (with `/L`, `/LE`, `/BS` and a real `/AP` appearance stream); they can be selected by their stroke, moved and deleted, with undo/redo covering all three. Free text, page operations and AcroForm forms remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 40 table captions in the twelve sample papers, the rest falling back to the page. Captions and per-page citation spans are indexed for the whole document, not the first 120 pages, so a reference to a figure or a citation near the end of a 900-page book resolves like one on page 8. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. A document that prints more than one reference list (a main bibliography and an appendix's own, or a per-chapter thesis list) attributes each citation to the list its section cites: the `cite` CLI prints the list and the reason, reports when a number exists only in an appendix list, and records an ambiguous choice instead of silently preferring the nearer list. On the **twenty-paper arXiv corpus**, 94.4% of 1826 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations remain unsupported. Bare parenthesised numerals - (12), (3-5), (7, 9) - are detected when the document proves its bibliography is numeric and its body does not already bracket those citations, with equation numbers, function calls, years, enumerations, figure sub-labels and out-of-range labels rejected by position and context; a Science paper in the evaluation set went from no spans to twenty resolved ones while every other row stayed identical. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning and index persistence remain. Document metadata (title, authors, venue, year, DOI, arXiv id) is recognised from XMP, `/Info` and page one, shown with per-field provenance in a sidebar section, editable, and exported as BibTeX with an offline generator. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | Partial: OpenAI-compatible streaming page/document summaries, selection Q&A and translation, local/remote visibility, request preview, Keychain, cancel/retry, usage and `[p.N]` page links. Document chat, vision/region discussion, summary merging and cross-platform credential stores remain. |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
