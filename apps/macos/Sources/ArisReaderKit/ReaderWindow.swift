@@ -163,14 +163,26 @@ public struct ReaderWindow: View {
                         )
                     }
                 },
+                // The eraser's mode owns the pointer, but all of its geometry and undo live in
+                // AppState like every other edit. Hover drives the pre-erase halo only.
+                onEraseGestureBegan: { point in
+                    state.beginEraserGesture(atContentPoint: point)
+                },
+                onEraseGestureDragged: { previous, point in
+                    state.extendEraserGesture(fromContentPoint: previous, toContentPoint: point)
+                },
+                onEraseGestureEnded: { state.endEraserGesture() },
+                onEraserHover: { point in
+                    state.updateEraserHover(atContentPoint: point)
+                },
                 onDeleteAnnotation: { state.deleteSelectedAnnotation() },
                 onPlaceStickyNote: { point in state.placeOrOpenStickyNote(atContentPoint: point) },
                 onAnnotationDoubleClick: { point in
                     state.beginEditingTextBox(atContentPoint: point)
                 },
-                // Escape leaves the sticky markup mode. It is consumed only when a mode was
-                // active; the canvas keeps its existing Escape handling for a live draft.
-                onCancelTextMarkup: { state.cancelTextMarkupTool() || state.cancelFormTool() },
+                // Escape leaves the sticky markup mode or the eraser. It is consumed only when a
+                // mode was active; the canvas keeps its existing Escape handling for a live draft.
+                onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
@@ -235,10 +247,13 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.pageEditSessionActive || state.formHasPendingChanges {
+            if state.pageEditSessionActive || state.formHasPendingChanges
+                || state.hasPendingInkErasure || state.eraserRefusalNotice != nil {
                 VStack(spacing: 8) {
                     if state.pageEditSessionActive { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
+                    if state.eraserRefusalNotice != nil { eraserRefusalBanner }
+                    if state.hasPendingInkErasure { eraserPendingBanner }
                     Spacer()
                 }
                 .padding(.top, 12)
@@ -396,6 +411,73 @@ public struct ReaderWindow: View {
         .accessibilityLabel(
             "Form changes pending. \(state.formChangedFields.count) field(s) differ from the file on disk."
         )
+    }
+
+    /// The eraser's pending state: the strokes are gone from the reader's view and from its
+    /// sidecar, but the PDF on disk is untouched until an explicit save. Same panel, icon and
+    /// sentence as the other pending banners; the only difference is that this one has no
+    /// "Apply to Original" pair because it is a deletion, not a value.
+    private var eraserPendingBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "eraser")
+                .foregroundStyle(LyraTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Ink changes pending")
+                    .font(.callout.weight(.semibold))
+                Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save a copy.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Divider().frame(height: 24)
+            Button("Save Copy…") { state.presentSaveAnnotatedCopyPanel() }
+                .disabled(!state.canSaveAnnotationsToPDF)
+            Button("Undo") { state.undo() }
+                .disabled(!state.canUndo)
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraTheme.warningFg.opacity(0.5), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Ink erasures pending. The PDF on disk is unchanged until you save a copy."
+        )
+    }
+
+    /// The eraser's refusal: the stroke under the pointer belongs to the PDF itself, so this
+    /// version's writer cannot remove it. Stated explicitly instead of leaving a press that
+    /// looks broken.
+    private var eraserRefusalBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(LyraTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("This ink belongs to the PDF")
+                    .font(.callout.weight(.semibold))
+                Text(state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 520, alignment: .leading)
+            }
+            Divider().frame(height: 24)
+            Button("Dismiss") { state.dismissEraserRefusal() }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraTheme.warningFg.opacity(0.5), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
     }
 
     private var emptyState: some View {

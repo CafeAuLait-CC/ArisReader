@@ -111,7 +111,23 @@ public final class MetalCanvasView: NSView {
     }
 
     /// The tool a pointer drag uses. `.select` leaves text selection and mark selection intact.
-    public var annotationTool: AnnotationTool = .select
+    ///
+    /// The eraser owns the gesture in the same way the pen does: a press starts a gesture, every
+    /// drag sample extends it, and the release ends it. Nothing about selection runs while it is
+    /// armed. Leaving the mode drops any gesture in flight (the model has already cancelled it).
+    public var annotationTool: AnnotationTool = .select {
+        didSet {
+            guard annotationTool != oldValue else { return }
+            if annotationTool == .eraser {
+                // mouseMoved: is only generated when the window opts in. Arming the eraser is
+                // the one moment the canvas needs it; leaving it on afterwards is harmless.
+                window?.acceptsMouseMovedEvents = true
+                return
+            }
+            eraserGestureActive = false
+            eraserLastContentPoint = nil
+        }
+    }
 
     /// Colour and width of the mark a drag creates. `AppState` owns both; the canvas only draws.
     public var annotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255)
@@ -121,6 +137,13 @@ public final class MetalCanvasView: NSView {
 
     /// A finished stroke or shape, handed to the shell once, on mouse-up.
     public var onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    /// The eraser gesture, in content points. `dragged` receives the segment's previous and
+    /// current points, so the model tests the path the pointer travelled, not isolated samples.
+    public var onEraseGestureBegan: ((CGPoint) -> Void)?
+    public var onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)?
+    public var onEraseGestureEnded: (() -> Void)?
+    /// The pointer over an armed eraser, in content points; `nil` leaves the view.
+    public var onEraserHover: ((CGPoint?) -> Void)?
     /// Delete the selected mark (Delete/Backspace). Returns whether something was deleted.
     public var onDeleteAnnotation: (() -> Bool)?
     /// The sticky-note tool's click: place a note at a content point, or open one already there.
@@ -128,9 +151,9 @@ public final class MetalCanvasView: NSView {
     /// A double-click on a placed text annotation; true means the shell opened its editor and
     /// the gesture must not become text selection.
     public var onAnnotationDoubleClick: ((CGPoint) -> Bool)?
-    /// Escape while the canvas is the first responder: leave the sticky markup mode. Returns
-    /// whether a mode was left, so Escape is only consumed when it did something.
-    public var onCancelTextMarkup: (() -> Bool)?
+    /// Escape while the canvas is the first responder: leave a mode (sticky markup or the
+    /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
+    public var onCancelTool: (() -> Bool)?
 
     private var pageChrome: PageChromeOverlayView?
     private var annotationOverlay: AnnotationOverlayView?
@@ -142,6 +165,12 @@ public final class MetalCanvasView: NSView {
     private var notePlacementPending = false
     /// The press opened an editor on a double-click; the release must not also select text.
     private var annotationDoubleClickConsumed = false
+    /// An eraser drag is in flight, and where its last sample landed (content points).
+    private var eraserGestureActive = false
+    private var eraserLastContentPoint: CGPoint?
+    /// Delivers pointer movement for the eraser's pre-erase halo. Installed once; AppKit
+    /// re-creates tracking areas when the view moves or resizes.
+    private var hoverTrackingArea: NSTrackingArea?
 
     /// Scroll gestures, reported as deltas in screen points.
     ///
@@ -349,8 +378,39 @@ public final class MetalCanvasView: NSView {
         if window == nil {
             detachSurface()
         } else {
+            if annotationTool == .eraser { window?.acceptsMouseMovedEvents = true }
             attachSurfaceIfNeeded()
         }
+    }
+
+    // MARK: - Pointer hover (eraser indication)
+
+    /// The eraser shows which stroke a press would remove, so pointer movement matters only
+    /// while it is armed. `.inVisibleRect` keeps the area correct across scrolling and resizing.
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    public override func mouseMoved(with event: NSEvent) {
+        guard annotationTool == .eraser, !eraserGestureActive else {
+            super.mouseMoved(with: event)
+            return
+        }
+        onEraserHover?(contentPoint(for: event))
+    }
+
+    public override func mouseExited(with event: NSEvent) {
+        if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
+        super.mouseExited(with: event)
     }
 
     public override func viewDidChangeEffectiveAppearance() {
@@ -574,6 +634,18 @@ public final class MetalCanvasView: NSView {
             return
         }
 
+        // The eraser owns the gesture from press to release, exactly like the pen. It erases on
+        // the press as well as on the drag: the hover halo has already shown which stroke that
+        // press will remove, so touching the eraser down on ink behaves like touching an eraser
+        // to paper. Nothing about text selection or mark selection runs in this mode.
+        if annotationTool == .eraser {
+            eraserGestureActive = true
+            eraserLastContentPoint = content
+            onEraserHover?(nil)
+            onEraseGestureBegan?(content)
+            return
+        }
+
         // The sticky-note tool places on a click. Waiting for mouse-up is what lets a press that
         // turns into a drag be ignored instead of leaving a note wherever the hand twitched.
         if annotationTool.placesNote {
@@ -617,6 +689,14 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if eraserGestureActive {
+            let content = contentPoint(for: event)
+            let previous = eraserLastContentPoint ?? content
+            eraserLastContentPoint = content
+            onEraseGestureDragged?(previous, content)
+            syncInteraction()
+            return
+        }
         if notePlacementPending {
             let location = convert(event.locationInWindow, from: nil)
             if hypot(location.x - (pressLocation?.x ?? location.x),
@@ -652,6 +732,15 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if eraserGestureActive {
+            eraserGestureActive = false
+            eraserLastContentPoint = nil
+            onEraseGestureEnded?()
+            pressLocation = nil
+            pointerMoved = false
+            syncInteraction()
+            return
+        }
         if annotationDoubleClickConsumed {
             annotationDoubleClickConsumed = false
             pressLocation = nil
@@ -738,7 +827,13 @@ public final class MetalCanvasView: NSView {
             drawingPage = nil
             drawingPlacesTextBox = false
             notePlacementPending = false
-            if onCancelTextMarkup?() == true { return }
+            if eraserGestureActive {
+                eraserGestureActive = false
+                eraserLastContentPoint = nil
+            }
+            // Leaving the eraser (or a sticky markup mode) consumes Escape; the model cancels
+            // any eraser gesture in flight when the tool changes.
+            if onCancelTool?() == true { return }
             super.keyDown(with: event)
         case " ":
             // Keyboard paging animates to its destination.
@@ -1131,10 +1226,14 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let annotationColor: AnnotationColor
     private let annotationStrokeWidth: CGFloat
     private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    private let onEraseGestureBegan: ((CGPoint) -> Void)?
+    private let onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)?
+    private let onEraseGestureEnded: (() -> Void)?
+    private let onEraserHover: ((CGPoint?) -> Void)?
     private let onDeleteAnnotation: (() -> Bool)?
     private let onPlaceStickyNote: ((CGPoint) -> Bool)?
     private let onAnnotationDoubleClick: ((CGPoint) -> Bool)?
-    private let onCancelTextMarkup: (() -> Bool)?
+    private let onCancelTool: (() -> Bool)?
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
@@ -1169,10 +1268,14 @@ public struct PDFCanvasView: NSViewRepresentable {
         annotationColor: AnnotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255),
         annotationStrokeWidth: CGFloat = 2,
         onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
+        onEraseGestureBegan: ((CGPoint) -> Void)? = nil,
+        onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)? = nil,
+        onEraseGestureEnded: (() -> Void)? = nil,
+        onEraserHover: ((CGPoint?) -> Void)? = nil,
         onDeleteAnnotation: (() -> Bool)? = nil,
         onPlaceStickyNote: ((CGPoint) -> Bool)? = nil,
         onAnnotationDoubleClick: ((CGPoint) -> Bool)? = nil,
-        onCancelTextMarkup: (() -> Bool)? = nil,
+        onCancelTool: (() -> Bool)? = nil,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
@@ -1203,10 +1306,14 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.annotationColor = annotationColor
         self.annotationStrokeWidth = annotationStrokeWidth
         self.onAnnotationDraft = onAnnotationDraft
+        self.onEraseGestureBegan = onEraseGestureBegan
+        self.onEraseGestureDragged = onEraseGestureDragged
+        self.onEraseGestureEnded = onEraseGestureEnded
+        self.onEraserHover = onEraserHover
         self.onDeleteAnnotation = onDeleteAnnotation
         self.onPlaceStickyNote = onPlaceStickyNote
         self.onAnnotationDoubleClick = onAnnotationDoubleClick
-        self.onCancelTextMarkup = onCancelTextMarkup
+        self.onCancelTool = onCancelTool
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
@@ -1265,10 +1372,14 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.annotationColor = annotationColor
         view.annotationStrokeWidth = annotationStrokeWidth
         view.onAnnotationDraft = onAnnotationDraft
+        view.onEraseGestureBegan = onEraseGestureBegan
+        view.onEraseGestureDragged = onEraseGestureDragged
+        view.onEraseGestureEnded = onEraseGestureEnded
+        view.onEraserHover = onEraserHover
         view.onDeleteAnnotation = onDeleteAnnotation
         view.onPlaceStickyNote = onPlaceStickyNote
         view.onAnnotationDoubleClick = onAnnotationDoubleClick
-        view.onCancelTextMarkup = onCancelTextMarkup
+        view.onCancelTool = onCancelTool
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
         // coordinator is the one long-lived object (it also serves the Dock and Finder paths).

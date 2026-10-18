@@ -10,6 +10,9 @@ import CoreGraphics
 public enum AnnotationTool: String, CaseIterable, Sendable {
     case select
     case pen
+    /// A mode rather than a drawing tool: dragging removes whole ink strokes instead of
+    /// creating anything. It is in the same enum so exactly one tool can own the canvas.
+    case eraser
     case line
     case arrow
     case rectangle
@@ -24,7 +27,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select, .note, .textBox, .highlight, .underline, .strikeout: return nil
+        case .select, .eraser, .note, .textBox, .highlight, .underline, .strikeout: return nil
         case .pen: return .ink
         case .line: return .line
         case .arrow: return .arrow
@@ -42,7 +45,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .highlight: return .highlight
         case .underline: return .underline
         case .strikeout: return .strikeout
-        case .select, .pen, .line, .arrow, .rectangle, .ellipse, .note, .textBox: return nil
+        case .select, .pen, .eraser, .line, .arrow, .rectangle, .ellipse, .note, .textBox:
+            return nil
         }
     }
 
@@ -62,6 +66,12 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// Whether a drag with this tool is a freehand stroke rather than a corner-to-corner shape.
     public var isFreehand: Bool { self == .pen }
 
+    /// Whether a drag with this tool removes ink rather than creating it.
+    ///
+    /// The eraser is a *mode*, not something that draws: it owns the pointer gesture exactly
+    /// like the pen does, but a finished gesture is a deletion, not a new annotation.
+    public var erasesInk: Bool { self == .eraser }
+
     /// Whether the tool draws a stroked mark by dragging.
     public var draws: Bool { kind != nil }
 
@@ -75,6 +85,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         switch self {
         case .select: return "Select"
         case .pen: return "Pen"
+        case .eraser: return "Eraser"
         case .line: return "Line"
         case .arrow: return "Arrow"
         case .rectangle: return "Rectangle"
@@ -91,6 +102,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         switch self {
         case .select: return "arrow.up.left"
         case .pen: return "pencil.tip"
+        case .eraser: return "eraser"
         case .line: return "line.diagonal"
         case .arrow: return "arrow.up.right"
         case .rectangle: return "rectangle"
@@ -148,6 +160,9 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
     public let color: AnnotationColor
     public let strokeWidth: CGFloat
     public let isSelected: Bool
+    /// True for the ink stroke an armed eraser is over: drawn with the same halo the select tool
+    /// uses, before any press removes it.
+    public let isEraseTarget: Bool
     /// False for a mark that only exists inside the PDF (it can be seen, not moved or deleted).
     public let isEditable: Bool
 
@@ -162,6 +177,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
         color: AnnotationColor,
         strokeWidth: CGFloat,
         isSelected: Bool,
+        isEraseTarget: Bool = false,
         isEditable: Bool
     ) {
         self.id = id
@@ -174,6 +190,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
         self.color = color
         self.strokeWidth = strokeWidth
         self.isSelected = isSelected
+        self.isEraseTarget = isEraseTarget
         self.isEditable = isEditable
     }
 
@@ -216,6 +233,24 @@ public enum AnnotationGeometry {
     /// so half its width plus 3 pt of hand tolerance selects it without reaching text a line
     /// away. The canvas divides this by the zoom before asking page-space geometry.
     public static let hitTolerancePt: CGFloat = 4
+
+    /// How far the eraser's pointer path may pass from an ink stroke and still remove it, in
+    /// **view** points.
+    ///
+    /// 8 pt is twice the select tool's 4 pt allowance, because an eraser is dragged rather than
+    /// aimed at one point: at 100% zoom a 2 pt pen stroke is removed when the pointer comes
+    /// within 9 pt of its centreline (8 pt plus half the stroke's width), which is roughly one
+    /// 12 pt text line — forgiving enough to feel like an eraser without reaching the line above
+    /// or below. The canvas converts the tolerance to page points with the zoom and adds half the
+    /// stroke's width there, so the distance a hand must miss by is the same at every zoom:
+    /// `8 view pt + half the stroke's on-screen width`.
+    public static let eraserToleranceViewPt: CGFloat = 8
+
+    /// The page-space distance within which the eraser removes a `strokeWidth`-wide ink stroke at
+    /// `zoom`. See ``eraserToleranceViewPt`` for the number and why it was chosen.
+    public static func eraserReach(strokeWidth: CGFloat, zoom: CGFloat) -> CGFloat {
+        strokeWidth / 2 + eraserToleranceViewPt / max(zoom, 0.01)
+    }
 
     /// A path through `points`, smoothed with the midpoint-quadratic rule.
     ///
@@ -380,6 +415,102 @@ public enum AnnotationGeometry {
             previous = current
         }
         return best
+    }
+
+    /// Distance from a pointer segment to a stroke polyline, or infinity for an empty stroke.
+    ///
+    /// An eraser gesture is a **path**, not a series of independent points: a fast drag delivers
+    /// one sample every few dozen points, and a stroke that crosses the line between two samples
+    /// must still be erased. Taking the minimum distance between the two *segments* (not between
+    /// their endpoints) is what makes that true.
+    public static func distance(fromSegment start: CGPoint, to end: CGPoint,
+                                andPolyline points: [CGPoint]) -> CGFloat {
+        guard let first = points.first else { return .infinity }
+        guard points.count > 1 else {
+            return distance(first, toSegmentFrom: start, to: end)
+        }
+        var best = CGFloat.infinity
+        for index in 1..<points.count {
+            best = min(best, distance(fromSegment: start, to: end,
+                                      andSegment: points[index - 1], points[index]))
+        }
+        return best
+    }
+
+    /// Distance between two line segments; zero when they cross or touch.
+    public static func distance(fromSegment a1: CGPoint, to a2: CGPoint,
+                                andSegment b1: CGPoint, _ b2: CGPoint) -> CGFloat {
+        if segmentsIntersect(a1, a2, b1, b2) { return 0 }
+        return min(
+            distance(a1, toSegmentFrom: b1, to: b2),
+            distance(a2, toSegmentFrom: b1, to: b2),
+            distance(b1, toSegmentFrom: a1, to: a2),
+            distance(b2, toSegmentFrom: a1, to: a2)
+        )
+    }
+
+    /// Whether two line segments cross or touch, including collinear overlap.
+    public static func segmentsIntersect(_ a1: CGPoint, _ a2: CGPoint,
+                                         _ b1: CGPoint, _ b2: CGPoint) -> Bool {
+        func orientation(_ p: CGPoint, _ q: CGPoint, _ r: CGPoint) -> CGFloat {
+            (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y)
+        }
+        func liesOnSegment(_ p: CGPoint, _ q: CGPoint, _ r: CGPoint) -> Bool {
+            q.x <= max(p.x, r.x) && q.x >= min(p.x, r.x)
+                && q.y <= max(p.y, r.y) && q.y >= min(p.y, r.y)
+        }
+        let o1 = orientation(a1, a2, b1)
+        let o2 = orientation(a1, a2, b2)
+        let o3 = orientation(b1, b2, a1)
+        let o4 = orientation(b1, b2, a2)
+        let epsilon: CGFloat = 1e-9
+        let straddles = { (first: CGFloat, second: CGFloat) in
+            (first > epsilon && second < -epsilon) || (first < -epsilon && second > epsilon)
+        }
+        if straddles(o1, o2) && straddles(o3, o4) { return true }
+        if abs(o1) <= epsilon && liesOnSegment(a1, b1, a2) { return true }
+        if abs(o2) <= epsilon && liesOnSegment(a1, b2, a2) { return true }
+        if abs(o3) <= epsilon && liesOnSegment(b1, a1, b2) { return true }
+        if abs(o4) <= epsilon && liesOnSegment(b1, a2, b2) { return true }
+        return false
+    }
+
+    /// The part of a segment inside an axis-aligned rectangle, or `nil` when it misses it.
+    ///
+    /// A drag in continuous layout can cross a page boundary between two pointer samples. The
+    /// eraser clips each sample segment to every page it touches before measuring distances in
+    /// that page's own space; without the clip, the part of the drag on the next page would be
+    /// compared against this page's strokes at the wrong coordinates.
+    public static func clippedSegment(from start: CGPoint, to end: CGPoint,
+                                      in rect: CGRect) -> (start: CGPoint, end: CGPoint)? {
+        var t0: CGFloat = 0
+        var t1: CGFloat = 1
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let checks: [(CGFloat, CGFloat)] = [
+            (-dx, start.x - rect.minX),
+            (dx, rect.maxX - start.x),
+            (-dy, start.y - rect.minY),
+            (dy, rect.maxY - start.y),
+        ]
+        for (p, q) in checks {
+            if abs(p) < 1e-12 {
+                if q < 0 { return nil }
+                continue
+            }
+            let r = q / p
+            if p < 0 {
+                if r > t1 { return nil }
+                if r > t0 { t0 = r }
+            } else {
+                if r < t0 { return nil }
+                if r < t1 { t1 = r }
+            }
+        }
+        return (
+            CGPoint(x: start.x + t0 * dx, y: start.y + t0 * dy),
+            CGPoint(x: start.x + t1 * dx, y: start.y + t1 * dy)
+        )
     }
 }
 

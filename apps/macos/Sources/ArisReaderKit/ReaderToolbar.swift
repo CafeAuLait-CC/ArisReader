@@ -387,7 +387,11 @@ struct ReaderSecondaryToolbar: View {
             ]) {
                 Image(systemName: "square.on.circle")
             }.disabled(state.document == nil)
-            pending("Eraser", "eraser")
+            tool("Eraser", "eraser",
+                 selected: state.annotationTool == .eraser,
+                 help: "Eraser: drag over ink to remove whole strokes (Esc leaves the eraser)") {
+                state.toggleEraserTool()
+            }.disabled(!state.canUseEraserTool)
             tool("Place a sticky note", "text.bubble",
                  selected: state.annotationTool == .note) {
                 state.annotationTool = state.annotationTool == .note ? .select : .note
