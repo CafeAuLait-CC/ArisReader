@@ -123,11 +123,21 @@ public final class MetalCanvasView: NSView {
     public var onAnnotationDraft: ((AnnotationDraft) -> Void)?
     /// Delete the selected mark (Delete/Backspace). Returns whether something was deleted.
     public var onDeleteAnnotation: (() -> Bool)?
+    /// The sticky-note tool's click: place a note at a content point, or open one already there.
+    public var onPlaceStickyNote: ((CGPoint) -> Bool)?
+    /// A double-click on a placed text annotation; true means the shell opened its editor and
+    /// the gesture must not become text selection.
+    public var onAnnotationDoubleClick: ((CGPoint) -> Bool)?
 
     private var annotationOverlay: AnnotationOverlayView?
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
+    private var drawingPlacesTextBox = false
     private var annotationSelectGesture = false
+    /// The press was the sticky-note tool's; placement happens on mouse-up if it stayed a click.
+    private var notePlacementPending = false
+    /// The press opened an editor on a double-click; the release must not also select text.
+    private var annotationDoubleClickConsumed = false
 
     /// Scroll gestures, reported as deltas in screen points.
     ///
@@ -544,13 +554,38 @@ public final class MetalCanvasView: NSView {
         pressLocation = convert(event.locationInWindow, from: nil)
         pointerMoved = false
         let content = contentPoint(for: event)
+        annotationDoubleClickConsumed = false
+
+        // A double-click on a placed text annotation opens its editor. It is decided before the
+        // ordinary press paths so the second press of the pair cannot start a move.
+        if annotationTool == .select, event.clickCount == 2,
+           onAnnotationDoubleClick?(content) == true {
+            annotationDoubleClickConsumed = true
+            return
+        }
+
+        // The sticky-note tool places on a click. Waiting for mouse-up is what lets a press that
+        // turns into a drag be ignored instead of leaving a note wherever the hand twitched.
+        if annotationTool.placesNote {
+            notePlacementPending = true
+            return
+        }
 
         // A drawing tool owns the gesture from press to release. The live preview lives entirely
-        // inside the overlay: nothing reaches AppState until mouse-up.
+        // inside the overlay: nothing reaches AppState until mouse-up. The text-box tool uses the
+        // rectangle preview and turns it into a text box when the drag ends.
+        if annotationTool.placesTextBox, let hit = pageLocalPoint(atContent: content) {
+            drawingPage = hit.page
+            drawingKind = .square
+            drawingPlacesTextBox = true
+            annotationOverlay?.beginLiveStroke(kind: .square, page: hit.page, at: hit.point)
+            return
+        }
         if annotationTool.draws, let kind = annotationTool.kind,
            let hit = pageLocalPoint(atContent: content) {
             drawingPage = hit.page
             drawingKind = kind
+            drawingPlacesTextBox = false
             annotationOverlay?.beginLiveStroke(kind: kind, page: hit.page, at: hit.point)
             return
         }
@@ -572,6 +607,14 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if notePlacementPending {
+            let location = convert(event.locationInWindow, from: nil)
+            if hypot(location.x - (pressLocation?.x ?? location.x),
+                     location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt {
+                pointerMoved = true
+            }
+            return
+        }
         if drawingKind != nil, drawingPage != nil {
             annotationOverlay?.extendLiveStroke(atContentPoint: contentPoint(for: event))
             return
@@ -599,11 +642,35 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if annotationDoubleClickConsumed {
+            annotationDoubleClickConsumed = false
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
+        if notePlacementPending {
+            notePlacementPending = false
+            if !pointerMoved {
+                _ = onPlaceStickyNote?(contentPoint(for: event))
+            }
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
         if drawingKind != nil {
             let draft = annotationOverlay?.finishLiveStroke(in: annotationPageFrames)
+            let placesTextBox = drawingPlacesTextBox
             drawingKind = nil
             drawingPage = nil
-            if let draft { onAnnotationDraft?(draft) }
+            drawingPlacesTextBox = false
+            if let draft {
+                if placesTextBox, let rect = draft.shapeRect {
+                    onAnnotationDraft?(AnnotationDraft(kind: .textBox, page: draft.page,
+                                                       shapeRect: rect))
+                } else {
+                    onAnnotationDraft?(draft)
+                }
+            }
             pressLocation = nil
             pointerMoved = false
             return
@@ -659,6 +726,8 @@ public final class MetalCanvasView: NSView {
             annotationOverlay?.cancelLiveStroke()
             drawingKind = nil
             drawingPage = nil
+            drawingPlacesTextBox = false
+            notePlacementPending = false
             super.keyDown(with: event)
         case " ":
             // Keyboard paging animates to its destination.
@@ -1046,6 +1115,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let annotationStrokeWidth: CGFloat
     private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
     private let onDeleteAnnotation: (() -> Bool)?
+    private let onPlaceStickyNote: ((CGPoint) -> Bool)?
+    private let onAnnotationDoubleClick: ((CGPoint) -> Bool)?
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
@@ -1081,6 +1152,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         annotationStrokeWidth: CGFloat = 2,
         onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
         onDeleteAnnotation: (() -> Bool)? = nil,
+        onPlaceStickyNote: ((CGPoint) -> Bool)? = nil,
+        onAnnotationDoubleClick: ((CGPoint) -> Bool)? = nil,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
@@ -1112,6 +1185,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.annotationStrokeWidth = annotationStrokeWidth
         self.onAnnotationDraft = onAnnotationDraft
         self.onDeleteAnnotation = onDeleteAnnotation
+        self.onPlaceStickyNote = onPlaceStickyNote
+        self.onAnnotationDoubleClick = onAnnotationDoubleClick
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
@@ -1171,6 +1246,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.annotationStrokeWidth = annotationStrokeWidth
         view.onAnnotationDraft = onAnnotationDraft
         view.onDeleteAnnotation = onDeleteAnnotation
+        view.onPlaceStickyNote = onPlaceStickyNote
+        view.onAnnotationDoubleClick = onAnnotationDoubleClick
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
         // coordinator is the one long-lived object (it also serves the Dock and Finder paths).

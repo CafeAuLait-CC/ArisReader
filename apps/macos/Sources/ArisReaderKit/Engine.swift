@@ -726,6 +726,9 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         case underline
         /// `/Subtype /Text`: a sticky note icon carrying the contents.
         case note
+        /// `/Subtype /FreeText`: text in `rect`, laid out at `fontSizePt` and aligned by
+        /// `textAlignment`, with `/DA` and an appearance stream.
+        case freeText
         /// `/Subtype /Ink`: the request's `inkPaths` are its `/InkList`.
         case ink
         /// `/Subtype /Square`.
@@ -760,6 +763,10 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     public let author: String
     /// `/M`, already in PDF date form.
     public let modified: String
+    /// `/DA` font size, in page points; only used by `.freeText`.
+    public let fontSizePt: CGFloat
+    /// `/Q` for `.freeText`: `left`, `center` or `right`.
+    public let textAlignment: String
 
     public init(
         id: String,
@@ -776,7 +783,9 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         opacity: Double,
         contents: String,
         author: String,
-        modified: String
+        modified: String,
+        fontSizePt: CGFloat = 0,
+        textAlignment: String = "left"
     ) {
         self.id = id
         self.page = page
@@ -793,6 +802,8 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         self.contents = contents
         self.author = author
         self.modified = modified
+        self.fontSizePt = fontSizePt
+        self.textAlignment = textAlignment
     }
 }
 
@@ -1944,6 +1955,7 @@ public final class RustEngine: PDFEngine {
             case .highlight: .highlight
             case .underline: .underline
             case .note: .note
+            case .freeText: .freeText
             case .ink: .ink
             case .square: .square
             case .circle: .circle
@@ -1971,7 +1983,9 @@ public final class RustEngine: PDFEngine {
                 opacity: request.opacity,
                 contents: request.contents,
                 author: request.author,
-                modified: request.modified
+                modified: request.modified,
+                fontSizePt: Double(request.fontSizePt),
+                textAlignment: request.textAlignment
             )
         }
     }

@@ -84,6 +84,9 @@ enum AnnotationSidecar {
         // and page-space geometry. A build that does not know those keys — or that knows the
         // kind but not this version — preserves the entry verbatim instead of guessing.
         "version", "paths", "rect", "lineStart", "lineEnd", "strokeWidth",
+        // Placed text (`stickyNote`, `textBox`) carries its box, its font size (text box only)
+        // and the same versioning rule.
+        "fontSize",
     ]
 
     /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
@@ -154,6 +157,8 @@ enum AnnotationSidecar {
             // must preserve it rather than interpret fields it does not know.
             let versionUnderstood: Bool = if let kind, kind.isGeometry {
                 (object["version"] as? Int) == AppState.Annotation.geometryVersion
+            } else if let kind, kind.isPlacedText {
+                (object["version"] as? Int) == AppState.Annotation.placedTextVersion
             } else {
                 object["version"] == nil
             }
@@ -172,7 +177,7 @@ enum AnnotationSidecar {
             guard annotation.page >= 0, annotation.page < pageCount else {
                 throw SidecarError.structure("page \(annotation.page + 1) is outside the document")
             }
-            if annotation.kind.isGeometry {
+            if annotation.kind.isGeometry || annotation.kind.isPlacedText {
                 guard annotation.hasValidGeometry else {
                     throw SidecarError.structure(
                         "an \(annotation.kind.rawValue) entry has incomplete or non-finite geometry")

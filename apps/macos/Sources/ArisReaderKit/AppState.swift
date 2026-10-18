@@ -600,12 +600,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case circle
         case line
         case arrow
+        /// A placeable sticky note: an icon at a page point, with its text in `note`.
+        case stickyNote
+        /// A placeable text box laid out in `shapeRect`, with its text in `note`.
+        case textBox
 
         /// Whether this kind is stored as geometry rather than as a character range.
         public var isGeometry: Bool {
             switch self {
             case .highlight, .underline: return false
             case .ink, .square, .circle, .line, .arrow: return true
+            case .stickyNote, .textBox: return false
+            }
+        }
+
+        /// Whether this kind is a placed text annotation (a sticky note or a text box).
+        ///
+        /// These carry page-space geometry like an ink stroke, but they are drawn from a glyph
+        /// bitmap rather than a vector path and they carry their text in `note`. They are
+        /// versioned separately from the stroked kinds so a newer schema is preserved rather
+        /// than partially read.
+        public var isPlacedText: Bool {
+            switch self {
+            case .stickyNote, .textBox: return true
+            case .highlight, .underline, .ink, .square, .circle, .line, .arrow: return false
             }
         }
     }
@@ -647,6 +665,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the new meaning. `AnnotationSidecar` preserves any entry it cannot interpret verbatim.
     public static let geometryVersion = 1
 
+    /// The sidecar schema version of a placed-text entry (sticky note or text box).
+    ///
+    /// Separate from `geometryVersion` on purpose: the two kinds are drawn and written by
+    /// different code, and a future change to one must never make the other's entries look
+    /// half-understood. `AnnotationSidecar` preserves any version it does not know.
+    public static let placedTextVersion = 1
+
+    /// The size a newly placed sticky note icon occupies on the page, in points.
+    public static let stickyNoteSize = CGSize(width: 22, height: 22)
+
+    /// The default font size of a new text box, in points.
+    public static let defaultTextBoxFontSize: CGFloat = 14
+
+    /// The smallest text box the reader may create or resize to, in points.
+    public static let minimumTextBoxSize = CGSize(width: 48, height: 24)
+
     public let id: UUID
     /// Defaults to `.highlight` for sidecars written before kinds existed.
     public var kind: Kind = .highlight
@@ -670,12 +704,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Line endpoints, page space. `nil` for every kind except `.line` and `.arrow`.
     public var lineStart: CGPoint?
     public var lineEnd: CGPoint?
-    /// The stroke width in points. Constant for the whole mark; zero for text markup.
+    /// The stroke width in points. Constant for the whole mark; zero for text markup and
+    /// placed text.
     public var strokeWidth: CGFloat = 0
+    /// The font size a text box is drawn and written at, in page points. Zero for every other
+    /// kind. This is `/DA`'s size on the way into the PDF.
+    public var fontSize: CGFloat = 0
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, page, start, end, color, colorIndex, note, createdAt
-        case version, paths, rect, lineStart, lineEnd, strokeWidth
+        case version, paths, rect, lineStart, lineEnd, strokeWidth, fontSize
     }
 
     public init(
@@ -691,7 +729,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         shapeRect: CGRect? = nil,
         lineStart: CGPoint? = nil,
         lineEnd: CGPoint? = nil,
-        strokeWidth: CGFloat = 0
+        strokeWidth: CGFloat = 0,
+        fontSize: CGFloat = 0
     ) {
         self.id = id
         self.kind = kind
@@ -706,6 +745,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         self.lineStart = lineStart
         self.lineEnd = lineEnd
         self.strokeWidth = strokeWidth
+        self.fontSize = fontSize
     }
 
     /// Whether the annotation's geometry is complete and finite.
@@ -714,7 +754,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// drawn or written must be refused before it reaches a file, not turned into an empty
     /// annotation on the page.
     public var hasValidGeometry: Bool {
-        guard strokeWidth.isFinite, strokeWidth > 0, strokeWidth <= 200 else { return false }
+        guard strokeWidth.isFinite, strokeWidth >= 0, strokeWidth <= 200 else { return false }
         switch kind {
         case .ink:
             return !inkPaths.isEmpty && inkPaths.allSatisfy { path in
@@ -729,6 +769,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard let start = lineStart, let end = lineEnd else { return false }
             return start.x.isFinite && start.y.isFinite && end.x.isFinite && end.y.isFinite
                 && hypot(end.x - start.x, end.y - start.y) > 0.01
+        case .stickyNote:
+            guard let rect = shapeRect else { return false }
+            return rect.minX.isFinite && rect.minY.isFinite
+                && rect.width.isFinite && rect.height.isFinite
+                && rect.width >= 1 && rect.height >= 1
+        case .textBox:
+            guard let rect = shapeRect else { return false }
+            return rect.minX.isFinite && rect.minY.isFinite
+                && rect.width.isFinite && rect.height.isFinite
+                && rect.width >= Self.minimumTextBoxSize.width
+                && rect.height >= Self.minimumTextBoxSize.height
+                && fontSize.isFinite && fontSize >= 1 && fontSize <= 400
         case .highlight, .underline:
             return false
         }
@@ -754,6 +806,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
                           width: max(abs(end.x - start.x), 0.01),
                           height: max(abs(end.y - start.y), 0.01))
+        case .stickyNote, .textBox:
+            return shapeRect
         case .highlight, .underline:
             return nil
         }
@@ -761,7 +815,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// A copy moved by `dx`/`dy` in page points.
     public func translated(by dx: CGFloat, dy: CGFloat) -> Annotation {
-        guard kind.isGeometry else { return self }
+        guard kind.isGeometry || kind.isPlacedText else { return self }
         var copy = self
         copy.inkPaths = inkPaths.map { path in
             path.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }
@@ -812,6 +866,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let point = try values.decodeIfPresent(StoredPoint.self, forKey: .lineEnd) {
                 lineEnd = CGPoint(x: point.x, y: point.y)
             }
+        } else if kind.isPlacedText {
+            let version = try values.decodeIfPresent(Int.self, forKey: .version)
+            guard version == Self.placedTextVersion else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .version,
+                    in: values,
+                    debugDescription: "placed-text annotation schema \(version.map(String.init) ?? "missing") is not supported"
+                )
+            }
+            start = 0
+            end = 0
+            note = try values.decodeIfPresent(String.self, forKey: .note) ?? ""
+            fontSize = CGFloat(try values.decodeIfPresent(Double.self, forKey: .fontSize) ?? 0)
+            if let rect = try values.decodeIfPresent(StoredRect.self, forKey: .rect) {
+                shapeRect = CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+            }
         } else {
             start = try values.decode(Int.self, forKey: .start)
             end = try values.decode(Int.self, forKey: .end)
@@ -831,11 +901,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             color = AppState.highlightPalette[index].color
         }
         createdAt = try values.decode(Date.self, forKey: .createdAt)
-        if kind.isGeometry, !hasValidGeometry {
+        if (kind.isGeometry || kind.isPlacedText), !hasValidGeometry {
             throw DecodingError.dataCorruptedError(
                 forKey: .kind,
                 in: values,
-                debugDescription: "geometry annotation \(kind.rawValue) has incomplete or non-finite geometry"
+                debugDescription: "\(kind.rawValue) annotation has incomplete or non-finite geometry"
             )
         }
     }
@@ -875,9 +945,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     try values.encode(StoredPoint(x: Double(end.x), y: Double(end.y)),
                                       forKey: .lineEnd)
                 }
-            case .highlight, .underline:
+            case .stickyNote, .textBox, .highlight, .underline:
                 break
             }
+        } else if kind.isPlacedText {
+            try values.encode(Self.placedTextVersion, forKey: .version)
+            if let rect = shapeRect {
+                try values.encode(StoredRect(x: Double(rect.minX), y: Double(rect.minY),
+                                             width: Double(rect.width), height: Double(rect.height)),
+                                  forKey: .rect)
+            }
+            try values.encode(Double(fontSize), forKey: .fontSize)
         } else {
             try values.encode(start, forKey: .start)
             try values.encode(end, forKey: .end)
@@ -1164,7 +1242,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotations.filter { $0.visible && $0.isNote }
     }
 
-    /// Highlights the reader added, and the file they are stored in.
+    /// The annotations the reader added (highlights, underlines, ink, shapes, sticky notes and
+    /// text boxes), and the file they are stored in.
     ///
     /// This is the array this version can *render and edit*. Entries a newer version wrote in
     /// a shape this one does not understand are not in here: they live in
@@ -1180,13 +1259,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// and shape marks use the same hue at full opacity: a stroke is the reader's ink, not a
     /// wash over the page.
     @Published public var annotationColor: AnnotationColor = AppState.annotationPalette[0].color
-    /// The geometry annotation the reader last clicked, if any. Only sidecar annotations can be
-    /// selected: a PDF's own ink and shapes are drawn but not editable, because moving them
+    /// The annotation the reader last clicked, if any. Only sidecar annotations can be selected:
+    /// a PDF's own ink, shapes, notes and text are drawn but not editable, because moving them
     /// would mean rewriting somebody else's annotation.
     @Published public private(set) var selectedAnnotationID: UUID?
     /// The mark being dragged, and where the drag started in its page's space.
     private var moveOriginalAnnotation: Annotation?
     private var moveStartPagePoint: CGPoint?
+    /// The text box being resized, where the drag started, and which edge or handle it grabbed.
+    private var resizeOriginalAnnotation: Annotation?
+    private var resizeStartPagePoint: CGPoint?
+    private var resizeHandle: TextBoxResizeHandle?
+    /// The sidecar annotation whose text editor is open, and the state needed to commit or
+    /// cancel that one editing session as one undoable change.
+    @Published public private(set) var editingAnnotationID: UUID?
+    private var editingWasCreated = false
+    private var editingOriginalText = ""
+    private var editingUndoDepth = 0
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
     /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
@@ -1271,6 +1360,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// annotation, at the scale the canvas is currently drawing it at. Cleared with the rest of
     /// the annotation textures when the document changes.
     private var noteGlyphTextures: [NoteGlyphKey: PageImage] = [:]
+    /// Textures for the sidecar's sticky notes and text boxes: the icon and the laid-out text,
+    /// keyed by every input that changes a pixel.
+    private var placedGlyphTextures: [PlacedGlyphKey: PageImage] = [:]
 
     /// Whether to print the annotations handed to the canvas (`ARIS_READER_CANVAS_DUMP=1`).
     ///
@@ -1451,6 +1543,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var openDocumentNoteID: String?
         var annotationTextures: [AnnotationTextureKey: PageImage]
         var noteGlyphTextures: [NoteGlyphKey: PageImage]
+        var placedGlyphTextures: [PlacedGlyphKey: PageImage]
         var undoStack: [UndoableAction]
         var redoStack: [UndoableAction]
     }
@@ -2151,6 +2244,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectedAnnotationID = nil
         moveOriginalAnnotation = nil
         moveStartPagePoint = nil
+        resizeOriginalAnnotation = nil
+        resizeStartPagePoint = nil
+        resizeHandle = nil
+        editingAnnotationID = nil
+        editingWasCreated = false
+        editingOriginalText = ""
+        editingUndoDepth = 0
         annotationTool = .select
         annotations = []
         bookmarks = []
@@ -2168,6 +2268,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectedDocumentAnnotationID = nil
         openDocumentNoteID = nil
         noteGlyphTextures = [:]
+        placedGlyphTextures = [:]
         scrollYPt = 0
         contentHeightPt = 0
         contentWidthPt = 0
@@ -2634,7 +2735,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .line, .arrow:
             guard let start = lineStart, let end = lineEnd,
                   hypot(end.x - start.x, end.y - start.y) >= 1 else { return false }
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             return false
         }
 
@@ -2701,9 +2802,383 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .ink:
             return addInkAnnotation(page: page, points: [start, end], color: color,
                                     strokeWidth: strokeWidth)
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             return false
         }
+    }
+
+    // MARK: - Placeable notes and text boxes
+
+    /// A hit on one of the reader's placed-text annotations, in page space.
+    public struct PlacedTextHit: Sendable {
+        public let id: UUID
+        public let page: Int
+        public let point: CGPoint
+        /// The resize handle the point grabbed; `nil` means move (or select).
+        public let handle: TextBoxResizeHandle?
+    }
+
+    /// The sticky-note or text-box annotation under a content point.
+    ///
+    /// A note is hit anywhere inside its icon (plus the same small slack a pointer deserves). A
+    /// text box is hit on its frame when it is not selected and anywhere inside when it is:
+    /// that is what keeps an unselected box from stealing a click meant for the text under it,
+    /// while making a selected box draggable by its interior.
+    public func placedTextHit(
+        atContentPoint point: CGPoint,
+        toleranceViewPt: CGFloat = AppState.noteClickSlackPt
+    ) -> PlacedTextHit? {
+        guard let pageHit = pagePoint(atContentPoint: point) else { return nil }
+        let tolerance = toleranceViewPt / max(zoomFactor, 0.01)
+        for annotation in annotations.reversed() where annotation.kind.isPlacedText {
+            guard annotation.page == pageHit.page, let rect = annotation.shapeRect else { continue }
+            let local = pageHit.point
+            switch annotation.kind {
+            case .stickyNote:
+                guard rect.insetBy(dx: -tolerance, dy: -tolerance).contains(local) else { continue }
+                return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
+                                     handle: nil)
+            case .textBox:
+                let selected = annotation.id == selectedAnnotationID
+                if selected,
+                   let handle = textBoxHandle(at: local, in: rect, tolerance: tolerance) {
+                    return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
+                                         handle: handle)
+                }
+                if AnnotationGeometry.distance(local, toRectOutline: rect) <= tolerance {
+                    let handle = selected ? textBoxEdge(at: local, in: rect) : nil
+                    return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
+                                         handle: handle)
+                }
+                if selected, rect.contains(local) {
+                    return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
+                                         handle: nil)
+                }
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    /// The corner or edge handle within `tolerance` of a point, nearest first.
+    private func textBoxHandle(
+        at point: CGPoint,
+        in rect: CGRect,
+        tolerance: CGFloat
+    ) -> TextBoxResizeHandle? {
+        // The drawn handle is about 7 view points across, so its half-size is part of the target.
+        let reach = tolerance + 4 / max(zoomFactor, 0.01)
+        var best: (handle: TextBoxResizeHandle, distance: CGFloat)?
+        for handle in TextBoxResizeHandle.allCases {
+            let distance = hypot(point.x - handle.point(in: rect).x,
+                                 point.y - handle.point(in: rect).y)
+            if distance <= reach, best == nil || distance < best!.distance {
+                best = (handle, distance)
+            }
+        }
+        return best?.handle
+    }
+
+    /// Which edge a point on a selected box's outline belongs to, for edge resizing.
+    private func textBoxEdge(
+        at point: CGPoint,
+        in rect: CGRect
+    ) -> TextBoxResizeHandle? {
+        let edges: [(TextBoxResizeHandle, CGFloat)] = [
+            (.left, AnnotationGeometry.distance(
+                point, toSegmentFrom: CGPoint(x: rect.minX, y: rect.minY),
+                to: CGPoint(x: rect.minX, y: rect.maxY))),
+            (.right, AnnotationGeometry.distance(
+                point, toSegmentFrom: CGPoint(x: rect.maxX, y: rect.minY),
+                to: CGPoint(x: rect.maxX, y: rect.maxY))),
+            (.top, AnnotationGeometry.distance(
+                point, toSegmentFrom: CGPoint(x: rect.minX, y: rect.minY),
+                to: CGPoint(x: rect.maxX, y: rect.minY))),
+            (.bottom, AnnotationGeometry.distance(
+                point, toSegmentFrom: CGPoint(x: rect.minX, y: rect.maxY),
+                to: CGPoint(x: rect.maxX, y: rect.maxY))),
+        ]
+        return edges.min(by: { $0.1 < $1.1 })?.0
+    }
+
+    /// The sticky-note tool's click: open an existing icon under the pointer, or place a new
+    /// note at the page point the pointer names.
+    @discardableResult
+    public func placeOrOpenStickyNote(atContentPoint point: CGPoint) -> Bool {
+        if let hit = placedTextHit(atContentPoint: point),
+           let annotation = annotations.first(where: { $0.id == hit.id }),
+           annotation.kind == .stickyNote {
+            selectedAnnotationID = annotation.id
+            beginEditingAnnotation(annotation.id)
+            return true
+        }
+        // A note that belongs to the PDF is read-only; opening its paper is better than placing
+        // a sidecar note on top of it.
+        if openDocumentNote(at: point) { return true }
+        guard let pageHit = pagePoint(atContentPoint: point) else { return false }
+        return placeStickyNote(page: pageHit.page, at: pageHit.point)
+    }
+
+    /// Creates a sticky note centred on `point` (page space) and opens its editor.
+    ///
+    /// The icon's box is page-space geometry, like a stroke: the point the reader clicked is the
+    /// same page point at every zoom. It is clamped inside the page so an icon placed on the
+    /// margin is still reachable.
+    @discardableResult
+    public func placeStickyNote(page: Int, at point: CGPoint) -> Bool {
+        guard let document, page >= 0, page < document.pageCount,
+              let placement = visiblePagePlacements.first(where: { $0.index == page }),
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+
+        let size = Annotation.stickyNoteSize
+        var rect = CGRect(x: point.x - size.width / 2, y: point.y - size.height / 2,
+                          width: size.width, height: size.height)
+        rect.origin.x = min(max(0, rect.origin.x), max(0, placement.widthPt - size.width))
+        rect.origin.y = min(max(0, rect.origin.y), max(0, placement.heightPt - size.height))
+
+        let annotation = Annotation(
+            id: UUID(),
+            kind: .stickyNote,
+            page: page,
+            start: 0,
+            end: 0,
+            color: annotationStrokeColor,
+            note: "",
+            createdAt: Date(),
+            shapeRect: rect,
+            strokeWidth: 0,
+            fontSize: 0
+        )
+        guard annotation.hasValidGeometry else { return false }
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated, trigger: "add-stickyNote") else { return false }
+        undoStack.append(.added(annotation))
+        redoStack.removeAll()
+        selectedAnnotationID = annotation.id
+        beginEditingAnnotation(annotation.id, created: true)
+        statusMessage = "Placed a sticky note"
+        return true
+    }
+
+    /// Creates an empty text box in `rect` (page space) and opens its editor.
+    @discardableResult
+    public func addTextBox(page: Int, rect: CGRect) -> Bool {
+        guard let document, page >= 0, page < document.pageCount,
+              let placement = visiblePagePlacements.first(where: { $0.index == page }),
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+
+        var box = rect.standardized
+        box.size.width = max(box.width, Annotation.minimumTextBoxSize.width)
+        box.size.height = max(box.height, Annotation.minimumTextBoxSize.height)
+        box.origin.x = min(max(0, box.origin.x), max(0, placement.widthPt - box.width))
+        box.origin.y = min(max(0, box.origin.y), max(0, placement.heightPt - box.height))
+
+        let annotation = Annotation(
+            id: UUID(),
+            kind: .textBox,
+            page: page,
+            start: 0,
+            end: 0,
+            color: AppState.defaultTextBoxColor,
+            note: "",
+            createdAt: Date(),
+            shapeRect: box,
+            strokeWidth: 0,
+            fontSize: Annotation.defaultTextBoxFontSize
+        )
+        guard annotation.hasValidGeometry else { return false }
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated, trigger: "add-textBox") else { return false }
+        undoStack.append(.added(annotation))
+        redoStack.removeAll()
+        selectedAnnotationID = annotation.id
+        beginEditingAnnotation(annotation.id, created: true)
+        statusMessage = "Added a text box"
+        return true
+    }
+
+    /// The colour a text box's text is stored in: dark ink, not the translucent markup palette.
+    ///
+    /// A text box is body text, and gold text on a white page is not readable. Keeping this
+    /// separate from `annotationColor` is the same distinction as a pen's opaque stroke: the
+    /// palette chooses highlights, not the colour of text somebody has to read.
+    public nonisolated static let defaultTextBoxColor =
+        AnnotationColor(red: 0x2B, green: 0x2B, blue: 0x2E, alpha: 255)
+
+    // MARK: - Editing placed text
+
+    /// The annotation whose text editor is open.
+    public var editingAnnotation: Annotation? {
+        guard let id = editingAnnotationID else { return nil }
+        return annotations.first { $0.id == id }
+    }
+
+    /// Opens the text editor for a placed-text annotation.
+    public func beginEditingAnnotation(_ id: UUID, created: Bool = false) {
+        guard let annotation = annotations.first(where: { $0.id == id }),
+              annotation.kind.isPlacedText else { return }
+        if editingAnnotationID != nil, editingAnnotationID != id {
+            commitTextEditing()
+        }
+        selectedAnnotationID = id
+        selection = nil
+        selectionAnchor = nil
+        closeDocumentNote()
+        editingAnnotationID = id
+        editingWasCreated = created
+        editingOriginalText = annotation.note
+        editingUndoDepth = undoStack.count
+        refreshSelectionOverlay()
+    }
+
+    /// Applies text typed in the editor. Sidecar writes are coalesced by `updateNote`; undo
+    /// merges consecutive keystrokes into one step for the session.
+    public func updateEditingText(_ text: String) {
+        guard let id = editingAnnotationID else { return }
+        // The editor itself shows what is being typed; the page glyph for a text box is hidden
+        // during editing and a note's icon does not change with its text. Rebuilding the canvas
+        // per keystroke would buy nothing and cost a tile pass.
+        updateNote(text, for: id)
+    }
+
+    /// Commits the open editor: flushes the coalesced sidecar write and closes the editor.
+    @discardableResult
+    public func commitTextEditing() -> Bool {
+        guard editingAnnotationID != nil else { return true }
+        let written = flushPendingAnnotationWrite()
+        editingAnnotationID = nil
+        editingWasCreated = false
+        editingOriginalText = ""
+        editingUndoDepth = 0
+        reloadVisiblePages()
+        return written
+    }
+
+    /// Cancels the open editor, restoring the text it started with.
+    ///
+    /// Cancelling a brand-new note or box removes it again (and the creation step); cancelling
+    /// an edit restores the previous text and drops the undo steps the session added. In both
+    /// cases the sidecar is written once so memory and disk agree.
+    public func cancelTextEditing() {
+        guard let id = editingAnnotationID else { return }
+        noteFlushTask?.cancel()
+        noteFlushTask = nil
+        noteWindowSawKeystrokes = false
+        let wasCreated = editingWasCreated
+        let originalText = editingOriginalText
+        let depth = editingUndoDepth
+        editingAnnotationID = nil
+        editingWasCreated = false
+        editingOriginalText = ""
+        editingUndoDepth = 0
+
+        var updated = annotations
+        if wasCreated {
+            updated.removeAll { $0.id == id }
+        } else if let index = updated.firstIndex(where: { $0.id == id }) {
+            updated[index].note = originalText
+        }
+        guard saveAnnotations(updated, trigger: wasCreated ? "cancel-new-text" : "cancel-text") else {
+            return
+        }
+        annotations = updated
+        undoStack = Array(undoStack.prefix(max(0, wasCreated ? depth - 1 : depth)))
+        redoStack.removeAll()
+        hasPendingAnnotationWrite = false
+        reloadVisiblePages()
+    }
+
+    /// Opens the editor for a text box on a double-click anywhere inside it, even when the box
+    /// is not selected yet. A single click inside an unselected box still goes to the text.
+    @discardableResult
+    public func beginEditingTextBox(atContentPoint point: CGPoint) -> Bool {
+        guard let pageHit = pagePoint(atContentPoint: point) else { return false }
+        for annotation in annotations.reversed() where annotation.kind == .textBox {
+            guard annotation.page == pageHit.page, let rect = annotation.shapeRect,
+                  rect.contains(pageHit.point) else { continue }
+            selectedAnnotationID = annotation.id
+            beginEditingAnnotation(annotation.id)
+            return true
+        }
+        return false
+    }
+
+    /// The rectangle after dragging `handle` by a page-space delta, clamped to the page and the
+    /// minimum text-box size.
+    public func resizedTextBox(
+        _ original: Annotation,
+        handle: TextBoxResizeHandle,
+        delta: CGPoint
+    ) -> CGRect? {
+        guard let box = original.shapeRect,
+              let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        else { return nil }
+        var minX = box.minX, maxX = box.maxX, minY = box.minY, maxY = box.maxY
+        if handle.movesLeft { minX += delta.x }
+        if handle.movesRight { maxX += delta.x }
+        if handle.movesTop { minY += delta.y }
+        if handle.movesBottom { maxY += delta.y }
+        let minimum = Annotation.minimumTextBoxSize
+        if maxX - minX < minimum.width {
+            if handle.movesLeft { minX = maxX - minimum.width } else { maxX = minX + minimum.width }
+        }
+        if maxY - minY < minimum.height {
+            if handle.movesTop { minY = maxY - minimum.height } else { maxY = minY + minimum.height }
+        }
+        minX = max(0, min(minX, placement.widthPt - minimum.width))
+        maxX = max(minX + minimum.width, min(maxX, placement.widthPt))
+        minY = max(0, min(minY, placement.heightPt - minimum.height))
+        maxY = max(minY + minimum.height, min(maxY, placement.heightPt))
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Commits a resize on mouse-up: one sidecar write and one undo step for the whole drag.
+    private func finishAnnotationResize(
+        original: Annotation,
+        handle: TextBoxResizeHandle,
+        start: CGPoint,
+        at point: CGPoint,
+        wasClick: Bool
+    ) {
+        defer {
+            resizeOriginalAnnotation = nil
+            resizeStartPagePoint = nil
+            resizeHandle = nil
+        }
+        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        else { return }
+        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        guard let finalRect = resizedTextBox(
+            original, handle: handle,
+            delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
+        ) else { return }
+        guard !wasClick, finalRect != original.shapeRect,
+              let index = annotations.firstIndex(where: { $0.id == original.id })
+        else { return }
+        var resized = annotations[index]
+        resized.shapeRect = finalRect
+        guard resized.hasValidGeometry else {
+            annotations[index] = original
+            return
+        }
+        var updated = annotations
+        updated[index] = resized
+        guard saveAnnotations(updated, trigger: "resize-textBox") else {
+            annotations[index] = original
+            selectedAnnotationID = original.id
+            refreshSelectionOverlay()
+            return
+        }
+        undoStack.append(.replaced(before: original, after: resized))
+        redoStack.removeAll()
+        selectedAnnotationID = original.id
+        refreshSelectionOverlay()
+        statusMessage = "Resized the text box"
     }
 
     /// The page under a **content point** and the point in that page's own space (top-left,
@@ -2725,7 +3200,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Every geometry mark the overlay should draw, in sidecar order followed by the file's own.
     public var canvasAnnotationMarks: [CanvasAnnotationMark] {
         var marks: [CanvasAnnotationMark] = annotations.compactMap { annotation in
-            guard annotation.kind.isGeometry else { return nil }
+            guard annotation.kind.isGeometry || annotation.kind.isPlacedText else { return nil }
             return CanvasAnnotationMark(
                 id: annotation.id.uuidString,
                 page: annotation.page,
@@ -2847,6 +3322,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func removeAnnotation(_ id: UUID) {
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        if editingAnnotationID == id {
+            noteFlushTask?.cancel()
+            noteFlushTask = nil
+            noteWindowSawKeystrokes = false
+            editingAnnotationID = nil
+            editingWasCreated = false
+            editingOriginalText = ""
+            editingUndoDepth = 0
+        }
         if selectedAnnotationID == id { selectedAnnotationID = nil }
         let removed = annotations[index]
         var updated = annotations
@@ -3013,6 +3497,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func undo() {
         guard let action = undoStack.last else { return }
+        if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
         let updated = annotations(applying: action, undoing: true)
         guard saveAnnotations(updated, trigger: "undo") else { return }
@@ -3024,6 +3509,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func redo() {
         guard let action = redoStack.last else { return }
+        if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
         let updated = annotations(applying: action, undoing: false)
         guard saveAnnotations(updated, trigger: "redo") else { return }
@@ -3106,7 +3592,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         to note: String
     ) -> [UndoableAction] {
         var stack = undoStack
-        if let last = stack.last,
+        // Merging is for a burst of typing, not for a later visit to the same note: the first
+        // keystroke of an editor session starts a new undo step whose `oldNote` is the text the
+        // session began with. The sidebar's inline field opens no session (`editingAnnotationID`
+        // is nil) and keeps its original per-burst merging.
+        let canMerge: Bool
+        if let editingID = editingAnnotationID {
+            canMerge = editingID == id && stack.count > editingUndoDepth
+        } else {
+            canMerge = true
+        }
+        if canMerge,
+           let last = stack.last,
            case .noteChanged(let lastID, let original, let previous) = last,
            lastID == id, previous == oldNote {
             stack.removeLast()
@@ -3168,6 +3665,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// tab close and by `resetDocumentState`, so a scroll or a typed note cannot be lost just
     /// because the debounce had not expired yet.
     public func flushPendingWrites() {
+        if editingAnnotationID != nil { commitTextEditing() }
         let pendingNote = hasPendingAnnotationWrite
         let pendingPosition = self.pendingPosition != nil
         guard pendingNote || pendingPosition else { return }
@@ -3182,9 +3680,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Shows an annotation: selects its range (or its mark) and scrolls it into view.
     public func jump(to annotation: Annotation) {
         let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
-        if annotation.kind.isGeometry {
-            // A geometry mark has no character range. Select it so the overlay shows the
-            // selection halo, and scroll to the mark rather than to the page's first character.
+        if annotation.kind.isGeometry || annotation.kind.isPlacedText {
+            // A geometry mark and a placed note/box have no character range. Select the mark so
+            // the overlay shows its halo, and scroll to it rather than to the page's first
+            // character.
             selectedAnnotationID = annotation.id
             selection = nil
             selectionAnchor = nil
@@ -3288,7 +3787,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
         panel.message =
-            "Every highlight and underline in the reader's list is written into a new PDF. "
+            "Every highlight, ink mark, note and text box in the reader's list is written into a new PDF. "
             + "The original file is not modified."
         panel.nameFieldStringValue = suggestion.lastPathComponent
         panel.directoryURL = suggestion.deletingLastPathComponent()
@@ -3489,6 +3988,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         "Annotation \(annotation.id.uuidString) names page \(annotation.page + 1), which is outside this document"]
                 )
             }
+            if annotation.kind.isPlacedText {
+                requests.append(try placedTextWriteRequest(annotation, zoom: zoom, modified: modified))
+                continue
+            }
             if annotation.kind.isGeometry {
                 requests.append(try geometryWriteRequest(annotation, zoom: zoom, modified: modified))
                 continue
@@ -3546,6 +4049,51 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return requests
     }
 
+    /// One placed-text annotation as a write request: a `/Text` sticky note for an icon, a
+    /// `/FreeText` annotation for a box.
+    ///
+    /// The sidecar's box is page space at 100%; the request wants view space at the current zoom,
+    /// exactly like the stroked kinds. A text box keeps its font size in page points (the zoom
+    /// is a display transform, not part of the stored text) and carries its alignment.
+    private func placedTextWriteRequest(
+        _ annotation: Annotation,
+        zoom: CGFloat,
+        modified: String
+    ) throws -> AnnotationWriteRequest {
+        guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
+            throw NSError(
+                domain: "Lyra",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
+            )
+        }
+        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
+                          width: box.width * zoom, height: box.height * zoom)
+        guard rect.width > 0.5, rect.height > 0.5 else {
+            throw NSError(
+                domain: "Lyra",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has a box too small to write"]
+            )
+        }
+        return AnnotationWriteRequest(
+            id: annotation.id.uuidString,
+            page: annotation.page,
+            kind: annotation.kind == .stickyNote ? .note : .freeText,
+            rect: rect,
+            quads: [],
+            color: annotation.color,
+            opacity: Double(annotation.color.alpha) / 255.0,
+            contents: annotation.note,
+            author: Self.annotationAuthor,
+            modified: modified,
+            fontSizePt: annotation.kind == .textBox ? annotation.fontSize : 0,
+            textAlignment: "left"
+        )
+    }
+
     /// One stroked annotation as a write request.
     ///
     /// The sidecar stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
@@ -3582,7 +4130,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .arrow:
             let head = max(width * 5, 8)
             outer = outer.insetBy(dx: -(width / 2 + head), dy: -(width / 2 + head))
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             break
         }
         guard outer.width > 0.5, outer.height > 0.5 else {
@@ -3607,6 +4155,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .circle: kind = .circle
         case .line, .arrow: kind = .line
         case .highlight, .underline: kind = .highlight
+        case .stickyNote, .textBox:
+            throw NSError(
+                domain: "Lyra",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Placed text is written by its own request builder"])
         }
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
@@ -3962,9 +4516,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         for annotation in annotations {
             var quote: String?
             var yPt = CGFloat.greatestFiniteMagnitude
-            if annotation.kind.isGeometry {
-                // A stroke has no character range; exporting the first character of the page as
-                // its "quote" would invent a relationship the mark does not have.
+            if annotation.kind.isGeometry || annotation.kind.isPlacedText {
+                // A stroke or a placed note has no character range; exporting the first character
+                // of the page as its "quote" would invent a relationship the mark does not have.
                 yPt = annotation.geometryBounds?.minY ?? yPt
             } else if let page = textByPage[annotation.page],
                annotation.start >= 0,
@@ -5167,6 +5721,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// except by selecting something else. A press that moved past the canvas' slop never reaches
     /// here: that gesture is a drag, and a drag selects (see `MetalCanvasView.clickSlopPt`).
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
+        // A click on the page (outside the editor) ends an open editing session. A press that
+        // begins a drag has already committed in `beginSelection`; this covers the plain click
+        // that never passes the drag slop.
+        if editingAnnotationID != nil { commitTextEditing() }
+        if let original = resizeOriginalAnnotation, let handle = resizeHandle,
+           let start = resizeStartPagePoint {
+            finishAnnotationResize(original: original, handle: handle, start: start,
+                                   at: point, wasClick: wasClick)
+            return
+        }
         if let original = moveOriginalAnnotation, let start = moveStartPagePoint {
             finishAnnotationMove(original: original, start: start, at: point, wasClick: wasClick)
             return
@@ -5210,7 +5774,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let dx = current.x - start.x
         let dy = current.y - start.y
         if wasClick || hypot(dx, dy) < 0.5 {
-            if wasClick { selectedAnnotationID = original.id }
+            if wasClick {
+                selectedAnnotationID = original.id
+                if original.kind == .stickyNote {
+                    beginEditingAnnotation(original.id)
+                }
+            }
             return
         }
         guard let moved = annotations.first(where: { $0.id == original.id }),
@@ -5294,7 +5863,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The same 3 pt the canvas uses to tell a click from a drag (`MetalCanvasView.clickSlopPt`),
     /// for the same reason: a pointer is not a pixel, and the smallest note icon in the review
     /// corpus is 20 pt across.
-    static let noteClickSlackPt: CGFloat = 3
+    public static let noteClickSlackPt: CGFloat = 3
 
     /// Fetches the figure/table mentions of every visible page, so a click resolves immediately.
     ///
@@ -6180,6 +6749,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             openDocumentNoteID: openDocumentNoteID,
             annotationTextures: annotationTextures,
             noteGlyphTextures: noteGlyphTextures,
+            placedGlyphTextures: placedGlyphTextures,
             undoStack: undoStack,
             redoStack: redoStack
         )
@@ -6271,6 +6841,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         openDocumentNoteID = state.openDocumentNoteID
         annotationTextures = state.annotationTextures
         noteGlyphTextures = state.noteGlyphTextures
+        placedGlyphTextures = state.placedGlyphTextures
         undoStack = state.undoStack
         redoStack = state.redoStack
 
@@ -7153,8 +7724,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         for (annotationIndex, annotation) in annotations.enumerated() {
-            // Geometry marks are drawn by the annotation overlay, not as tinted text boxes.
-            guard !annotation.kind.isGeometry else { continue }
+            // Geometry marks are drawn by the annotation overlay, and placed text is drawn from
+            // its own glyph below; neither is a tinted text box.
+            guard !annotation.kind.isGeometry, !annotation.kind.isPlacedText else { continue }
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
@@ -7170,6 +7742,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
                 to: &pages
             )
+        }
+
+        // Sticky notes and text boxes are glyphs, not tinted text boxes: an icon and a laid-out
+        // paragraph. They go through their own placement block for the reason `PlacementIndex`
+        // spells out. A text box being edited hides its page copy so the editor is the only text
+        // on screen; a sticky note keeps its icon beside the editor.
+        for (annotationIndex, annotation) in annotations.enumerated()
+        where annotation.kind.isPlacedText {
+            if editingAnnotationID == annotation.id, annotation.kind == .textBox { continue }
+            guard let placement = visiblePagePlacements.first(where: { $0.index == annotation.page }),
+                  let box = annotation.shapeRect,
+                  let image = placedGlyphTexture(for: annotation, index: annotationIndex)
+            else { continue }
+            pages.append(CanvasPage(
+                placement: PagePlacement(
+                    index: PlacementIndex.ownNote(annotationIndex),
+                    topPt: placement.topPt + box.minY,
+                    leftPt: placement.leftPt + box.minX,
+                    widthPt: box.width,
+                    heightPt: box.height
+                ),
+                image: image,
+                blend: .normal
+            ))
         }
 
         appendDocumentAnnotations(to: &pages)
@@ -7407,6 +8003,55 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return image
     }
 
+    /// The bitmap for one sidecar sticky note or text box, from the cache or freshly rendered.
+    private func placedGlyphTexture(for annotation: Annotation, index: Int) -> PageImage? {
+        guard let box = annotation.shapeRect, box.width > 0, box.height > 0 else { return nil }
+        let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let key = PlacedGlyphKey(
+            index: index,
+            kind: annotation.kind.rawValue,
+            color: annotation.color,
+            text: annotation.note,
+            fontSize: annotation.fontSize,
+            boxPt: box.size,
+            scale: scale
+        )
+        if let cached = placedGlyphTextures[key] { return cached }
+        // One cached bitmap per placed annotation: a resize walks through many box sizes (and a
+        // zoom through scale steps), and keeping them all would grow with the gesture instead of
+        // with the document.
+        placedGlyphTextures = placedGlyphTextures.filter { $0.key.index != index }
+
+        nextAnnotationTextureGeneration += 1
+        let generation = nextAnnotationTextureGeneration
+        let image: PageImage? = switch annotation.kind {
+        case .stickyNote:
+            NoteGlyph.noteIcon(color: annotation.color, boxPt: box.size, scale: scale,
+                               generation: generation)
+        case .textBox:
+            NoteGlyph.freeText(annotation.note, color: annotation.color,
+                               fontSizePt: annotation.fontSize > 0
+                                   ? annotation.fontSize : Annotation.defaultTextBoxFontSize,
+                               alignment: "left", boxPt: box.size, scale: scale,
+                               generation: generation)
+        default:
+            nil
+        }
+        if let image { placedGlyphTextures[key] = image }
+        return image
+    }
+
+    /// Identity of one placed-text glyph: every input that changes a pixel of it.
+    private struct PlacedGlyphKey: Hashable {
+        let index: Int
+        let kind: String
+        let color: AnnotationColor
+        let text: String
+        let fontSize: CGFloat
+        let boxPt: CGSize
+        let scale: CGFloat
+    }
+
     /// Identity of one note glyph texture: every input that changes a pixel of it.
     private struct NoteGlyphKey: Hashable {
         let index: Int
@@ -7477,20 +8122,49 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// a click on the text goes on to select it. A PDF's own ink is deliberately not hit tested
     /// here: it can be seen, not edited.
     public func beginSelection(at point: CGPoint) {
-        if annotationTool == .select,
-           let hit = geometryAnnotationHit(atContentPoint: point),
-           let annotation = annotations.first(where: { $0.id == hit.id }) {
-            selectedAnnotationID = hit.id
-            moveOriginalAnnotation = annotation
-            moveStartPagePoint = hit.point
-            selection = nil
-            selectionAnchor = nil
-            refreshSelectionOverlay()
-            return
+        if editingAnnotationID != nil { commitTextEditing() }
+        if annotationTool == .select {
+            if let hit = placedTextHit(atContentPoint: point),
+               let annotation = annotations.first(where: { $0.id == hit.id }) {
+                selectedAnnotationID = hit.id
+                selection = nil
+                selectionAnchor = nil
+                moveOriginalAnnotation = nil
+                moveStartPagePoint = nil
+                resizeOriginalAnnotation = nil
+                resizeStartPagePoint = nil
+                resizeHandle = nil
+                if let handle = hit.handle {
+                    resizeOriginalAnnotation = annotation
+                    resizeStartPagePoint = hit.point
+                    resizeHandle = handle
+                } else {
+                    moveOriginalAnnotation = annotation
+                    moveStartPagePoint = hit.point
+                }
+                refreshSelectionOverlay()
+                return
+            }
+            if let hit = geometryAnnotationHit(atContentPoint: point),
+               let annotation = annotations.first(where: { $0.id == hit.id }) {
+                selectedAnnotationID = hit.id
+                moveOriginalAnnotation = annotation
+                moveStartPagePoint = hit.point
+                resizeOriginalAnnotation = nil
+                resizeStartPagePoint = nil
+                resizeHandle = nil
+                selection = nil
+                selectionAnchor = nil
+                refreshSelectionOverlay()
+                return
+            }
         }
         selectedAnnotationID = nil
         moveOriginalAnnotation = nil
         moveStartPagePoint = nil
+        resizeOriginalAnnotation = nil
+        resizeStartPagePoint = nil
+        resizeHandle = nil
         guard let hit = characterIndex(at: point) else {
             clearSelection()
             return
@@ -7502,6 +8176,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Extends the selection to a point in content space.
     public func extendSelection(to point: CGPoint) {
+        if let original = resizeOriginalAnnotation, let handle = resizeHandle,
+           let start = resizeStartPagePoint,
+           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
+            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            guard let rect = resizedTextBox(
+                original, handle: handle,
+                delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
+            ), let index = annotations.firstIndex(where: { $0.id == original.id })
+            else { return }
+            annotations[index].shapeRect = rect
+            // The text box's text is a canvas quad, so it has to be re-laid out at the new size
+            // while the drag is in flight. This is a canvas refresh, not a sidecar write: the
+            // file is written once, on mouse-up.
+            refreshSelectionOverlay()
+            return
+        }
         if let original = moveOriginalAnnotation,
            let start = moveStartPagePoint,
            let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
@@ -7514,6 +8204,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // In memory only: one drag is one sidecar write, on mouse-up. Writing per pointer
             // event would turn a single gesture into hundreds of disk writes.
             annotations = updated
+            if original.kind.isPlacedText {
+                // A note icon and a text box are quads on the canvas rather than paths on the
+                // overlay, so the picture follows the drag through the canvas refresh, not the
+                // model write.
+                refreshSelectionOverlay()
+            }
             return
         }
         guard let anchor = selectionAnchor,

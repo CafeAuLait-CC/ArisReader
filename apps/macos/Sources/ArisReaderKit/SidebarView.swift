@@ -695,7 +695,7 @@ public struct SidebarView: View {
     @ViewBuilder
     private var ownAnnotationSection: some View {
         if !state.annotations.isEmpty {
-            Section("My highlights") {
+            Section("My annotations") {
                 ForEach(state.annotations) { annotation in
                     HStack(spacing: 8) {
                         Circle()
@@ -738,7 +738,7 @@ public struct SidebarView: View {
                                 .font(.caption)
                         }
                         .buttonStyle(.plain)
-                        .help("Delete highlight")
+                        .help("Delete annotation")
                     }
                 }
             }
@@ -748,6 +748,14 @@ public struct SidebarView: View {
     /// The one line under a sidecar annotation's note field.
     private func ownAnnotationSubtitle(_ annotation: AppState.Annotation) -> String {
         let kind = annotation.kind.rawValue
+        if annotation.kind.isPlacedText {
+            let characters = annotation.note.count
+            let detail = annotation.kind == .textBox
+                ? "\(String(format: "%.0f", annotation.fontSize)) pt"
+                : "icon"
+            return "Page \(annotation.page + 1) · placed \(kind) · \(detail) · "
+                + "\(characters) character\(characters == 1 ? "" : "s")"
+        }
         if annotation.kind.isGeometry {
             let width = String(format: "%.1f pt", annotation.strokeWidth)
             return "Page \(annotation.page + 1) · \(kind) · \(width) stroke"
