@@ -72,33 +72,24 @@ struct TabStrip: View {
     }
 }
 
-/// Reader controls, tool categories, then a contextual second row. Unimplemented commands have
-/// reserved, disabled positions; existing annotation commands still act on the current selection.
+/// Reader controls and tool categories. Unimplemented commands have reserved, disabled
+/// positions; existing annotation commands still act on the current selection.
+///
+/// The contextual second row (annotation tools, page overview) is no longer part of this
+/// `VStack`: it is drawn over the canvas by ``ReaderSecondaryToolbar`` so that opening it does not
+/// move the document. The primary row keeps its position and height.
 struct ReaderToolbar: View {
     @ObservedObject var state: AppState
     @Environment(\.openSettings) private var openSettings
-    @State private var annotationsExpanded = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            ViewThatFits(in: .horizontal) {
-                primaryRow(compact: false)
-                primaryRow(compact: true)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(LyraTheme.toolbarBg)
-            if state.pageOverviewVisible {
-                overviewRow
-                    .padding(.horizontal, 14).padding(.vertical, 7)
-                    .background(LyraTheme.panelBg)
-            } else if annotationsExpanded {
-                annotationRow
-                    .padding(.horizontal, 14).padding(.vertical, 7)
-                    .background(LyraTheme.panelBg)
-                    .overlay(alignment: .top) { LyraTheme.separator.frame(height: 1) }
-            }
+        ViewThatFits(in: .horizontal) {
+            primaryRow(compact: false)
+            primaryRow(compact: true)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(LyraTheme.toolbarBg)
         .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
         .buttonStyle(LyraToolStyle())
         .fixedSize(horizontal: false, vertical: true)
@@ -135,16 +126,16 @@ struct ReaderToolbar: View {
                 tool("Zoom in (⌘+)", "plus") { state.zoomIn() }
             }.disabled(state.pageOverviewVisible)
             separator
-            Button { state.pageOverviewVisible = false; annotationsExpanded.toggle() } label: {
+            Button { state.pageOverviewVisible = false; state.annotationToolsVisible.toggle() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
                     if !compact { Text("Annotate").font(.system(size: 12, weight: .medium)) }
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraToolStyle(selected: annotationsExpanded && !state.pageOverviewVisible))
+            .buttonStyle(LyraToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
-            .accessibilityValue(annotationsExpanded ? "Expanded" : "Collapsed")
+            .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
             pending("Edit PDF", "character.cursor.ibeam")
             LyraMenu(title: "Organise pages", items: [
                 LyraMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
@@ -178,6 +169,77 @@ struct ReaderToolbar: View {
             Spacer(minLength: 4)
             search(compact: compact)
         }
+    }
+
+    private func menuLabel(_ icon: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
+        }.padding(.horizontal, 4)
+    }
+
+    private func search(compact: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass").foregroundStyle(LyraTheme.iconSecondary)
+            TextField("Search document", text: $state.searchQuery)
+                .textFieldStyle(.plain).font(.system(size: 12))
+                .frame(width: compact ? 100 : 150)
+                .onSubmit { state.pageOverviewVisible = false; state.runSearch() }
+            if !state.searchHits.isEmpty {
+                Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
+                    .font(.caption2).monospacedDigit().foregroundStyle(LyraTheme.textSecondary)
+                tool("Previous match (⇧⌘G)", "chevron.up") { state.findPrevious() }
+                tool("Next match (⌘G)", "chevron.down") { state.findNext() }
+            }
+        }
+        .padding(.leading, 9).padding(.trailing, 5).frame(height: 32)
+        .background(LyraTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(LyraTheme.controlBorder, lineWidth: 0.5))
+    }
+
+    private var separator: some View { LyraTheme.separator.frame(width: 1, height: 22).padding(.horizontal, 4) }
+
+    private func tool(_ title: String, _ icon: String, selected: Bool = false,
+                      action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: icon) }
+            .buttonStyle(LyraToolStyle(selected: selected))
+            .help(title).accessibilityLabel(title)
+            .accessibilityValue(selected ? "Selected" : "")
+    }
+
+    private func pending(_ title: String, _ icon: String) -> some View {
+        Button {} label: { Image(systemName: icon) }
+            .disabled(true).help("\(title) · Coming soon").accessibilityLabel("\(title), coming soon")
+    }
+}
+
+/// The contextual second row, drawn **over** the canvas instead of above it.
+///
+/// It is one view with one selection rule, exactly like the row that used to sit in
+/// ``ReaderToolbar``'s `VStack`: page overview wins over the annotation tools. Because both states
+/// feed the same view, turning page overview on while the annotation row is open swaps the
+/// content in place - it cannot stack a second overlay or leave the row's height empty.
+///
+/// The row is always laid out at `ReaderChrome.secondaryToolbarHeightPt` with an opaque panel
+/// background and a bottom separator, so it reads as a floating row over the page and catches
+/// clicks for its whole rectangle.
+struct ReaderSecondaryToolbar: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        Group {
+            if state.pageOverviewVisible {
+                overviewRow
+            } else {
+                annotationRow
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .frame(height: ReaderChrome.secondaryToolbarHeightPt)
+        .background(LyraTheme.panelBg)
+        .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
+        .buttonStyle(LyraToolStyle())
     }
 
     private var overviewRow: some View {
@@ -266,41 +328,17 @@ struct ReaderToolbar: View {
                     .font(.system(size: 17)).frame(width: 32, height: 32)
             }
             Spacer(minLength: 0)
-            Button { annotationsExpanded = false } label: {
+            Button { state.annotationToolsVisible = false } label: {
                 Image(systemName: "xmark").font(.system(size: 11))
             }.help("Hide annotation tools").accessibilityLabel("Hide annotation tools")
         }
     }
 
-    private func menuLabel(_ icon: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon)
-            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
-        }.padding(.horizontal, 4)
-    }
-
     private var annotationColor: AnnotationColor { state.annotationColor }
 
-    private func search(compact: Bool) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: "magnifyingglass").foregroundStyle(LyraTheme.iconSecondary)
-            TextField("Search document", text: $state.searchQuery)
-                .textFieldStyle(.plain).font(.system(size: 12))
-                .frame(width: compact ? 100 : 150)
-                .onSubmit { state.pageOverviewVisible = false; state.runSearch() }
-            if !state.searchHits.isEmpty {
-                Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
-                    .font(.caption2).monospacedDigit().foregroundStyle(LyraTheme.textSecondary)
-                tool("Previous match (⇧⌘G)", "chevron.up") { state.findPrevious() }
-                tool("Next match (⌘G)", "chevron.down") { state.findNext() }
-            }
-        }
-        .padding(.leading, 9).padding(.trailing, 5).frame(height: 32)
-        .background(LyraTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(LyraTheme.controlBorder, lineWidth: 0.5))
+    private var separator: some View {
+        LyraTheme.separator.frame(width: 1, height: 22).padding(.horizontal, 4)
     }
-
-    private var separator: some View { LyraTheme.separator.frame(width: 1, height: 22).padding(.horizontal, 4) }
 
     private func tool(_ title: String, _ icon: String, selected: Bool = false,
                       action: @escaping () -> Void) -> some View {

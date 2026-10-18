@@ -280,6 +280,9 @@ public final class AppState: ObservableObject {
     @Published public var sidebarTab: SidebarTab = .thumbnails
     @Published public var sidebarVisible: Bool = true
     @Published public var pageOverviewVisible: Bool = false
+    /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
+    /// layout row above it, so this is the value its show/hide transition animates.
+    @Published public var annotationToolsVisible: Bool = false
     @Published public var zoomPercent: Int = 100
     @Published public var currentPage: Int = 1
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"
@@ -348,6 +351,11 @@ public final class AppState: ObservableObject {
 
     /// Viewport size in screen points, reported by the canvas.
     private var viewportSizePt: CGSize = .zero
+    /// One coalesced rebuild for width-only changes that can move the visible columns.
+    private var pendingViewportReload: DispatchWorkItem?
+    /// How many times the visible band was rebuilt. Read by the transition checks: a width-only
+    /// slide that cannot move the band must leave this unchanged for the whole animation.
+    public private(set) var viewportReloadCount = 0
     /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
     private let tileSizePx = 512
 
@@ -2133,10 +2141,55 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Called by the canvas whenever its size changes.
+    ///
+    /// A height change always rebuilds the visible band: it changes which page rows can be seen.
+    /// A **width-only** change is different. The canvas centres the content from its own surface
+    /// width, and the pages/tiles are placed in content coordinates, so when the whole content
+    /// width fits inside both the old and the new viewport there is nothing to rebuild - the band
+    /// is exactly the same. That is the normal case while the sidebar slides, and skipping the
+    /// rebuild is what keeps the slide from re-running the visible-set loop (and from asking for
+    /// a raster or a tile) on every frame.
+    ///
+    /// When the content is wider than one of the widths the visible columns can change. Those
+    /// changes are coalesced into one rebuild shortly after the width stops moving, so a slide or
+    /// a live window resize still settles correctly without doing that work per frame.
     public func setViewportSize(_ size: CGSize) {
         guard size != viewportSizePt else { return }
+        let previous = viewportSizePt
         viewportSizePt = size
+
+        let heightChanged = abs(size.height - previous.height) > 0.5
+        if !heightChanged {
+            let contentWidth = contentWidthPt * max(zoomFactor, 0.01)
+            let fitsBoth = contentWidth <= min(previous.width, size.width) + 0.5
+            if fitsBoth {
+                cancelPendingViewportReload()
+            } else {
+                scheduleViewportReload()
+            }
+            return
+        }
         reloadVisiblePages()
+    }
+
+    /// A width-only change that can move the visible columns (a zoomed-in page wider than the
+    /// canvas) is rebuilt once after the width stops changing rather than on every frame.
+    private func scheduleViewportReload() {
+        pendingViewportReload?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingViewportReload = nil
+                self.reloadVisiblePages()
+            }
+        }
+        pendingViewportReload = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
+    private func cancelPendingViewportReload() {
+        pendingViewportReload?.cancel()
+        pendingViewportReload = nil
     }
 
     /// Scrolls by a delta measured in **screen points** (what `scrollWheel` reports).
@@ -6094,6 +6147,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// to promise this retention removed a "visible diagonal sweep" of preview plus tiles,
     /// which overstates what the base did.
     public func reloadVisiblePages() {
+        // Any explicit rebuild supersedes a width-only rebuild that was waiting to settle.
+        pendingViewportReload?.cancel()
+        pendingViewportReload = nil
+        viewportReloadCount += 1
         guard document != nil else {
             canvasPages = []
             canvasTiles = []

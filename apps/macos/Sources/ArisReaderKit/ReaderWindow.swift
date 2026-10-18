@@ -19,6 +19,9 @@ public struct ReaderWindow: View {
     /// (see `ReaderSession`).
     private let previewPanels: ReferencePreviewPanelController
     private let integratesTitlebar: Bool
+    /// Tracked so a toggle made while the window edge is being dragged changes layout at once
+    /// instead of animating against the pointer (see ``WindowLiveResizeReporter``).
+    @State private var isLiveResizing = false
 
     public init(
         state: AppState,
@@ -40,13 +43,21 @@ public struct ReaderWindow: View {
             ReaderToolbar(state: state)
             ZStack {
                 HStack(spacing: 0) {
-                    if state.sidebarVisible {
+                    // A sliding drawer, not a conditional: the panel keeps its content width
+                    // while the frame around it closes, so the canvas gets the freed width frame
+                    // by frame and the document's vertical position never changes.
+                    ReaderSidebarTransition(isVisible: state.sidebarVisible) {
                         SidebarView(state: state, opener: opener)
-                            .frame(width: 250)
-                        Rectangle().fill(LyraTheme.separator).frame(width: 1)
                     }
+                    // The edge shadow is drawn just outside the sidebar's frame; it has to be
+                    // above the canvas to be visible over the page.
+                    .zIndex(1)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                // The animation belongs to the row, not to the sidebar view: it is this
+                // HStack's layout that must interpolate, so the canvas width moves with the
+                // panel instead of jumping to the final width on the first frame.
+                .animation(sidebarAnimation, value: state.sidebarVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -55,9 +66,13 @@ public struct ReaderWindow: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+            // An overlay, not a ZStack child: it takes its own height at the top and can never
+            // participate in (or be centred by) the content's layout.
+            .overlay(alignment: .top) { secondaryToolbarLayer }
         }
         .frame(minWidth: 900, minHeight: 600)
         .background(LyraTheme.windowBg)
+        .background(WindowLiveResizeReporter { isLiveResizing = $0 })
         .foregroundStyle(LyraTheme.textPrimary)
         .tint(LyraTheme.accent)
         .onAppear { state.installTerminationHandling() }
@@ -190,6 +205,60 @@ public struct ReaderWindow: View {
             }
         }
         .animation(.easeOut(duration: 0.12), value: opener.dropHint)
+    }
+
+    // MARK: - Secondary toolbar row
+
+    /// The contextual row (annotation tools or page overview) drawn over the content.
+    ///
+    /// It is a sibling of the content, not a row inside the `VStack` above it, so its height never
+    /// participates in the canvas's layout: showing it cannot push the document down, and the
+    /// canvas frame and page position are identical before, during and after the reveal.
+    ///
+    /// While the sidebar is open the row starts at the sidebar's width and spans only the canvas,
+    /// so it never covers the sidebar's tab picker. Page overview draws its grid over the sidebar,
+    /// so there the row spans the full content area like the grid does. The inset uses the
+    /// sidebar's target width rather than its animated width, which keeps the row's own contents
+    /// from reflowing on every frame if the sidebar is toggled while the row is open.
+    private var secondaryToolbarLayer: some View {
+        let inset = secondaryToolbarInset
+        // Top alignment matters while the row is only partly revealed: a centred HStack would
+        // grow the row from its middle instead of down from the toolbar's edge.
+        return HStack(alignment: .top, spacing: 0) {
+            if inset > 0 {
+                // Fixed height, or the flexible colour would stretch the overlay HStack to the
+                // full content height and centre the row vertically instead of top-aligning it.
+                Color.clear
+                    .frame(width: inset, height: ReaderChrome.secondaryToolbarHeightPt)
+                    .allowsHitTesting(false)
+            }
+            ReaderSecondaryToolbarTransition(isVisible: secondaryToolbarVisible) {
+                ReaderSecondaryToolbar(state: state)
+            }
+        }
+        // Same rule as the sidebar: the animation has to own the layout that changes.
+        .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
+    }
+
+    /// A toggle made while the window edge is being dragged changes layout without animating:
+    /// animating against the pointer would make the layout chase two sizes at once.
+    private var sidebarAnimation: Animation? {
+        isLiveResizing ? nil : ReaderMotion.sidebarAnimation
+    }
+
+    private var secondaryRowAnimation: Animation? {
+        isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
+    }
+
+    /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
+    /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
+    private var secondaryToolbarVisible: Bool {
+        state.pageOverviewVisible || state.annotationToolsVisible
+    }
+
+    private var secondaryToolbarInset: CGFloat {
+        guard !state.pageOverviewVisible, state.sidebarVisible else { return 0 }
+        return ReaderChrome.sidebarTotalWidthPt
     }
 
     /// The one place the interface states, without qualification, that the file on disk is not
