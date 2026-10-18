@@ -655,3 +655,210 @@ fn two_pieces_of_one_numbering_are_joined_whichever_the_score_picks() {
         "the two runs of one numbering were not joined: {entries:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T4.42 — one document, several reference lists
+// ---------------------------------------------------------------------------
+
+/// A document with a main list and an appendix list under independent numberings.
+///
+/// Page 0 is the main text: it cites the works the main list's numbering names, and `[7]`, which
+/// only the appendix list prints. Page 1 is the main list (6 entries). Page 2 is the appendix,
+/// which begins with its own heading and cites `[3]` — the number both lists carry, for different
+/// works. Page 3 is the appendix list (8 entries, so it is not a second run of the main
+/// numbering). Page 4 is a closing note after both lists, where nothing separates the two lists.
+fn two_list_pages() -> Vec<RawTextPage> {
+    vec![
+        test_page("The main text cites [1], [2], [3], [4], [5], [6] and also [7].\n"),
+        test_page(
+            "References\n[1] One 2019. Report work one.\n[2] Two 2020. Report work two.\n\
+             [3] Three 2021. Report work three.\n[4] Four 2022. Report work four.\n\
+             [5] Five 2023. Report work five.\n[6] Six 2024. Report work six.\n",
+        ),
+        page_of(&[
+            (760.0, 14.0, "Appendix A — Extra results"),
+            (738.0, 10.0, "The appendix relies on [3] and on [7]."),
+        ]),
+        test_page(
+            "References\n[1] Alpha 2017. Card work one.\n[2] Beta 2017. Card work two.\n\
+             [3] Gamma 2017. Card work three.\n[4] Delta 2017. Card work four.\n\
+             [5] Epsilon 2017. Card work five.\n[6] Zeta 2017. Card work six.\n\
+             [7] Eta 2017. Card work seven.\n[8] Theta 2017. Card work eight.\n",
+        ),
+        test_page("A closing note cites [3] once more.\n"),
+    ]
+}
+
+fn attributed(bibliography: &Bibliography, page: u32, label: &str) -> CitationAttribution {
+    attribute_citation(bibliography, page, &[label.to_string()]).expect("a bibliography")
+}
+
+#[test]
+fn two_reference_lists_are_found_with_their_sections_and_regions() {
+    let pages = two_list_pages();
+    let bibliography = find_reference_lists(
+        pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index as u32, page)),
+        100,
+    );
+    assert_eq!(
+        bibliography.lists.len(),
+        2,
+        "expected a main and an appendix list: {bibliography:?}"
+    );
+    // The score would pick the 8-entry appendix list; the main text's citations are what make the
+    // 6-entry main list the document-wide one (T4.41), and the attribution must not move it.
+    assert_eq!(bibliography.document_wide, 0);
+    assert_eq!(bibliography.lists[0].entries.len(), 6);
+    assert_eq!(bibliography.lists[0].heading.as_deref(), Some("References"));
+    assert_eq!(bibliography.lists[0].first_page(), Some(1));
+    assert_eq!(bibliography.lists[1].entries.len(), 8);
+    assert_eq!(bibliography.lists[1].first_page(), Some(3));
+    assert_eq!(
+        bibliography.lists[1]
+            .section
+            .as_ref()
+            .map(|section| section.kind),
+        Some(SectionKind::Appendix),
+        "the appendix heading was not read: {:?}",
+        bibliography.lists[1].section
+    );
+    assert_eq!(bibliography.lists[1].region_start, Some(2));
+}
+
+#[test]
+fn a_body_citation_resolves_into_the_main_list_and_an_appendix_citation_into_the_appendix_list() {
+    let pages = two_list_pages();
+    let bibliography = find_reference_lists(
+        pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index as u32, page)),
+        100,
+    );
+
+    // The main text's `[3]`: both lists print a 3, the main text is before both, and the
+    // document-wide list is the one it belongs to.
+    let body = attributed(&bibliography, 0, "3");
+    assert_eq!(body.list, 0, "{body:?}");
+    assert_eq!(body.reason, AttributionReason::DocumentWide);
+    let entry = resolve_reference(&["3".to_string()], &bibliography.lists[body.list].entries)
+        .expect("[3] in the main list");
+    assert!(entry.text.contains("Report work three"), "{entry:?}");
+
+    // The appendix's `[3]`: the citation lies in the pages the appendix list closes, so it
+    // belongs to that list — the same label, a different work. Resolving it against the
+    // document-wide list is exactly the silent wrong answer this test exists to refuse.
+    let appendix = attributed(&bibliography, 2, "3");
+    assert_eq!(appendix.list, 1, "{appendix:?}");
+    assert_eq!(appendix.reason, AttributionReason::SectionList);
+    let entry = resolve_reference(
+        &["3".to_string()],
+        &bibliography.lists[appendix.list].entries,
+    )
+    .expect("[3] in the appendix list");
+    assert!(entry.text.contains("Card work three"), "{entry:?}");
+    let wrong =
+        resolve_reference(&["3".to_string()], &bibliography.lists[0].entries).expect("[3] main");
+    assert!(
+        !wrong.text.contains("Card work"),
+        "the two lists must name different works: {wrong:?}"
+    );
+}
+
+#[test]
+fn a_number_only_an_appendix_list_prints_is_attributed_to_it() {
+    // `[7]` is printed only by the appendix list. A main-text citation of it is not a main-list
+    // citation; it resolves there, and the CLI is required to say so (the attribution reason).
+    let pages = two_list_pages();
+    let bibliography = find_reference_lists(
+        pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index as u32, page)),
+        100,
+    );
+    let attribution = attributed(&bibliography, 0, "7");
+    assert_eq!(attribution.list, 1, "{attribution:?}");
+    assert_eq!(attribution.reason, AttributionReason::LabelOnly);
+    assert!(!attribution.ambiguous);
+    let entry = resolve_reference(
+        &["7".to_string()],
+        &bibliography.lists[attribution.list].entries,
+    )
+    .expect("[7]");
+    assert!(entry.text.contains("Card work seven"), "{entry:?}");
+}
+
+#[test]
+fn a_citation_after_both_lists_prefers_the_document_wide_list_and_records_the_ambiguity() {
+    // The closing note is after both lists. Both carry a 3, and the appendix list is nearer, but
+    // proximity alone is not evidence; the document-wide list wins and the choice is recorded.
+    let pages = two_list_pages();
+    let bibliography = find_reference_lists(
+        pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index as u32, page)),
+        100,
+    );
+    let attribution = attributed(&bibliography, 4, "3");
+    assert_eq!(attribution.list, 0, "{attribution:?}");
+    assert_eq!(attribution.reason, AttributionReason::DocumentWide);
+    assert!(attribution.ambiguous, "{attribution:?}");
+    assert_eq!(attribution.alternatives, [1]);
+}
+
+#[test]
+fn the_document_wide_list_is_byte_identical_to_find_references() {
+    // The single-list API is the app's contract; the new one must not change it, including for a
+    // document that prints a second list. This is the T4.41 shape, where the report's own list is
+    // the document-wide one and the card's list at the end is a separate bibliography.
+    let pages =
+        two_bibliography_pages("Related work is surveyed in [1], [2], [3], [4], [5], [6].\n");
+    let single = find_references(
+        [
+            (0, &pages[0]),
+            (1, &pages[1]),
+            (2, &pages[2]),
+            (3, &pages[3]),
+        ],
+        100,
+    );
+    let bibliography = find_reference_lists(
+        [
+            (0, &pages[0]),
+            (1, &pages[1]),
+            (2, &pages[2]),
+            (3, &pages[3]),
+        ],
+        100,
+    );
+    assert_eq!(bibliography.lists.len(), 2);
+    assert_eq!(
+        bibliography.lists[bibliography.document_wide].entries, single,
+        "the document-wide list diverged from find_references"
+    );
+}
+
+#[test]
+fn a_single_list_document_reports_one_list_and_never_chooses() {
+    let pages = [
+        test_page("Prior work [1] is the baseline.\n"),
+        test_page("References\n[1] One 2020. First.\n[2] Two 2021. Second.\n"),
+    ];
+    let bibliography = find_reference_lists(
+        pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index as u32, page)),
+        100,
+    );
+    assert_eq!(bibliography.lists.len(), 1);
+    let attribution = attributed(&bibliography, 0, "1");
+    assert_eq!(attribution.list, 0);
+    assert_eq!(attribution.reason, AttributionReason::OnlyList);
+    assert!(!attribution.ambiguous);
+}

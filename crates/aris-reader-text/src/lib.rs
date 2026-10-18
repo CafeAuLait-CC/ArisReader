@@ -24,6 +24,9 @@ mod paren;
 mod superscript;
 pub mod tables;
 
+pub use bibliography::{
+    AttributionReason, Bibliography, CitationAttribution, ReferenceList, SectionKind, SectionRef,
+};
 pub use figures::{
     CaptionMention, PageEvidence, caption_region, caption_region_from,
     caption_region_without_margin, find_caption_mentions,
@@ -339,20 +342,31 @@ impl EntryFragment {
     }
 }
 
+/// Heading spellings, lower-cased. A line *starts* with one of these (with nothing after it but
+/// the first entry) or ends with one of these after an appendix/chapter/number qualifier; see
+/// [`qualified_reference_heading`].
+const REFERENCE_HEADINGS: [&str; 8] = [
+    "references",
+    "bibliography",
+    "literature cited",
+    "works cited",
+    "参考文献",
+    "referencias",
+    "bibliographie",
+    "literaturverzeichnis",
+];
+
 /// Whether a page looks like the start of the reference list.
 ///
 /// Accept common heading spellings, including mid-page headings and a numeric
 /// entry sharing the heading's line. A mention in running prose is not a heading.
+///
+/// Two shapes count. The plain one is the heading at the start of a line (`References`,
+/// `References [1] Aberman`). The qualified one names the section the list belongs to — an
+/// appendix's or chapter's own list — and is recognised by `Appendix A — References`,
+/// `Chapter 3 Bibliography`, `3 References` and `附录 A 参考文献`; see
+/// [`qualified_reference_heading`].
 pub fn looks_like_reference_heading(text: &str) -> bool {
-    const HEADINGS: [&str; 6] = [
-        "references",
-        "bibliography",
-        "literature cited",
-        "参考文献",
-        "referencias",
-        "bibliographie",
-    ];
-
     // Measured on real papers: the heading often starts mid-page (right after the conclusion),
     // and it often shares its line with the first entry -- PDFium's text extraction produces
     // `References [1] Aberman, K. …`, which a strict equality check rejects, after which a whole
@@ -361,7 +375,7 @@ pub fn looks_like_reference_heading(text: &str) -> bool {
     text.lines().any(|line| {
         let trimmed = line.trim().trim_end_matches(':').trim();
         let lower = trimmed.to_ascii_lowercase();
-        HEADINGS.iter().any(|heading| {
+        let plain = REFERENCE_HEADINGS.iter().any(|heading| {
             if !lower.starts_with(heading) {
                 return false;
             }
@@ -370,8 +384,68 @@ pub fn looks_like_reference_heading(text: &str) -> bool {
                 || rest.is_empty()
                 || rest.starts_with('[')
                 || rest.starts_with(|character: char| character.is_ascii_digit())
-        })
+        });
+        plain || qualified_reference_heading(trimmed)
     })
+}
+
+/// Whether the line names a reference list *and* the section that owns it:
+/// `Appendix A — References`, `Chapter 3 Bibliography`, `3 References`, `附录 A 参考文献`.
+///
+/// The qualifier is what makes this safe: a body sentence that merely mentions references does
+/// not start with `Appendix`/`Chapter`/a number, and the last word has to be the heading itself,
+/// so `Appendix A — References and Notes` is not admitted. An entry printed on the same line
+/// (`Appendix A — References [1] Aberman`) is cut off before the bracket, as in the plain shape.
+fn qualified_reference_heading(line: &str) -> bool {
+    let prefix = line.split('[').next().unwrap_or(line).trim();
+    if prefix.is_empty() {
+        return false;
+    }
+    let lower = prefix.to_ascii_lowercase();
+    // CJK headings are commonly printed without a space after the qualifier.
+    if (lower.starts_with('第') || lower.starts_with("附录") || lower.starts_with("附錄"))
+        && REFERENCE_HEADINGS
+            .iter()
+            .any(|heading| lower.ends_with(heading))
+    {
+        return true;
+    }
+    let words: Vec<&str> = prefix.split_whitespace().collect();
+    if !(2..=6).contains(&words.len()) {
+        return false;
+    }
+    let last = words[words.len() - 1].trim_matches(|character: char| !character.is_alphanumeric());
+    if !REFERENCE_HEADINGS
+        .iter()
+        .any(|heading| last.eq_ignore_ascii_case(heading))
+    {
+        return false;
+    }
+    let qualifier = words[..words.len() - 1].join(" ").to_ascii_lowercase();
+    if ["appendix", "chapter", "part", "附录", "附錄", "第"]
+        .iter()
+        .any(|word| qualifier.starts_with(word))
+    {
+        // `Appendix A — References` and `Chapter 3 Bibliography` are headings; `Chapter 3
+        // discusses the bibliography` is prose. A qualifier may carry one designation (a letter,
+        // a number, a dash) before the heading word, and nothing that is a lower-case word.
+        if words.len() > 4 {
+            return false;
+        }
+        return words[1..words.len() - 1].iter().all(|token| {
+            token
+                .chars()
+                .filter(|character| character.is_alphabetic())
+                .all(|character| !character.is_lowercase())
+        });
+    }
+    let first = words[0].trim_end_matches(['.', ')', ':']);
+    let numbered = !first.is_empty() && first.chars().all(|character| character.is_ascii_digit());
+    let lettered = first.chars().count() == 1
+        && first
+            .chars()
+            .all(|character| character.is_ascii_uppercase());
+    (numbered || lettered) && words.len() <= 3
 }
 
 /// Parses numeric-style entries (`[12] Author, Title…`) out of one page's text.
@@ -1395,6 +1469,81 @@ pub fn find_references<'a>(
     entries
 }
 
+/// Finds **every** reference list the document prints, in reading order.
+///
+/// [`find_references`] answers "which list is the document's bibliography"; a document can print
+/// more than one, and a citation has to resolve against the list its own section cites. The
+/// document-wide list in [`Bibliography::lists`] is exactly what [`find_references`] returns —
+/// same entries, same order, same geometry — so a caller that only needs the single-list answer
+/// keeps using that function, and the single-list documents behave identically through both.
+///
+/// A list is reported when the document announced it with a reference heading (`References`,
+/// `Bibliography`, `参考文献`, `Appendix A — References`, a numbered chapter list), and the
+/// document-wide list is reported even when its heading was missed, because the layout score and
+/// the body already admit it. Entries have the same trailing-section trim and fragment geometry
+/// as the document-wide list.
+pub fn find_reference_lists<'a>(
+    pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
+    max_entries: usize,
+) -> Bibliography {
+    let pages: Vec<(u32, &RawTextPage)> = pages.into_iter().collect();
+    let mut bibliography = bibliography::find_reference_lists(
+        pages.iter().map(|(page, text)| (*page, *text)),
+        max_entries,
+    );
+    for list in &mut bibliography.lists {
+        // Each list ends where the page does; cut the section after it, exactly as the
+        // document-wide path does, then derive the fragment geometry.
+        bibliography::trim_trailing_section(&mut list.entries, &pages);
+        fragments::assign(&mut list.entries, &pages);
+    }
+    bibliography
+}
+
+/// [`find_reference_lists`], with the document-wide list rebuilt from link landings.
+///
+/// The landings are the document-wide bibliography's own link annotations, validated exactly as
+/// [`find_references_with_landings`] validates them, so that list is byte-identical to what the
+/// app already returns. The other lists keep their parsed entries: reusing the document-wide
+/// landings to rebuild a page that holds another list would replace entries the links do not name.
+pub fn find_reference_lists_with_landings(
+    pages: &[(u32, RawTextPage)],
+    landings: &std::collections::BTreeMap<u32, Vec<f64>>,
+    max_entries: usize,
+) -> Bibliography {
+    let mut bibliography =
+        find_reference_lists(pages.iter().map(|(page, text)| (*page, text)), max_entries);
+    if bibliography.lists.is_empty() {
+        return bibliography;
+    }
+    let document_wide = find_references_with_landings(pages, landings, max_entries);
+    let index = bibliography.document_wide;
+    bibliography.lists[index].entries = document_wide;
+    bibliography
+}
+
+/// Chooses the list a citation on `page`, naming `labels`, is attributed to.
+///
+/// The public contract is [`CitationAttribution`]: the list, the reason, whether the answer is
+/// ambiguous, and the other lists that also carry a label. `None` means the document printed no
+/// reference list at all. The decision itself is documented in the crate's bibliography module:
+/// a list's reading-order region decides first, then the label only one list prints, then the
+/// document-wide fallback.
+///
+/// A single-list document gets [`AttributionReason::OnlyList`] for every citation — there is
+/// nothing to choose, which is how the single-list behaviour stays exactly what it was.
+pub fn attribute_citation(
+    bibliography: &Bibliography,
+    page: u32,
+    labels: &[String],
+) -> Option<CitationAttribution> {
+    if bibliography.lists.is_empty() {
+        None
+    } else {
+        Some(bibliography::attribute(bibliography, page, labels))
+    }
+}
+
 #[cfg(test)]
 mod caption_tests {
     use super::*;
@@ -1791,6 +1940,37 @@ mod reference_tests {
         assert!(!looks_like_reference_heading(
             "1 Introduction\nWe discuss references in Section 5.\n"
         ));
+    }
+
+    #[test]
+    fn section_qualified_reference_headings_are_recognised() {
+        for heading in [
+            "Appendix A — References",
+            "Appendix A — References [1] Aberman, K.",
+            "APPENDIX B: BIBLIOGRAPHY",
+            "Chapter 3 Bibliography",
+            "3 References",
+            "3. References",
+            "A References",
+            "附录 A 参考文献",
+            "第3章 参考文献",
+        ] {
+            assert!(
+                looks_like_reference_heading(heading),
+                "section-qualified heading not recognised: {heading}"
+            );
+        }
+        for body in [
+            "Appendix A — References and Notes",
+            "Chapter 3 discusses the bibliography",
+            "3 References are listed below",
+            "The appendix references Section 2",
+        ] {
+            assert!(
+                !looks_like_reference_heading(body),
+                "body text read as a heading: {body}"
+            );
+        }
     }
 
     #[test]
