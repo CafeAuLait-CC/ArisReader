@@ -161,6 +161,15 @@ pub enum RawAnnotationKind {
     Text,
     /// `/FreeText`: text placed on the page.
     FreeText,
+    /// `/Ink`: freehand strokes, carried in [`RawAnnotation::ink_paths`].
+    Ink,
+    /// `/Square`: a rectangle drawn with a stroke; its geometry is [`RawAnnotation::rect`].
+    Square,
+    /// `/Circle`: an ellipse drawn with a stroke; its geometry is [`RawAnnotation::rect`].
+    Circle,
+    /// `/Line`: a line from [`RawAnnotation::line`]'s start to its end. An arrowhead is the
+    /// file's `/LE` (or this writer's `/Subj`), reported as [`RawAnnotation::line_arrow`].
+    Line,
     /// A subtype this build does not model; the PDF's own `/Subtype` name is carried with it.
     Other(String),
 }
@@ -175,6 +184,10 @@ impl RawAnnotationKind {
             Self::Squiggly => "squiggly",
             Self::Text => "text",
             Self::FreeText => "freeText",
+            Self::Ink => "ink",
+            Self::Square => "square",
+            Self::Circle => "circle",
+            Self::Line => "line",
             Self::Other(name) => name,
         }
     }
@@ -230,9 +243,14 @@ impl RawAnnotationKind {
             // A squiggly is drawn as a wave *beside* the text rather than through it, and PDFium
             // composites it alpha-over; a note's icon and its free text are opaque glyphs and
             // alpha-over too, and everything unmodelled is not drawn at all.
-            Self::Squiggly | Self::Text | Self::FreeText | Self::Other(_) => {
-                AnnotationBlend::Normal
-            }
+            Self::Squiggly
+            | Self::Text
+            | Self::FreeText
+            | Self::Ink
+            | Self::Square
+            | Self::Circle
+            | Self::Line
+            | Self::Other(_) => AnnotationBlend::Normal,
         }
     }
 }
@@ -319,6 +337,10 @@ pub enum AnnotationDrawing {
     NoteIcon,
     /// `/FreeText`: the annotation's own text, laid out in `/Rect`.
     FreeText,
+    /// `/Ink`, `/Square`, `/Circle` or `/Line`: a stroked path the canvas draws from its
+    /// page-space geometry (`ink_paths`, `line` or `rect`) in the annotation's colour and
+    /// border width.
+    Geometry,
     /// Nothing is drawn, for the reason carried.
     Skipped(AnnotationSkipReason),
 }
@@ -330,6 +352,7 @@ impl AnnotationDrawing {
             Self::Markup => "markup",
             Self::NoteIcon => "noteIcon",
             Self::FreeText => "freeText",
+            Self::Geometry => "geometry",
             Self::Skipped(_) => "skipped",
         }
     }
@@ -353,9 +376,12 @@ pub enum AnnotationSkipReason {
     /// annotation's text rather than its box. (A sticky note with no text is still drawn — its
     /// icon is the point, which is why that case is not here.)
     EmptyContents,
-    /// The subtype has no drawing rule in this build (`Ink`, `Stamp`, …). Listing it is all this
+    /// The subtype has no drawing rule in this build (`Stamp`, …). Listing it is all this
     /// reader promises for now, and the PDF's own `/Subtype` name travels with the annotation.
     Unmodelled,
+    /// A stroked geometry annotation whose dictionary carries no path to draw: an `/Ink` with
+    /// an empty or unreadable `/InkList`, or a `/Line` with no `/L`.
+    EmptyGeometry,
 }
 
 impl AnnotationSkipReason {
@@ -366,6 +392,7 @@ impl AnnotationSkipReason {
             Self::EmptyRect => "empty-rect",
             Self::EmptyContents => "no-text",
             Self::Unmodelled => "unmodelled",
+            Self::EmptyGeometry => "empty-geometry",
         }
     }
 }
@@ -376,6 +403,13 @@ pub struct RawAnnotationColor {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
+}
+
+/// A `/Line` annotation's endpoints, in page space (bottom-left origin).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawAnnotationLine {
+    pub start: Point,
+    pub end: Point,
 }
 
 /// One annotation that already exists inside the PDF.
@@ -415,6 +449,21 @@ pub struct RawAnnotation {
     /// Empty when the file has none. Consumers should fall back to `rect`: a highlight without
     /// `/QuadPoints` is malformed but does occur, and its `/Rect` is still the right box.
     pub quads: Vec<Rect>,
+    /// `/InkList`: one entry per stroke, each a sequence of page-space points.
+    ///
+    /// Empty for every kind except `/Ink`; a malformed ink annotation with no list is still
+    /// reported (and classified [`AnnotationDrawing::Skipped`] with
+    /// [`AnnotationSkipReason::EmptyGeometry`]) so the reader never silently loses it.
+    pub ink_paths: Vec<Vec<Point>>,
+    /// `/L` for a `/Line` annotation, in page space; `None` for every other kind.
+    pub line: Option<RawAnnotationLine>,
+    /// Whether the line carries an arrowhead: the file's `/LE` names one, or its `/Subj` says
+    /// "Arrow". Only meaningful for [`RawAnnotationKind::Line`].
+    pub line_arrow: bool,
+    /// `/BS /W` (the border width) in points, when the file states a usable one.
+    ///
+    /// `None` means "the file did not say"; the canvas then draws the `PDF` default of 1 pt.
+    pub border_width: Option<f64>,
     /// `/C` — `None` when the file carries no colour at all (common for sticky notes, whose
     /// colour is the icon's, not the file's).
     pub color: Option<RawAnnotationColor>,
@@ -481,6 +530,16 @@ impl RawAnnotation {
                 AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyContents)
             }
             RawAnnotationKind::FreeText => AnnotationDrawing::FreeText,
+            RawAnnotationKind::Ink if self.ink_paths.is_empty() => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyGeometry)
+            }
+            RawAnnotationKind::Line if self.line.is_none() => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyGeometry)
+            }
+            RawAnnotationKind::Ink
+            | RawAnnotationKind::Square
+            | RawAnnotationKind::Circle
+            | RawAnnotationKind::Line => AnnotationDrawing::Geometry,
             RawAnnotationKind::Other(_) => {
                 AnnotationDrawing::Skipped(AnnotationSkipReason::Unmodelled)
             }

@@ -106,6 +106,22 @@ public struct ReaderWindow: View {
                 scrollYPt: state.scrollYPt,
                 zoom: state.zoomFactor,
                 contentWidthPt: state.contentWidthPt,
+                annotationMarks: state.canvasAnnotationMarks,
+                annotationPageFrames: state.canvasPageFrames,
+                annotationTool: state.annotationTool,
+                annotationColor: state.annotationStrokeColor,
+                annotationStrokeWidth: AppState.defaultAnnotationStrokeWidth,
+                onAnnotationDraft: { draft in
+                    _ = state.addGeometryAnnotation(
+                        kind: draft.kind,
+                        page: draft.page,
+                        inkPaths: draft.inkPaths,
+                        shapeRect: draft.shapeRect,
+                        lineStart: draft.lineStart,
+                        lineEnd: draft.lineEnd
+                    )
+                },
+                onDeleteAnnotation: { state.deleteSelectedAnnotation() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },

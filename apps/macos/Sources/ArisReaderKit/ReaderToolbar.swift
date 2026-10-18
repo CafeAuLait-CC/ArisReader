@@ -78,7 +78,6 @@ struct ReaderToolbar: View {
     @ObservedObject var state: AppState
     @Environment(\.openSettings) private var openSettings
     @State private var annotationsExpanded = false
-    @State private var annotationColorIndex = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -214,10 +213,36 @@ struct ReaderToolbar: View {
             }.disabled(state.selection == nil)
             pending("Strikethrough", "strikethrough")
             separator
-            pending("Draw", "pencil.tip")
+            tool("Select a mark", "arrow.up.left",
+                 selected: state.annotationTool == .select) {
+                state.annotationTool = .select
+            }.disabled(state.document == nil)
+            tool("Draw with the pen", "pencil.tip",
+                 selected: state.annotationTool == .pen) {
+                state.annotationTool = state.annotationTool == .pen ? .select : .pen
+            }.disabled(state.document == nil)
+            LyraMenu(title: "Shapes", items: [
+                LyraMenuItem("Line", icon: "line.diagonal",
+                             selected: state.annotationTool == .line) {
+                    state.annotationTool = state.annotationTool == .line ? .select : .line
+                },
+                LyraMenuItem("Arrow", icon: "arrow.up.right",
+                             selected: state.annotationTool == .arrow) {
+                    state.annotationTool = state.annotationTool == .arrow ? .select : .arrow
+                },
+                LyraMenuItem("Rectangle", icon: "rectangle",
+                             selected: state.annotationTool == .rectangle) {
+                    state.annotationTool = state.annotationTool == .rectangle ? .select : .rectangle
+                },
+                LyraMenuItem("Ellipse", icon: "circle",
+                             selected: state.annotationTool == .ellipse) {
+                    state.annotationTool = state.annotationTool == .ellipse ? .select : .ellipse
+                },
+            ]) {
+                Image(systemName: "square.on.circle")
+            }.disabled(state.document == nil)
             pending("Eraser", "eraser")
             pending("Text box", "textbox")
-            pending("Shapes", "square.on.circle")
             tool("Add a note to selected text", "text.bubble") {
                 if let note = ReaderWindow.promptForNote() {
                     state.addAnnotationFromSelection(kind: .highlight, color: annotationColor, note: note)
@@ -226,11 +251,13 @@ struct ReaderToolbar: View {
             pending("Stamps", "seal")
             pending("Signature", "signature")
             separator
-            LyraMenu(title: "Annotation color", items: AppState.annotationPalette.enumerated().map { index, item in
-                LyraMenuItem(item.name, icon: "circle.fill", selected: annotationColorIndex == index,
+            LyraMenu(title: "Annotation color", items: AppState.annotationPalette.enumerated().map { _, item in
+                LyraMenuItem(item.name, icon: "circle.fill", selected: state.annotationColor == item.color,
                              color: Color(red: Double(item.color.red) / 255,
                                           green: Double(item.color.green) / 255,
-                                          blue: Double(item.color.blue) / 255)) { annotationColorIndex = index }
+                                          blue: Double(item.color.blue) / 255)) {
+                    state.annotationColor = item.color
+                }
             }) {
                 Image(systemName: "circle.fill")
                     .foregroundStyle(Color(red: Double(annotationColor.red) / 255,
@@ -252,7 +279,7 @@ struct ReaderToolbar: View {
         }.padding(.horizontal, 4)
     }
 
-    private var annotationColor: AnnotationColor { AppState.annotationPalette[annotationColorIndex].color }
+    private var annotationColor: AnnotationColor { state.annotationColor }
 
     private func search(compact: Bool) -> some View {
         HStack(spacing: 5) {

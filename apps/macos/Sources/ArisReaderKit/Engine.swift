@@ -578,6 +578,9 @@ public enum AnnotationDrawing: String, Sendable {
     case noteIcon
     /// A `/FreeText` annotation: its own text, laid out in `/Rect`.
     case freeText
+    /// An ink stroke or a stroked shape: drawn from `DocumentAnnotation.inkPaths`,
+    /// `lineStart`/`lineEnd` or `boxes` in the annotation's colour and border width.
+    case geometry
     /// Nothing, for the reason in `DocumentAnnotation.skipReason`.
     case skipped
 }
@@ -590,8 +593,11 @@ public enum AnnotationSkipReason: String, Sendable {
     case emptyRect = "empty-rect"
     /// A free-text annotation with no `/Contents`: there is no text to lay out.
     case emptyContents = "no-text"
-    /// A subtype this build has no drawing rule for (`Ink`, `Stamp`, …).
+    /// A subtype this build has no drawing rule for (`Stamp`, …).
     case unmodelled
+    /// A stroked annotation with no path to draw (`/Ink` without an `/InkList`, `/Line` without
+    /// an `/L`).
+    case emptyGeometry = "empty-geometry"
 }
 
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
@@ -619,6 +625,15 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let widthPt: CGFloat
     public let heightPt: CGFloat
     public let quads: [AnnotationQuadBox]
+    /// `/InkList` in view space, one polyline per stroke; empty for every other kind.
+    public let inkPaths: [[CGPoint]]
+    /// `/L`, view space; `nil` for every kind except a line.
+    public let lineStart: CGPoint?
+    public let lineEnd: CGPoint?
+    /// Whether the line's `/LE` (or `/Subj`) names an arrowhead.
+    public let lineArrow: Bool
+    /// `/BS /W` in points, when the file states one.
+    public let borderWidthPt: CGFloat?
     /// `nil` when the file carries no `/C` (sticky notes usually do not).
     public let color: AnnotationColor?
     /// `/CA`; `nil` means the file did not state one, which reads as opaque.
@@ -648,6 +663,11 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     /// `drawing`, which is `markup` for exactly these four when the file does not hide them.
     public var isMarkup: Bool {
         ["highlight", "underline", "strikeout", "squiggly"].contains(kind)
+    }
+
+    /// True when this is a stroked mark drawn from its geometry rather than a text quad.
+    public var isGeometry: Bool {
+        ["ink", "square", "circle", "line", "arrow"].contains(kind)
     }
 
     /// True when the annotation is a note rather than markup: something to *read*, listed in the
@@ -706,6 +726,14 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         case underline
         /// `/Subtype /Text`: a sticky note icon carrying the contents.
         case note
+        /// `/Subtype /Ink`: the request's `inkPaths` are its `/InkList`.
+        case ink
+        /// `/Subtype /Square`.
+        case square
+        /// `/Subtype /Circle`.
+        case circle
+        /// `/Subtype /Line`, with `/LE` when `lineArrow` is true.
+        case line
     }
 
     /// Written as `/NM`; the sidecar's UUID string, so a saved annotation can be recognised.
@@ -714,8 +742,17 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     public let kind: Kind
     /// View-space box at `zoom`; for markup the union of `quads` is what is written as `/Rect`.
     public let rect: CGRect
-    /// View-space `/QuadPoints` at `zoom`; empty only for a `.note`.
+    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
     public let quads: [CGRect]
+    /// View-space `/InkList` at `zoom`, one stroke per entry; only for `.ink`.
+    public let inkPaths: [[CGPoint]]
+    /// View-space `/L` endpoints at `zoom`; required for `.line`.
+    public let lineStart: CGPoint?
+    public let lineEnd: CGPoint?
+    /// Write `/LE [/None /ClosedArrow]`; only meaningful for `.line`.
+    public let lineArrow: Bool
+    /// `/BS /W` in points, for the stroked kinds.
+    public let borderWidthPt: CGFloat
     public let color: AnnotationColor
     /// `/CA`, 0…1. The shell's colour alpha carries it.
     public let opacity: Double
@@ -730,6 +767,11 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         kind: Kind,
         rect: CGRect,
         quads: [CGRect],
+        inkPaths: [[CGPoint]] = [],
+        lineStart: CGPoint? = nil,
+        lineEnd: CGPoint? = nil,
+        lineArrow: Bool = false,
+        borderWidthPt: CGFloat = 0,
         color: AnnotationColor,
         opacity: Double,
         contents: String,
@@ -741,6 +783,11 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         self.kind = kind
         self.rect = rect
         self.quads = quads
+        self.inkPaths = inkPaths
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
+        self.lineArrow = lineArrow
+        self.borderWidthPt = borderWidthPt
         self.color = color
         self.opacity = opacity
         self.contents = contents
@@ -1796,6 +1843,13 @@ public final class RustEngine: PDFEngine {
             case .highlight: .highlight
             case .underline: .underline
             case .note: .note
+            case .ink: .ink
+            case .square: .square
+            case .circle: .circle
+            case .line: .line
+            }
+            let point = { (point: CGPoint) in
+                AnnotationPoint(xPt: Double(point.x), yPt: Double(point.y))
             }
             return WriteAnnotationRecord(
                 id: request.id,
@@ -1803,6 +1857,11 @@ public final class RustEngine: PDFEngine {
                 kind: kind,
                 rect: quad(request.rect),
                 quads: request.quads.map(quad),
+                inkPaths: request.inkPaths.map { $0.map(point) },
+                lineStart: request.lineStart.map(point),
+                lineEnd: request.lineEnd.map(point),
+                lineArrow: request.lineArrow,
+                borderWidthPt: Double(request.borderWidthPt),
                 color: AnnotationColorRecord(
                     red: request.color.red,
                     green: request.color.green,
@@ -1841,6 +1900,11 @@ public final class RustEngine: PDFEngine {
                 heightPt: CGFloat(quad.heightPt)
             )
         }
+        let inkPaths = record.inkPaths.map { path in
+            path.map { CGPoint(x: CGFloat($0.xPt), y: CGFloat($0.yPt)) }
+        }
+        let lineStart = record.lineStart.map { CGPoint(x: CGFloat($0.xPt), y: CGFloat($0.yPt)) }
+        let lineEnd = record.lineEnd.map { CGPoint(x: CGFloat($0.xPt), y: CGFloat($0.yPt)) }
 
         // The FFI reports "no colour" as an absent record, and the shell keeps that distinction:
         // black is a colour somebody may have chosen, and a sticky note carries no colour at all.
@@ -1868,6 +1932,11 @@ public final class RustEngine: PDFEngine {
             widthPt: CGFloat(record.widthPt),
             heightPt: CGFloat(record.heightPt),
             quads: quads,
+            inkPaths: inkPaths,
+            lineStart: lineStart,
+            lineEnd: lineEnd,
+            lineArrow: record.lineArrow,
+            borderWidthPt: record.borderWidthPt.map { CGFloat($0) },
             color: color,
             opacity: record.opacity,
             blend: record.blend,

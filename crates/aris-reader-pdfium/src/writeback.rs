@@ -38,12 +38,19 @@
 //! tint the glyphs instead of multiplying into the page — strictly worse than no appearance at
 //! all, because the two viewers would then disagree about the same file.
 //!
-//! This writer therefore does **not** write `/AP`. Both PDFium and PDFKit synthesize the
-//! appearance from `/QuadPoints` and `/C`; the macOS test suite renders a saved copy with PDFKit
-//! and asserts that the highlight covers the line while the glyph pixels stay black, which is the
-//! multiply-like result Preview is expected to show. A viewer that requires an explicit `/AP`
-//! (some older readers do) will show nothing; the alternative was to write a state that is
-//! knowingly wrong. See the task report and `README.md` for the measurement.
+//! This writer therefore does **not** write `/AP` for the quad-based kinds. Both PDFium and
+//! PDFKit synthesize the appearance from `/QuadPoints` and `/C`; the macOS test suite renders a
+//! saved copy with PDFKit and asserts that the highlight covers the line while the glyph pixels
+//! stay black, which is the multiply-like result Preview is expected to show. A viewer that
+//! requires an explicit `/AP` (some older readers do) will show nothing; the alternative was to
+//! write a state that is knowingly wrong. See the task report and `README.md` for the measurement.
+//!
+//! Ink and shapes are different: a stroke has no blend mode to get wrong, so they are written by
+//! [`crate::geometry_write`] with a real `/AP /N` Form XObject **and** the geometry (`/InkList`
+//! or `/L`/`/LE`) and `/BS` width. The appearance objects are appended by the same save as the
+//! annotation dictionaries and are verified before the rename. A viewer that ignores the
+//! appearance can still synthesize the stroke; a viewer that ignores both shows nothing, which
+//! no such viewer in this environment did.
 //!
 //! # Threading
 //!
@@ -54,7 +61,10 @@
 use crate::annotations::{
     AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind,
 };
-use aris_reader_core::{ArisError, ErrorCode, PageIndex, RawAnnotation, RawAnnotationKind, Result};
+use crate::geometry_write::{append_geometry_annotations, verify_geometry_annotations};
+use aris_reader_core::{
+    ArisError, ErrorCode, PageIndex, Point, RawAnnotation, RawAnnotationKind, Result,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -128,6 +138,8 @@ const COPY_BUFFER: usize = 64 * 1024;
 /// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable PDF.
 const MAX_ANNOTATIONS: usize = 20_000;
 const MAX_QUADS: usize = 1_000;
+const MAX_INK_PATHS: usize = 256;
+const MAX_INK_POINTS: usize = 100_000;
 const MAX_TEXT_BYTES: usize = 100_000;
 const MAX_AUTHOR_BYTES: usize = 1_024;
 const MAX_ID_BYTES: usize = 128;
@@ -202,6 +214,15 @@ pub fn save_annotated_pdf(
     let mut appender = AnnotationAppender::open(&source, password)?;
     let page_count = appender.page_count();
     validate(annotations, page_count)?;
+    // Two writers, one save contract. PDFium creates the quad-based kinds; the stroked kinds
+    // need `/BS`, `/L` and a real appearance XObject, none of which its C API can write (see
+    // `geometry_write`). Both write into the same temporary file and are verified together
+    // before the rename.
+    let (pdfium_annotations, geometry_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
+        annotations
+            .iter()
+            .cloned()
+            .partition(|annotation| annotation.kind.uses_pdfium());
 
     let preexisting = read_annotations(&source, password, page_count)?;
     let preexisting_annotation_count: usize = preexisting.iter().map(Vec::len).sum();
@@ -217,10 +238,28 @@ pub fn save_annotated_pdf(
     let result = (|| -> Result<SaveReport> {
         // PDFium writes into the already-open file; there is no window in which another
         // process could replace the just-created path before the first byte is written.
-        for annotation in annotations {
+        for annotation in &pdfium_annotations {
             appender.add(annotation)?;
         }
-        let written_bytes = appender.save_incremental(file)?;
+        let mut written_bytes = if pdfium_annotations.is_empty() {
+            0
+        } else {
+            appender.save_incremental(file)?
+        };
+        if !geometry_annotations.is_empty() {
+            // With no PDFium update the temporary file is still empty; the geometry writer
+            // starts from the source. With one, it starts from the already-appended file, so
+            // the final document has the source and the PDFium update as its prefix.
+            let base = if pdfium_annotations.is_empty() {
+                source.as_path()
+            } else {
+                temp.path()
+            };
+            append_geometry_annotations(base, temp.path(), &geometry_annotations, password)?;
+            written_bytes = fs::metadata(temp.path())
+                .map_err(|error| io_error("could not measure the saved file", temp.path(), error))?
+                .len();
+        }
 
         // The document must not have moved under us while the update was being produced.
         let after = fs::metadata(&source)
@@ -236,6 +275,7 @@ pub fn save_annotated_pdf(
 
         let saved = read_annotations(temp.path(), password, page_count)?;
         verify_all(&preexisting, &saved, annotations)?;
+        verify_geometry_annotations(temp.path(), annotations, password)?;
 
         if written_bytes < source_len {
             return Err(ArisError::new(
@@ -586,28 +626,101 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
             ));
         }
         validate_rect(&annotation.rect, id, "rect")?;
-        if annotation.kind == WriteAnnotationKind::Text {
-            if !annotation.quads.is_empty() {
-                return Err(ArisError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("text annotation {id:?} must not carry /QuadPoints"),
-                ));
+        match annotation.kind {
+            WriteAnnotationKind::Text => {
+                if !annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("text annotation {id:?} must not carry /QuadPoints"),
+                    ));
+                }
             }
-        } else {
-            if annotation.quads.is_empty() {
-                return Err(ArisError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("markup annotation {id:?} has no /QuadPoints"),
-                ));
+            WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
+                if annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("markup annotation {id:?} has no /QuadPoints"),
+                    ));
+                }
+                if annotation.quads.len() > MAX_QUADS {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("annotation {id:?} has more than {MAX_QUADS} quads"),
+                    ));
+                }
+                for quad in &annotation.quads {
+                    validate_rect(quad, id, "quad")?;
+                }
             }
-            if annotation.quads.len() > MAX_QUADS {
-                return Err(ArisError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has more than {MAX_QUADS} quads"),
-                ));
+            WriteAnnotationKind::Ink => {
+                validate_geometry_common(annotation, id)?;
+                if !annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("ink annotation {id:?} must not carry /QuadPoints"),
+                    ));
+                }
+                if annotation.ink_paths.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("ink annotation {id:?} has no /InkList"),
+                    ));
+                }
+                if annotation.ink_paths.len() > MAX_INK_PATHS {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("ink annotation {id:?} has more than {MAX_INK_PATHS} strokes"),
+                    ));
+                }
+                let mut points = 0usize;
+                for path in &annotation.ink_paths {
+                    // One point cannot describe a stroke; a dot would need a rendering rule the
+                    // canvas does not have, and silently turning it into a line would invent one.
+                    if path.len() < 2 {
+                        return Err(ArisError::new(
+                            ErrorCode::InvalidArgument,
+                            format!(
+                                "ink annotation {id:?} has a stroke with fewer than two points"
+                            ),
+                        ));
+                    }
+                    points += path.len();
+                    for point in path {
+                        validate_point(*point, annotation.rect, id, "ink point")?;
+                    }
+                }
+                if points > MAX_INK_POINTS {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("ink annotation {id:?} has more than {MAX_INK_POINTS} points"),
+                    ));
+                }
             }
-            for quad in &annotation.quads {
-                validate_rect(quad, id, "quad")?;
+            WriteAnnotationKind::Line => {
+                validate_geometry_common(annotation, id)?;
+                if !annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("line annotation {id:?} must not carry /QuadPoints"),
+                    ));
+                }
+                let Some(line) = annotation.line else {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("line annotation {id:?} has no /L endpoints"),
+                    ));
+                };
+                validate_point(line.start, annotation.rect, id, "line start")?;
+                validate_point(line.end, annotation.rect, id, "line end")?;
+            }
+            WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {
+                validate_geometry_common(annotation, id)?;
+                if !annotation.quads.is_empty() {
+                    return Err(ArisError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("shape annotation {id:?} must not carry /QuadPoints"),
+                    ));
+                }
             }
         }
         if let Some(contents) = &annotation.contents {
@@ -670,6 +783,47 @@ fn validate_rect(rect: &aris_reader_core::Rect, id: &str, what: &str) -> Result<
             format!("annotation {id:?} has an empty or non-finite {what}"),
         )
         .with_detail(format!("{rect:?}")));
+    }
+    Ok(())
+}
+
+/// The checks every stroked kind shares: a positive border width and no quads.
+fn validate_geometry_common(annotation: &WriteAnnotation, id: &str) -> Result<()> {
+    if !annotation.border_width.is_finite()
+        || annotation.border_width <= 0.0
+        || annotation.border_width > 200.0
+    {
+        return Err(ArisError::new(
+            ErrorCode::InvalidArgument,
+            format!("annotation {id:?} has a border width outside 0…200 pt"),
+        ));
+    }
+    Ok(())
+}
+
+/// A point must be finite and inside the annotation's own box (with half a point of slack for
+/// float conversion). A mark whose `/Rect` does not contain its geometry is malformed: some
+/// viewers clip the appearance to it, so writing one would produce a file that shows different
+/// things in different readers.
+fn validate_point(
+    point: aris_reader_core::Point,
+    rect: aris_reader_core::Rect,
+    id: &str,
+    what: &str,
+) -> Result<()> {
+    const SLACK: f64 = 0.5;
+    if !point.x.is_finite()
+        || !point.y.is_finite()
+        || point.x < rect.min_x() - SLACK
+        || point.x > rect.max_x() + SLACK
+        || point.y < rect.min_y() - SLACK
+        || point.y > rect.max_y() + SLACK
+    {
+        return Err(ArisError::new(
+            ErrorCode::InvalidArgument,
+            format!("annotation {id:?} has a {what} outside its /Rect"),
+        )
+        .with_detail(format!("{point:?} is not inside {rect:?}")));
     }
     Ok(())
 }
@@ -824,6 +978,10 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
         WriteAnnotationKind::Highlight => RawAnnotationKind::Highlight,
         WriteAnnotationKind::Underline => RawAnnotationKind::Underline,
         WriteAnnotationKind::Text => RawAnnotationKind::Text,
+        WriteAnnotationKind::Ink => RawAnnotationKind::Ink,
+        WriteAnnotationKind::Square => RawAnnotationKind::Square,
+        WriteAnnotationKind::Circle => RawAnnotationKind::Circle,
+        WriteAnnotationKind::Line => RawAnnotationKind::Line,
     };
     if record.kind != kind {
         return Err(mismatch(
@@ -837,17 +995,30 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
             format!("expected {:?}, got {:?}", expected.rect, record.rect),
         ));
     }
-    if record.quads.len() != expected.quads.len()
-        || record
-            .quads
-            .iter()
-            .zip(&expected.quads)
-            .any(|(left, right)| !approximately(*left, *right, 0.01))
-    {
-        return Err(mismatch(
-            "quads",
-            format!("expected {:?}, got {:?}", expected.quads, record.quads),
-        ));
+    if expected.kind.uses_pdfium() {
+        if record.quads.len() != expected.quads.len()
+            || record
+                .quads
+                .iter()
+                .zip(&expected.quads)
+                .any(|(left, right)| !approximately(*left, *right, 0.01))
+        {
+            return Err(mismatch(
+                "quads",
+                format!("expected {:?}, got {:?}", expected.quads, record.quads),
+            ));
+        }
+    } else {
+        if !record.quads.is_empty() {
+            return Err(mismatch(
+                "quads",
+                format!(
+                    "a stroked annotation must not write /QuadPoints, found {:?}",
+                    record.quads
+                ),
+            ));
+        }
+        verify_geometry(record, expected, &mismatch)?;
     }
     let color = record
         .color
@@ -866,7 +1037,9 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
     // `/CA` as "the file did not say" — which a consumer treats as opaque. A fully opaque note
     // is therefore verified against its semantic opacity, not against the key's presence.
     let opacity = record.opacity.unwrap_or(1.0);
-    if (opacity - alpha).abs() > 1e-6 {
+    // The 8-bit writers store `/CA` as a rounded byte; the dictionary writer stores the exact
+    // requested number. One byte of quantisation is the difference that is allowed here.
+    if (opacity - alpha).abs() > 1.0 / 255.0 + 1e-6 {
         return Err(mismatch(
             "opacity",
             format!("expected {alpha}, got {opacity}"),
@@ -879,7 +1052,11 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
         WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
             aris_reader_core::AnnotationBlend::Multiply
         }
-        WriteAnnotationKind::Text => aris_reader_core::AnnotationBlend::Normal,
+        WriteAnnotationKind::Text
+        | WriteAnnotationKind::Ink
+        | WriteAnnotationKind::Square
+        | WriteAnnotationKind::Circle
+        | WriteAnnotationKind::Line => aris_reader_core::AnnotationBlend::Normal,
     };
     if record.blend != expected_blend {
         return Err(mismatch(
@@ -915,6 +1092,84 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
         return Err(mismatch(
             "visible",
             "the written annotation is hidden".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The geometry a stroked annotation was asked to carry, as the reader reads it back.
+fn verify_geometry(
+    record: &RawAnnotation,
+    expected: &WriteAnnotation,
+    mismatch: &impl Fn(&str, String) -> ArisError,
+) -> Result<()> {
+    match expected.kind {
+        WriteAnnotationKind::Ink => {
+            let matches = record.ink_paths.len() == expected.ink_paths.len()
+                && record
+                    .ink_paths
+                    .iter()
+                    .zip(&expected.ink_paths)
+                    .all(|(left, right)| {
+                        left.len() == right.len()
+                            && left.iter().zip(right).all(|(left, right)| {
+                                (left.x - right.x).abs() <= 0.02 && (left.y - right.y).abs() <= 0.02
+                            })
+                    });
+            if !matches {
+                return Err(mismatch(
+                    "ink",
+                    format!(
+                        "expected {} stroke(s), got {}",
+                        expected.ink_paths.len(),
+                        record.ink_paths.len()
+                    ),
+                ));
+            }
+        }
+        WriteAnnotationKind::Line => {
+            let Some(expected_line) = expected.line else {
+                return Err(mismatch("line", "the request has no endpoints".into()));
+            };
+            let Some(line) = record.line else {
+                return Err(mismatch("line", "the saved file reports no /L".into()));
+            };
+            let close = |left: Point, right: Point| {
+                (left.x - right.x).abs() <= 0.02 && (left.y - right.y).abs() <= 0.02
+            };
+            if !close(line.start, expected_line.start) || !close(line.end, expected_line.end) {
+                return Err(mismatch(
+                    "line",
+                    format!("expected {expected_line:?}, got {line:?}"),
+                ));
+            }
+            if record.line_arrow != expected.line_arrow {
+                return Err(mismatch(
+                    "line_arrow",
+                    format!(
+                        "expected {}, got {}",
+                        expected.line_arrow, record.line_arrow
+                    ),
+                ));
+            }
+        }
+        WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {}
+        WriteAnnotationKind::Highlight
+        | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::Text => {
+            unreachable!("only called for a stroked kind")
+        }
+    }
+    let Some(width) = record.border_width else {
+        return Err(mismatch(
+            "border",
+            "the saved file reports no /BS width".into(),
+        ));
+    };
+    if (width - expected.border_width).abs() > 0.02 {
+        return Err(mismatch(
+            "border",
+            format!("expected {}, got {width}", expected.border_width),
         ));
     }
     Ok(())
@@ -1238,6 +1493,10 @@ mod tests {
             kind: WriteAnnotationKind::Highlight,
             rect: Rect::new(72.0, 686.0, 388.0, 15.0),
             quads: vec![Rect::new(72.0, 686.0, 388.0, 15.0)],
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 0.0,
             color: [255, 216, 64],
             opacity: 0.4,
             contents: Some("Lyra round-trip highlight.".to_string()),
@@ -1253,12 +1512,225 @@ mod tests {
             kind: WriteAnnotationKind::Text,
             rect: Rect::new(500.0, 700.0, 26.0, 26.0),
             quads: Vec::new(),
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 0.0,
             color: [255, 216, 64],
             opacity: 1.0,
             contents: Some("Lyra round-trip note.".to_string()),
             author: Some("Lyra Test".to_string()),
             modified: Some("D:20261016213000-07'00'".to_string()),
         }
+    }
+
+    fn ink() -> WriteAnnotation {
+        WriteAnnotation {
+            id: "33333333-3333-3333-3333-333333333331".to_string(),
+            page: PageIndex(0),
+            kind: WriteAnnotationKind::Ink,
+            rect: Rect::new(60.0, 580.0, 200.0, 80.0),
+            quads: Vec::new(),
+            ink_paths: vec![vec![
+                Point::new(72.0, 600.0),
+                Point::new(110.0, 640.0),
+                Point::new(160.0, 595.0),
+                Point::new(240.0, 650.0),
+            ]],
+            line: None,
+            line_arrow: false,
+            border_width: 2.5,
+            color: [220, 40, 40],
+            opacity: 0.75,
+            contents: Some("Lyra round-trip ink.".to_string()),
+            author: Some("Lyra Test".to_string()),
+            modified: Some("D:20261017120000-07'00'".to_string()),
+        }
+    }
+
+    fn square() -> WriteAnnotation {
+        WriteAnnotation {
+            id: "33333333-3333-3333-3333-333333333332".to_string(),
+            page: PageIndex(0),
+            kind: WriteAnnotationKind::Square,
+            rect: Rect::new(320.0, 600.0, 120.0, 60.0),
+            quads: Vec::new(),
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 3.0,
+            color: [30, 90, 200],
+            opacity: 1.0,
+            contents: None,
+            author: Some("Lyra Test".to_string()),
+            modified: Some("D:20261017120000-07'00'".to_string()),
+        }
+    }
+
+    fn arrow() -> WriteAnnotation {
+        WriteAnnotation {
+            id: "33333333-3333-3333-3333-333333333333".to_string(),
+            page: PageIndex(0),
+            kind: WriteAnnotationKind::Line,
+            rect: Rect::new(70.0, 480.0, 190.0, 50.0),
+            quads: Vec::new(),
+            ink_paths: Vec::new(),
+            line: Some(aris_reader_core::RawAnnotationLine {
+                start: Point::new(80.0, 490.0),
+                end: Point::new(250.0, 520.0),
+            }),
+            line_arrow: true,
+            border_width: 2.0,
+            color: [20, 140, 60],
+            opacity: 1.0,
+            contents: Some("An arrow.".to_string()),
+            author: Some("Lyra Test".to_string()),
+            modified: Some("D:20261017120000-07'00'".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_mixed_save_keeps_the_pdfium_update_and_appends_the_stroked_objects() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("mixed-round-trip");
+        let source = copy_fixture(&directory, "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let original = fs::read(&source).expect("read source");
+
+        let report = save_annotated_pdf(
+            &source,
+            &destination,
+            &[highlight(), ink(), square()],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save a mixed set");
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(
+            fs::read(&destination)
+                .expect("saved")
+                .starts_with(&original)
+        );
+
+        let saved = read_annotations(&destination, None, 2).expect("read saved");
+        assert_eq!(saved.iter().map(Vec::len).sum::<usize>(), 10);
+        for expected in [highlight(), ink(), square()] {
+            let identity = format!("nm:{}", expected.id);
+            let matches: Vec<&RawAnnotation> = saved
+                .iter()
+                .flatten()
+                .filter(|record| record.id == identity)
+                .collect();
+            assert_eq!(matches.len(), 1, "{} appears exactly once", expected.id);
+            verify_one(matches[0], &expected).expect("the written annotation verifies");
+        }
+        // The source's own annotations are byte-for-byte the same records they were.
+        let before = read_annotations(&source, None, 2).expect("read source");
+        for (page, records) in before.iter().enumerate() {
+            for original in records {
+                assert!(saved[page].contains(original));
+            }
+        }
+    }
+
+    #[test]
+    fn stroked_kinds_round_trip_with_bs_l_and_appearances() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("stroked-round-trip");
+        let source = copy_fixture(&directory, "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let original_bytes = fs::read(&source).expect("read fixture");
+
+        let report = save_annotated_pdf(
+            &source,
+            &destination,
+            &[ink(), square(), arrow()],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save stroked annotations");
+
+        assert_eq!(report.written_ids, vec![ink().id, square().id, arrow().id]);
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(report.source_bytes_preserved);
+        assert!(
+            fs::read(&destination)
+                .expect("saved")
+                .starts_with(&original_bytes)
+        );
+
+        let saved = read_annotations(&destination, None, 2).expect("read saved");
+        let records: Vec<&RawAnnotation> = saved.iter().flatten().collect();
+        assert_eq!(
+            records.len(),
+            10,
+            "seven pre-existing plus the three written"
+        );
+
+        let saved_ink = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", ink().id))
+            .expect("ink in saved file");
+        assert_eq!(saved_ink.kind, RawAnnotationKind::Ink);
+        assert_eq!(saved_ink.ink_paths, ink().ink_paths);
+        assert_eq!(saved_ink.border_width, Some(2.5));
+        assert!((saved_ink.opacity.expect("opacity") - 0.75).abs() < 1e-6);
+
+        let saved_square = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", square().id))
+            .expect("square in saved file");
+        assert_eq!(saved_square.kind, RawAnnotationKind::Square);
+        assert_eq!(saved_square.rect, square().rect);
+        assert_eq!(saved_square.border_width, Some(3.0));
+
+        let saved_arrow = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", arrow().id))
+            .expect("arrow in saved file");
+        assert_eq!(saved_arrow.kind, RawAnnotationKind::Line);
+        assert_eq!(saved_arrow.line, arrow().line);
+        assert!(saved_arrow.line_arrow, "/LE and /Subj both say arrow");
+
+        // No duplicate identities, and every pre-existing annotation is unchanged.
+        let mut ids: Vec<&str> = saved.iter().flatten().map(|a| a.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique);
+        let before = read_annotations(&source, None, 2).expect("read source");
+        for (page, records) in before.iter().enumerate() {
+            for original in records {
+                assert!(
+                    saved[page].contains(original),
+                    "pre-existing annotation {} on page {page} changed",
+                    original.id
+                );
+            }
+        }
+
+        // The appearance streams and /BS the verification checks are real dictionary objects,
+        // not something PDFium happened to write: read them back from the saved bytes.
+        let bytes = fs::read(&destination).expect("saved bytes");
+        for needle in [b"/InkList".as_slice(), b"/BS".as_slice(), b"/AP".as_slice()] {
+            assert!(
+                bytes.windows(needle.len()).any(|window| window == needle),
+                "the saved file carries {}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        assert!(
+            bytes
+                .windows(b"/ClosedArrow".len())
+                .any(|window| window == b"/ClosedArrow"),
+            "a line with an arrow writes /LE"
+        );
     }
 
     #[test]

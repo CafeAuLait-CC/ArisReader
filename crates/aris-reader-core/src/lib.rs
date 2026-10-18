@@ -21,7 +21,7 @@ pub mod geometry;
 pub use backend::{
     AnnotationAlignment, AnnotationBlend, AnnotationDrawing, AnnotationSkipReason, DocumentBackend,
     RasterFlags, RasterFormat, RasterRequest, RasterTile, RawAnnotation, RawAnnotationColor,
-    RawAnnotationKind, RawCharBox, RawTextPage,
+    RawAnnotationKind, RawAnnotationLine, RawCharBox, RawTextPage,
 };
 pub use config::{CacheBudget, EngineConfig};
 pub use document::{

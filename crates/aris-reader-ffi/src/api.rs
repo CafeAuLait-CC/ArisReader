@@ -25,7 +25,7 @@ use aris_reader_ai::openai::{
 };
 use aris_reader_core::{
     AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig, ErrorCode, PageGeometry,
-    PageIndex, Point, RasterRequest, Transform2D,
+    PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
 };
 use aris_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::{
@@ -1178,18 +1178,63 @@ impl ArisDocument {
                         }
                     })
                     .collect();
+                let to_view = geometry.page_to_view(1.0);
+                let ink_paths = annotation
+                    .ink_paths
+                    .iter()
+                    .map(|path| {
+                        path.iter()
+                            .map(|point| {
+                                let view = to_view.apply(*point);
+                                AnnotationPoint {
+                                    x_pt: view.x,
+                                    y_pt: view.y,
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let (line_start, line_end) = match annotation.line {
+                    Some(line) => {
+                        let start = to_view.apply(line.start);
+                        let end = to_view.apply(line.end);
+                        (
+                            Some(AnnotationPoint {
+                                x_pt: start.x,
+                                y_pt: start.y,
+                            }),
+                            Some(AnnotationPoint {
+                                x_pt: end.x,
+                                y_pt: end.y,
+                            }),
+                        )
+                    }
+                    None => (None, None),
+                };
+                let kind = if annotation.kind == aris_reader_core::RawAnnotationKind::Line
+                    && annotation.line_arrow
+                {
+                    "arrow".to_string()
+                } else {
+                    annotation.kind.as_str().to_string()
+                };
 
                 records.push(AnnotationRecord {
                     page,
                     id: annotation.id,
                     parent_id: annotation.parent_id,
                     is_reply: annotation.is_reply,
-                    kind: annotation.kind.as_str().to_string(),
+                    kind,
                     x_pt: view.origin.x,
                     y_pt: view.origin.y,
                     width_pt: view.size.width,
                     height_pt: view.size.height,
                     quads,
+                    ink_paths,
+                    line_start,
+                    line_end,
+                    line_arrow: annotation.line_arrow,
+                    border_width_pt: annotation.border_width,
                     color: annotation.color.map(|color| AnnotationColorRecord {
                         red: color.red,
                         green: color.green,
@@ -1736,8 +1781,27 @@ impl ArisDocument {
                 .map(|quad| view_box_to_page_rect(quad, inverse, &geometry))
                 .collect::<Result<Vec<_>, _>>()?;
             let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
-            let (kind, rect, quads) = match record.kind {
-                AnnotationWriteKind::Note => (WriteAnnotationKind::Text, supplied_rect, Vec::new()),
+            let geometry_border = |id: &str, width: f64| -> Result<f64, ArisFfiError> {
+                if !width.is_finite() || width <= 0.0 || width > 200.0 {
+                    return Err(ArisFfiError::InvalidArgument {
+                        message: format!("annotation {id:?} has a border width outside 0…200 pt"),
+                    });
+                }
+                Ok(width)
+            };
+            let view_point = |point: &AnnotationPoint| -> Point {
+                inverse.apply(Point::new(point.x_pt, point.y_pt))
+            };
+            let (kind, rect, quads, ink_paths, line, line_arrow, border_width) = match record.kind {
+                AnnotationWriteKind::Note => (
+                    WriteAnnotationKind::Text,
+                    supplied_rect,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    false,
+                    0.0,
+                ),
                 AnnotationWriteKind::Highlight | AnnotationWriteKind::Underline => {
                     if quads.is_empty() {
                         return Err(ArisFfiError::InvalidArgument {
@@ -1759,9 +1823,74 @@ impl ArisDocument {
                     let kind = match record.kind {
                         AnnotationWriteKind::Highlight => WriteAnnotationKind::Highlight,
                         AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
-                        AnnotationWriteKind::Note => unreachable!("handled above"),
+                        _ => unreachable!("handled by the outer match"),
                     };
-                    (kind, union, quads)
+                    (kind, union, quads, Vec::new(), None, false, 0.0)
+                }
+                AnnotationWriteKind::Ink => {
+                    if record.ink_paths.is_empty() {
+                        return Err(ArisFfiError::InvalidArgument {
+                            message: format!(
+                                "ink annotation {:?} has no strokes to write",
+                                record.id
+                            ),
+                        });
+                    }
+                    let border = geometry_border(&record.id, record.border_width_pt)?;
+                    let paths: Vec<Vec<Point>> = record
+                        .ink_paths
+                        .iter()
+                        .map(|path| path.iter().map(view_point).collect())
+                        .collect();
+                    (
+                        WriteAnnotationKind::Ink,
+                        supplied_rect,
+                        Vec::new(),
+                        paths,
+                        None,
+                        false,
+                        border,
+                    )
+                }
+                AnnotationWriteKind::Square | AnnotationWriteKind::Circle => {
+                    let border = geometry_border(&record.id, record.border_width_pt)?;
+                    let kind = match record.kind {
+                        AnnotationWriteKind::Square => WriteAnnotationKind::Square,
+                        AnnotationWriteKind::Circle => WriteAnnotationKind::Circle,
+                        _ => unreachable!("handled by the outer match"),
+                    };
+                    (
+                        kind,
+                        supplied_rect,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        border,
+                    )
+                }
+                AnnotationWriteKind::Line => {
+                    let border = geometry_border(&record.id, record.border_width_pt)?;
+                    let (Some(start), Some(end)) = (record.line_start, record.line_end) else {
+                        return Err(ArisFfiError::InvalidArgument {
+                            message: format!(
+                                "line annotation {:?} has no endpoints to write",
+                                record.id
+                            ),
+                        });
+                    };
+                    (
+                        WriteAnnotationKind::Line,
+                        supplied_rect,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(RawAnnotationLine {
+                            start: view_point(&start),
+                            end: view_point(&end),
+                        }),
+                        record.line_arrow,
+                        border,
+                    )
                 }
             };
             specs.push(WriteAnnotation {
@@ -1770,6 +1899,10 @@ impl ArisDocument {
                 kind,
                 rect,
                 quads,
+                ink_paths,
+                line,
+                line_arrow,
+                border_width,
                 color: [record.color.red, record.color.green, record.color.blue],
                 opacity: record.opacity,
                 contents: text_or_none(&record.contents),
@@ -2412,6 +2545,15 @@ pub struct AnnotationRecord {
     pub height_pt: f64,
     /// `/QuadPoints`, one box per quadrilateral; empty when the file has none.
     pub quads: Vec<AnnotationQuad>,
+    /// `/InkList`, one polyline per stroke, each point in view space (top-left origin).
+    pub ink_paths: Vec<Vec<AnnotationPoint>>,
+    /// A `/Line` annotation's endpoints in view space; `None` for every other kind.
+    pub line_start: Option<AnnotationPoint>,
+    pub line_end: Option<AnnotationPoint>,
+    /// Whether a line annotation carries an arrowhead (`/LE`, or `/Subj (Arrow)`).
+    pub line_arrow: bool,
+    /// `/BS /W`, in points, when the file states one.
+    pub border_width_pt: Option<f64>,
     /// `/C` as 8-bit sRGB; `None` when the file carries no colour (sticky notes usually do not).
     pub color: Option<AnnotationColorRecord>,
     /// `/CA` constant opacity in `0.0..=1.0`; `None` when the file does not state one, which
@@ -2460,6 +2602,13 @@ pub struct AnnotationRecord {
     pub visible: bool,
 }
 
+/// One point of an ink stroke or a line, in view space (points, top-left origin).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationPoint {
+    pub x_pt: f64,
+    pub y_pt: f64,
+}
+
 /// One quadrilateral of an annotation's `/QuadPoints`, in view space.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct AnnotationQuad {
@@ -2487,6 +2636,14 @@ pub enum AnnotationWriteKind {
     Highlight,
     Underline,
     Note,
+    /// `/Ink`: `ink_paths` are the strokes, in view space.
+    Ink,
+    /// `/Square`: `rect` is the stroked rectangle.
+    Square,
+    /// `/Circle`: `rect` is the stroked ellipse.
+    Circle,
+    /// `/Line`: `line_start`/`line_end` are the endpoints; `line_arrow` adds a head.
+    Line,
 }
 
 /// One annotation the shell asks the writer to put into a PDF.
@@ -2504,8 +2661,17 @@ pub struct WriteAnnotationRecord {
     /// View-space box at `zoom`. For a note this is its icon; for markup the union of `quads`
     /// is used and this box is validated for consistency.
     pub rect: AnnotationQuad,
-    /// View-space `/QuadPoints` at `zoom`; empty only for [`AnnotationWriteKind::Note`].
+    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
     pub quads: Vec<AnnotationQuad>,
+    /// View-space `/InkList` at `zoom`, one stroke per entry; only for [`AnnotationWriteKind::Ink`].
+    pub ink_paths: Vec<Vec<AnnotationPoint>>,
+    /// View-space `/L` endpoints at `zoom`; required for [`AnnotationWriteKind::Line`].
+    pub line_start: Option<AnnotationPoint>,
+    pub line_end: Option<AnnotationPoint>,
+    /// Write `/LE [/None /ClosedArrow]`; only meaningful for a line.
+    pub line_arrow: bool,
+    /// `/BS /W` in points, for the stroked kinds.
+    pub border_width_pt: f64,
     pub color: AnnotationColorRecord,
     /// `/CA`; the shell's colour alpha carries it (0…1).
     pub opacity: f64,
@@ -4364,6 +4530,11 @@ mod tests {
             // View space at 100% is page space y-flipped: page [72 686 388 15] on an 842 pt
             // page is view (72, 842 - 686 - 15) = (72, 141).
             quads: vec![box_at_zoom(72.0, 141.0, 388.0, 15.0)],
+            ink_paths: Vec::new(),
+            line_start: None,
+            line_end: None,
+            line_arrow: false,
+            border_width_pt: 0.0,
             color: AnnotationColorRecord {
                 red: 255,
                 green: 216,
@@ -4373,6 +4544,47 @@ mod tests {
             contents: "Saved at an arbitrary zoom.".to_string(),
             author: "Lyra".to_string(),
             modified: "D:20261016213000-07'00'".to_string(),
+        }
+    }
+
+    fn zoom_stroke(zoom: f64) -> WriteAnnotationRecord {
+        let point = |x: f64, y: f64| AnnotationPoint {
+            x_pt: x * zoom,
+            y_pt: y * zoom,
+        };
+        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x * zoom,
+            y_pt: y * zoom,
+            width_pt: width * zoom,
+            height_pt: height * zoom,
+        };
+        WriteAnnotationRecord {
+            id: "44444444-4444-4444-4444-444444444444".to_string(),
+            page: 0,
+            kind: AnnotationWriteKind::Ink,
+            // The outer box at view 100%: page [72 600 200 60] on an 842 pt page is
+            // view (72, 842 - 600 - 60) = (72, 182), inflated by the stroke's half width.
+            rect: box_at_zoom(72.0, 181.0, 201.0, 61.0),
+            quads: Vec::new(),
+            ink_paths: vec![vec![
+                point(73.0, 182.0),
+                point(120.0, 220.0),
+                point(180.0, 190.0),
+                point(272.0, 240.0),
+            ]],
+            line_start: None,
+            line_end: None,
+            line_arrow: false,
+            border_width_pt: 2.5,
+            color: AnnotationColorRecord {
+                red: 220,
+                green: 40,
+                blue: 30,
+            },
+            opacity: 0.8,
+            contents: "Stroked at an arbitrary zoom.".to_string(),
+            author: "Lyra".to_string(),
+            modified: "D:20261017120000-07'00'".to_string(),
         }
     }
 
@@ -4480,6 +4692,59 @@ mod tests {
         );
         assert!(bad_zoom.is_err(), "a zero zoom is refused before any write");
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stroke_write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
+        let Some(directory) = writeback_fixture("stroke-zoom") else {
+            return;
+        };
+        let engine = ArisEngine::new();
+        let source = directory.join("source.pdf");
+        let document = engine
+            .open_document(source.display().to_string(), None)
+            .expect("open source");
+        let at_100 = directory.join("stroke-100.pdf");
+        let at_300 = directory.join("stroke-300.pdf");
+        document
+            .save_annotations_copy(at_100.display().to_string(), vec![zoom_stroke(1.0)], 1.0)
+            .expect("save stroke at 100%");
+        document
+            .save_annotations_copy(at_300.display().to_string(), vec![zoom_stroke(3.0)], 3.0)
+            .expect("save stroke at 300%");
+
+        let page_space = |path: &std::path::Path| {
+            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
+            backend
+                .annotations(PageIndex(0))
+                .expect("page annotations")
+                .into_iter()
+                .find(|annotation| annotation.id == "nm:44444444-4444-4444-4444-444444444444")
+                .expect("written stroke")
+        };
+        let first = page_space(&at_100);
+        let second = page_space(&at_300);
+        assert_eq!(
+            first, second,
+            "zoom must not change the stroke's page-space points"
+        );
+        assert_eq!(first.kind, aris_reader_core::RawAnnotationKind::Ink);
+        assert_eq!(first.ink_paths.len(), 1);
+        let expected = [
+            (73.0, 182.0),
+            (120.0, 220.0),
+            (180.0, 190.0),
+            (272.0, 240.0),
+        ];
+        for (point, (x, y)) in first.ink_paths[0].iter().zip(expected) {
+            // The view points above are page-space top-left; the writer's inverse flips them
+            // back into PDF page space, so compare the y flip explicitly.
+            assert!((point.x - x).abs() < 0.01, "{point:?} vs {x}");
+            assert!((point.y - (842.0 - y)).abs() < 0.01, "{point:?} vs {y}");
+        }
+        assert_eq!(first.border_width, Some(2.5));
+        assert!((first.opacity.expect("opacity") - 0.8).abs() < 0.01);
         let _ = std::fs::remove_dir_all(directory);
     }
 
