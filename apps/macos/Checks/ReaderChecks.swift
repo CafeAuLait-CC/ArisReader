@@ -18,6 +18,21 @@ struct ReaderChecks {
         fatalError("TIMEOUT: \(message)")
     }
 
+    /// Like `eventually`, but a timeout carries the state that explains it. A bare
+    /// "TIMEOUT: …" cannot say which window was occluded, whether its GPU surface was ever
+    /// attached, or whether frames were submitted but not presented.
+    @MainActor static func eventuallyExplaining(
+        _ message: String,
+        _ explanation: () -> String,
+        _ condition: () -> Bool
+    ) async throws {
+        for _ in 0..<400 {
+            if condition() { print("PASS: \(message)"); return }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        fatalError("TIMEOUT: \(message)\n\(explanation())")
+    }
+
     @MainActor static func main() async throws {
         // The reader's layout preferences live in UserDefaults (so the app remembers facing
         // pages and the page gap). Checks must not inherit them from whatever the person
