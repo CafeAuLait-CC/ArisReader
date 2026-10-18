@@ -103,6 +103,14 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // The annotation text export on its own (`ArisReaderChecks --check-annotation-export .`).
+        if CommandLine.arguments.contains("--check-annotation-export") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await annotationExportChecks(root: root)
+            print("Annotation export checks passed")
+            return
+        }
         // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -326,6 +334,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await annotationReplyChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"))
+        try await annotationExportChecks(root: root)
         try await thumbnailAnnotationChecks(
             url: root.appendingPathComponent("tests/fixtures/annotated-appearance.pdf"))
         try await outlineNumberingChecks(
