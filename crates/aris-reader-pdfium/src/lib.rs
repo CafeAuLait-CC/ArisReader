@@ -45,6 +45,8 @@
 #[cfg(feature = "pdfium")]
 mod annotations;
 #[cfg(feature = "pdfium")]
+mod appearance_font;
+#[cfg(feature = "pdfium")]
 mod backend;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
@@ -59,6 +61,8 @@ mod xmp;
 
 #[cfg(feature = "pdfium")]
 pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind};
+#[cfg(feature = "pdfium")]
+pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, missing_glyphs};
 #[cfg(feature = "pdfium")]
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,

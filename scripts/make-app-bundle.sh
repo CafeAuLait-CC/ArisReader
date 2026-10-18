@@ -56,6 +56,15 @@ if [ -f "$ROOT/apps/macos/Support/AppIcon.icns" ]; then
   cp "$ROOT/apps/macos/Support/AppIcon.icns" "$APP/Contents/Resources/"
 fi
 
+# The appearance font and its licence ship side by side. The Rust writer resolves this path at
+# run time (see crates/aris-reader-pdfium/src/appearance_font.rs), so the bundle is the source of
+# truth and the executable does not carry a second copy.
+if [ -d "$ROOT/apps/macos/Resources/Fonts" ]; then
+  echo "==> Bundling appearance font"
+  mkdir -p "$APP/Contents/Resources/Fonts"
+  cp -R "$ROOT/apps/macos/Resources/Fonts/." "$APP/Contents/Resources/Fonts/"
+fi
+
 # ── PDFium (dynamic library: fix install_name, then re-sign) ──────────────────
 if [ -f "$PDFIUM_LIB" ]; then
   echo "==> Bundling PDFium"

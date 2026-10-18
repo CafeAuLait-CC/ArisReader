@@ -1855,7 +1855,19 @@ mod tests {
             saved_bytes
                 .windows(b"/Helv".len())
                 .any(|window| window == b"/Helv"),
-            "the free-text /DA and appearance name the Helvetica resource"
+            "/DA keeps Helvetica as the standard-14 fallback for a viewer that ignores /AP"
+        );
+        assert!(
+            saved_bytes
+                .windows(b"/Type0".len())
+                .any(|window| window == b"/Type0"),
+            "the appearance itself uses the embedded Type0/Identity-H font"
+        );
+        assert!(
+            saved_bytes
+                .windows(b"/FontFile2".len())
+                .any(|window| window == b"/FontFile2"),
+            "the appearance font carries an embedded TrueType program"
         );
 
         let saved = read_annotations(&destination, None, 2).expect("read saved");
