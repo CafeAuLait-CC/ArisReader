@@ -1,6 +1,6 @@
 use crate::PdfiumBackend;
+use crate::test_support::{fixture, scratch};
 use aris_reader_core::{DocumentBackend, PageIndex, RasterRequest, RasterTile, Rect};
-use std::path::Path;
 
 fn green(pixel: &[u8]) -> bool {
     i32::from(pixel[1]) - i32::from(pixel[2]) > 60 && i32::from(pixel[1]) - i32::from(pixel[0]) > 60
@@ -30,10 +30,9 @@ fn count(tile: &RasterTile, rect: Rect, matches: fn(&[u8]) -> bool) -> usize {
 
 #[test]
 fn navigation_borders_render_without_burning_content_annotations() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/link-borders.pdf");
-    if !fixture.exists() || !crate::is_available() {
-        eprintln!("skipping link borders: fixture or PDFium unavailable");
+    let fixture = fixture("link-borders.pdf");
+    if !crate::is_available() {
+        eprintln!("skipping link borders: PDFium unavailable");
         return;
     }
     let original = std::fs::read(&fixture).expect("original bytes");
@@ -138,11 +137,10 @@ fn navigation_borders_render_without_burning_content_annotations() {
 
 #[test]
 fn compressed_rotated_and_cropped_pages_keep_link_borders_in_their_view_coordinates() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/link-borders.pdf");
-    if !fixture.exists() || !crate::is_available() {
+    if !crate::is_available() {
         return;
     }
+    let fixture = fixture("link-borders.pdf");
     let mut document = lopdf::Document::load(&fixture).expect("parse fixture");
     let id = document.get_pages()[&1];
     let page = document
@@ -155,7 +153,8 @@ fn compressed_rotated_and_cropped_pages_keep_link_borders_in_their_view_coordina
         "CropBox",
         lopdf::Object::Array(vec![50.into(), 50.into(), 550.into(), 780.into()]),
     );
-    let path = std::env::temp_dir().join(format!("aris-link-borders-{}.pdf", std::process::id()));
+    let scratch = scratch("link-borders-rotated");
+    let path = scratch.join("link-borders.pdf");
     document
         .save_modern(&mut std::fs::File::create(&path).expect("temporary file"))
         .expect("save compressed object streams");
@@ -195,5 +194,4 @@ fn compressed_rotated_and_cropped_pages_keep_link_borders_in_their_view_coordina
         "deep-zoom tiles use the same rotated CropBox transform as the page raster"
     );
     drop(backend);
-    std::fs::remove_file(path).expect("remove temporary fixture");
 }

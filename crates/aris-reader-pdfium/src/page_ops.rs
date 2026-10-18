@@ -1192,35 +1192,11 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> ArisError {
 mod tests {
     use super::*;
     use crate::annotations::AnnotationReader;
+    use crate::test_support::scratch;
     use aris_reader_core::RawAnnotation;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures")
-            .join(name)
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let directory = std::env::temp_dir().join(format!(
-            "aris-page-ops-{}-{nanos}-{}-{name}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).expect("scratch directory");
-        directory
-    }
 
     fn copy_fixture(directory: &Path, name: &str) -> PathBuf {
-        let path = directory.join(name);
-        fs::copy(fixture(name), &path).expect("copy fixture");
-        path
+        crate::test_support::copy_fixture(directory, name, name)
     }
 
     fn texts(path: &Path) -> Vec<String> {
@@ -1443,8 +1419,6 @@ mod tests {
         assert_eq!(rotations(&half)[0], 2);
         assert!((sizes(&half)[0].0 - original_sizes[0].0).abs() <= 1.0);
         assert!((sizes(&half)[0].1 - original_sizes[0].1).abs() <= 1.0);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1493,8 +1467,6 @@ mod tests {
             "the surviving page's annotations must be exactly the ones it had"
         );
         assert_eq!(texts(&after_path)[0], texts(&annotated)[1]);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1592,8 +1564,6 @@ mod tests {
             expected.swap(0, 1);
             expected
         });
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1658,8 +1628,6 @@ mod tests {
         let last_size = original_sizes[original_sizes.len() - 1];
         assert!((end_sizes[last as usize].0 - last_size.0).abs() <= 1.0);
         assert!(texts(&end)[last as usize].trim().is_empty());
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1701,8 +1669,6 @@ mod tests {
             .expect("extract every page");
         assert_eq!(report.page_count, count);
         assert_eq!(texts(&all), original_texts);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1770,8 +1736,6 @@ mod tests {
             crate::writeback::interrupted_save_temporaries(&directory_destination).is_empty(),
             "a failed write cleans its temporary"
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1825,8 +1789,6 @@ mod tests {
         assert!(refused.is_err());
         let self_copy = publish_edited_copy(&annotated, &annotated, 1);
         assert!(self_copy.is_err());
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

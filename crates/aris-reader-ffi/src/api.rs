@@ -2983,6 +2983,121 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, ArisFfiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Resolves a committed fixture at run time.
+    ///
+    /// `CARGO_MANIFEST_DIR` is compiled into the binary. When several checkouts share one
+    /// `target/` directory, cargo can run a binary that was built in a checkout which has since
+    /// been deleted; the committed fixtures then exist only in the checkout running the tests.
+    /// The working directory (the package root) and an explicit override are therefore searched
+    /// as well.
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut roots = Vec::new();
+        if let Some(override_dir) = std::env::var_os("ARIS_READER_TEST_FIXTURES")
+            && !override_dir.is_empty()
+        {
+            roots.push(std::path::PathBuf::from(override_dir));
+        }
+        // The checkout currently running the tests wins over the one that compiled the binary.
+        if let Ok(current_dir) = std::env::current_dir() {
+            roots.extend(
+                current_dir
+                    .ancestors()
+                    .map(|ancestor| ancestor.join("tests/fixtures")),
+            );
+        }
+        roots.push(manifest.join("../../tests/fixtures"));
+        let mut tried = Vec::new();
+        for root in roots {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+            tried.push(candidate);
+        }
+        let tried = tried
+            .iter()
+            .map(|path| format!("  {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("test fixture {name:?} was not found. Tried:\n{tried}");
+    }
+
+    /// A scratch directory owned by one test and removed when the test ends (or panics).
+    ///
+    /// The name includes a process-wide sequence number as well as the pid and clock, and the
+    /// directory itself is reserved with `create_dir`, so two tests can never share it.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScratchDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn scratch(label: &str) -> ScratchDir {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir();
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+            panic!(
+                "could not create the temporary directory {}: {error}",
+                root.display()
+            )
+        });
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let label: String = label
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .take(48)
+            .collect();
+        for _ in 0..128 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!(
+                "aris-ffi-test-{}-{sequence}-{nanos}-{label}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return ScratchDir { path },
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!(
+                    "could not create test scratch directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        panic!(
+            "could not find a free test scratch directory under {}",
+            root.display()
+        );
+    }
 
     #[test]
     fn figure_region_bounds_are_transformed_with_rotation_and_crop_origin() {
@@ -3709,24 +3824,14 @@ mod tests {
     // ── Annotation write-back ──────────────────────────────────────────────────────────
 
     /// A scratch copy of the committed annotated fixture, or `None` when PDFium is absent.
-    fn writeback_fixture(name: &str) -> Option<std::path::PathBuf> {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/annotated.pdf");
-        if !fixture.exists() || !aris_reader_pdfium::is_available() {
-            eprintln!("skipping: fixture or PDFium unavailable");
+    fn writeback_fixture(name: &str) -> Option<ScratchDir> {
+        if !aris_reader_pdfium::is_available() {
+            eprintln!("skipping: PDFium unavailable");
             return None;
         }
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let directory = std::env::temp_dir().join(format!(
-            "aris-ffi-writeback-{}-{nanos}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let directory = scratch(name);
         let copy = directory.join("source.pdf");
-        std::fs::copy(&fixture, &copy).expect("copy fixture");
+        std::fs::copy(fixture("annotated.pdf"), &copy).expect("copy fixture");
         Some(directory)
     }
 

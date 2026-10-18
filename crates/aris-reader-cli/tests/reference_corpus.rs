@@ -8,7 +8,9 @@ use aris_reader_text::{
     CitationStyle, find_citations_with, find_references, find_references_with_landings,
     resolve_reference,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
+
+mod common;
 
 /// Longest a bibliography entry can plausibly be, in characters, before it reads as a collapsed
 /// list rather than a reference: 1035 is the longest entry on these twelve samples apart from
@@ -21,9 +23,7 @@ const PLAUSIBLE_ENTRY_CHARS: usize = 1800;
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
 fn sample_citations_resolve_to_bibliography_entries() {
-    let directory = std::env::var_os("ARIS_READER_PDF_SAMPLES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples"));
+    let directory = common::samples_dir();
     let files: Vec<_> = std::fs::read_dir(&directory)
         .expect("local PDF samples")
         .map(|p| p.unwrap().path())

@@ -13,13 +13,13 @@ use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{find_captions, lines_from, tables::table_outcome};
 use std::path::PathBuf;
 
+mod common;
+
 /// Every `Table` caption in the corpus, and how many of them got a grid region.
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
 fn table_captions_get_a_grid_region_when_the_page_draws_one() {
-    let directory = std::env::var_os("ARIS_READER_PDF_SAMPLES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples"));
+    let directory = common::samples_dir();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)
         .expect("local PDF samples")
         .map(|entry| entry.unwrap().path())

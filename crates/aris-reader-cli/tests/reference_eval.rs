@@ -48,6 +48,8 @@ use aris_reader_text::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Thresholds: every number this harness enforces lives here, and nowhere else.
 // ---------------------------------------------------------------------------
@@ -251,7 +253,7 @@ struct CorpusEntry {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    common::repo_root()
 }
 
 fn corpus_list(root: &Path) -> Vec<CorpusEntry> {

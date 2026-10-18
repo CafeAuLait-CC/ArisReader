@@ -1223,32 +1223,12 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> ArisError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scratch;
     use aris_reader_core::Rect;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures")
-            .join(name)
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let directory = std::env::temp_dir().join(format!(
-            "aris-writeback-{}-{nanos}-{name}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).expect("scratch directory");
-        directory
-    }
-
     fn copy_fixture(directory: &Path, name: &str) -> PathBuf {
-        let path = directory.join(name);
-        fs::copy(fixture("annotated.pdf"), &path).expect("copy fixture");
-        path
+        crate::test_support::copy_fixture(directory, "annotated.pdf", name)
     }
 
     fn highlight() -> WriteAnnotation {
@@ -1386,8 +1366,6 @@ mod tests {
         );
         assert_eq!(saved_note.author.as_deref(), Some("Lyra Test"));
         assert_eq!(saved_note.blend, aris_reader_core::AnnotationBlend::Normal);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1449,8 +1427,6 @@ mod tests {
             metadata.permissions().mode() & 0o777,
             backup_metadata.permissions().mode() & 0o777
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1476,7 +1452,6 @@ mod tests {
         {
             let _ = fs::remove_file(probe);
             let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
-            let _ = fs::remove_dir_all(directory);
             eprintln!("skipping: a read-only directory is still writable here");
             return;
         }
@@ -1504,8 +1479,6 @@ mod tests {
             interrupted_save_temporaries(&source).is_empty(),
             "a refused save must not leave a temporary file"
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1568,8 +1541,6 @@ mod tests {
         let reopened =
             read_annotations(&source, None, 2).expect("original still opens after a failed save");
         assert_eq!(reopened.iter().map(Vec::len).sum::<usize>(), 7);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1636,8 +1607,6 @@ mod tests {
             in_destination.is_err(),
             "an identity already in the file must not be duplicated"
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1656,6 +1625,5 @@ mod tests {
             SaveMode::Copy,
         );
         assert!(result.is_err(), "copy mode refuses the source path");
-        let _ = fs::remove_dir_all(directory);
     }
 }
