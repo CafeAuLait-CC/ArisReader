@@ -678,5 +678,5 @@ resolve locally.
 ## License
 
 This project is released under the MIT license (see [ADR-0005](docs/adr/0005-licensing.md)).
-Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), ring (Apache-2.0 AND ISC), rustls-native-certs (Apache-2.0 OR ISC OR MIT), webpki-roots (CDLA-Permissive-2.0), rcgen (MIT OR Apache-2.0, tests only).
+Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT). Interface icons are drawn from **SF Symbols**, used under Apple's SF Symbols license for in-app use on Apple platforms only: they may not be used as application icons or marks, redistributed as an icon set, and a future Linux or Windows shell must substitute its own icon set. The application icon is original artwork made for this project., ring (Apache-2.0 AND ISC), rustls-native-certs (Apache-2.0 OR ISC OR MIT), webpki-roots (CDLA-Permissive-2.0), rcgen (MIT OR Apache-2.0, tests only).
 **No AGPL components** (MuPDF is excluded).
