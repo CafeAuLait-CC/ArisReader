@@ -19,15 +19,178 @@
 //! at `[1]`, and the longer one wins on every layout measure while being the wrong list for the
 //! report's main text. Both are real lists, so [`cited_run`] decides between them on evidence the
 //! score does not read: which of them the text that precedes it cites.
+//!
+//! T4.42 goes one step further: selecting *one* list is still wrong for the citations of the other
+//! section. [`find_reference_lists`] returns every list the document announced, and [`attribute`]
+//! decides which one a citation belongs to from evidence it can state — the reading-order region a
+//! list closes (a chapter's list owns its chapter, an appendix's owns the appendix), the label a
+//! list prints, and which list is the document-wide one. A citation is only resolved against an
+//! attributed list when the attribution carried some evidence, and an ambiguous choice is reported
+//! (see [`CitationAttribution`]) rather than hidden.
 
 use super::*;
 use std::collections::BTreeSet;
+
+// ---------------------------------------------------------------------------
+// One document, several reference lists
+// ---------------------------------------------------------------------------
+
+/// The kind of section a reference list closes.
+///
+/// Only sections a document marks in its text are reported: an appendix heading, a chapter
+/// heading, the title page of an embedded document (the GPT-4 report appends its system card as a
+/// document of its own, with the card's title page and the card's references), or a numbered
+/// section heading. A list whose section cannot be read from the text carries `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SectionKind {
+    Appendix,
+    Chapter,
+    /// A document part or an embedded document's title page.
+    Part,
+    /// A numbered or lettered section heading.
+    Section,
+}
+
+impl SectionKind {
+    /// The word a decision message uses for this kind of section.
+    pub fn noun(self) -> &'static str {
+        match self {
+            SectionKind::Appendix => "appendix",
+            SectionKind::Chapter => "chapter",
+            SectionKind::Part => "part",
+            SectionKind::Section => "section",
+        }
+    }
+}
+
+/// Where a section that carries its own reference list begins.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SectionRef {
+    /// The heading as it is printed, whitespace collapsed.
+    pub title: String,
+    /// Page the heading is on.
+    pub page: u32,
+    pub kind: SectionKind,
+}
+
+/// One reference list found in a document.
+///
+/// Entries are in reading order, trimmed the same way the document-wide list is (see
+/// [`trim_trailing_section`]), and carry fragment geometry. A list is reported when the document
+/// printed a reference heading above it, so an unheaded numbered paragraph cannot become one;
+/// the document-wide list is reported even when its heading was missed, because the layout score
+/// and the body's citations already admit it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceList {
+    pub entries: Vec<ReferenceEntry>,
+    /// Whether this list is numbered (`[12]`, `12.`), as opposed to author-year or alphanumeric.
+    pub numbered: bool,
+    /// The heading line that announced the list, when the document printed one.
+    pub heading: Option<String>,
+    /// Page the heading is on.
+    pub heading_page: Option<u32>,
+    /// The section this list closes, when the document shows where that section starts.
+    pub section: Option<SectionRef>,
+    /// First page of the reading-order region this list owns, for a list that is not the
+    /// document-wide one. The region runs from here to the list's own first page: the text a
+    /// list printed at its end belongs to is the text immediately before it.
+    pub region_start: Option<u32>,
+}
+
+impl ReferenceList {
+    /// First page an entry of the list starts on, if it has entries.
+    pub fn first_page(&self) -> Option<u32> {
+        self.entries.iter().map(|entry| entry.page).min()
+    }
+
+    /// Last page an entry of the list starts on, if it has entries.
+    pub fn last_page(&self) -> Option<u32> {
+        self.entries.iter().map(|entry| entry.page).max()
+    }
+}
+
+/// Every reference list a document prints, and which one is its document-wide list.
+///
+/// The document-wide list is exactly the list [`find_references`](crate::find_references) returns:
+/// the layout score's choice, overruled by the body's own citations when two independent
+/// bibliographies compete (T4.41), with a second run of one numbering joined in (T4.20). Every
+/// other list is one the document announced with a reference heading.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Bibliography {
+    /// All lists, in reading order.
+    pub lists: Vec<ReferenceList>,
+    /// Index of the document-wide list in [`Bibliography::lists`].
+    pub document_wide: usize,
+    /// Section starts the document prints, in reading order. They are what bounds a list's
+    /// region: a chapter's list owns its chapter, not the pages of the previous one.
+    pub sections: Vec<SectionRef>,
+}
+
+impl Bibliography {
+    /// The list a citation with no better evidence is attributed to.
+    pub fn document_wide_list(&self) -> Option<&ReferenceList> {
+        self.lists.get(self.document_wide)
+    }
+}
+
+/// The evidence that attributed a citation to one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributionReason {
+    /// The document prints one list; there is nothing to choose.
+    OnlyList,
+    /// The citation lies in the reading-order region that this list closes, and the list carries
+    /// the citation's label. This is the appendix/chapter case: the list belongs to the section
+    /// the citation is in.
+    SectionList,
+    /// Only one list carries the citation's label, so the numbering itself names the list.
+    LabelOnly,
+    /// No evidence separated the lists, so the document-wide list is used.
+    DocumentWide,
+    /// No region and no document-wide match, but one other list carries the label; the nearest
+    /// such list in reading order is used.
+    NearestList,
+}
+
+impl AttributionReason {
+    /// The sentence the CLI prints for this reason.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            AttributionReason::OnlyList => "the document prints one reference list",
+            AttributionReason::SectionList => {
+                "the citation lies in the section this list closes, and the list carries its label"
+            }
+            AttributionReason::LabelOnly => "only this list carries the citation's label",
+            AttributionReason::DocumentWide => "the document-wide list is the fallback",
+            AttributionReason::NearestList => "this is the nearest list that carries the label",
+        }
+    }
+}
+
+/// The list a citation was attributed to, and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CitationAttribution {
+    /// Index into [`Bibliography::lists`].
+    pub list: usize,
+    pub reason: AttributionReason,
+    /// True when another list carries the label and nothing in the document separates the two;
+    /// the document-wide list is still used, as the documented rule requires.
+    pub ambiguous: bool,
+    /// Other lists whose labels include one the citation names.
+    pub alternatives: Vec<usize>,
+    /// The list that owns the reading-order region the citation sits in, if any. When it differs
+    /// from `list`, the section's own list did not carry the citation's label.
+    pub region_list: Option<usize>,
+    /// Whether the attributed list prints any of the citation's labels exactly.
+    pub label_matches: bool,
+}
 
 #[derive(Default, Clone)]
 struct Run {
     entries: Vec<ReferenceEntry>,
     last_page: Option<u32>,
     headed: bool,
+    /// The first reference heading seen inside the run: its page and its printed text.
+    heading: Option<(u32, String)>,
 }
 
 impl Run {
@@ -106,14 +269,23 @@ fn close(run: &mut Run, numbered: bool, best: &mut Best, candidates: &mut Vec<Ca
     best.finish(run, numbered, index);
 }
 
-pub(super) fn select_reference_run<'a>(
-    pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
-    max_entries: usize,
-) -> Vec<ReferenceEntry> {
-    if max_entries == 0 {
-        return Vec::new();
-    }
-    let pages: Vec<(u32, &RawTextPage)> = pages.into_iter().collect();
+/// What the walk and the document-level choice decided, before trimming and geometry.
+struct Selection {
+    /// The document-wide list: the winner, plus any corroborated run of the same numbering.
+    entries: Vec<ReferenceEntry>,
+    /// Every run the walk closed, in the order it was closed.
+    candidates: Vec<Candidate>,
+    /// Index of the run the document-wide list came from.
+    chosen: Option<usize>,
+    /// Candidate indices joined into the document-wide list as further pieces of its numbering.
+    joined: Vec<usize>,
+    /// Whether the document-wide list is numbered.
+    numbered: bool,
+}
+
+/// Selects the document-wide list and keeps every closed run, which is what the multi-list
+/// attribution needs; [`select_reference_run`] throws the losers away.
+fn select(pages: &[(u32, &RawTextPage)], max_entries: usize) -> Selection {
     let mut numeric = Run::default();
     let mut alpha = Run::default();
     let mut author_year = Run::default();
@@ -134,7 +306,7 @@ pub(super) fn select_reference_run<'a>(
                     .iter()
                     .filter_map(|c| char::from_u32(c.unicode))
                     .collect();
-                looks_like_reference_heading(&line).then_some(start)
+                looks_like_reference_heading(&line).then(|| (start, page, line.trim().to_string()))
             });
         for (run, mut entries, numbered) in [
             (&mut numeric, parse_numeric_references(page, text), true),
@@ -145,8 +317,8 @@ pub(super) fn select_reference_run<'a>(
                 false,
             ),
         ] {
-            if let Some(start) = heading {
-                entries.retain(|entry| entry.start >= start);
+            if let Some((start, _, _)) = &heading {
+                entries.retain(|entry| entry.start >= *start);
             }
             let consecutive_page = run
                 .last_page
@@ -172,6 +344,9 @@ pub(super) fn select_reference_run<'a>(
                 continue;
             }
             run.headed |= heading.is_some();
+            if let Some((_, heading_page, printed)) = &heading {
+                run.heading.get_or_insert((*heading_page, printed.clone()));
+            }
             run.last_page = Some(page);
             run.entries.extend(entries);
         }
@@ -182,7 +357,7 @@ pub(super) fn select_reference_run<'a>(
     // The layout score picks the run that reads most like a bibliography. When the document
     // prints two of them under independent numberings, that is not enough; see `cited_run`.
     let chosen = if best.numbered {
-        cited_run(&candidates, best.index, &pages).or(best.index)
+        cited_run(&candidates, best.index, pages).or(best.index)
     } else {
         best.index
     };
@@ -190,14 +365,264 @@ pub(super) fn select_reference_run<'a>(
         Some(index) => candidates[index].run.entries.clone(),
         None => std::mem::take(&mut best.run.entries),
     };
+    let mut joined = Vec::new();
     // `cited_run` only ever returns a numbered candidate, and `Best` records the winner's own
     // flag, so the selection and this flag agree: the pass below is for a numbered selection.
     if best.numbered {
-        entries.extend(extra_corroborated_runs(&candidates, &entries, &pages));
+        let mut extra;
+        (extra, joined) = extra_corroborated_runs(&candidates, &entries, pages);
+        entries.append(&mut extra);
         entries.sort_by_key(|entry| (entry.page, entry.start));
     }
     entries.truncate(max_entries);
-    entries
+    Selection {
+        entries,
+        candidates,
+        chosen,
+        joined,
+        numbered: best.numbered,
+    }
+}
+
+pub(super) fn select_reference_run<'a>(
+    pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
+    max_entries: usize,
+) -> Vec<ReferenceEntry> {
+    let pages: Vec<(u32, &RawTextPage)> = pages.into_iter().collect();
+    select(&pages, max_entries).entries
+}
+
+/// Every reference list the document prints, in reading order, with the evidence a citation
+/// attribution is decided on.
+pub(super) fn find_reference_lists<'a>(
+    pages: impl IntoIterator<Item = (u32, &'a RawTextPage)>,
+    max_entries: usize,
+) -> Bibliography {
+    let pages: Vec<(u32, &RawTextPage)> = pages.into_iter().collect();
+    if max_entries == 0 || pages.is_empty() {
+        return Bibliography::default();
+    }
+    let selection = select(&pages, max_entries);
+    let Some(chosen) = selection.chosen else {
+        return Bibliography::default();
+    };
+
+    // The document-wide list first. Its heading is the winner's own; when the winner was an
+    // unheaded run whose entry list the walk read across repeated headers, there is none.
+    let document_wide_heading = selection.candidates[chosen].run.heading.clone();
+    let document_wide_numbered = selection.numbered;
+    let mut lists: Vec<ReferenceList> = vec![ReferenceList {
+        entries: selection.entries.clone(),
+        numbered: document_wide_numbered,
+        heading: document_wide_heading.as_ref().map(|(_, text)| text.clone()),
+        heading_page: document_wide_heading.as_ref().map(|(page, _)| *page),
+        section: None,
+        region_start: None,
+    }];
+
+    // A candidate that carries a reference heading is a list the document announced. The others
+    // are competitors the layout score rejected, but no evidence says they are separate
+    // bibliographies rather than noise, so they are not reported.
+    let document_range = consecutive_range(&selection.entries);
+    let mut others: Vec<&Candidate> = Vec::new();
+    for (index, candidate) in selection.candidates.iter().enumerate() {
+        if index == chosen || selection.joined.contains(&index) || !candidate.run.headed {
+            continue;
+        }
+        if candidate.run.entries.len() < 2 {
+            continue;
+        }
+        // A second run of the document-wide numbering is one bibliography printed in two
+        // pieces (Nature's 1–33 + 34–68), not a second bibliography. The join above already
+        // returns it when the body cites it; this keeps the uncited piece from becoming a
+        // list of its own and re-attributing citations to half a bibliography. The test is
+        // "contained in, or immediately continuous with": two independently numbered lists both
+        // starting at 1 overlap without being one numbering, and the appendix list is exactly
+        // that shape.
+        if candidate.numbered
+            && document_wide_numbered
+            && document_range
+                .as_deref()
+                .zip(consecutive_range(&candidate.run.entries).as_deref())
+                .is_some_and(|(document, run)| {
+                    same_numbering(
+                        document,
+                        run,
+                        page_span(&selection.entries),
+                        page_span(&candidate.run.entries),
+                    )
+                })
+        {
+            continue;
+        }
+        others.push(candidate);
+    }
+    // Two parsers can describe the same physical list (a list with alphanumeric keys is read by
+    // both the alphanumeric and the author-year parser). Lists do not share pages in practice, so
+    // one whose page span overlaps a list already kept is the same list; the longer reading wins.
+    others.sort_by_key(|candidate| {
+        let first = candidate
+            .run
+            .entries
+            .iter()
+            .map(|entry| entry.page)
+            .min()
+            .unwrap_or(0);
+        (
+            first,
+            candidate.run.entries.first().map(|e| e.start).unwrap_or(0),
+        )
+    });
+    for candidate in others {
+        let (Some(first), Some(last)) = (
+            candidate.run.entries.iter().map(|e| e.page).min(),
+            candidate.run.entries.iter().map(|e| e.page).max(),
+        ) else {
+            continue;
+        };
+        // The document-wide list is the selection's own answer and never replaced. Another
+        // candidate overlapping it is the same physical list read by another parser.
+        let overlap = lists
+            .iter()
+            .position(|list| match (list.first_page(), list.last_page()) {
+                (Some(a), Some(b)) => first <= b && a <= last,
+                _ => false,
+            });
+        if let Some(existing) = overlap {
+            if existing > 0 && candidate.run.entries.len() > lists[existing].entries.len() {
+                // Replace the smaller reading of the same list.
+                lists[existing] = ReferenceList {
+                    entries: candidate.run.entries.clone(),
+                    numbered: candidate.numbered,
+                    heading: candidate.run.heading.as_ref().map(|(_, text)| text.clone()),
+                    heading_page: candidate.run.heading.as_ref().map(|(page, _)| *page),
+                    section: None,
+                    region_start: None,
+                };
+            }
+            continue;
+        }
+        lists.push(ReferenceList {
+            entries: candidate.run.entries.clone(),
+            numbered: candidate.numbered,
+            heading: candidate.run.heading.as_ref().map(|(_, text)| text.clone()),
+            heading_page: candidate.run.heading.as_ref().map(|(page, _)| *page),
+            section: None,
+            region_start: None,
+        });
+    }
+
+    // Reading order. The document-wide list is index 0 until here, so sorting an index vector is
+    // what keeps `document_wide` pointing at it after the move.
+    let mut order: Vec<usize> = (0..lists.len()).collect();
+    order.sort_by_key(|index| {
+        let list = &lists[*index];
+        (
+            list.first_page().unwrap_or(0),
+            list.entries.first().map(|entry| entry.start).unwrap_or(0),
+        )
+    });
+    let document_wide = order.iter().position(|index| *index == 0).unwrap_or(0);
+    let sorted: Vec<ReferenceList> = order.iter().map(|index| lists[*index].clone()).collect();
+    let mut lists = sorted;
+
+    // A list closes a section: its own text is the text immediately before it, back to the end of
+    // the previous list, or back to the section heading when the document prints one (GPT-4's
+    // system card title page starts a part that contains the card's own references).
+    let sections = detect_sections(&pages);
+    let document_first = pages.iter().map(|(page, _)| *page).min().unwrap_or(0);
+    let mut previous_end: Option<u32> = None;
+    for (index, list) in lists.iter_mut().enumerate() {
+        let Some(first) = list.first_page() else {
+            continue;
+        };
+        list.section = None;
+        if index != document_wide {
+            let floor = previous_end.map(|end| end + 1).unwrap_or(document_first);
+            // A section heading only narrows the region when it is printed after the previous
+            // list; an older heading describes text that list already owns. A *container*
+            // (appendix, chapter, embedded document's title page) wins over the numbered
+            // subsections inside it: the system card's "1 Introduction" must not cut the card's
+            // own list's region down to the page before the list.
+            let candidates: Vec<&SectionRef> = sections
+                .iter()
+                .filter(|section| section.page < first && section.page >= floor)
+                .collect();
+            list.section = candidates
+                .iter()
+                .rev()
+                .find(|section| {
+                    matches!(
+                        section.kind,
+                        SectionKind::Appendix | SectionKind::Chapter | SectionKind::Part
+                    )
+                })
+                .map(|section| (*section).clone())
+                .or_else(|| candidates.last().map(|section| (*section).clone()));
+            let start = list
+                .section
+                .as_ref()
+                .map(|section| section.page.max(floor))
+                .unwrap_or(floor)
+                .min(first);
+            list.region_start = Some(start);
+        }
+        // The document-wide list is the fallback everywhere, but the reading-order chain still
+        // advances past it: the next list's region starts after this list's last page.
+        previous_end = list.last_page().or(previous_end);
+    }
+    for list in &mut lists {
+        list.entries.truncate(max_entries);
+    }
+    Bibliography {
+        lists,
+        document_wide,
+        sections,
+    }
+}
+
+/// The pages an entry list occupies, as a closed span.
+fn page_span(entries: &[ReferenceEntry]) -> Option<(u32, u32)> {
+    Some((
+        entries.iter().map(|entry| entry.page).min()?,
+        entries.iter().map(|entry| entry.page).max()?,
+    ))
+}
+
+/// Whether a run is one piece of the document-wide numbering.
+///
+/// Three shapes are one bibliography:
+///
+/// * **Adjacent ranges** — the journal list split in two (`1–33` then `34–68`); the ranges do
+///   not overlap, so a list numbering independently from 1 cannot be adjacent to the document's.
+/// * **A contained range on pages the document list already occupies** — a piece of a run the
+///   join in [`extra_corroborated_runs`] did not take, e.g. a split the body never cites. The page
+///   overlap is what separates it from an appendix list that also numbers from 1: the appendix is
+///   printed on pages *after* the document's list, so it is contained in the labels but disjoint
+///   on the page.
+/// * **The same range** — one physical list read twice (the alphanumeric and author-year parsers),
+///   which the page-overlap dedup would also collapse.
+fn same_numbering(
+    document: &[u32],
+    run: &[u32],
+    document_pages: Option<(u32, u32)>,
+    run_pages: Option<(u32, u32)>,
+) -> bool {
+    let (Some(&document_first), Some(&document_last), Some(&run_first), Some(&run_last)) =
+        (document.first(), document.last(), run.first(), run.last())
+    else {
+        return false;
+    };
+    if run_last.checked_add(1) == Some(document_first)
+        || document_last.checked_add(1) == Some(run_first)
+    {
+        return true;
+    }
+    let contained = document_first <= run_first && run_last <= document_last;
+    let same_pages = document_pages
+        .zip(run_pages)
+        .is_some_and(|((a, b), (c, d))| a <= d && c <= b);
+    contained && same_pages
 }
 
 // ---------------------------------------------------------------------------
@@ -227,16 +652,20 @@ pub(super) fn select_reference_run<'a>(
 ///   enough.
 ///
 /// Runs are added best-corroborated first and chained, so a list printed in three pieces joins
-/// in three steps.
+/// in three steps. Returns the entries to add and the candidates they came from.
 fn extra_corroborated_runs(
     candidates: &[Candidate],
     incumbent: &[ReferenceEntry],
     pages: &[(u32, &RawTextPage)],
-) -> Vec<ReferenceEntry> {
+) -> (Vec<ReferenceEntry>, Vec<usize>) {
     // Nothing to corroborate against: one run is the whole document's numbering.
-    let numbered: Vec<&Candidate> = candidates.iter().filter(|c| c.numbered).collect();
+    let numbered: Vec<(usize, &Candidate)> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.numbered)
+        .collect();
     if numbered.len() < 2 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut selected: BTreeSet<u32> = BTreeSet::new();
     for entry in incumbent {
@@ -245,10 +674,10 @@ fn extra_corroborated_runs(
                 // A repeated label means this is not one numbering, and the adjacency test below
                 // would be meaningless.
                 if !selected.insert(number) {
-                    return Vec::new();
+                    return (Vec::new(), Vec::new());
                 }
             }
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), Vec::new()),
         }
     }
     let (Some(body_end), Some(mut low), Some(mut high)) = (
@@ -256,7 +685,7 @@ fn extra_corroborated_runs(
         selected.iter().next().copied(),
         selected.iter().next_back().copied(),
     ) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     // Bibliography pages are not body: a raised numeral inside a reference must not corroborate
     // the list that carries it.
@@ -273,14 +702,15 @@ fn extra_corroborated_runs(
         body_end,
     );
     let mut extra: Vec<ReferenceEntry> = Vec::new();
+    let mut extra_indices: Vec<usize> = Vec::new();
     // Each run joins at most once. The adjacency test below cannot admit one twice — the range it
     // must touch has moved by then — but this loop is a fixpoint, and a filter weakened by a
     // later edit would spin here instead of failing a test.
     let mut joined = vec![false; numbered.len()];
     loop {
         let mut choice: Option<(usize, usize, &Candidate)> = None;
-        for (index, candidate) in numbered.iter().enumerate() {
-            if joined[index] {
+        for (position, (_, candidate)) in numbered.iter().enumerate() {
+            if joined[position] {
                 continue;
             }
             let Some(range) = consecutive_range(&candidate.run.entries) else {
@@ -301,20 +731,21 @@ fn extra_corroborated_runs(
                     > (best, candidate_best.run.entries.len())
             });
             if better {
-                choice = Some((corroborated, index, candidate));
+                choice = Some((corroborated, position, candidate));
             }
         }
-        let Some((_, index, candidate)) = choice else {
+        let Some((_, position, candidate)) = choice else {
             break;
         };
         let range = consecutive_range(&candidate.run.entries).unwrap_or_default();
         low = low.min(range[0]);
         high = high.max(range[range.len() - 1]);
         selected.extend(range);
-        joined[index] = true;
+        joined[position] = true;
+        extra_indices.push(numbered[position].0);
         extra.extend(candidate.run.entries.iter().cloned());
     }
-    extra
+    (extra, extra_indices)
 }
 
 /// The run's labels as one consecutive range, or `None` when it is not a complete numbering.
@@ -778,4 +1209,441 @@ fn line_pitch(lines: &[EntryLine]) -> f64 {
     }
     gaps.sort_by(f64::total_cmp);
     gaps[gaps.len() / 2]
+}
+
+// ---------------------------------------------------------------------------
+// Sections, and which list a citation belongs to
+// ---------------------------------------------------------------------------
+
+/// How much taller than the page's body a line must be set to read as a section heading.
+///
+/// A numbered section heading in the corpora is set 1.2–1.6 times its body size; a running header
+/// is at or below it, and a reference entry is at body size. The appendix and chapter headings
+/// that decide section ownership in the fixture are 1.2× and 1.4×. This is a *layout* threshold,
+/// not a bibliographic one: it only says where a section starts, and a wrong section start can
+/// only move the page a list's region begins on.
+const SECTION_HEADING_RATIO: f64 = 1.15;
+
+/// A line a section heading could be read from.
+struct SectionLine {
+    text: String,
+    /// Dominant glyph size of the line.
+    size: f64,
+    characters: usize,
+    /// Horizontal extent of the line's ink, in page space.
+    x0: f64,
+    x1: f64,
+}
+
+/// A line of a page as the section detector reads it: the printed characters, its dominant type
+/// size, and how many visible glyphs it carries.
+fn section_lines(page: &RawTextPage) -> Vec<SectionLine> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in page
+        .chars
+        .split_inclusive(|character| character.unicode == '\n' as u32)
+    {
+        let start = offset;
+        offset += line.len();
+        let mut sizes: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        let mut characters = 0usize;
+        let mut x0 = f64::MAX;
+        let mut x1 = f64::MIN;
+        for character in &page.chars[start..start + line.len()] {
+            let Some(decoded) = char::from_u32(character.unicode) else {
+                continue;
+            };
+            if decoded.is_whitespace() || character.rect.size.height <= 0.0 {
+                continue;
+            }
+            *sizes
+                .entry((character.font_size * 10.0).round() as i64)
+                .or_default() += 1;
+            characters += 1;
+            x0 = x0.min(character.rect.origin.x);
+            x1 = x1.max(character.rect.origin.x + character.rect.size.width);
+        }
+        if characters == 0 {
+            continue;
+        }
+        let size = sizes
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(size, _)| *size as f64 / 10.0)
+            .unwrap_or(0.0);
+        let text: String = page.chars[start..start + line.len()]
+            .iter()
+            .filter_map(|character| char::from_u32(character.unicode))
+            .collect();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(SectionLine {
+            text,
+            size,
+            characters,
+            x0,
+            x1,
+        });
+    }
+    lines
+}
+
+/// The size most of a page's visible glyphs are set at: the page's body size.
+fn page_body_size(page: &RawTextPage) -> f64 {
+    let mut sizes: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for character in &page.chars {
+        let Some(decoded) = char::from_u32(character.unicode) else {
+            continue;
+        };
+        if decoded.is_whitespace() || character.rect.size.height <= 0.0 {
+            continue;
+        }
+        *sizes
+            .entry((character.font_size * 10.0).round() as i64)
+            .or_default() += 1;
+    }
+    sizes
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(size, _)| *size as f64 / 10.0)
+        .unwrap_or(0.0)
+}
+
+/// Section starts the document prints, one per page, in reading order.
+///
+/// Only headings that say where a *container* begins are reported: `Appendix …`, `Chapter …`,
+/// an embedded document's title page, and a top-level numbered or lettered heading. The point is
+/// not to reconstruct a table of contents; it is to answer which pages a reference list at the
+/// end of a section belongs to. A list's region therefore starts at the latest such heading before
+/// it (GPT-4's system card begins with its own title page and its own larger type), and otherwise
+/// directly after the previous list, which is what a per-chapter thesis shows.
+fn detect_sections(pages: &[(u32, &RawTextPage)]) -> Vec<SectionRef> {
+    let mut sections = Vec::new();
+    for (page, text) in pages {
+        let body = page_body_size(text);
+        if body <= 0.0 {
+            continue;
+        }
+        let lines = section_lines(text);
+        let page_left = lines.iter().map(|line| line.x0).fold(f64::MAX, f64::min);
+        let page_right = lines.iter().map(|line| line.x1).fold(f64::MIN, f64::max);
+        let mut best: Option<(u8, SectionRef)> = None;
+        for (index, line) in lines.iter().enumerate() {
+            let Some(kind) = section_kind(line, body, index, page_left, page_right) else {
+                continue;
+            };
+            let priority = match kind {
+                SectionKind::Appendix | SectionKind::Chapter => 3,
+                SectionKind::Part => 2,
+                SectionKind::Section => 1,
+            };
+            if best.as_ref().is_none_or(|(best, _)| priority > *best) {
+                best = Some((
+                    priority,
+                    SectionRef {
+                        title: line.text.clone(),
+                        page: *page,
+                        kind,
+                    },
+                ));
+            }
+        }
+        if let Some((_, section)) = best {
+            sections.push(section);
+        }
+    }
+    sections
+}
+
+/// What kind of section this line opens, if any.
+fn section_kind(
+    line: &SectionLine,
+    body: f64,
+    index: usize,
+    page_left: f64,
+    page_right: f64,
+) -> Option<SectionKind> {
+    let text = line.text.trim();
+    if text.chars().count() > 90 || line.characters < 2 {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    // A part or embedded document starts with a centred title, visibly larger than the page's
+    // text. Centring is what separates it from a section heading set in the same larger type at
+    // the left margin (GPT-4's "Authorship, Credit Attribution, and Acknowledgements" is one).
+    let page_width = page_right - page_left;
+    let centred = page_width > 0.0
+        && ((line.x0 + line.x1) / 2.0 - (page_left + page_right) / 2.0).abs() <= page_width * 0.08;
+    // A running header repeats on every page and is not a section start. An appendix or chapter
+    // heading is set larger than the text, or — in GPT-4, where "Appendix" is barely taller than
+    // its body — centred above it; the centring tells the two apart.
+    let heading_sized = line.size >= body * 1.05 || (line.size >= body * 0.95 && centred);
+    if (lower.starts_with("appendix") || lower.starts_with("附录") || lower.starts_with("附錄"))
+        && heading_sized
+    {
+        return Some(SectionKind::Appendix);
+    }
+    if (lower.starts_with("chapter") || (lower.starts_with('第') && lower.contains('章')))
+        && heading_sized
+    {
+        return Some(SectionKind::Chapter);
+    }
+    // An embedded document of its own starts with its title, set visibly larger than the text
+    // below it — GPT-4's system card is such a document and its own references are its own.
+    if index <= 2
+        && line.size >= body * 1.5
+        && centred
+        && text
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .count()
+            >= 3
+        && !starts_with_figure_or_table(&lower)
+    {
+        return Some(SectionKind::Part);
+    }
+    if line.size < body * SECTION_HEADING_RATIO
+        || text.contains('[')
+        || contains_publication_year(text)
+        || text.ends_with(['.', ',', ';'])
+    {
+        return None;
+    }
+    if numbered_section_word(text) || lettered_section_word(text) {
+        // A heading is words. This refuses a page number (`16`), a formula (`D − GC`) and a
+        // table row that happens to begin with a number; a genuine section heading carries at
+        // least six letters and reads in at most ten words.
+        let alphabetic = text
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .count();
+        if alphabetic < 6 || text.split_whitespace().count() > 10 {
+            return None;
+        }
+        return Some(SectionKind::Section);
+    }
+    None
+}
+
+/// Whether the line opens with a top-level number: `2`, `2.`, `A`, `A.` — but not `2.1`.
+fn numbered_section_word(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let Some(token) = words.next() else {
+        return false;
+    };
+    // A bare page number is not a heading; a numbered section carries words after its number.
+    if words.next().is_none() {
+        return false;
+    }
+    let trimmed = token.trim_end_matches(['.', ')', ':']);
+    if trimmed.is_empty() || !trimmed.chars().all(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    // Reject subsection numbers: `2.1` is a token that still carries a dot inside it.
+    *token == *trimmed || token == format!("{trimmed}.")
+}
+
+/// Whether the line opens with a single capital letter: the appendix's `A Exam methodology`.
+fn lettered_section_word(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let letter = first.trim_end_matches(['.', ')', ':']);
+    letter.chars().count() == 1
+        && letter
+            .chars()
+            .all(|character| character.is_ascii_uppercase())
+        && words.next().is_some()
+}
+
+fn starts_with_figure_or_table(lower: &str) -> bool {
+    ["figure", "fig.", "table", "algorithm", "listing"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Whether the line carries a four-digit year in the publication range. A reference entry almost
+/// always does; a section heading almost never does. It is the guard that keeps a numbered
+/// bibliography's own entries from reading as section starts.
+fn contains_publication_year(text: &str) -> bool {
+    let characters: Vec<char> = text.chars().collect();
+    characters.windows(4).any(|window| {
+        window.iter().all(char::is_ascii_digit)
+            && (window[0] == '1' || window[0] == '2')
+            && matches!(window[1], '9' | '0')
+    })
+}
+
+/// Whether the list prints any of the citation's labels exactly.
+fn carries_label(list: &ReferenceList, labels: &[String]) -> bool {
+    labels.iter().any(|label| {
+        list.entries
+            .iter()
+            .any(|entry| entry.label.eq_ignore_ascii_case(label))
+    })
+}
+
+/// Pages between `page` and the list, or zero when the page is inside the list's page span.
+fn list_distance(list: &ReferenceList, page: u32) -> u32 {
+    let (Some(first), Some(last)) = (list.first_page(), list.last_page()) else {
+        return u32::MAX;
+    };
+    if page < first {
+        first - page
+    } else {
+        page.saturating_sub(last)
+    }
+}
+
+/// The list nearest to `page` in reading order among `candidates`.
+fn nearest_list(bibliography: &Bibliography, candidates: &[usize], page: u32) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|index| list_distance(&bibliography.lists[*index], page))
+}
+
+/// Whether the nearest candidate is tied with another one, which is no evidence at all.
+fn nearest_is_tied(bibliography: &Bibliography, candidates: &[usize], page: u32) -> bool {
+    let Some(nearest) = nearest_list(bibliography, candidates, page) else {
+        return false;
+    };
+    let distance = list_distance(&bibliography.lists[nearest], page);
+    candidates
+        .iter()
+        .filter(|index| list_distance(&bibliography.lists[**index], page) == distance)
+        .count()
+        > 1
+}
+
+/// Decides which list owns a citation on `page` naming `labels`.
+///
+/// The evidence, in the order it is read:
+///
+/// 1. **One list.** Nothing to decide.
+/// 2. **The section's own list.** A list closes a section: a per-chapter thesis list or an
+///    appendix's list owns the pages from its section's start (or the end of the previous list)
+///    to its own first page. A citation in those pages that the list can resolve belongs to it.
+/// 3. **The numbering.** A label only one list prints names that list, wherever the citation is —
+///    this is what makes a number that exists only in an appendix list resolve there instead of
+///    failing against the main list.
+/// 4. **The document-wide list.** With no region and several lists carrying the label, the
+///    document-wide list is used; that is the T4.41 selection the main text already resolves
+///    against.
+/// 5. **Distance.** With no region and no document-wide match, the nearest list that carries the
+///    label is used.
+///
+/// The ambiguity rule: when several lists carry the label and no region separates them, the
+/// document-wide list wins and `ambiguous` is set unless that list is also uniquely nearest in
+/// reading order. A nearer list is *reported*, never silently picked, because proximity alone does
+/// not say which section the citation belongs to.
+pub(super) fn attribute(
+    bibliography: &Bibliography,
+    page: u32,
+    labels: &[String],
+) -> CitationAttribution {
+    debug_assert!(!bibliography.lists.is_empty());
+    let document_wide = bibliography.document_wide;
+    if bibliography.lists.len() == 1 {
+        return CitationAttribution {
+            list: 0,
+            reason: AttributionReason::OnlyList,
+            ambiguous: false,
+            alternatives: Vec::new(),
+            region_list: None,
+            label_matches: carries_label(&bibliography.lists[0], labels),
+        };
+    }
+    let matching: Vec<usize> = bibliography
+        .lists
+        .iter()
+        .enumerate()
+        .filter(|(_, list)| carries_label(list, labels))
+        .map(|(index, _)| index)
+        .collect();
+    // A list owns its region *and its own pages*: a bracket inside the list is that list's own
+    // label, not a body citation, and attributing it to the document-wide list is the mirror
+    // error this task exists to remove. The region of the next list starts after this one.
+    let region = bibliography.lists.iter().position(|list| {
+        list.region_start
+            .zip(list.last_page())
+            .is_some_and(|(start, last)| start <= page && page <= last)
+    });
+    let build =
+        |list: usize, reason, ambiguous: bool, region_list: Option<usize>| CitationAttribution {
+            list,
+            reason,
+            ambiguous,
+            alternatives: matching
+                .iter()
+                .copied()
+                .filter(|index| *index != list)
+                .collect(),
+            region_list,
+            label_matches: matching.contains(&list),
+        };
+
+    if let Some(region) = region {
+        if matching.contains(&region) {
+            return build(region, AttributionReason::SectionList, false, Some(region));
+        }
+        // The section's list does not carry the label. The numbering still decides: one list that
+        // does carry it, then the document-wide fallback that the main text cites.
+        if let [only] = matching.as_slice() {
+            return build(*only, AttributionReason::LabelOnly, false, Some(region));
+        }
+        if matching.contains(&document_wide) {
+            let ambiguous = matching.len() > 1;
+            return build(
+                document_wide,
+                AttributionReason::DocumentWide,
+                ambiguous,
+                Some(region),
+            );
+        }
+        if let Some(nearest) = nearest_list(bibliography, &matching, page) {
+            let ambiguous = nearest_is_tied(bibliography, &matching, page);
+            return build(
+                nearest,
+                AttributionReason::NearestList,
+                ambiguous,
+                Some(region),
+            );
+        }
+        return build(
+            document_wide,
+            AttributionReason::DocumentWide,
+            false,
+            Some(region),
+        );
+    }
+
+    match matching.as_slice() {
+        [] => build(document_wide, AttributionReason::DocumentWide, false, None),
+        [only] => build(*only, AttributionReason::LabelOnly, false, None),
+        _ if matching.contains(&document_wide) => {
+            // Prefer the document-wide list, and say so. Proximity only decides whether the
+            // choice was genuinely ambiguous: if the document-wide list is not the unique nearest,
+            // another list could own the citation and the reader is told.
+            let document_distance = list_distance(&bibliography.lists[document_wide], page);
+            let ambiguous = bibliography.lists.iter().enumerate().any(|(index, list)| {
+                index != document_wide && list_distance(list, page) <= document_distance
+            });
+            build(
+                document_wide,
+                AttributionReason::DocumentWide,
+                ambiguous,
+                None,
+            )
+        }
+        _ => {
+            let nearest = nearest_list(bibliography, &matching, page).unwrap_or(document_wide);
+            let ambiguous = nearest_is_tied(bibliography, &matching, page);
+            build(nearest, AttributionReason::NearestList, ambiguous, None)
+        }
+    }
 }

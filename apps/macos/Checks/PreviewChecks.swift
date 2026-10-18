@@ -29,7 +29,7 @@ import Foundation
     func annotations() async throws -> [DocumentAnnotation] { [] }
     func figures() async throws -> [Figure] { [] }
     func references() async throws -> [Reference] { [] }
-    func resolveCitations(labels: [String]) async throws -> [Reference] { [] }
+    func resolveCitations(labels: [String], page: Int) async throws -> [Reference] { [] }
     func outline() async throws -> [OutlineEntry] { [] }
     func metadata() async throws -> DocumentMetadata { .empty }
     func generateBibtex(_ draft: MetadataDraft) -> String { draft.bibtex }

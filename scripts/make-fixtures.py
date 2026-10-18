@@ -1202,6 +1202,83 @@ def numeric_references_page() -> str:
     return "\n".join(parts)
 
 
+def multi_bibliography_pages() -> list[tuple[str, int]]:
+    """Two reference lists in one document, both numbered from 1 (T4.42).
+
+    Page 1 is the main text; it cites the labels the main list prints (six of them, so the
+    document-wide selection stays on the main list even though the appendix list is longer)
+    and one label only the appendix list prints. Page 2 is the main bibliography. Page 3 opens
+    an appendix and cites `[3]` — a number both lists print, naming different works. Page 4 is
+    the appendix's own bibliography. Page 5 is a closing note after both lists, where nothing
+    separates the two lists: the attribution must prefer the document-wide list and record the
+    ambiguity.
+
+    The test (`multi_bibliography_fixture.rs`) asserts the body's `[3]` lands on the main
+    list's entry and the appendix's `[3]` on the appendix's, which is the defect the fixture
+    exists for: before T4.42 both resolved against the main list.
+    """
+    body = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 18 Tf 72 790 Td (Two reference lists) Tj ET",
+            "BT /F1 10 Tf 72 750 Td (The main text cites [1], [2], [3], [4], [5], [6] and also [7].) Tj ET",
+            "BT /F1 10 Tf 72 734 Td (The appendix has its own list and cites [3] there.) Tj ET",
+        ]
+    )
+
+    def list_page(heading_size: float, entries: list[str]) -> str:
+        parts = [
+            "0 0 0 rg",
+            f"BT /F1 {heading_size:g} Tf 72 790 Td (References) Tj ET",
+        ]
+        y = 760
+        for entry in entries:
+            parts.append(
+                f"BT /F1 10 Tf 72 {y} Td ({escape_pdf_string(entry)}) Tj ET"
+            )
+            y -= 15
+        return "\n".join(parts)
+
+    main = list_page(
+        12,
+        [
+            "[1] One 2019. Report work one.",
+            "[2] Two 2020. Report work two.",
+            "[3] Three 2021. Report work three.",
+            "[4] Four 2022. Report work four.",
+            "[5] Five 2023. Report work five.",
+            "[6] Six 2024. Report work six.",
+        ],
+    )
+    appendix_body = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 14 Tf 72 790 Td (Appendix A \u2014 Extra results) Tj ET",
+            "BT /F1 10 Tf 72 750 Td (The appendix relies on [3] and on [7].) Tj ET",
+        ]
+    )
+    appendix = list_page(
+        12,
+        [
+            "[1] Alpha 2017. Card work one.",
+            "[2] Beta 2017. Card work two.",
+            "[3] Gamma 2017. Card work three.",
+            "[4] Delta 2017. Card work four.",
+            "[5] Epsilon 2017. Card work five.",
+            "[6] Zeta 2017. Card work six.",
+            "[7] Eta 2017. Card work seven.",
+            "[8] Theta 2017. Card work eight.",
+        ],
+    )
+    closing = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 10 Tf 72 760 Td (A closing note cites [3] once more.) Tj ET",
+        ]
+    )
+    return [(body, 0), (main, 0), (appendix_body, 0), (appendix, 0), (closing, 0)]
+
+
 def caption_false_positive_pages() -> list[tuple[str, int]]:
     """The T4.12 shape: a label that only *ends* a sentence at the start of a printed line.
 
@@ -1472,6 +1549,10 @@ def main() -> int:
             (numeric_citation_page(), 0),
             (numeric_references_page(), 0),
         ],
+        # 11) T4.42: a main bibliography and an appendix bibliography, both numbered from 1, so
+        #     the same bracket number means different works. The body citation must land on the
+        #     main list and the appendix citation on the appendix list.
+        "multi-bibliography.pdf": multi_bibliography_pages(),
     }
 
     for name, pages in fixtures.items():

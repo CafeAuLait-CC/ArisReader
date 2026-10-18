@@ -14,7 +14,7 @@
 //! aris-reader-cli bench <file.pdf> [--pages N] [--dpi D] [--search TERM]
 //! aris-reader-cli corpus <dir|files...> [--search TERM] [--pages N]
 //! aris-reader-cli analyze <file.pdf> [--pages N]
-//! aris-reader-cli cite <file.pdf> [--body-pages N]
+//! aris-reader-cli cite <file.pdf> [--body-pages N] [--show-lists] [--show-attribution]
 //! aris-reader-cli figures <file.pdf> [--pages N]
 //! aris-reader-cli tables <file.pdf>... [--pages N] [--all]
 //! aris-reader-cli metadata <file.pdf> [--bibtex]
@@ -37,8 +37,10 @@ Usage:
   aris-reader-cli info <file.pdf>                document info (pages, page boxes, rotation)
   aris-reader-cli analyze <file.pdf>             citations, figures, tables, formulas on a page
   aris-reader-cli cite <file.pdf>                match body citations against the reference list; print
-                                                 the detected style and every parenthesised-numeral
-                                                 candidate with its accept/reject reason
+                 [--body-pages N] [--show-entries] [--show-lists] [--show-attribution] [--show-misses]
+                                                 the detected style, every reference list with the pages
+                                                 it owns, each resolved citation's list and reason, and
+                                                 every parenthesised-numeral accept/reject decision
   aris-reader-cli figures <file.pdf>...          figure/table captions and the region to preview
                  [--pages N]                    (grid / image / page per caption)
   aris-reader-cli tables <file.pdf>...           table previews: grid-derived or full-page fallback
@@ -1532,7 +1534,7 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
     let Some(path) = positional.first() else {
         eprintln!(
-            "usage: aris-reader-cli cite <file.pdf> [--body-pages N] [--show-misses] [--show-entries] [--no-landings]"
+            "usage: aris-reader-cli cite <file.pdf> [--body-pages N] [--show-misses] [--show-entries] [--show-lists] [--show-attribution] [--no-landings]"
         );
         return ExitCode::from(64);
     };
@@ -1598,11 +1600,43 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         None => println!("  page-score diagnostic: no region"),
     }
 
-    let references = if options.iter().any(|(key, _)| key == "--no-landings") {
-        provisional
+    // Every reference list the document prints. The document-wide one is exactly what the app
+    // has always resolved against; the others are what a citation in their section must resolve
+    // against instead. See `attribute_citation`.
+    let bibliography = if options.iter().any(|(key, _)| key == "--no-landings") {
+        aris_reader_text::find_reference_lists(pages.iter().map(|(page, text)| (*page, text)), 2000)
     } else {
-        aris_reader_text::find_references_with_landings(&pages, &landings, 2000)
+        aris_reader_text::find_reference_lists_with_landings(&pages, &landings, 2000)
     };
+    let references = bibliography
+        .document_wide_list()
+        .map(|list| list.entries.clone())
+        .unwrap_or_default();
+    let show_lists = options.iter().any(|(key, _)| key == "--show-lists");
+    if bibliography.lists.is_empty() {
+        println!("  reference lists: none");
+    } else {
+        println!(
+            "  reference lists: {} (document-wide: list {})",
+            bibliography.lists.len(),
+            bibliography.document_wide + 1
+        );
+        if bibliography.lists.len() > 1 || show_lists {
+            for (index, list) in bibliography.lists.iter().enumerate() {
+                println!("    {}", list_summary(&bibliography, index, list));
+            }
+            if show_lists {
+                for section in &bibliography.sections {
+                    println!(
+                        "    section start: p{} {} {:?}",
+                        section.page + 1,
+                        section.kind.noun(),
+                        section.title
+                    );
+                }
+            }
+        }
+    }
     if let (Some(first), Some(last)) = (references.first(), references.last()) {
         println!(
             "  selected bibliography: pages {}..{}",
@@ -1632,21 +1666,29 @@ fn cmd_cite(args: &[String]) -> ExitCode {
             .count()
     );
     let show_all = options.iter().any(|(key, _)| key == "--show-entries");
-    for entry in references
-        .iter()
-        .take(if show_all { usize::MAX } else { 3 })
-    {
-        println!(
-            "    p{} [{}] {}{}",
-            entry.page + 1,
-            entry.label,
-            if show_all {
-                entry.text.clone()
-            } else {
-                entry.text.chars().take(70).collect::<String>()
-            },
-            fragment_mark(entry)
-        );
+    if show_all {
+        for (index, list) in bibliography.lists.iter().enumerate() {
+            println!("    {}", list_summary(&bibliography, index, list));
+            for entry in &list.entries {
+                println!(
+                    "      p{} [{}] {}{}",
+                    entry.page + 1,
+                    entry.label,
+                    entry.text,
+                    fragment_mark(entry)
+                );
+            }
+        }
+    } else {
+        for entry in references.iter().take(3) {
+            println!(
+                "    p{} [{}] {}{}",
+                entry.page + 1,
+                entry.label,
+                entry.text.chars().take(70).collect::<String>(),
+                fragment_mark(entry)
+            );
+        }
     }
     // Print the pieces of every split entry, even when the entry list itself is truncated:
     // this is the part of the report the change exists for.
@@ -1679,8 +1721,12 @@ fn cmd_cite(args: &[String]) -> ExitCode {
         citation_style_summary(&style, references.len())
     );
 
+    let show_attribution = options.iter().any(|(key, _)| key == "--show-attribution");
     let mut resolved = 0usize;
     let mut attempted = 0usize;
+    let mut per_list = vec![0usize; bibliography.lists.len()];
+    let mut ambiguous = 0usize;
+    let mut appendix_only = 0usize;
     for index in 0..total.min(body_pages) {
         let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
             continue;
@@ -1720,31 +1766,61 @@ fn cmd_cite(args: &[String]) -> ExitCode {
             }
             attempted += 1;
 
-            // One resolver for the whole project: exact label first, then position for a
-            // numeric citation against an unnumbered list.
-            let hit = aris_reader_text::resolve_reference(&citation.labels, &references);
+            // The attribution decides *which* list this citation resolves against; with one list
+            // in the document it is that list, so the single-list result cannot move.
+            let attribution =
+                aris_reader_text::attribute_citation(&bibliography, index, &citation.labels);
+            let hit = attribution.as_ref().and_then(|attribution| {
+                let list = bibliography.lists.get(attribution.list)?;
+                aris_reader_text::resolve_reference(&citation.labels, &list.entries)
+            });
+            if let Some(attribution) = &attribution {
+                if hit.is_some() {
+                    per_list[attribution.list] += 1;
+                }
+                if attribution.ambiguous {
+                    ambiguous += 1;
+                }
+                if hit.is_some() && attribution_is_appendix_only(&bibliography, attribution) {
+                    appendix_only += 1;
+                }
+            }
 
             if options.iter().any(|(key, _)| key == "--show-misses") && hit.is_none() {
                 println!(
-                    "    p{} MISS {:?} → labels {:?}",
+                    "    p{} MISS {:?} → labels {:?}{}",
                     index + 1,
                     citation.text.chars().take(28).collect::<String>(),
-                    citation.labels
+                    citation.labels,
+                    attribution
+                        .as_ref()
+                        .map(|attribution| format!(
+                            " [{}]",
+                            attribution_note(&bibliography, attribution)
+                        ))
+                        .unwrap_or_default()
                 );
             }
 
             if let Some(entry) = hit {
                 resolved += 1;
-                if resolved <= 5 {
+                if show_attribution || resolved <= 5 {
                     println!(
-                        "    p{} {} → [{}] {}{} (at {:.0},{:.0})",
+                        "    p{} {} → [{}] {}{} (at {:.0},{:.0}){}",
                         index + 1,
                         citation.text,
                         entry.label,
                         entry.text.chars().take(50).collect::<String>(),
                         fragment_mark(entry),
                         citation.rect.origin.x,
-                        citation.rect.origin.y
+                        citation.rect.origin.y,
+                        attribution
+                            .as_ref()
+                            .map(|attribution| format!(
+                                " [{}]",
+                                attribution_note(&bibliography, attribution)
+                            ))
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -1756,8 +1832,175 @@ fn cmd_cite(args: &[String]) -> ExitCode {
     } else {
         resolved as f64 / attempted as f64 * 100.0
     };
+    if bibliography.lists.len() > 1 {
+        let per_list = per_list
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, count)| format!("list {}: {count}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  attribution: resolved spans per list — {per_list}");
+        if ambiguous > 0 {
+            println!(
+                "  attribution: {ambiguous} span(s) were ambiguous between lists; the document-wide list was used"
+            );
+        }
+        if appendix_only > 0 {
+            println!(
+                "  attribution: {appendix_only} span(s) name a number that exists only in an appendix list"
+            );
+        }
+    }
     println!("  → {resolved}/{attempted} citation(s) resolved to an entry ({share:.0}%)");
     ExitCode::SUCCESS
+}
+
+/// One line describing a reference list: where it is, what announced it, and what it owns.
+fn list_summary(
+    bibliography: &aris_reader_text::Bibliography,
+    index: usize,
+    list: &aris_reader_text::ReferenceList,
+) -> String {
+    let mut summary = format!("list {}: ", index + 1);
+    if index == bibliography.document_wide {
+        summary.push_str("[document-wide] ");
+    }
+    match (list.first_page(), list.last_page()) {
+        (Some(first), Some(last)) => {
+            summary.push_str(&format!("pages {}..{}", first + 1, last + 1))
+        }
+        _ => summary.push_str("no pages"),
+    }
+    summary.push_str(&format!(", {} entries", list.entries.len()));
+    if let Some(heading) = &list.heading {
+        summary.push_str(&format!(
+            ", heading {:?} p{}",
+            heading,
+            list.heading_page.unwrap_or(0) + 1
+        ));
+    }
+    if let Some(section) = &list.section {
+        summary.push_str(&format!(
+            ", {} {:?} from p{}",
+            section.kind.noun(),
+            section.title,
+            section.page + 1
+        ));
+    }
+    if let Some(start) = list.region_start
+        && let Some(first) = list.first_page()
+    {
+        summary.push_str(&format!(", owns pages {}-{}", start + 1, first));
+    }
+    summary
+}
+
+/// The attribution of one citation, in the shape the `cite` report prints.
+///
+/// A reader must be able to see *why* a citation resolved where it did — the same demand the
+/// accept/reject decisions of the parenthesised detector already meet. The note names the list,
+/// the reason, and the cases the rule refuses to hide: an ambiguous choice, a section list that
+/// does not carry the number, and a number that only an appendix list prints.
+fn attribution_note(
+    bibliography: &aris_reader_text::Bibliography,
+    attribution: &aris_reader_text::CitationAttribution,
+) -> String {
+    let total = bibliography.lists.len();
+    let list = &bibliography.lists[attribution.list];
+    let mut note = format!(
+        "list {}/{total}: {}; {}",
+        attribution.list + 1,
+        list.heading
+            .as_deref()
+            .map(|heading| format!("{heading:?}"))
+            .unwrap_or_else(|| "no heading".to_string()),
+        attribution.reason.explanation()
+    );
+    if attribution.ambiguous {
+        let alternatives = attribution
+            .alternatives
+            .iter()
+            .map(|index| format!("list {}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let carries = if attribution.alternatives.len() == 1 {
+            "also carries"
+        } else {
+            "also carry"
+        };
+        note.push_str(&format!(
+            "; AMBIGUOUS: {alternatives} {carries} this label, and no section separates them, so the document-wide list was preferred"
+        ));
+    }
+    if let Some(region) = attribution.region_list
+        && region != attribution.list
+    {
+        let section = bibliography.lists[region]
+            .section
+            .as_ref()
+            .map(|section| format!("{} {:?}", section.kind.noun(), section.title))
+            .unwrap_or_else(|| "section".to_string());
+        note.push_str(&format!(
+            "; the list of the {section} does not carry this label, so it was not used"
+        ));
+    }
+    if attribution_is_appendix_only(bibliography, attribution) {
+        note.push_str("; this number exists only in the appendix list");
+    }
+    if !attribution.label_matches {
+        note.push_str("; no list prints this exact label");
+    }
+    note
+}
+
+/// Whether a list belongs to an appendix: its own heading or section says so, or the document
+/// printed an `Appendix` heading between the previous list and this one. The second form is what
+/// recognises GPT-4's system card: its list sits under a part title of its own, but that part is
+/// itself inside the report's `Appendix` section.
+fn list_is_appendix(bibliography: &aris_reader_text::Bibliography, index: usize) -> bool {
+    let Some(list) = bibliography.lists.get(index) else {
+        return false;
+    };
+    if list
+        .section
+        .as_ref()
+        .is_some_and(|section| section.kind == aris_reader_text::SectionKind::Appendix)
+    {
+        return true;
+    }
+    if list.heading.as_deref().is_some_and(|heading| {
+        heading.to_ascii_lowercase().contains("appendix")
+            || heading.contains("附录")
+            || heading.contains("附錄")
+    }) {
+        return true;
+    }
+    let previous_end = bibliography.lists[..index]
+        .iter()
+        .filter_map(|previous| previous.last_page())
+        .max();
+    list.first_page().is_some_and(|first| {
+        bibliography.sections.iter().any(|section| {
+            section.kind == aris_reader_text::SectionKind::Appendix
+                && previous_end.is_none_or(|end| section.page > end)
+                && section.page < first
+        })
+    })
+}
+
+/// Whether the citation's only match is an appendix list — the case the CLI must name rather than
+/// report as an ordinary resolution.
+fn attribution_is_appendix_only(
+    bibliography: &aris_reader_text::Bibliography,
+    attribution: &aris_reader_text::CitationAttribution,
+) -> bool {
+    if attribution.list == bibliography.document_wide {
+        return false;
+    }
+    // "Only" is about the label, not about the reason the list was chosen: a citation inside
+    // the appendix can be attributed by its section and still name a number no other list prints.
+    list_is_appendix(bibliography, attribution.list) && attribution.alternatives.is_empty()
 }
 
 /// The detected citation style, in the terms the reader acts on.

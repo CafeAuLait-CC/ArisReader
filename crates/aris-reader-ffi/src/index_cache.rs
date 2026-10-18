@@ -76,7 +76,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// version is bumped so every version-1 cache is re-derived from the document. The layout is
 /// otherwise unchanged; the bump is about the values, which is exactly what this constant
 /// documents.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+///
+/// # 3 (T4.42)
+///
+/// The reference half gained the document's other reference lists (`lists` and
+/// `document_wide`): a page-aware citation resolution needs them to attribute a citation to its
+/// section's list. A version-2 sidecar has only the document-wide list, so using it would make
+/// an appendix citation resolve into the main list again. Every version-2 cache is therefore
+/// re-derived once; the replacement carries the lists.
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// Tag that identifies our sidecar (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-document-index";
@@ -129,12 +137,37 @@ impl ContentIdentity {
     }
 }
 
-/// The reference half of the index: the entries and the citation style they imply.
+/// One reference list in the persisted index: its entries, and the evidence a citation
+/// attribution needs (the same fields `aris_reader_text::ReferenceList` carries live).
+///
+/// The records carry view-space geometry so a resolved entry can be previewed straight from a
+/// cache hit; the text library's live entries are not persisted because their page-space glyph
+/// ranges are derivable from a fresh parse and are not needed to resolve or attribute a label.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedReferenceList {
+    pub records: Vec<ReferenceRecord>,
+    pub numbered: bool,
+    pub heading: Option<String>,
+    pub heading_page: Option<u32>,
+    pub section: Option<aris_reader_text::SectionRef>,
+    pub region_start: Option<u32>,
+}
+
+/// The reference half of the index: the entries and the citation style they imply, plus every
+/// list so a citation can be attributed to the one its page belongs to.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CachedReferences {
     pub style: CitationStyle,
+    /// The document-wide list's records. Kept alongside `lists` because it is what
+    /// `ArisDocument::references` has always returned and what a caller with no page resolves
+    /// against.
     pub records: Vec<ReferenceRecord>,
+    /// Every list, in reading order.
+    pub lists: Vec<CachedReferenceList>,
+    /// Index of the document-wide list in `lists`.
+    pub document_wide: u32,
 }
 
 /// The complete persisted index.
@@ -386,6 +419,8 @@ mod tests {
             references: CachedReferences {
                 style: CitationStyle::default(),
                 records: Vec::new(),
+                lists: Vec::new(),
+                document_wide: 0,
             },
             figures: Vec::new(),
             metadata: empty_metadata(),
