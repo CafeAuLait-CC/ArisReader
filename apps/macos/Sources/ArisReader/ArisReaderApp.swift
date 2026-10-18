@@ -170,6 +170,20 @@ struct ReaderCommands: Commands {
                 .keyboardShortcut(.rightArrow, modifiers: .command)
                 .disabled(session == nil)
 
+            Divider()
+
+            // History for jumps the floating preview started (and the forward branch those
+            // jumps truncate). ⌘[ / ⌘] are the window-navigation pair macOS readers share,
+            // and they stay available after the preview is closed.
+            Button("Back") { session?.state.goBack() }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(session?.state.canGoBack != true)
+            Button("Forward") { session?.state.goForward() }
+                .keyboardShortcut("]", modifiers: .command)
+                .disabled(session?.state.canGoForward != true)
+
+            Divider()
+
             Button("Next Search Match") { session?.state.findNext() }
                 .keyboardShortcut("g", modifiers: .command)
                 .disabled(session == nil)

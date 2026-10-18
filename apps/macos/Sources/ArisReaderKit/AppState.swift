@@ -1015,7 +1015,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var selection: Selection?
 
     /// What a floating preview is *for*. It decides what the panel's body shows, because the
-    /// three cases genuinely want three different things.
+    /// four cases genuinely want four different things.
     public enum ReferencePreviewKind: Equatable, Sendable {
         /// A bibliography entry a citation resolved to: the panel shows the entry **as text**.
         /// The reader wants to read the reference, and a crop of a two-column bibliography page
@@ -1024,6 +1024,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// A figure or table caption: the panel shows the rendered region. A picture of a figure
         /// is the point.
         case figure
+        /// A section, chapter or appendix reference (`Sec. 2`, `Chapter IV`, `Appendix A`): a
+        /// picture of the target page is useless, so the panel shows the section's title as text
+        /// and leaves the page number as the click target.
+        case section
         /// A plain link destination — a page, or a `/FitR` region with no entry behind it: the
         /// panel shows the page image, which is the only thing there is to show.
         case page
@@ -1052,6 +1056,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// (`[1,2]`, `(He et al. 2024; Kim 2023)`) names several works and the panel lists all
         /// of them; a plain link or a figure preview has none.
         public let entries: [CitationEntry]
+        /// A `.section` preview's title from the document outline. `nil` means the page has no
+        /// outline entry; the panel then shows `sectionReference` and says why.
+        public let sectionTitle: String?
+        /// A `.section` preview's reference as printed (`Sec. 2`), used as the fallback title and
+        /// shown for context. `nil` only when no reference text could be read at all.
+        public let sectionReference: String?
     }
 
     /// One resolved bibliography entry, as the panel lists it.
@@ -1067,6 +1077,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             self.page = page
             self.region = region
         }
+    }
+
+    /// Where the reader was before a jump the preview started.
+    ///
+    /// `scrollYPt` is the **exact** content offset, not a page number rounded to a page top: a
+    /// reader halfway down a long page must come back halfway down it. `selection` and `preview`
+    /// ride along because both are already values in memory — returning to a highlighted
+    /// paragraph should not lose the highlight — and they cost a copy of references, not a
+    /// re-render.
+    public struct ReaderLocation: Equatable, Sendable {
+        /// 0-based, the page under the viewport's top edge.
+        public let page: Int
+        /// Content offset in points, exactly as ``AppState/scrollYPt`` held it.
+        public let scrollYPt: CGFloat
+        public let selection: Selection?
+        /// The preview that was open when the jump was made. Kept for context; Back does not
+        /// reopen a panel the reader has since closed.
+        public let preview: ReferencePreview?
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -1090,7 +1118,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if widthChanged, let preview = referencePreview {
             openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
                                  kind: preview.kind, anchor: preview.anchor,
-                                 region: preview.region, entries: preview.entries)
+                                 region: preview.region, entries: preview.entries,
+                                 sectionTitle: preview.sectionTitle,
+                                 sectionReference: preview.sectionReference)
         } else {
             scrollReferencePreview(by: 0)
         }
@@ -1107,12 +1137,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let preview = referencePreview, let page = entry.page else { return }
         openReferencePreview(page: page, title: entry.label, from: preview.source,
                              kind: preview.kind, anchor: preview.anchor,
-                             region: entry.region, entries: preview.entries)
+                             region: entry.region, entries: preview.entries,
+                             sectionTitle: preview.sectionTitle,
+                             sectionReference: preview.sectionReference)
     }
 
     public func showFullPreviewPage() {
         guard let preview = referencePreview else { return }
         // The page image is exactly what "Full page" is for, so the kind changes with the view.
+        // A section preview's text body is traded for the page it points at, which is the one
+        // place its crop is still the point.
         openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
                              kind: .page, anchor: preview.anchor, entries: preview.entries)
     }
@@ -1124,8 +1158,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// shows. `kind` decides which of the two bodies the panel builds, and `anchor` — the
     /// rectangle the reader clicked, in canvas view space — is where it opens.
     ///
-    /// A `.reference` preview never rasterizes anything: the entry text *is* the body, so the
-    /// panel opens immediately and no page, tile or prefetch work is started for it.
+    /// A `.reference` or `.section` preview never rasterizes anything: the entry or section title
+    /// *is* the body, so the panel opens immediately and no page, tile or prefetch work is
+    /// started for it.
     public func openReferencePreview(
         page: Int,
         title: String,
@@ -1133,7 +1168,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         kind: ReferencePreviewKind,
         anchor: CGRect? = nil,
         region: CGRect? = nil,
-        entries: [CitationEntry] = []
+        entries: [CitationEntry] = [],
+        sectionTitle: String? = nil,
+        sectionReference: String? = nil
     ) {
         guard let document, page >= 0, page < document.pageCount else { return }
         if let region {
@@ -1153,7 +1190,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             kind: kind,
             anchor: anchor,
             region: region,
-            entries: entries
+            entries: entries,
+            sectionTitle: sectionTitle,
+            sectionReference: sectionReference
         )
 
         if !entries.isEmpty {
@@ -1165,14 +1204,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         }
 
-        if kind == .reference {
-            // Nothing to rasterize: the panel's body is the entry text, which the shell already
-            // has. Reporting "loading" here would be a lie and leaving it set would keep the
-            // panel's spinner up forever.
+        if kind == .reference || kind == .section {
+            // Nothing to rasterize: the panel's body is text the shell already has. Reporting
+            // "loading" here would be a lie and leaving it set would keep the panel's spinner up
+            // forever.
             referencePreviewLoading = false
-            FileHandle.standardError.write(
-                Data("aris-preview: entry text for \"\(title)\" (\(entries.count) entries, \(entries.reduce(0) { $0 + $1.text.count }) characters)\n".utf8)
-            )
+            if kind == .reference {
+                FileHandle.standardError.write(
+                    Data("aris-preview: entry text for \"\(title)\" (\(entries.count) entries, \(entries.reduce(0) { $0 + $1.text.count }) characters)\n".utf8)
+                )
+            } else {
+                FileHandle.standardError.write(
+                    Data("aris-preview: section text for \"\(title)\" on page \(page + 1) (no crop)\n".utf8)
+                )
+            }
             return
         }
 
@@ -1190,7 +1235,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     xPt: region.minX,
                     yPt: region.minY,
                     widthPt: region.width,
-                    heightPt: region.height
+                    heightPt: region.height,
+                    // A figure/table crop is shown on the panel's own colour, so its white
+                    // page margin must be transparent. A whole-page preview keeps its paper.
+                    transparentBackground: kind == .figure
                 )
             } else {
                 rasterized = try? await self.engine.renderPage(page, scale: scale)
@@ -1228,6 +1276,104 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         referencePreviewScrollYPt = 0
         referencePreview = nil
         referencePreviewPages = []
+    }
+
+    // MARK: - Preview jumps and Back
+
+    /// How many past (and future) locations one window remembers.
+    ///
+    /// Each direction's stack is trimmed to this many entries when a jump or a back would exceed
+    /// it, so a reader who follows the same preview twenty-five times keeps the twenty most
+    /// recent places. Twenty entries of value types is bounded memory, and far more than a
+    /// preview jump normally needs.
+    public static let navigationHistoryLimit = 20
+
+    @Published public private(set) var backHistory: [ReaderLocation] = []
+    @Published public private(set) var forwardHistory: [ReaderLocation] = []
+    public var canGoBack: Bool { !backHistory.isEmpty }
+    public var canGoForward: Bool { !forwardHistory.isEmpty }
+
+    /// A jump the **preview** started: record where the reader is, then move.
+    ///
+    /// Only this entry point records history. Page turns, sidebar jumps, tab restores and Back
+    /// itself all move the reader without becoming entries, which is what keeps programmatic
+    /// scroll restoration out of the stack.
+    public func jumpFromPreview(to page: Int) {
+        guard let document, page >= 0, page < document.pageCount else { return }
+        recordReaderLocation()
+        gotoPage(page)
+    }
+
+    /// Returns to the reader's previous location. True when there was one.
+    @discardableResult
+    public func goBack() -> Bool {
+        guard let target = backHistory.popLast() else { return false }
+        forwardHistory.append(currentReaderLocation())
+        trimNavigationHistory()
+        applyReaderLocation(target, message: "Back to page")
+        return true
+    }
+
+    /// Moves forward again. True when the forward branch had an entry.
+    @discardableResult
+    public func goForward() -> Bool {
+        guard let target = forwardHistory.popLast() else { return false }
+        backHistory.append(currentReaderLocation())
+        trimNavigationHistory()
+        applyReaderLocation(target, message: "Forward to page")
+        return true
+    }
+
+    /// Leaving a document throws its history away; the document reset path calls this.
+    public func clearNavigationHistory() {
+        guard !backHistory.isEmpty || !forwardHistory.isEmpty else { return }
+        backHistory = []
+        forwardHistory = []
+    }
+
+    /// Whether a page's text layer is already in memory.
+    ///
+    /// The section-reference click path reads the clicked line to tell a `Sec. 2` link from a
+    /// generic page link; a page whose layer has not arrived yet is simply previewed as a page
+    /// rather than guessed at. Exposed so the native checks can wait for the real precondition
+    /// instead of sleeping.
+    public func hasTextLayer(_ page: Int) -> Bool {
+        textPages[page] != nil
+    }
+
+    private func currentReaderLocation() -> ReaderLocation {
+        ReaderLocation(page: max(0, currentPage - 1), scrollYPt: scrollYPt,
+                       selection: selection, preview: referencePreview)
+    }
+
+    private func recordReaderLocation() {
+        backHistory.append(currentReaderLocation())
+        // A new jump has a new future: the forward branch it replaced is stale.
+        forwardHistory.removeAll()
+        trimNavigationHistory()
+    }
+
+    private func trimNavigationHistory() {
+        if backHistory.count > Self.navigationHistoryLimit {
+            backHistory.removeFirst(backHistory.count - Self.navigationHistoryLimit)
+        }
+        if forwardHistory.count > Self.navigationHistoryLimit {
+            forwardHistory.removeFirst(forwardHistory.count - Self.navigationHistoryLimit)
+        }
+    }
+
+    /// Restores a remembered **offset**, not just its page. `reloadVisiblePages` then re-derives
+    /// the current page, visible placements and selection highlights from it.
+    private func applyReaderLocation(_ location: ReaderLocation, message: String) {
+        cancelScrollGlide()
+        // Clamp only if the content shrank since (a window resize or a layout change); on the
+        // ordinary path this is exactly the remembered number.
+        scrollYPt = clampedScrollOffset(location.scrollYPt)
+        selection = location.selection
+        selectionAnchor = nil
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = "\(message) \(currentPage)"
     }
 
     /// Annotations the **PDF itself carries**, in view space — highlights and notes somebody
@@ -2285,6 +2431,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         positionSaveTask?.cancel()
         pendingPosition = nil
         closeReferencePreview()
+        // The history belongs to the document that is leaving; a jump from its preview must not
+        // be able to scroll the next document to an offset it never had.
+        clearNavigationHistory()
         invalidateTiles()
         canvasPages = []
         canvasTiles = []
@@ -7754,6 +7903,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if let page = link.page {
             if openCitation(at: point) || openFigureMention(at: point) { return true }
+            // A section link is a reference to a *heading*, not to a picture: the clicked line
+            // says so (`Sec. 2`, `Chapter IV`, `Appendix A`). A `/FitR` link already means a
+            // figure or table region, so only a plain destination is considered.
+            if link.region == nil,
+               let section = sectionReference(near: box, on: placement) {
+                openSectionPreview(page: page, reference: section,
+                                   from: placement.index,
+                                   anchor: viewRect(local: box, on: placement))
+                return true
+            }
             // M4: show the target in a floating panel rather than jumping, so the
             // citation can be read without losing the place in the text. When the
             // destination names a region (/FitR), only that region is shown -- which
@@ -7772,6 +7931,49 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         return false
+    }
+
+    /// The section reference printed around a link box, if the link is one.
+    ///
+    /// The **line** the box touches is the evidence, not the box itself: papers routinely link
+    /// only the numeral of `Section 2`, and the word that gives it meaning sits outside the
+    /// annotation. `nil` when the page's text layer is not in memory yet; a generic page preview
+    /// is the honest fallback then, and a later click (after the layer arrives) classifies it.
+    private func sectionReference(near box: CGRect, on placement: PagePlacement) -> SectionReference? {
+        guard let textPage = textPages[placement.index] else { return nil }
+        let line = textPage.lineBounds(overlapping: box) ?? box
+        guard let range = textPage.characterRange(in: line) else { return nil }
+        return SectionReferenceText.reference(in: textPage.string(in: range))
+    }
+
+    /// Opens the text-only preview for a section reference, resolving its title from the outline.
+    ///
+    /// The title is the outline entry for the destination page (`designation` prefers the entry
+    /// that names the same number/letter when a page holds several). Without one, the printed
+    /// reference is the title; without either, the panel says so instead of showing an empty box.
+    private func openSectionPreview(
+        page: Int,
+        reference: SectionReference,
+        from sourcePage: Int,
+        anchor: CGRect?
+    ) {
+        let title = SectionReferenceText.title(
+            from: outline, page: page, designation: reference.designation
+        )
+        openReferencePreview(
+            page: page,
+            title: title ?? reference.printed,
+            from: "page \(sourcePage + 1)",
+            kind: .section,
+            anchor: anchor,
+            entries: [],
+            sectionTitle: title,
+            sectionReference: reference.printed
+        )
+        let resolved = title.map { "\"\($0)\"" } ?? "from the reference text"
+        let line = "aris-section: \"\(reference.printed)\" -> page \(page + 1) title \(resolved)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+        statusMessage = title.map { "Previewing \($0)" } ?? "Previewing \(reference.printed)"
     }
 
     // MARK: - Tabs
@@ -8052,6 +8254,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         noteFlushTask = nil
         noteWindowSawKeystrokes = false
         closeReferencePreview()
+        // Switching tabs leaves the document the history was recorded in.
+        clearNavigationHistory()
         isRestoringDocument = false
         annotationSaveInProgress = false
         pageEditBusy = false

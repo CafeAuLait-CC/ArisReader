@@ -19,7 +19,9 @@ public enum LyraTheme {
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
     public static let sidebarBg = Color(nsColor: sidebarColor)
     public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
-    public static let raisedBg = Color(nsColor: adaptive(0xFFFDFA, 0x343029))
+    /// The floating preview's card colour, also cleared behind its transparent figure crops.
+    public static let raisedBgColor = adaptive(0xFFFDFA, 0x343029)
+    public static let raisedBg = Color(nsColor: raisedBgColor)
     public static let menuBg = Color(nsColor: adaptive(0xFFFDFA, 0x343029))
     public static let fieldBg = Color(nsColor: adaptive(0xFFFDFA, 0x1F1D1A))
     public static let canvasBg = Color(nsColor: adaptive(0xE7E2D9, 0x171716))
@@ -81,9 +83,17 @@ public enum LyraTheme {
 
     /// GPU clears are linear; the palette and PDF texture bytes are sRGB.
     static func canvasClear(appearance: NSAppearance) -> [Double] {
-        var color = NSColor.black
-        appearance.performAsCurrentDrawingAppearance { color = canvasColor.usingColorSpace(.sRGB)! }
-        return [color.redComponent, color.greenComponent, color.blueComponent].map {
+        clearComponents(of: canvasColor, appearance: appearance)
+    }
+
+    /// The same conversion for a caller that clears to something other than the reader canvas
+    /// (the floating preview clears figure crops to its own card colour).
+    static func clearComponents(of color: NSColor, appearance: NSAppearance) -> [Double] {
+        var resolved = NSColor.black
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB) ?? color
+        }
+        return [resolved.redComponent, resolved.greenComponent, resolved.blueComponent].map {
             let value = Double($0)
             return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
         }

@@ -103,6 +103,28 @@ struct ReaderChecks {
             try await hostedPreviewChecks(root: root)
             return
         }
+        if CommandLine.arguments.contains("--check-preview-history") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await previewHistoryChecks(
+                url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Preview history checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--check-preview-transparency") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await previewTransparencyChecks(root: root)
+            print("Preview transparency checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--check-section-preview") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await previewSectionChecks(root: root)
+            print("Section preview checks passed")
+            return
+        }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`ArisReaderChecks --check-transitions .`).
         if CommandLine.arguments.contains("--check-transitions") {
@@ -476,6 +498,9 @@ struct ReaderChecks {
         try await hostedPreviewChecks(root: root)
         try await transitionChecks(root: root)
         try await previewChecks(url: b)
+        try await previewHistoryChecks(url: b)
+        try await previewTransparencyChecks(root: root)
+        try await previewSectionChecks(root: root)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()
         try await previewPanelSessionChecks(url: b)

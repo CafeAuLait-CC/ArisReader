@@ -2067,6 +2067,63 @@ def main() -> int:
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
 
+    # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at
+    #     "Appendix A"; the destination of the first is in the outline (so the preview title comes
+    #     from there) and the second is deliberately not (so the reference's own text is used).
+    #     The link boxes cover the whole line, which is how a producer that links only the
+    #     numeral is modelled: the classifier reads the line, not just the box.
+    section_pages = [
+        (
+            text_page(
+                "Linking",
+                "section references in running text",
+                ["See Section 2 for the method.", "Appendix A lists the parameters."],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "2 Method",
+                "the section the body points at",
+                ["The method has three steps."],
+            ),
+            0,
+        ),
+        (
+            text_page(
+                "Appendix A Parameters",
+                "the appendix the body points at",
+                ["Every parameter is listed here."],
+            ),
+            0,
+        ),
+    ]
+    section_annotations = {
+        0: [
+            # Page object numbers are 4 + 2 * index: page 0 = 4, page 1 = 6, page 2 = 8.
+            annotation("Link", body_line_box(0, 523), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+            annotation("Link", body_line_box(1, 523), extra="/Border [0 0 0] /Dest [8 0 R /Fit]"),
+        ]
+    }
+    section_outline = [{"title": "2 Method", "page": 1, "children": []}]
+    path = out_dir / "section-references.pdf"
+    path.write_bytes(build_pdf(section_pages, section_annotations, outline=section_outline))
+    print(f"  {path}  ({path.stat().st_size} bytes, 3 page(s), 2 section links, 1 outline entry)")
+
+    # 13) T4.51: a page with no text and four known tones, so the alpha profile of a transparent
+    #     region can be measured at exact pixels: unpainted paper (clear), a near-white patch, a
+    #     light-grey patch, a mid-grey patch, a black patch, and a 0.5 pt light-grey table rule.
+    alpha_content = "\n".join([
+        "0.95 0.95 0.95 rg 72 700 120 60 re f",
+        "0.8 0.8 0.8 rg 72 600 120 60 re f",
+        "0.5 0.5 0.5 rg 240 600 120 60 re f",
+        "0 0 0 rg 408 600 120 60 re f",
+        "0.8 0.8 0.8 RG 0.5 w 72 500 m 523 500 l S",
+    ])
+    path = out_dir / "alpha-crop.pdf"
+    path.write_bytes(build_pdf([(alpha_content, 0)]))
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, tone patches + light-grey rule)")
+
     # 5) Annotations written into the file: the reader has to find them without this
     #    application ever having written them. Kept as its own entry because it is the only
     #    fixture with an `/Annots` array, and because the widths above are what the existing

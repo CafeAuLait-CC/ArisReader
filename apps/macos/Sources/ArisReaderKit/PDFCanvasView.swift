@@ -251,6 +251,18 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// The colour the GPU clears to behind transparent texture pixels.
+    ///
+    /// `nil` keeps the reader canvas colour. The floating preview sets its own card colour for
+    /// figure/table crops: their page background is transparent, so whatever the canvas clears
+    /// to is what the crop's margin becomes.
+    public var canvasClearColor: NSColor? {
+        didSet {
+            guard oldValue != canvasClearColor else { return }
+            markNeedsRender()
+        }
+    }
+
     /// Width of the widest page in points; used to centre narrow documents.
     public var contentWidthPt: CGFloat = 0 {
         didSet {
@@ -1095,7 +1107,9 @@ public final class MetalCanvasView: NSView {
             traceLayer.traceSurface = surfaceId
             traceLayer.traceY = Double(scrollYPt)
         }
-        let clear = LyraTheme.canvasClear(appearance: effectiveAppearance)
+        let clear = canvasClearColor.map {
+            LyraTheme.clearComponents(of: $0, appearance: effectiveAppearance)
+        } ?? LyraTheme.canvasClear(appearance: effectiveAppearance)
         var stats = ArisFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
@@ -1220,6 +1234,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let zoom: CGFloat
     private let contentWidthPt: CGFloat
     private let paperAppearance: PaperAppearance
+    private let canvasClearColor: NSColor?
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
     private let annotationTool: AnnotationTool
@@ -1262,6 +1277,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         zoom: CGFloat = 1.0,
         contentWidthPt: CGFloat = 0,
         paperAppearance: PaperAppearance = .original,
+        canvasClearColor: NSColor? = nil,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
         annotationTool: AnnotationTool = .select,
@@ -1300,6 +1316,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.zoom = zoom
         self.contentWidthPt = contentWidthPt
         self.paperAppearance = paperAppearance
+        self.canvasClearColor = canvasClearColor
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
         self.annotationTool = annotationTool
@@ -1366,6 +1383,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
         view.paperAppearance = paperAppearance
+        view.canvasClearColor = canvasClearColor
         view.annotationMarks = annotationMarks
         view.annotationPageFrames = annotationPageFrames
         view.annotationTool = annotationTool
