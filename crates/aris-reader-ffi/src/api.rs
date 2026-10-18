@@ -842,6 +842,16 @@ impl ArisDocument {
     /// The tile path proves PDFium's matrix rendering is exact; this exposes the same
     /// capability for a rectangle the caller chooses, which is what a figure or table preview
     /// needs (a citation points at a region, not at a whole page).
+    ///
+    /// `transparent_background` asks for the page's own paper to be left unpainted, so the
+    /// returned bitmap has an alpha channel: white page background becomes alpha 0 while every
+    /// mark the PDF draws keeps its coverage (a light-grey rule stays opaque grey, not
+    /// translucent grey). PDF pages paint no paper themselves, so this is the renderer's native
+    /// output rather than a colour key. The alpha is **straight (unpremultiplied)** — the form
+    /// the canvas's alpha-over blend consumes — and the opaque path is byte-for-byte unchanged.
+    // The six geometry arguments are the shape the C ABI exposes; `transparent_background` is
+    // the only new axis and splitting them into a record would make the Swift call site worse.
+    #[allow(clippy::too_many_arguments)]
     pub fn rasterize_region(
         &self,
         page: u32,
@@ -850,6 +860,7 @@ impl ArisDocument {
         y_pt: f64,
         width_pt: f64,
         height_pt: f64,
+        transparent_background: bool,
     ) -> Result<PageBitmap, ArisFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(ArisFfiError::InvalidArgument {
@@ -900,8 +911,14 @@ impl ArisDocument {
                 message: "region dimensions exceed the renderer's supported range".to_string(),
             });
         }
-        let request =
+        let mut request =
             RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+        if transparent_background {
+            // A zero-alpha clear: the page background stays clear, the content PDFium draws
+            // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
+            // alpha-over, which weights it by zero.
+            request.background = [0, 0, 0, 0];
+        }
         let tile = self.backend.rasterize(&request)?;
 
         Ok(PageBitmap {
@@ -5136,7 +5153,7 @@ mod tests {
         );
 
         let region = document
-            .rasterize_region(0, 1000.0, 0.0, 0.0, 595.0, 842.0)
+            .rasterize_region(0, 1000.0, 0.0, 0.0, 595.0, 842.0, false)
             .expect("rasterize bounded region");
         assert!(region.scale_used < 1000.0);
         assert_eq!((region.width_pt, region.height_pt), (595.0, 842.0));
@@ -5147,17 +5164,34 @@ mod tests {
         );
 
         assert!(matches!(
-            document.rasterize_region(0, 1.0, f64::NAN, 0.0, 10.0, 10.0),
+            document.rasterize_region(0, 1.0, f64::NAN, 0.0, 10.0, 10.0, false),
             Err(ArisFfiError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            document.rasterize_region(0, 1.0, 0.0, 0.0, f64::INFINITY, 10.0),
+            document.rasterize_region(0, 1.0, 0.0, 0.0, f64::INFINITY, 10.0, false),
             Err(ArisFfiError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            document.rasterize_region(0, 1.0, 0.0, 0.0, 10_000.0, 10.0),
+            document.rasterize_region(0, 1.0, 0.0, 0.0, 10_000.0, 10.0, false),
             Err(ArisFfiError::InvalidArgument { .. })
         ));
+
+        // The transparent crop path: the page's unpainted paper becomes alpha 0 while the
+        // fixture's black text stays opaque. This is the flag the figure preview asks for.
+        let transparent = document
+            .rasterize_region(0, 1.0, 0.0, 0.0, 595.0, 842.0, true)
+            .expect("rasterize transparent region");
+        let pixels = transparent.pixels.as_chunks::<4>().0;
+        assert!(
+            pixels.iter().any(|pixel| pixel[3] == 0),
+            "transparent crop must leave the paper clear"
+        );
+        assert!(
+            pixels
+                .iter()
+                .any(|pixel| pixel[3] == 255 && pixel[0] < 32 && pixel[1] < 32 && pixel[2] < 32),
+            "transparent crop must keep the fixture's black text opaque"
+        );
     }
 
     /// The thumbnail path asks PDFium to burn the file's annotations into the raster; the canvas

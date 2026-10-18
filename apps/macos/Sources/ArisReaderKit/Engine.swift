@@ -1165,6 +1165,12 @@ public struct OutlineEntry: Sendable, Identifiable {
     public let page: Int?
     public let depth: Int
     public var id: String { "\(depth):\(page ?? -1):\(title)" }
+
+    public init(title: String, page: Int?, depth: Int) {
+        self.title = title
+        self.page = page
+        self.depth = depth
+    }
 }
 
 /// One search hit: a character range in a page's text layer.
@@ -1311,13 +1317,18 @@ public protocol PDFEngine: AnyObject {
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
     /// Rasterizes one rectangle of a page, in view-space points.
+    ///
+    /// `transparentBackground` leaves the page's unpainted paper clear (alpha 0) instead of
+    /// white, so a figure or table crop can sit on the preview panel's own colour. Content keeps
+    /// its own opacity: a light-grey rule is opaque grey, not a translucent one.
     func rasterizeRegion(
         page: Int,
         scale: CGFloat,
         xPt: CGFloat,
         yPt: CGFloat,
         widthPt: CGFloat,
-        heightPt: CGFloat
+        heightPt: CGFloat,
+        transparentBackground: Bool
     ) async throws -> PageImage
     /// Links on a page, in view space (empty when the page has none).
     func links(_ page: Int) async throws -> [DocumentLink]
@@ -1897,7 +1908,8 @@ public final class RustEngine: PDFEngine {
         xPt: CGFloat,
         yPt: CGFloat,
         widthPt: CGFloat,
-        heightPt: CGFloat
+        heightPt: CGFloat,
+        transparentBackground: Bool
     ) async throws -> PageImage {
         guard let document else {
             throw NSError(
@@ -1919,7 +1931,8 @@ public final class RustEngine: PDFEngine {
                         xPt: Double(xPt),
                         yPt: Double(yPt),
                         widthPt: Double(widthPt),
-                        heightPt: Double(heightPt)
+                        heightPt: Double(heightPt),
+                        transparentBackground: transparentBackground
                     )
                     continuation.resume(
                         returning: PageImage(
@@ -3059,7 +3072,8 @@ public final class MockEngine: PDFEngine {
         xPt: CGFloat,
         yPt: CGFloat,
         widthPt: CGFloat,
-        heightPt: CGFloat
+        heightPt: CGFloat,
+        transparentBackground: Bool
     ) async throws -> PageImage {
         throw NSError(
             domain: "Lyra",
@@ -3116,6 +3130,16 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
+    /// The text those characters spell, with the same Unicode-scalar mapping `copySelection`
+    /// uses. Empty when the range is empty or contains no decodable scalar.
+    public func string(in range: ClosedRange<Int>) -> String {
+        guard !chars.isEmpty else { return "" }
+        let clamped = range.clamped(to: 0...(chars.count - 1))
+        guard !clamped.isEmpty else { return "" }
+        let scalars = chars[clamped].compactMap { Unicode.Scalar($0.unicode) }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
     /// The character range whose glyphs a box on the page covers — the inverse of
     /// [`selectionRects(in:)`], used to select the text under an annotation the PDF carries.
     ///

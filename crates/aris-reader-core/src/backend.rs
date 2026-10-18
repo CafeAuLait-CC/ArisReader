@@ -25,6 +25,11 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RasterFormat {
     /// BGRA, 8 bits per channel, **premultiplied alpha** — maps directly to `wgpu::TextureFormat::Bgra8UnormSrgb`, zero conversion.
+    ///
+    /// A raster requested with a transparent [`RasterRequest::background`] carries **straight
+    /// (unpremultiplied)** coverage alpha instead: PDFium composites its marks onto the cleared
+    /// buffer and the canvas's alpha-over blend consumes that form. Opaque pixels are identical
+    /// under either interpretation, so the opaque page and tile paths are unaffected.
     Bgra8Premultiplied,
 }
 
@@ -62,7 +67,12 @@ pub struct RasterRequest {
     pub region: Option<Rect>,
     pub format: RasterFormat,
     pub flags: RasterFlags,
-    /// Background color (RGBA, not premultiplied); the PDF page itself may be transparent.
+    /// Background colour (RGBA, not premultiplied); the PDF page itself may be transparent.
+    ///
+    /// PDF pages paint no paper of their own, so a zero-alpha clear leaves the page background
+    /// untouched and PDFium's coverage becomes the bitmap's alpha channel. That alpha is
+    /// **straight (unpremultiplied)**, which is the form the canvas's alpha-over blend consumes;
+    /// with the opaque white default every pixel is opaque and the distinction does not arise.
     pub background: [u8; 4],
 }
 

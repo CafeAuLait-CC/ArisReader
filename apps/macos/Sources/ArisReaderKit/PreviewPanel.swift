@@ -159,6 +159,83 @@ public enum ReferencePreviewLayout {
     }
 }
 
+// MARK: - Section references
+
+/// A printed reference to a section rather than to a work or a figure.
+///
+/// The reader clicks the running text, so the only reliable evidence for "this is a section
+/// reference" is the text itself: a link annotation says where it goes, not what it means. The
+/// printed form (`Sec. 2`, `§3.2`, `Chapter IV`, `Appendix A`) and the designation that follows it
+/// are both kept, because the designation is what picks the right outline entry and the printed
+/// form is the fallback title when the document has no outline.
+public struct SectionReference: Equatable, Sendable {
+    /// The reference as printed, whitespace collapsed: `Sec. 2`, `Appendix A`.
+    public let printed: String
+    /// What the reference names, without its prefix: `2`, `3.2`, `IV`, `A`.
+    public let designation: String
+
+    public init(printed: String, designation: String) {
+        self.printed = printed
+        self.designation = designation
+    }
+}
+
+/// Recognises `Sec.` / `Chapter` / `Appendix` references and resolves their titles.
+public enum SectionReferenceText {
+    /// Prefix forms a paper actually prints. Roman numerals, letters and dotted numbers are the
+    /// designation; `Figure`, `Table`, `Eq.` and `Fig.` deliberately do not match, so their own
+    /// click paths keep owning those references.
+    private static let pattern = #"(?i)(?<![A-Za-z])(?:§\s*|(?:sections?|sect|secs?|chapters?|ch|appendices|appendix|apps?|parts?)\.?\s+)((?:[A-Z]{1,2}|\d+)(?:\.\d+)*|[IVXLC]+)(?![A-Za-z0-9])"#
+
+    /// The first section reference in `text`, when it has one.
+    ///
+    /// The caller passes the **whole line** the click landed on, not only the link box: papers
+    /// routinely link only the numeral of "Section 2", and the word that gives it meaning is
+    /// outside the box.
+    public static func reference(in text: String) -> SectionReference? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let ns = text as NSString
+        guard let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) else {
+            return nil
+        }
+        let printed = ns.substring(with: match.range)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        let designation = ns.substring(with: match.range(at: 1))
+        guard !printed.isEmpty, !designation.isEmpty else { return nil }
+        return SectionReference(printed: printed, designation: designation)
+    }
+
+    /// The outline entry on `page` that names `designation`, or the page's shallowest entry.
+    ///
+    /// A destination's page can be the whole chapter while the reference names one of its
+    /// sections, so a designation match wins over depth; without one, the shallowest entry is the
+    /// page's own heading. `nil` means the document has no outline entry for the page and the
+    /// caller falls back to the reference's printed text.
+    public static func title(
+        from outline: [OutlineEntry],
+        page: Int,
+        designation: String?
+    ) -> String? {
+        let candidates = outline.filter {
+            $0.page == page
+                && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !candidates.isEmpty else { return nil }
+        if let designation, !designation.isEmpty {
+            let escaped = NSRegularExpression.escapedPattern(for: designation)
+            let token = #"(?<![A-Za-z0-9.])"# + escaped + #"(?![A-Za-z0-9.])"#
+            let matches = candidates.filter {
+                $0.title.range(of: token, options: .regularExpression) != nil
+            }
+            if let best = matches.min(by: { $0.depth < $1.depth }) {
+                return best.title
+            }
+        }
+        return candidates.min(by: { $0.depth < $1.depth })?.title
+    }
+}
+
 // MARK: - Model
 
 /// Complete bibliography entries and their title headings for the current preview.
@@ -214,6 +291,10 @@ public final class ReferencePreviewPanel: NSPanel, NSWindowDelegate {
     /// controller applies itself).
     package var onUserFrameChange: ((CGRect) -> Void)?
     package var onCancel: (() -> Void)?
+    /// ⌘[ while the panel is key. The Reading menu carries the same shortcut; handling it here
+    /// too means Back still works when the menu item is unavailable because the preview, not the
+    /// reader window, owns the key focus.
+    package var onGoBack: (() -> Void)?
 
     /// The screen area the panel must stay inside. Injectable so the check harness can assert the
     /// limits without depending on the displays of the machine running it.
@@ -261,8 +342,14 @@ public final class ReferencePreviewPanel: NSPanel, NSWindowDelegate {
     public override var canBecomeMain: Bool { false }
 
     public override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onCancel?() }
-        else { super.keyDown(with: event) }
+        if event.keyCode == 53 {
+            onCancel?()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers == "[" {
+            onGoBack?()
+        } else {
+            super.keyDown(with: event)
+        }
     }
 
     /// The area the panel is kept inside: the screen its own visible frame, or the injected one
@@ -472,6 +559,7 @@ public final class ReferencePreviewPanelController {
         panel.delegate = nil
         panel.onUserFrameChange = nil
         panel.onCancel = nil
+        panel.onGoBack = nil
         self.panel = nil
         hosting = nil
         grip = nil
@@ -502,6 +590,7 @@ public final class ReferencePreviewPanelController {
             self?.userAdjustedFrame = true
             self?.rememberedFrame = frame
         }
+        panel.onGoBack = { [weak state] in state?.goBack() }
         let hosting = NSHostingView(rootView: ReferencePreviewPanelContent(state: state, model: model))
         hosting.autoresizingMask = [.width, .height]
         let container = NSView(frame: CGRect(origin: .zero, size: PreviewPanelGeometry.defaultSize))
@@ -569,7 +658,8 @@ public final class ReferencePreviewPanelController {
         key: FitKey,
         area: CGRect
     ) -> CGSize {
-        let preferredWidth: CGFloat = preview.kind == .reference ? 520 : 560
+        let preferredWidth: CGFloat =
+            preview.kind == .reference || preview.kind == .section ? 520 : 560
         let width = userAdjustedFrame ? (panel?.frame.width ?? preferredWidth)
             : min(preferredWidth, PreviewPanelGeometry.maximumSize(onScreen: area).width)
         let height: CGFloat
@@ -577,6 +667,16 @@ public final class ReferencePreviewPanelController {
         case .reference:
             // Measure the full citation and its title using the same column as the view.
             height = model.fullContentHeight(panelWidthPt: width)
+        case .section:
+            // A section preview is a title, a reference line, and the page link: a compact
+            // card, never an image. The message for a missing title is part of the height.
+            let column = ReferencePreviewLayout.textColumnWidth(panelWidthPt: width)
+            let title = preview.sectionTitle ?? preview.sectionReference
+            let titleHeight = ReferencePreviewLayout.textHeight(title ?? "", widthPt: column)
+            let referenceHeight = preview.sectionReference == nil
+                ? 0
+                : ReferencePreviewLayout.textHeight(preview.sectionReference ?? "", widthPt: column)
+            height = max(160, 96 + titleHeight + referenceHeight)
         case .figure, .page:
             let imageHeight: CGFloat
             if let region = preview.region {
@@ -624,6 +724,7 @@ struct ReferencePreviewPanelContent: View {
                 header(preview)
                 switch preview.kind {
                 case .reference: referenceBody(preview)
+                case .section: sectionBody(preview)
                 case .figure, .page: imageBody(preview)
                 }
             }
@@ -639,6 +740,22 @@ struct ReferencePreviewPanelContent: View {
     private func header(_ preview: AppState.ReferencePreview) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
+                // The one control that undoes a jump the preview started. It stays visible
+                // (disabled) so the affordance does not appear only after it is needed, and
+                // "Go to page" keeps the panel open precisely so this button remains reachable.
+                Button {
+                    state.goBack()
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!state.canGoBack)
+                .help(state.canGoBack
+                      ? "Return to where you were before this jump"
+                      : "No preview jump to go back from")
+
                 Text(preview.title).font(.headline).lineLimit(1)
                 Spacer(minLength: 0)
                 Button { state.closeReferencePreview() } label: {
@@ -647,14 +764,20 @@ struct ReferencePreviewPanelContent: View {
                 .buttonStyle(.plain)
                 .help("Close preview")
             }
-            HStack {
-                Text("From \(preview.source) · page \(preview.page + 1)")
+            HStack(spacing: 4) {
+                Text("From \(preview.source) ·")
                     .font(.caption).foregroundStyle(.secondary)
+                // The page number is a jump target in every preview, including the text-only
+                // section one; the explicit "Go to page" button below stays for discoverability.
+                Button("page \(preview.page + 1)") {
+                    state.jumpFromPreview(to: preview.page)
+                }
+                .buttonStyle(.link)
+                .font(.caption)
                 Spacer()
                 Button("Full page") { state.showFullPreviewPage() }
                 Button("Go to page") {
-                    state.gotoPage(preview.page)
-                    state.closeReferencePreview()
+                    state.jumpFromPreview(to: preview.page)
                 }
             }
             .font(.caption)
@@ -686,16 +809,65 @@ struct ReferencePreviewPanelContent: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// A section, chapter or appendix destination: the title (in the header) and the printed
+    /// reference as text. A picture of the target page would tell the reader nothing the title
+    /// does not, so this body never asks for a raster and never shows an empty image box.
+    private func sectionBody(_ preview: AppState.ReferencePreview) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let title = preview.sectionTitle {
+                        // Repeated from the one-line header so the whole title is selectable and
+                        // wraps, which is the point of replacing the screenshot with text.
+                        Text(title)
+                            .font(.title3)
+                            .fontWeight(.semibold)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let reference = preview.sectionReference {
+                        Text(reference)
+                            .font(.system(size: ReferencePreviewLayout.textFontSize, weight: .semibold))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if preview.sectionTitle == nil {
+                        Text(preview.sectionReference == nil
+                             ? "The section title could not be determined."
+                             : "No outline entry names this page, so the reference above is the title.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button {
+                state.jumpFromPreview(to: preview.page)
+            } label: {
+                Label("Go to page \(preview.page + 1)", systemImage: "arrow.right")
+            }
+            .buttonStyle(.link)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
     /// A figure, table or plain page destination: the rendered region, because the picture is the
     /// point.
     private func imageBody(_ preview: AppState.ReferencePreview) -> some View {
-        ZStack {
+        // A figure/table crop is rasterized with a transparent page background, so the canvas
+        // must clear to the panel's own colour. Clearing to the reader-canvas grey instead would
+        // put the white-card problem back as a grey card, and in the dark theme as a near-black
+        // one. A whole-page preview keeps the canvas colour: there the paper is the subject.
+        let crop = preview.kind == .figure
+        return ZStack {
             PDFCanvasView(
                 pages: state.referencePreviewPages,
                 scrollYPt: state.referencePreviewScrollYPt,
                 zoom: state.referencePreviewZoom,
                 contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
                 paperAppearance: appearance.mode,
+                canvasClearColor: crop ? LyraTheme.raisedBgColor : nil,
                 onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onViewportSize: { size in state.setReferencePreviewViewport(size) },
@@ -711,7 +883,7 @@ struct ReferencePreviewPanelContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(LyraTheme.canvasBg)
+        .background(crop ? LyraTheme.raisedBg : LyraTheme.canvasBg)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 

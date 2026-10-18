@@ -2363,4 +2363,84 @@ mod tests {
             "channels look swapped (red={red}, blue={blue}); expected native BGRA"
         );
     }
+    /// A transparent region is the same picture as an opaque one composited over white.
+    ///
+    /// This is what makes a figure crop sit on the panel background instead of on a white card:
+    /// the page paints no background of its own, so a zero-alpha clear is left untouched wherever
+    /// the page has no content. It also pins the *kind* of alpha PDFium produces: the comparison
+    /// below is `colour × alpha + white × (1 − alpha)`, i.e. straight (unpremultiplied) coverage,
+    /// which is what the canvas's alpha-over blend consumes. A premultiplied producer would fail
+    /// this test (its edge pixels would composite too dark).
+    #[test]
+    fn a_transparent_region_matches_the_same_region_composited_over_white() {
+        let fixture = crate::test_support::fixture("text-page.pdf");
+        if !crate::is_available() {
+            eprintln!("skipping: fixture or PDFium unavailable");
+            return;
+        }
+
+        let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
+        let region = Rect::new(40.0, 40.0, 500.0, 220.0);
+        let mut transparent_request = RasterRequest::full_page(PageIndex(0), 2.0);
+        transparent_request.region = Some(region);
+        transparent_request.background = [0, 0, 0, 0];
+        let transparent = backend
+            .rasterize(&transparent_request)
+            .expect("transparent tile");
+
+        let mut opaque_request = RasterRequest::full_page(PageIndex(0), 2.0);
+        opaque_request.region = Some(region);
+        let opaque = backend.rasterize(&opaque_request).expect("opaque tile");
+
+        assert_eq!(transparent.size, opaque.size);
+        assert_eq!(transparent.stride, opaque.stride);
+
+        let mut clear = 0usize;
+        let mut solid = 0usize;
+        let mut antialiased = 0usize;
+        let mut worst_delta = 0i32;
+        let mut mismatched = 0usize;
+        for (index, (transparent_pixel, opaque_pixel)) in transparent
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(opaque.pixels.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            let alpha = i32::from(transparent_pixel[3]);
+            match alpha {
+                0 => clear += 1,
+                255 => solid += 1,
+                _ => antialiased += 1,
+            }
+            for channel in 0..3 {
+                // Straight alpha over white.
+                let composited =
+                    (i32::from(transparent_pixel[channel]) * alpha + 255 * (255 - alpha) + 127)
+                        / 255;
+                let delta = (composited - i32::from(opaque_pixel[channel])).abs();
+                worst_delta = worst_delta.max(delta);
+                if delta > 2 {
+                    mismatched += 1;
+                    if mismatched == 1 {
+                        eprintln!(
+                            "first mismatch at pixel {index}: transparent {transparent_pixel:?} vs opaque {opaque_pixel:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            clear > 0 && solid > 0 && antialiased > 0,
+            "fixture must exercise clear, solid and antialiased pixels: clear={clear}, solid={solid}, antialiased={antialiased}"
+        );
+        assert!(
+            mismatched == 0,
+            "{mismatched} channel(s) differ from the opaque render; worst {worst_delta}/255"
+        );
+        eprintln!(
+            "transparent region: {clear} clear, {solid} opaque, {antialiased} antialiased pixels; worst composite delta {worst_delta}/255"
+        );
+    }
 }
