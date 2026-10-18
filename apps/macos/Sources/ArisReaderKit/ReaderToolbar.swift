@@ -8,45 +8,64 @@ struct TabStrip: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        HStack(spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
+        GeometryReader { geometry in
+            // Reserve the add button and a small draggable gap before dividing the remaining
+            // space equally. Filename length never participates in a tab's width.
+            let count = CGFloat(max(1, state.tabs.count))
+            let available = max(0, geometry.size.width - 20 - 24 - 6)
+            let tabWidth = min(250, max(96, (available - 32 - CGFloat(state.tabs.count) * 4) / count))
+            let stripWidth = min(available, CGFloat(state.tabs.count) * (tabWidth + 4) + 32)
+            HStack(spacing: 6) {
+                ScrollViewReader { scroll in
+                    ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 4) {
-                            Button { state.selectTab(index) } label: {
-                                Label(tab.title, systemImage: "doc.text")
-                                    .lineLimit(1).frame(minWidth: 80, maxWidth: 180, alignment: .leading)
-                                    .padding(.leading, 12).padding(.vertical, 10)
+                            ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
+                                HStack(spacing: 4) {
+                                    Button { state.selectTab(index) } label: {
+                                        Label(tab.title, systemImage: "doc.text")
+                                            .lineLimit(1).truncationMode(.tail)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.leading, 12).padding(.vertical, 10)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityValue(index == state.activeTabIndex ? "Selected" : "")
+                                    Button { state.closeTab(index) } label: {
+                                        Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                                            .frame(width: 24, height: 28)
+                                    }
+                                    .buttonStyle(.plain).help("Close \(tab.title)")
+                                    .accessibilityLabel("Close \(tab.title)")
+                                    .padding(.trailing, 4)
+                                }
+                                .frame(width: tabWidth)
+                                .font(.system(size: 12, weight: index == state.activeTabIndex ? .medium : .regular))
+                                .foregroundStyle(index == state.activeTabIndex ? LyraTheme.textPrimary : LyraTheme.textSecondary)
+                                .background(index == state.activeTabIndex ? LyraTheme.raisedBg : .clear,
+                                            in: UnevenRoundedRectangle(topLeadingRadius: 7, topTrailingRadius: 7))
+                                .overlay(alignment: .bottom) {
+                                    if index == state.activeTabIndex { LyraTheme.accent.frame(height: 2) }
+                                }
+                                .id(tab.id)
+                                .help(tab.title)
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityValue(index == state.activeTabIndex ? "Selected" : "")
-                            Button { state.closeTab(index) } label: {
-                                Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
-                                    .frame(width: 24, height: 28)
-                            }
-                            .buttonStyle(.plain).help("Close \(tab.title)")
-                            .accessibilityLabel("Close \(tab.title)")
-                            .padding(.trailing, 4)
+                            Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
+                                .buttonStyle(LyraToolStyle()).frame(width: 32, height: 32)
+                                .help("Open a PDF in a new tab (⌘O)")
+                                .accessibilityLabel("Open PDF").id("new-tab")
                         }
-                        .font(.system(size: 12, weight: index == state.activeTabIndex ? .medium : .regular))
-                        .foregroundStyle(index == state.activeTabIndex ? LyraTheme.textPrimary : LyraTheme.textSecondary)
-                        .background(index == state.activeTabIndex ? LyraTheme.raisedBg : .clear,
-                                    in: UnevenRoundedRectangle(topLeadingRadius: 7, topTrailingRadius: 7))
-                        .overlay(alignment: .bottom) {
-                            if index == state.activeTabIndex { LyraTheme.accent.frame(height: 2) }
-                        }
-                        .help(tab.title)
                     }
-                    Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
-                        .buttonStyle(LyraToolStyle()).help("Open a PDF in a new tab (⌘O)")
-                        .accessibilityLabel("Open PDF")
+                    .onChange(of: state.activeTabIndex) { _, index in
+                        guard let index, state.tabs.indices.contains(index) else { return }
+                        if index == state.tabs.count - 1 { scroll.scrollTo("new-tab", anchor: .trailing) }
+                        else { scroll.scrollTo(state.tabs[index].id) }
+                    }
                 }
+                .frame(width: stripWidth)
+                ReaderWindowDragArea().frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityHidden(true)
             }
-            .frame(maxWidth: CGFloat(state.tabs.count) * 250 + 40)
-            ReaderWindowDragArea().frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityHidden(true)
+            .padding(.horizontal, 10).padding(.top, 6)
         }
-        .padding(.horizontal, 10).padding(.top, 6)
         .frame(height: Self.height)
         .background(LyraTheme.tabbarBg)
         .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }

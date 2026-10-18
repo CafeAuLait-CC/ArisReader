@@ -228,6 +228,8 @@ Lyra follows the system appearance with a warm cream/gold light palette and warm
 palette. Document tabs share the top window row with the native window controls; the separate
 native title strip is hidden and the empty tab-bar area moves the window. The native window
 buttons are centred vertically in that row, with the new-tab button following the document tabs.
+Tabs start at a fixed 250pt width and share the available space equally when the row fills;
+very large tab sets scroll horizontally at a readable minimum width.
 Toolbar drop-downs open below their controls in compact Lyra panels; document and thumbnail
 context menus use the same styling. Icons, grouped commands, hover states, and
 arrow-key/Return/Escape navigation are supported. The second toolbar button opens a full-window
