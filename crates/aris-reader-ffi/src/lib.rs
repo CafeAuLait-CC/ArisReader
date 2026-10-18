@@ -39,6 +39,7 @@ use std::sync::Mutex;
 uniffi::setup_scaffolding!();
 
 pub mod api;
+mod index_cache;
 pub use api::{ArisEngine, ArisFfiError, DocumentSummary};
 
 /// ABI version. **Must be bumped whenever the signature or semantics of any exported function changes**.

@@ -109,7 +109,7 @@ const WORD_MIN: usize = 3;
 /// exist. [`CitationStyle::numeric_only`] is what a caller with no bibliography gets: it detects
 /// the bracket and author-year styles exactly as before and never invents a superscript or
 /// parenthesised citation.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CitationStyle {
     /// Every numeric label the bibliography carries.
     labels: BTreeSet<u32>,

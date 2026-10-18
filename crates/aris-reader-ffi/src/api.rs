@@ -10,6 +10,10 @@
 //! The full object graph (long-lived documents, sessions, viewports, event streams)
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
+use crate::index_cache::{
+    CacheRead, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
+    disabled_by_environment, read_cache, write_cache,
+};
 use aris_reader_ai::MockProvider;
 use aris_reader_ai::chat::{
     Action as AiAction, ChatPlan, ChatSettings, MergePart, MergePlanRequest, PageChar, PageText,
@@ -29,8 +33,9 @@ use aris_reader_pdfium::{
     backend_description,
 };
 use aris_reader_session::{DocumentLayout, LayoutMode};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
@@ -209,7 +214,7 @@ pub struct PageBitmap {
 /// Where a metadata field came from, as the panel shows it.
 ///
 /// `Absent` is the only correct source of an empty field: "no value" is not a guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum, serde::Serialize, serde::Deserialize)]
 pub enum MetadataSourceKind {
     Absent,
     Xmp,
@@ -222,7 +227,8 @@ pub enum MetadataSourceKind {
 }
 
 /// One field with its value(s) and the source that produced them.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataFieldRecord {
     pub values: Vec<String>,
     pub source: MetadataSourceKind,
@@ -237,7 +243,8 @@ pub struct MetadataFieldRecord {
 }
 
 /// The recognised metadata for one document, plus the BibTeX its values generate.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentMetadataRecord {
     pub title: MetadataFieldRecord,
     pub authors: MetadataFieldRecord,
@@ -333,13 +340,26 @@ pub struct ArisDocument {
     layout: Mutex<Option<(ReaderLayout, f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list, with the citation style it implies (scanning the tail pages is
     /// not free, and neither ever changes while the document is open).
-    references: Mutex<Option<ReferenceCache>>,
+    ///
+    /// `Arc` so [`ArisDocument::citations`] can borrow the style without cloning a hundred
+    /// entries per page. The persistent index cache stores exactly these records.
+    references: Mutex<Option<Arc<ReferenceCache>>>,
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
     annotations: Mutex<Option<Vec<AnnotationRecord>>>,
     /// Recognised metadata; page one does not change while the document is open.
     metadata: Mutex<Option<DocumentMetadataRecord>>,
+    /// Outline, flattened once. Cheap to store and part of the cached index, so a warm open does
+    /// not touch the PDF's outline tree at all.
+    outline: Mutex<Option<Vec<OutlineEntry>>>,
+    /// Citation spans per page, in view space. Filled by the reference scan (which already has
+    /// every page's text in hand) and from the cache; pages outside the scan window fall back to
+    /// a one-page read. This is what makes a warm click independent of the PDF text layer.
+    citations: Mutex<Option<std::collections::BTreeMap<u32, Vec<CitationRecord>>>>,
+    /// State of the persistent index cache: whether it was looked up, what was found, and the
+    /// timings/counters the checks and the measurement report.
+    index: Mutex<IndexRuntime>,
     /// Set when [`ArisDocument::replace_with_annotations`] has replaced the file on disk. The
     /// in-memory PDFium document is the pre-replacement one, so every content read would be a
     /// stale answer; the shell reopens the file immediately and this makes a missed reopen a
@@ -359,6 +379,89 @@ pub struct ArisDocument {
 struct ReferenceCache {
     records: Vec<ReferenceRecord>,
     style: aris_reader_text::CitationStyle,
+}
+
+/// What the persistent index cache lookup found when a document was first indexed.
+///
+/// Reported for checks and measurements (and visible in the app's stderr log), not shown in the
+/// UI. `Hit` means no index component was derived from the PDF for this document instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexCacheOutcome {
+    /// No index access has happened yet, so nothing was looked up.
+    NotAttempted,
+    /// A current-format cache matched the PDF's content identity.
+    Hit,
+    /// No cache file exists.
+    Missing,
+    /// A cache exists but was built from different bytes (or a different page count).
+    Stale,
+    /// The cache could not be parsed. A complete re-index may replace it.
+    Corrupt,
+    /// The cache has fields this build does not understand; it is preserved and ignored.
+    Incompatible,
+    /// The cache's format version is newer than this build; it is preserved and ignored.
+    FutureVersion,
+    /// The cache is disabled for this process (`ARIS_READER_INDEX_CACHE`).
+    Disabled,
+    /// The cache could not be read (permissions, I/O, oversize); it is preserved.
+    Unreadable,
+}
+
+/// Counters and timings for one document's index cache.
+///
+/// All times are microseconds spent in the current process for the current document instance.
+/// `derived_parts` is the number of index components built from the PDF (references, figures,
+/// metadata, outline); a cache hit leaves it at zero, which is the check that a second open did
+/// not reparse anything.
+#[derive(Clone, Debug)]
+pub struct IndexCacheReport {
+    pub outcome: IndexCacheOutcome,
+    pub cache_path: String,
+    pub cache_bytes: u64,
+    /// Time spent hashing the PDF and reading/validating the cache.
+    pub validation_micros: u64,
+    /// Index components derived from the PDF in this document instance.
+    pub derived_parts: u32,
+    /// Total time spent deriving those components.
+    pub derived_micros: u64,
+    /// SHA-256 of the PDF this document's cache is bound to; `None` when hashing was skipped.
+    pub content_sha256: Option<String>,
+    /// True after a read-only/future file was seen or a write failed: this document will not
+    /// write to the cache path.
+    pub write_disabled: bool,
+    /// Last write failure, for diagnostics; `None` when no write was attempted or it succeeded.
+    pub write_error: Option<String>,
+}
+
+/// Mutable cache bookkeeping, guarded by `ArisDocument::index`.
+struct IndexRuntime {
+    attempted: bool,
+    outcome: IndexCacheOutcome,
+    identity: Option<ContentIdentity>,
+    cache_path: Option<PathBuf>,
+    cache_bytes: u64,
+    validation: Duration,
+    derived_parts: u32,
+    derived: Duration,
+    write_disabled: bool,
+    write_error: Option<String>,
+}
+
+impl Default for IndexRuntime {
+    fn default() -> Self {
+        Self {
+            attempted: false,
+            outcome: IndexCacheOutcome::NotAttempted,
+            identity: None,
+            cache_path: None,
+            cache_bytes: 0,
+            validation: Duration::ZERO,
+            derived_parts: 0,
+            derived: Duration::ZERO,
+            write_disabled: false,
+            write_error: None,
+        }
+    }
 }
 
 #[uniffi::export]
@@ -471,6 +574,9 @@ impl ArisDocument {
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
+            outline: Mutex::new(None),
+            citations: Mutex::new(None),
+            index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
         }))
@@ -686,42 +792,44 @@ impl ArisDocument {
     /// Citations in the body text of `page`, boxed in view space.
     ///
     /// A page's citations are not a page-local question any more: a superscript numeral is only
-    /// a citation when the document's bibliography carries its label, so this call now depends
-    /// on [`ArisDocument::references`] and pays its one-time scan the first time it runs. The
-    /// shell loads the reference list when a document opens, so in practice the cache is warm;
-    /// the alternative — guessing on page one and correcting on page twenty — would make the
-    /// same citation clickable or not depending on how far the reader had scrolled.
+    /// a citation when the document's bibliography carries its label, so this call depends on
+    /// the document's reference list and its citation style. The first access builds that index
+    /// (or loads it from the sidecar); the reference scan already holds every scanned page's
+    /// text, so it records each page's spans at the same time. A cached index therefore makes
+    /// this call independent of the PDF text layer for every page inside the scan window.
+    ///
+    /// Pages outside the 120-page scan window still read that one page, exactly as before; the
+    /// result stays identical because it is produced by the same `find_citations_with` call with
+    /// the same style.
     pub fn citations(&self, page: u32) -> Result<Vec<CitationRecord>, ArisFfiError> {
+        self.ensure_index_loaded();
+
+        // Superscript numerals are only reported when the document's own bibliography
+        // corroborates them, which is why this reads the shared style rather than the page.
+        let style = self.reference_cache()?.style.clone();
+        if let Ok(cache) = self.citations.lock()
+            && let Some(cached) = cache.as_ref().and_then(|pages| pages.get(&page))
+        {
+            return Ok(cached.clone());
+        }
+
         let raw = self.backend.raw_text_page(PageIndex(page))?;
         let transform = self
             .backend
             .page_info(PageIndex(page))?
             .geometry
             .page_to_view(1.0);
+        let records = citation_records(&raw, &style, page, transform);
 
-        // Superscript numerals are only reported when the document's own bibliography
-        // corroborates them, which is why this reads the shared style rather than the page.
-        let style = self.reference_cache()?.style;
-
-        Ok(aris_reader_text::find_citations_with(&raw, &style)
-            .into_iter()
-            .map(|citation| {
-                let top_left = Point::new(
-                    citation.rect.origin.x,
-                    citation.rect.origin.y + citation.rect.size.height,
-                );
-                let view = transform.apply(top_left);
-                CitationRecord {
-                    page,
-                    text: citation.text,
-                    labels: citation.labels,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: citation.rect.size.width,
-                    height_pt: citation.rect.size.height,
-                }
-            })
-            .collect())
+        // Remember the page for repeated clicks even when it is outside the scan window. It is
+        // not written back to the sidecar: the cache is complete for every page the scan saw,
+        // and a late page is a one-page read, not a reason to rewrite the document index.
+        if let Ok(mut cache) = self.citations.lock() {
+            cache
+                .get_or_insert_with(std::collections::BTreeMap::new)
+                .insert(page, records.clone());
+        }
+        Ok(records)
     }
 
     /// `Figure N` / `Fig. N` / `Table N` / `Algorithm N` references in the body text of `page`,
@@ -767,6 +875,7 @@ impl ArisDocument {
     /// This is what makes a citation work **without** a link annotation: the shell resolves
     /// `[12]` to an entry and previews the entry's own rectangle.
     pub fn references(&self) -> Result<Vec<ReferenceRecord>, ArisFfiError> {
+        self.ensure_index_loaded();
         Ok(self.reference_cache()?.records.clone())
     }
 
@@ -829,12 +938,14 @@ impl ArisDocument {
     /// image object for a raster figure, and the full page when neither can be bounded reliably
     /// (vector figures, `booktabs` tables with too few rules, algorithms).
     pub fn figures(&self) -> Result<Vec<FigureRecord>, ArisFfiError> {
+        self.ensure_index_loaded();
         if let Ok(cache) = self.figures.lock()
             && let Some(cached) = cache.as_ref()
         {
             return Ok(cached.clone());
         }
 
+        let started = Instant::now();
         let total = self.backend.page_count();
         let scan_end = total.min(120);
         let mut records = Vec::new();
@@ -887,6 +998,8 @@ impl ArisDocument {
         if let Ok(mut cache) = self.figures.lock() {
             *cache = Some(records.clone());
         }
+        self.note_derived(started.elapsed());
+        self.maybe_write_index();
         Ok(records)
     }
 
@@ -932,10 +1045,24 @@ impl ArisDocument {
     /// Document outline, flattened depth-first with a depth per entry.
     ///
     /// Flat is what a sidebar list wants; nesting is carried by `depth` instead of nested
-    /// records, which keeps the FFI surface small.
+    /// records, which keeps the FFI surface small. Stored in the index cache like the rest of
+    /// the derived data: a warm open does not read the outline tree.
     pub fn outline(&self) -> Result<Vec<OutlineEntry>, ArisFfiError> {
+        self.ensure_index_loaded();
+        if let Ok(cache) = self.outline.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+
+        let started = Instant::now();
         let mut entries = Vec::new();
         flatten_outline(&self.backend.outline()?, 0, &mut entries);
+        if let Ok(mut cache) = self.outline.lock() {
+            *cache = Some(entries.clone());
+        }
+        self.note_derived(started.elapsed());
+        self.maybe_write_index();
         Ok(entries)
     }
 
@@ -948,12 +1075,14 @@ impl ArisDocument {
     /// The BibTeX string in the report is generated from exactly these values. After the
     /// reader edits a field, [`generate_bibtex_entry`] regenerates the entry from the draft.
     pub fn metadata(&self) -> Result<DocumentMetadataRecord, ArisFfiError> {
+        self.ensure_index_loaded();
         if let Ok(cache) = self.metadata.lock()
             && let Some(cached) = cache.as_ref()
         {
             return Ok(cached.clone());
         }
 
+        let started = Instant::now();
         let embedded = self.backend.embedded_metadata()?;
         let first_page = self.backend.raw_text_page(PageIndex(0)).ok();
         // The text boxes are in unrotated PDF user space; the footer band is measured there.
@@ -967,6 +1096,8 @@ impl ArisDocument {
         if let Ok(mut cache) = self.metadata.lock() {
             *cache = Some(report.clone());
         }
+        self.note_derived(started.elapsed());
+        self.maybe_write_index();
         Ok(report)
     }
 
@@ -1723,13 +1854,19 @@ impl ArisDocument {
     /// if the bibliography carries its label and the body does not bracket its citations. Both
     /// answers come from this one scan, so the detector can never disagree with the resolver
     /// about which labels exist.
-    fn reference_cache(&self) -> Result<ReferenceCache, ArisFfiError> {
+    ///
+    /// The scan already reads every page's text, so it records each page's citation spans here
+    /// as well. That is the same work a first click on a page would do, done once for the whole
+    /// scan window, and it is what the persistent cache stores.
+    fn reference_cache(&self) -> Result<Arc<ReferenceCache>, ArisFfiError> {
+        self.ensure_index_loaded();
         if let Ok(cache) = self.references.lock()
             && let Some(cached) = cache.as_ref()
         {
-            return Ok(cached.clone());
+            return Ok(Arc::clone(cached));
         }
 
+        let started = Instant::now();
         // Scanning from the front with a cap, rather than only the tail: real papers put the
         // list anywhere from a third of the way in (with appendices after it) to the very end.
         // `find_references` stops as soon as the list ends, so the cost is bounded by the list's
@@ -1841,12 +1978,305 @@ impl ArisDocument {
             });
         }
 
-        let cache = ReferenceCache { records, style };
-        if let Ok(mut guard) = self.references.lock() {
-            *guard = Some(cache.clone());
+        // The body pages are in `pages` already; turn their text into click targets now, with
+        // the same function and style a per-page call would use. Empty pages stay in the map so
+        // a click on them is a lookup, not a second text extraction.
+        let mut citations = std::collections::BTreeMap::new();
+        for (index, text) in &pages {
+            let Some(transform) = document_page_view(&self.backend, &mut transforms, *index) else {
+                continue;
+            };
+            citations.insert(*index, citation_records(text, &style, *index, transform));
         }
+
+        let cache = Arc::new(ReferenceCache { records, style });
+        if let Ok(mut guard) = self.references.lock() {
+            *guard = Some(Arc::clone(&cache));
+        }
+        if let Ok(mut guard) = self.citations.lock() {
+            *guard = Some(citations);
+        }
+        self.note_derived(started.elapsed());
+        self.maybe_write_index();
         Ok(cache)
     }
+}
+
+/// Index-cache bookkeeping and the persistent-index report.
+///
+/// These stay outside the `#[uniffi::export]` block: the shell does not need a new method, and
+/// the report is a Rust-side check/measurement surface. Every accessor above funnels through
+/// [`ArisDocument::ensure_index_loaded`], so the lookup happens exactly once per document.
+impl ArisDocument {
+    /// The cache state for this document, for checks and measurements.
+    ///
+    /// Calling this first performs the one cache lookup (hashing the PDF and reading the
+    /// sidecar); it does not build any index component. `derived_parts` then says how much work
+    /// the following accessors actually did.
+    pub fn index_cache_report(&self) -> IndexCacheReport {
+        self.ensure_index_loaded();
+        if let Ok(runtime) = self.index.lock() {
+            return IndexCacheReport {
+                outcome: runtime.outcome,
+                cache_path: runtime
+                    .cache_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                cache_bytes: runtime.cache_bytes,
+                validation_micros: micros(runtime.validation),
+                derived_parts: runtime.derived_parts,
+                derived_micros: micros(runtime.derived),
+                content_sha256: runtime
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.sha256.clone()),
+                write_disabled: runtime.write_disabled,
+                write_error: runtime.write_error.clone(),
+            };
+        }
+        IndexCacheReport {
+            outcome: IndexCacheOutcome::NotAttempted,
+            cache_path: String::new(),
+            cache_bytes: 0,
+            validation_micros: 0,
+            derived_parts: 0,
+            derived_micros: 0,
+            content_sha256: None,
+            write_disabled: true,
+            write_error: Some("the index cache state is poisoned".to_string()),
+        }
+    }
+
+    /// Looks the sidecar up once and, on a hit, fills every in-memory index component with it.
+    ///
+    /// Lazy by design: opening a document never hashes the file or reads the cache, so the page
+    /// raster and the first paint do not wait for the index. The shell's background loaders are
+    /// what call the accessors that reach this point.
+    fn ensure_index_loaded(&self) {
+        let mut runtime = match self.index.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => return,
+        };
+        if runtime.attempted {
+            return;
+        }
+        runtime.attempted = true;
+
+        let path = cache_path(Path::new(&self.path));
+        runtime.cache_path = Some(path.clone());
+        if disabled_by_environment() {
+            runtime.outcome = IndexCacheOutcome::Disabled;
+            runtime.write_disabled = true;
+            return;
+        }
+
+        let started = Instant::now();
+        let identity = match ContentIdentity::of(Path::new(&self.path)) {
+            Ok(identity) => identity,
+            Err(error) => {
+                runtime.outcome = IndexCacheOutcome::Unreadable;
+                runtime.write_disabled = true;
+                runtime.write_error = Some(format!("could not hash the PDF: {error}"));
+                runtime.validation = started.elapsed();
+                return;
+            }
+        };
+        runtime.cache_bytes = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        runtime.identity = Some(identity.clone());
+
+        match read_cache(&path, &identity, self.backend.page_count()) {
+            CacheRead::Hit(file) => {
+                let IndexCacheFile {
+                    outline,
+                    references,
+                    figures,
+                    metadata,
+                    citations,
+                    ..
+                } = *file;
+                if let Ok(mut cache) = self.references.lock() {
+                    *cache = Some(Arc::new(ReferenceCache {
+                        records: references.records,
+                        style: references.style,
+                    }));
+                }
+                if let Ok(mut cache) = self.figures.lock() {
+                    *cache = Some(figures);
+                }
+                if let Ok(mut cache) = self.metadata.lock() {
+                    *cache = Some(metadata);
+                }
+                if let Ok(mut cache) = self.outline.lock() {
+                    *cache = Some(outline);
+                }
+                if let Ok(mut cache) = self.citations.lock() {
+                    *cache = Some(citations);
+                }
+                runtime.outcome = IndexCacheOutcome::Hit;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: hit {} ({} bytes, sha256 {}…, validated in {:.1} ms)",
+                    path.display(),
+                    runtime.cache_bytes,
+                    &identity.sha256[..identity.sha256.len().min(12)],
+                    runtime.validation.as_secs_f64() * 1000.0,
+                );
+            }
+            CacheRead::Stale => {
+                runtime.outcome = IndexCacheOutcome::Stale;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: stale cache (content changed), falling back to a full parse"
+                );
+            }
+            CacheRead::Missing => {
+                runtime.outcome = IndexCacheOutcome::Missing;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: no cache (hashed in {:.1} ms), the index will be built",
+                    runtime.validation.as_secs_f64() * 1000.0,
+                );
+            }
+            CacheRead::Corrupt { detail } => {
+                runtime.outcome = IndexCacheOutcome::Corrupt;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: ignoring a corrupt cache ({detail}); the document will be parsed"
+                );
+            }
+            CacheRead::Incompatible { detail } => {
+                runtime.outcome = IndexCacheOutcome::Incompatible;
+                runtime.write_disabled = true;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: keeping an incompatible cache untouched ({detail}); using a full parse"
+                );
+            }
+            CacheRead::FutureVersion { version } => {
+                runtime.outcome = IndexCacheOutcome::FutureVersion;
+                runtime.write_disabled = true;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: cache format {version} is newer than this build (format {}); preserving it and using a full parse",
+                    crate::index_cache::FORMAT_VERSION,
+                );
+            }
+            CacheRead::Unreadable { detail } => {
+                runtime.outcome = IndexCacheOutcome::Unreadable;
+                runtime.write_disabled = true;
+                runtime.validation = started.elapsed();
+                eprintln!(
+                    "aris-index: cannot read the cache ({detail}); using a full parse and preserving it"
+                );
+            }
+        }
+    }
+
+    /// Writes the complete index once, the first time all four components are available.
+    ///
+    /// A partial index is never persisted: a cache without, say, its figures would make the next
+    /// open return an empty figure set until the missing part was rebuilt, and a cache that can
+    /// answer only half a question is exactly the silent-wrong-answer failure this task exists to
+    /// prevent. If the write fails, the document keeps its in-memory index; the only cost is that
+    /// the next open parses again.
+    fn maybe_write_index(&self) {
+        let mut runtime = match self.index.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => return,
+        };
+        if !runtime.attempted
+            || runtime.write_disabled
+            || matches!(
+                runtime.outcome,
+                IndexCacheOutcome::Hit
+                    | IndexCacheOutcome::Disabled
+                    | IndexCacheOutcome::FutureVersion
+                    | IndexCacheOutcome::Incompatible
+                    | IndexCacheOutcome::Unreadable
+            )
+        {
+            return;
+        }
+        let Some(path) = runtime.cache_path.clone() else {
+            return;
+        };
+        let Some(identity) = runtime.identity.clone() else {
+            return;
+        };
+        let Some(references) = self
+            .references
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().cloned())
+        else {
+            return;
+        };
+        let Some(figures) = self.figures.lock().ok().and_then(|cache| cache.clone()) else {
+            return;
+        };
+        let Some(metadata) = self.metadata.lock().ok().and_then(|cache| cache.clone()) else {
+            return;
+        };
+        let Some(outline) = self.outline.lock().ok().and_then(|cache| cache.clone()) else {
+            return;
+        };
+        let citations = self
+            .citations
+            .lock()
+            .ok()
+            .and_then(|cache| cache.clone())
+            .unwrap_or_default();
+
+        let file = IndexCacheFile {
+            kind: crate::index_cache::KIND.to_string(),
+            format_version: crate::index_cache::FORMAT_VERSION,
+            engine_version: ENGINE_VERSION.to_string(),
+            content: identity,
+            page_count: self.backend.page_count(),
+            outline,
+            references: CachedReferences {
+                style: references.style.clone(),
+                records: references.records.clone(),
+            },
+            figures,
+            metadata,
+            citations,
+        };
+        let started = Instant::now();
+        match write_cache(&path, &file) {
+            Ok(bytes) => {
+                runtime.cache_bytes = bytes;
+                eprintln!(
+                    "aris-index: wrote {} ({} bytes, {:.1} ms)",
+                    path.display(),
+                    bytes,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            Err(error) => {
+                runtime.write_disabled = true;
+                runtime.write_error = Some(error.to_string());
+                eprintln!(
+                    "aris-index: cache not writable beside the PDF ({error}); continuing with the in-memory index"
+                );
+            }
+        }
+    }
+
+    /// Records that one index component was derived from the PDF, with its elapsed time.
+    fn note_derived(&self, elapsed: Duration) {
+        if let Ok(mut runtime) = self.index.lock() {
+            runtime.derived_parts = runtime.derived_parts.saturating_add(1);
+            runtime.derived = runtime.derived.saturating_add(elapsed);
+        }
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Largest edge length a single page texture may have.
@@ -2109,7 +2539,8 @@ pub struct PageEditReport {
 }
 
 /// One outline entry.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutlineEntry {
     pub title: String,
     /// Target page (0-based), when the destination resolves to one.
@@ -2136,7 +2567,8 @@ fn flatten_outline(
 
 /// A citation in the body text, boxed in **view space**.
 
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CitationRecord {
     pub page: u32,
     /// As it appears, e.g. `[12,13]` or `He et al. 2024`.
@@ -2156,7 +2588,8 @@ pub struct CitationRecord {
 /// one that is split it is the union of the pieces on `page` (see `fragments`). The pieces
 /// themselves are in `fragments`; an entry spanning two pages has one there per page, and the
 /// single box here can only ever describe `page`.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceRecord {
     pub label: String,
     pub text: String,
@@ -2176,7 +2609,8 @@ pub struct ReferenceRecord {
 }
 
 /// One piece of a reference entry: the page to draw on and the box to show, in **view space**.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceFragment {
     /// Page the fragment is drawn on (0-based).
     pub page: u32,
@@ -2188,7 +2622,8 @@ pub struct ReferenceFragment {
 }
 
 /// A figure or table caption, with the region of its page a floating preview should show.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FigureRecord {
     /// `Figure`, `Table`, or `Algorithm`.
     pub kind: String,
@@ -2360,6 +2795,37 @@ fn document_page_view(
     Some(transform)
 }
 
+/// Citation spans in one page's text layer, converted to the view space the canvas draws in.
+///
+/// One function for the per-page path and the document scan, so a cached span can never differ
+/// from the span a fresh `citations(page)` call would produce.
+fn citation_records(
+    raw: &aris_reader_core::RawTextPage,
+    style: &aris_reader_text::CitationStyle,
+    page: u32,
+    transform: aris_reader_core::Transform2D,
+) -> Vec<CitationRecord> {
+    aris_reader_text::find_citations_with(raw, style)
+        .into_iter()
+        .map(|citation| {
+            let top_left = Point::new(
+                citation.rect.origin.x,
+                citation.rect.origin.y + citation.rect.size.height,
+            );
+            let view = transform.apply(top_left);
+            CitationRecord {
+                page,
+                text: citation.text,
+                labels: citation.labels,
+                x_pt: view.x,
+                y_pt: view.y,
+                width_pt: citation.rect.size.width,
+                height_pt: citation.rect.size.height,
+            }
+        })
+        .collect()
+}
+
 /// A page-space box as its view-space **top-left corner**, the convention the preview uses.
 fn view_box(
     backend: &PdfiumBackend,
@@ -2445,6 +2911,9 @@ impl ArisEngine {
             figures: Mutex::new(None),
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
+            outline: Mutex::new(None),
+            citations: Mutex::new(None),
+            index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
         }))
