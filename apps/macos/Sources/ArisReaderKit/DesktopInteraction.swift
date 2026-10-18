@@ -20,7 +20,7 @@ public enum CanvasContextMenuAction: Equatable, Sendable {
 
 /// A title and a command, decided before the menu is shown.
 ///
-/// The app builds an `NSMenu` from these; the checks read the same list, which is how "no
+/// The app builds a command list from these; the checks read the same list, which is how "no
 /// selection means no copy item" is asserted without putting a window on the reader's screen.
 public struct CanvasContextMenuItem: Equatable, Sendable {
     public let title: String
@@ -39,7 +39,7 @@ public struct CanvasContextMenuItem: Equatable, Sendable {
 /// operations alone, and a right-click in the gap between pages offers nothing (the caller then
 /// leaves AppKit's default menu alone).
 public enum CanvasContextMenu {
-    /// The menu's sections, in display order. Each section becomes one group in the `NSMenu`.
+    /// The menu's sections, in display order. Each section becomes one command group.
     @MainActor
     public static func sections(state: AppState, at point: CGPoint) -> [[CanvasContextMenuItem]] {
         var sections: [[CanvasContextMenuItem]] = []
@@ -144,7 +144,8 @@ public enum CanvasContextMenu {
         }
     }
 
-    /// Builds the AppKit menu the canvas shows, or `nil` when there is nothing to offer.
+    /// Builds the AppKit-backed command list rendered by the Lyra menu panel, or `nil` when
+    /// there is nothing to offer. AppKit does not present this as a system menu.
     ///
     /// Nothing to offer is a real answer: a right-click in the gap between two pages should not
     /// pop an empty menu. `promptForNote` is the app's only UI contribution; everything else runs
@@ -184,6 +185,17 @@ public enum CanvasContextMenu {
                 // NSMenuItem's target is not retained; the handler travels with the item.
                 menuItem.representedObject = handler
                 menuItem.isEnabled = item.isEnabled
+                let icon: String
+                switch item.action {
+                case .copySelection: icon = "doc.on.doc"
+                case .highlightSelection: icon = "highlighter"
+                case .addNoteToSelection: icon = "text.bubble"
+                case .openLink: icon = "link"
+                case .rotatePage(_, let clockwise): icon = clockwise ? "rotate.right" : "rotate.left"
+                case .extractPage: icon = "square.and.arrow.up"
+                }
+                menuItem.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+                if item.action == .copySelection { menuItem.keyEquivalent = "c" }
                 menu.addItem(menuItem)
             }
         }

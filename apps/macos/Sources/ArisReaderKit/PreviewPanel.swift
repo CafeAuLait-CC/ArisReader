@@ -697,7 +697,9 @@ struct ReferencePreviewPanelContent: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 12))
+            .foregroundStyle(LyraTheme.textPrimary)
+            .tint(LyraTheme.accent)
             .onExitCommand { state.closeReferencePreview() }
         }
     }

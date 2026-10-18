@@ -235,9 +235,57 @@ with the produced fields, and the fixtures `metadata-embedded.pdf`, `metadata-in
 fallback, page-one fallback, arXiv-only) in `crates/aris-reader-cli/tests/metadata_fixtures.rs` and
 `apps/macos/Checks/MetadataChecks.swift`.
 
-## AI assistant (OpenAI-compatible)
+## Reader interface
 
-The AI sidebar tab is a working, deliberately small assistant. It speaks only the
+Lyra follows the system appearance with a warm cream/gold light palette and warm charcoal dark
+palette. Document tabs share the top window row with the native window controls; the separate
+native title strip is hidden and the empty tab-bar area moves the window. The native window
+buttons are centred vertically in that row, with the new-tab button following the document tabs.
+Tabs start at a fixed 250pt width and share the available space equally when the row fills;
+very large tab sets scroll horizontally at a readable minimum width.
+Toolbar drop-downs open below their controls in compact Lyra panels; document and thumbnail
+context menus use the same styling. Icons, grouped commands, hover states, and
+arrow-key/Return/Escape navigation are supported. The second toolbar button opens a full-window
+page overview with adaptive thumbnails, selection, reordering and page operations. Double-click
+a page to return to reading, or choose Done; the sidebar remains a separate control.
+The tab row is followed by grouped view/zoom controls,
+annotation tools, page operations, export, AI, and search. **Annotate** expands a second row for
+highlights, underlines, selection notes, and six Lyra color presets. Existing indexed sidecar
+colors retain their original values. Tools that are not implemented yet are disabled in their
+reserved positions. PDF pages and existing PDF annotation colors stay faithful to the document.
+Settings > Performance uses a grouped, wrapping layout for engine information and cache controls.
+
+## AI assistant (ChatGPT plan or API key)
+
+In **Settings > AI > Use AI with**, choose one connection:
+
+- **ChatGPT plan:** press **Continue with ChatGPT**, finish the browser sign-in, and authorize
+  Lyra to use your eligible ChatGPT plan. Choose a model from your account's catalog. Each saved
+  connection keeps its own client registration and validated identity; **Add Account** creates
+  another connection. **Manage usage in ChatGPT** opens the page for reviewing shared plan usage
+  and app limits. Availability and remaining allowance depend on the account and plan.
+- **API key:** the existing OpenAI-compatible endpoint, model, reasoning settings, and Keychain
+  API key continue to work for hosted providers and local services.
+
+ChatGPT connections use OpenAI's official [open-source Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in):
+loopback callback, PKCE, state/nonce validation, and RS256 identity signature verification against
+OpenAI's published keys. Credentials stay in the macOS Keychain and refresh tokens rotate atomically.
+Sign Out cancels active requests, attempts remote revocation, and clears credentials; if remote
+revocation cannot be confirmed, Lyra points to ChatGPT Settings to disconnect the app.
+
+ChatGPT inference uses the public Responses API with `store: false` and `stream: true`, as required
+by the [official inference contract](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
+It uses no Codex credentials, private ChatGPT endpoints, or API key fallback. Requests retain the
+existing local context preview and explicit Send step. Changing the connection after preparing a
+preview requires a fresh preview. Streamed usage-limit errors, incomplete answers, and interrupted
+connections are failures with the partial answer preserved. Only `response.completed` completes a
+request. The initial account/model discovery happens when connecting or refreshing the catalog;
+PDF text is sent only after Send. Browser sign-in and a live eligible account are still required
+to validate real subscription access; automated tests use synthetic credentials and mocked HTTP.
+
+### API key connection
+
+The API key connection in the AI sidebar speaks the
 OpenAI-compatible `chat/completions` protocol — a base URL, a model name, and an API key — so the
 same code works with OpenAI, DeepSeek, and a local Ollama
 (`http://localhost:11434/v1`, any non-empty key). No vendor SDK is used.

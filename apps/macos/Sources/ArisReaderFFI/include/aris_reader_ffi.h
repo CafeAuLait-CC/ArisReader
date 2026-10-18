@@ -145,6 +145,15 @@ int32_t aris_reader_surface_draw_pages(uint64_t surface_id,
                                        size_t count,
                                        ArisFrameStats *stats);
 
+/* Same arrays/empty-frame contract; RGB components are finite linear-light values in [0,1]. */
+int32_t aris_reader_surface_draw_pages_on_background(uint64_t surface_id,
+                                       const uint64_t *texture_ids,
+                                       const float *rects,
+                                       const uint8_t *blend_modes,
+                                       size_t count,
+                                       double red, double green, double blue,
+                                       ArisFrameStats *stats);
+
 /* Releases the device and every surface. */
 int32_t aris_reader_gpu_shutdown(void);
 

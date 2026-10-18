@@ -24,6 +24,18 @@ struct ArisReaderApp: App {
     private static var quitWatchdog: DispatchSourceTimer?
 
     init() {
+        // A packaged app must use its own PDFium before the engine's development-directory
+        // fallback. That fallback may point into a protected Documents checkout and block
+        // dlopen on first open. Preserve an explicit, nonempty developer override.
+        let pdfiumOverride = ProcessInfo.processInfo.environment["ARIS_READER_PDFIUM_PATH"]
+        if pdfiumOverride?.isEmpty != false,
+           let frameworks = Bundle.main.privateFrameworksURL {
+            let bundled = frameworks.appendingPathComponent("libpdfium.dylib")
+            if FileManager.default.fileExists(atPath: bundled.path) {
+                setenv("ARIS_READER_PDFIUM_PATH", bundled.path, 1)
+            }
+        }
+
         // Running the bare executable (swift run / swift build output) has no
         // LaunchServices activation, so the window can stay behind the terminal —
         // and a Metal surface reports itself as occluded while it is not on screen.
@@ -70,6 +82,7 @@ struct ArisReaderApp: App {
             // the reader's window (`ReaderWindowRegistry`).
             ReaderWindowRoot(registry: appDelegate.registry)
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1200, height: 800)
         .commands {
             ReaderCommands()

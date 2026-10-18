@@ -13,6 +13,8 @@ public struct SidebarView: View {
     /// window through this coordinator; `nil` in previews/checks that only want the panel, in
     /// which case the sidebar is not a drop target.
     private let opener: DocumentOpenCoordinator?
+    private let pageOverview: Bool
+    private var thumbnailWidth: CGFloat { pageOverview ? 180 : state.thumbnailWidthPt }
     /// Shared by the drop delegate: it bumps a generation for every drag that enters or leaves,
     /// so a slow item-provider load that lands after the drag moved on cannot paint a stale hint
     /// or perform a stale drop.
@@ -35,35 +37,46 @@ public struct SidebarView: View {
     /// The coordinate space that makes the SwiftUI cell frames and the AppKit overlay agree.
     private static let thumbnailStripSpace = "LyraThumbnailStrip"
 
-    public init(state: AppState, opener: DocumentOpenCoordinator? = nil) {
+    public init(state: AppState, opener: DocumentOpenCoordinator? = nil, pageOverview: Bool = false) {
         self.state = state
         self.opener = opener
+        self.pageOverview = pageOverview
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            Picker("Sidebar", selection: $state.sidebarTab) {
-                ForEach(SidebarTab.allCases) { tab in
-                    Label(tab.title, systemImage: tab.systemImage).tag(tab)
+        Group {
+            if pageOverview {
+                thumbnailStrip
+            } else {
+                VStack(spacing: 0) {
+                    Picker("Sidebar", selection: $state.sidebarTab) {
+                        ForEach(SidebarTab.allCases) { tab in
+                            Label(tab.title, systemImage: tab.systemImage).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+
+                    Divider()
+
+                    content
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 180)
+        .scrollContentBackground(.hidden)
+        .background(pageOverview ? LyraTheme.canvasBg : LyraTheme.sidebarBg)
+        .foregroundStyle(LyraTheme.textPrimary)
+        .tint(LyraTheme.accent)
         // Dropping a file here opens a new window (the canvas keeps opening tabs in this one).
         // The whole panel is the target: thumbnails, the outline and the empty background all
         // answer the same way, because "on the sidebar" is one place to a reader holding a file.
         .onDrop(
             of: [.fileURL],
-            delegate: SidebarFileDropDelegate(coordinator: opener, session: dropSession)
+            delegate: SidebarFileDropDelegate(coordinator: pageOverview ? nil : opener, session: dropSession)
         )
         .overlay {
             if let hint = opener?.newWindowDropHint {
@@ -104,13 +117,13 @@ public struct SidebarView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "text.badge.checkmark")
                         .font(.system(size: 30, weight: .light))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(LyraTheme.textTertiary)
                     Text("No document")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                     Text("Open a PDF to read and correct its title, authors, venue, year, DOI and arXiv id.")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(LyraTheme.textTertiary)
                         .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -120,20 +133,20 @@ public struct SidebarView: View {
                     ProgressView().controlSize(.small)
                     Text("Reading metadata…")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let failure = state.metadataError {
                 VStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 26, weight: .light))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(LyraTheme.warningFg)
                     Text("Metadata could not be read")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                     Text(failure)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(LyraTheme.textTertiary)
                         .lineLimit(4)
                         .multilineTextAlignment(.center)
                 }
@@ -219,15 +232,15 @@ public struct SidebarView: View {
         if field.source == .absent {
             Text("empty")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
         } else if field.source == .edited {
             Text("Edited")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LyraTheme.textSecondary)
         } else if field.guessed || field.source.isGuessed {
             Label(field.source.label, systemImage: "questionmark.circle")
                 .font(.caption2)
-                .foregroundStyle(.orange)
+                .foregroundStyle(LyraTheme.warningFg)
         } else {
             Text(field.source.label)
                 .font(.caption2)
@@ -239,7 +252,7 @@ public struct SidebarView: View {
 
     private var thumbnailStrip: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: state.thumbnailWidthPt))], spacing: 10) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: thumbnailWidth + 16), spacing: pageOverview ? 28 : 10)], spacing: pageOverview ? 24 : 10) {
                 ForEach(0..<max(state.document?.pageCount ?? 0, 0), id: \.self) { page in
                     Button {
                         state.handleThumbnailClick(
@@ -260,12 +273,12 @@ public struct SidebarView: View {
                     .padding(4)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(page + 1 == state.currentPage ? Color.accentColor.opacity(0.18) : .clear)
+                            .fill(page + 1 == state.currentPage ? LyraTheme.selectedBg : .clear)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 6)
                             .stroke(
-                                state.pageSelection.contains(page) ? Color.accentColor : .clear,
+                                state.pageSelection.contains(page) ? LyraTheme.accentBorder : .clear,
                                 lineWidth: 2
                             )
                     )
@@ -285,7 +298,7 @@ public struct SidebarView: View {
                     }
                 }
             }
-            .padding(10)
+            .padding(pageOverview ? 28 : 10)
             .coordinateSpace(name: Self.thumbnailStripSpace)
             // One AppKit view owns the strip's pointer: it keeps a press under the drag
             // threshold a click (navigating exactly as the Button does), turns a longer press
@@ -302,6 +315,14 @@ public struct SidebarView: View {
             }
         }
         .onAppear { state.loadThumbnails() }
+    }
+
+    private var overviewDoubleClick: (@MainActor (Int) -> Void)? {
+        guard pageOverview else { return nil }
+        return { [weak state] page in
+            state?.gotoPage(page)
+            state?.pageOverviewVisible = false
+        }
     }
 
     private var thumbnailDragOverlay: some View {
@@ -325,6 +346,7 @@ public struct SidebarView: View {
             onClick: { [weak state] page, modifiers in
                 state?.handleThumbnailClick(page, modifiers: modifiers)
             },
+            onDoubleClick: overviewDoubleClick,
             onDrop: { [weak state] request in
                 Task { @MainActor [weak state] in
                     _ = await state?.performThumbnailDrop(request)
@@ -385,15 +407,15 @@ public struct SidebarView: View {
                 .resizable()
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fit)
-                .frame(width: state.thumbnailWidthPt)
+                .frame(width: thumbnailWidth)
                 .background(Color.white)
-                .overlay(Rectangle().stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
+                .overlay(Rectangle().stroke(LyraTheme.pageEdge, lineWidth: 0.5))
         } else {
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.primary.opacity(0.06))
                 .frame(
-                    width: state.thumbnailWidthPt,
-                    height: state.thumbnailWidthPt * 1.414
+                    width: thumbnailWidth,
+                    height: thumbnailWidth * 1.414
                 )
         }
     }
@@ -510,7 +532,7 @@ public struct SidebarView: View {
                             Text(row.number)
                                 .font(.caption2)
                                 .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(LyraTheme.textSecondary)
                                 .frame(minWidth: 18, alignment: .trailing)
                             Text(row.entry.title)
                                 .lineLimit(2)
@@ -523,7 +545,7 @@ public struct SidebarView: View {
                                 Text("\(page + 1)")
                                     .font(.caption2)
                                     .monospacedDigit()
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(LyraTheme.textSecondary)
                             }
                         }
                         .padding(.leading, row.indentPt)
@@ -553,7 +575,7 @@ public struct SidebarView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Page \(hit.page + 1)")
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(LyraTheme.textSecondary)
                             Text(hit.snippet)
                                 .font(.caption)
                                 .lineLimit(3)
@@ -602,14 +624,14 @@ public struct SidebarView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "bookmark")
                         .font(.system(size: 30, weight: .light))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(LyraTheme.textTertiary)
                     Text(state.document == nil ? "No document" : "No bookmarks")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                     if state.document != nil {
                         Text("⌘D or Add Bookmark puts the current page and position here.")
                             .font(.caption)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(LyraTheme.textTertiary)
                             .multilineTextAlignment(.center)
                     }
                 }
@@ -645,7 +667,7 @@ public struct SidebarView: View {
                     Text("Page \(bookmark.page + 1) · \(Int(bookmark.yPt.rounded())) pt")
                         .font(.caption2)
                         .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                 }
                 .buttonStyle(.plain)
                 .help("Jump to this bookmark")
@@ -716,14 +738,14 @@ public struct SidebarView: View {
             Section("In this PDF") {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Reading annotations…").font(.caption).foregroundStyle(.secondary)
+                    Text("Reading annotations…").font(.caption).foregroundStyle(LyraTheme.textSecondary)
                 }
             }
         } else if let failure = state.documentAnnotationsError {
             Section("In this PDF") {
                 Label(failure, systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
             }
         } else if !state.documentAnnotations.isEmpty {
             let panel = AnnotationPanelModel.build(from: state.documentAnnotations)
@@ -754,7 +776,7 @@ public struct SidebarView: View {
                                     ? "1 annotation" : "\(section.annotationCount) annotations"
                             )
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(LyraTheme.textSecondary)
                         }
                     }
                 }
@@ -781,7 +803,7 @@ public struct SidebarView: View {
                         HStack(spacing: 4) {
                             Image(systemName: "arrowshape.turn.up.left")
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(LyraTheme.textSecondary)
                             Text(row.replyAuthor ?? "Reply")
                                 .font(.caption)
                                 .fontWeight(.semibold)
@@ -795,7 +817,7 @@ public struct SidebarView: View {
                             Text(date)
                                 .font(.caption2)
                                 .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(LyraTheme.textSecondary)
                         }
                     } else {
                         Text(documentAnnotationTitle(row.annotation))
@@ -803,23 +825,23 @@ public struct SidebarView: View {
                             .lineLimit(3)
                         Text(documentAnnotationSubtitle(row.annotation))
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(LyraTheme.textSecondary)
                     }
 
                     if !row.annotation.visible {
                         Label("Hidden on page", systemImage: "eye.slash")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(LyraTheme.textSecondary)
                     }
                     if row.showsPage {
                         Text("On page \(row.annotation.page + 1)")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(LyraTheme.textSecondary)
                     }
                     if let orphan = row.orphanReason {
                         Label(orphan.message, systemImage: "exclamationmark.triangle")
                             .font(.caption2)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(LyraTheme.warningFg)
                             .lineLimit(3)
                     }
                 }
@@ -881,7 +903,7 @@ public struct SidebarView: View {
                                         + "\(annotation.end - annotation.start + 1) characters"
                                 )
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(LyraTheme.textSecondary)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
@@ -937,13 +959,13 @@ public struct SidebarView: View {
         VStack(spacing: 10) {
             Image(systemName: symbol)
                 .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
             Text(title)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LyraTheme.textSecondary)
             Text("Planned for \(task)")
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
         }
         .multilineTextAlignment(.center)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

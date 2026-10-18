@@ -609,13 +609,15 @@ public final class KeychainAPIKeyStore: AIAPIKeyStore {
         else {
             throw AIKeyStoreError.invalidKey
         }
-        // Delete first rather than update: an update query has to match every attribute, and a
-        // missing item must become a create rather than a silently dropped save.
-        try? deleteKey()
-        var query = baseQuery()
-        query[kSecValueData as String] = Data(key.utf8)
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        let status = SecItemAdd(query as CFDictionary, nil)
+        let query = baseQuery()
+        let attributes = [kSecValueData as String: Data(key.utf8)]
+        let updated = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return }
+        guard updated == errSecItemNotFound else { throw AIKeyStoreError.keychain(updated) }
+        var newItem = query
+        newItem[kSecValueData as String] = Data(key.utf8)
+        newItem[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        let status = SecItemAdd(newItem as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw AIKeyStoreError.keychain(status)
         }
@@ -685,6 +687,11 @@ public final class AISettingsStore: ObservableObject {
     @Published public private(set) var reasoningMode: AIReasoningMode
     @Published public private(set) var reasoningEncoding: AIReasoningEncoding
     @Published public private(set) var hasKey: Bool
+    @Published public var connectionMode: AIConnectionMode {
+        didSet { defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode") }
+    }
+    public let chatGPT: ChatGPTAccountStore
+    public var canUseAI: Bool { connectionMode == .chatGPT ? chatGPT.isConnected : hasKey }
     @Published public private(set) var invalidSettingsMessage: String?
     /// The validated endpoint for the current base URL, from the Rust validator.
     @Published public private(set) var endpointInfo: AiEndpointRecord?
@@ -694,8 +701,11 @@ public final class AISettingsStore: ObservableObject {
 
     public init(
         defaults: UserDefaults = .standard,
-        keyStore: any AIAPIKeyStore = KeychainAPIKeyStore()
+        keyStore: any AIAPIKeyStore = KeychainAPIKeyStore(),
+        chatGPT: ChatGPTAccountStore? = nil
     ) {
+        self.chatGPT = chatGPT ?? ChatGPTAccountStore(defaults: defaults)
+        self.connectionMode = defaults.string(forKey: "aiConnectionMode").flatMap(AIConnectionMode.init(rawValue:)) ?? .apiKey
         self.defaults = defaults
         self.keyStore = keyStore
         self.baseURL = defaults.string(forKey: Self.baseURLKey) ?? Self.defaultBaseURL
@@ -813,6 +823,14 @@ public final class AISettingsStore: ObservableObject {
     /// The validated settings the request builder receives. Throws a reader-facing message when the
     /// stored values are no longer usable.
     public func providerSettings() throws -> AIProviderSettings {
+        if connectionMode == .chatGPT {
+            guard let account = chatGPT.selected, account.connected, !account.model.isEmpty else {
+                throw AISettingsError.invalid("Connect ChatGPT and select a model in Settings > AI first.")
+            }
+            return AIProviderSettings(baseURL: "https://api.openai.com/v1", model: account.model,
+                                      temperature: nil, maxTokens: nil,
+                                      reasoningMode: .providerDefault, reasoningEncoding: .none)
+        }
         let endpoint = try inspectAiBaseUrl(baseUrl: baseURL)
         let model = try validateAiModel(model: model)
         guard temperature.isFinite, Self.temperatureRange.contains(temperature) else {

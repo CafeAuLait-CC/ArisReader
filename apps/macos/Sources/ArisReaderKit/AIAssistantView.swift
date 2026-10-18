@@ -8,11 +8,13 @@ public struct AIAssistantPanel: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
     @ObservedObject private var settings: AISettingsStore
+    @ObservedObject private var chatGPT: ChatGPTAccountStore
 
     public init(state: AppState, model: AIAssistantModel) {
         self.state = state
         self.model = model
         _settings = ObservedObject(wrappedValue: model.settings)
+        _chatGPT = ObservedObject(wrappedValue: model.settings.chatGPT)
     }
 
     public var body: some View {
@@ -23,7 +25,7 @@ public struct AIAssistantPanel: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         providerHeader
-                        if !settings.hasKey {
+                        if !settings.canUseAI {
                             keyMissing
                         }
                         actions
@@ -32,9 +34,9 @@ public struct AIAssistantPanel: View {
                                 .font(.caption)
                                 .foregroundStyle(
                                     model.phase == .failed
-                                        ? Color.red
+                                        ? LyraTheme.errorFg
                                         : (model.phase == .finished && model.answer.isEmpty
-                                            ? Color.orange : Color.secondary)
+                                            ? LyraTheme.warningFg : Color.secondary)
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -43,7 +45,7 @@ public struct AIAssistantPanel: View {
                                 ProgressView().controlSize(.small)
                                 Text("Reading text and building the preview…")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(LyraTheme.textSecondary)
                             }
                         }
                         if let plan = model.plan, model.phase != .preparing {
@@ -56,7 +58,7 @@ public struct AIAssistantPanel: View {
                                 ProgressView().controlSize(.small)
                                 Text("Building the consolidation preview…")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(LyraTheme.textSecondary)
                             }
                         }
                         if model.phase == .streaming || model.phase.isTerminal || model.phase == .mergePreview {
@@ -76,13 +78,13 @@ public struct AIAssistantPanel: View {
         VStack(spacing: 10) {
             Image(systemName: "sparkles")
                 .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
             Text("No document")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LyraTheme.textSecondary)
             Text("Open a PDF to summarise a page, ask about a selection, or translate one.")
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -91,9 +93,19 @@ public struct AIAssistantPanel: View {
 
     private var providerHeader: some View {
         VStack(alignment: .leading, spacing: 4) {
+            if settings.connectionMode == .chatGPT {
+                Label("ChatGPT plan", systemImage: "person.crop.circle")
+                    .font(.caption.weight(.semibold)).foregroundStyle(LyraTheme.accent)
+                Text(chatGPT.selected.map { "\($0.label) · \($0.email)" } ?? "Not connected")
+                    .font(.caption2).foregroundStyle(LyraTheme.textSecondary)
+                Text(chatGPT.selected?.model ?? "Choose a model in Settings > AI")
+                    .font(.caption2).foregroundStyle(LyraTheme.textTertiary)
+                Link("Manage usage", destination: ChatGPTAccountStore.usageURL).font(.caption2)
+                SettingsLink { Text("Connection settings…").font(.caption2) }
+            } else {
             HStack(spacing: 6) {
                 Image(systemName: settings.isLocalEndpoint ? "desktopcomputer" : "network")
-                    .foregroundStyle(settings.isLocalEndpoint ? Color.green : Color.orange)
+                    .foregroundStyle(settings.isLocalEndpoint ? LyraTheme.successFg : LyraTheme.warningFg)
                 Text(settings.isLocalEndpoint ? "Local endpoint" : "Remote endpoint")
                     .font(.caption.weight(.semibold))
                 Spacer()
@@ -101,28 +113,29 @@ public struct AIAssistantPanel: View {
                     Label("Key configured", systemImage: "key.fill")
                         .labelStyle(.titleAndIcon)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                 }
             }
             Text(settings.endpointInfo?.host ?? settings.baseURL)
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Text(settings.model)
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
                 .lineLimit(1)
+            }
         }
     }
 
     private var keyMissing: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("No API key", systemImage: "key")
+            Label(settings.connectionMode == .chatGPT ? "Connect ChatGPT" : "Connect an AI provider", systemImage: "person.crop.circle")
                 .font(.caption.weight(.semibold))
-            Text("Add a key in Settings > AI. The key is stored in the macOS Keychain; nothing is sent until you press Send.")
+            Text("Continue with ChatGPT or add an API key in Settings > AI. Credentials are stored in the macOS Keychain; nothing is sent until you press Send.")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LyraTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             SettingsLink {
                 Text("Open Settings…")
@@ -130,7 +143,7 @@ public struct AIAssistantPanel: View {
             }
         }
         .padding(8)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+        .background(LyraTheme.panelBg, in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var actions: some View {
@@ -154,11 +167,11 @@ public struct AIAssistantPanel: View {
             if let selection = state.selection {
                 Text("Selection: \(selection.range.count) characters on page \(selection.page + 1)")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
             } else {
                 Text("Select text in the page to ask about it or translate it.")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
 
             TextField("Question about the selection", text: $model.question)
@@ -193,18 +206,18 @@ public struct AIAssistantPanel: View {
                 Spacer()
                 Text("\(plan.estimatedTokens) est. tokens")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
             Text(plan.isLocal
                  ? "This endpoint runs on this Mac; the page text does not leave it."
                  : "This is a remote endpoint: the page text below leaves this Mac when you press Send.")
                 .font(.caption2)
-                .foregroundStyle(plan.isLocal ? Color.secondary : Color.orange)
+                .foregroundStyle(plan.isLocal ? Color.secondary : LyraTheme.warningFg)
                 .fixedSize(horizontal: false, vertical: true)
             if isMerge {
                 Text("This consolidation is a separate request and has its own cost. The part summaries are not re-sent as page text.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if model.phase == .preview {
@@ -221,10 +234,11 @@ public struct AIAssistantPanel: View {
                 previewRow("Pages", plan.sourcePageLabel)
                 previewRow("Prompt", "\(plan.estimatedTokens) estimated tokens")
                 previewRow("Completion budget", plan.maxTokens.map { String($0) } ?? "provider default")
-                previewRow("Reasoning", settings.reasoningSummary)
-                Text(settings.reasoningFieldDescription)
+                previewRow("Connection", settings.connectionMode == .chatGPT ? "ChatGPT plan usage" : "API key")
+                previewRow("Reasoning", settings.connectionMode == .chatGPT ? "Model default" : settings.reasoningSummary)
+                Text(settings.connectionMode == .chatGPT ? "This request uses your shared ChatGPT plan allowance." : settings.reasoningFieldDescription)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
             if let note = plan.note {
                 Text(note)
@@ -238,14 +252,14 @@ public struct AIAssistantPanel: View {
                     ForEach(plan.previewHeaders, id: \.name) { header in
                         Text("\(header.name): \(header.value)")
                             .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(LyraTheme.textSecondary)
                             .textSelection(.enabled)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 Text("The transport also sends Content-Length and connection headers. The body below is sent byte for byte.")
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .font(.caption2)
@@ -255,14 +269,14 @@ public struct AIAssistantPanel: View {
             }
         }
         .padding(8)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+        .background(LyraTheme.panelBg, in: RoundedRectangle(cornerRadius: 6))
     }
 
     private func previewRow(_ name: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(name)
                 .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LyraTheme.textSecondary)
                 .frame(width: 52, alignment: .leading)
             Text(value)
                 .font(.caption2)
@@ -300,7 +314,7 @@ public struct AIAssistantPanel: View {
                     .font(.caption2.weight(.medium))
                 Text(part.characterLabel + " \u{00B7} \(part.wireBody.utf8.count) body bytes")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
         }
         .font(.caption2)
@@ -315,7 +329,7 @@ public struct AIAssistantPanel: View {
         }
         .frame(maxHeight: 140)
         .padding(4)
-        .background(.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+        .background(LyraTheme.fieldBg, in: RoundedRectangle(cornerRadius: 4))
     }
 
     private var answerSection: some View {
@@ -340,11 +354,11 @@ public struct AIAssistantPanel: View {
                 } else if model.phase == .streaming {
                     Text("Waiting for the first token…")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                 } else if model.phase == .finished {
                     Label("The provider returned no answer text", systemImage: "exclamationmark.triangle")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.orange)
+                        .foregroundStyle(LyraTheme.warningFg)
                 }
             } else {
                 // Page links are offered only for actions whose prompt asked for [p.N].
@@ -359,7 +373,7 @@ public struct AIAssistantPanel: View {
                      ? "Rendered as paragraphs, headings, bullet and numbered lists. This action did not ask for page citations, so no numbers are linkified; other Markdown is shown literally."
                      : "Rendered as paragraphs, headings, bullet and numbered lists. Only [p.N] citations are clickable; other Markdown is shown literally.")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !model.reasoning.isEmpty {
                     DisclosureGroup("Provider reasoning (not the answer)") {
@@ -396,12 +410,12 @@ public struct AIAssistantPanel: View {
             } else if model.phase == .finished && !model.answer.isEmpty {
                 Text("No token usage was reported by the provider.")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
             if !model.answer.isEmpty && model.finishReason == "length" {
                 Label("The provider stopped at its token limit; this answer may be truncated.", systemImage: "exclamationmark.triangle")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Color.orange)
+                    .foregroundStyle(LyraTheme.warningFg)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if model.reasoningTokensIgnored {
@@ -410,12 +424,12 @@ public struct AIAssistantPanel: View {
                     systemImage: "exclamationmark.triangle"
                 )
                 .font(.caption2)
-                .foregroundStyle(Color.orange)
+                .foregroundStyle(LyraTheme.warningFg)
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(8)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+        .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var answerHeader: String {
@@ -429,16 +443,16 @@ public struct AIAssistantPanel: View {
         VStack(alignment: .leading, spacing: 4) {
             Label(title, systemImage: "lightbulb")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(prominent ? Color.orange : Color.secondary)
+                .foregroundStyle(prominent ? LyraTheme.warningFg : Color.secondary)
             reasoningText
             Text("This is the model's reasoning, not the answer. It was not concatenated into the answer.")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(LyraTheme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(6)
         .background(
-            (prominent ? Color.orange : Color.secondary).opacity(prominent ? 0.08 : 0.05),
+            (prominent ? LyraTheme.warningFg : Color.secondary).opacity(prominent ? 0.08 : 0.05),
             in: RoundedRectangle(cornerRadius: 5)
         )
     }
@@ -446,7 +460,7 @@ public struct AIAssistantPanel: View {
     private var reasoningText: some View {
         Text(model.reasoning)
             .font(.callout)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(LyraTheme.textSecondary)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -482,7 +496,7 @@ public struct AIAssistantPanel: View {
                      ? "Reasoning received; no answer text yet"
                      : "\(model.answer.count) characters received")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(LyraTheme.textTertiary)
             }
         case .finished, .cancelled, .failed:
             HStack(spacing: 8) {
