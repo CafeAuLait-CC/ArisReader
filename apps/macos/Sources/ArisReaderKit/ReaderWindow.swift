@@ -152,16 +152,25 @@ public struct ReaderWindow: View {
                 annotationColor: state.annotationStrokeColor,
                 annotationStrokeWidth: AppState.defaultAnnotationStrokeWidth,
                 onAnnotationDraft: { draft in
-                    _ = state.addGeometryAnnotation(
-                        kind: draft.kind,
-                        page: draft.page,
-                        inkPaths: draft.inkPaths,
-                        shapeRect: draft.shapeRect,
-                        lineStart: draft.lineStart,
-                        lineEnd: draft.lineEnd
-                    )
+                    if draft.kind == .textBox {
+                        _ = state.addTextBox(page: draft.page,
+                                             rect: draft.shapeRect ?? .zero)
+                    } else {
+                        _ = state.addGeometryAnnotation(
+                            kind: draft.kind,
+                            page: draft.page,
+                            inkPaths: draft.inkPaths,
+                            shapeRect: draft.shapeRect,
+                            lineStart: draft.lineStart,
+                            lineEnd: draft.lineEnd
+                        )
+                    }
                 },
                 onDeleteAnnotation: { state.deleteSelectedAnnotation() },
+                onPlaceStickyNote: { point in state.placeOrOpenStickyNote(atContentPoint: point) },
+                onAnnotationDoubleClick: { point in
+                    state.beginEditingTextBox(atContentPoint: point)
+                },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
@@ -243,6 +252,7 @@ public struct ReaderWindow: View {
             }
 
             DocumentNoteOverlay(state: state)
+            PlacedTextEditorOverlay(state: state)
 
             if let hint = opener.dropHint {
                 FileDropOverlay(hint: hint)

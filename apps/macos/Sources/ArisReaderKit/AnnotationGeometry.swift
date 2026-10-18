@@ -12,11 +12,13 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     case arrow
     case rectangle
     case ellipse
+    case note
+    case textBox
 
-    /// The annotation kind a drag creates, or `nil` for the select tool.
+    /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select: return nil
+        case .select, .note, .textBox: return nil
         case .pen: return .ink
         case .line: return .line
         case .arrow: return .arrow
@@ -28,8 +30,14 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// Whether a drag with this tool is a freehand stroke rather than a corner-to-corner shape.
     public var isFreehand: Bool { self == .pen }
 
-    /// Whether the tool draws at all.
+    /// Whether the tool draws a stroked mark by dragging.
     public var draws: Bool { kind != nil }
+
+    /// Whether a click with this tool places a sticky note instead of selecting text.
+    public var placesNote: Bool { self == .note }
+
+    /// Whether a drag with this tool creates a text box.
+    public var placesTextBox: Bool { self == .textBox }
 
     public var title: String {
         switch self {
@@ -39,6 +47,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .arrow: return "Arrow"
         case .rectangle: return "Rectangle"
         case .ellipse: return "Ellipse"
+        case .note: return "Sticky Note"
+        case .textBox: return "Text Box"
         }
     }
 
@@ -50,8 +60,38 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .arrow: return "arrow.up.right"
         case .rectangle: return "rectangle"
         case .ellipse: return "circle"
+        case .note: return "note.text"
+        case .textBox: return "textbox"
         }
     }
+}
+
+/// Which part of a selected text box a resize drag grabbed.
+///
+/// Edges and corners are distinct because they resize different axes: dragging the left edge
+/// moves `minX` and leaves `maxX` where it was, while the top-left corner moves both. The canvas
+/// draws a handle at each of the eight positions; the edge names are the same eight positions.
+public enum TextBoxResizeHandle: CaseIterable, Sendable {
+    case topLeft, top, topRight, left, right, bottomLeft, bottom, bottomRight
+
+    /// The point on `rect` this handle sits at, in the same page space as the rect.
+    public func point(in rect: CGRect) -> CGPoint {
+        switch self {
+        case .topLeft: return CGPoint(x: rect.minX, y: rect.minY)
+        case .top: return CGPoint(x: rect.midX, y: rect.minY)
+        case .topRight: return CGPoint(x: rect.maxX, y: rect.minY)
+        case .left: return CGPoint(x: rect.minX, y: rect.midY)
+        case .right: return CGPoint(x: rect.maxX, y: rect.midY)
+        case .bottomLeft: return CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottom: return CGPoint(x: rect.midX, y: rect.maxY)
+        case .bottomRight: return CGPoint(x: rect.maxX, y: rect.maxY)
+        }
+    }
+
+    public var movesLeft: Bool { self == .left || self == .topLeft || self == .bottomLeft }
+    public var movesRight: Bool { self == .right || self == .topRight || self == .bottomRight }
+    public var movesTop: Bool { self == .top || self == .topLeft || self == .topRight }
+    public var movesBottom: Bool { self == .bottom || self == .bottomLeft || self == .bottomRight }
 }
 
 /// One geometry mark as the canvas overlay draws it.
@@ -112,7 +152,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
             }
             return CGRect(x: minX, y: minY, width: max(maxX - minX, 0.01),
                           height: max(maxY - minY, 0.01))
-        case .square, .circle:
+        case .square, .circle, .stickyNote, .textBox:
             return shapeRect
         case .line, .arrow:
             guard let start = lineStart, let end = lineEnd else { return nil }
@@ -203,6 +243,10 @@ public enum AnnotationGeometry {
             }
         case .highlight, .underline:
             break
+        case .stickyNote, .textBox:
+            // These are drawn from a bitmap (the note icon or the laid-out text), not a stroke;
+            // the overlay uses `bounds` for the selection halo. No vector path to return.
+            break
         }
         return path
     }
@@ -232,6 +276,16 @@ public enum AnnotationGeometry {
             return distance(point, toEllipseIn: rect) <= reach
         case .highlight, .underline:
             return false
+        case .stickyNote:
+            guard let rect = mark.shapeRect else { return false }
+            return rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
+        case .textBox:
+            guard let rect = mark.shapeRect else { return false }
+            // A text box is selected by its frame, never by its interior while it is not
+            // selected: the text under it must stay selectable. Once selected, dragging its
+            // inside moves it, which is why the interior counts only then.
+            if distance(point, toRectOutline: rect) <= reach { return true }
+            return mark.isSelected && rect.contains(point)
         }
     }
 

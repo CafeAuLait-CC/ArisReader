@@ -491,7 +491,7 @@ extension ReaderChecks {
     /// half of the PDFKit pipeline drew them: if a viewer synthesises from `/L` or `/InkList`,
     /// or uses the `/AP` this writer now supplies, the stroke is there either way.
     @MainActor
-    private static func pdfKitPixels(
+    static func pdfKitPixels(
         url: URL,
         viewSpaceRect: CGRect,
         scale: CGFloat,

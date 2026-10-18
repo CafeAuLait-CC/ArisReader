@@ -112,6 +112,17 @@ public enum PlacementIndex {
         -5 * block + annotation * 1_024 + box
     }
 
+    /// A placed-text glyph this reader wrote and keeps in its sidecar — a sticky note icon or a
+    /// text box's laid-out text: one per annotation, downwards from `-7·block`. Capacity:
+    /// 2^28 annotations. A block of its own, below `documentNote`, for the same reason that one
+    /// has its own: the two kinds are drawn from different bitmaps and must not share a texture.
+    public static func ownNote(_ index: Int) -> Int { -7 * block + index }
+
+    /// Whether `index` names a sidecar placed-text glyph (a sticky note icon or a text box).
+    public static func isOwnNote(_ index: Int) -> Bool {
+        index >= -7 * block && index < -6 * block
+    }
+
     /// A note glyph loaded from the PDF — a sticky icon, free text or inline-comment label:
     /// one per annotation, upwards from `-6·block`. Capacity: 2^28 notes.
     ///

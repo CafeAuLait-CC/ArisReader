@@ -329,6 +329,10 @@ pub struct WriteAnnotation {
     /// `/BS /W`, in points. Always positive; written for every stroked geometry kind and
     /// ignored for the quad-based kinds.
     pub border_width: f64,
+    /// `/DA` font size, in points. Used by `/FreeText`; 0 for every other kind.
+    pub font_size: f64,
+    /// `/Q` text alignment, used by `/FreeText`; the PDF default (left) for every other kind.
+    pub alignment: AnnotationAlignment,
     pub color: [u8; 3],
     /// `/CA`; 1.0 means fully opaque and is still written, because the shell's model carries
     /// an opacity for every annotation.
@@ -349,6 +353,8 @@ pub enum WriteAnnotationKind {
     Underline,
     /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
     Text,
+    /// `/FreeText`: text laid out in `/Rect`, with `/DA`, `/Q` and an appearance stream.
+    FreeText,
     /// `/Ink`: a freehand stroke list. Written with `/InkList` and `/BS`.
     Ink,
     /// `/Square`: a stroked rectangle. Written with `/Rect` and `/BS`.
@@ -365,6 +371,7 @@ impl WriteAnnotationKind {
             Self::Highlight => ANNOT_HIGHLIGHT,
             Self::Underline => ANNOT_UNDERLINE,
             Self::Text => ANNOT_TEXT,
+            Self::FreeText => ANNOT_FREETEXT,
             Self::Ink => ANNOT_INK,
             Self::Square => ANNOT_SQUARE,
             Self::Circle => ANNOT_CIRCLE,
@@ -378,6 +385,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::Text => "Text",
+            Self::FreeText => "FreeText",
             Self::Ink => "Ink",
             Self::Square => "Square",
             Self::Circle => "Circle",
@@ -391,6 +399,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::Text => "Note",
+            Self::FreeText => "Free Text",
             Self::Ink => "Ink",
             Self::Square => "Square",
             Self::Circle => "Circle",
@@ -403,10 +412,19 @@ impl WriteAnnotationKind {
     /// PDFium will not create `/Line` at all (`FPDFPage_CreateAnnot` returns null), and none of
     /// the stroked kinds can carry `/BS` or an appearance stream through its C API: the only
     /// border setter writes `/Border`, and the only appearance setter stores a text string
-    /// rather than a form XObject. Those three facts are why the stroked kinds go through the
-    /// dictionary writer in `geometry_write` and the quad-based kinds keep the PDFium path.
+    /// rather than a form XObject. A sticky note has the same problem with `/Name` (the icon
+    /// name), and a free-text annotation needs `/DA`, `/Q` and a real `/AP` form XObject.
+    ///
+    /// Those facts are why highlights and underlines keep the PDFium path and every kind whose
+    /// appearance matters is written by the dictionary writer in `geometry_write` (which now
+    /// writes `/Text` and `/FreeText` too, despite the file's historical name).
     pub(crate) fn uses_pdfium(self) -> bool {
-        matches!(self, Self::Highlight | Self::Underline | Self::Text)
+        matches!(self, Self::Highlight | Self::Underline)
+    }
+
+    /// Whether this kind is written by the direct (lopdf) writer.
+    pub(crate) fn is_direct(self) -> bool {
+        !self.uses_pdfium()
     }
 }
 

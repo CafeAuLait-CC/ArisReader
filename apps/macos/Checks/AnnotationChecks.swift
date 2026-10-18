@@ -668,6 +668,9 @@ extension ReaderChecks {
         for index in 0..<4_096 {
             claim(PlacementIndex.documentNote(index), "note glyph \(index)")
         }
+        for index in 0..<4_096 {
+            claim(PlacementIndex.ownNote(index), "sidecar placed-text glyph \(index)")
+        }
 
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
@@ -680,10 +683,11 @@ extension ReaderChecks {
         claim(PlacementIndex.documentAnnotation(262_143, box: 1_023),
               "the last loaded annotation's last box")
         claim(PlacementIndex.documentNote(PlacementIndex.block - 1), "the last note glyph")
+        claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last sidecar placed-text glyph")
 
-        require(owner.count == 4_096 * 4 + 4_096 * 64 + 5,
-                "page rasters, the selection, this reader's annotations, loaded annotations and "
-                    + "note glyphs never share a placement index (\(owner.count) distinct indices, "
+        require(owner.count == 4_096 * 5 + 4_096 * 64 + 6,
+                "page rasters, the selection, this reader's annotations, loaded annotations, "
+                    + "sidecar placed-text glyphs and note glyphs never share a placement index (\(owner.count) distinct indices, "
                     + "including the ends of each block)")
     }
 

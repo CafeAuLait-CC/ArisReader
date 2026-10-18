@@ -2,7 +2,11 @@ import AppKit
 import CoreGraphics
 import QuartzCore
 
-/// The layer that draws the reader's ink and shapes **above** the Metal canvas.
+/// The layer that draws the reader's ink, shapes and selection chrome **above** the Metal canvas.
+///
+/// Sticky-note icons and text boxes' text are bitmaps handed to the Metal canvas (see
+/// `PlacementIndex.ownNote`); this layer draws their selection halo and the eight resize handles
+/// of a selected text box, plus the live preview of a drag.
 ///
 /// Two reasons this is not a texture like a highlight:
 ///
@@ -143,7 +147,7 @@ final class AnnotationOverlayView: NSView {
             liveLayer.path = nil
             liveStart = content
             liveEnd = content
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             break
         }
         liveKind = kind
@@ -171,7 +175,7 @@ final class AnnotationOverlayView: NSView {
             let path = CGMutablePath()
             if kind == .square { path.addRect(rect) } else { path.addEllipse(in: rect) }
             liveLayer.path = path
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             break
         }
     }
@@ -203,7 +207,7 @@ final class AnnotationOverlayView: NSView {
                               width: abs(end.x - start.x), height: abs(end.y - start.y))
             guard rect.width >= 1, rect.height >= 1 else { return nil }
             return AnnotationDraft(kind: kind, page: page, shapeRect: rect)
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             return nil
         }
     }
@@ -246,6 +250,9 @@ final class AnnotationOverlayView: NSView {
                     NSNumber(value: 4 / max(zoom, 0.01)),
                     NSNumber(value: 3 / max(zoom, 0.01)),
                 ]
+                if mark.kind == .textBox {
+                    appendResizeHandles(for: mark, frame: frame)
+                }
             }
         }
     }
@@ -275,7 +282,7 @@ final class AnnotationOverlayView: NSView {
                                        width: mark.strokeWidth)
             paths.stroke = path
             if mark.kind == .arrow { paths.fill = path }
-        case .highlight, .underline:
+        case .highlight, .underline, .stickyNote, .textBox:
             return []
         }
 
@@ -288,6 +295,35 @@ final class AnnotationOverlayView: NSView {
         layer.lineCap = .round
         layer.contentsScale = window?.backingScaleFactor ?? 2
         return [layer]
+    }
+
+    /// The eight grab handles on a selected text box: four corners and four edge midpoints.
+    ///
+    /// They are plain layers rather than part of the dashed halo so the pointer can see a target
+    /// to grab; the hit test that decides which one the pointer is over lives in `AppState`, in
+    /// page space, where the resize maths also lives.
+    private func appendResizeHandles(for mark: CanvasAnnotationMark, frame: PagePlacement) {
+        guard let box = mark.shapeRect else { return }
+        let rect = box.offsetBy(dx: frame.leftPt, dy: frame.topPt)
+        let points = [
+            CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.midY),
+            CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY),
+            CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.minX, y: rect.midY),
+        ]
+        let side = 7 / max(zoom, 0.01)
+        for point in points {
+            let handle = CALayer()
+            handle.frame = CGRect(x: point.x - side / 2, y: point.y - side / 2,
+                                  width: side, height: side)
+            handle.backgroundColor = themeColor.cgColor
+            handle.borderColor = NSColor.white.cgColor
+            handle.borderWidth = 1 / max(zoom, 0.01)
+            handle.cornerRadius = 1.5 / max(zoom, 0.01)
+            handle.contentsScale = window?.backingScaleFactor ?? 2
+            marksLayer.addSublayer(handle)
+            markLayers.append(handle)
+        }
     }
 
     private func lineOrArrowPath(kind: AppState.Annotation.Kind, start: CGPoint, end: CGPoint,
