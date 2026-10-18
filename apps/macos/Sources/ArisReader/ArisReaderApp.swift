@@ -70,6 +70,7 @@ struct ArisReaderApp: App {
             // the reader's window (`ReaderWindowRegistry`).
             ReaderWindowRoot(registry: appDelegate.registry)
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1200, height: 800)
         .commands {
             ReaderCommands()

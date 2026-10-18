@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Full-width document tabs sit above all commands, independently of the sidebar.
@@ -40,6 +41,9 @@ struct TabStrip: View {
                     }
                 }
             }
+            .frame(maxWidth: CGFloat(max(1, state.tabs.count)) * 250)
+            ReaderWindowDragArea().frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityHidden(true)
             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
                 .buttonStyle(LyraToolStyle()).help("Open a PDF in a new tab (⌘O)")
                 .accessibilityLabel("Open PDF")
@@ -55,6 +59,7 @@ struct TabStrip: View {
 /// reserved, disabled positions; existing annotation commands still act on the current selection.
 struct ReaderToolbar: View {
     @ObservedObject var state: AppState
+    @Environment(\.openSettings) private var openSettings
     @State private var annotationsExpanded = false
     @State private var annotationColorIndex = 0
 
@@ -76,7 +81,6 @@ struct ReaderToolbar: View {
         }
         .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
         .buttonStyle(LyraToolStyle())
-        .menuStyle(.borderlessButton)
         .fixedSize(horizontal: false, vertical: true)
     }
 
@@ -89,30 +93,23 @@ struct ReaderToolbar: View {
                 if state.sidebarVisible && state.sidebarTab == .thumbnails { state.sidebarVisible = false }
                 else { state.sidebarTab = .thumbnails; state.sidebarVisible = true }
             }
-            Menu {
-                ForEach(ReaderLayoutMode.allCases) { mode in
-                    Button { state.setLayoutMode(mode) } label: {
-                        Label(mode.title, systemImage: state.layoutMode == mode ? "checkmark" : "rectangle")
-                    }
-                }
-            } label: { Image(systemName: "book") .frame(width: 30, height: 32) }
-            .fixedSize().menuIndicator(.hidden)
-            .help("View settings · continuous or facing pages").accessibilityLabel("View settings")
+            LyraMenu(title: "View settings", items: ReaderLayoutMode.allCases.map { mode in
+                LyraMenuItem(mode.title, icon: mode == .facing ? "book" : "rectangle",
+                             selected: state.layoutMode == mode) { state.setLayoutMode(mode) }
+            }) { menuLabel("book") }
             separator
             HStack(spacing: 0) {
                 tool("Zoom out (⌘−)", "minus") { state.zoomOut() }
-                Menu {
-                    Button("Actual Size (100%)") { state.zoomActual() }
-                    Button("Zoom In") { state.zoomIn() }
-                    Button("Zoom Out") { state.zoomOut() }
-                } label: {
+                LyraMenu(title: "Zoom", items: [
+                    LyraMenuItem("Actual Size (100%)", icon: "1.magnifyingglass", shortcut: "⌘0") { state.zoomActual() },
+                    LyraMenuItem("Zoom In", icon: "plus.magnifyingglass", shortcut: "⌘+") { state.zoomIn() },
+                    LyraMenuItem("Zoom Out", icon: "minus.magnifyingglass", shortcut: "⌘−") { state.zoomOut() },
+                ]) {
                     HStack(spacing: 4) {
                         Text("\(state.zoomPercent)%").monospacedDigit().fixedSize()
                         Image(systemName: "chevron.down").font(.system(size: 8))
                     }.font(.system(size: 12)).frame(minWidth: 60, minHeight: 32)
                 }
-                .fixedSize().menuIndicator(.hidden)
-                .help("Zoom").accessibilityLabel("Zoom")
                 tool("Zoom in (⌘+)", "plus") { state.zoomIn() }
             }
             separator
@@ -127,48 +124,34 @@ struct ReaderToolbar: View {
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(annotationsExpanded ? "Expanded" : "Collapsed")
             pending("Edit PDF", "character.cursor.ibeam")
-            Menu {
-                Button("Rotate Selected Pages Clockwise") { state.rotateSelectedPages(clockwise: true) }
-                    .disabled(!state.canPageEdit)
-                Button("Rotate Selected Pages Anticlockwise") { state.rotateSelectedPages(clockwise: false) }
-                    .disabled(!state.canPageEdit)
-                Button("Insert Blank Page After") { state.insertBlankPage(before: false) }
-                    .disabled(!state.canPageEdit)
-                Button("Extract Selected Pages…") { state.presentExtractPagesPanel() }
-                    .disabled(state.document == nil)
-            } label: { Image(systemName: "doc.on.doc").frame(width: 30, height: 32) }
-            .fixedSize().menuIndicator(.hidden)
-            .help("Organise pages").accessibilityLabel("Organise pages")
-            Menu {
-                Button("Save Annotated Copy…") { state.presentSaveAnnotatedCopyPanel() }
-                    .disabled(!state.canSaveAnnotationsToPDF)
-                Button("Save and Replace Original…") { state.presentReplaceOriginalConfirmation() }
-                    .disabled(!state.canSaveAnnotationsToPDF)
-                Divider()
-                Button("Save Edited Copy…") { state.presentSavePageEditsCopyPanel() }
-                    .disabled(!state.canApplyPageEdits)
-            } label: { Image(systemName: "square.and.arrow.up").frame(width: 30, height: 32) }
-            .fixedSize().menuIndicator(.hidden)
-            .help("Export and save").accessibilityLabel("Export and save")
+            LyraMenu(title: "Organise pages", items: [
+                LyraMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
+                LyraMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },
+                .separator("page-operations"),
+                LyraMenuItem("Insert Blank Page After", icon: "doc.badge.plus", enabled: state.canPageEdit) { state.insertBlankPage(before: false) },
+                LyraMenuItem("Extract Selected Pages…", icon: "doc.on.doc", enabled: state.document != nil) { state.presentExtractPagesPanel() },
+            ]) { menuLabel("doc.on.doc") }
+            LyraMenu(title: "Export and save", items: [
+                LyraMenuItem("Save Annotated Copy…", icon: "square.and.arrow.up", shortcut: "⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentSaveAnnotatedCopyPanel() },
+                LyraMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentReplaceOriginalConfirmation() },
+                .separator("export"),
+                LyraMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canApplyPageEdits) { state.presentSavePageEditsCopyPanel() },
+            ]) { menuLabel("square.and.arrow.up") }
             pending("Fill & Sign", "signature")
             separator
             tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
                 state.sidebarTab = .ai; state.sidebarVisible = true
             }
-            Menu {
-                Button("Open PDF…") { state.showFileImporter = true }
-                Button("Add Bookmark (⌘D)") { state.addBookmarkAtCurrentPage() }
-                    .disabled(state.document == nil)
-                Button("Previous Page") { state.previousPage() }.disabled(state.document == nil)
-                Button("Next Page") { state.nextPage() }.disabled(state.document == nil)
-                Divider()
-                Button("Undo") { state.undo() }.disabled(!state.canUndo)
-                Button("Close Reference Preview") { state.closeReferencePreview() }
-                    .disabled(state.referencePreview == nil)
-                SettingsLink { Text("Settings…") }
-            } label: { Image(systemName: "ellipsis.circle").frame(width: 30, height: 32) }
-            .fixedSize().menuIndicator(.hidden)
-            .help("More commands").accessibilityLabel("More commands")
+            LyraMenu(title: "More commands", items: [
+                LyraMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
+                LyraMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D", enabled: state.document != nil) { state.addBookmarkAtCurrentPage() },
+                LyraMenuItem("Previous Page", icon: "chevron.up", enabled: state.document != nil) { state.previousPage() },
+                LyraMenuItem("Next Page", icon: "chevron.down", enabled: state.document != nil) { state.nextPage() },
+                .separator("more"),
+                LyraMenuItem("Undo", icon: "arrow.uturn.backward", shortcut: "⌘Z", enabled: state.canUndo) { state.undo() },
+                LyraMenuItem("Close Reference Preview", icon: "rectangle.on.rectangle", enabled: state.referencePreview != nil) { state.closeReferencePreview() },
+                LyraMenuItem("Settings…", icon: "gearshape", shortcut: "⌘,") { openSettings() },
+            ]) { Image(systemName: "ellipsis.circle") }
             Spacer(minLength: 4)
             search(compact: compact)
         }
@@ -196,28 +179,30 @@ struct ReaderToolbar: View {
             pending("Stamps", "seal")
             pending("Signature", "signature")
             separator
-            Menu {
-                ForEach(Array(AppState.annotationPalette.enumerated()), id: \.offset) { index, item in
-                    Button { annotationColorIndex = index } label: {
-                        Label(item.name, systemImage: annotationColorIndex == index ? "checkmark.circle.fill" : "circle.fill")
-                    }
-                }
-            } label: {
+            LyraMenu(title: "Annotation color", items: AppState.annotationPalette.enumerated().map { index, item in
+                LyraMenuItem(item.name, icon: "circle.fill", selected: annotationColorIndex == index,
+                             color: Color(red: Double(item.color.red) / 255,
+                                          green: Double(item.color.green) / 255,
+                                          blue: Double(item.color.blue) / 255)) { annotationColorIndex = index }
+            }) {
                 Image(systemName: "circle.fill")
                     .foregroundStyle(Color(red: Double(annotationColor.red) / 255,
                                            green: Double(annotationColor.green) / 255,
                                            blue: Double(annotationColor.blue) / 255))
                     .font(.system(size: 17)).frame(width: 32, height: 32)
             }
-            .fixedSize().menuIndicator(.hidden)
-            .help("Annotation color: \(AppState.annotationPalette[annotationColorIndex].name)")
-            .accessibilityLabel("Annotation color")
-            .accessibilityValue(AppState.annotationPalette[annotationColorIndex].name)
             Spacer(minLength: 0)
             Button { annotationsExpanded = false } label: {
                 Image(systemName: "xmark").font(.system(size: 11))
             }.help("Hide annotation tools").accessibilityLabel("Hide annotation tools")
         }
+    }
+
+    private func menuLabel(_ icon: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
+        }.padding(.horizontal, 4)
     }
 
     private var annotationColor: AnnotationColor { AppState.annotationPalette[annotationColorIndex].color }
@@ -254,5 +239,17 @@ struct ReaderToolbar: View {
     private func pending(_ title: String, _ icon: String) -> some View {
         Button {} label: { Image(systemName: icon) }
             .disabled(true).help("\(title) · Coming soon").accessibilityLabel("\(title), coming soon")
+    }
+}
+
+/// An explicit empty tab-bar region owns window dragging; tab/close/open buttons keep their
+/// own pointer handling, and document drags continue to select text in the Metal canvas.
+private struct ReaderWindowDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+        override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     }
 }

@@ -225,7 +225,10 @@ fallback, page-one fallback, arXiv-only) in `crates/aris-reader-cli/tests/metada
 ## Reader interface
 
 Lyra follows the system appearance with a warm cream/gold light palette and warm charcoal dark
-palette. Document tabs span the top of the reader, followed by grouped view/zoom controls,
+palette. Document tabs share the top window row with the native window controls; the separate
+native title strip is hidden and the empty tab-bar area moves the window. Toolbar drop-downs use
+Lyra popovers with icons, grouped commands, hover states, and arrow-key/Return/Escape navigation.
+The tab row is followed by grouped view/zoom controls,
 annotation tools, page operations, export, AI, and search. **Annotate** expands a second row for
 highlights, underlines, selection notes, and six Lyra color presets. Existing indexed sidecar
 colors retain their original values. Tools that are not implemented yet are disabled in their

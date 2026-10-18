@@ -18,20 +18,25 @@ public struct ReaderWindow: View {
     /// test or preview that only has an `AppState` still works; the app passes the session's own
     /// (see `ReaderSession`).
     private let previewPanels: ReferencePreviewPanelController
+    private let integratesTitlebar: Bool
 
     public init(
         state: AppState,
         opener: DocumentOpenCoordinator,
-        previewPanels: ReferencePreviewPanelController = .shared
+        previewPanels: ReferencePreviewPanelController = .shared,
+        integratesTitlebar: Bool = false
     ) {
         self.state = state
         self.opener = opener
         self.previewPanels = previewPanels
+        self.integratesTitlebar = integratesTitlebar
     }
 
     public var body: some View {
         VStack(spacing: 0) {
             TabStrip(state: state)
+                .padding(.leading, integratesTitlebar ? 78 : 0)
+                .background(LyraTheme.tabbarBg)
             ReaderToolbar(state: state)
             HStack(spacing: 0) {
                 if state.sidebarVisible {

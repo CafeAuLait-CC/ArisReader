@@ -107,6 +107,8 @@ public final class ReaderSession: ObservableObject, Identifiable {
             self.window = window
             window.backgroundColor = LyraTheme.titlebarColor
             window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.titlebarSeparatorStyle = .none
             let center = NotificationCenter.default
             windowObservers.append(center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
@@ -166,7 +168,9 @@ public struct ReaderWindowRoot: View {
     }
 
     public var body: some View {
-        ReaderWindow(state: session.state, opener: session.opener, previewPanels: session.previewPanels)
+        ReaderWindow(state: session.state, opener: session.opener,
+                     previewPanels: session.previewPanels, integratesTitlebar: true)
+            .ignoresSafeArea(.container, edges: .top)
             // The reading commands (⌘O, ⌘←/→, ⌘G, zoom, sidebar) are app-wide menu items, so they
             // read the session of the *focused* window rather than a single global one.
             .focusedSceneValue(\.readerSession, session)
