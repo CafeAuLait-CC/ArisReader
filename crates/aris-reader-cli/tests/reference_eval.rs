@@ -42,8 +42,9 @@
 use aris_reader_core::{DocumentBackend, PageIndex, RawTextPage};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{
-    Citation, CitationStyle, ReferenceEntry, find_citations_with, find_references,
-    find_references_with_landings, resolve_reference, resolve_references,
+    AttributionReason, Citation, CitationStyle, ReferenceEntry, SectionKind, attribute_citation,
+    find_citations_with, find_reference_lists, find_references, find_references_with_landings,
+    resolve_reference, resolve_references,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1885,5 +1886,124 @@ fn gpt4_main_text_resolves_into_the_reports_own_bibliography() {
         "GPT-4 two-bibliography check: {} entries on pages 18–23; [1] Brown, [13] Kojima; \
          {labels} label(s) over {spans} main-text span(s), every one inside the report's list",
         references.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.42 — which of several lists a citation belongs to
+// ---------------------------------------------------------------------------
+
+/// The appendix's own citations must resolve into the appendix's list, not into the report's.
+///
+/// T4.41 made the *main text* point at the report's own list; it left the mirror error in place:
+/// the system card appendix prints its own references (pages 71–78, 105 entries, independently
+/// numbered from 1), and every citation in the card resolved into the report's 85-entry list.
+/// This is the label-level check again, because a page number and a hit rate cannot see it: `[13]`
+/// in the card means Christiano (deep reinforcement learning from human preferences), and the
+/// report's `[13]` is Kojima. The test also checks a number only the appendix prints (`[96]` on
+/// page 60), which is the case the CLI is required to name.
+#[test]
+#[ignore = "needs the locked arXiv corpus and PDFium"]
+fn gpt4_appendix_citations_resolve_into_the_appendixs_own_list() {
+    let root = repo_root();
+    let path = corpus_dir(&root).join(TWO_BIBLIOGRAPHY_PDF);
+    if !path.is_file() {
+        announce_two_bibliography_skip(&path);
+        return;
+    }
+    let backend = PdfiumBackend::open(&path, None).expect("locked GPT-4 PDF must be readable");
+    let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count())
+        .map(|page| {
+            (
+                page,
+                backend
+                    .raw_text_page(PageIndex(page))
+                    .expect("extract locked document"),
+            )
+        })
+        .collect();
+    let bibliography =
+        find_reference_lists(pages.iter().map(|(page, text)| (*page, text)), MAX_ENTRIES);
+    assert_eq!(
+        bibliography.lists.len(),
+        2,
+        "the report prints its own list and the system card appendix's"
+    );
+    let report = &bibliography.lists[bibliography.document_wide];
+    assert_eq!(
+        (
+            report.first_page(),
+            report.last_page(),
+            report.entries.len()
+        ),
+        (Some(17), Some(22), 85),
+        "the document-wide list is not the report's own references"
+    );
+    let appendix = bibliography
+        .lists
+        .iter()
+        .position(|list| list.first_page() == Some(70))
+        .expect("the appendix's list on pages 71–78");
+    let appendix_list = &bibliography.lists[appendix];
+    assert_eq!(
+        (
+            appendix_list.last_page(),
+            appendix_list.entries.len(),
+            appendix_list.region_start
+        ),
+        (Some(77), 105, Some(40)),
+        "the appendix list must own the pages from the system card's title page"
+    );
+    assert_eq!(
+        appendix_list.section.as_ref().map(|section| section.kind),
+        Some(SectionKind::Part),
+        "the system card title page is what starts the appendix list's region"
+    );
+
+    // The report's own `[13]`: Kojima, as T4.41 pinned.
+    let body = attribute_citation(&bibliography, 12, &["13".to_string()]).expect("a bibliography");
+    assert_eq!(body.list, bibliography.document_wide, "{body:?}");
+    let kojima = resolve_reference(&["13".to_string()], &report.entries).expect("[13] report");
+    assert!(
+        kojima.text.contains("Kojima") && kojima.text.contains("zero-shot reasoners"),
+        "{:?}",
+        kojima.text.chars().take(120).collect::<String>()
+    );
+
+    // The card's `[13]` on page 42: Christiano, from the card's own list.
+    let card = attribute_citation(&bibliography, 41, &["13".to_string()]).expect("a bibliography");
+    assert_eq!(card.list, appendix, "{card:?}");
+    assert_eq!(card.reason, AttributionReason::SectionList);
+    let christiano =
+        resolve_reference(&["13".to_string()], &appendix_list.entries).expect("[13] appendix");
+    let christiano_text = christiano
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        christiano_text.contains("Christiano")
+            && christiano_text.contains("Deep reinforcement learning from human preferences"),
+        "{:?}",
+        christiano.text.chars().take(120).collect::<String>()
+    );
+    assert!(
+        !christiano.text.contains("Kojima"),
+        "the card's [13] resolved into the report's list"
+    );
+
+    // A number the report's list never prints. The card cites [96] on page 60; the attribution
+    // must name the appendix list, which is what the CLI reports as "only in the appendix list".
+    let only = attribute_citation(&bibliography, 59, &["96".to_string()]).expect("a bibliography");
+    assert_eq!(only.list, appendix, "{only:?}");
+    assert_eq!(only.reason, AttributionReason::SectionList);
+    assert!(
+        report.entries.iter().all(|entry| entry.label != "96"),
+        "label 96 was expected to exist only in the appendix list"
+    );
+    println!(
+        "GPT-4 multi-bibliography check: report list pages 18–23 / 85 entries, appendix list \
+         pages 71–78 / 105 entries; report [13] Kojima, card [13] Christiano, card [96] only in \
+         the appendix list"
     );
 }
