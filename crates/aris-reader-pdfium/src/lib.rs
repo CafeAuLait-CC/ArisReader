@@ -49,6 +49,10 @@ mod appearance_font;
 #[cfg(feature = "pdfium")]
 mod backend;
 #[cfg(feature = "pdfium")]
+mod document_properties;
+#[cfg(feature = "pdfium")]
+mod forms;
+#[cfg(feature = "pdfium")]
 mod geometry_write;
 #[cfg(feature = "pdfium")]
 mod page_ops;
@@ -66,6 +70,17 @@ pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, m
 #[cfg(feature = "pdfium")]
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
+};
+#[cfg(feature = "pdfium")]
+pub use document_properties::{
+    DocumentFacts, DocumentInfo, DocumentProperties, PropertiesSaveReport,
+    read_document_facts_unencrypted_header, read_document_info, save_document_properties,
+    suggested_properties_copy_path,
+};
+#[cfg(feature = "pdfium")]
+pub use forms::{
+    FormDocument, FormField, FormFieldKind, FormOption, FormSaveReport, FormValueUpdate,
+    FormWidget, read_form_document, save_form_pdf, suggested_filled_copy_path,
 };
 #[cfg(feature = "pdfium")]
 pub use page_ops::{

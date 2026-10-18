@@ -764,6 +764,28 @@ impl Drop for PdfiumBackend {
     }
 }
 
+impl PdfiumBackend {
+    /// Whether PDFium sees an AcroForm in this document.
+    ///
+    /// The form reader parses the widget dictionaries with `lopdf`, which means reading the
+    /// whole file. That is the right price for a form and the wrong price for every other PDF,
+    /// so `ArisDocument::form_info` asks PDFium first: `FPDF_GetFormType` is a document-state
+    /// read with no parse. `false` (including an XFA-only form, which has no AcroForm widget
+    /// dictionaries) means there is nothing this reader can fill.
+    pub fn has_acro_form(&self) -> bool {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        document
+            .form()
+            .map(|form| matches!(form.form_type(), PdfFormType::Acrobat))
+            .unwrap_or(false)
+    }
+}
+
 impl DocumentBackend for PdfiumBackend {
     fn page_count(&self) -> u32 {
         // Immutable until page editing is implemented; no FFI call or nested lock.

@@ -326,6 +326,155 @@ pub fn save_annotated_pdf(
     result
 }
 
+/// What an incremental save that is not an annotation write produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IncrementalSaveReport {
+    /// The file the verified bytes were renamed onto.
+    pub destination: PathBuf,
+    /// Bytes appended to the original, measured after verification.
+    pub appended_bytes: u64,
+    /// The verified backup, only for [`SaveMode::ReplaceOriginal`].
+    pub backup_path: Option<PathBuf>,
+    /// Stale `*.lyra-save-*.tmp` files removed from the destination directory before this save.
+    pub cleaned_temporaries: usize,
+    /// True when the output's prefix equals the source byte-for-byte. Always true on `Ok`.
+    pub source_bytes_preserved: bool,
+}
+
+/// Runs an **incremental** writer under the same file-safety contract as
+/// [`save_annotated_pdf`], for updates that are not annotations (form values, `/Info`).
+///
+/// `build` receives the temporary file and must produce the complete output — the source bytes
+/// followed by the update — exactly as the direct annotation writer does. `verify` receives the
+/// temporary path after it has been flushed and must reopen it and prove the update is there and
+/// that everything it did not change is still unchanged. This function adds the parts that
+/// protect the user, so both writers cannot drift apart:
+///
+/// 1. The source is canonicalised and must be a regular file; a copy may not be the source and a
+///    replace must be the source.
+/// 2. A replace writes a byte-identical backup before the temporary file is created.
+/// 3. The output is written to a temporary file beside the destination, flushed and `fsync`ed.
+/// 4. The source is checked for concurrent modification, and its bytes must be the output's
+///    prefix.
+/// 5. `verify` reopens the temporary file before it is renamed.
+/// 6. The destination's permissions are preserved and the rename is the last step.
+pub(crate) fn save_incremental_with_contract<Build, Verify>(
+    source: &Path,
+    destination: &Path,
+    mode: SaveMode,
+    build: Build,
+    verify: Verify,
+) -> Result<IncrementalSaveReport>
+where
+    Build: FnOnce(&mut File) -> Result<()>,
+    Verify: FnOnce(&Path) -> Result<()>,
+{
+    let source = fs::canonicalize(source)
+        .map_err(|error| io_error("could not resolve the document being saved", source, error))?;
+    if !source.is_file() {
+        return Err(ArisError::new(
+            ErrorCode::NotFound,
+            "the document being saved is not a regular file",
+        )
+        .with_detail(source.display().to_string()));
+    }
+    let destination = canonical_destination(destination)?;
+    match mode {
+        SaveMode::Copy if destination == source => {
+            return Err(ArisError::new(
+                ErrorCode::InvalidArgument,
+                "the saved copy would overwrite the original; choose another name or the explicit replace action",
+            ));
+        }
+        SaveMode::ReplaceOriginal if destination != source => {
+            return Err(ArisError::new(
+                ErrorCode::InvalidArgument,
+                "the replace action can only write the document it was opened from",
+            )
+            .with_detail(format!(
+                "opened: {} · requested: {}",
+                source.display(),
+                destination.display()
+            )));
+        }
+        _ => {}
+    }
+
+    let source_metadata = fs::metadata(&source)
+        .map_err(|error| io_error("could not read the source metadata", &source, error))?;
+    let source_len = source_metadata.len();
+    let source_modified = source_metadata.modified().ok();
+
+    let mut cleaned_temporaries = cleanup_interrupted_save_temporaries(&destination)?;
+    if destination != source {
+        cleaned_temporaries += cleanup_interrupted_save_temporaries(&source)?;
+    }
+
+    let backup_path = match mode {
+        SaveMode::ReplaceOriginal => Some(write_backup(&source)?),
+        SaveMode::Copy => None,
+    };
+
+    let (temp, mut file) = TempFile::create(&destination)?;
+    (|| -> Result<IncrementalSaveReport> {
+        build(&mut file)?;
+        file.flush()
+            .map_err(|error| io_error("could not flush the saved document", temp.path(), error))?;
+        file.sync_all()
+            .map_err(|error| io_error("could not fsync the saved document", temp.path(), error))?;
+        drop(file);
+
+        let written_bytes = fs::metadata(temp.path())
+            .map_err(|error| io_error("could not measure the saved file", temp.path(), error))?
+            .len();
+        if written_bytes < source_len {
+            return Err(ArisError::new(
+                ErrorCode::Internal,
+                "the incremental save produced fewer bytes than the original",
+            )
+            .with_detail(format!("{written_bytes} < {source_len}")));
+        }
+
+        let after = fs::metadata(&source)
+            .map_err(|error| io_error("could not re-read the source metadata", &source, error))?;
+        if after.len() != source_len || after.modified().ok() != source_modified {
+            return Err(ArisError::new(
+                ErrorCode::Io,
+                "the document changed on disk while it was being saved; nothing was replaced",
+            ));
+        }
+
+        verify_prefix(&source, temp.path(), source_len)?;
+        verify(temp.path())?;
+
+        fs::set_permissions(temp.path(), source_metadata.permissions()).map_err(|error| {
+            io_error(
+                "could not preserve the document's permissions",
+                temp.path(),
+                error,
+            )
+        })?;
+
+        fs::rename(temp.path(), &destination).map_err(|error| {
+            io_error(
+                "could not move the verified file into place",
+                &destination,
+                error,
+            )
+        })?;
+        temp.disarm();
+        sync_directory(destination.parent());
+
+        Ok(IncrementalSaveReport {
+            destination: destination.clone(),
+            appended_bytes: written_bytes.saturating_sub(source_len),
+            backup_path: backup_path.clone(),
+            cleaned_temporaries,
+            source_bytes_preserved: true,
+        })
+    })()
+}
+
 /// Writes a **rewritten** document under the same file-safety contract as an annotation save.
 ///
 /// Used by page operations, which cannot be incremental: `FPDF_SaveAsCopy` without

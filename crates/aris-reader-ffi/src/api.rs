@@ -111,6 +111,123 @@ pub struct DocumentSummary {
     pub backend: String,
 }
 
+/// One widget of an AcroForm field, in view space (points, top-left origin).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormWidgetRecord {
+    /// 0-based page the widget annotation is on.
+    pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// `/AS`: the button state name; empty for a text widget.
+    pub state: String,
+}
+
+/// One option of a choice or radio field.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormOptionRecord {
+    /// The value written to `/V`.
+    pub value: String,
+    /// The label the reader shows.
+    pub label: String,
+}
+
+/// One AcroForm field, read from the widget dictionaries.
+///
+/// `kind` is one of `text`, `checkBox`, `radio`, `comboBox`, `listBox`, `signature`. Every
+/// rectangle is in view space — the same convention as [`AnnotationRecord`] — and comes from the
+/// widget's `/Rect` through the page's `/CropBox`, `/Rotate` and `/UserUnit`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormFieldRecord {
+    /// Stable identity for a save: `f<object number>` of the field dictionary.
+    pub id: String,
+    /// Fully-qualified `/T` name.
+    pub name: String,
+    pub kind: String,
+    /// Page of the first widget.
+    pub page: u32,
+    /// The first widget's rectangle, view space.
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// `/V` for a text or choice field, or the selected state name of a button.
+    pub value: Option<String>,
+    /// Selected option indices for a choice or radio field.
+    pub selected: Vec<u32>,
+    /// Whether a check box's `/V`/`/AS` is on.
+    pub checked: bool,
+    pub widgets: Vec<FormWidgetRecord>,
+    pub options: Vec<FormOptionRecord>,
+    /// False for a signature field, a read-only field, or any field while the file is encrypted.
+    pub editable: bool,
+    pub multiline: bool,
+    pub max_length: Option<u32>,
+    pub font_size_pt: f64,
+    pub required: bool,
+}
+
+/// The form facts and fields of a document.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormInfoRecord {
+    pub fields: Vec<FormFieldRecord>,
+    /// Encrypted files are read (when the caller has the password) but refused for filling.
+    pub encrypted: bool,
+    /// The file header's version, e.g. `1.7`.
+    pub pdf_version: String,
+    pub page_count: u32,
+    /// Why filling is disabled, when it is. Readable and shown to the reader.
+    pub refusal: Option<String>,
+}
+
+/// One field value the shell asks the writer to put into the document.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormFieldValueRecord {
+    pub field_id: String,
+    /// A text field's new value, or a choice's chosen value.
+    pub text: Option<String>,
+    /// A check box's new state.
+    pub checked: Option<bool>,
+    /// A radio group's or choice's selected option index.
+    pub selected: Option<u32>,
+}
+
+/// What a successful form save did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FormSaveReport {
+    pub destination_path: String,
+    pub written_field_ids: Vec<String>,
+    pub appended_bytes: u64,
+    pub backup_path: Option<String>,
+    pub cleaned_temporary_files: u32,
+    pub source_bytes_preserved: bool,
+}
+
+/// The facts and editable `/Info` entries of a document.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DocumentInfoRecord {
+    pub title: String,
+    pub author: String,
+    pub subject: String,
+    pub keywords: String,
+    pub page_count: u32,
+    pub pdf_version: String,
+    pub is_encrypted: bool,
+    pub has_info_dictionary: bool,
+}
+
+/// What a successful properties save did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PropertiesSaveReport {
+    pub destination_path: String,
+    pub written_keys: Vec<String>,
+    pub appended_bytes: u64,
+    pub backup_path: Option<String>,
+    pub cleaned_temporary_files: u32,
+    pub source_bytes_preserved: bool,
+}
+
 /// How the session lays pages out horizontally.
 ///
 /// Separate from the older [`aris_reader_session::Layout`] command enum because only the two
@@ -1554,6 +1671,246 @@ impl ArisDocument {
         )
     }
 
+    /// The document's AcroForm fields, in reading order and in **view space**.
+    ///
+    /// The geometry and type come from the widget dictionaries (`/AcroForm` → `/Fields` with
+    /// the `/Kids` hierarchy and inherited `/FT`, `/Ff`, `/V`, `/Opt`, `/DA`), read with the
+    /// same `lopdf` parser the appearance writer uses. PDFium's public form API enumerates no
+    /// fields at all: it is an event/render API (`FORM_OnChar`, `FPDF_FFLDraw`) with no
+    /// field-count or field-value accessors, so the dictionaries are both the normative source
+    /// and the only one that survives every producer.
+    ///
+    /// This call never writes. An encrypted file is reported with `encrypted: true` and a
+    /// readable `refusal`; filling it is refused by [`Self::save_filled_form_copy`] as well.
+    pub fn form_info(&self) -> Result<FormInfoRecord, ArisFfiError> {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ArisFfiError::Document {
+                message: "the document was replaced on disk; reopen it before reading its form"
+                    .to_string(),
+            });
+        }
+        let path = Path::new(&self.path);
+        if !self.backend.has_acro_form() {
+            // No AcroForm: skip the whole-file dictionary parse. The PDF version is still a
+            // fact the information panel would ask for, and reading the header is cheap.
+            return Ok(FormInfoRecord {
+                fields: Vec::new(),
+                encrypted: self.backend.is_encrypted(),
+                pdf_version: aris_reader_pdfium::read_document_facts_unencrypted_header(
+                    path,
+                    self.backend.page_count(),
+                )
+                .pdf_version,
+                page_count: self.backend.page_count(),
+                refusal: None,
+            });
+        }
+        let form = match aris_reader_pdfium::read_form_document(path, self.password.as_deref()) {
+            Ok(form) => form,
+            Err(error) if error.code == ErrorCode::Encrypted => {
+                return Ok(FormInfoRecord {
+                    fields: Vec::new(),
+                    encrypted: true,
+                    pdf_version: aris_reader_pdfium::read_document_facts_unencrypted_header(
+                        path,
+                        self.backend.page_count(),
+                    )
+                    .pdf_version,
+                    page_count: self.backend.page_count(),
+                    refusal: Some(
+                        "This PDF is encrypted. The reader will not fill it: writing form                          values would require rewriting its security envelope, and a file                          written anyway might not open in another viewer."
+                            .to_string(),
+                    ),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut geometries: std::collections::HashMap<u32, PageGeometry> =
+            std::collections::HashMap::new();
+        let mut fields = Vec::with_capacity(form.fields.len());
+        for field in &form.fields {
+            let mut widgets = Vec::with_capacity(field.widgets.len());
+            let mut field_rect = None;
+            for widget in &field.widgets {
+                let geometry = match geometries.get(&widget.page) {
+                    Some(geometry) => *geometry,
+                    None => {
+                        let geometry = self.backend.page_info(PageIndex(widget.page))?.geometry;
+                        geometries.insert(widget.page, geometry);
+                        geometry
+                    }
+                };
+                let view = page_region_to_view(widget.rect, geometry);
+                if field_rect.is_none() {
+                    field_rect = Some(view);
+                }
+                widgets.push(FormWidgetRecord {
+                    page: widget.page,
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
+                    state: widget.state.clone(),
+                });
+            }
+            let rect = field_rect.unwrap_or(aris_reader_core::Rect::new(0.0, 0.0, 0.0, 0.0));
+            fields.push(FormFieldRecord {
+                id: field.id.clone(),
+                name: field.name.clone(),
+                kind: field.kind.code().to_string(),
+                page: field.page().unwrap_or(0),
+                x_pt: rect.origin.x,
+                y_pt: rect.origin.y,
+                width_pt: rect.size.width,
+                height_pt: rect.size.height,
+                value: field.value.clone(),
+                selected: field.selected.clone(),
+                checked: field.checked,
+                widgets,
+                options: field
+                    .options
+                    .iter()
+                    .map(|option| FormOptionRecord {
+                        value: option.value.clone(),
+                        label: option.label.clone(),
+                    })
+                    .collect(),
+                editable: field.editable && !form.encrypted,
+                multiline: field.multiline,
+                max_length: field.max_length,
+                font_size_pt: field.font_size,
+                required: field.required,
+            });
+        }
+        Ok(FormInfoRecord {
+            fields,
+            encrypted: form.encrypted,
+            pdf_version: form.pdf_version,
+            page_count: form.page_count,
+            refusal: form.encrypted.then(|| {
+                "This PDF is encrypted. The reader will not fill it: writing form values would                  require rewriting its security envelope, and a file written anyway might not                  open in another viewer."
+                    .to_string()
+            }),
+        })
+    }
+
+    /// Writes `values` into a **new PDF** at `destination`; the open document is untouched.
+    ///
+    /// The output begins with every byte of the source and every unfilled field and annotation
+    /// is verified unchanged before the temporary file is renamed. The widgets stay interactive:
+    /// `/AcroForm`, `/Fields`, the widget dictionaries and their `/AP` are kept, and the writer
+    /// only adds the appearance streams a viewer draws when it does not synthesize one.
+    pub fn save_filled_form_copy(
+        &self,
+        destination: String,
+        values: Vec<FormFieldValueRecord>,
+    ) -> Result<FormSaveReport, ArisFfiError> {
+        self.save_filled_form_to(PathBuf::from(destination), values, SaveMode::Copy)
+    }
+
+    /// Replaces the open document with one carrying `values`, after a verified backup.
+    pub fn replace_with_filled_form(
+        &self,
+        values: Vec<FormFieldValueRecord>,
+    ) -> Result<FormSaveReport, ArisFfiError> {
+        self.save_filled_form_to(PathBuf::from(&self.path), values, SaveMode::ReplaceOriginal)
+    }
+
+    /// The name to offer when saving a filled copy: `<name> (filled).pdf`.
+    pub fn suggested_filled_copy_path(&self) -> String {
+        aris_reader_pdfium::suggested_filled_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The document facts and the four editable `/Info` entries.
+    ///
+    /// Page count, PDF version and encryption state are read-only facts. An encrypted document
+    /// is reported with `is_encrypted: true` even when its dictionaries cannot be decrypted with
+    /// the caller's password; the panel then explains why the save is refused.
+    pub fn document_info(&self) -> Result<DocumentInfoRecord, ArisFfiError> {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ArisFfiError::Document {
+                message: "the document was replaced on disk; reopen it to read its information"
+                    .to_string(),
+            });
+        }
+        let path = Path::new(&self.path);
+        match aris_reader_pdfium::read_document_info(path, self.password.as_deref()) {
+            Ok(info) => Ok(DocumentInfoRecord {
+                title: info.properties.title,
+                author: info.properties.author,
+                subject: info.properties.subject,
+                keywords: info.properties.keywords,
+                page_count: info.facts.page_count,
+                pdf_version: info.facts.pdf_version,
+                is_encrypted: info.facts.is_encrypted,
+                has_info_dictionary: info.has_info_dictionary,
+            }),
+            Err(error) if error.code == ErrorCode::Encrypted => {
+                let facts = aris_reader_pdfium::read_document_facts_unencrypted_header(
+                    path,
+                    self.backend.page_count(),
+                );
+                Ok(DocumentInfoRecord {
+                    title: String::new(),
+                    author: String::new(),
+                    subject: String::new(),
+                    keywords: String::new(),
+                    page_count: facts.page_count,
+                    pdf_version: facts.pdf_version,
+                    is_encrypted: true,
+                    has_info_dictionary: false,
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Writes the four `/Info` entries into a **new PDF** at `destination`.
+    pub fn save_document_properties_copy(
+        &self,
+        destination: String,
+        title: String,
+        author: String,
+        subject: String,
+        keywords: String,
+    ) -> Result<PropertiesSaveReport, ArisFfiError> {
+        self.save_document_properties_to(
+            PathBuf::from(destination),
+            title,
+            author,
+            subject,
+            keywords,
+            SaveMode::Copy,
+        )
+    }
+
+    /// Replaces the open document's `/Info` entries, after a verified backup.
+    pub fn replace_with_document_properties(
+        &self,
+        title: String,
+        author: String,
+        subject: String,
+        keywords: String,
+    ) -> Result<PropertiesSaveReport, ArisFfiError> {
+        self.save_document_properties_to(
+            PathBuf::from(&self.path),
+            title,
+            author,
+            subject,
+            keywords,
+            SaveMode::ReplaceOriginal,
+        )
+    }
+
+    /// The name to offer when saving an edited-properties copy: `<name> (properties).pdf`.
+    pub fn suggested_properties_copy_path(&self) -> String {
+        aris_reader_pdfium::suggested_properties_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Whether a previous save of this document was interrupted.
     ///
     /// A save is only applied by the final rename, so a `<name>.lyra-save-*.tmp` file beside the
@@ -1814,6 +2171,83 @@ impl ArisDocument {
     /// Plain text and character boxes for one page, extracted once and kept for the
     /// document's lifetime. The boxes and the text come from the same `raw.chars` sequence, so
     /// the context builder's gutter rule and the canvas's selection indices agree.
+    fn save_filled_form_to(
+        &self,
+        destination: PathBuf,
+        values: Vec<FormFieldValueRecord>,
+        mode: SaveMode,
+    ) -> Result<FormSaveReport, ArisFfiError> {
+        let updates: Vec<aris_reader_pdfium::FormValueUpdate> = values
+            .into_iter()
+            .map(|value| aris_reader_pdfium::FormValueUpdate {
+                field_id: value.field_id,
+                text: value.text,
+                checked: value.checked,
+                selected: value.selected,
+            })
+            .collect();
+        let report = aris_reader_pdfium::save_form_pdf(
+            Path::new(&self.path),
+            &destination,
+            &updates,
+            self.password.as_deref(),
+            mode,
+        )?;
+        if mode == SaveMode::ReplaceOriginal {
+            self.replaced
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(FormSaveReport {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            written_field_ids: report.written_fields,
+            appended_bytes: report.appended_bytes,
+            backup_path: report
+                .backup_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            source_bytes_preserved: report.source_bytes_preserved,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_document_properties_to(
+        &self,
+        destination: PathBuf,
+        title: String,
+        author: String,
+        subject: String,
+        keywords: String,
+        mode: SaveMode,
+    ) -> Result<PropertiesSaveReport, ArisFfiError> {
+        let properties = aris_reader_pdfium::DocumentProperties {
+            title,
+            author,
+            subject,
+            keywords,
+        };
+        let report = aris_reader_pdfium::save_document_properties(
+            Path::new(&self.path),
+            &destination,
+            &properties,
+            self.password.as_deref(),
+            mode,
+        )?;
+        if mode == SaveMode::ReplaceOriginal {
+            self.replaced
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(PropertiesSaveReport {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            written_keys: report.written_keys,
+            appended_bytes: report.appended_bytes,
+            backup_path: report
+                .backup_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            source_bytes_preserved: report.source_bytes_preserved,
+        })
+    }
+
     fn ai_page(&self, page: u32) -> Result<(String, Vec<PageChar>), ArisFfiError> {
         if page >= self.backend.page_count() {
             return Err(ArisFfiError::InvalidArgument {

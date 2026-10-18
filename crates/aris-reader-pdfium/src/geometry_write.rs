@@ -122,10 +122,10 @@ pub(crate) fn append_direct_annotations(
 }
 
 /// One document's embedded appearance font. Every `/FreeText` appearance in the save points at
-/// this single Type0 font object.
-struct EmbeddedFreeTextFont {
-    type0: ObjectId,
-    subset: AppearanceSubset,
+/// this single Type0 font object; form-field appearances use it the same way.
+pub(crate) struct EmbeddedFreeTextFont {
+    pub(crate) type0: ObjectId,
+    pub(crate) subset: AppearanceSubset,
 }
 
 /// Builds the shared free-text font, or `None` when the save contains no visible text at all.
@@ -138,6 +138,19 @@ fn build_free_text_font(
         .filter(|annotation| annotation.kind == WriteAnnotationKind::FreeText)
         .filter_map(|annotation| annotation.contents.as_deref())
         .collect();
+    build_appearance_font(document, &texts)
+}
+
+/// Builds one embedded Type0 font for every visible string the save needs to paint.
+///
+/// The annotation writer and the form writer call this with their own texts; the font object is
+/// appended to `document` once, and every appearance stream points at it. The characters are
+/// subset by [`AppearanceSubset`], and a character outside the shipped font keeps an exact
+/// ToUnicode entry and paints as `.notdef` rather than as `?`.
+pub(crate) fn build_appearance_font(
+    document: &mut Document,
+    texts: &[&str],
+) -> Result<Option<EmbeddedFreeTextFont>> {
     let has_visible_text = texts.iter().any(|text| {
         text.chars()
             .any(|character| !appearance_font::is_layout_control(character))
@@ -145,7 +158,7 @@ fn build_free_text_font(
     if !has_visible_text {
         return Ok(None);
     }
-    let subset = AppearanceSubset::build(&texts)?;
+    let subset = AppearanceSubset::build(texts)?;
     debug_assert!(
         subset.glyph_count() >= 1,
         "a font subset has at least .notdef"
@@ -155,8 +168,8 @@ fn build_free_text_font(
         // .notdef glyph plus an exact ToUnicode entry. This stderr line makes the same fact
         // visible in the annotation instrumentation log the shell already writes.
         eprintln!(
-            "aris-annotate: {} character(s) in this document's text boxes are outside the bundled font; \
-             the appearance uses .notdef and keeps the exact text in /Contents",
+            "aris-annotate: {} character(s) in this document's text are outside the bundled font; \
+             the appearance uses .notdef and keeps the exact text in /Contents or /V",
             subset.missing().len()
         );
     }
