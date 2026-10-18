@@ -334,6 +334,38 @@ pub fn generate_bibtex_entry(draft: MetadataDraftRecord) -> String {
     .to_bibtex()
 }
 
+/// What the bundled appearance font can and cannot draw in a given string.
+///
+/// The text-box editor calls this while typing. A missing character is not rejected and does not
+/// become `?`: the writer encodes it through `.notdef` with its exact Unicode in `/ToUnicode`, so
+/// `/Contents` and text extraction stay exact while the page shows a missing-glyph box.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AppearanceCoverageRecord {
+    /// Family name of the bundled font (currently `Lyra Sans SC`).
+    pub family: String,
+    /// Glyphs in the shipped subset, for the diagnostics line.
+    pub glyph_count: u32,
+    /// Characters the font cannot draw, de-duplicated, in first-appearance order.
+    pub missing: Vec<String>,
+}
+
+/// Reports which characters of `text` the bundled appearance font cannot draw.
+///
+/// This is a read-only query; it never changes the document and never rejects input.
+#[uniffi::export]
+pub fn appearance_font_coverage(text: String) -> Result<AppearanceCoverageRecord, ArisFfiError> {
+    let coverage = aris_reader_pdfium::appearance_coverage(&text)?;
+    Ok(AppearanceCoverageRecord {
+        family: coverage.family,
+        glyph_count: u32::from(coverage.glyph_count),
+        missing: coverage
+            .missing
+            .into_iter()
+            .map(|character| character.to_string())
+            .collect(),
+    })
+}
+
 /// An open document.
 ///
 /// Long-lived by design: the shell opens once and then asks for pages as the reader

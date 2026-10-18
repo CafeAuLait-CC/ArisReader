@@ -36,9 +36,17 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std"], op
 # ABI has no XMP accessor, so the backend inflates the packet itself.
 flate2 = "1"
 
+# Reading the bundled appearance font (cmap, advances, metrics) and subsetting it per
+# document. `subsetter` is the PDF-oriented subsetter from Typst: it remaps glyph IDs into a
+# contiguous sequence and drops `cmap`, which is exactly the shape a Type0/Identity-H font
+# embedded with `CIDToGIDMap` needs. The variable-font path is not needed because the
+# committed font is already instantiated at wght=400, so its optional dependencies stay out.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"], optional = true }
+subsetter = { version = "0.2", default-features = false, optional = true }
+
 [features]
 default = ["pdfium"]
 # Enables the real PDFium implementation. With `--no-default-features` only the stub
 # is built, which keeps `cargo check --target x86_64-unknown-linux-gnu` (and any
 # machine without PDFium) working.
-pdfium = ["dep:pdfium-render", "dep:libloading", "dep:lopdf", "dep:tiny-skia"]
+pdfium = ["dep:pdfium-render", "dep:libloading", "dep:lopdf", "dep:tiny-skia", "dep:ttf-parser", "dep:subsetter"]

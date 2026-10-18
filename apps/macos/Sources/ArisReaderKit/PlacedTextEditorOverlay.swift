@@ -1,3 +1,4 @@
+import ArisReaderBindings
 import SwiftUI
 
 /// The editor for a sticky note or text box this reader placed.
@@ -14,6 +15,7 @@ struct PlacedTextEditorOverlay: View {
     @ObservedObject var state: AppState
     @State private var text = ""
     @State private var loadedID: UUID?
+    @State private var missingGlyphs: [String] = []
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -36,6 +38,10 @@ struct PlacedTextEditorOverlay: View {
                         .padding(.horizontal, 6)
                         .padding(.vertical, 4)
                         .onExitCommand { state.cancelTextEditing() }
+                    if !isNote, !missingGlyphs.isEmpty {
+                        Divider()
+                        appearanceWarning
+                    }
                 }
                 .frame(width: frame.width, height: frame.height)
                 .background(LyraTheme.noteBg)
@@ -47,11 +53,13 @@ struct PlacedTextEditorOverlay: View {
                 .onAppear {
                     text = annotation.note
                     loadedID = annotation.id
+                    refreshAppearanceCoverage(annotation.note)
                     DispatchQueue.main.async { focused = true }
                 }
                 .onChange(of: text) { _, newValue in
                     guard loadedID == annotation.id else { return }
                     state.updateEditingText(newValue)
+                    refreshAppearanceCoverage(newValue)
                 }
                 .onChange(of: state.editingAnnotationID) { _, newValue in
                     // The editor is removed when the session ends; keep its local state from
@@ -60,10 +68,45 @@ struct PlacedTextEditorOverlay: View {
                         focused = false
                         loadedID = nil
                         text = ""
+                        missingGlyphs = []
                     }
                 }
             }
         }
+    }
+
+    /// A missing character is never `?` and never dropped from `/Contents`; the appearance uses
+    /// the font's `.notdef` box and keeps the exact Unicode in its ToUnicode map. Say so while the
+    /// reader is typing, not only when a viewer shows the box later.
+    private var appearanceWarning: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+            Text(warningText)
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(LyraTheme.noteFg.opacity(0.85))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(LyraTheme.noteFg.opacity(0.06))
+    }
+
+    private var warningText: String {
+        let listed = missingGlyphs.prefix(8).joined(separator: " ")
+        let more = missingGlyphs.count > 8 ? " ..." : ""
+        let noun = missingGlyphs.count == 1 ? "character" : "characters"
+        return "The bundled font can't draw \(missingGlyphs.count) \(noun): \(listed)\(more). "
+            + "They stay in the annotation text but appear as a missing-glyph box in other viewers."
+    }
+
+    private func refreshAppearanceCoverage(_ value: String) {
+        guard !value.isEmpty, let coverage = try? appearanceFontCoverage(text: value) else {
+            missingGlyphs = []
+            return
+        }
+        missingGlyphs = coverage.missing
     }
 
     private func header(for annotation: AppState.Annotation) -> some View {

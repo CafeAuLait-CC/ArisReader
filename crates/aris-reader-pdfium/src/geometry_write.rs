@@ -31,12 +31,17 @@
 //! the stream strokes with.
 //!
 //! A `/FreeText` annotation gets the same treatment: `/Rect`, `/Contents`, `/DA`, `/Q` and an
-//! appearance stream that lays the text out in Helvetica at the requested size. The stream is
-//! WinAnsi, so text outside that encoding is written as `?` **in the appearance stream** while
-//! `/Contents` keeps the exact Unicode text. A viewer that honours `/AP` shows the WinAnsi form;
-//! Lyra and viewers that lay out `/Contents` themselves show the full text. This is the honest
-//! limit of not embedding a font, and it is why the shell's own glyph renderer does not read the
-//! stream.
+//! appearance stream that lays the exact text out in an embedded font at the requested size. The
+//! font is a Type0/Identity-H CID font (`Lyra Sans SC`, a Noto Sans SC subset) embedded once per
+//! document with `FontFile2`, `CIDToGIDMap`, `/W` widths and a `/ToUnicode` CMap; only the glyphs
+//! the document's text boxes use are included. A Chinese, Japanese, Greek or maths character is
+//! therefore a real glyph in the appearance, not `?`, and extracting the appearance returns the
+//! original string. `/DA` keeps Helvetica as the standard-14 fallback for a viewer that ignores
+//! `/AP`; the appearance itself never uses it.
+//!
+//! A character outside the shipped font is encoded through `.notdef` with its own CID and its
+//! exact Unicode in `/ToUnicode`. It paints as a visible missing-glyph box (never `?`), the
+//! editor warns while typing, and `/Contents` stays exact. See [`crate::appearance_font`].
 //!
 //! A `/Text` sticky note deliberately has **no** appearance stream: the shape a viewer draws for
 //! it is its own icon, selected by `/Name`, and the body lives in `/Contents` in the viewer's
@@ -47,7 +52,10 @@
 //! is written in the page coordinates the rest of this crate uses.
 
 use crate::annotations::{WriteAnnotation, WriteAnnotationKind};
+use crate::appearance_font::{self, AppearanceSubset};
 use aris_reader_core::{AnnotationAlignment, ArisError, ErrorCode, Point, Rect, Result};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use lopdf::{
     Dictionary, Document, IncrementalDocument, LoadOptions, Object, ObjectId, Stream, StringFormat,
 };
@@ -79,6 +87,11 @@ pub(crate) fn append_direct_annotations(
     let document = load_document(base, password)?;
     let mut incremental = IncrementalDocument::create_from(previous_bytes, document);
 
+    // One font resource per document, not one per text box: every `/FreeText` appearance in this
+    // save points at the same Type0 font object. The subset covers every character used by every
+    // text box in this document, and nothing else.
+    let free_text_font = build_free_text_font(&mut incremental.new_document, annotations)?;
+
     for annotation in annotations {
         if !annotation.kind.is_direct() {
             return Err(ArisError::new(
@@ -87,7 +100,7 @@ pub(crate) fn append_direct_annotations(
             )
             .with_detail(format!("{}: {:?}", annotation.id, annotation.kind)));
         }
-        append_one(&mut incremental, annotation)?;
+        append_one(&mut incremental, annotation, free_text_font.as_ref())?;
     }
 
     let mut file = File::create(output).map_err(|error| {
@@ -106,6 +119,208 @@ pub(crate) fn append_direct_annotations(
     file.sync_all()
         .map_err(|error| io_error("could not fsync the annotation update", output, error))?;
     Ok(())
+}
+
+/// One document's embedded appearance font. Every `/FreeText` appearance in the save points at
+/// this single Type0 font object.
+struct EmbeddedFreeTextFont {
+    type0: ObjectId,
+    subset: AppearanceSubset,
+}
+
+/// Builds the shared free-text font, or `None` when the save contains no visible text at all.
+fn build_free_text_font(
+    document: &mut Document,
+    annotations: &[WriteAnnotation],
+) -> Result<Option<EmbeddedFreeTextFont>> {
+    let texts: Vec<&str> = annotations
+        .iter()
+        .filter(|annotation| annotation.kind == WriteAnnotationKind::FreeText)
+        .filter_map(|annotation| annotation.contents.as_deref())
+        .collect();
+    let has_visible_text = texts.iter().any(|text| {
+        text.chars()
+            .any(|character| !appearance_font::is_layout_control(character))
+    });
+    if !has_visible_text {
+        return Ok(None);
+    }
+    let subset = AppearanceSubset::build(&texts)?;
+    debug_assert!(
+        subset.glyph_count() >= 1,
+        "a font subset has at least .notdef"
+    );
+    if !subset.missing().is_empty() {
+        // The editor warns while typing (appearance_coverage); the writer's fallback is the
+        // .notdef glyph plus an exact ToUnicode entry. This stderr line makes the same fact
+        // visible in the annotation instrumentation log the shell already writes.
+        eprintln!(
+            "aris-annotate: {} character(s) in this document's text boxes are outside the bundled font; \
+             the appearance uses .notdef and keeps the exact text in /Contents",
+            subset.missing().len()
+        );
+    }
+    let type0 = add_free_text_font_objects(document, &subset)?;
+    Ok(Some(EmbeddedFreeTextFont { type0, subset }))
+}
+
+/// Writes the Type0 → CIDFontType2 → FontDescriptor → FontFile2 graph.
+///
+/// The embedded program is `subsetter`'s output: `.notdef` plus only the glyphs the appearance
+/// uses, with glyph IDs renumbered. `CIDToGIDMap` is explicit (two bytes per CID) rather than
+/// `/Identity` so a `.notdef` fallback can share glyph 0 while keeping its own CID and ToUnicode
+/// entry.
+fn add_free_text_font_objects(
+    document: &mut Document,
+    subset: &AppearanceSubset,
+) -> Result<ObjectId> {
+    let mut font_file = Dictionary::new();
+    font_file.set("Length1", Object::Integer(subset.font_file().len() as i64));
+    let font_file_id = add_stream(document, font_file, subset.font_file().to_vec(), true)?;
+
+    let cid_to_gid_id = add_stream(document, Dictionary::new(), subset.cid_to_gid_map(), false)?;
+    let to_unicode_id = add_stream(document, Dictionary::new(), subset.to_unicode_cmap(), false)?;
+
+    let metrics = embedded_font_metrics(subset)?;
+    let mut descriptor = Dictionary::new();
+    descriptor.set("Type", name("FontDescriptor"));
+    descriptor.set("FontName", name(appearance_font::POSTSCRIPT_NAME));
+    // Bit 3 (value 4): symbolic. A CID-keyed font's glyphs are addressed by CID, not by a
+    // character encoding, so the font program is not expected to carry a Unicode cmap.
+    descriptor.set("Flags", Object::Integer(4));
+    descriptor.set(
+        "FontBBox",
+        Object::Array(
+            metrics
+                .bbox
+                .iter()
+                .map(|value| Object::Integer(*value))
+                .collect(),
+        ),
+    );
+    descriptor.set("ItalicAngle", Object::Integer(0));
+    descriptor.set("Ascent", Object::Integer(metrics.ascent));
+    descriptor.set("Descent", Object::Integer(metrics.descent));
+    descriptor.set("CapHeight", Object::Integer(metrics.cap_height));
+    descriptor.set("StemV", Object::Integer(80));
+    descriptor.set("FontFile2", Object::Reference(font_file_id));
+    let descriptor_id = add_object(document, Object::Dictionary(descriptor));
+
+    let mut cid_system = Dictionary::new();
+    cid_system.set(
+        "Registry",
+        Object::String(b"Adobe".to_vec(), StringFormat::Literal),
+    );
+    cid_system.set(
+        "Ordering",
+        Object::String(b"Identity".to_vec(), StringFormat::Literal),
+    );
+    cid_system.set("Supplement", Object::Integer(0));
+
+    let mut cid_font = Dictionary::new();
+    cid_font.set("Type", name("Font"));
+    cid_font.set("Subtype", name("CIDFontType2"));
+    cid_font.set("BaseFont", name(appearance_font::POSTSCRIPT_NAME));
+    cid_font.set("CIDSystemInfo", Object::Dictionary(cid_system));
+    cid_font.set("FontDescriptor", Object::Reference(descriptor_id));
+    cid_font.set("DW", Object::Integer(1000));
+    cid_font.set("W", width_array(&subset.width_groups()));
+    cid_font.set("CIDToGIDMap", Object::Reference(cid_to_gid_id));
+    let cid_font_id = add_object(document, Object::Dictionary(cid_font));
+
+    let mut type0 = Dictionary::new();
+    type0.set("Type", name("Font"));
+    type0.set("Subtype", name("Type0"));
+    type0.set("BaseFont", name(appearance_font::POSTSCRIPT_NAME));
+    type0.set("Encoding", name("Identity-H"));
+    type0.set(
+        "DescendantFonts",
+        Object::Array(vec![Object::Reference(cid_font_id)]),
+    );
+    type0.set("ToUnicode", Object::Reference(to_unicode_id));
+    Ok(add_object(document, Object::Dictionary(type0)))
+}
+
+struct EmbeddedFontMetrics {
+    bbox: [i64; 4],
+    ascent: i64,
+    descent: i64,
+    cap_height: i64,
+}
+
+fn embedded_font_metrics(subset: &AppearanceSubset) -> Result<EmbeddedFontMetrics> {
+    let face = ttf_parser::Face::parse(subset.font_file(), 0).map_err(|error| {
+        ArisError::new(
+            ErrorCode::Internal,
+            "the subset appearance font could not be parsed back for its metrics",
+        )
+        .with_detail(format!("{error:?}"))
+    })?;
+    let units_per_em = f64::from(face.units_per_em().max(1));
+    let scale = |value: i32| -> i64 { (f64::from(value) * 1000.0 / units_per_em).round() as i64 };
+    let bbox = face.global_bounding_box();
+    let ascent = scale(i32::from(face.ascender()));
+    let descent = scale(i32::from(face.descender()));
+    let cap_height = (ascent as f64 * 0.7).round() as i64;
+    Ok(EmbeddedFontMetrics {
+        bbox: [
+            scale(i32::from(bbox.x_min)),
+            scale(i32::from(bbox.y_min)),
+            scale(i32::from(bbox.x_max)),
+            scale(i32::from(bbox.y_max)),
+        ],
+        ascent,
+        descent,
+        cap_height,
+    })
+}
+
+fn add_stream(
+    document: &mut Document,
+    mut dictionary: Dictionary,
+    data: Vec<u8>,
+    compress: bool,
+) -> Result<ObjectId> {
+    let data = if compress {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data).map_err(|error| {
+            ArisError::new(
+                ErrorCode::Internal,
+                "could not compress the appearance font",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            ArisError::new(
+                ErrorCode::Internal,
+                "could not finish compressing the appearance font",
+            )
+            .with_detail(error.to_string())
+        })?;
+        dictionary.set("Filter", name("FlateDecode"));
+        compressed
+    } else {
+        data
+    };
+    let mut stream = Stream::new(dictionary, data);
+    // The font program was compressed above. ToUnicode and CIDToGIDMap are tiny and stay
+    // readable in the incremental update.
+    stream.allows_compression = false;
+    Ok(add_object(document, Object::Stream(stream)))
+}
+
+fn width_array(groups: &[(u16, Vec<u16>)]) -> Object {
+    let mut array = Vec::with_capacity(groups.len() * 2);
+    for (first, widths) in groups {
+        array.push(Object::Integer(i64::from(*first)));
+        array.push(Object::Array(
+            widths
+                .iter()
+                .map(|width| Object::Integer(i64::from(*width)))
+                .collect(),
+        ));
+    }
+    Object::Array(array)
 }
 
 /// Reopen `path` and check that every direct-write annotation carries what this writer promised.
@@ -229,6 +444,7 @@ pub(crate) fn verify_direct_annotations(
                     .with_detail(format!("{}: {quadding:?}", expected.id)));
                 }
                 verify_appearance(&document, dictionary, expected)?;
+                verify_embedded_appearance_font(&document, dictionary, expected)?;
             }
             kind if kind.is_geometry() => {
                 let border = dictionary
@@ -340,13 +556,165 @@ fn verify_appearance(
     Ok(())
 }
 
+/// Checks the font graph a `/FreeText` appearance promises: Type0, Identity-H, a descendant
+/// CIDFontType2 with `/W` and `CIDToGIDMap`, a `/FontFile2`, and a `/ToUnicode` CMap.
+///
+/// This is intentionally structural rather than a render: it runs on every save and catches the
+/// failure mode this change exists to remove — an appearance that points at Helvetica/WinAnsi
+/// instead of an embedded Unicode font.
+fn verify_embedded_appearance_font(
+    document: &Document,
+    dictionary: &Dictionary,
+    expected: &WriteAnnotation,
+) -> Result<()> {
+    let has_text = expected.contents.as_deref().is_some_and(|text| {
+        text.chars()
+            .any(|character| !appearance_font::is_layout_control(character))
+    });
+    if !has_text {
+        return Ok(());
+    }
+    let fail = |detail: String| -> Result<()> {
+        Err(ArisError::new(
+            ErrorCode::Internal,
+            "a written free-text appearance has no proper embedded Type0 font",
+        )
+        .with_detail(format!("{}: {detail}", expected.id)))
+    };
+
+    let Some(Object::Stream(stream)) = dictionary
+        .get(b"AP")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|ap| ap.get(b"N").ok())
+        .and_then(|object| deref(document, object))
+    else {
+        return fail("no /AP /N stream".to_string());
+    };
+    let Some(resources) = stream
+        .dict
+        .get(b"Resources")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+    else {
+        return fail("no /Resources".to_string());
+    };
+    let Some(fonts) = resources
+        .get(b"Font")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+    else {
+        return fail("no /Font resources".to_string());
+    };
+
+    let mut type0 = None;
+    for (_, object) in fonts.iter() {
+        let Some(font) = deref(document, object).and_then(|object| object.as_dict().ok()) else {
+            continue;
+        };
+        if font
+            .get(b"Subtype")
+            .ok()
+            .and_then(|object| object.as_name().ok())
+            == Some(b"Type0".as_slice())
+        {
+            type0 = Some(font);
+            break;
+        }
+    }
+    let Some(type0) = type0 else {
+        return fail("the appearance's font is not /Subtype /Type0".to_string());
+    };
+    if type0
+        .get(b"Encoding")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        != Some(b"Identity-H".as_slice())
+    {
+        return fail("missing /Encoding /Identity-H".to_string());
+    }
+    let Some(to_unicode) = type0
+        .get(b"ToUnicode")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_stream().ok())
+    else {
+        return fail("missing /ToUnicode stream".to_string());
+    };
+    if to_unicode.content.is_empty() {
+        return fail("empty /ToUnicode stream".to_string());
+    }
+    let Some(cid_font) = type0
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_array().ok())
+        .and_then(|array| array.first())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+    else {
+        return fail("missing /DescendantFonts".to_string());
+    };
+    if cid_font
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        != Some(b"CIDFontType2".as_slice())
+    {
+        return fail("the descendant is not /CIDFontType2".to_string());
+    }
+    let Some(widths) = cid_font
+        .get(b"W")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_array().ok())
+    else {
+        return fail("missing /W widths".to_string());
+    };
+    if widths.is_empty() {
+        return fail("empty /W widths".to_string());
+    }
+    let Some(cid_to_gid) = cid_font
+        .get(b"CIDToGIDMap")
+        .ok()
+        .and_then(|object| deref(document, object))
+    else {
+        return fail("missing /CIDToGIDMap".to_string());
+    };
+    if cid_to_gid.as_stream().is_err() {
+        return fail("/CIDToGIDMap is not a stream".to_string());
+    }
+    let Some(font_file) = cid_font
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|descriptor| descriptor.get(b"FontFile2").ok())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_stream().ok())
+    else {
+        return fail("missing /FontFile2".to_string());
+    };
+    if font_file.content.is_empty() {
+        return fail("empty /FontFile2".to_string());
+    }
+    Ok(())
+}
+
 impl WriteAnnotationKind {
     pub(crate) fn is_geometry(self) -> bool {
         matches!(self, Self::Ink | Self::Square | Self::Circle | Self::Line)
     }
 }
 
-fn append_one(incremental: &mut IncrementalDocument, annotation: &WriteAnnotation) -> Result<()> {
+fn append_one(
+    incremental: &mut IncrementalDocument,
+    annotation: &WriteAnnotation,
+    free_text_font: Option<&EmbeddedFreeTextFont>,
+) -> Result<()> {
     let page_id = {
         let pages = incremental.get_prev_documents().get_pages();
         *pages.get(&(annotation.page.get() + 1)).ok_or_else(|| {
@@ -363,19 +731,18 @@ fn append_one(incremental: &mut IncrementalDocument, annotation: &WriteAnnotatio
     };
 
     // A `/Text` note's picture is its icon, which the viewer draws from `/Name`; every other
-    // directly written kind carries a form XObject here. Free text's stream needs the font its
-    // `/DA` names.
+    // directly written kind carries a form XObject here.
     let mut appearance_id = None;
     if annotation.kind != WriteAnnotationKind::Text {
         let mut resources = Dictionary::new();
-        if annotation.kind == WriteAnnotationKind::FreeText {
-            let mut font = Dictionary::new();
-            font.set("Type", name("Font"));
-            font.set("Subtype", name("Type1"));
-            font.set("BaseFont", name("Helvetica"));
-            font.set("Encoding", name("WinAnsiEncoding"));
+        if annotation.kind == WriteAnnotationKind::FreeText
+            && let Some(font) = free_text_font
+        {
+            // The appearance's own font: Type0/Identity-H, subset for this document. `/DA`
+            // keeps Helvetica as the standard-14 fallback for a viewer that ignores `/AP`; the
+            // appearance itself no longer uses WinAnsi and never writes `?`.
             let mut fonts = Dictionary::new();
-            fonts.set("Helv", Object::Dictionary(font));
+            fonts.set("F1", Object::Reference(font.type0));
             resources.set("Font", Object::Dictionary(fonts));
         }
         let mut stream_dictionary = Dictionary::new();
@@ -383,7 +750,10 @@ fn append_one(incremental: &mut IncrementalDocument, annotation: &WriteAnnotatio
         stream_dictionary.set("Subtype", name("Form"));
         stream_dictionary.set("BBox", rect_array(annotation.rect));
         stream_dictionary.set("Resources", Object::Dictionary(resources));
-        let mut stream = Stream::new(stream_dictionary, appearance_content(annotation));
+        let mut stream = Stream::new(
+            stream_dictionary,
+            appearance_content(annotation, free_text_font.map(|font| &font.subset)),
+        );
         // Keep the content legible in the saved file; the whole document is already compressed
         // where its producer chose to compress it, and this stream is a few hundred bytes.
         stream.allows_compression = false;
@@ -585,9 +955,12 @@ fn add_object(document: &mut Document, object: Object) -> ObjectId {
     id
 }
 
-fn appearance_content(annotation: &WriteAnnotation) -> Vec<u8> {
+fn appearance_content(
+    annotation: &WriteAnnotation,
+    free_text_font: Option<&AppearanceSubset>,
+) -> Vec<u8> {
     if annotation.kind == WriteAnnotationKind::FreeText {
-        return free_text_appearance(annotation);
+        return free_text_appearance(annotation, free_text_font);
     }
     let [red, green, blue] = annotation.color;
     let width = annotation.border_width.max(0.1);
@@ -650,19 +1023,29 @@ fn appearance_content(annotation: &WriteAnnotation) -> Vec<u8> {
     content.into_bytes()
 }
 
-/// The appearance of a `/FreeText` annotation: the text laid out at the `/DA` size in Helvetica,
-/// wrapped to the box and aligned by `/Q`.
+/// The appearance of a `/FreeText` annotation: the exact `/Contents` text, encoded as
+/// Type0/Identity-H CIDs in the document's shared subset font.
 ///
 /// The stream is a picture of the same text `/Contents` carries. It is deliberately not generated
 /// from the file's own text layout: a free-text annotation owns its rectangle, and the reader
 /// already measures the text with CoreText for the canvas. This one only has to agree with itself.
-fn free_text_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
+///
+/// Characters the bundled font cannot show are encoded through `.notdef` with a CID of their own
+/// and keep their exact Unicode in `/ToUnicode`; they paint as the font's missing-glyph box, never
+/// as `?`. `/Contents` is unchanged either way. The editor warns while typing.
+fn free_text_appearance(annotation: &WriteAnnotation, font: Option<&AppearanceSubset>) -> Vec<u8> {
     let [red, green, blue] = annotation.color;
     let size = annotation.font_size.max(1.0);
     let padding = (size * 0.15).clamp(1.0, 6.0);
     let max_width = (annotation.rect.size.width - 2.0 * padding).max(1.0);
-    let text = annotation.contents.as_deref().unwrap_or("");
-    let lines = wrap_free_text(text, size, max_width);
+    // Normalise line endings for layout only; `/Contents` keeps the original bytes as a PDF
+    // string. A tab is laid out as a space by `wrap_free_text`.
+    let text = annotation
+        .contents
+        .as_deref()
+        .unwrap_or("")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let leading = size * 1.2;
     let mut content = String::from("q\n");
     content.push_str(&format!(
@@ -672,9 +1055,14 @@ fn free_text_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
         annotation.rect.size.width.max(0.01),
         annotation.rect.size.height.max(0.01)
     ));
+    let Some(font) = font else {
+        content.push_str("Q\n");
+        return content.into_bytes();
+    };
+    let lines = wrap_free_text(&text, size, max_width, font);
     content.push_str("BT\n");
     content.push_str(&format!(
-        "/Helv {:.4} Tf\n{:.4} {:.4} {:.4} rg\n{:.4} TL\n",
+        "/F1 {:.4} Tf\n{:.4} {:.4} {:.4} rg\n{:.4} TL\n",
         size,
         f64::from(red) / 255.0,
         f64::from(green) / 255.0,
@@ -682,8 +1070,8 @@ fn free_text_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
         leading
     ));
     let mut baseline = annotation.rect.max_y() - padding - size;
-    for line in lines {
-        let width = text_width(&line, size);
+    for line in &lines {
+        let width = font.text_width(line, size);
         let x = match annotation.alignment {
             AnnotationAlignment::Left => annotation.rect.min_x() + padding,
             AnnotationAlignment::Center => {
@@ -698,7 +1086,7 @@ fn free_text_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
             "1 0 0 1 {:.3} {:.3} Tm\n{} Tj\n",
             x,
             baseline,
-            pdf_literal_string(&line)
+            font.hex_string(line)
         ));
         baseline -= leading;
     }
@@ -706,25 +1094,59 @@ fn free_text_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
     content.into_bytes()
 }
 
-/// Greedy word wrap for the appearance stream, at Helvetica's width for `size`.
-fn wrap_free_text(text: &str, size: f64, max_width: f64) -> Vec<String> {
+/// Greedy line breaking with the embedded font's real advances.
+///
+/// Chinese and Japanese have no spaces, so a word-wrap that only splits whitespace would put an
+/// entire sentence on one overflowing line. A break is allowed after a space, between two CJK
+/// characters, and after a hyphen/slash; it is refused before closing punctuation (so a comma
+/// does not start a line) and before opening punctuation. A Latin word wider than the box still
+/// breaks at the last character that fits, because a text box must not silently clip a word.
+fn wrap_free_text(text: &str, size: f64, max_width: f64, font: &AppearanceSubset) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
-        let mut line = String::new();
-        for word in paragraph.split_whitespace() {
-            let candidate = if line.is_empty() {
-                word.to_string()
-            } else {
-                format!("{line} {word}")
-            };
-            if text_width(&candidate, size) <= max_width || line.is_empty() {
-                line = candidate;
-            } else {
-                lines.push(std::mem::take(&mut line));
-                line = word.to_string();
-            }
+        let characters: Vec<char> = paragraph
+            .chars()
+            .map(|character| if character == '\t' { ' ' } else { character })
+            .collect();
+        if characters.is_empty() {
+            lines.push(String::new());
+            continue;
         }
-        lines.push(line);
+        let mut start = 0;
+        while start < characters.len() {
+            while start < characters.len() && characters[start] == ' ' {
+                start += 1;
+            }
+            if start >= characters.len() {
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
+                break;
+            }
+            let mut width = 0.0;
+            let mut end = start;
+            let mut last_break = None;
+            while end < characters.len() {
+                let advance = font.character_width(characters[end], size);
+                if width + advance > max_width && end > start {
+                    break;
+                }
+                width += advance;
+                end += 1;
+                if end < characters.len() && can_break_between(characters[end - 1], characters[end])
+                {
+                    last_break = Some(end);
+                }
+            }
+            if end < characters.len()
+                && let Some(break_at) = last_break.filter(|break_at| *break_at > start)
+            {
+                end = break_at;
+            }
+            let line: String = characters[start..end].iter().collect();
+            lines.push(line.trim_end().to_string());
+            start = end;
+        }
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -732,153 +1154,80 @@ fn wrap_free_text(text: &str, size: f64, max_width: f64) -> Vec<String> {
     lines
 }
 
-/// Width of `text` in Helvetica points, from the standard font's advance widths.
-fn text_width(text: &str, size: f64) -> f64 {
-    text.chars().map(helvetica_width).sum::<f64>() * size / 1000.0
+fn can_break_between(left: char, right: char) -> bool {
+    if left == ' ' || matches!(left, '-' | '/' | '\u{2013}' | '\u{2014}') {
+        return true;
+    }
+    if is_cjk(left) || is_cjk(right) {
+        return !is_closing_punctuation(right) && !is_opening_punctuation(right);
+    }
+    false
 }
 
-/// Helvetica advance widths (1/1000 em) for the printable ASCII range. Characters outside it
-/// use a middle-of-the-road 556, which is only a wrapping estimate; the text itself is WinAnsi.
-fn helvetica_width(character: char) -> f64 {
-    match character {
-        ' ' => 278.0,
-        '!' => 278.0,
-        '"' => 355.0,
-        '#' => 556.0,
-        '$' => 556.0,
-        '%' => 889.0,
-        '&' => 667.0,
-        '\'' => 191.0,
-        '(' | ')' => 333.0,
-        '*' => 389.0,
-        '+' => 584.0,
-        ',' => 278.0,
-        '-' => 333.0,
-        '.' => 278.0,
-        '/' => 278.0,
-        '0'..='9' => 556.0,
-        ':' | ';' => 278.0,
-        '<' | '=' | '>' => 584.0,
-        '?' => 556.0,
-        '@' => 1015.0,
-        'A' => 667.0,
-        'B' => 667.0,
-        'C' => 722.0,
-        'D' => 722.0,
-        'E' => 667.0,
-        'F' => 611.0,
-        'G' => 778.0,
-        'H' => 722.0,
-        'I' => 278.0,
-        'J' => 500.0,
-        'K' => 667.0,
-        'L' => 556.0,
-        'M' => 833.0,
-        'N' => 722.0,
-        'O' => 778.0,
-        'P' => 667.0,
-        'Q' => 778.0,
-        'R' => 722.0,
-        'S' => 667.0,
-        'T' => 611.0,
-        'U' => 722.0,
-        'V' => 667.0,
-        'W' => 944.0,
-        'X' => 667.0,
-        'Y' => 667.0,
-        'Z' => 611.0,
-        '[' | ']' | '\\' => 278.0,
-        '^' => 469.0,
-        '_' => 556.0,
-        '`' => 333.0,
-        'a' => 556.0,
-        'b' => 556.0,
-        'c' => 500.0,
-        'd' => 556.0,
-        'e' => 556.0,
-        'f' => 278.0,
-        'g' => 556.0,
-        'h' => 556.0,
-        'i' | 'j' | 'l' => 222.0,
-        'k' => 500.0,
-        'm' => 833.0,
-        'n' => 556.0,
-        'o' => 556.0,
-        'p' => 556.0,
-        'q' => 556.0,
-        'r' => 333.0,
-        's' => 500.0,
-        't' => 278.0,
-        'u' => 556.0,
-        'v' => 500.0,
-        'w' => 722.0,
-        'x' => 500.0,
-        'y' => 500.0,
-        'z' => 500.0,
-        '{' | '}' => 334.0,
-        '|' => 260.0,
-        '~' => 584.0,
-        _ => 556.0,
-    }
+fn is_cjk(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x2E80..=0x2FFF // CJK Radicals, Kangxi Radicals, Ideographic Description
+            | 0x3000..=0x303F // CJK Symbols and Punctuation
+            | 0x3040..=0x30FF // Hiragana, Katakana
+            | 0x3100..=0x312F // Bopomofo
+            | 0x3190..=0x31EF // Kanbun, CJK Strokes, Katakana Phonetic Extensions
+            | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFE30..=0xFE4F // CJK Compatibility Forms
+            | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+            | 0x20000..=0x2FA1F // CJK Unified Ideographs Extension B–F
+    )
 }
 
-/// A PDF literal string in WinAnsi: `\`, `(` and `)` escaped, bytes outside WinAnsi written as
-/// `?`. The full text remains in `/Contents`; this is only the appearance stream's copy.
-fn pdf_literal_string(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len() + 2);
-    escaped.push('(');
-    for character in text.chars() {
-        let byte = win_ansi_byte(character).unwrap_or(b'?');
-        match byte {
-            b'\\' | b'(' | b')' => {
-                escaped.push('\\');
-                escaped.push(char::from(byte));
-            }
-            b'\n' => escaped.push_str("\\n"),
-            b'\r' => escaped.push_str("\\r"),
-            b'\t' => escaped.push_str("\\t"),
-            0x20..=0x7E => escaped.push(char::from(byte)),
-            _ => escaped.push_str(&format!("\\{:03o}", byte)),
-        }
-    }
-    escaped.push(')');
-    escaped
+fn is_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '、' | '。'
+            | '，'
+            | '．'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '）'
+            | '〕'
+            | '］'
+            | '｝'
+            | '〉'
+            | '》'
+            | '」'
+            | '』'
+            | '】'
+            | '〗'
+            | '〙'
+            | '〛'
+            | '”'
+            | '’'
+            | '…'
+            | '‥'
+            | 'ー'
+    )
 }
 
-/// One character in WinAnsiEncoding (cp1252 minus the five undefined bytes). The common Latin-1
-/// range and the typographic punctuation Windows writes are mapped; anything else has no byte.
-fn win_ansi_byte(character: char) -> Option<u8> {
-    match character {
-        '\u{20AC}' => Some(0x80),
-        '\u{201A}' => Some(0x82),
-        '\u{0192}' => Some(0x83),
-        '\u{201E}' => Some(0x84),
-        '\u{2026}' => Some(0x85),
-        '\u{2020}' => Some(0x86),
-        '\u{2021}' => Some(0x87),
-        '\u{02C6}' => Some(0x88),
-        '\u{2030}' => Some(0x89),
-        '\u{0160}' => Some(0x8A),
-        '\u{2039}' => Some(0x8B),
-        '\u{0152}' => Some(0x8C),
-        '\u{017D}' => Some(0x8E),
-        '\u{2018}' => Some(0x91),
-        '\u{2019}' => Some(0x92),
-        '\u{201C}' => Some(0x93),
-        '\u{201D}' => Some(0x94),
-        '\u{2022}' => Some(0x95),
-        '\u{2013}' => Some(0x96),
-        '\u{2014}' => Some(0x97),
-        '\u{02DC}' => Some(0x98),
-        '\u{2122}' => Some(0x99),
-        '\u{0161}' => Some(0x9A),
-        '\u{203A}' => Some(0x9B),
-        '\u{0153}' => Some(0x9C),
-        '\u{017E}' => Some(0x9E),
-        '\u{0178}' => Some(0x9F),
-        character if (character as u32) <= 0xFF && character != '\u{7F}' => Some(character as u8),
-        _ => None,
-    }
+fn is_opening_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '（' | '〔'
+            | '［'
+            | '｛'
+            | '〈'
+            | '《'
+            | '「'
+            | '『'
+            | '【'
+            | '〖'
+            | '〘'
+            | '〚'
+            | '“'
+            | '‘'
+    )
 }
 
 fn quadding(alignment: AnnotationAlignment) -> i64 {
