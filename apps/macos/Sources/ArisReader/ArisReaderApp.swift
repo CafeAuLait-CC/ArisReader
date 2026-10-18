@@ -132,13 +132,19 @@ struct ReaderCommands: Commands {
 
             Divider()
 
-            // A text export, not a PDF write: the save panel chooses Markdown or CSV, and the
-            // document on disk is never touched. ⌘E is free in this app.
-            Button("Export Annotations…") {
-                session?.state.presentExportAnnotationsPanel()
+            // Exports that leave the reader as data rather than writing into the PDF: the
+            // annotation text (Markdown or CSV, chosen in the save panel) and the BibTeX entry
+            // for the paper. Both are grouped here because neither touches the document.
+            Menu("Export") {
+                Button("Annotations…") {
+                    session?.state.presentExportAnnotationsPanel()
+                }
+                .keyboardShortcut("e", modifiers: .command)
+                .disabled(session?.state.canExportAnnotations != true)
+
+                Button("BibTeX…") { session?.state.presentSaveBibtexPanel() }
+                    .disabled(session?.state.canCopyMetadataBibtex != true)
             }
-            .keyboardShortcut("e", modifiers: .command)
-            .disabled(session?.state.canExportAnnotations != true)
         }
 
         CommandMenu("Reading") {
@@ -171,8 +177,6 @@ struct ReaderCommands: Commands {
             // fields in the Metadata sidebar section and both commands use the corrected values.
             Button("Copy BibTeX") { session?.state.copyMetadataBibtex() }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
-                .disabled(session?.state.canCopyMetadataBibtex != true)
-            Button("Save BibTeX…") { session?.state.presentSaveBibtexPanel() }
                 .disabled(session?.state.canCopyMetadataBibtex != true)
 
             Menu("Page Layout") {
