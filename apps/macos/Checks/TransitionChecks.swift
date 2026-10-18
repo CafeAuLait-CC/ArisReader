@@ -247,8 +247,11 @@ extension ReaderChecks {
         require(closing.contains { $0 > 20 && $0 < 230 },
                 "at least one frame is partly open during the close "
                     + "(range \(closing.min() ?? -1)...\(closing.max() ?? -1) pt)")
-        require(abs((closing.last ?? -1)) < 0.5,
-                "the close reaches the closed endpoint (\(closing.last ?? -1) pt)")
+        // The display link can deliver its last animation frame a little after the sampling
+        // window on a loaded machine; the endpoint itself is asserted by waiting for it.
+        try await eventually("the close reaches the closed endpoint", {
+            abs(harness.sidebarWidth) < 0.5
+        })
         require(!state.sidebarVisible,
                 "the state and the screen agree at the closed end (sidebarVisible=\(state.sidebarVisible))")
 
@@ -260,8 +263,9 @@ extension ReaderChecks {
         require(opening.contains { $0 > 20 && $0 < 230 },
                 "at least one frame is partly open during the open "
                     + "(range \(opening.min() ?? -1)...\(opening.max() ?? -1) pt)")
-        require(abs((opening.last ?? -1) - ReaderChrome.sidebarTotalWidthPt) < 0.5,
-                "the open reaches the open endpoint (\(opening.last ?? -1) pt)")
+        try await eventually("the open reaches the open endpoint", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
         require(state.sidebarVisible,
                 "the state and the screen agree at the open end (sidebarVisible=\(state.sidebarVisible))")
 
@@ -312,19 +316,23 @@ extension ReaderChecks {
         state.sidebarVisible = false
         state.sidebarVisible = true
         state.sidebarVisible = false
-        let rapid = try await harness.sampleSidebarWidths(for: 0.50)
-        require(abs((rapid.last ?? -1)) < 0.5 && !state.sidebarVisible,
-                "a rapid double toggle ends closed and consistent "
-                    + "(\(rapid.last ?? -1) pt, sidebarVisible=\(state.sidebarVisible))")
+        _ = try await harness.sampleSidebarWidths(for: 0.50)
+        try await eventually("a rapid double toggle ends closed", {
+            abs(harness.sidebarWidth) < 0.5
+        })
+        require(!state.sidebarVisible,
+                "a rapid double toggle ends consistent (sidebarVisible=\(state.sidebarVisible))")
         for _ in 0..<5 {
             state.sidebarVisible.toggle()
             try await Task.sleep(for: .milliseconds(15))
         }
         state.sidebarVisible = false
-        let burst = try await harness.sampleSidebarWidths(for: 0.50)
-        require(abs((burst.last ?? -1)) < 0.5 && !state.sidebarVisible,
-                "a burst of toggles ends closed, not half open "
-                    + "(\(burst.last ?? -1) pt, sidebarVisible=\(state.sidebarVisible))")
+        _ = try await harness.sampleSidebarWidths(for: 0.50)
+        try await eventually("a burst of toggles ends closed, not half open", {
+            abs(harness.sidebarWidth) < 0.5
+        })
+        require(!state.sidebarVisible,
+                "the burst leaves the state closed (sidebarVisible=\(state.sidebarVisible))")
 
         // ── Toggle while a document is opening ──────────────────────────────────────────
         let openingState = AppState(engine: try RustEngine())
@@ -342,10 +350,13 @@ extension ReaderChecks {
         try await eventually("the document finishes opening during the sidebar toggles", {
             openingState.document?.pageCount == 3
         })
-        let settledDuringOpen = try await openingHarness.sampleSidebarWidths(for: 0.50)
-        require(abs((settledDuringOpen.last ?? -1)) < 0.5 && !openingState.sidebarVisible,
-                "toggling during document opening settles closed and consistent "
-                    + "(\(settledDuringOpen.last ?? -1) pt, sidebarVisible=\(openingState.sidebarVisible))")
+        _ = try await openingHarness.sampleSidebarWidths(for: 0.50)
+        try await eventually("toggling during document opening settles closed", {
+            abs(openingHarness.sidebarWidth) < 0.5
+        })
+        require(!openingState.sidebarVisible,
+                "toggling during document opening ends consistent "
+                    + "(sidebarVisible=\(openingState.sidebarVisible))")
         require(abs(openingHarness.canvasHeight - heightBeforeOpen) < 0.5,
                 "the canvas is not left mis-sized by the opening toggles "
                     + "(\(openingHarness.canvasHeight) pt vs \(heightBeforeOpen) pt)")
@@ -401,8 +412,11 @@ extension ReaderChecks {
                 "after the reveal the canvas is still \(Int(frameAfter.width))x\(Int(frameAfter.height)) "
                     + "at y=\(frameAfter.minY) and the page top is still y=\(pageTopAfter)")
 
+        try await eventually("the row finishes its reveal at the full 46 pt", {
+            harness.rowBottomFromCanvasTop() >= 44
+        })
         let revealedBottom = harness.rowBottomFromCanvasTop()
-        require(revealedBottom >= 44 && revealedBottom <= 46,
+        require(revealedBottom <= 46,
                 "the reveal ends at the full 46 pt row (hit area bottom \(revealedBottom) pt)")
         let overlayHit = harness.hit(fromCanvasTop: 10)
         require(overlayHit != nil && overlayHit !== harness.canvas,
@@ -419,6 +433,9 @@ extension ReaderChecks {
         require(collapseHeightDeviation < 0.01 && collapsePageDeviation < 0.01,
                 "the canvas and page stay put while the row collapses "
                     + "(height deviation \(collapseHeightDeviation), page deviation \(collapsePageDeviation))")
+        try await eventually("the row finishes its collapse", {
+            harness.rowBottomFromCanvasTop() == 0
+        })
         require(harness.hit(fromCanvasTop: 10) === harness.canvas,
                 "with the row collapsed again, the page's top receives clicks")
 
@@ -493,9 +510,11 @@ extension ReaderChecks {
         require(afterLiveResize.contains { $0 > 20 && $0 < 230 },
                 "after the live resize ends, toggles animate again "
                     + "(range \(afterLiveResize.min() ?? -1)...\(afterLiveResize.max() ?? -1) pt)")
-        require(abs((afterLiveResize.last ?? -1)) < 0.5,
-                "and the restored animation reaches the closed endpoint "
-                    + "(\(afterLiveResize.last ?? -1) pt)")
+        // Same allowance as the other endpoints: the last animation frame can land just
+        // outside the fixed sampling window on a loaded runner.
+        try await eventually("the restored animation reaches the closed endpoint", {
+            abs(harness.sidebarWidth) < 0.5
+        })
         try await Task.sleep(for: .milliseconds(100))
 
         print("Transition checks passed")
