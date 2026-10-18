@@ -999,6 +999,15 @@ public struct CanvasPage: Sendable {
 @MainActor
 public protocol PDFEngine: AnyObject {
     func openDocument(at url: URL) throws -> LoadedDocument
+    /// Makes an already-open document current without reading the file again.
+    ///
+    /// The engine may keep a small set of documents open at once; switching tabs that are still
+    /// in that set is a pointer swap, not an open. Returns false when the URL is not retained,
+    /// in which case the caller must `openDocument(at:)`.
+    func activateDocument(at url: URL) -> Bool
+    /// Drops a retained document. Called when the shell's keep-limit evicts a tab or the last tab
+    /// for that document closes, so the memory is released exactly once and through one path.
+    func closeDocument(at url: URL)
     /// Rasterizes a page at `scale` (1.0 = 72 dpi, so pass zoom × backing scale).
     ///
     /// Asynchronous because it runs off the main thread: PDFium is not thread-safe, so
@@ -1198,6 +1207,10 @@ public extension PDFEngine {
         )
     }
 
+    func activateDocument(at url: URL) -> Bool { false }
+
+    func closeDocument(at url: URL) {}
+
     func interruptedSaveNote(at url: URL) -> String? { nil }
 
     func suggestedAnnotatedCopyURL(for url: URL) -> URL {
@@ -1243,9 +1256,26 @@ public extension PDFEngine {
 @MainActor
 public final class RustEngine: PDFEngine {
     private let engine: ArisEngine
-    /// The open document. One document per engine for now; the full document/session
-    /// graph (several windows, shared documents, event streams) is M1 work.
+    /// The document current calls act on.
     private var document: ArisDocument?
+    /// Documents this engine keeps open, keyed by the URL they were opened from.
+    ///
+    /// The shell's `AppState` owns the keep-limit and calls `closeDocument(at:)` when it evicts a
+    /// tab; this dictionary is only the handle store that makes a tab switch a pointer swap.
+    /// Every document here is the same `ArisDocument` object the engine would have opened again.
+    private var openDocuments: [URL: ArisDocument] = [:]
+    /// The `LoadedDocument` snapshot that belongs to each handle, so a re-activation returns the
+    /// same identity (and the same page count) instead of inventing a second document.
+    private var loadedDocuments: [URL: LoadedDocument] = [:]
+    /// Caption indexes are per document, like the handles.
+    private var figuresCaches: [URL: [Figure]] = [:]
+    private var activeDocumentURL: URL?
+    /// Purely diagnostic: the checks assert on counts, not on timing or a screenshot.
+    public private(set) var documentOpenCount = 0
+    public private(set) var documentCloseCount = 0
+    public private(set) var lastClosedDocumentURL: URL?
+    public private(set) var documentActivationCount = 0
+    public var retainedDocumentURLs: [URL] { Array(openDocuments.keys) }
     private var generation: UInt64 = 0
     /// Serialises PDFium: the library is not thread-safe, so rasterizations run one at a
     /// time on a dedicated queue and never on the main thread.
@@ -1265,16 +1295,23 @@ public final class RustEngine: PDFEngine {
     }
 
     public func openDocument(at url: URL) throws -> LoadedDocument {
+        let key = url.standardizedFileURL
+        // A tab that was never closed must not pay for a second open. The shell normally calls
+        // `activateDocument`, but `openDocument` itself stays safe for direct callers (page-edit
+        // revisions, checks, a document opened again while its handle is still retained).
+        if let existing = openDocuments[key], let loaded = loadedDocuments[key] {
+            document = existing
+            activeDocumentURL = key
+            documentEpoch &+= 1
+            figuresCache = figuresCaches[key]
+            return loaded
+        }
+
         let opened = try engine.openDocument(path: url.path, password: nil)
         // A new document means a new caption index; keeping the old one would resolve a
         // `Figure 3` click to the previous paper's artwork.
         let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
-
-        document = opened
-        documentEpoch &+= 1
-        figuresCache = nil
-
-        return LoadedDocument(
+        let loaded = LoadedDocument(
             title: url.deletingPathExtension().lastPathComponent,
             pageCount: Int(opened.pageCount()),
             url: url,
@@ -1284,6 +1321,42 @@ public final class RustEngine: PDFEngine {
             ),
             backend: engine.backend()
         )
+
+        openDocuments[key] = opened
+        loadedDocuments[key] = loaded
+        figuresCaches[key] = nil
+        documentOpenCount += 1
+        document = opened
+        activeDocumentURL = key
+        documentEpoch &+= 1
+        figuresCache = nil
+        return loaded
+    }
+
+    public func activateDocument(at url: URL) -> Bool {
+        let key = url.standardizedFileURL
+        guard let existing = openDocuments[key] else { return false }
+        document = existing
+        activeDocumentURL = key
+        documentEpoch &+= 1
+        figuresCache = figuresCaches[key]
+        documentActivationCount += 1
+        return true
+    }
+
+    public func closeDocument(at url: URL) {
+        let key = url.standardizedFileURL
+        guard openDocuments.removeValue(forKey: key) != nil else { return }
+        loadedDocuments.removeValue(forKey: key)
+        figuresCaches.removeValue(forKey: key)
+        if activeDocumentURL == key {
+            document = nil
+            activeDocumentURL = nil
+            figuresCache = nil
+            documentEpoch &+= 1
+        }
+        documentCloseCount += 1
+        lastClosedDocumentURL = url
     }
 
     public func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
@@ -1625,6 +1698,10 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
+        // If the destination was previously opened, its cached handle now describes the old
+        // bytes. A copy write never invalidates the *active* handle (the reader keeps reading
+        // the source), but a later open of the destination must read the new file.
+        invalidateCachedCopy(at: url)
         return Self.writeReport(from: report)
     }
 
@@ -1652,6 +1729,10 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
+        // The file the active handle was opened from has been replaced. The handle is stale and
+        // must not be handed out by a later `openDocument`; the caller immediately opens the
+        // replacement, which reads the new bytes and becomes the retained document.
+        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
         return Self.writeReport(from: report)
     }
 
@@ -1703,6 +1784,7 @@ public final class RustEngine: PDFEngine {
         }
         // The whole engine is main-actor isolated, so the UniFFI record is converted here rather
         // than on `rasterQueue` (a main-actor assertion would trap there).
+        invalidateCachedCopy(at: destination)
         return Self.pageEditReport(report, destination: destination)
     }
 
@@ -1729,6 +1811,7 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
+        invalidateCachedCopy(at: destination)
         return Self.pageEditReport(report, destination: destination)
     }
 
@@ -1751,6 +1834,7 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
+        invalidateCachedCopy(at: destination)
         return Self.pageEditReport(report, destination: destination)
     }
 
@@ -1762,6 +1846,7 @@ public final class RustEngine: PDFEngine {
                 userInfo: [NSLocalizedDescriptionKey: "No document is open"]
             )
         }
+        let replacedURL = activeDocumentURL
         let report: PageEditReport = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
@@ -1773,7 +1858,21 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
+        // Both the original and the working revision are stale after the replacement. The
+        // caller opens the original again through the ordinary open path.
+        closeDocument(at: original)
+        if let replacedURL, replacedURL != original.standardizedFileURL {
+            closeDocument(at: replacedURL)
+        }
         return Self.pageEditReport(report, destination: original)
+    }
+
+    /// Drops a cached handle whose file was rewritten by a copy/save operation. The active
+    /// document is deliberately left alone: a copy save must not disturb the document on screen.
+    private func invalidateCachedCopy(at url: URL) {
+        let key = url.standardizedFileURL
+        guard activeDocumentURL != key, openDocuments[key] != nil else { return }
+        closeDocument(at: key)
     }
 
     private static func pageOperationRecord(_ operation: PageEditOperation) -> PageOperationRecord {
@@ -1984,7 +2083,10 @@ public final class RustEngine: PDFEngine {
                 heightPt: CGFloat(record.heightPt)
             )
         }
-        if epoch == documentEpoch { figuresCache = figures }
+        if epoch == documentEpoch {
+            figuresCache = figures
+            if let activeDocumentURL { figuresCaches[activeDocumentURL] = figures }
+        }
         return figures
     }
 

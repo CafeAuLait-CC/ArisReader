@@ -180,6 +180,17 @@ struct ReaderChecks {
             try await measureWindowEngineCost()
             return
         }
+        // Lets the tab-row and tab-switching checks be run on their own while they are being
+        // worked on (`ArisReaderChecks --check-tab-row .`).
+        if CommandLine.arguments.contains("--check-tab-row") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            tabRowLayoutChecks()
+            titlebarResizeChecks()
+            try await tabRetentionChecks(root: root)
+            print("Tab-row checks passed")
+            return
+        }
         // Lets the document-opening checks be run on their own while they are being worked on.
         if CommandLine.arguments.contains("--check-document-opening") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
@@ -386,6 +397,9 @@ struct ReaderChecks {
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)
         try await thumbnailDragChecks(root: root)
+        tabRowLayoutChecks()
+        titlebarResizeChecks()
+        try await tabRetentionChecks(root: root)
         try await documentOpeningChecks(a: a, b: b)
         try await desktopInteractionChecks(
             a: a, b: b,
