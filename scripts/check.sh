@@ -160,7 +160,12 @@ else
 fi
 
 if [ "$SWIFT_BUILT" = "1" ]; then
-  if ARIS_READER_PDFIUM_PATH="${ARIS_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
+  # The native checks open the committed fixtures by their repository paths. The index cache
+  # writes beside the PDF by design, so the suite disables it rather than leaving sidecars in
+  # tests/fixtures; the cache itself is covered by the Rust integration tests, which copy their
+  # fixtures into a scratch directory first.
+  if ARIS_READER_INDEX_CACHE=disabled \
+    ARIS_READER_PDFIUM_PATH="${ARIS_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
     "$ROOT/apps/macos/.build/debug/ArisReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then
     ok "ArisReaderChecks (complete native regression suite)"
   else
