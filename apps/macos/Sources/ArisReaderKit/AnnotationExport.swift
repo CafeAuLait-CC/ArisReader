@@ -447,7 +447,7 @@ public enum AnnotationExport {
         switch kind {
         case "highlight": return "Highlight"
         case "underline": return "Underline"
-        case "strikeout": return "Strikeout"
+        case "strikeout": return "Strikethrough"
         case "squiggly": return "Squiggly"
         case "text": return "Sticky note"
         case "freeText": return "Free text"

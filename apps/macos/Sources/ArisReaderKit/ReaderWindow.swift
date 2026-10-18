@@ -168,6 +168,9 @@ public struct ReaderWindow: View {
                 onAnnotationDoubleClick: { point in
                     state.beginEditingTextBox(atContentPoint: point)
                 },
+                // Escape leaves the sticky markup mode. It is consumed only when a mode was
+                // active; the canvas keeps its existing Escape handling for a live draft.
+                onCancelTextMarkup: { state.cancelTextMarkupTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
