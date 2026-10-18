@@ -5383,8 +5383,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Opens the reference panel for a citation the reader clicked.
     ///
     /// Resolution lives in Rust: exact label match, then position for a numeric citation against
-    /// an unnumbered list, once per label so a group resolves whole. The shell only draws the
-    /// result.
+    /// an unnumbered list, once per label so a group resolves whole. The citation's page is part
+    /// of the call so a document with several reference lists attributes it to the list its
+    /// section cites. The shell only draws the result.
     private func previewCitation(_ citation: Citation, on placement: PagePlacement) {
         let labels = citation.labels
         // A long group can wrap in the text layer; the title and the log stay one line.
@@ -5402,7 +5403,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
         Task { @MainActor [weak self] in
             guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
-            let resolved = (try? await self.engine.resolveCitations(labels: labels)) ?? []
+            let resolved = (try? await self.engine.resolveCitations(
+                labels: labels,
+                page: placement.index
+            )) ?? []
             guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
             guard let first = resolved.first else {
                 self.statusMessage = "Citation \"\(written)\" has no matching entry"

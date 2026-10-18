@@ -11,7 +11,7 @@
 //! lands in M1; its shape is specified in `docs/05-ffi.md` §3–§4.
 
 use crate::index_cache::{
-    CacheRead, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
+    CacheRead, CachedReferenceList, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
     disabled_by_environment, read_cache, write_cache,
 };
 use aris_reader_ai::MockProvider;
@@ -388,10 +388,49 @@ pub struct ArisDocument {
 ///
 /// One cache rather than two: both are derived from the same scan of the document, and the
 /// detector must judge a superscript run against exactly the list the resolver will answer from.
+///
+/// `bibliography` is the live attribution view built from the same records as `lists`; keeping
+/// it here means a click does not rebuild (or re-parse) the lists. `lists` is what the persistent
+/// cache stores, and `bibliography` derives from it on a cache hit.
 #[derive(Clone)]
 struct ReferenceCache {
+    /// The document-wide list's records: what [`ArisDocument::references`] returns.
     records: Vec<ReferenceRecord>,
     style: aris_reader_text::CitationStyle,
+    /// Every list, in reading order, as the persistent cache stores it.
+    lists: Vec<crate::index_cache::CachedReferenceList>,
+    /// The same lists as live `aris_reader_text` values, with the sections/regions a citation
+    /// attribution reads.
+    bibliography: aris_reader_text::Bibliography,
+}
+
+/// One resolved reference entry and the list a citation on a page was attributed to.
+///
+/// Returning both in one record matters for the shell and for the checks: the entry is what the
+/// preview draws, and the list fields are the evidence that it came from the right bibliography
+/// rather than from whichever list happened to print that number.
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedReference {
+    /// The entry to preview, with the same geometry [`ReferenceRecord`] always carried.
+    pub reference: ReferenceRecord,
+    /// Index of the attributed list in reading order (0-based).
+    pub list_index: u32,
+    /// How many reference lists the document prints.
+    pub list_count: u32,
+    /// The attributed list's heading, when the document printed one.
+    pub list_heading: Option<String>,
+    /// First and last page an entry of the attributed list starts on.
+    pub list_first_page: Option<u32>,
+    pub list_last_page: Option<u32>,
+    /// Whether the attributed list is the document-wide one — the list
+    /// [`ArisDocument::resolve_citations`] answers from when it has no page.
+    pub document_wide: bool,
+    /// Why this list was chosen, in one sentence (the `cite` CLI prints the same words).
+    pub reason: String,
+    /// True when another list also carries the label and no section separated the two; the
+    /// document-wide list is then used, as the documented rule requires.
+    pub ambiguous: bool,
 }
 
 /// What the persistent index cache lookup found when a document was first indexed.
@@ -895,7 +934,7 @@ impl ArisDocument {
         Ok(self.reference_cache()?.records.clone())
     }
 
-    /// Resolves every label of a citation against the reference list.
+    /// Resolves every label of a citation against the **document-wide** reference list.
     ///
     /// A citation routinely names several works at once — `[1,2]`, `(He et al. 2024; Kim 2023)`
     /// — and the reader expects all of them, so the plural form exists: the shell asks once for
@@ -904,6 +943,13 @@ impl ArisDocument {
     /// unnumbered list) on the Swift side. Entries come back in label order and are
     /// de-duplicated by `(label, page)`. An empty vector means nothing in the group could be
     /// resolved, which is an ordinary outcome for the caller to report, not an error.
+    ///
+    /// This signature has no page, and a label list alone cannot say which section a citation is
+    /// in. It therefore keeps the pre-T4.42 behaviour — the list the document-wide selection
+    /// chose — and is the right call for a whole-document label list. A citation clicked in the
+    /// reader has a page: use [`ArisDocument::resolve_citations_on`], which is what the shell's
+    /// click path does. Adding the page as a distinct method rather than an optional argument
+    /// keeps every existing caller source-compatible and makes the two behaviours explicit.
     pub fn resolve_citations(
         &self,
         labels: Vec<String>,
@@ -935,6 +981,62 @@ impl ArisDocument {
                     .cloned()
             })
             .collect())
+    }
+
+    /// Resolves every label of a citation found on `page`, against the list that page's section
+    /// cites.
+    ///
+    /// This is the app's click path: a click knows the page it was made on, and that page is the
+    /// evidence which decides between several reference lists. A citation in the GPT-4 system
+    /// card appendix resolves into the appendix's own list; the same bracket number in the
+    /// report's main text resolves into the report's list. The return type names the attributed
+    /// list and the reason, so a caller can show (or log) why the preview is what it is.
+    ///
+    /// The attribution and its ambiguity rule live in `aris_reader_text`; this method only hands
+    /// the page through and maps the resolved entry back to the record the preview draws. With
+    /// one reference list in the document the attributed list is that list, so the result is the
+    /// same entry [`ArisDocument::resolve_citations`] returns.
+    pub fn resolve_citations_on(
+        &self,
+        page: u32,
+        labels: Vec<String>,
+    ) -> Result<Vec<ResolvedReference>, ArisFfiError> {
+        self.ensure_index_loaded();
+        let cache = self.reference_cache()?;
+        let bibliography = &cache.bibliography;
+        let Some(attribution) = aris_reader_text::attribute_citation(bibliography, page, &labels)
+        else {
+            return Ok(Vec::new());
+        };
+        let list = &bibliography.lists[attribution.list];
+        let cached_list = &cache.lists[attribution.list];
+        let mut resolved = Vec::new();
+        for entry in aris_reader_text::resolve_references(&labels, &list.entries) {
+            // The live entries are built from the cached records one to one, so an entry's index
+            // is its preview record's index too.
+            let Some(index) = list
+                .entries
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, entry))
+            else {
+                continue;
+            };
+            let Some(reference) = cached_list.records.get(index) else {
+                continue;
+            };
+            resolved.push(ResolvedReference {
+                reference: reference.clone(),
+                list_index: attribution.list as u32,
+                list_count: bibliography.lists.len() as u32,
+                list_heading: cached_list.heading.clone(),
+                list_first_page: cached_list.records.iter().map(|record| record.page).min(),
+                list_last_page: cached_list.records.iter().map(|record| record.page).max(),
+                document_wide: attribution.list == bibliography.document_wide,
+                reason: attribution.reason.explanation().to_string(),
+                ambiguous: attribution.ambiguous,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Figure, table, and algorithm captions across the document, each with the region to preview.
@@ -2058,77 +2160,32 @@ impl ArisDocument {
             }
         }
 
-        let entries = aris_reader_text::find_references_with_landings(&pages, &landings, 2000);
-        let style = aris_reader_text::CitationStyle::for_document(&pages, &entries);
-
-        let mut records = Vec::with_capacity(entries.len());
+        // Every reference list, with the document-wide one rebuilt from the link landings exactly
+        // as the app has always resolved against it. The other lists are what a page-aware
+        // citation needs; they are parsed once here and persisted with the index.
+        let bibliography =
+            aris_reader_text::find_reference_lists_with_landings(&pages, &landings, 2000);
+        let document_wide_entries = bibliography
+            .document_wide_list()
+            .map(|list| list.entries.clone())
+            .unwrap_or_default();
+        let style = aris_reader_text::CitationStyle::for_document(&pages, &document_wide_entries);
         // One page → view transform per page, not per fragment: a bibliography page holds dozens
         // of entries and each of their fragments asks for the same page again.
         let mut transforms: std::collections::HashMap<u32, aris_reader_core::Transform2D> =
             std::collections::HashMap::new();
-        for entry in entries {
-            // The entry's box comes from the character boxes of its own range, so the preview
-            // can show exactly the entry rather than a whole page.
-            let Ok(text) = self.backend.raw_text_page(PageIndex(entry.page)) else {
-                continue;
-            };
-            if document_page_view(&self.backend, &mut transforms, entry.page).is_none() {
-                continue;
-            }
-            // The single rectangle stays the box on the entry's own page. For one fragment that
-            // is the fragment's own box, unchanged; when the entry is split, it is the union of
-            // the pieces that page carries. A continuation on another page cannot be part of a
-            // box here: the record names one page, and the preview rasterizes that page.
-            let on_page = entry
-                .fragments
-                .iter()
-                .filter(|fragment| fragment.page == entry.page)
-                .map(|fragment| fragment.rect)
-                .reduce(aris_reader_core::Rect::union);
-            let rect = match on_page {
-                Some(rect) => rect,
-                // No fragment geometry (the text layer offered no boxes): fall back to the
-                // character boxes of the entry's own range, as this used to read.
-                None => {
-                    let slice = &text.chars
-                        [entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
-                    let Some(rect) = union_of_char_boxes(slice) else {
-                        continue;
-                    };
-                    rect
-                }
-            };
-            let Some(view) = view_box(&self.backend, &mut transforms, entry.page, rect) else {
-                continue;
-            };
-
-            let mut fragments = Vec::with_capacity(entry.fragments.len());
-            for fragment in &entry.fragments {
-                let Some(view) =
-                    view_box(&self.backend, &mut transforms, fragment.page, fragment.rect)
-                else {
-                    continue;
-                };
-                fragments.push(ReferenceFragment {
-                    page: fragment.page,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: fragment.rect.size.width,
-                    height_pt: fragment.rect.size.height,
-                });
-            }
-
-            records.push(ReferenceRecord {
-                label: entry.label,
-                text: entry.text,
-                page: entry.page,
-                x_pt: view.x,
-                y_pt: view.y,
-                width_pt: rect.size.width,
-                height_pt: rect.size.height,
-                fragments,
-            });
+        let mut lists = Vec::with_capacity(bibliography.lists.len());
+        for list in &bibliography.lists {
+            let records = reference_records(&self.backend, &mut transforms, &list.entries);
+            lists.push(cached_reference_list(list, records));
         }
+        let records = lists
+            .get(bibliography.document_wide)
+            .map(|list| list.records.clone())
+            .unwrap_or_default();
+        // Resolution and attribution run on the records the cache carries, so an entry index is
+        // also its preview record's index.
+        let bibliography = bibliography_from_cached(&lists, bibliography.document_wide);
 
         // The body pages are in `pages` already; turn their text into click targets now, with
         // the same function and style a per-page call would use. Empty pages stay in the map so
@@ -2154,7 +2211,12 @@ impl ArisDocument {
             citations.insert(index, citation_records(&text, &style, index, transform));
         }
 
-        let cache = Arc::new(ReferenceCache { records, style });
+        let cache = Arc::new(ReferenceCache {
+            records,
+            style,
+            lists,
+            bibliography,
+        });
         if let Ok(mut guard) = self.references.lock() {
             *guard = Some(Arc::clone(&cache));
         }
@@ -2273,9 +2335,15 @@ impl ArisDocument {
                     ..
                 } = *file;
                 if let Ok(mut cache) = self.references.lock() {
+                    let bibliography = bibliography_from_cached(
+                        &references.lists,
+                        references.document_wide as usize,
+                    );
                     *cache = Some(Arc::new(ReferenceCache {
                         records: references.records,
                         style: references.style,
+                        lists: references.lists,
+                        bibliography,
                     }));
                 }
                 if let Ok(mut cache) = self.figures.lock() {
@@ -2418,6 +2486,8 @@ impl ArisDocument {
             references: CachedReferences {
                 style: references.style.clone(),
                 records: references.records.clone(),
+                lists: references.lists.clone(),
+                document_wide: references.bibliography.document_wide as u32,
             },
             figures,
             metadata,
@@ -3037,6 +3107,131 @@ fn citation_records(
         .collect()
 }
 
+/// The preview records for one reference list, in view space.
+///
+/// The single rectangle stays the box on the entry's own page. For one fragment that is the
+/// fragment's own box, unchanged; when the entry is split, it is the union of the pieces that
+/// page carries. A continuation on another page cannot be part of a box here: the record names
+/// one page, and the preview rasterizes that page.
+fn reference_records(
+    backend: &PdfiumBackend,
+    transforms: &mut std::collections::HashMap<u32, aris_reader_core::Transform2D>,
+    entries: &[aris_reader_text::ReferenceEntry],
+) -> Vec<ReferenceRecord> {
+    let mut records = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // The entry's box comes from the character boxes of its own range, so the preview can
+        // show exactly the entry rather than a whole page.
+        let Ok(text) = backend.raw_text_page(PageIndex(entry.page)) else {
+            continue;
+        };
+        if document_page_view(backend, transforms, entry.page).is_none() {
+            continue;
+        }
+        let on_page = entry
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.page == entry.page)
+            .map(|fragment| fragment.rect)
+            .reduce(aris_reader_core::Rect::union);
+        let rect = match on_page {
+            Some(rect) => rect,
+            // No fragment geometry (the text layer offered no boxes): fall back to the
+            // character boxes of the entry's own range, as this used to read.
+            None => {
+                let slice =
+                    &text.chars[entry.start.min(text.chars.len())..entry.end.min(text.chars.len())];
+                let Some(rect) = union_of_char_boxes(slice) else {
+                    continue;
+                };
+                rect
+            }
+        };
+        let Some(view) = view_box(backend, transforms, entry.page, rect) else {
+            continue;
+        };
+
+        let mut fragments = Vec::with_capacity(entry.fragments.len());
+        for fragment in &entry.fragments {
+            let Some(view) = view_box(backend, transforms, fragment.page, fragment.rect) else {
+                continue;
+            };
+            fragments.push(ReferenceFragment {
+                page: fragment.page,
+                x_pt: view.x,
+                y_pt: view.y,
+                width_pt: fragment.rect.size.width,
+                height_pt: fragment.rect.size.height,
+            });
+        }
+
+        records.push(ReferenceRecord {
+            label: entry.label.clone(),
+            text: entry.text.clone(),
+            page: entry.page,
+            x_pt: view.x,
+            y_pt: view.y,
+            width_pt: rect.size.width,
+            height_pt: rect.size.height,
+            fragments,
+        });
+    }
+    records
+}
+
+/// A live attribution view built from the records the cache carries.
+///
+/// Resolution and attribution need labels, text and pages only; geometry stays with the records
+/// that are handed back for the preview. Building the entries from the same records means a
+/// resolved entry's index is also its record's index, so the preview cannot drift from the
+/// thing that was resolved.
+fn bibliography_from_cached(
+    lists: &[CachedReferenceList],
+    document_wide: usize,
+) -> aris_reader_text::Bibliography {
+    let lists = lists
+        .iter()
+        .map(|list| aris_reader_text::ReferenceList {
+            entries: list
+                .records
+                .iter()
+                .map(|record| aris_reader_text::ReferenceEntry {
+                    label: record.label.clone(),
+                    text: record.text.clone(),
+                    page: record.page,
+                    start: 0,
+                    end: 0,
+                    fragments: Vec::new(),
+                })
+                .collect(),
+            numbered: list.numbered,
+            heading: list.heading.clone(),
+            heading_page: list.heading_page,
+            section: list.section.clone(),
+            region_start: list.region_start,
+        })
+        .collect();
+    aris_reader_text::Bibliography {
+        lists,
+        document_wide,
+        sections: Vec::new(),
+    }
+}
+
+/// The persistent form of one live reference list.
+fn cached_reference_list(
+    list: &aris_reader_text::ReferenceList,
+    records: Vec<ReferenceRecord>,
+) -> CachedReferenceList {
+    CachedReferenceList {
+        records,
+        numbered: list.numbered,
+        heading: list.heading.clone(),
+        heading_page: list.heading_page,
+        section: list.section.clone(),
+        region_start: list.region_start,
+    }
+}
 /// A page-space box as its view-space **top-left corner**, the convention the preview uses.
 fn view_box(
     backend: &PdfiumBackend,

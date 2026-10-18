@@ -41,7 +41,7 @@ use std::collections::BTreeSet;
 /// heading, the title page of an embedded document (the GPT-4 report appends its system card as a
 /// document of its own, with the card's title page and the card's references), or a numbered
 /// section heading. A list whose section cannot be read from the text carries `None`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SectionKind {
     Appendix,
     Chapter,
@@ -64,7 +64,7 @@ impl SectionKind {
 }
 
 /// Where a section that carries its own reference list begins.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SectionRef {
     /// The heading as it is printed, whitespace collapsed.
     pub title: String,

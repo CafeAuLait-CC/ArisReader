@@ -1069,9 +1069,11 @@ public protocol PDFEngine: AnyObject {
     func figures() async throws -> [Figure]
     /// The document's reference list (empty when none can be parsed).
     func references() async throws -> [Reference]
-    /// Resolves a citation's labels to **every** reference entry they name, in label order
-    /// (one implementation, in Rust; empty when nothing resolves).
-    func resolveCitations(labels: [String]) async throws -> [Reference]
+    /// Resolves a citation's labels to **every** reference entry they name, in label order,
+    /// against the reference list of the section the citation's `page` belongs to (one
+    /// implementation, in Rust; empty when nothing resolves). The page is what attributes a
+    /// citation to its list when the document prints more than one.
+    func resolveCitations(labels: [String], page: Int) async throws -> [Reference]
     /// Document outline (empty when the PDF has no bookmarks).
     func outline() async throws -> [OutlineEntry]
     /// Recognised metadata for the open document, with the source of every field.
@@ -2013,23 +2015,25 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    public func resolveCitations(labels: [String]) async throws -> [Reference] {
+    public func resolveCitations(labels: [String], page: Int) async throws -> [Reference] {
         guard let document else { return [] }
 
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
-                    let records = try document.resolveCitations(labels: labels)
+                    // The page-aware FFI call: Rust attributes the citation to the list its
+                    // section cites and returns the preview record from that list.
+                    let records = try document.resolveCitationsOn(page: UInt32(page), labels: labels)
                     continuation.resume(
                         returning: records.map { record in
                             Reference(
-                                label: record.label,
-                                text: record.text,
-                                page: Int(record.page),
-                                xPt: CGFloat(record.xPt),
-                                yPt: CGFloat(record.yPt),
-                                widthPt: CGFloat(record.widthPt),
-                                heightPt: CGFloat(record.heightPt)
+                                label: record.reference.label,
+                                text: record.reference.text,
+                                page: Int(record.reference.page),
+                                xPt: CGFloat(record.reference.xPt),
+                                yPt: CGFloat(record.reference.yPt),
+                                widthPt: CGFloat(record.reference.widthPt),
+                                heightPt: CGFloat(record.reference.heightPt)
                             )
                         }
                     )
@@ -2341,7 +2345,7 @@ public final class MockEngine: PDFEngine {
 
     public func references() async throws -> [Reference] { [] }
 
-    public func resolveCitations(labels: [String]) async throws -> [Reference] { [] }
+    public func resolveCitations(labels: [String], page: Int) async throws -> [Reference] { [] }
 
     public func outline() async throws -> [OutlineEntry] { [] }
 
