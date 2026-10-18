@@ -53,6 +53,7 @@ struct ThumbnailDragOverlay: NSViewRepresentable {
     let payloadIdentity: @MainActor () -> ThumbnailDragIdentity?
     let dragImage: @MainActor (Int, Int) -> NSImage?
     let onClick: @MainActor (Int, NSEvent.ModifierFlags) -> Void
+    var onDoubleClick: (@MainActor (Int) -> Void)? = nil
     let onDrop: @MainActor (ThumbnailDropRequest) -> Void
     let onRefusal: @MainActor (ThumbnailDragRefusal) -> Void
     let menu: @MainActor (Int) -> NSMenu?
@@ -74,6 +75,7 @@ struct ThumbnailDragOverlay: NSViewRepresentable {
         view.payloadIdentity = payloadIdentity
         view.dragImage = dragImage
         view.onClick = onClick
+        view.onDoubleClick = onDoubleClick
         view.onDrop = onDrop
         view.onRefusal = onRefusal
         view.menuProvider = menu
@@ -96,6 +98,7 @@ final class ThumbnailDragHostView: NSView, NSDraggingSource {
     var payloadIdentity: () -> ThumbnailDragIdentity?
     var dragImage: (Int, Int) -> NSImage?
     var onClick: (Int, NSEvent.ModifierFlags) -> Void
+    var onDoubleClick: ((Int) -> Void)?
     var onDrop: (ThumbnailDropRequest) -> Void
     var onRefusal: (ThumbnailDragRefusal) -> Void
     var menuProvider: (Int) -> NSMenu?
@@ -166,7 +169,8 @@ final class ThumbnailDragHostView: NSView, NSDraggingSource {
         guard let press else { return }
         self.press = nil
         guard press.isClick else { return }
-        onClick(press.page, event.modifierFlags)
+        if event.clickCount >= 2, let onDoubleClick { onDoubleClick(press.page) }
+        else { onClick(press.page, event.modifierFlags) }
     }
 
     private func beginDrag(from page: Int, event: NSEvent, at point: CGPoint) {
@@ -426,7 +430,10 @@ final class ThumbnailDragHostView: NSView, NSDraggingSource {
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         guard let page = page(at: point) else { return nil }
-        return menuProvider(page)
+        guard let menu = menuProvider(page), let window else { return nil }
+        LyraMenuPresenter.shared.show(menu: menu, at: window.convertPoint(toScreen: event.locationInWindow),
+                                      in: window, owner: self)
+        return nil
     }
 
     // MARK: Helpers

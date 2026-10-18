@@ -3,14 +3,12 @@ import SwiftUI
 
 /// Full-width document tabs sit above all commands, independently of the sidebar.
 struct TabStrip: View {
+    static let height: CGFloat = 44
+
     @ObservedObject var state: AppState
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "sparkle")
-                .font(.system(size: 17)).foregroundStyle(LyraTheme.accent)
-                .frame(width: 34)
-                .accessibilityHidden(true)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
                     ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
@@ -39,17 +37,17 @@ struct TabStrip: View {
                         }
                         .help(tab.title)
                     }
+                    Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
+                        .buttonStyle(LyraToolStyle()).help("Open a PDF in a new tab (⌘O)")
+                        .accessibilityLabel("Open PDF")
                 }
             }
-            .frame(maxWidth: CGFloat(max(1, state.tabs.count)) * 250)
+            .frame(maxWidth: CGFloat(state.tabs.count) * 250 + 40)
             ReaderWindowDragArea().frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityHidden(true)
-            Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
-                .buttonStyle(LyraToolStyle()).help("Open a PDF in a new tab (⌘O)")
-                .accessibilityLabel("Open PDF")
         }
         .padding(.horizontal, 10).padding(.top, 6)
-        .frame(height: 44)
+        .frame(height: Self.height)
         .background(LyraTheme.tabbarBg)
         .overlay(alignment: .bottom) { LyraTheme.separator.frame(height: 1) }
     }
@@ -72,7 +70,11 @@ struct ReaderToolbar: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(LyraTheme.toolbarBg)
-            if annotationsExpanded {
+            if state.pageOverviewVisible {
+                overviewRow
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(LyraTheme.panelBg)
+            } else if annotationsExpanded {
                 annotationRow
                     .padding(.horizontal, 14).padding(.vertical, 7)
                     .background(LyraTheme.panelBg)
@@ -87,16 +89,18 @@ struct ReaderToolbar: View {
     private func primaryRow(compact: Bool) -> some View {
         HStack(spacing: compact ? 3 : 7) {
             tool("Toggle sidebar", "sidebar.left", selected: state.sidebarVisible) {
-                state.sidebarVisible.toggle()
+                if state.pageOverviewVisible {
+                    state.pageOverviewVisible = false
+                    state.sidebarVisible = true
+                } else { state.sidebarVisible.toggle() }
             }
-            tool("Page thumbnails", "square.grid.2x2", selected: state.sidebarVisible && state.sidebarTab == .thumbnails) {
-                if state.sidebarVisible && state.sidebarTab == .thumbnails { state.sidebarVisible = false }
-                else { state.sidebarTab = .thumbnails; state.sidebarVisible = true }
-            }
+            tool("Page overview", "square.grid.2x2", selected: state.pageOverviewVisible) {
+                state.pageOverviewVisible.toggle()
+            }.disabled(state.document == nil)
             LyraMenu(title: "View settings", items: ReaderLayoutMode.allCases.map { mode in
                 LyraMenuItem(mode.title, icon: mode == .facing ? "book" : "rectangle",
                              selected: state.layoutMode == mode) { state.setLayoutMode(mode) }
-            }) { menuLabel("book") }
+            }) { menuLabel("book") }.disabled(state.pageOverviewVisible)
             separator
             HStack(spacing: 0) {
                 tool("Zoom out (⌘−)", "minus") { state.zoomOut() }
@@ -111,16 +115,16 @@ struct ReaderToolbar: View {
                     }.font(.system(size: 12)).frame(minWidth: 60, minHeight: 32)
                 }
                 tool("Zoom in (⌘+)", "plus") { state.zoomIn() }
-            }
+            }.disabled(state.pageOverviewVisible)
             separator
-            Button { annotationsExpanded.toggle() } label: {
+            Button { state.pageOverviewVisible = false; annotationsExpanded.toggle() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
                     if !compact { Text("Annotate").font(.system(size: 12, weight: .medium)) }
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraToolStyle(selected: annotationsExpanded))
+            .buttonStyle(LyraToolStyle(selected: annotationsExpanded && !state.pageOverviewVisible))
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(annotationsExpanded ? "Expanded" : "Collapsed")
             pending("Edit PDF", "character.cursor.ibeam")
@@ -140,6 +144,7 @@ struct ReaderToolbar: View {
             pending("Fill & Sign", "signature")
             separator
             tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
+                state.pageOverviewVisible = false
                 state.sidebarTab = .ai; state.sidebarVisible = true
             }
             LyraMenu(title: "More commands", items: [
@@ -155,6 +160,29 @@ struct ReaderToolbar: View {
             Spacer(minLength: 4)
             search(compact: compact)
         }
+    }
+
+    private var overviewRow: some View {
+        HStack(spacing: 10) {
+            Button { state.insertBlankPage(before: false) } label: {
+                Label("Insert Page", systemImage: "doc.badge.plus")
+            }.disabled(!state.canPageEdit)
+            Button { state.rotateSelectedPages(clockwise: true) } label: {
+                Label("Rotate", systemImage: "rotate.right")
+            }.disabled(!state.canPageEdit)
+            Button { state.presentExtractPagesPanel() } label: {
+                Label("Extract", systemImage: "square.and.arrow.up")
+            }.disabled(state.document == nil)
+            Button { state.confirmDeleteSelectedPages() } label: {
+                Label("Delete", systemImage: "trash")
+            }.disabled(!state.canPageEdit || state.selectedPageIndices.count >= (state.document?.pageCount ?? 0))
+            Spacer(minLength: 0)
+            Text("\(state.selectedPageIndices.count) selected")
+                .foregroundStyle(LyraTheme.textSecondary)
+            Button { state.pageOverviewVisible = false } label: {
+                Label("Done", systemImage: "checkmark")
+            }.accessibilityLabel("Close page overview")
+        }.font(.system(size: 12))
     }
 
     private var annotationRow: some View {
@@ -213,7 +241,7 @@ struct ReaderToolbar: View {
             TextField("Search document", text: $state.searchQuery)
                 .textFieldStyle(.plain).font(.system(size: 12))
                 .frame(width: compact ? 100 : 150)
-                .onSubmit { state.runSearch() }
+                .onSubmit { state.pageOverviewVisible = false; state.runSearch() }
             if !state.searchHits.isEmpty {
                 Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
                     .font(.caption2).monospacedDigit().foregroundStyle(LyraTheme.textSecondary)

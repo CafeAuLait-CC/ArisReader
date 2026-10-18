@@ -38,13 +38,22 @@ public struct ReaderWindow: View {
                 .padding(.leading, integratesTitlebar ? 78 : 0)
                 .background(LyraTheme.tabbarBg)
             ReaderToolbar(state: state)
-            HStack(spacing: 0) {
-                if state.sidebarVisible {
-                    SidebarView(state: state, opener: opener)
-                        .frame(width: 250)
-                    Rectangle().fill(LyraTheme.separator).frame(width: 1)
+            ZStack {
+                HStack(spacing: 0) {
+                    if state.sidebarVisible {
+                        SidebarView(state: state, opener: opener)
+                            .frame(width: 250)
+                        Rectangle().fill(LyraTheme.separator).frame(width: 1)
+                    }
+                    canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+                .opacity(state.pageOverviewVisible ? 0 : 1)
+                .allowsHitTesting(!state.pageOverviewVisible)
+                .accessibilityHidden(state.pageOverviewVisible)
+                if state.pageOverviewVisible, state.document != nil {
+                    SidebarView(state: state, opener: opener, pageOverview: true)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
         .frame(minWidth: 900, minHeight: 600)
@@ -52,6 +61,9 @@ public struct ReaderWindow: View {
         .foregroundStyle(LyraTheme.textPrimary)
         .tint(LyraTheme.accent)
         .onAppear { state.installTerminationHandling() }
+        .onChange(of: state.document?.url) { _, url in
+            if url == nil { state.pageOverviewVisible = false }
+        }
         .alert("Lyra", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }

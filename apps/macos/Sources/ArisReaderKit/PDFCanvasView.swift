@@ -159,7 +159,7 @@ public final class MetalCanvasView: NSView {
     ///
     /// The view owns no menu policy — the shell decides what is available from the reader's state
     /// (`CanvasContextMenu`) — and `nil` means "nothing to offer here", which leaves AppKit's
-    /// default menu alone. Returning a menu is what lets a right-click on the page reach the same
+    /// default menu unused. The command list is rendered in the shared Lyra panel and reaches the same
     /// `AppState` commands the toolbar and the Pages menu use.
     public var onContextMenu: ((CGPoint) -> NSMenu?)?
 
@@ -434,7 +434,10 @@ public final class MetalCanvasView: NSView {
     /// the thing under the pointer.
     public override func menu(for event: NSEvent) -> NSMenu? {
         guard let onContextMenu else { return super.menu(for: event) }
-        return onContextMenu(contentPoint(for: event)) ?? super.menu(for: event)
+        guard let menu = onContextMenu(contentPoint(for: event)), let window else { return nil }
+        LyraMenuPresenter.shared.show(menu: menu, at: window.convertPoint(toScreen: event.locationInWindow),
+                                      in: window, owner: self)
+        return nil
     }
 
     // MARK: - Pointer
@@ -895,8 +898,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
     /// Documents dropped on the canvas: the shell's open funnel (see `DocumentOpenCoordinator`).
     private let fileDrop: DocumentOpenCoordinator?
-    /// Right-click menu, built from the reader's state at the clicked point. `nil` leaves AppKit's
-    /// default menu alone.
+    /// Right-click command list, rendered in the shared Lyra panel. `nil` offers no menu.
     private let onContextMenu: ((CGPoint) -> NSMenu?)?
 
     public init(

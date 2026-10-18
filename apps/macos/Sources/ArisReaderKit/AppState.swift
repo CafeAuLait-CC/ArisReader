@@ -279,6 +279,7 @@ public final class AppState: ObservableObject {
     @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails
     @Published public var sidebarVisible: Bool = true
+    @Published public var pageOverviewVisible: Bool = false
     @Published public var zoomPercent: Int = 100
     @Published public var currentPage: Int = 1
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"

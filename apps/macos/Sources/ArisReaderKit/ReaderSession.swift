@@ -66,6 +66,7 @@ public final class ReaderSession: ObservableObject, Identifiable {
     var registrationOrdinal = 0
 
     private var windowObservers: [NSObjectProtocol] = []
+    private var titlebarLayout: ReaderTitlebarLayout?
 
     /// `state` is injectable so the checks can drive a session against a known engine; the app
     /// leaves it out and gets a session with its own engine.
@@ -109,11 +110,22 @@ public final class ReaderSession: ObservableObject, Identifiable {
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.titlebarSeparatorStyle = .none
+            if window.styleMask.contains(.fullSizeContentView) {
+                titlebarLayout = ReaderTitlebarLayout(window: window)
+            }
             let center = NotificationCenter.default
+            for name in [NSWindow.didResizeNotification, NSWindow.didExitFullScreenNotification] {
+                windowObservers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.titlebarLayout?.scheduleAlignment() }
+                })
+            }
             windowObservers.append(center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.noteFocused() }
+                MainActor.assumeIsolated {
+                    self?.noteFocused()
+                    self?.titlebarLayout?.scheduleAlignment()
+                }
             })
             windowObservers.append(center.addObserver(
                 forName: NSWindow.willCloseNotification, object: window, queue: .main
@@ -148,6 +160,7 @@ public final class ReaderSession: ObservableObject, Identifiable {
     private func removeWindowObservers() {
         for observer in windowObservers { NotificationCenter.default.removeObserver(observer) }
         windowObservers.removeAll()
+        titlebarLayout = nil
     }
 }
 
