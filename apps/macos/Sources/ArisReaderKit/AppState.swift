@@ -911,6 +911,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var documentAnnotationsLoading = false
     /// Why the document's annotations could not be read, if they could not.
     @Published public private(set) var documentAnnotationsError: String?
+    private var documentAnnotationsLoadCompleted = false
 
     /// The note the reader last clicked on the page, highlighted in the sidebar so its text is
     /// where the click put it. `nil` until a note is clicked or a document is opened.
@@ -1098,6 +1099,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// for it instead of paying for a second read of the page (see `startCitationLoad`).
     private var citationLoads: [Int: Task<[Citation]?, Never>] = [:]
     @Published public private(set) var references: [Reference] = []
+    private var referencesLoadCompleted = false
 
     /// `Figure 3` / `Table 2` mentions per page, and the document's caption index.
     ///
@@ -1108,6 +1110,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var captionMentionsByPage: [Int: [CaptionMention]] = [:]
     private var captionMentionsInFlight: Set<Int> = []
     @Published public private(set) var figures: [Figure] = []
+    private var figuresLoadCompleted = false
     /// Recognised document metadata, with the source of every field.
     @Published public private(set) var metadata: DocumentMetadata?
     /// The editable values and the BibTeX generated from them. This is the panel's single
@@ -1116,6 +1119,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var metadataBibtex: String = ""
     @Published public private(set) var metadataLoading = false
     @Published public private(set) var metadataError: String?
+    private var metadataLoadCompleted = false
     /// Bumped on every document open, so caption data that arrives afterwards is dropped
     /// instead of being attributed to the document now on screen (the `renderEpoch` idea).
     private var documentEpoch: UInt64 = 0
@@ -1124,8 +1128,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var linkCache: [Int: [DocumentLink]] = [:]
     private var linksInFlight: Set<Int> = []
 
-    /// An open document. The engine holds one document at a time for now, so switching tabs
-    /// reopens the file and reapplies the tab's own scroll offset.
+    /// One tab. The document itself lives in the tab-retention cache below; a tab whose document
+    /// is beyond the keep-limit keeps only its URL and reading position and reloads on selection.
     public struct OpenTab: Identifiable, Sendable {
         public let id = UUID()
         public let url: URL
@@ -1136,8 +1140,113 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var tabs: [OpenTab] = []
     @Published public private(set) var activeTabIndex: Int?
 
+    // MARK: - Tab document retention (LRU)
+
+    /// How many documents (the active one plus the retained inactive ones) stay fully open.
+    ///
+    /// Three is the small bound the task asks for: the tab being read, the one before it and one
+    /// more. With the default 48 MB tile budget the raster caches this keeps alive are bounded by
+    /// three budgets, not by the number of tabs; the fourth document is closed through
+    /// `RustEngine.closeDocument(at:)` and its tab reloads when selected again.
+    public static let maximumRetainedDocuments = 3
+
+    /// Everything about one document that must survive a tab switch. The active document's
+    /// values live in `AppState`; an inactive document's values live in a `RetainedTab`.
+    ///
+    /// This is a value snapshot, so retaining it does not copy the raster bytes (Swift arrays and
+    /// dictionaries are copy-on-write); when the active state is reset for another document the
+    /// snapshot keeps its own storage.
+    private struct TabDocumentState {
+        var document: LoadedDocument
+        var currentPage: Int
+        var scrollYPt: CGFloat
+        var contentHeightPt: CGFloat
+        var contentWidthPt: CGFloat
+        var statusMessage: String
+        var pageSelection: Set<Int>
+        var pageSelectionAnchor: Int?
+        var pageEditSession: PageEditSession?
+        var pageEditPendingOperations: [String]
+        var pageEditIsApplied: Bool
+        var selection: Selection?
+        var selectionAnchor: Int?
+        var searchHits: [SearchHit]
+        var currentHitIndex: Int?
+        var tileCache: TileCache
+        var pagePreviews: [Int: PageImage]
+        var pagePreviewScales: [Int: CGFloat]
+        var desiredPreviewScale: CGFloat
+        var failedPreviewPages: Set<Int>
+        var failedTiles: Set<TileKey>
+        var usesScreenPageRasters: Bool
+        var screenPagePathNote: String?
+        var screenPagePathSummary: String
+        var lastScreenPagePathNote: String?
+        var hasReportedScreenPagePath: Bool
+        var textPages: [Int: TextPage]
+        var canvasPages: [CanvasPage]
+        var canvasTiles: [CanvasPage]
+        var visiblePagePlacements: [PagePlacement]
+        var linkCache: [Int: [DocumentLink]]
+        var citationsByPage: [Int: [Citation]]
+        var captionMentionsByPage: [Int: [CaptionMention]]
+        var references: [Reference]
+        var referencesLoadCompleted: Bool
+        var figures: [Figure]
+        var figuresLoadCompleted: Bool
+        var metadata: DocumentMetadata?
+        var metadataDraft: MetadataDraft
+        var metadataBibtex: String
+        var metadataError: String?
+        var metadataLoadCompleted: Bool
+        var documentAnnotations: [DocumentAnnotation]
+        var documentAnnotationsError: String?
+        var documentAnnotationsLoadCompleted: Bool
+        var outline: [OutlineEntry]
+        var outlineLoadCompleted: Bool
+        var thumbnails: [Int: PageImage]
+        var annotations: [Annotation]
+        var bookmarks: [Bookmark]
+        var preservedAnnotationEntryCount: Int
+        var annotationWriteCount: Int
+        var lastAnnotationWriteReport: AnnotationWriteReport?
+        var interruptedAnnotationSaveNotice: String?
+        var lastSidecarBackupURL: URL?
+        var annotationsURL: URL?
+        var annotationWritesBlockedReason: String?
+        var annotationSidecarSlots: [AnnotationSidecar.Slot]
+        var selectedDocumentAnnotationID: String?
+        var openDocumentNoteID: String?
+        var annotationTextures: [AnnotationTextureKey: PageImage]
+        var noteGlyphTextures: [NoteGlyphKey: PageImage]
+        var undoStack: [UndoableAction]
+        var redoStack: [UndoableAction]
+    }
+
+    private struct RetainedTab {
+        let tabID: UUID
+        let url: URL
+        var state: TabDocumentState
+        var lastUsed: UInt64
+    }
+
+    private var retainedTabs: [UUID: RetainedTab] = [:]
+    private var useTick: UInt64 = 0
+    /// Diagnostic counter: each entry is one least-recently-used document closed because the
+    /// keep-limit was exceeded.
+    public private(set) var documentEvictionCount = 0
+    public private(set) var lastEvictedDocumentURL: URL?
+    /// Documents that are fully open right now: the active one (if any) plus the retained tabs.
+    public var retainedDocumentCount: Int { (document == nil ? 0 : 1) + retainedTabs.count }
+    /// Retained inactive tabs, for the checks and diagnostics.
+    public var retainedTabCount: Int { retainedTabs.count }
+    /// True between selecting an evicted tab and the first raster of its reloaded document. The
+    /// interface shows a clear placeholder instead of an empty canvas in that window.
+    @Published public private(set) var isRestoringDocument = false
+
     /// Document outline, loaded once per document.
     @Published public private(set) var outline: [OutlineEntry] = []
+    private var outlineLoadCompleted = false
     /// Small page previews for the sidebar, keyed by page index.
     @Published public private(set) var thumbnails: [Int: PageImage] = [:]
     private var thumbnailsInFlight: Set<Int> = []
@@ -1652,6 +1761,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func open(url: URL) -> Bool {
+        // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
+        // committed after the new document actually opens, so a refused open leaves the cache and
+        // the screen exactly as they were.
+        let previous = prepareActiveDocumentForReplacement()
+        // A direct open with no tab (the launch hook, a check) has nobody to bring the old
+        // document back; its handle must go, or an untabbed open path would leak one per file.
+        let orphanURL = previous == nil && activeTabIndex == nil ? document?.url : nil
+        guard loadDocument(url: url, restoringTabScroll: nil) else { return false }
+        if var previous {
+            // The new open may have discarded a page-edit session on the previous document
+            // (after the explicit alert). Its revision is gone, so the retained tab must not
+            // bring a dead session back.
+            if previous.state.pageEditSession != nil && pageEditSession == nil {
+                previous.state.pageEditSession = nil
+                previous.state.pageEditPendingOperations = []
+                previous.state.pageEditIsApplied = false
+            }
+            retain(previous)
+        } else if let orphanURL, orphanURL != document?.url {
+            releaseEngineDocumentIfUnused(orphanURL)
+        }
+        trimRetainedDocuments()
+        return true
+    }
+
+    /// The one loading path. `restoringTabScroll` is non-nil only when a tab whose document was
+    /// evicted is being reopened: the saved position is applied before the first raster is
+    /// requested, so the placeholder never jumps to the top of the file first.
+    @discardableResult
+    private func loadDocument(url: URL, restoringTabScroll: CGFloat?,
+                              preservingPageEditSessionInSnapshot: Bool = false) -> Bool {
         openRequestCount += 1
         if let session = pageEditSession {
             let same = Self.resolvesToSameFile(url, session.originalURL)
@@ -1671,6 +1811,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         do {
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
+            // A tab switch already put the old document's page-edit session in its retained
+            // snapshot. The live copy belongs to the document being replaced and must not leak
+            // into the new one; the working files stay alive for the snapshot.
+            if preservingPageEditSessionInSnapshot {
+                pageEditSession = nil
+                pageEditPendingOperations = []
+                pageEditIsApplied = false
+            }
             document = loaded
             lastError = nil
             currentPage = 1
@@ -1690,8 +1838,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
             loadAnnotations(for: url)
             noticeInterruptedSave(at: url)
-            reloadVisiblePages()
-            restoreReadingPosition(for: url)
+            if let restoringTabScroll {
+                contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+                contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
+                scrollYPt = min(max(0, restoringTabScroll),
+                                max(0, contentHeightPt - viewportHeightContentPt))
+                reloadVisiblePages()
+            } else {
+                reloadVisiblePages()
+                restoreReadingPosition(for: url)
+            }
             loadOutline()
             loadThumbnails()
             loadReferences()
@@ -1746,6 +1902,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         lastAnnotationWriteReport = nil
         annotationTextures = [:]
         outline = []
+        outlineLoadCompleted = false
+        referencesLoadCompleted = false
+        figuresLoadCompleted = false
+        metadataLoadCompleted = false
+        documentAnnotationsLoadCompleted = false
+        isRestoringDocument = false
         thumbnails = [:]
         thumbnailsInFlight = []
         pendingThumbnails = []
@@ -2701,6 +2863,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             documentEpoch &+= 1
             documentAnnotations = []
             documentAnnotationsLoading = false
+            documentAnnotationsLoadCompleted = false
             documentAnnotationsError = nil
             interruptedAnnotationSaveNotice = nil
             selectedDocumentAnnotationID = nil
@@ -4050,6 +4213,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "an annotation is still being edited"]
             )
         }
+        let previousDocumentURL = document?.url
         resetDocumentState()
         var loaded = try engine.openDocument(at: url)
         loaded.title = title
@@ -4078,13 +4242,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         loadReferences()
         loadFigures()
         loadMetadata()
+        // A page-editing session can create one working revision per command. Only the current
+        // one is reachable after this load, so the previous handle is closed here rather than
+        // accumulating every intermediate revision in the engine for the life of the session.
+        if let previousDocumentURL, previousDocumentURL != loaded.url {
+            engine.closeDocument(at: previousDocumentURL)
+        }
     }
 
     private func endPageEditSession(deleteFiles: Bool) {
         let directory = pageEditSession?.directory
+        let revisionURL = pageEditSession?.revisionURL
+        let originalURL = pageEditSession?.originalURL
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
+        if let revisionURL, revisionURL != originalURL {
+            engine.closeDocument(at: revisionURL)
+        }
         if deleteFiles, let directory {
             try? FileManager.default.removeItem(at: directory)
         }
@@ -4449,7 +4624,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Loads the figure/table caption index once per open document (see `open(url:)`).
     private func loadFigures() {
-        guard figures.isEmpty else { return }
+        guard !figuresLoadCompleted else { return }
+        figuresLoadCompleted = true
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -4470,7 +4646,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// on screen. A failure is reported rather than swallowed — "the file has no annotations" and
     /// "the annotations could not be read" look identical on an empty canvas otherwise.
     private func loadDocumentAnnotations() {
-        guard documentAnnotations.isEmpty, !documentAnnotationsLoading else { return }
+        guard !documentAnnotationsLoadCompleted, !documentAnnotationsLoading else { return }
+        documentAnnotationsLoadCompleted = true
         documentAnnotationsLoading = true
         documentAnnotationsError = nil
         let epoch = documentEpoch
@@ -4532,7 +4709,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Loads the reference list once (it never changes for an open document).
     private func loadReferences() {
-        guard references.isEmpty else { return }
+        guard !referencesLoadCompleted else { return }
+        referencesLoadCompleted = true
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -4552,7 +4730,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// document. An empty field stays empty: this method never falls back to the filename or the
     /// file's creation date to make the panel look complete.
     private func loadMetadata() {
-        guard document != nil else { return }
+        guard document != nil, !metadataLoadCompleted else { return }
+        metadataLoadCompleted = true
         metadataLoading = true
         metadataError = nil
         let epoch = documentEpoch
@@ -5073,9 +5252,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func openDocumentInTab(_ url: URL) -> Bool {
         saveActiveTabPosition()
         guard open(url: url) else { return false }
-        tabs.append(OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
-                            scrollYPt: scrollYPt))
+        let tab = OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
+                          scrollYPt: scrollYPt)
+        tabs.append(tab)
         activeTabIndex = tabs.count - 1
+        isRestoringDocument = false
+        trimRetainedDocuments()
         return true
     }
 
@@ -5094,32 +5276,104 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return opened
     }
 
+    /// Switches to a tab.
+    ///
+    /// A tab whose document is still retained is activated without reading the file: its engine
+    /// handle, tile cache, page rasters and derived index are already in memory, so the page on
+    /// screen does not go blank and the scroll offset comes back exactly. A tab whose document was
+    /// evicted beyond `maximumRetainedDocuments` is reloaded through the existing `open` path,
+    /// with a placeholder shown until its first raster arrives.
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
         saveActiveTabPosition()
-        guard open(url: tabs[index].url) else { return }
+        flushPendingWrites()
+        let previousID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
+        if let previousID, document != nil {
+            retainedTabs[previousID] = RetainedTab(
+                tabID: previousID,
+                url: tabs.first(where: { $0.id == previousID })?.url ?? document?.url
+                    ?? URL(fileURLWithPath: "/"),
+                state: captureDocumentState(),
+                lastUsed: nextUseTick()
+            )
+        }
+
+        let target = tabs[index]
+        if let cached = retainedTabs.removeValue(forKey: target.id),
+           engine.activateDocument(at: cached.state.document.url ?? cached.url) {
+            activeTabIndex = index
+            restoreDocumentState(cached.state)
+            restoreDerivedDataIfNeeded()
+            reloadVisiblePages()
+            trimRetainedDocuments()
+            return
+        }
+
+        // No retained state: this tab's document was evicted (or its activation failed). The
+        // tab's saved offset is applied before the first raster request, and the placeholder
+        // stays until the first page is available.
+        isRestoringDocument = true
+        guard loadDocument(url: target.url, restoringTabScroll: target.scrollYPt,
+                           preservingPageEditSessionInSnapshot: true) else {
+            isRestoringDocument = false
+            // `loadDocument` leaves the previous live state untouched on failure; the snapshot
+            // taken above would only duplicate it, so drop it.
+            if let previousID { retainedTabs.removeValue(forKey: previousID) }
+            return
+        }
         activeTabIndex = index
-        restoreActiveTabPosition()
+        // `loadDocument` resets the document state (including this flag) before it renders.
+        // Raise it again after the successful open so the placeholder covers the canvas until
+        // the first reloaded raster arrives.
+        isRestoringDocument = true
+        restoreDerivedDataIfNeeded()
+        trimRetainedDocuments()
     }
 
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
         saveActiveTabPosition()
+        let closing = tabs[index]
         if index != activeTabIndex {
             tabs.remove(at: index)
             if let active = activeTabIndex, index < active { activeTabIndex = active - 1 }
+            if let retained = retainedTabs.removeValue(forKey: closing.id) {
+                releaseEngineDocumentIfUnused(retained.state.document.url ?? retained.url)
+            }
             return
         }
+
         tabs.remove(at: index)
+        retainedTabs.removeValue(forKey: closing.id)
+        let closingDocumentURL = document?.url
         activeTabIndex = nil
+        // Flush first: while the page-edit session is still current, its sidecar path is the
+        // working copy. Deleting the working directory before the flush would lose the note.
         resetDocumentState()
+        endPageEditSession(deleteFiles: true)
         document = nil
+        isRestoringDocument = false
+        if let closingDocumentURL { releaseEngineDocumentIfUnused(closingDocumentURL) }
         guard !tabs.isEmpty else { return }
         let next = min(index, tabs.count - 1)
-        if open(url: tabs[next].url) {
+        let nextTab = tabs[next]
+        if let cached = retainedTabs.removeValue(forKey: nextTab.id),
+           engine.activateDocument(at: cached.state.document.url ?? cached.url) {
             activeTabIndex = next
-            restoreActiveTabPosition()
+            restoreDocumentState(cached.state)
+            restoreDerivedDataIfNeeded()
+            reloadVisiblePages()
+            trimRetainedDocuments()
+            return
         }
+        isRestoringDocument = true
+        if loadDocument(url: nextTab.url, restoringTabScroll: nextTab.scrollYPt) {
+            activeTabIndex = next
+            restoreDerivedDataIfNeeded()
+        } else {
+            isRestoringDocument = false
+        }
+        trimRetainedDocuments()
     }
 
     private func saveActiveTabPosition() {
@@ -5134,12 +5388,258 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
     }
 
+    // MARK: Tab document cache
+
+    private func nextUseTick() -> UInt64 {
+        useTick &+= 1
+        return useTick
+    }
+
+    /// Snapshots the active tab before a new document replaces it. Only committed by the caller
+    /// after the replacement succeeded, so a refused open does not disturb the cache.
+    private func prepareActiveDocumentForReplacement() -> RetainedTab? {
+        guard document != nil, let index = activeTabIndex, tabs.indices.contains(index) else {
+            return nil
+        }
+        saveActiveTabPosition()
+        flushPendingWrites()
+        let tab = tabs[index]
+        return RetainedTab(tabID: tab.id, url: tab.url,
+                           state: captureDocumentState(), lastUsed: nextUseTick())
+    }
+
+    private func retain(_ tab: RetainedTab) {
+        retainedTabs[tab.tabID] = tab
+    }
+
+    /// Everything document-specific, captured as one value. Transient tasks and epochs are not
+    /// captured: on restore the epochs are bumped, which cancels every in-flight result that
+    /// belonged to the document the reader left.
+    private func captureDocumentState() -> TabDocumentState {
+        TabDocumentState(
+            document: document ?? LoadedDocument(title: "", pageCount: 0),
+            currentPage: currentPage,
+            scrollYPt: scrollYPt,
+            contentHeightPt: contentHeightPt,
+            contentWidthPt: contentWidthPt,
+            statusMessage: statusMessage,
+            pageSelection: pageSelection,
+            pageSelectionAnchor: pageSelectionAnchor,
+            pageEditSession: pageEditSession,
+            pageEditPendingOperations: pageEditPendingOperations,
+            pageEditIsApplied: pageEditIsApplied,
+            selection: selection,
+            selectionAnchor: selectionAnchor,
+            searchHits: searchHits,
+            currentHitIndex: currentHitIndex,
+            tileCache: tileCache,
+            pagePreviews: pagePreviews,
+            pagePreviewScales: pagePreviewScales,
+            desiredPreviewScale: desiredPreviewScale,
+            failedPreviewPages: failedPreviewPages,
+            failedTiles: failedTiles,
+            usesScreenPageRasters: usesScreenPageRasters,
+            screenPagePathNote: screenPagePathNote,
+            screenPagePathSummary: screenPagePathSummary,
+            lastScreenPagePathNote: lastScreenPagePathNote,
+            hasReportedScreenPagePath: hasReportedScreenPagePath,
+            textPages: textPages,
+            canvasPages: canvasPages,
+            canvasTiles: canvasTiles,
+            visiblePagePlacements: visiblePagePlacements,
+            linkCache: linkCache,
+            citationsByPage: citationsByPage,
+            captionMentionsByPage: captionMentionsByPage,
+            references: references,
+            referencesLoadCompleted: referencesLoadCompleted,
+            figures: figures,
+            figuresLoadCompleted: figuresLoadCompleted,
+            metadata: metadata,
+            metadataDraft: metadataDraft,
+            metadataBibtex: metadataBibtex,
+            metadataError: metadataError,
+            metadataLoadCompleted: metadataLoadCompleted,
+            documentAnnotations: documentAnnotations,
+            documentAnnotationsError: documentAnnotationsError,
+            documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
+            outline: outline,
+            outlineLoadCompleted: outlineLoadCompleted,
+            thumbnails: thumbnails,
+            annotations: annotations,
+            bookmarks: bookmarks,
+            preservedAnnotationEntryCount: preservedAnnotationEntryCount,
+            annotationWriteCount: annotationWriteCount,
+            lastAnnotationWriteReport: lastAnnotationWriteReport,
+            interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
+            lastSidecarBackupURL: lastSidecarBackupURL,
+            annotationsURL: annotationsURL,
+            annotationWritesBlockedReason: annotationWritesBlockedReason,
+            annotationSidecarSlots: annotationSidecarSlots,
+            selectedDocumentAnnotationID: selectedDocumentAnnotationID,
+            openDocumentNoteID: openDocumentNoteID,
+            annotationTextures: annotationTextures,
+            noteGlyphTextures: noteGlyphTextures,
+            undoStack: undoStack,
+            redoStack: redoStack
+        )
+    }
+
+    /// Puts a retained document's state back. The engine has already been told to make its
+    /// document current (`RustEngine.activateDocument(at:)`), so no file is read here.
+    private func restoreDocumentState(_ state: TabDocumentState) {
+        documentEpoch &+= 1
+        searchEpoch &+= 1
+        renderEpoch &+= 1
+        cancelScrollGlide()
+        scrollIdleTask?.cancel()
+        scrollIdleTask = nil
+        positionSaveTask?.cancel()
+        positionSaveTask = nil
+        pendingPosition = nil
+        noteFlushTask?.cancel()
+        noteFlushTask = nil
+        noteWindowSawKeystrokes = false
+        closeReferencePreview()
+        isRestoringDocument = false
+        annotationSaveInProgress = false
+        pageEditBusy = false
+        documentAnnotationsLoading = false
+        metadataLoading = false
+        isSearching = false
+        hasPendingAnnotationWrite = false
+
+        document = state.document
+        currentPage = state.currentPage
+        scrollYPt = state.scrollYPt
+        contentHeightPt = state.contentHeightPt
+        contentWidthPt = state.contentWidthPt
+        statusMessage = state.statusMessage
+        pageSelection = state.pageSelection
+        pageSelectionAnchor = state.pageSelectionAnchor
+        pageEditSession = state.pageEditSession
+        pageEditPendingOperations = state.pageEditPendingOperations
+        pageEditIsApplied = state.pageEditIsApplied
+        selection = state.selection
+        selectionAnchor = state.selectionAnchor
+        searchHits = state.searchHits
+        currentHitIndex = state.currentHitIndex
+        tileCache = state.tileCache
+        pagePreviews = state.pagePreviews
+        pagePreviewScales = state.pagePreviewScales
+        desiredPreviewScale = state.desiredPreviewScale
+        failedPreviewPages = state.failedPreviewPages
+        failedTiles = state.failedTiles
+        usesScreenPageRasters = state.usesScreenPageRasters
+        screenPagePathNote = state.screenPagePathNote
+        screenPagePathSummary = state.screenPagePathSummary
+        lastScreenPagePathNote = state.lastScreenPagePathNote
+        hasReportedScreenPagePath = state.hasReportedScreenPagePath
+        textPages = state.textPages
+        canvasPages = state.canvasPages
+        canvasTiles = state.canvasTiles
+        visiblePagePlacements = state.visiblePagePlacements
+        linkCache = state.linkCache
+        citationsByPage = state.citationsByPage
+        captionMentionsByPage = state.captionMentionsByPage
+        references = state.references
+        referencesLoadCompleted = state.referencesLoadCompleted
+        figures = state.figures
+        figuresLoadCompleted = state.figuresLoadCompleted
+        metadata = state.metadata
+        metadataDraft = state.metadataDraft
+        metadataBibtex = state.metadataBibtex
+        metadataError = state.metadataError
+        metadataLoadCompleted = state.metadataLoadCompleted
+        documentAnnotations = state.documentAnnotations
+        documentAnnotationsError = state.documentAnnotationsError
+        documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted
+        outline = state.outline
+        outlineLoadCompleted = state.outlineLoadCompleted
+        thumbnails = state.thumbnails
+        annotations = state.annotations
+        bookmarks = state.bookmarks
+        preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
+        annotationWriteCount = state.annotationWriteCount
+        lastAnnotationWriteReport = state.lastAnnotationWriteReport
+        interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
+        lastSidecarBackupURL = state.lastSidecarBackupURL
+        annotationsURL = state.annotationsURL
+        annotationWritesBlockedReason = state.annotationWritesBlockedReason
+        annotationSidecarSlots = state.annotationSidecarSlots
+        selectedDocumentAnnotationID = state.selectedDocumentAnnotationID
+        openDocumentNoteID = state.openDocumentNoteID
+        annotationTextures = state.annotationTextures
+        noteGlyphTextures = state.noteGlyphTextures
+        undoStack = state.undoStack
+        redoStack = state.redoStack
+
+        // Nothing that was in flight for the previous document may land in this one.
+        tilesInFlight.removeAll()
+        pendingTiles = []
+        wantedTiles = []
+        textPagesInFlight.removeAll()
+        linksInFlight.removeAll()
+        citationLoads = [:]
+        captionMentionsInFlight.removeAll()
+        thumbnailsInFlight.removeAll()
+        pendingThumbnails = []
+        desiredPreviewPages = []
+        pagePreviewInFlight = nil
+        isScrolling = false
+        isScrollIndicatorHovered = false
+        isDraggingScrollIndicator = false
+    }
+
+    /// Loads whatever a restored snapshot did not have yet. A completed empty result keeps its
+    /// flag, so a document with no figures is not re-indexed on every switch.
+    private func restoreDerivedDataIfNeeded() {
+        if !outlineLoadCompleted { loadOutline() }
+        if thumbnails.isEmpty { loadThumbnails() }
+        if !referencesLoadCompleted { loadReferences() }
+        if !figuresLoadCompleted { loadFigures() }
+        if !metadataLoadCompleted { loadMetadata() }
+        if !documentAnnotationsLoadCompleted { loadDocumentAnnotations() }
+    }
+
+    /// Evicts least-recently-used retained documents beyond the keep-limit. The active document
+    /// is never evicted; a tab with a pending page-edit session is skipped because its working
+    /// revision cannot be reconstructed from the file on disk. (If every inactive tab has such a
+    /// session the limit is exceeded temporarily rather than discarding a staged edit.)
+    private func trimRetainedDocuments() {
+        while retainedDocumentCount > Self.maximumRetainedDocuments {
+            let victim = retainedTabs.values
+                .filter { $0.state.pageEditSession == nil }
+                .min { $0.lastUsed < $1.lastUsed }
+            guard let victim else { return }
+            retainedTabs.removeValue(forKey: victim.tabID)
+            documentEvictionCount += 1
+            let victimURL = victim.state.document.url ?? victim.url
+            lastEvictedDocumentURL = victimURL
+            releaseEngineDocumentIfUnused(victimURL)
+            FileHandle.standardError.write(Data((
+                "aris-tabs: evicted \(victim.url.lastPathComponent) "
+                + "(LRU, \(Self.maximumRetainedDocuments) documents retained)\n"
+            ).utf8))
+        }
+    }
+
+    /// Closes an engine document once nothing in this window can activate it again. The check for
+    /// the live document and for another retained snapshot is what makes eviction *exactly once*
+    /// even when two tabs point at the same file.
+    private func releaseEngineDocumentIfUnused(_ url: URL) {
+        if document?.url == url { return }
+        if retainedTabs.values.contains(where: { ($0.state.document.url ?? $0.url) == url }) { return }
+        engine.closeDocument(at: url)
+    }
+
     /// Loads the document outline (once per document).
     public func loadOutline() {
         guard document != nil else {
             outline = []
             return
         }
+        guard !outlineLoadCompleted else { return }
+        outlineLoadCompleted = true
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -5630,6 +6130,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles = wanted
         evictTiles()
         canvasPages = pages
+        if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
         currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,

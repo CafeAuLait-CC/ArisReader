@@ -35,7 +35,7 @@ public struct ReaderWindow: View {
     public var body: some View {
         VStack(spacing: 0) {
             TabStrip(state: state)
-                .padding(.leading, integratesTitlebar ? 78 : 0)
+                .padding(.leading, integratesTitlebar ? TabRowLayout.tabStripLeadingInset : 0)
                 .background(LyraTheme.tabbarBg)
             ReaderToolbar(state: state)
             ZStack {
@@ -151,6 +151,25 @@ public struct ReaderWindow: View {
             if state.document == nil {
                 LyraTheme.emptyBg
                 emptyState
+            }
+
+            // A tab whose document was evicted by the keep-limit reloads in the background of
+            // this overlay. It covers the canvas only until the first page raster is ready; the
+            // tab's saved scroll offset has already been applied, so the page does not jump.
+            if state.isRestoringDocument, let document = state.document {
+                VStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Reopening \(document.title)…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(LyraTheme.textSecondary)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(LyraTheme.panelBg,
+                            in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(LyraTheme.separator, lineWidth: 0.5))
+                .accessibilityLabel("Reopening \(document.title)")
             }
 
             if state.pageEditSessionActive {
