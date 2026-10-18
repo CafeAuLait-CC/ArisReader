@@ -3016,6 +3016,255 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: - Exporting annotations as text
+
+    /// Whether the Export Annotations command can run.
+    ///
+    /// Deliberately true for a document with no annotations: invoking the command then says so
+    /// and writes nothing. A disabled item would leave the reader wondering whether the document
+    /// has annotations at all.
+    public var canExportAnnotations: Bool { document != nil }
+
+    /// True when the current document has anything the export would write.
+    ///
+    /// Every annotation the file carries is included, including ones whose `/F` hides them from
+    /// the page: the flag says what to paint, not what the review thread contains. The reader's
+    /// own sidecar entries are included of course. Bookmarks are not annotations and are not part
+    /// of this export.
+    public var hasAnnotationsToExport: Bool {
+        !annotations.isEmpty || !documentAnnotations.isEmpty
+    }
+
+    /// Why an export found nothing, without pretending a failed read was an empty file.
+    private var noAnnotationsToExportDetail: String {
+        if let error = documentAnnotationsError {
+            return "The PDF's annotations could not be read (\(error)), and Lyra's sidecar has "
+                + "none, so no file was written."
+        }
+        return "This document has no annotations from Lyra and none in the PDF, so no file was written."
+    }
+
+    /// The save-panel suggestion for one format, e.g. `paper (annotations).md`.
+    ///
+    /// During a page-editing session the open document is a revision; the reader is still working
+    /// on the original file, so the original's name is the one the export should carry.
+    public func suggestedAnnotationExportFilename(for format: AnnotationExportFormat) -> String {
+        AnnotationExport.suggestedFilename(documentURL: pageEditDisplayURL, format: format)
+    }
+
+    /// Opens the save panel that offers Markdown and CSV.
+    ///
+    /// The format is chosen in the panel, so there is one File menu command rather than two
+    /// parallel ones. PDF annotations may still be loading when the reader picks the command
+    /// (the engine reads them asynchronously on open), so the panel waits for that read to
+    /// finish before deciding whether there is anything to export.
+    public func presentExportAnnotationsPanel() {
+        guard document != nil else {
+            statusMessage = "Open a document before exporting annotations"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.waitForDocumentAnnotationsIfNeeded()
+            guard self.hasAnnotationsToExport else {
+                self.statusMessage = "There are no annotations to export"
+                self.lastError = self.noAnnotationsToExportDetail
+                FileHandle.standardError.write(
+                    Data("aris-annotate-export: nothing to export, no panel shown\n".utf8)
+                )
+                return
+            }
+            self.runExportAnnotationsPanel()
+        }
+    }
+
+    private func runExportAnnotationsPanel() {
+        guard document != nil else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Annotations"
+        panel.prompt = "Export"
+        panel.message =
+            "Writes every annotation — the reader's and the PDF's own — to a text file. "
+            + "Nothing is sent anywhere; the file is written on this Mac."
+        panel.directoryURL = pageEditDisplayURL?.deletingLastPathComponent()
+        panel.canCreateDirectories = true
+
+        let accessory = AnnotationExportSavePanelAccessory(
+            panel: panel,
+            documentURL: pageEditDisplayURL
+        )
+        panel.accessoryView = accessory.view
+        accessory.apply(format: .markdown)
+
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let format = accessory.format
+        Task { @MainActor [weak self] in
+            await self?.exportAnnotations(to: destination, format: format)
+        }
+    }
+
+    /// The ordered, source-labelled export of the current document, or `nil` when it has no
+    /// annotations.
+    ///
+    /// Text layers are fetched only for pages the export needs: a sidecar highlight's character
+    /// range gives both its quote and its vertical position, and a file markup annotation's
+    /// quads give its quote the same way. A page whose text layer cannot be read still exports
+    /// its annotations — the quote and the vertical position are simply absent, rather than the
+    /// whole export failing.
+    public func annotationExportDocument(
+        exportedAt: Date = Date(),
+        timeZone: TimeZone = .current
+    ) async -> AnnotationExportDocument? {
+        guard let document else { return nil }
+        await waitForDocumentAnnotationsIfNeeded()
+
+        var neededPages = Set(annotations.map(\.page))
+        for annotation in documentAnnotations where annotation.isMarkup {
+            neededPages.insert(annotation.page)
+        }
+        var textByPage: [Int: TextPage] = [:]
+        for page in neededPages.sorted() {
+            guard page >= 0, page < document.pageCount else { continue }
+            if let cached = textPages[page] {
+                textByPage[page] = cached
+                continue
+            }
+            if let fetched = try? await engine.textPage(page) {
+                textByPage[page] = fetched
+            }
+        }
+
+        var entries: [AnnotationExportEntry] = []
+        for annotation in annotations {
+            var quote: String?
+            var yPt = CGFloat.greatestFiniteMagnitude
+            if let page = textByPage[annotation.page],
+               annotation.start >= 0,
+               annotation.end >= annotation.start,
+               annotation.end < page.chars.count {
+                let range = annotation.start...annotation.end
+                if let raw = AnnotationExport.text(in: page, range: range) {
+                    quote = AnnotationExport.normalized(raw)
+                }
+                if let top = page.selectionRects(in: range).map(\.minY).min() {
+                    yPt = top
+                }
+            }
+            entries.append(AnnotationExportEntry(
+                id: annotation.id.uuidString,
+                page: annotation.page,
+                kind: annotation.kind.rawValue,
+                colorHex: annotation.color.hex,
+                author: Self.annotationAuthor,
+                date: annotation.createdAt,
+                quote: quote,
+                comment: AnnotationExport.normalized(annotation.note),
+                source: .sidecar,
+                yPt: yPt
+            ))
+        }
+
+        for annotation in documentAnnotations {
+            let page = textByPage[annotation.page]
+            entries.append(AnnotationExportEntry(
+                id: annotation.id,
+                page: annotation.page,
+                kind: annotation.kind,
+                colorHex: annotation.color?.hex,
+                author: annotation.author,
+                date: AnnotationExport.date(fromPDFDate: annotation.modified),
+                quote: AnnotationExport.quote(for: annotation, in: page),
+                comment: AnnotationExport.normalized(annotation.contents),
+                source: .pdf,
+                parentID: annotation.parentID,
+                yPt: annotation.boxes.map(\.yPt).min() ?? annotation.yPt
+            ))
+        }
+
+        guard !entries.isEmpty else { return nil }
+        return AnnotationExportDocument(
+            fileName: pageEditDisplayURL?.lastPathComponent ?? document.title,
+            pageCount: document.pageCount,
+            exportedAt: exportedAt,
+            timeZone: timeZone,
+            entries: entries
+        )
+    }
+
+    /// Writes the export at `destination` and returns whether a file was written.
+    ///
+    /// This is a local file write with the same atomic discipline as the sidecar: the complete
+    /// document is written to a sibling temporary file and renamed into place, so an interrupted
+    /// or failed export cannot leave a truncated file where the reader expects a complete one.
+    /// With no annotations the method writes nothing, reports why, and returns `false`.
+    @discardableResult
+    public func exportAnnotations(
+        to destination: URL,
+        format: AnnotationExportFormat,
+        exportedAt: Date = Date(),
+        timeZone: TimeZone = .current
+    ) async -> Bool {
+        guard let document else {
+            lastError = "Open a document before exporting annotations"
+            statusMessage = "Open a document before exporting annotations"
+            return false
+        }
+        if let documentURL = document.url, Self.resolvesToSameFile(destination, documentURL) {
+            lastError = "The annotation export cannot overwrite the PDF it describes. Choose another name."
+            statusMessage = "Could not export annotations"
+            return false
+        }
+        // A note that is still inside the typing debounce is already in `annotations`; flushing
+        // it first keeps the sidecar consistent with what this export says.
+        flushPendingWrites()
+
+        guard let export = await annotationExportDocument(exportedAt: exportedAt, timeZone: timeZone) else {
+            statusMessage = "There are no annotations to export"
+            lastError = noAnnotationsToExportDetail
+            FileHandle.standardError.write(
+                Data("aris-annotate-export: nothing to export, no file written\n".utf8)
+            )
+            return false
+        }
+
+        let text = AnnotationExport.render(export, format: format)
+        do {
+            try Data(text.utf8).write(to: destination, options: .atomic)
+        } catch {
+            lastError = "Could not export annotations: \(error.localizedDescription)"
+            statusMessage = "Could not export annotations"
+            FileHandle.standardError.write(
+                Data("aris-annotate-export: write to \(destination.path) failed: \(error)\n".utf8)
+            )
+            return false
+        }
+
+        let sidecarCount = export.rows.filter { $0.entry.source == .sidecar }.count
+        let pdfCount = export.rows.count - sidecarCount
+        statusMessage =
+            "Exported \(export.rows.count) annotation(s) to \(destination.lastPathComponent)"
+            + " · \(format.displayName) · \(sidecarCount) from the sidecar, \(pdfCount) from the PDF"
+        FileHandle.standardError.write(Data((
+            "aris-annotate-export: wrote \(export.rows.count) annotation(s) to \(destination.path)"
+            + " (\(format.rawValue), \(sidecarCount) sidecar, \(pdfCount) pdf)\n"
+        ).utf8))
+        return true
+    }
+
+    /// Waits briefly for the engine's document-wide annotation read when it is in flight.
+    ///
+    /// `/Annots` is read once per open document, asynchronously, so an export issued immediately
+    /// after opening would otherwise silently omit the file's own annotations. A bounded wait
+    /// keeps a slow or failed read from blocking the command forever; the export then proceeds
+    /// with what is loaded.
+    private func waitForDocumentAnnotationsIfNeeded() async {
+        guard documentAnnotationsLoading else { return }
+        let deadline = ContinuousClock.now + .milliseconds(3000)
+        while documentAnnotationsLoading && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+    }
+
     // MARK: - Page editing (T3.9)
     //
     // The original file is never modified until the reader chooses "Replace Original". Every

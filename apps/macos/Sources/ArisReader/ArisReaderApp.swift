@@ -116,6 +116,16 @@ struct ReaderCommands: Commands {
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
             .disabled(session?.state.canSaveAnnotationsToPDF != true)
+
+            Divider()
+
+            // A text export, not a PDF write: the save panel chooses Markdown or CSV, and the
+            // document on disk is never touched. ⌘E is free in this app.
+            Button("Export Annotations…") {
+                session?.state.presentExportAnnotationsPanel()
+            }
+            .keyboardShortcut("e", modifiers: .command)
+            .disabled(session?.state.canExportAnnotations != true)
         }
 
         CommandMenu("Reading") {
