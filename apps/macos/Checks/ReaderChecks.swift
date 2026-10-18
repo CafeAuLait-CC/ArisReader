@@ -72,6 +72,14 @@ struct ReaderChecks {
             try await hostedPreviewChecks(root: root)
             return
         }
+        // The sidebar and secondary-row transitions on their own, while they are being worked on
+        // (`ArisReaderChecks --check-transitions .`).
+        if CommandLine.arguments.contains("--check-transitions") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await transitionChecks(root: root)
+            return
+        }
         if CommandLine.arguments.contains("--measure-page-navigation") {
             try await measurePageNavigation()
             return
@@ -367,6 +375,7 @@ struct ReaderChecks {
         try await facingLayoutChecks(url: b)
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)
+        try await transitionChecks(root: root)
         try await previewChecks(url: b)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()
