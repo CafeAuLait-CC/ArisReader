@@ -1003,6 +1003,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `nonisolated` because `Codable` conformances are not main-actor isolated: an annotation
     /// decodes its legacy `colorIndex` against this table from any thread. It is a `let` of
     /// `Sendable` values, so sharing it is safe.
+    /// Lyra presets for new annotations. The legacy indexed palette below remains stable so
+    /// old sidecars retain their original colors when decoded or re-saved.
+    public nonisolated static let annotationPalette: [(name: String, color: AnnotationColor)] = [
+        ("Gold", AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 82)),
+        ("Apricot", AnnotationColor(red: 0xEF, green: 0xA7, blue: 0x7D, alpha: 77)),
+        ("Sage", AnnotationColor(red: 0x90, green: 0xB7, blue: 0x9A, alpha: 71)),
+        ("Mist Blue", AnnotationColor(red: 0x7D, green: 0xAD, blue: 0xD6, alpha: 66)),
+        ("Lavender", AnnotationColor(red: 0xAB, green: 0x9A, blue: 0xCB, alpha: 71)),
+        ("Rose", AnnotationColor(red: 0xD9, green: 0x9A, blue: 0x9B, alpha: 71)),
+    ]
+
     public nonisolated static let highlightPalette: [(name: String, color: AnnotationColor)] = [
         ("Yellow", AnnotationColor(red: 0xFF, green: 0xD8, blue: 0x40, alpha: 0x66)),
         ("Green", AnnotationColor(red: 0x70, green: 0xD0, blue: 0x60, alpha: 0x66)),
@@ -2085,7 +2096,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func addAnnotationFromSelection(
         kind: Annotation.Kind = .highlight,
-        color: AnnotationColor = AppState.highlightPalette[0].color,
+        color: AnnotationColor = AppState.annotationPalette[0].color,
         note: String = ""
     ) -> Bool {
         guard let selection, let url = document?.url else { return false }
@@ -2115,7 +2126,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func addHighlightFromSelection(
-        color: AnnotationColor = AppState.highlightPalette[0].color
+        color: AnnotationColor = AppState.annotationPalette[0].color
     ) -> Bool {
         addAnnotationFromSelection(kind: .highlight, color: color)
     }

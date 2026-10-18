@@ -412,6 +412,45 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
     count: usize,
     stats: *mut ArisFrameStats,
 ) -> i32 {
+    // SAFETY: forwards the same caller-owned arrays and stats, with the legacy clear color.
+    unsafe {
+        aris_reader_surface_draw_pages_on_background(
+            surface_id,
+            texture_ids,
+            rects,
+            blend_modes,
+            count,
+            0.13,
+            0.13,
+            0.15,
+            stats,
+        )
+    }
+}
+
+/// Draws the same page list with a host-selected, opaque linear-RGB canvas color.
+/// PDF pixels and annotation colors are not transformed.
+///
+/// # Safety
+/// Same array and stats contract as [`aris_reader_surface_draw_pages`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aris_reader_surface_draw_pages_on_background(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    stats: *mut ArisFrameStats,
+) -> i32 {
+    if [red, green, blue]
+        .iter()
+        .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+    {
+        return code::ERR_INVALID_ARGUMENT;
+    }
     if count > 0 && (texture_ids.is_null() || rects.is_null() || blend_modes.is_null()) {
         return code::ERR_INVALID_ARGUMENT;
     }
@@ -444,8 +483,8 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages(
         let frame = context.render_pages(
             SurfaceId(surface_id),
             &draws,
-            // Neutral reading background; pages are drawn on top of it.
-            [0.13, 0.13, 0.15, 1.0],
+            // The shell supplies a linear-light semantic surface color.
+            [red, green, blue, 1.0],
         )?;
         // Frame time is only logged for the first frames and then rarely: an idle window must
         // not spam a terminal. `ARIS_READER_RENDER_STATS=1` (the switch docs/09 §9 documents)

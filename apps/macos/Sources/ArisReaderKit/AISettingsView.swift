@@ -18,6 +18,14 @@ public struct AISettingsView: View {
 
     public var body: some View {
         Form {
+            Section("Connection") {
+                Picker("Use AI with", selection: $store.connectionMode) {
+                    ForEach(AIConnectionMode.allCases) { Text($0.title).tag($0) }
+                }.pickerStyle(.segmented)
+            }
+            if store.connectionMode == .chatGPT {
+                ChatGPTConnectionView(accounts: store.chatGPT)
+            } else {
             Section {
                 TextField("Base URL", text: $baseURL)
                     .textFieldStyle(.roundedBorder)
@@ -25,7 +33,7 @@ public struct AISettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 Text("Examples: https://api.openai.com/v1, https://api.deepseek.com/v1, or http://localhost:11434/v1 for Ollama. Lyra appends /chat/completions; do not include it here.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let endpoint = store.endpointInfo {
                     Label(
@@ -35,7 +43,7 @@ public struct AISettingsView: View {
                         systemImage: endpoint.isLocal ? "desktopcomputer" : "network"
                     )
                     .font(.caption)
-                    .foregroundStyle(endpoint.isLocal ? Color.green : Color.orange)
+                    .foregroundStyle(endpoint.isLocal ? LyraTheme.successFg : LyraTheme.warningFg)
                 }
             } header: {
                 Text("Provider (OpenAI-compatible)")
@@ -46,7 +54,7 @@ public struct AISettingsView: View {
             Section {
                 HStack(spacing: 6) {
                     Image(systemName: store.hasKey ? "key.fill" : "key")
-                        .foregroundStyle(store.hasKey ? Color.green : Color.secondary)
+                        .foregroundStyle(store.hasKey ? LyraTheme.successFg : Color.secondary)
                     Text(store.hasKey ? "A key is configured in the Keychain." : "No key is configured.")
                         .font(.callout)
                 }
@@ -71,7 +79,7 @@ public struct AISettingsView: View {
             } footer: {
                 Text("The key is stored only in the macOS Keychain. It is never written to UserDefaults, a file, the request preview, or a log. Lyra reads it only when you press Send in the AI panel.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -88,18 +96,18 @@ public struct AISettingsView: View {
                 }
                 Text(previewSettings.reasoningSummary)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(previewSettings.reasoningFieldDescription)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                 if let message = AISettingsStore.reasoningValidationMessage(
                     mode: reasoningMode,
                     encoding: reasoningEncoding
                 ) {
                     Text(message)
                         .font(.caption)
-                        .foregroundStyle(Color.red)
+                        .foregroundStyle(LyraTheme.errorFg)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             } header: {
@@ -107,7 +115,7 @@ public struct AISettingsView: View {
             } footer: {
                 Text("Plain OpenAI compatibility has no standard reasoning switch. This provider documents several encodings, so Lyra sends exactly the one selected here and nothing else. The default is off via thinking, because it changes cost and latency. A strict provider may reject an encoding; the error will name the parameter and point back to this setting.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -117,30 +125,34 @@ public struct AISettingsView: View {
                     Slider(value: $temperature, in: 0...2, step: 0.1)
                     Text(String(format: "%.1f", temperature))
                         .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(LyraTheme.textSecondary)
                         .frame(width: 30, alignment: .trailing)
                 }
                 Stepper("Max tokens: \(maxTokens)", value: $maxTokens, in: 64...8192, step: 64)
                 Text("These are sent as temperature and max_tokens. A provider may ignore or cap them.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(LyraTheme.textSecondary)
             } header: {
                 Text("Generation")
 
             }
 
-            if let message = savedMessage ?? store.invalidSettingsMessage {
+            }
+            if store.connectionMode == .apiKey, let message = savedMessage ?? store.invalidSettingsMessage {
                 Section {
                     Text(message)
                         .font(.caption)
                         .foregroundStyle(message == "Saved." || message.hasPrefix("The API key was removed")
-                                         ? Color.secondary : Color.red)
+                                         ? Color.secondary : LyraTheme.errorFg)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
         .formStyle(.grouped)
         .onAppear(perform: load)
+        .task(id: store.connectionMode) {
+            if store.connectionMode == .chatGPT { await store.chatGPT.loadModels() }
+        }
     }
 
     private func load() {

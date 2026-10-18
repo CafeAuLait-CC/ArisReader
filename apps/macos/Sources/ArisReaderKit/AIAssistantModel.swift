@@ -58,6 +58,8 @@ public final class AIAssistantModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var currentPartIndex: Int?
     private var merging = false
+    private var preparedConnection: AIConnectionMode = .apiKey
+    private var preparedAccountID: UUID?
 
     public init(settings: AISettingsStore = .shared) {
         self.settings = settings
@@ -131,10 +133,11 @@ public final class AIAssistantModel: ObservableObject {
             statusNote = Self.noEngineMessage
             return
         }
-        guard settings.hasKey else {
+        guard settings.canUseAI else {
             phase = .failed
-            errorMessage = Self.noKeyMessage
-            statusNote = Self.noKeyMessage
+            errorMessage = settings.connectionMode == .chatGPT
+                ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
+            statusNote = errorMessage
             return
         }
         let providerSettings: AIProviderSettings
@@ -148,6 +151,8 @@ public final class AIAssistantModel: ObservableObject {
         }
 
         cancelWork()
+        preparedConnection = settings.connectionMode
+        preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
         phase = .preparing
         plan = nil
         resetMergeState()
@@ -171,7 +176,8 @@ public final class AIAssistantModel: ObservableObject {
         )
 
         do {
-            let plan = try await service.prepare(request)
+            let source = try await service.prepare(request)
+            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
             guard documentKey == context.documentKey else { return }
             self.plan = plan
             phase = .preview
@@ -192,29 +198,10 @@ public final class AIAssistantModel: ObservableObject {
             return
         }
         guard !isSending else { return }
-        let key: String
-        do {
-            guard let stored = try settings.readKey() else {
-                phase = .failed
-                errorMessage = Self.noKeyMessage
-                statusNote = Self.noKeyMessage
-                return
-            }
-            key = stored
-        } catch {
-            phase = .failed
-            errorMessage = AIReadableError.message(error)
-            statusNote = errorMessage
-            return
-        }
-
         let handle: any AIChatHandle
-        do {
-            handle = try service.start(plan, apiKey: key)
-        } catch {
-            phase = .failed
-            errorMessage = AIReadableError.message(error)
-            statusNote = errorMessage
+        do { handle = try startPrepared(plan, service: service) }
+        catch {
+            phase = .failed; errorMessage = AIReadableError.message(error); statusNote = errorMessage
             return
         }
         pollTask?.cancel()
@@ -275,28 +262,10 @@ public final class AIAssistantModel: ObservableObject {
     /// this is the only place the merge request is sent, and only after the reader presses it.
     public func sendMerge() {
         guard let mergePlan, let service, phase == .mergePreview else { return }
-        let key: String
-        do {
-            guard let stored = try settings.readKey() else {
-                phase = .failed
-                errorMessage = Self.noKeyMessage
-                statusNote = Self.noKeyMessage
-                return
-            }
-            key = stored
-        } catch {
-            phase = .failed
-            errorMessage = AIReadableError.message(error)
-            statusNote = errorMessage
-            return
-        }
         let handle: any AIChatHandle
-        do {
-            handle = try service.start(mergePlan, apiKey: key)
-        } catch {
-            phase = .failed
-            errorMessage = AIReadableError.message(error)
-            statusNote = errorMessage
+        do { handle = try startPrepared(mergePlan, service: service) }
+        catch {
+            phase = .failed; errorMessage = AIReadableError.message(error); statusNote = errorMessage
             return
         }
         pollTask?.cancel()
@@ -315,6 +284,20 @@ public final class AIAssistantModel: ObservableObject {
         mergePlan = nil
         phase = .finished
         statusNote = "Part summaries kept. No consolidation was sent."
+    }
+
+    private func startPrepared(_ plan: AiPlanRecord, service: any AIChatServicing) throws -> any AIChatHandle {
+        guard settings.connectionMode == preparedConnection else {
+            throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+        }
+        if preparedConnection == .chatGPT {
+            guard let id = preparedAccountID, settings.chatGPT.selectedID == id, settings.chatGPT.isConnected else {
+                throw AISettingsError.invalid("The ChatGPT account changed or signed out. Prepare a new request.")
+            }
+            return ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
+        }
+        guard let key = try settings.readKey() else { throw AISettingsError.invalid(Self.noKeyMessage) }
+        return try service.start(plan, apiKey: key)
     }
 
     // MARK: - Polling
@@ -481,7 +464,7 @@ public final class AIAssistantModel: ObservableObject {
                     parts: parts
                 )
             )
-            self.mergePlan = mergePlan
+            self.mergePlan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(mergePlan) : mergePlan
             phase = .mergePreview
             statusNote = "Part summaries complete. Review the consolidation request below; sending it is a separate request."
         } catch {

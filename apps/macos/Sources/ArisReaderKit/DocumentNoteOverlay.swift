@@ -27,11 +27,11 @@ struct DocumentNoteOverlay: View {
                     NotePaperText(text: note.contents ?? "")
                         .padding(8)
                 }
-                .foregroundStyle(Color.black.opacity(0.85))
+                .foregroundStyle(LyraTheme.noteFg)
                 .frame(width: frame.width, height: frame.height)
-                .background(Color(red: 1, green: 0.96, blue: 0.70))
+                .background(LyraTheme.noteBg)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.black.opacity(0.15)))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(LyraTheme.border))
                 .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
                 .position(x: frame.midX, y: frame.midY)
                 .id(note.id)
@@ -69,7 +69,7 @@ struct NotePaperText: NSViewRepresentable {
         body.isSelectable = true
         body.drawsBackground = false
         body.font = .systemFont(ofSize: 13)
-        body.textColor = .black.withAlphaComponent(0.85)
+        body.textColor = LyraTheme.noteTextColor
         body.textContainerInset = CGSize(width: 4, height: 6)
         body.isVerticallyResizable = true
         body.isHorizontallyResizable = false

@@ -126,7 +126,7 @@ struct ScrollIndicator: View {
                     .gesture(laneGesture(geometry: geometry))
 
                 Capsule()
-                    .fill(Color.primary.opacity(active ? 0.32 : 0.22))
+                    .fill(active ? LyraTheme.scrollThumbHover : LyraTheme.scrollThumb)
                     .frame(width: width, height: geometry.thumbHeight)
                     .padding(.trailing, trailingInset)
                     // Visual only: the gesture above owns the hit area, so the thumb's position

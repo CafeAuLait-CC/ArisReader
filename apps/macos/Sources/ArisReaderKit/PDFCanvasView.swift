@@ -270,6 +270,11 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        markNeedsRender()
+    }
+
     public override func layout() {
         super.layout()
         resizeSurfaceIfNeeded()
@@ -779,16 +784,18 @@ public final class MetalCanvasView: NSView {
             traceLayer.traceSurface = surfaceId
             traceLayer.traceY = Double(scrollYPt)
         }
+        let clear = LyraTheme.canvasClear(appearance: effectiveAppearance)
         var stats = ArisFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
                 blends.withUnsafeBufferPointer { modes in
-                    aris_reader_surface_draw_pages(
+                    aris_reader_surface_draw_pages_on_background(
                         surfaceId,
                         ids.baseAddress,
                         rectangles.baseAddress,
                         modes.baseAddress,
                         textureIds.count,
+                        clear[0], clear[1], clear[2],
                         &stats
                     )
                 }

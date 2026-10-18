@@ -105,6 +105,8 @@ public final class ReaderSession: ObservableObject, Identifiable {
         if window !== self.window {
             removeWindowObservers()
             self.window = window
+            window.backgroundColor = LyraTheme.titlebarColor
+            window.titlebarAppearsTransparent = true
             let center = NotificationCenter.default
             windowObservers.append(center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main

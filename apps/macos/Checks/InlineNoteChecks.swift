@@ -71,10 +71,6 @@ extension ReaderChecks {
             window.contentView = host
             window.orderFrontRegardless()
             defer { window.orderOut(nil) }
-            guard let marker = state.inlineNoteMarkers.first(where: { $0.id == first.id }),
-                  let anchor = state.anchorViewRect(page: marker.page, region: marker.rect) else {
-                fatalError("FAIL: the label has a view-space anchor")
-            }
             func canvas(in view: NSView) -> MetalCanvasView? {
                 if let canvas = view as? MetalCanvasView { return canvas }
                 return view.subviews.lazy.compactMap { canvas(in: $0) }.first
@@ -86,6 +82,12 @@ extension ReaderChecks {
             state.closeDocumentNote()
             host.layoutSubtreeIfNeeded()
             guard let canvas = canvas(in: host) else { fatalError("FAIL: missing canvas") }
+            // The toolbar and sidebar determine the real canvas viewport. Compute the click
+            // anchor after hosting/layout, rather than using the provisional 1000pt viewport.
+            guard let marker = state.inlineNoteMarkers.first(where: { $0.id == first.id }),
+                  let anchor = state.anchorViewRect(page: marker.page, region: marker.rect) else {
+                fatalError("FAIL: the label has a view-space anchor")
+            }
             let location = CGPoint(x: anchor.midX, y: canvas.bounds.height - anchor.midY)
             let hit = host.hitTest(host.convert(location, from: canvas))
             require(hit === canvas, "the label remains clickable through SwiftUI hit testing")

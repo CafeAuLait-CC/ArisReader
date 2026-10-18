@@ -30,27 +30,23 @@ public struct ReaderWindow: View {
     }
 
     public var body: some View {
-        HStack(spacing: 0) {
-            if state.sidebarVisible {
-                // The sidebar is also a drop target: files dropped there open in a new window,
-                // not in a tab of this one, so it needs the window coordinator.
-                SidebarView(state: state, opener: opener)
-                    .frame(width: 240)
-                    .background(Color(nsColor: .windowBackgroundColor))
-                Divider()
-            }
-            VStack(spacing: 0) {
-                if !state.tabs.isEmpty { TabStrip(state: state) }
+        VStack(spacing: 0) {
+            TabStrip(state: state)
+            ReaderToolbar(state: state)
+            HStack(spacing: 0) {
+                if state.sidebarVisible {
+                    SidebarView(state: state, opener: opener)
+                        .frame(width: 250)
+                    Rectangle().fill(LyraTheme.separator).frame(width: 1)
+                }
                 canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(minWidth: 900, minHeight: 600)
-        .onAppear {
-            // Flush hooks for the shell: normal quit and SIGTERM/SIGINT (see AppState). Installed
-            // here rather than in `AppState.init` so the check harness never takes over signals.
-            state.installTerminationHandling()
-        }
-        .toolbar { toolbarContent }
+        .background(LyraTheme.windowBg)
+        .foregroundStyle(LyraTheme.textPrimary)
+        .tint(LyraTheme.accent)
+        .onAppear { state.installTerminationHandling() }
         .alert("Lyra", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
@@ -136,6 +132,7 @@ public struct ReaderWindow: View {
             HStack { Spacer(); ScrollIndicator(state: state) }
 
             if state.document == nil {
+                LyraTheme.emptyBg
                 emptyState
             }
 
@@ -167,7 +164,7 @@ public struct ReaderWindow: View {
     private var pageEditBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "square.stack.3d.up")
-                .foregroundStyle(.orange)
+                .foregroundStyle(LyraTheme.warningFg)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Page changes pending")
                     .font(.callout.weight(.semibold))
@@ -195,10 +192,10 @@ public struct ReaderWindow: View {
         .controlSize(.small)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.orange.opacity(0.5), lineWidth: 1)
+                .stroke(LyraTheme.warningFg.opacity(0.5), lineWidth: 1)
         )
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
@@ -233,159 +230,8 @@ public struct ReaderWindow: View {
             .monospacedDigit()
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(.regularMaterial, in: Capsule())
+            .background(LyraTheme.raisedBg, in: Capsule())
             .opacity(state.document == nil ? 0 : 1)
-    }
-
-    // MARK: - Toolbar
-
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
-            Button {
-                state.showFileImporter = true
-            } label: {
-                Image(systemName: "folder")
-            }
-            .help("Open document (⌘O)")
-
-            Button {
-                state.previousPage()
-            } label: {
-                Image(systemName: "chevron.left")
-            }
-            .disabled(state.document == nil)
-            .help("Previous page (⌘←)")
-
-            Button {
-                state.nextPage()
-            } label: {
-                Image(systemName: "chevron.right")
-            }
-            .disabled(state.document == nil)
-            .help("Next page (⌘→)")
-        }
-
-        ToolbarItem(placement: .principal) {
-            VStack(spacing: 0) {
-                Text(state.windowTitle)
-                    .font(.headline)
-                Text(state.gpuStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-
-        ToolbarItemGroup(placement: .primaryAction) {
-            HStack(spacing: 4) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search", text: Binding(
-                    get: { state.searchQuery },
-                    set: { state.searchQuery = $0 }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 150)
-                .onSubmit { state.runSearch() }
-
-                if !state.searchHits.isEmpty {
-                    Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                }
-                Button {
-                    state.findPrevious()
-                } label: {
-                    Image(systemName: "chevron.up")
-                }
-                .disabled(state.searchHits.isEmpty)
-                .help("Previous match (⇧⌘G)")
-
-                Button {
-                    state.findNext()
-                } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .disabled(state.searchHits.isEmpty)
-                .help("Next match (⌘G)")
-            }
-
-            Button {
-                state.addAnnotationFromSelection(kind: .highlight)
-            } label: {
-                Image(systemName: "highlighter")
-            }
-            .disabled(state.selection == nil)
-            .help("Highlight the selection")
-
-            Button {
-                state.addAnnotationFromSelection(kind: .underline)
-            } label: {
-                Image(systemName: "underline")
-            }
-            .disabled(state.selection == nil)
-            .help("Underline the selection")
-
-            Button {
-                state.addBookmarkAtCurrentPage()
-            } label: {
-                Image(systemName: "bookmark.badge.plus")
-            }
-            .disabled(state.document == nil)
-            .help("Add bookmark (⌘D)")
-
-            Button {
-                state.toggleFacingPages()
-            } label: {
-                Image(systemName: state.layoutMode == .facing
-                    ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
-            }
-            .disabled(state.document == nil)
-            .help(state.layoutMode == .facing ? "Continuous pages (⌘1)" : "Facing pages (⌘3)")
-
-            Button {
-                state.undo()
-            } label: {
-                Image(systemName: "arrow.uturn.backward")
-            }
-            .disabled(!state.canUndo)
-            .help("Undo (⌘Z)")
-
-            Button {
-                state.zoomOut()
-            } label: {
-                Image(systemName: "minus.magnifyingglass")
-            }
-            .help("Zoom out (⌘−)")
-
-            Text("\(state.zoomPercent)%")
-                .font(.caption)
-                .monospacedDigit()
-                .frame(width: 44)
-
-            Button {
-                state.zoomIn()
-            } label: {
-                Image(systemName: "plus.magnifyingglass")
-            }
-            .help("Zoom in (⌘+)")
-
-            Button {
-                state.closeReferencePreview()
-            } label: {
-                Image(systemName: "rectangle.on.rectangle")
-            }
-            .disabled(state.referencePreview == nil)
-            .help("Close reference preview")
-
-            Button {
-                state.sidebarVisible.toggle()
-            } label: {
-                Image(systemName: "sidebar.left")
-            }
-            .help("Show/hide sidebar (⌘⌥S)")
-        }
     }
 
     /// Asks for the text of a note attached to the current selection.
@@ -413,135 +259,6 @@ public struct ReaderWindow: View {
     }
 }
 
-/// Settings window (`⌘,`). During the skeleton phase it exposes one performance setting —
-/// the tile-cache byte budget, which `AppState` adopts live (ADR 0007). The tile size is *not*
-/// a setting: it is fixed at 512 px because changing it moves the LOD math and the cache
-/// semantics with it, and no measurement supports that trade. The rest of the configuration is
-/// held by the Rust side (`docs/02-architecture.md` §9).
-///
-/// It reads the `ReaderWindowRegistry` rather than one `AppState`: there is no longer a single
-/// state to show, and the budget it changes is one process-wide setting that *every* window has to
-/// adopt — a reader who raises it while two windows are open means both of them.
-public struct SettingsView: View {
-    @ObservedObject private var registry: ReaderWindowRegistry
-    @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
-    @AppStorage(ReadingLayoutPreferences.layoutKey) private var layoutRaw = ReaderLayoutMode.continuous.rawValue
-    @AppStorage(ReadingLayoutPreferences.gapKey) private var pageGapPt = Double(ReadingLayoutPreferences.defaultGapPt)
-
-    public init(registry: ReaderWindowRegistry) {
-        self.registry = registry
-    }
-
-    public var body: some View {
-        TabView {
-            Form {
-                Text("Engine: \(registry.settingsState.engine.version)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Stepper("Page cache budget: \(cacheBudgetMB) MB",
-                        value: $cacheBudgetMB, in: 16...1024, step: 16)
-                    .onChange(of: cacheBudgetMB) { _, _ in registry.applyCacheBudgetSetting() }
-                Text("Keeps nearby pages ready for scrolling. A larger budget retains more clear pages. "
-                     + "Content currently on screen is preserved even if it exceeds this budget.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(20)
-            .tabItem { Label("Performance", systemImage: "speedometer") }
-
-            Form {
-                Picker("Page layout", selection: layoutBinding) {
-                    ForEach(ReaderLayoutMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                HStack {
-                    Text("Page gap")
-                    Slider(value: $pageGapPt, in: pageGapRange, step: 1)
-                        .onChange(of: pageGapPt) { _, _ in registry.applyReadingLayoutSetting() }
-                    Text("\(Int(pageGapPt.rounded())) pt")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .frame(width: 48, alignment: .trailing)
-                }
-
-                Text("Facing pages show page 1 alone, then pages 2–3 side by side. "
-                     + "Both settings are remembered for the reader and apply to every window immediately.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(20)
-            .tabItem { Label("Reading", systemImage: "book") }
-
-            AISettingsView(store: AISettingsStore.shared)
-                .tabItem { Label("AI", systemImage: "sparkles") }
-        }
-        .frame(width: 520, height: 480)
-    }
-
-    private var layoutBinding: Binding<ReaderLayoutMode> {
-        Binding(
-            get: { ReaderLayoutMode(rawValue: layoutRaw) ?? .continuous },
-            set: { mode in
-                layoutRaw = mode.rawValue
-                registry.applyReadingLayoutSetting()
-            }
-        )
-    }
-
-    private var pageGapRange: ClosedRange<Double> {
-        Double(ReadingLayoutPreferences.gapRange.lowerBound)...Double(ReadingLayoutPreferences.gapRange.upperBound)
-    }
-}
-
-
-/// Tab strip: one chip per open document (`docs/04-ui-ux.md` §2.3).
-///
-/// The engine holds a single document today, so switching tabs reopens the file and
-/// reapplies that tab's scroll offset; per-tab offsets live in `AppState.OpenTab`.
-struct TabStrip: View {
-    @ObservedObject var state: AppState
-
-    var body: some View {
-        HStack(spacing: 6) {
-            ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
-                HStack(spacing: 6) {
-                    Text(tab.title)
-                        .font(.caption)
-                        .lineLimit(1)
-                    Button {
-                        state.closeTab(index)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 8, weight: .bold))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Close tab")
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(
-                            index == state.activeTabIndex
-                                ? Color.accentColor.opacity(0.22)
-                                : Color.primary.opacity(0.06)
-                        )
-                )
-                .contentShape(Rectangle())
-                .onTapGesture { state.selectTab(index) }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
 /// Feedback for a file being dragged over the canvas (T2.12): a tinted border around the drop
 /// area plus one line saying what letting go would do — including *not* opening the file, which
 /// is why a refusal is drawn in the warning colour rather than simply swallowed.
@@ -553,7 +270,7 @@ struct FileDropOverlay: View {
     let hint: FileDropPreview
 
     private var tint: Color {
-        hint.kind == .acceptable ? .accentColor : .orange
+        hint.kind == .acceptable ? LyraTheme.accent : LyraTheme.warningFg
     }
 
     var body: some View {
@@ -572,7 +289,7 @@ struct FileDropOverlay: View {
                     .multilineTextAlignment(.center)
             }
             .padding(16)
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.92),
+            .background(LyraTheme.raisedBg,
                         in: RoundedRectangle(cornerRadius: 12))
             .overlay(
                 RoundedRectangle(cornerRadius: 12).strokeBorder(tint.opacity(0.5))
