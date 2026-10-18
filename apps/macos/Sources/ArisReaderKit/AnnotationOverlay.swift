@@ -26,6 +26,9 @@ final class AnnotationOverlayView: NSView {
     private let container = CALayer()
     private let marksLayer = CALayer()
     private let selectionLayer = CAShapeLayer()
+    /// The same halo language as `selectionLayer`, drawn for the ink stroke an armed eraser is
+    /// over. A separate layer so a selected mark and the eraser's target can both be visible.
+    private let eraserTargetLayer = CAShapeLayer()
     private let liveLayer = CAShapeLayer()
     private var markLayers: [CALayer] = []
 
@@ -55,6 +58,7 @@ final class AnnotationOverlayView: NSView {
         layer?.addSublayer(container)
         container.addSublayer(marksLayer)
         container.addSublayer(selectionLayer)
+        container.addSublayer(eraserTargetLayer)
         container.addSublayer(liveLayer)
         container.anchorPoint = CGPoint(x: 0, y: 0)
         container.position = .zero
@@ -62,6 +66,9 @@ final class AnnotationOverlayView: NSView {
         selectionLayer.fillColor = nil
         selectionLayer.lineDashPattern = [NSNumber(value: 4), NSNumber(value: 3)]
         selectionLayer.lineCap = .butt
+        eraserTargetLayer.fillColor = nil
+        eraserTargetLayer.lineDashPattern = [NSNumber(value: 4), NSNumber(value: 3)]
+        eraserTargetLayer.lineCap = .butt
         liveLayer.fillColor = nil
         liveLayer.lineJoin = .round
         liveLayer.lineCap = .round
@@ -233,17 +240,14 @@ final class AnnotationOverlayView: NSView {
         for layer in markLayers { layer.removeFromSuperlayer() }
         markLayers = []
         selectionLayer.path = nil
+        eraserTargetLayer.path = nil
         for mark in marks {
             guard let frame = frames[mark.page] else { continue }
             let layers = layers(for: mark, frame: frame)
             for layer in layers { marksLayer.addSublayer(layer) }
             markLayers.append(contentsOf: layers)
             if mark.isSelected {
-                let bounds = contentBounds(of: mark, frame: frame)
-                    .insetBy(dx: -6, dy: -6)
-                let path = CGMutablePath()
-                path.addRoundedRect(in: bounds, cornerWidth: 4, cornerHeight: 4)
-                selectionLayer.path = path
+                selectionLayer.path = haloPath(for: mark, frame: frame)
                 selectionLayer.strokeColor = themeColor.withAlphaComponent(0.85).cgColor
                 selectionLayer.lineWidth = 1 / max(zoom, 0.01)
                 selectionLayer.lineDashPattern = [
@@ -253,6 +257,17 @@ final class AnnotationOverlayView: NSView {
                 if mark.kind == .textBox {
                     appendResizeHandles(for: mark, frame: frame)
                 }
+            }
+            if mark.isEraseTarget {
+                // Exactly the select tool's halo: the eraser is showing what a press will
+                // remove, not inventing a second visual language for "about to change".
+                eraserTargetLayer.path = haloPath(for: mark, frame: frame)
+                eraserTargetLayer.strokeColor = themeColor.withAlphaComponent(0.85).cgColor
+                eraserTargetLayer.lineWidth = 1 / max(zoom, 0.01)
+                eraserTargetLayer.lineDashPattern = [
+                    NSNumber(value: 4 / max(zoom, 0.01)),
+                    NSNumber(value: 3 / max(zoom, 0.01)),
+                ]
             }
         }
     }
@@ -337,6 +352,13 @@ final class AnnotationOverlayView: NSView {
 
     private func contentBounds(of mark: CanvasAnnotationMark, frame: PagePlacement) -> CGRect {
         (mark.bounds ?? .zero).offsetBy(dx: frame.leftPt, dy: frame.topPt)
+    }
+
+    private func haloPath(for mark: CanvasAnnotationMark, frame: PagePlacement) -> CGPath {
+        let bounds = contentBounds(of: mark, frame: frame).insetBy(dx: -6, dy: -6)
+        let path = CGMutablePath()
+        path.addRoundedRect(in: bounds, cornerWidth: 4, cornerHeight: 4)
+        return path
     }
 
     private func updateTransform() {

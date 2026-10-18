@@ -196,7 +196,7 @@ struct ReaderToolbar: View {
             ]) { menuLabel("doc.on.doc") }
             LyraMenu(title: "Export and save", items: [
                 LyraMenuItem("Save Annotated Copy…", icon: "square.and.arrow.up", shortcut: "⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentSaveAnnotatedCopyPanel() },
-                LyraMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentReplaceOriginalConfirmation() },
+                LyraMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S", enabled: state.canReplaceOriginalWithAnnotations) { state.presentReplaceOriginalConfirmation() },
                 .separator("export"),
                 LyraMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canApplyPageEdits) { state.presentSavePageEditsCopyPanel() },
                 .separator("forms"),
@@ -387,7 +387,11 @@ struct ReaderSecondaryToolbar: View {
             ]) {
                 Image(systemName: "square.on.circle")
             }.disabled(state.document == nil)
-            pending("Eraser", "eraser")
+            tool("Eraser", "eraser",
+                 selected: state.annotationTool == .eraser,
+                 help: "Eraser: drag over ink to remove whole strokes (Esc leaves the eraser)") {
+                state.toggleEraserTool()
+            }.disabled(!state.canUseEraserTool)
             tool("Place a sticky note", "text.bubble",
                  selected: state.annotationTool == .note) {
                 state.annotationTool = state.annotationTool == .note ? .select : .note

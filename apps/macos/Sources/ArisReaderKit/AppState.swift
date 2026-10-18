@@ -1291,7 +1291,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         didSet { rebuildAnnotationPassages() }
     }
     /// The one active canvas tool. A text-markup case makes finished text selections mark
-    /// themselves; the pen and shape cases draw on a drag. The two cannot both be active.
+    /// themselves; the pen and shape cases draw on a drag. The eraser removes ink on a drag. The
+    /// modes cannot both be active.
     @Published public var annotationTool: AnnotationTool = .select {
         didSet {
             // The form tool and the drawing tools are modes of the same canvas; choosing a
@@ -1301,8 +1302,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 formFocusedFieldID = nil
                 formOpenChoiceFieldID = nil
             }
+            if annotationTool != oldValue {
+                // The hover halo and any draft gesture belong to the tool that was armed. A tool
+                // switch from the toolbar mid-drag cannot leave a half-erased gesture behind.
+                if annotationTool != .eraser {
+                    eraserHoverMarkID = nil
+                    cancelEraserGesture()
+                }
+            }
         }
     }
+    /// The ink stroke under an armed eraser, in `canvasAnnotationMarks` order. The overlay draws
+    /// the select tool's halo around it before a press removes it, so the reader sees exactly
+    /// which stroke is about to go.
+    @Published public private(set) var eraserHoverMarkID: String?
+    /// Ink strokes the eraser has removed since their absence was last written to a PDF. While
+    /// this is non-empty the interface says that the PDF on disk is still unchanged.
+    @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = []
+    /// Why the eraser refused its last gesture. A PDF's own ink cannot be removed by this
+    /// version's append-only writer, so the refusal is stated rather than silently ignored.
+    @Published public private(set) var eraserRefusalNotice: String?
     /// The colour a newly created mark is stored in.
     ///
     /// The highlight palette's presets are translucent because a highlight sits over text. Pen
@@ -1328,6 +1347,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var editingOriginalAnnotation: Annotation?
     private var editingTextBoxWidth: CGFloat = 320
     private var editingUndoDepth = 0
+    /// The annotations as they were when the current eraser drag began, and the ones it has
+    /// removed so far (keyed by their index in that base array, so undo can restore their order).
+    /// Both are `nil`/empty when no gesture is in flight.
+    private var eraserGestureBase: [Annotation]?
+    private var eraserGestureRemoved: [Int: Annotation] = [:]
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
     /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
@@ -1589,6 +1613,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var outlineLoadCompleted: Bool
         var thumbnails: [Int: PageImage]
         var annotations: [Annotation]
+        /// Ink erasures still pending a PDF write, so their banner survives a tab switch.
+        var erasedInkStrokeIDs: Set<UUID>
         var bookmarks: [Bookmark]
         var preservedAnnotationEntryCount: Int
         var annotationWriteCount: Int
@@ -2328,6 +2354,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationTool = .select
         annotations = []
         bookmarks = []
+        erasedInkStrokeIDs = []
+        eraserHoverMarkID = nil
+        eraserRefusalNotice = nil
+        eraserGestureBase = nil
+        eraserGestureRemoved = [:]
         pageSelection = []
         pageSelectionAnchor = nil
         annotationsURL = nil
@@ -2806,6 +2837,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The Select button leaves whatever mode is active, including a sticky markup tool.
     public func selectTool() {
         annotationTool = .select
+    }
+
+    /// Whether the toolbar's eraser button has something to act on.
+    ///
+    /// The button used to be a disabled `pending("Eraser")` placeholder. It is enabled exactly
+    /// when a document is open, and arming it is the only way to enter the mode.
+    public var canUseEraserTool: Bool { document != nil }
+
+    /// The toolbar's eraser button: arms the mode, or leaves it when it is already active.
+    public func toggleEraserTool() {
+        guard canUseEraserTool else { return }
+        annotationTool = annotationTool == .eraser ? .select : .eraser
+        eraserRefusalNotice = nil
+    }
+
+    /// Escape and the Select button leave every mode that has no finished draft to keep.
+    ///
+    /// Returns whether a mode was actually left, so the canvas consumes Escape only when it did
+    /// something. Text markup and the eraser are left; the pen and shape tools keep their
+    /// existing behaviour (only the live draft is cancelled).
+    @discardableResult
+    public func cancelActiveAnnotationTool() -> Bool {
+        if cancelTextMarkupTool() { return true }
+        guard annotationTool == .eraser else { return false }
+        cancelEraserGesture()
+        annotationTool = .select
+        return true
     }
 
     /// Escape and the Select button leave the sticky markup mode.
@@ -3477,6 +3535,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 strokeWidth: annotation.strokeWidth,
                 isSelected: annotation.id == selectedAnnotationID
                     && !(editingAnnotationID == annotation.id && annotation.kind == .textBox),
+                isEraseTarget: annotation.id.uuidString == eraserHoverMarkID,
                 isEditable: true
             )
         }
@@ -3548,6 +3607,270 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let id = hitTestGeometryAnnotation(page: hit.page, point: hit.point,
                                                 tolerance: tolerance) else { return nil }
         return (id, hit.page, hit.point)
+    }
+
+    // MARK: - Eraser
+
+    // The eraser removes **whole ink strokes**: the annotation is removed as a unit, never split
+    // into two shorter strokes. Partial erase (splitting a stroke and re-joining it on undo) is a
+    // separately scoped later task and is deliberately not attempted here.
+
+    /// What an armed eraser is over, and therefore what a press would do.
+    ///
+    /// Sidecar strokes are erasable. A stroke the PDF itself carries is reported separately so
+    /// the reader gets an explanation instead of a silent no-op: this version's writer appends
+    /// annotations, and removing one the file already carries would need a different write path.
+    public enum EraserTarget: Equatable, Sendable {
+        case sidecar(id: UUID, page: Int)
+        case document(id: String, page: Int)
+
+        public var page: Int {
+            switch self {
+            case .sidecar(_, let page), .document(_, let page): return page
+            }
+        }
+
+        /// True when the target is in Lyra's annotation list and can be removed.
+        public var isEditable: Bool {
+            if case .sidecar = self { return true }
+            return false
+        }
+    }
+
+    /// The ink stroke an armed eraser would remove at a content point, or the file-owned stroke
+    /// it must refuse.
+    ///
+    /// Only `.ink` is considered: highlights, underlines, strikeouts, notes, text boxes and the
+    /// four shapes are annotations, not ink, and the eraser deliberately leaves them alone (they
+    /// are still removed with Select + Delete). Sidecar ink is tested before the PDF's own ink so
+    /// a stroke the reader drew on top of a file annotation stays erasable; the hover halo shows
+    /// which one the eraser picked.
+    public func eraserTarget(atContentPoint point: CGPoint) -> EraserTarget? {
+        guard annotationTool == .eraser, let hit = pagePoint(atContentPoint: point) else {
+            return nil
+        }
+        let tolerance = AnnotationGeometry.eraserToleranceViewPt / max(zoomFactor, 0.01)
+        for annotation in annotations.reversed()
+            where annotation.kind == .ink && annotation.page == hit.page {
+            let mark = CanvasAnnotationMark(
+                id: annotation.id.uuidString, page: hit.page, kind: .ink,
+                inkPaths: annotation.inkPaths, color: annotation.color,
+                strokeWidth: annotation.strokeWidth, isSelected: false, isEditable: true)
+            if AnnotationGeometry.hitTest(mark, at: hit.point, tolerance: tolerance) {
+                return .sidecar(id: annotation.id, page: hit.page)
+            }
+        }
+        for annotation in documentAnnotations.reversed()
+            where annotation.visible && annotation.kind == "ink" && annotation.page == hit.page {
+            if AnnotationGeometry.hitTest(documentInkMark(annotation), at: hit.point,
+                                          tolerance: tolerance) {
+                return .document(id: annotation.id, page: hit.page)
+            }
+        }
+        return nil
+    }
+
+    /// Updates the pre-erase indication as the pointer moves.
+    ///
+    /// The overlay draws the same dashed halo the select tool uses around the returned stroke.
+    /// A file-owned stroke gets no halo because it cannot be erased; its refusal is stated when
+    /// the reader presses, so the press is never silently ignored.
+    public func updateEraserHover(atContentPoint point: CGPoint?) {
+        guard annotationTool == .eraser, let point, !eraserGestureActive,
+              let target = eraserTarget(atContentPoint: point) else {
+            if eraserHoverMarkID != nil { eraserHoverMarkID = nil }
+            return
+        }
+        let id: String? = switch target {
+        case .sidecar(let id, _): id.uuidString
+        case .document: nil
+        }
+        if eraserHoverMarkID != id { eraserHoverMarkID = id }
+    }
+
+    /// Starts one eraser gesture. A completed gesture is one undo step, however many strokes it
+    /// crosses.
+    public func beginEraserGesture(atContentPoint point: CGPoint) {
+        guard annotationTool == .eraser, document != nil else { return }
+        cancelEraserGesture()
+        eraserGestureBase = annotations
+        eraserGestureRemoved = [:]
+        eraserRefusalNotice = nil
+        eraseInk(alongContentSegment: point, to: point)
+    }
+
+    /// Continues the gesture along the pointer's path. `previous` and `point` are the two ends of
+    /// the segment the pointer travelled since the last event; the whole segment is tested, so a
+    /// fast drag cannot skip a stroke that lies between two samples.
+    public func extendEraserGesture(fromContentPoint previous: CGPoint,
+                                    toContentPoint point: CGPoint) {
+        guard eraserGestureActive else { return }
+        eraseInk(alongContentSegment: previous, to: point)
+    }
+
+    /// Ends the gesture and writes its result to the sidecar as one change.
+    ///
+    /// The sidecar is the reader's unsaved-work store, so the write happens once here rather than
+    /// per pointer event. The PDF is untouched; saving a copy afterwards writes the remaining
+    /// annotations only. Returns the number of strokes removed.
+    @discardableResult
+    public func endEraserGesture() -> Int {
+        guard let base = eraserGestureBase else { return 0 }
+        let removed = erasedGestureStrokes()
+        eraserGestureBase = nil
+        eraserGestureRemoved = [:]
+        guard !removed.isEmpty else { return 0 }
+
+        let removedIDs = Set(removed.map(\.annotation.id))
+        if let selected = selectedAnnotationID, removedIDs.contains(selected) {
+            selectedAnnotationID = nil
+        }
+        let candidate = base.filter { !removedIDs.contains($0.id) }
+        guard saveAnnotations(candidate, trigger: "erase-ink") else {
+            // The candidate never reached disk: put the page back exactly as it was, with no
+            // undo step that would claim an erasure the sidecar does not have.
+            annotations = base
+            refreshSelectionOverlay()
+            return 0
+        }
+        undoStack.append(.erased(removed))
+        redoStack.removeAll()
+        erasedInkStrokeIDs.formUnion(removedIDs)
+        reloadVisiblePages()
+        statusMessage = removed.count == 1
+            ? "Erased 1 ink stroke · the PDF on disk is unchanged"
+            : "Erased \(removed.count) ink strokes · the PDF on disk is unchanged"
+        return removed.count
+    }
+
+    /// Abandons a gesture in flight (Escape, or a tool switch): nothing was written yet, so the
+    /// page simply returns to its pre-gesture state.
+    public func cancelEraserGesture() {
+        guard let base = eraserGestureBase else { return }
+        eraserGestureBase = nil
+        eraserGestureRemoved = [:]
+        annotations = base
+        refreshSelectionOverlay()
+    }
+
+    /// True while an eraser drag owns the pointer.
+    public var eraserGestureActive: Bool { eraserGestureBase != nil }
+
+    /// The number of erased strokes whose absence has not reached a PDF yet.
+    public var hasPendingInkErasure: Bool { !erasedInkStrokeIDs.isEmpty }
+
+    /// The eraser banner's second line, in the same language as the page-edit and form banners.
+    public var eraserPendingSummary: String? {
+        guard !erasedInkStrokeIDs.isEmpty else { return nil }
+        let count = erasedInkStrokeIDs.count
+        let noun = count == 1 ? "1 ink stroke erased" : "\(count) ink strokes erased"
+        return "\(noun) · the PDF on disk is unchanged until you save a copy"
+    }
+
+    /// Why a file-owned stroke cannot be erased, stated once and reused by the banner and checks.
+    public static let eraserFileOwnedMessage =
+        "This ink belongs to the PDF file, not to Lyra's annotations. "
+        + "The eraser can only remove strokes from Lyra's annotation list; ink the file itself "
+        + "carries cannot be deleted without rewriting the PDF."
+
+    /// The refusal banner's Dismiss button (the refusal is a statement, not an unsaved change).
+    public func dismissEraserRefusal() {
+        eraserRefusalNotice = nil
+    }
+
+    /// The strokes the current gesture removed, in their pre-gesture array order.
+    private func erasedGestureStrokes() -> [ErasedInkStroke] {
+        eraserGestureRemoved.keys.sorted().compactMap { index in
+            guard let annotation = eraserGestureRemoved[index] else { return nil }
+            return ErasedInkStroke(annotation: annotation, index: index)
+        }
+    }
+
+    /// Tests one pointer segment against the ink that existed when the gesture began.
+    ///
+    /// Each page the segment touches is handled in that page's own space (the segment is clipped
+    /// to the page first). File-owned ink is checked separately and only ever sets the refusal
+    /// notice; it is never removed.
+    private func eraseInk(alongContentSegment start: CGPoint, to end: CGPoint) {
+        guard let base = eraserGestureBase else { return }
+        let zoom = max(zoomFactor, 0.01)
+        var removedAny = false
+        for placement in visiblePagePlacements {
+            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
+                              width: placement.widthPt, height: placement.heightPt)
+            guard let clipped = AnnotationGeometry.clippedSegment(from: start, to: end, in: rect)
+            else { continue }
+            let localStart = CGPoint(x: clipped.start.x - placement.leftPt,
+                                     y: clipped.start.y - placement.topPt)
+            let localEnd = CGPoint(x: clipped.end.x - placement.leftPt,
+                                   y: clipped.end.y - placement.topPt)
+            for (index, annotation) in base.enumerated() {
+                guard annotation.kind == .ink, annotation.page == placement.index,
+                      eraserGestureRemoved[index] == nil else { continue }
+                let reach = AnnotationGeometry.eraserReach(strokeWidth: annotation.strokeWidth,
+                                                          zoom: zoom)
+                let hit = annotation.inkPaths.contains { path in
+                    AnnotationGeometry.distance(fromSegment: localStart, to: localEnd,
+                                                andPolyline: path) <= reach
+                }
+                if hit {
+                    eraserGestureRemoved[index] = annotation
+                    removedAny = true
+                }
+            }
+        }
+        if removedAny {
+            let removedIDs = Set(eraserGestureRemoved.values.map(\.id))
+            annotations = base.filter { !removedIDs.contains($0.id) }
+        }
+        if fileOwnedInkIsNear(from: start, to: end) {
+            eraserRefusalNotice = Self.eraserFileOwnedMessage
+        }
+    }
+
+    /// Whether the pointer segment passes within eraser reach of an ink stroke the PDF carries.
+    private func fileOwnedInkIsNear(from start: CGPoint, to end: CGPoint) -> Bool {
+        guard !documentAnnotations.isEmpty else { return false }
+        let zoom = max(zoomFactor, 0.01)
+        for placement in visiblePagePlacements {
+            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
+                              width: placement.widthPt, height: placement.heightPt)
+            guard let clipped = AnnotationGeometry.clippedSegment(from: start, to: end, in: rect)
+            else { continue }
+            let localStart = CGPoint(x: clipped.start.x - placement.leftPt,
+                                     y: clipped.start.y - placement.topPt)
+            let localEnd = CGPoint(x: clipped.end.x - placement.leftPt,
+                                   y: clipped.end.y - placement.topPt)
+            for annotation in documentAnnotations
+                where annotation.visible && annotation.kind == "ink"
+                    && annotation.page == placement.index {
+                let mark = documentInkMark(annotation)
+                let reach = AnnotationGeometry.eraserReach(strokeWidth: mark.strokeWidth,
+                                                           zoom: zoom)
+                if mark.inkPaths.contains(where: {
+                    AnnotationGeometry.distance(fromSegment: localStart, to: localEnd,
+                                                andPolyline: $0) <= reach
+                }) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// A PDF-owned ink stroke as the canvas draws it, for hit testing and eraser refusal.
+    private func documentInkMark(_ annotation: DocumentAnnotation) -> CanvasAnnotationMark {
+        CanvasAnnotationMark(
+            id: "pdf:" + annotation.id,
+            page: annotation.page,
+            kind: .ink,
+            inkPaths: annotation.inkPaths,
+            color: annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80,
+                                                       alpha: 255),
+            strokeWidth: annotation.borderWidthPt ?? 1,
+            isSelected: false,
+            isEditable: false
+        )
     }
 
     public func selectAnnotation(_ id: UUID?) {
@@ -3743,6 +4066,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Undo / redo
 
+    /// One ink stroke removed by an eraser gesture, with the array position it had before the
+    /// gesture. Undo reinserts it there so the drawing order (and the sidecar's slot order) is
+    /// exactly what it was.
+    public struct ErasedInkStroke: Equatable, Sendable {
+        public let annotation: Annotation
+        public let index: Int
+
+        public init(annotation: Annotation, index: Int) {
+            self.annotation = annotation
+            self.index = index
+        }
+    }
+
     /// One reversible change. Note edits are represented as old/new values so an edit can
     /// be undone and redone together with annotation creation and deletion.
     public enum UndoableAction: Sendable {
@@ -3752,6 +4088,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// before and after, so undo/redo does not have to know which field the gesture touched.
         case replaced(before: Annotation, after: Annotation)
         case noteChanged(id: UUID, oldNote: String, newNote: String)
+        /// Everything one eraser drag removed. A drag is one gesture and therefore **one undo
+        /// step**, even when it crosses three strokes: one ⌘Z restores the whole sweep, because
+        /// the reader made one motion and undoing it stroke by stroke would be a surprise.
+        case erased([ErasedInkStroke])
     }
 
     @Published public private(set) var undoStack: [UndoableAction] = []
@@ -3768,6 +4108,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard saveAnnotations(updated, trigger: "undo") else { return }
         undoStack.removeLast()
         redoStack.append(action)
+        if case .erased(let strokes) = action {
+            erasedInkStrokeIDs.subtract(strokes.map(\.annotation.id))
+        }
         reloadVisiblePages()
         statusMessage = "Undo"
     }
@@ -3780,6 +4123,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard saveAnnotations(updated, trigger: "redo") else { return }
         redoStack.removeLast()
         undoStack.append(action)
+        if case .erased(let strokes) = action {
+            erasedInkStrokeIDs.formUnion(strokes.map(\.annotation.id))
+        }
         reloadVisiblePages()
         statusMessage = "Redo"
     }
@@ -3809,6 +4155,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .noteChanged(let id, let oldNote, let newNote):
             if let index = updated.firstIndex(where: { $0.id == id }) {
                 updated[index].note = undoing ? oldNote : newNote
+            }
+        case .erased(let strokes):
+            if undoing {
+                // The actions after this one have already been undone, so the array is the same
+                // arrangement minus these strokes; inserting at their original indices restores
+                // the drawing order exactly.
+                for stroke in strokes.sorted(by: { $0.index < $1.index })
+                    where !updated.contains(where: { $0.id == stroke.annotation.id }) {
+                    updated.insert(stroke.annotation, at: min(max(stroke.index, 0), updated.count))
+                }
+            } else {
+                let ids = Set(strokes.map(\.annotation.id))
+                updated.removeAll { ids.contains($0.id) }
             }
         }
         return updated
@@ -4619,9 +4978,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Whether the two PDF-writing commands can run.
     ///
     /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
-    /// command from the reader, and it is disabled when there is nothing to write.
+    /// command from the reader, and it is disabled when there is nothing to write. A pending
+    /// erasure counts even when it removed the last annotation: the copy must still be
+    /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
-        document != nil && !annotations.isEmpty && !annotationSaveInProgress
+        document != nil && (!annotations.isEmpty || hasPendingInkErasure)
+            && !annotationSaveInProgress
+    }
+
+    /// Replacing the original has something to write only when an annotation remains. A copy is
+    /// still offered after the eraser removed the last one (it is the source bytes), but
+    /// replacing a file with an identical copy would be a destructive no-op with a backup.
+    public var canReplaceOriginalWithAnnotations: Bool {
+        canSaveAnnotationsToPDF && !annotations.isEmpty
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -4652,7 +5021,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The clearly-labelled second choice: replace the original. The alert spells out the backup;
     /// the engine refuses the replacement if that backup cannot be written and verified.
     public func presentReplaceOriginalConfirmation() {
-        guard let url = document?.url else { return }
+        guard canReplaceOriginalWithAnnotations, let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Replace “\(url.lastPathComponent)” with the annotated version?"
@@ -4671,7 +5040,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The original document is not touched, and its sidecar is not changed: the copy carries
     /// the annotations itself, so a fresh Lyra opening that copy sees them from the PDF and no
-    /// sidecar duplicates them. Returns `false` when nothing was written.
+    /// sidecar duplicates them. When an eraser gesture removed the last annotation there is
+    /// nothing to append, and the copy is the source file byte for byte. Returns `false` when
+    /// nothing was written.
     @discardableResult
     public func saveAnnotatedCopy(to destination: URL) async -> Bool {
         guard !annotationSaveInProgress else { return false }
@@ -4679,7 +5050,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before saving annotations"
             return false
         }
-        guard !annotations.isEmpty else {
+        guard !annotations.isEmpty || hasPendingInkErasure else {
             statusMessage = "There are no annotations to save"
             return false
         }
@@ -4708,12 +5079,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let requests = try await pendingAnnotationWrites()
+            if requests.isEmpty {
+                // The eraser removed the last annotation: there is nothing to append, and the
+                // engine deliberately refuses an empty annotation list. The honest copy is the
+                // source bytes. It still matters: the pending banner offers "Save Copy…" and
+                // that action must work precisely in this case.
+                let source = try Data(contentsOf: documentURL, options: .mappedIfSafe)
+                try source.write(to: destination, options: .atomic)
+                lastAnnotationWriteReport = AnnotationWriteReport(
+                    destinationPath: destination.path,
+                    writtenIDs: [],
+                    appendedBytes: 0,
+                    backupPath: nil,
+                    preexistingAnnotationCount: documentAnnotations.count,
+                    cleanedTemporaryFiles: 0,
+                    sourceBytesPreserved: true
+                )
+                erasedInkStrokeIDs.removeAll()
+                statusMessage =
+                    "Saved a copy without annotations to \(destination.lastPathComponent)"
+                    + " · the original is unchanged"
+                FileHandle.standardError.write(Data((
+                    "aris-annotate: saved a byte copy without annotations to \(destination.path)\n"
+                ).utf8))
+                return true
+            }
             let report = try await engine.saveAnnotatedCopy(
                 to: destination,
                 annotations: requests,
                 zoom: zoomFactor
             )
             lastAnnotationWriteReport = report
+            // The erasure now exists in a PDF (the copy), so the pending-erasure banner has
+            // nothing left to warn about. The open document and its sidecar are unchanged.
+            erasedInkStrokeIDs.removeAll()
             let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
             statusMessage =
                 "Saved \(report.writtenIDs.count) annotation(s) to \(destination.lastPathComponent)"
@@ -4789,6 +5188,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             reloadVisiblePages()
 
             lastAnnotationWriteReport = report
+            // The current annotations (and therefore the erasures) are in the PDF itself now.
+            erasedInkStrokeIDs.removeAll()
             if !cleanedSidecar {
                 lastError =
                     "The annotations are saved in the PDF, but the sidecar could not be updated. "
@@ -5144,6 +5545,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationSidecarSlots = []
         annotationWriteCount = 0
         hasPendingAnnotationWrite = false
+        erasedInkStrokeIDs = []
+        eraserHoverMarkID = nil
+        eraserRefusalNotice = nil
 
         do {
             _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
@@ -7612,6 +8016,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             outlineLoadCompleted: outlineLoadCompleted,
             thumbnails: thumbnails,
             annotations: annotations,
+            erasedInkStrokeIDs: erasedInkStrokeIDs,
             bookmarks: bookmarks,
             preservedAnnotationEntryCount: preservedAnnotationEntryCount,
             annotationWriteCount: annotationWriteCount,
@@ -7717,6 +8122,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         outlineLoadCompleted = state.outlineLoadCompleted
         thumbnails = state.thumbnails
         annotations = state.annotations
+        erasedInkStrokeIDs = state.erasedInkStrokeIDs
+        eraserHoverMarkID = nil
+        eraserRefusalNotice = nil
+        eraserGestureBase = nil
+        eraserGestureRemoved = [:]
         bookmarks = state.bookmarks
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount

@@ -185,7 +185,7 @@ extension ReaderChecks {
         state.toggleTextMarkupTool(.underline)
         require(state.annotationTool == .underline, "another tool can be armed after a mark")
         let canvas = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
-        canvas.onCancelTextMarkup = { state.cancelTextMarkupTool() }
+        canvas.onCancelTool = { state.cancelActiveAnnotationTool() }
         guard let escape = NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: 0, context: nil, characters: "\u{1b}",

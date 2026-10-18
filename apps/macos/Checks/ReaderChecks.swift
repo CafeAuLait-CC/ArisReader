@@ -162,6 +162,15 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // The eraser on its own (`ArisReaderChecks --check-eraser .`).
+        if CommandLine.arguments.contains("--check-eraser") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await eraserChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+            return
+        }
         // Ink and shapes on their own (`ArisReaderChecks --check-ink-annotations .`).
         if CommandLine.arguments.contains("--check-ink-annotations") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -439,6 +448,9 @@ struct ReaderChecks {
         try await inkAnnotationChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
+            strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+        try await eraserChecks(
+            drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
         try await placedTextChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),

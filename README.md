@@ -24,7 +24,10 @@ original after a verified backup, appends real PDF annotations with quads or str
 colour, opacity, author and date through an incremental save that leaves every pre-existing
 annotation byte-identical.
 Replacing the original also removes exactly the sidecar entries it saved, so nothing appears twice;
-a saved copy carries no sidecar and shows each annotation once, from the file. Pages can be rotated,
+a saved copy carries no sidecar and shows each annotation once, from the file. An eraser removes
+whole ink strokes only: a drag removes every stroke its path passes within reach of, the stroke a
+press would remove is haloed first, one gesture is one undo step, and a saved copy simply omits the
+erased strokes. Pages can be rotated,
 deleted, reordered, inserted and extracted through a staged session whose undo covers the whole
 session; the file on disk stays untouched until the reader applies the changes, and applying writes
 a verified backup before replacing anything. An optional AI assistant speaks the OpenAI-compatible
