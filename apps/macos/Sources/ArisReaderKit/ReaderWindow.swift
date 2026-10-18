@@ -170,7 +170,7 @@ public struct ReaderWindow: View {
                 },
                 // Escape leaves the sticky markup mode. It is consumed only when a mode was
                 // active; the canvas keeps its existing Escape handling for a live draft.
-                onCancelTextMarkup: { state.cancelTextMarkupTool() },
+                onCancelTextMarkup: { state.cancelTextMarkupTool() || state.cancelFormTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
@@ -237,9 +237,10 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.pageEditSessionActive {
-                VStack {
-                    pageEditBanner
+            if state.pageEditSessionActive || state.formHasPendingChanges {
+                VStack(spacing: 8) {
+                    if state.pageEditSessionActive { pageEditBanner }
+                    if state.formHasPendingChanges { formBanner }
                     Spacer()
                 }
                 .padding(.top, 12)
@@ -251,6 +252,7 @@ public struct ReaderWindow: View {
                     .padding(.bottom, 16)
             }
 
+            FormOverlay(state: state)
             DocumentNoteOverlay(state: state)
             PlacedTextEditorOverlay(state: state)
 
@@ -357,6 +359,45 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Page changes pending. The file on disk is unchanged.")
+    }
+
+    /// The form session's version of the page-edit banner: the same raised panel, the same
+    /// warning icon and the same sentence about the file on disk. It says exactly which fields
+    /// changed and never calls the file saved.
+    private var formBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "signature")
+                .foregroundStyle(LyraTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Form changes pending")
+                    .font(.callout.weight(.semibold))
+                Text(state.formPendingSummary ?? "The file on disk is unchanged.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Divider().frame(height: 24)
+            Button("Save Copy…") { state.presentSaveFilledFormPanel() }
+                .disabled(!state.canSaveFilledForm)
+            Button("Apply to Original…") {
+                state.presentReplaceOriginalWithFilledFormConfirmation()
+            }
+            .disabled(!state.canSaveFilledForm)
+            Button("Discard") { state.discardFormChanges() }
+                .disabled(!state.formHasPendingChanges)
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraTheme.warningFg.opacity(0.5), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Form changes pending. \(state.formChangedFields.count) field(s) differ from the file on disk."
+        )
     }
 
     private var emptyState: some View {

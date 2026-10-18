@@ -54,9 +54,9 @@ tabs and independent windows, outline with section numbers and levels, page and 
 with reply threads, highlight/underline/strikethrough/note/ink/shape creation with a colour and blend, saved
 annotations inside the PDF, staged page editing, facing pages and bookmarks,
 citation/figure/table/algorithm previews with draggable panels, paper metadata and BibTeX export,
-and the AI assistant described above. Known gaps are listed in the project's design notes:
-standalone sticky notes and text boxes, form filling, redaction and printing, and the Linux and
-Windows shells.
+AcroForm filling and editable document properties, and the AI assistant described above. Known gaps
+are listed in the project's design notes: standalone sticky notes and text boxes, redaction and
+printing, and the Linux and Windows shells.
 
 ---
 
@@ -126,6 +126,8 @@ cd apps/macos && swift build && swift run ArisReader
 #    PDF write-back is instrumented as `aris-annotate: saved … to … (append N bytes)` and
 #    `aris-annotate: replaced … , backup …`; the checks can run it alone with
 #    `ArisReaderChecks --check-annotation-writeback .
+#    Form filling, its cross-viewer evidence and the properties editor:
+#    `ArisReaderChecks --check-forms .
 
 # 3) Package a .app bundle
 ./scripts/make-app-bundle.sh          # output: build/Lyra.app
@@ -153,8 +155,9 @@ cargo run -p aris-reader-cli -- metadata tests/fixtures/metadata-text-layer.pdf
 ## Annotation write-back
 
 The reader's highlights, underlines, strikeouts, notes and text boxes can be written into the PDF
-itself, so another viewer sees them. This is deliberately the only code path that writes to a
-user's document, and it is always an explicit command:
+itself, so another viewer sees them. Together with form filling and document properties (below),
+these are the only code paths that write to a user's document, and every one of them is an
+explicit command:
 
 * **File ▸ Save Annotated Copy… (⌘S)** writes a new PDF (suggested name `<name> (annotated).pdf`).
   The open document and its sidecar are not touched. The copy has no sidecar, so reopening it
@@ -243,6 +246,58 @@ blockquotes rather than truncated lines; CSV uses RFC 4180 quoting and keeps emb
 double quotes and newlines. This is a local file write with the same atomic discipline as the
 sidecar (a temporary file renamed into place), and a document with no annotations produces no file
 and says so.
+
+## Form filling and document properties
+
+**Fill & Sign** is an explicit mode, bound to the toolbar's former placeholder. With it on, a click
+on a widget edits it; with it off the overlay is transparent to the mouse and the keyboard, so text
+selection, links and scrolling are exactly what they were. Choosing any annotation tool leaves the
+form tool (the reverse is also true), and pressing Escape in a field leaves the field; Escape on the
+page leaves the tool. The reader never writes while the reader types: values are staged in the
+reader, the page-edit banner's language is reused for "Form changes pending · the file on disk is
+unchanged", and only **Save Filled Form Copy…** or **Write Form Values to Original…** writes a file.
+
+* **Reading the fields.** PDFium's public form API has no field enumeration (it is an event/render
+  API: `FORM_OnChar`, `FPDF_FFLDraw`), so the engine reads the widget dictionaries with `lopdf`:
+  `/AcroForm` → `/Fields`, the `/Kids` hierarchy, inherited `/FT`, `/Ff`, `/V`, `/Opt`, `/DA`,
+  and each page's `/Annots`. The page's `/CropBox`, `/Rotate` and `/UserUnit` map every widget
+  `/Rect` into view space through the same single Y-flip annotations use. Text fields, check
+  boxes, radio groups, combo boxes, list boxes and signature fields are reported; a signature is
+  a distinct kind and is not editable. A widget that is itself the field (the shape most
+  producers write) and a field whose widgets are `/Kids` are both accepted, and so are files
+  where `/AcroForm` and the page annotations hold separate copies (PDFKit writes that shape).
+* **Drawing.** A SwiftUI overlay draws the reader's chrome over the Metal raster at the widget
+  rectangle: a light border, an accent border and wash once a value is present, a real focus
+  ring, a drawn check mark, a radio dot, a drop-down chevron and an in-place list. The text
+  editor is a real `NSTextField` (caret, selection, IME), sized to the zoom; Tab and Shift-Tab
+  move in page/top/left reading order, Return advances and Escape leaves the field.
+* **Saving.** The writer is an incremental revision through the same contract as annotation
+  saves: the original bytes stay the prefix, the field and widget dictionaries are cloned,
+  `/V` and `/AS` are set, appearance streams are generated (using the bundled CJK font subset,
+  so a name in Chinese is a real glyph rather than `?`), the temporary file is flushed,
+  `fsync`ed, reopened, every changed value is read back, every untouched field and the page
+  annotation counts are verified unchanged, and only then is the file renamed into place. The
+  replace action writes and verifies a byte-identical backup first. **Widgets stay
+  interactive**: `/AcroForm`, `/Fields`, the widget dictionaries and their `/AP` are kept. The
+  generated appearance is what makes the same file show its values in PDFKit, Poppler and
+  Ghostscript.
+* **Evidence.** `tests/fixtures/form-fields.pdf` (two pages, eight fields, generated by
+  `scripts/make-fixtures.py`) carries values written by the generator; `form-fields-encrypted.pdf`
+  is the same form with an empty user password. `ArisReaderChecks --check-forms .` reads the
+  fixture's types, rectangles and values, fills six fields through `AppState`, saves a copy, reads
+  it back with this engine, with PDFKit's widget model and renderer (text ink, check-mark pixels),
+  with Poppler's `pdftotext` and with Ghostscript's `txtwrite`; it also fills a copy with
+  **PDFKit itself** and reads that back here. The encrypted fixture is refused with the reason
+  shown in the UI, and the check asserts that no file was written.
+
+**Document Information** (View ▸ Document Information…, ⌥⌘I) now also edits the PDF's own
+information dictionary: Title, Author, Subject and Keywords, with page count, PDF version and
+encryption shown as read-only facts. **Save Copy…** writes the four entries into a new PDF;
+**Write to This File…** backs the original up and replaces it. Both use the verified incremental
+save above and read the entries back before the rename. An encrypted document is refused with a
+readable reason instead of being written without its security envelope. This section is the
+`/Info` dictionary itself; the recognised-metadata section below remains a separate, layout-based
+reading, and XMP remains its highest-priority source.
 
 ## Document metadata and BibTeX
 

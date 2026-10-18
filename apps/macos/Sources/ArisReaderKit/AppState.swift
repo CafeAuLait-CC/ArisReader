@@ -283,6 +283,28 @@ public final class AppState: ObservableObject {
     @Published public var sidebarVisible: Bool = true
     @Published public var searchSidebarVisible = false
     @Published public var showDocumentInformation = false
+    // ── Form filling and document properties ───────────────────────────────────
+    /// The AcroForm fields and facts read from the open document.
+    @Published public private(set) var formInfo: FormInfo = .empty
+    /// The reader's unsaved values, keyed by field identity. Empty means "the file's values".
+    @Published public private(set) var formDraft: [String: FormFieldValue] = [:]
+    @Published public private(set) var formLoading = false
+    @Published public private(set) var formError: String?
+    @Published public private(set) var formLoadCompleted = false
+    /// The form tool is a mode like the ink and markup tools: while it is on, a click on a field
+    /// edits it and a click elsewhere still reads the page. Leaving it restores normal reading.
+    @Published public var formToolActive = false
+    /// The field that owns the keyboard while the form tool is active.
+    @Published public private(set) var formFocusedFieldID: String?
+    /// The drop-down whose option list is open, when the form tool is active.
+    @Published public private(set) var formOpenChoiceFieldID: String?
+    @Published public private(set) var formSaveInProgress = false
+    /// Facts and `/Info` values for the information panel, loaded when it opens.
+    @Published public private(set) var documentInfo: DocumentInfo?
+    @Published public private(set) var documentPropertiesDraft: DocumentProperties = .init()
+    @Published public private(set) var documentInfoLoading = false
+    @Published public private(set) var documentInfoError: String?
+    @Published public private(set) var propertiesSaveInProgress = false
     @Published public var pageOverviewVisible: Bool = false
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
@@ -1256,7 +1278,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var annotations: [Annotation] = []
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The two cannot both be active.
-    @Published public var annotationTool: AnnotationTool = .select
+    @Published public var annotationTool: AnnotationTool = .select {
+        didSet {
+            // The form tool and the drawing tools are modes of the same canvas; choosing a
+            // drawing tool leaves the form tool (and never the other way around).
+            if annotationTool != .select && formToolActive {
+                formToolActive = false
+                formFocusedFieldID = nil
+                formOpenChoiceFieldID = nil
+            }
+        }
+    }
     /// The colour a newly created mark is stored in.
     ///
     /// The highlight palette's presets are translucent because a highlight sits over text. Pen
@@ -1527,6 +1559,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var metadataBibtex: String
         var metadataError: String?
         var metadataLoadCompleted: Bool
+        var formInfo: FormInfo
+        var formDraft: [String: FormFieldValue]
+        var formToolActive: Bool
+        var formLoadCompleted: Bool
+        var formError: String?
+        var documentInfo: DocumentInfo?
+        var documentInfoLoading: Bool
         var documentAnnotations: [DocumentAnnotation]
         var documentAnnotationsError: String?
         var documentAnnotationsLoadCompleted: Bool
@@ -2183,6 +2222,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadFigures()
             loadMetadata()
             loadDocumentAnnotations()
+            loadFormInfo()
             return true
 
         } catch {
@@ -2222,6 +2262,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         metadataBibtex = ""
         metadataLoading = false
         metadataError = nil
+        formInfo = .empty
+        formDraft = [:]
+        formLoading = false
+        formError = nil
+        formLoadCompleted = false
+        formToolActive = false
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+        formSaveInProgress = false
+        documentInfo = nil
+        documentPropertiesDraft = .init()
+        documentInfoLoading = false
+        documentInfoError = nil
+        propertiesSaveInProgress = false
         documentAnnotations = []
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
@@ -3842,6 +3896,591 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let range else { return false }
         selection = Selection(page: annotation.page, range: range)
         return true
+    }
+
+    // MARK: - Forms
+
+    /// The fields of the open document, in reading order (page, then top-to-bottom, then left
+    /// to right — the same order Tab walks).
+    public var formFields: [FormField] { formInfo.fields }
+
+    public func formField(id: String) -> FormField? {
+        formInfo.fields.first { $0.id == id }
+    }
+
+    /// Loads the form fields once per open document. Reading never writes.
+    private func loadFormInfo() {
+        guard document != nil, !formLoadCompleted else { return }
+        formLoadCompleted = true
+        formLoading = true
+        formError = nil
+        let epoch = documentEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if epoch == self.documentEpoch { self.formLoading = false } }
+            do {
+                let info = try await self.engine.formInfo()
+                guard epoch == self.documentEpoch else { return }
+                self.formInfo = info
+                self.formDraft = [:]
+                if let refusal = info.refusal {
+                    FileHandle.standardError.write(Data(
+                        "aris-forms: \(refusal)\n".utf8
+                    ))
+                }
+            } catch {
+                guard epoch == self.documentEpoch else { return }
+                self.formInfo = .empty
+                self.formError = "Could not read the document's form fields: \(error.localizedDescription)"
+                FileHandle.standardError.write(Data(
+                    "aris-forms: read failed: \(error)\n".utf8
+                ))
+            }
+        }
+    }
+
+    /// The value the form currently shows for `field`: the reader's draft when there is one,
+    /// otherwise the file's own value.
+    public func formCurrentValue(_ field: FormField) -> FormFieldValue {
+        if let draft = formDraft[field.id] { return draft }
+        switch field.kind {
+        case .text:
+            return FormFieldValue(fieldID: field.id, text: field.value ?? "")
+        case .checkBox:
+            return FormFieldValue(fieldID: field.id, checked: field.checked)
+        case .radio, .comboBox, .listBox:
+            return FormFieldValue(fieldID: field.id, selected: field.selected.first)
+        case .signature:
+            return FormFieldValue(fieldID: field.id)
+        }
+    }
+
+    public func formCurrentText(_ field: FormField) -> String {
+        formCurrentValue(field).text ?? ""
+    }
+
+    public func formCurrentChecked(_ field: FormField) -> Bool {
+        formCurrentValue(field).checked ?? false
+    }
+
+    public func formCurrentSelection(_ field: FormField) -> Int? {
+        formCurrentValue(field).selected
+    }
+
+    /// Whether the field holds a value on screen now. An empty text field is not filled.
+    public func formValueIsFilled(_ field: FormField) -> Bool {
+        switch field.kind {
+        case .text:
+            return !formCurrentText(field).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .checkBox:
+            return formCurrentChecked(field)
+        case .radio, .comboBox, .listBox:
+            return formCurrentSelection(field) != nil
+        case .signature:
+            return false
+        }
+    }
+
+    /// How many fields the reader has filled (including values the file already carried).
+    public var formFilledCount: Int {
+        formInfo.fields.filter { $0.editable && formValueIsFilled($0) }.count
+    }
+
+    /// The fields whose on-screen value differs from the file's.
+    public var formChangedFields: [FormField] {
+        formInfo.fields.filter { field in
+            guard field.editable else { return false }
+            let current = formCurrentValue(field)
+            switch field.kind {
+            case .text:
+                return (current.text ?? "") != (field.value ?? "")
+            case .checkBox:
+                return (current.checked ?? false) != field.checked
+            case .radio, .comboBox, .listBox:
+                return current.selected != field.selected.first
+            case .signature:
+                return false
+            }
+        }
+    }
+
+    public var formHasPendingChanges: Bool { !formChangedFields.isEmpty }
+
+    /// The banner's first line, in the same language as the page-edit session's.
+    public var formPendingSummary: String? {
+        guard formHasPendingChanges else { return nil }
+        let count = formChangedFields.count
+        let noun = count == 1 ? "1 form change pending" : "\(count) form changes pending"
+        return "\(noun) · the file on disk is unchanged"
+    }
+
+    public var canSaveFilledForm: Bool {
+        document != nil && formHasPendingChanges && !formSaveInProgress && !formInfo.encrypted
+    }
+
+    /// Whether the Fill & Sign placeholder has something to offer.
+    public var canUseFormTool: Bool {
+        document != nil && !formInfo.encrypted && formInfo.fields.contains(where: { $0.editable })
+    }
+
+    /// The toolbar button. Activating the form tool leaves the annotation tool in its normal
+    /// selection mode, so a click on a field is an edit and a click elsewhere still reads.
+    public func toggleFormTool() {
+        guard document != nil else { return }
+        if formInfo.encrypted {
+            lastError = formInfo.refusal
+                ?? "This PDF is encrypted, so the reader will not fill it."
+            return
+        }
+        guard canUseFormTool else {
+            statusMessage = formInfo.fields.isEmpty
+                ? "This document has no form fields"
+                : "This document has no fillable form fields"
+            return
+        }
+        if formToolActive {
+            leaveFormTool()
+            return
+        }
+        formToolActive = true
+        annotationTool = .select
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+        statusMessage = formHasPendingChanges
+            ? (formPendingSummary ?? "Form tool: click a field to fill it")
+            : "Form tool: click a field to fill it · Tab next field · Esc leaves"
+        FileHandle.standardError.write(Data(
+            "aris-forms: tool on · \(formInfo.fields.count) field(s) · "
+            .appending("encrypted: \(formInfo.encrypted)\n").utf8
+        ))
+    }
+
+    /// Escape on the canvas: leave the form tool when it is active. Returns whether a mode was
+    /// consumed, so the canvas can fall through to its other Escape handling when it was not.
+    @discardableResult
+    public func cancelFormTool() -> Bool {
+        guard formToolActive || formFocusedFieldID != nil else { return false }
+        leaveFormTool()
+        return true
+    }
+
+    /// Leaves the form tool and returns the canvas to normal reading. Pending values stay in the
+    /// reader and the banner keeps saying so; only an explicit save writes them.
+    public func leaveFormTool() {
+        let wasActive = formToolActive || formFocusedFieldID != nil
+        formToolActive = false
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+        if wasActive {
+            statusMessage = formHasPendingChanges
+                ? (formPendingSummary ?? "Reading mode")
+                : "Reading mode · form values are unchanged"
+        }
+    }
+
+    /// Puts the keyboard in a field. Only the form tool can focus an editable field.
+    public func focusFormField(_ id: String) {
+        guard formToolActive, let field = formField(id: id), field.editable else { return }
+        formFocusedFieldID = id
+        formOpenChoiceFieldID = field.kind == .comboBox ? id : nil
+    }
+
+    /// Ends field editing without leaving the tool. Escape in a field calls this.
+    public func blurFormField() {
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+    }
+
+    /// Tab order: the engine's reading order — page ascending, then the widget's top edge
+    /// top-to-bottom, then its left edge. Wraps around at both ends.
+    public func focusNextFormField(backwards: Bool = false) {
+        let editable = formInfo.fields.filter { $0.editable }
+        guard !editable.isEmpty else { return }
+        let current = formFocusedFieldID.flatMap { id in
+            editable.firstIndex { $0.id == id }
+        }
+        let next: Int
+        if let current {
+            next = (current + (backwards ? -1 : 1) + editable.count) % editable.count
+        } else {
+            next = backwards ? editable.count - 1 : 0
+        }
+        let field = editable[next]
+        formFocusedFieldID = field.id
+        formOpenChoiceFieldID = field.kind == .comboBox ? field.id : nil
+    }
+
+    /// One text edit. `maxLength` is enforced as characters, matching how PDF `/MaxLen` counts.
+    public func updateFormText(_ id: String, text: String) {
+        guard let field = formField(id: id), field.kind == .text, field.editable else { return }
+        var value = text
+        if let maxLength = field.maxLength, value.count > maxLength {
+            value = String(value.prefix(maxLength))
+        }
+        formDraft[id] = FormFieldValue(fieldID: id, text: value)
+    }
+
+    public func toggleFormCheckbox(_ id: String) {
+        guard let field = formField(id: id), field.kind == .checkBox, field.editable else { return }
+        formDraft[id] = FormFieldValue(fieldID: id, checked: !formCurrentChecked(field))
+        formFocusedFieldID = id
+        formOpenChoiceFieldID = nil
+    }
+
+    public func selectFormRadioOption(_ id: String, index: Int) {
+        guard let field = formField(id: id), field.kind == .radio, field.editable,
+              field.options.indices.contains(index) else { return }
+        formDraft[id] = FormFieldValue(fieldID: id, selected: index)
+        formFocusedFieldID = id
+        formOpenChoiceFieldID = nil
+    }
+
+    public func selectFormChoice(_ id: String, index: Int) {
+        guard let field = formField(id: id), field.kind.isChoice, field.editable,
+              field.options.indices.contains(index) else { return }
+        formDraft[id] = FormFieldValue(fieldID: id, selected: index)
+        formFocusedFieldID = id
+        formOpenChoiceFieldID = nil
+    }
+
+    /// The drop-down's option list open/closed state (the combo is the only popup; a list box
+    /// shows its options inside its rectangle).
+    public func toggleFormChoiceMenu(_ id: String) {
+        guard let field = formField(id: id), field.kind == .comboBox, field.editable else { return }
+        formFocusedFieldID = id
+        formOpenChoiceFieldID = formOpenChoiceFieldID == id ? nil : id
+    }
+
+    public func discardFormChanges() {
+        guard formHasPendingChanges else {
+            statusMessage = "There are no form changes to discard"
+            return
+        }
+        formDraft = [:]
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+        statusMessage = "Form changes discarded · the file on disk is unchanged"
+    }
+
+    /// The values an explicit save sends: only the fields that differ from the file, with the
+    /// complete value a writer needs (a choice carries its option's export value).
+    private func formValueRecords() -> [FormFieldValue] {
+        formChangedFields.map { field in
+            let current = formCurrentValue(field)
+            switch field.kind {
+            case .text:
+                return FormFieldValue(fieldID: field.id, text: current.text ?? "")
+            case .checkBox:
+                return FormFieldValue(fieldID: field.id, checked: current.checked ?? false)
+            case .radio:
+                return FormFieldValue(fieldID: field.id, selected: current.selected)
+            case .comboBox, .listBox:
+                let index = current.selected
+                let value = index.flatMap { field.options.indices.contains($0) ? field.options[$0].value : nil }
+                return FormFieldValue(fieldID: field.id, text: value, selected: index)
+            case .signature:
+                return FormFieldValue(fieldID: field.id)
+            }
+        }
+    }
+
+    public func presentSaveFilledFormPanel() {
+        guard let url = document?.url else { return }
+        guard formHasPendingChanges else {
+            statusMessage = "There are no form changes to save"
+            return
+        }
+        let suggestion = engine.suggestedFilledCopyURL(for: url)
+        let panel = NSSavePanel()
+        panel.title = "Save Filled Form Copy"
+        panel.message =
+            "The values in the reader are written into a copy. The original file is not modified."
+        panel.nameFieldStringValue = suggestion.lastPathComponent
+        panel.directoryURL = suggestion.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.saveFilledForm(to: destination)
+        }
+    }
+
+    /// Writes the pending values into a new PDF through the verified incremental save.
+    @discardableResult
+    public func saveFilledForm(to destination: URL) async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a document before filling its form"
+            return false
+        }
+        let values = formValueRecords()
+        guard !values.isEmpty else {
+            statusMessage = "There are no form changes to save"
+            return false
+        }
+        guard !formInfo.encrypted else {
+            lastError = formInfo.refusal
+                ?? "This PDF is encrypted, so the reader will not fill it."
+            return false
+        }
+        formSaveInProgress = true
+        defer { formSaveInProgress = false }
+        do {
+            let report = try await engine.saveFilledForm(to: destination, values: values)
+            statusMessage =
+                "Saved \(report.writtenFieldIDs.count) filled field(s) to "
+                + "\(destination.lastPathComponent) · \(report.appendedBytes) bytes appended"
+                + " · the original is unchanged"
+            FileHandle.standardError.write(Data((
+                "aris-forms: saved \(report.writtenFieldIDs.count) field(s) to "
+                + "\(destination.path) (append \(report.appendedBytes) bytes)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not save the filled copy: \(error.localizedDescription)"
+            statusMessage = "Could not save the filled form"
+            FileHandle.standardError.write(Data(
+                "aris-forms: copy save failed (\(url.lastPathComponent)): \(error)\n".utf8
+            ))
+            return false
+        }
+    }
+
+    public func presentReplaceOriginalWithFilledFormConfirmation() {
+        guard let url = document?.url else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Replace “\(url.lastPathComponent)” with the filled form?"
+        alert.informativeText =
+            "This changes the file on disk. A byte-identical backup is written first; if the "
+            + "backup cannot be written and verified, nothing is replaced. The widgets stay "
+            + "interactive."
+        alert.addButton(withTitle: "Save and Replace")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor [weak self] in
+            await self?.replaceOriginalWithFilledForm()
+        }
+    }
+
+    @discardableResult
+    public func replaceOriginalWithFilledForm() async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a document before filling its form"
+            return false
+        }
+        let values = formValueRecords()
+        guard !values.isEmpty else {
+            statusMessage = "There are no form changes to save"
+            return false
+        }
+        formSaveInProgress = true
+        defer { formSaveInProgress = false }
+        do {
+            let report = try await engine.replaceWithFilledForm(values)
+            let backup = report.backupPath?.lastPathComponent ?? "none"
+            formDraft = [:]
+            formInfo = .empty
+            formToolActive = false
+            formFocusedFieldID = nil
+            formOpenChoiceFieldID = nil
+            formLoadCompleted = false
+            _ = open(url: url)
+            statusMessage =
+                "Saved \(report.writtenFieldIDs.count) filled field(s) into "
+                + "\(url.lastPathComponent) · backup: \(backup)"
+            FileHandle.standardError.write(Data((
+                "aris-forms: replaced \(url.path) with \(report.writtenFieldIDs.count) "
+                + "field(s), backup \(backup)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not replace the original: \(error.localizedDescription)"
+            statusMessage = "Could not replace the original"
+            FileHandle.standardError.write(Data(
+                "aris-forms: replace failed: \(error)\n".utf8
+            ))
+            return false
+        }
+    }
+
+    // MARK: - Document properties
+
+    /// Loads the facts and `/Info` entries when the information panel opens. The recognized
+    /// metadata panel is a separate, layout-based view; these are the file's own dictionary.
+    public func loadDocumentInfo(force: Bool = false) {
+        guard document != nil else {
+            documentInfo = nil
+            return
+        }
+        if documentInfoLoading { return }
+        if !force, documentInfo != nil { return }
+        documentInfoLoading = true
+        documentInfoError = nil
+        let epoch = documentEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if epoch == self.documentEpoch { self.documentInfoLoading = false } }
+            do {
+                let info = try await self.engine.documentInfo()
+                guard epoch == self.documentEpoch else { return }
+                self.documentInfo = info
+                self.documentPropertiesDraft = DocumentProperties(
+                    title: info.title,
+                    author: info.author,
+                    subject: info.subject,
+                    keywords: info.keywords
+                )
+            } catch {
+                guard epoch == self.documentEpoch else { return }
+                self.documentInfoError = "Could not read the document information: "
+                    + error.localizedDescription
+                self.documentInfo = nil
+            }
+        }
+    }
+
+    public func updateDocumentProperty(_ key: DocumentPropertyKey, text: String) {
+        switch key {
+        case .title: documentPropertiesDraft.title = text
+        case .author: documentPropertiesDraft.author = text
+        case .subject: documentPropertiesDraft.subject = text
+        case .keywords: documentPropertiesDraft.keywords = text
+        }
+    }
+
+    public var documentPropertiesAreDirty: Bool {
+        guard let info = documentInfo else { return false }
+        return documentPropertiesDraft.title != info.title
+            || documentPropertiesDraft.author != info.author
+            || documentPropertiesDraft.subject != info.subject
+            || documentPropertiesDraft.keywords != info.keywords
+    }
+
+    public var canSaveDocumentProperties: Bool {
+        document != nil && documentInfo != nil && documentPropertiesAreDirty
+            && !propertiesSaveInProgress && !(documentInfo?.isEncrypted ?? true)
+    }
+
+    /// Why the Save buttons are disabled, shown in the panel. Nil when they are available.
+    public var documentPropertiesRefusal: String? {
+        guard let info = documentInfo else { return nil }
+        if info.isEncrypted {
+            return "This PDF is encrypted. The reader will not write its document information: "
+                + "the new dictionary would need the security envelope rewritten, and a file "
+                + "written anyway might not open in another viewer."
+        }
+        return nil
+    }
+
+    public func presentSaveDocumentPropertiesPanel() {
+        guard let url = document?.url else { return }
+        guard documentPropertiesAreDirty else {
+            statusMessage = "The document information has no changes to save"
+            return
+        }
+        let suggestion = engine.suggestedPropertiesCopyURL(for: url)
+        let panel = NSSavePanel()
+        panel.title = "Save Document Properties Copy"
+        panel.message =
+            "The four information entries are written into a copy. The original file is not modified."
+        panel.nameFieldStringValue = suggestion.lastPathComponent
+        panel.directoryURL = suggestion.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.saveDocumentProperties(to: destination)
+        }
+    }
+
+    @discardableResult
+    public func saveDocumentProperties(to destination: URL) async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a document before editing its properties"
+            return false
+        }
+        guard documentPropertiesAreDirty else {
+            statusMessage = "The document information has no changes to save"
+            return false
+        }
+        guard documentInfo?.isEncrypted != true else {
+            lastError = documentPropertiesRefusal
+                ?? "This PDF is encrypted, so its document properties cannot be saved."
+            return false
+        }
+        propertiesSaveInProgress = true
+        defer { propertiesSaveInProgress = false }
+        do {
+            let report = try await engine.saveDocumentProperties(
+                to: destination,
+                properties: documentPropertiesDraft
+            )
+            statusMessage =
+                "Saved the document properties to \(destination.lastPathComponent)"
+                + " · \(report.appendedBytes) bytes appended · the original is unchanged"
+            FileHandle.standardError.write(Data((
+                "aris-properties: saved \(report.writtenKeys.joined(separator: ",")) to "
+                + "\(destination.path)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not save the document properties: \(error.localizedDescription)"
+            statusMessage = "Could not save the document properties"
+            FileHandle.standardError.write(Data(
+                "aris-properties: copy save failed (\(url.lastPathComponent)): \(error)\n".utf8
+            ))
+            return false
+        }
+    }
+
+    public func presentReplaceOriginalWithPropertiesConfirmation() {
+        guard let url = document?.url else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Write the document properties into “\(url.lastPathComponent)”?"
+        alert.informativeText =
+            "This changes the file on disk. A byte-identical backup is written first; if the "
+            + "backup cannot be written and verified, nothing is replaced."
+        alert.addButton(withTitle: "Save and Replace")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor [weak self] in
+            await self?.replaceOriginalWithProperties()
+        }
+    }
+
+    @discardableResult
+    public func replaceOriginalWithProperties() async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a document before editing its properties"
+            return false
+        }
+        guard documentPropertiesAreDirty else {
+            statusMessage = "The document information has no changes to save"
+            return false
+        }
+        guard documentInfo?.isEncrypted != true else {
+            lastError = documentPropertiesRefusal
+                ?? "This PDF is encrypted, so its document properties cannot be saved."
+            return false
+        }
+        propertiesSaveInProgress = true
+        defer { propertiesSaveInProgress = false }
+        do {
+            let report = try await engine.replaceWithDocumentProperties(documentPropertiesDraft)
+            let backup = report.backupPath?.lastPathComponent ?? "none"
+            documentInfo = nil
+            _ = open(url: url)
+            loadDocumentInfo(force: true)
+            statusMessage =
+                "Saved the document properties into \(url.lastPathComponent)"
+                + " · backup: \(backup)"
+            return true
+        } catch {
+            lastError = "Could not replace the original: \(error.localizedDescription)"
+            statusMessage = "Could not replace the original"
+            return false
+        }
     }
 
     // MARK: - Saving annotations into the PDF
@@ -6821,6 +7460,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             metadataBibtex: metadataBibtex,
             metadataError: metadataError,
             metadataLoadCompleted: metadataLoadCompleted,
+            formInfo: formInfo,
+            formDraft: formDraft,
+            formToolActive: formToolActive,
+            formLoadCompleted: formLoadCompleted,
+            formError: formError,
+            documentInfo: documentInfo,
+            documentInfoLoading: documentInfoLoading,
             documentAnnotations: documentAnnotations,
             documentAnnotationsError: documentAnnotationsError,
             documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
@@ -6913,6 +7559,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         metadataBibtex = state.metadataBibtex
         metadataError = state.metadataError
         metadataLoadCompleted = state.metadataLoadCompleted
+        formInfo = state.formInfo
+        formDraft = state.formDraft
+        formToolActive = state.formToolActive
+        formLoadCompleted = state.formLoadCompleted
+        formError = state.formError
+        formLoading = false
+        formFocusedFieldID = nil
+        formOpenChoiceFieldID = nil
+        formSaveInProgress = false
+        documentInfo = state.documentInfo
+        documentInfoLoading = state.documentInfoLoading
+        documentInfoError = nil
+        propertiesSaveInProgress = false
         documentAnnotations = state.documentAnnotations
         documentAnnotationsError = state.documentAnnotationsError
         documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted
@@ -6962,6 +7621,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if !referencesLoadCompleted { loadReferences() }
         if !figuresLoadCompleted { loadFigures() }
         if !metadataLoadCompleted { loadMetadata() }
+        if !formLoadCompleted { loadFormInfo() }
         if !documentAnnotationsLoadCompleted { loadDocumentAnnotations() }
     }
 
@@ -8226,6 +8886,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// a click on the text goes on to select it. A PDF's own ink is deliberately not hit tested
     /// here: it can be seen, not edited.
     public func beginSelection(at point: CGPoint) {
+        // A click that reached the canvas is outside every field (the form overlay consumes
+        // field clicks), so it ends field editing and lets the press become a text selection.
+        if formFocusedFieldID != nil { blurFormField() }
         if editingAnnotationID != nil { commitTextEditing() }
         if annotationTool == .select {
             if let hit = placedTextHit(atContentPoint: point),

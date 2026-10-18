@@ -22,7 +22,12 @@ struct DocumentInformationView: View {
 
 struct DocumentInformationContent: View {
     @ObservedObject var state: AppState
-    var body: some View { metadataPanel.scrollContentBackground(.hidden).background(LyraTheme.panelBg) }
+    var body: some View {
+        metadataPanel
+            .scrollContentBackground(.hidden)
+            .background(LyraTheme.panelBg)
+            .onAppear { state.loadDocumentInfo() }
+    }
     // MARK: - Metadata
 
     /// Title, authors, venue, year, DOI and arXiv id, each editable and each labelled with the
@@ -71,6 +76,7 @@ struct DocumentInformationContent: View {
                 .padding(20)
             } else {
                 List {
+                    propertiesSection
                     Section {
                         ForEach(MetadataFieldKey.allCases, id: \.self) { key in
                             metadataRow(key)
@@ -118,6 +124,124 @@ struct DocumentInformationContent: View {
                 .listStyle(.sidebar)
             }
         }
+    }
+
+    // MARK: - Document properties (/Info)
+
+    /// The four entries the reader writes into the document's information dictionary, plus the
+    /// facts it will not write: page count, PDF version and encryption. The recognized metadata
+    /// below is a layout-based reading of the same file; this section is the file's own
+    /// dictionary, and saving here does not regenerate BibTeX.
+    @ViewBuilder
+    private var propertiesSection: some View {
+        Section {
+            if state.documentInfoLoading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading document properties…")
+                        .font(.caption)
+                        .foregroundStyle(LyraTheme.textSecondary)
+                }
+            } else {
+                HStack(spacing: 18) {
+                    fact("Pages", value: state.documentInfo.map { "\($0.pageCount)" }
+                        ?? state.document.map { "\($0.pageCount)" } ?? "—")
+                    fact("PDF version", value: state.documentInfo?.pdfVersion ?? "—")
+                    fact("Encrypted", value: (state.documentInfo?.isEncrypted ?? false) ? "Yes" : "No")
+                    Spacer(minLength: 0)
+                }
+                if let failure = state.documentInfoError {
+                    Text(failure)
+                        .font(.caption)
+                        .foregroundStyle(LyraTheme.errorFg)
+                }
+                if let refusal = state.documentPropertiesRefusal {
+                    Label(refusal, systemImage: "lock.doc")
+                        .font(.caption)
+                        .foregroundStyle(LyraTheme.warningFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, 2)
+                } else {
+                    ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
+                        propertyRow(key)
+                    }
+                    HStack(spacing: 10) {
+                        Button {
+                            state.presentSaveDocumentPropertiesPanel()
+                        } label: {
+                            Label("Save Copy…", systemImage: "square.and.arrow.down")
+                        }
+                        .disabled(!state.canSaveDocumentProperties)
+                        Button {
+                            state.presentReplaceOriginalWithPropertiesConfirmation()
+                        } label: {
+                            Label("Write to This File…", systemImage: "doc.badge.arrow.up")
+                        }
+                        .disabled(!state.canSaveDocumentProperties)
+                        Spacer()
+                        if state.documentPropertiesAreDirty {
+                            Text("Unsaved")
+                                .font(.caption2)
+                                .foregroundStyle(LyraTheme.warningFg)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    Text(
+                        "Save Copy writes the entries into a new PDF and leaves this file "
+                        + "untouched; Write to This File backs it up first and then replaces it. "
+                        + "Changing the recognized metadata above does not write anything."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(LyraTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                if state.documentInfo?.hasInfoDictionary == false {
+                    Text("This PDF has no information dictionary yet; a save adds one.")
+                        .font(.caption2)
+                        .foregroundStyle(LyraTheme.textTertiary)
+                }
+            }
+        } header: {
+            Text("Document properties in the PDF")
+        }
+    }
+
+    private func fact(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(LyraTheme.textTertiary)
+            Text(value)
+                .font(.caption)
+                .fontWeight(.medium)
+                .monospacedDigit()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label): \(value)")
+    }
+
+    private func propertyRow(_ key: DocumentPropertyKey) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(key.label)
+                .font(.caption)
+                .fontWeight(.semibold)
+            TextField(key.prompt, text: Binding(
+                get: {
+                    switch key {
+                    case .title: return state.documentPropertiesDraft.title
+                    case .author: return state.documentPropertiesDraft.author
+                    case .subject: return state.documentPropertiesDraft.subject
+                    case .keywords: return state.documentPropertiesDraft.keywords
+                    }
+                },
+                set: { state.updateDocumentProperty(key, text: $0) }
+            ))
+            .textFieldStyle(.roundedBorder)
+            .font(.caption)
+            .accessibilityLabel(key.label)
+        }
+        .padding(.vertical, 1)
     }
 
     private func metadataRow(_ key: MetadataFieldKey) -> some View {

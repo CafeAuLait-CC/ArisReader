@@ -199,8 +199,21 @@ struct ReaderToolbar: View {
                 LyraMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentReplaceOriginalConfirmation() },
                 .separator("export"),
                 LyraMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canApplyPageEdits) { state.presentSavePageEditsCopyPanel() },
+                .separator("forms"),
+                LyraMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm) {
+                    state.presentSaveFilledFormPanel()
+                },
+                LyraMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canSaveFilledForm) {
+                    state.presentReplaceOriginalWithFilledFormConfirmation()
+                },
             ]) { menuLabel("square.and.arrow.up") }
-            pending("Fill & Sign", "signature")
+            tool("Fill & Sign", "signature", selected: state.formToolActive) {
+                state.toggleFormTool()
+            }
+            .disabled(state.document == nil)
+            .help(state.formToolActive
+                  ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
+                  : "Fill & Sign · fill this PDF's form fields")
             separator
             tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
                 state.pageOverviewVisible = false

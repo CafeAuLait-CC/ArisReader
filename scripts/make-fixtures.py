@@ -23,6 +23,8 @@ PDF objects and a correct cross-reference table are emitted by hand.
 
 from __future__ import annotations
 
+import hashlib
+import struct
 import sys
 import zlib
 from pathlib import Path
@@ -242,6 +244,511 @@ def outline_objects(
 
     emit(nodes, root_id)
     return [root.encode("ascii")] + bodies
+
+
+# ── Form fixtures ────────────────────────────────────────────────────────────
+#
+# A form filled by another writer, and the document-properties fixture. The fields live in
+# AcroForm and every widget is a real page annotation, so PDFium, PDFKit, Poppler and
+# Ghostscript all see the same file. The appearance streams are generated here for the same
+# reason: a viewer that ignores `/V` still has a picture to draw (the reader asserts all four
+# viewers show the prefilled values).
+
+FORM_TEXT_FONT_SIZE = 11
+
+
+def form_ap_stream(width: float, height: float, content: str) -> bytes:
+    data = content.encode("cp1252")
+    return (
+        b"<< /Type /XObject /Subtype /Form "
+        + f"/BBox [0 0 {width:g} {height:g}] ".encode("ascii")
+        + b"/Resources << /Font << /Helv 3 0 R >> >> /Length "
+        + str(len(data)).encode("ascii")
+        + b" >>\nstream\n"
+        + data
+        + b"\nendstream"
+    )
+
+
+def form_ap_text(
+    width: float,
+    height: float,
+    text: str | None,
+    *,
+    combo: bool = False,
+    options: list[str] | None = None,
+    selected: int | None = None,
+) -> bytes:
+    """A widget appearance: a white field box with its value, or a list of options.
+
+    A list box draws every option with the selected row tinted; a combo draws the selected
+    value and a chevron. The reader draws its own chrome over the page, so these streams are
+    what the *other* viewers show, and the two have to agree about the value.
+    """
+    parts = [
+        "q 1 1 1 rg 0.45 0.45 0.45 RG 0.6 w",
+        f"0.3 0.3 {width - 0.6:g} {height - 0.6:g} re B",
+    ]
+    if options:
+        row = min(22.0, height / max(len(options), 1))
+        for index, label in enumerate(options):
+            top = height - row * (index + 1)
+            if index == selected:
+                parts.append("0.80 0.88 0.98 rg")
+                parts.append(f"1 1 {width - 2:g} {row:g} re f")
+            parts.append("0 0 0 rg")
+            parts.append(
+                f"BT /Helv {FORM_TEXT_FONT_SIZE:g} Tf {4:g} {top + 5.5:g} Td "
+                f"({escape_pdf_string(label)}) Tj ET"
+            )
+    elif text:
+        parts.append("0 0 0 rg")
+        parts.append(
+            f"BT /Helv {FORM_TEXT_FONT_SIZE:g} Tf 4 {max(3.0, height / 2 - 4):g} Td "
+            f"({escape_pdf_string(text)}) Tj ET"
+        )
+    if combo:
+        # A small downward chevron near the right edge, in the reader's control grey.
+        x = width - 15
+        y = height / 2 + 2
+        parts.append("0.35 0.35 0.35 RG 1.2 w")
+        parts.append(f"{x:g} {y:g} m {x + 4:g} {y - 4:g} l {x + 8:g} {y:g} l S")
+    parts.append("Q")
+    return form_ap_stream(width, height, "\n".join(parts))
+
+
+def form_ap_box(width: float, height: float, on: bool, round_mark: bool) -> bytes:
+    """A checkbox or radio appearance. `on` draws the mark that belongs to the kind."""
+    parts = ["q 1 1 1 rg 0.35 0.35 0.35 RG 0.8 w"]
+    if round_mark:
+        radius = min(width, height) / 2 - 1
+        cx, cy = width / 2, height / 2
+        k = 0.5523 * radius
+        parts.append(
+            f"{cx + radius:g} {cy:g} m "
+            f"{cx + radius:g} {cy + k:g} {cx + k:g} {cy + radius:g} {cx:g} {cy + radius:g} c "
+            f"{cx - k:g} {cy + radius:g} {cx - radius:g} {cy + k:g} {cx - radius:g} {cy:g} c "
+            f"{cx - radius:g} {cy - k:g} {cx - k:g} {cy - radius:g} {cx:g} {cy - radius:g} c "
+            f"{cx + k:g} {cy - radius:g} {cx + radius:g} {cy - k:g} {cx + radius:g} {cy:g} c S"
+        )
+        if on:
+            inner = max(2.0, radius - 4)
+            parts.append(f"0 0 0 rg {cx:g} {cy:g} {inner:g} {inner:g} re f")
+    else:
+        parts.append(f"0.8 0.8 {width - 1.6:g} {height - 1.6:g} re S")
+        if on:
+            parts.append(
+                "0 0 0 RG 1.6 w "
+                f"{width * 0.22:g} {height * 0.52:g} m "
+                f"{width * 0.42:g} {height * 0.30:g} l "
+                f"{width * 0.78:g} {height * 0.72:g} l S"
+            )
+    parts.append("Q")
+    return form_ap_stream(width, height, "\n".join(parts))
+
+
+# The fields the reader has to understand. The second page proves page-relative geometry: a
+# rectangle that is only correct on its own page must not be drawn on page one.
+FORM_FIELDS: list[dict] = [
+    {"name": "fullName", "kind": "text", "page": 0, "rect": (72, 638, 300, 664),
+     "label": "Full name", "value": None, "max_len": 80},
+    {"name": "email", "kind": "text", "page": 0, "rect": (72, 598, 300, 624),
+     "label": "Email", "value": "prefilled@example.com"},
+    {"name": "agree", "kind": "checkbox", "page": 0, "rect": (72, 563, 90, 581),
+     "label": "I agree to the terms", "value": False},
+    {"name": "color", "kind": "radio", "page": 0, "rect": (72, 523, 186, 541),
+     "label": "Favourite colour", "value": "Green",
+     "options": [("Red", (72, 523, 90, 541)),
+                 ("Green", (120, 523, 138, 541)),
+                 ("Blue", (168, 523, 186, 541))]},
+    {"name": "country", "kind": "combo", "page": 0, "rect": (72, 478, 300, 504),
+     "label": "Country", "value": "Canada",
+     "options": ["Canada", "Japan", "Germany"]},
+    {"name": "interests", "kind": "list", "page": 0, "rect": (72, 378, 300, 454),
+     "label": "Interests", "value": "Reading",
+     "options": ["Reading", "Running", "Cooking"]},
+    {"name": "signature", "kind": "signature", "page": 0, "rect": (72, 318, 300, 358),
+     "label": "Signature"},
+    {"name": "notes", "kind": "text", "page": 1, "rect": (72, 638, 500, 760),
+     "label": "Notes (page 2)", "value": None, "multiline": True},
+]
+
+
+def form_page_content(page: int) -> str:
+    """Page text around the widgets. Field labels sit above their controls."""
+    parts = [
+        "0 0 0 rg",
+        f"BT /F1 20 Tf 72 {790 - page * 4} Td (Lyra form fixture{'' if page == 0 else ' — page 2'}) Tj ET",
+        "BT /F1 9 Tf 72 774 Td (Generated by scripts/make-fixtures.py; values written by another tool.) Tj ET",
+    ]
+    for field in FORM_FIELDS:
+        if field["page"] != page:
+            continue
+        label = field["label"]
+        if field["kind"] == "radio":
+            left, bottom, _, top = field["rect"]
+            parts.append(
+                f"BT /F1 9 Tf {left} {top + 5} Td ({escape_pdf_string(label)}) Tj ET"
+            )
+            for name, (rx, ry, _, rtop) in field["options"]:
+                parts.append(
+                    f"BT /F1 9 Tf {rx + 24} {ry + 4} Td ({escape_pdf_string(name)}) Tj ET"
+                )
+        elif field["kind"] == "checkbox":
+            left, bottom, _, top = field["rect"]
+            parts.append(
+                f"BT /F1 9 Tf {left + 24} {bottom + 4} Td ({escape_pdf_string(label)}) Tj ET"
+            )
+        else:
+            left, bottom, _, top = field["rect"]
+            parts.append(
+                f"BT /F1 9 Tf {left} {top + 5} Td ({escape_pdf_string(label)}) Tj ET"
+            )
+    if page == 0:
+        parts.append("0.75 0.75 0.75 RG 0.5 w 72 300 m 523 300 l S")
+    return "\n".join(parts)
+
+
+PDF_PASSWORD_PAD = bytes([
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA,
+    0x01, 0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE,
+    0x64, 0x53, 0x69, 0x7A,
+])
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + state[i]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) & 0xFF])
+    return bytes(out)
+
+
+def _literal_escape(data: bytes) -> bytes:
+    out = bytearray()
+    for byte in data:
+        if byte in (0x28, 0x29, 0x5C):
+            out += b"\\" + bytes([byte])
+        elif 32 <= byte <= 126:
+            out.append(byte)
+        else:
+            out += ("\\%03o" % byte).encode("ascii")
+    return bytes(out)
+
+
+def _encrypt_literals(body: bytes, key: bytes) -> bytes:
+    """RC4-encrypt every PDF literal string in an object body (not a stream's bytes)."""
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        if body[index] != 0x28:  # '('
+            out.append(body[index])
+            index += 1
+            continue
+        start = index + 1
+        depth = 1
+        cursor = start
+        while cursor < len(body) and depth:
+            byte = body[cursor]
+            if byte == 0x5C:  # backslash: the next byte is literal
+                cursor += 2
+                continue
+            if byte == 0x28:
+                depth += 1
+            elif byte == 0x29:
+                depth -= 1
+            cursor += 1
+        if depth:
+            out += body[index:]
+            break
+        inner = body[start:cursor - 1]
+        out += b"(" + _literal_escape(_rc4(key, inner)) + b")"
+        index = cursor
+    return bytes(out)
+
+
+def _encrypt_body(body: bytes, key: bytes, object_number: int) -> bytes:
+    object_key = _md5(
+        key + object_number.to_bytes(3, "little") + b"\x00\x00"
+    )[: min(len(key) + 5, 16)]
+    marker = b"stream\n"
+    if marker not in body:
+        return _encrypt_literals(body, object_key)
+    head, rest = body.split(marker, 1)
+    data, tail = rest.rsplit(b"\nendstream", 1)
+    return (
+        _encrypt_literals(head, object_key)
+        + marker
+        + _rc4(object_key, data)
+        + b"\nendstream"
+        + tail
+    )
+
+
+def _md5(data: bytes) -> bytes:
+    return hashlib.md5(data).digest()
+
+
+def build_form_pdf(
+    pages: list[tuple[str, int]],
+    fields: list[dict],
+    info: dict[str, str] | None = None,
+    encrypt: bool = False,
+) -> bytes:
+    """Assemble the form fixture: pages, AcroForm fields, their widget appearances and `/Info`.
+
+    Object numbering is fixed before any body is written, because a widget, its `/Parent` and
+    its appearance streams refer to each other. The layout matches `build_pdf`'s first four
+    objects (catalog, page tree, Helvetica) so the fixture stays easy to read with the other
+    generators; everything after the page/content pairs is specific to this builder.
+    """
+    page_count = len(pages)
+    page_ids = [4 + 2 * index for index in range(page_count)]
+    content_ids = [page_id + 1 for page_id in page_ids]
+    next_id = 4 + 2 * page_count
+
+    plans: list[dict] = []
+    for field in fields:
+        plan: dict = {"field": field, "field_id": next_id, "widgets": []}
+        next_id += 1
+        kind = field["kind"]
+        if kind == "checkbox":
+            plan["on_ap"] = next_id
+            plan["off_ap"] = next_id + 1
+            next_id += 2
+        elif kind == "radio":
+            for label, rect in field["options"]:
+                plan["widgets"].append({
+                    "label": label,
+                    "rect": rect,
+                    "id": next_id,
+                    "on_ap": next_id + 1,
+                    "off_ap": next_id + 2,
+                })
+                next_id += 3
+        elif kind in ("text", "combo", "list"):
+            plan["ap"] = next_id
+            next_id += 1
+        plans.append(plan)
+
+    acroform_id = next_id
+    next_id += 1
+    info_id = next_id if info else None
+    if info:
+        next_id += 1
+
+    objects: dict[int, bytes] = {}
+    objects[1] = (
+        f"<< /Type /Catalog /Pages 2 0 R /AcroForm {acroform_id} 0 R >>"
+    ).encode("ascii")
+    kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+    objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {page_count} >>".encode("ascii")
+    objects[3] = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    )
+
+    # Widgets belong to a page's /Annots; merged field+widget objects are listed by their own
+    # object number, and a radio group lists each of its widget children.
+    annots_by_page: dict[int, list[int]] = {index: [] for index in range(page_count)}
+    for plan in plans:
+        field = plan["field"]
+        if plan["widgets"]:
+            annots_by_page[field["page"]].extend(w["id"] for w in plan["widgets"])
+        else:
+            annots_by_page[field["page"]].append(plan["field_id"])
+
+    for index, (content, rotation) in enumerate(pages):
+        annots = annots_by_page[index]
+        annots_entry = (
+            " /Annots [" + " ".join(f"{object_id} 0 R" for object_id in annots) + "]"
+            if annots else ""
+        )
+        rotate = f" /Rotate {rotation}" if rotation else ""
+        objects[page_ids[index]] = (
+            f"<< /Type /Page /Parent 2 0 R "
+            f"/MediaBox [0 0 {A4_WIDTH} {A4_HEIGHT}] "
+            f"/Resources << /Font << /F1 3 0 R >> >> "
+            f"/Contents {content_ids[index]} 0 R{rotate}{annots_entry} >>"
+        ).encode("ascii")
+        stream = content.encode("cp1252")
+        objects[content_ids[index]] = (
+            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+            + stream + b"\nendstream"
+        )
+
+    def widget_rect(field: dict) -> tuple[float, float, float, float]:
+        return field["rect"]
+
+    def rect_array(rect: tuple[float, float, float, float]) -> str:
+        return "[" + " ".join(f"{value:g}" for value in rect) + "]"
+
+    def text_string(value: str) -> str:
+        return "(" + escape_pdf_string(value) + ")"
+
+    def name(value: str) -> str:
+        # Field values and appearance state names are simple ASCII in this fixture.
+        return "/" + value
+
+    def text_ap(field: dict, plan: dict) -> None:
+        left, bottom, right, top = widget_rect(field)
+        width, height = right - left, top - bottom
+        selected = None
+        options = None
+        if field["kind"] in ("combo", "list"):
+            options = field["options"]
+            if field.get("value") in options:
+                selected = options.index(field["value"])
+        objects[plan["ap"]] = form_ap_text(
+            width,
+            height,
+            field.get("value"),
+            combo=field["kind"] == "combo",
+            options=options,
+            selected=selected,
+        )
+        return
+
+    for plan in plans:
+        field = plan["field"]
+        kind = field["kind"]
+        name_byte = text_string(field["name"])
+        page_ref = f"{page_ids[field['page']]} 0 R"
+        common = (
+            f"/Type /Annot /Subtype /Widget /T {name_byte} /P {page_ref} /F 4 "
+            f"/BS << /W 1 /S /S >> /MK << /BC [0.35 0.35 0.35] /BG [1 1 1] >> "
+        )
+        if kind == "text":
+            text_ap(field, plan)
+            flags = " /Ff 4096" if field.get("multiline") else ""
+            max_len = f" /MaxLen {field['max_len']}" if field.get("max_len") else ""
+            value = (
+                f" /V {text_string(field['value'])}" if field.get("value") else ""
+            )
+            objects[plan["field_id"]] = (
+                f"<< {common}/FT /Tx /Rect {rect_array(widget_rect(field))} "
+                f"/DA (/Helv {FORM_TEXT_FONT_SIZE} Tf 0 g){flags}{max_len}{value} "
+                f"/AP << /N {plan['ap']} 0 R >> >>"
+            ).encode("ascii")
+        elif kind == "combo" or kind == "list":
+            text_ap(field, plan)
+            options = field["options"]
+            opt_array = " ".join(text_string(option) for option in options)
+            flags = " /Ff 131072" if kind == "combo" else ""
+            value = ""
+            if field.get("value") in options:
+                index = options.index(field["value"])
+                value = f" /V {text_string(field['value'])} /I [{index}]"
+            objects[plan["field_id"]] = (
+                f"<< {common}/FT /Ch /Rect {rect_array(widget_rect(field))} "
+                f"/DA (/Helv {FORM_TEXT_FONT_SIZE} Tf 0 g){flags} /Opt [{opt_array}]{value} "
+                f"/AP << /N {plan['ap']} 0 R >> >>"
+            ).encode("ascii")
+        elif kind == "signature":
+            objects[plan["field_id"]] = (
+                f"<< {common}/FT /Sig /Ff 1 /Rect {rect_array(widget_rect(field))} >>"
+            ).encode("ascii")
+        elif kind == "checkbox":
+            checked = bool(field.get("value"))
+            left, bottom, right, top = widget_rect(field)
+            width, height = right - left, top - bottom
+            objects[plan["on_ap"]] = form_ap_box(width, height, True, False)
+            objects[plan["off_ap"]] = form_ap_box(width, height, False, False)
+            state = "/Yes" if checked else "/Off"
+            objects[plan["field_id"]] = (
+                f"<< {common}/FT /Btn /Rect {rect_array(widget_rect(field))} "
+                f"/V {state} /AS {state} "
+                f"/AP << /N << /Yes {plan['on_ap']} 0 R /Off {plan['off_ap']} 0 R >> >> >>"
+            ).encode("ascii")
+        elif kind == "radio":
+            left, bottom, right, top = widget_rect(field)
+            selected = field.get("value")
+            field_id = plan["field_id"]
+            objects[field_id] = (
+                f"<< /FT /Btn /Ff 32768 /T {name_byte} /Opt "
+                f"[{' '.join(text_string(label) for label, _ in field['options'])}] "
+                f"/Kids [{' '.join(f'{widget['id']} 0 R' for widget in plan['widgets'])}] "
+                f"/V {name(selected) if selected else '/Off'} >>"
+            ).encode("ascii")
+            for widget in plan["widgets"]:
+                wleft, wbottom, wright, wtop = widget["rect"]
+                width, height = wright - wleft, wtop - wbottom
+                objects[widget["on_ap"]] = form_ap_box(width, height, True, True)
+                objects[widget["off_ap"]] = form_ap_box(width, height, False, True)
+                state = name(widget["label"]) if widget["label"] == selected else "/Off"
+                objects[widget["id"]] = (
+                    f"<< /Type /Annot /Subtype /Widget /Parent {field_id} 0 R "
+                    f"/Rect {rect_array(widget['rect'])} /P {page_ref} /F 4 "
+                    f"/MK << /BC [0.35 0.35 0.35] /BG [1 1 1] >> "
+                    f"/AS {state} /AP << /N << "
+                    f"/{widget['label']} {widget['on_ap']} 0 R /Off {widget['off_ap']} 0 R >> >> >>"
+                ).encode("ascii")
+
+    field_refs = " ".join(f"{plan['field_id']} 0 R" for plan in plans)
+    objects[acroform_id] = (
+        f"<< /Fields [{field_refs}] "
+        f"/DA (/Helv {FORM_TEXT_FONT_SIZE} Tf 0 g) "
+        f"/DR << /Font << /Helv 3 0 R >> >> "
+        f"/NeedAppearances false /SigFlags 3 >>"
+    ).encode("ascii")
+
+    if info:
+        entries = []
+        for key in ("Title", "Author", "Subject", "Keywords", "Creator", "Producer"):
+            if info.get(key):
+                entries.append(f"/{key} {text_string(info[key])}")
+        objects[info_id] = ("<< " + " ".join(entries) + " >>").encode("cp1252")
+
+    file_id = _md5(b"lyra-form-fixture")
+    encrypt_id = None
+    if encrypt:
+        owner = b"lyra-fixture-owner"
+        owner_key = _md5(owner)[:5]
+        o_value = _rc4(owner_key, PDF_PASSWORD_PAD)
+        key = _md5(PDF_PASSWORD_PAD + o_value + struct.pack("<i", -1) + file_id)[:5]
+        u_value = _rc4(key, PDF_PASSWORD_PAD)
+        encrypt_object = len(objects) + 1
+        objects = {
+            number: _encrypt_body(body, key, number)
+            for number, body in objects.items()
+        }
+        objects[encrypt_object] = (
+            f"<< /Filter /Standard /V 1 /R 2 /Length 40 /P -1 "
+            f"/O <{o_value.hex()}> /U <{u_value.hex()}> >>"
+        ).encode("ascii")
+        encrypt_id = encrypt_object
+
+    out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets: list[int] = []
+    max_object = max(objects)
+    for number in range(1, max_object + 1):
+        body = objects.get(number)
+        if body is None:
+            raise ValueError(f"form fixture object {number} is missing")
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+
+    xref_offset = len(out)
+    count = max_object + 1
+    out += f"xref\n0 {count}\n".encode("ascii")
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode("ascii")
+    trailer = f"trailer\n<< /Size {count} /Root 1 0 R"
+    if info_id is not None:
+        trailer += f" /Info {info_id} 0 R"
+    if encrypt_id is not None:
+        trailer += f" /Encrypt {encrypt_id} 0 R /ID [<{file_id.hex()}> <{file_id.hex()}>]"
+    trailer += f" >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    out += trailer.encode("ascii")
+    return bytes(out)
 
 
 def first_extra_object_id(page_count: int, annotation_count: int) -> int:
@@ -1853,6 +2360,28 @@ def main() -> int:
     path = out_dir / "metadata-arxiv.pdf"
     path.write_bytes(build_pdf([(arxiv_page, 0)]))
     print(f"  {path}  ({path.stat().st_size} bytes, 1 page, arXiv id only)")
+
+    # 10b) Form fixtures. Every field kind the reader models, on two pages, with values a
+    #      different writer put there (the appearance streams are generated here). The
+    #      encrypted copy carries the same fields behind the standard security handler with
+    #      an empty user password, so PDFium opens it without a prompt; filling it must still
+    #      be refused. `/Info` gives the properties editor something to correct.
+    form_pages = [(form_page_content(0), 0), (form_page_content(1), 0)]
+    form_info = {
+        "Title": "Lyra Form Fixture",
+        "Author": "Fixture Author",
+        "Subject": "AcroForm fields for the reader's form tool",
+        "Keywords": "forms, fixture, lyra",
+        "Creator": "make-fixtures.py",
+        "Producer": "make-fixtures.py",
+    }
+    path = out_dir / "form-fields.pdf"
+    path.write_bytes(build_form_pdf(form_pages, FORM_FIELDS, info=form_info))
+    print(f"  {path}  ({path.stat().st_size} bytes, 2 page(s), {len(FORM_FIELDS)} form fields)")
+
+    path = out_dir / "form-fields-encrypted.pdf"
+    path.write_bytes(build_form_pdf(form_pages, FORM_FIELDS, info=form_info, encrypt=True))
+    print(f"  {path}  ({path.stat().st_size} bytes, encrypted with an empty user password)")
 
     if long_pages > 0:
         pages = long_document(long_pages)

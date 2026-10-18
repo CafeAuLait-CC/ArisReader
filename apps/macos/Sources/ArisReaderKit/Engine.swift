@@ -822,6 +822,275 @@ public struct AnnotationWriteReport: Sendable, Equatable {
     public let sourceBytesPreserved: Bool
 }
 
+/// The kind of an AcroForm field, as the engine reports it.
+public enum FormFieldKind: String, Sendable, CaseIterable {
+    case text
+    case checkBox
+    case radio
+    case comboBox
+    case listBox
+    case signature
+
+    /// The title the form overlay puts on a field's accessibility label.
+    public var title: String {
+        switch self {
+        case .text: return "Text field"
+        case .checkBox: return "Check box"
+        case .radio: return "Radio button"
+        case .comboBox: return "Drop-down"
+        case .listBox: return "List"
+        case .signature: return "Signature"
+        }
+    }
+
+    /// Whether the reader offers an edit. A signature is a distinct, non-editable kind.
+    public var isEditable: Bool { self != .signature }
+
+    /// The value kind a field holds, for the draft-value map.
+    public var isChoice: Bool { self == .comboBox || self == .listBox }
+}
+
+/// One widget rectangle of a form field, in view space (points, top-left origin).
+///
+/// The rectangle is page-local: it comes from the widget's `/Rect` through the page's crop box,
+/// `/Rotate` and `/UserUnit`, exactly like an annotation's `/Rect`. A radio group has one widget
+/// per choice; every other kind normally has one.
+public struct FormWidgetBox: Sendable, Equatable {
+    public let page: Int
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+    /// `/AS`: the button state name. Empty for a text/choice widget.
+    public let state: String
+
+    public init(page: Int, xPt: CGFloat, yPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat,
+                state: String) {
+        self.page = page
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+        self.state = state
+    }
+
+    public var rect: CGRect { CGRect(x: xPt, y: yPt, width: widthPt, height: heightPt) }
+}
+
+/// One option of a choice or radio field.
+public struct FormOption: Sendable, Equatable {
+    /// The value written to `/V`.
+    public let value: String
+    /// The label shown to the reader.
+    public let label: String
+
+    public init(value: String, label: String) {
+        self.value = value
+        self.label = label
+    }
+}
+
+/// One AcroForm field, read from the widget dictionaries.
+///
+/// The engine reads `/AcroForm` → `/Fields` (including the `/Kids` hierarchy and inherited
+/// `/FT`, `/Ff`, `/V`, `/Opt` and `/DA`), associates each `/Subtype /Widget` with its page via
+/// that page's `/Annots`, and maps its `/Rect` into view space. PDFium's public form API has no
+/// field enumeration, so the dictionaries are the source of type and geometry.
+public struct FormField: Sendable, Identifiable, Equatable {
+    /// Stable identity for a save: `f<object number>` of the field dictionary.
+    public let id: String
+    /// Fully-qualified `/T` name.
+    public let name: String
+    public let kind: FormFieldKind
+    /// Page of the first widget.
+    public let page: Int
+    /// The first widget's rectangle, view space.
+    public let xPt: CGFloat
+    public let yPt: CGFloat
+    public let widthPt: CGFloat
+    public let heightPt: CGFloat
+    /// `/V` for text and choice fields, or a button's selected state name.
+    public let value: String?
+    /// Selected option indices for a choice or radio field.
+    public let selected: [Int]
+    public let checked: Bool
+    public let widgets: [FormWidgetBox]
+    public let options: [FormOption]
+    public let editable: Bool
+    public let multiline: Bool
+    public let maxLength: Int?
+    public let fontSizePt: CGFloat
+    public let required: Bool
+
+    public init(id: String, name: String, kind: FormFieldKind, page: Int,
+                xPt: CGFloat, yPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat,
+                value: String?, selected: [Int], checked: Bool,
+                widgets: [FormWidgetBox], options: [FormOption],
+                editable: Bool, multiline: Bool, maxLength: Int?,
+                fontSizePt: CGFloat, required: Bool) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.page = page
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+        self.value = value
+        self.selected = selected
+        self.checked = checked
+        self.widgets = widgets
+        self.options = options
+        self.editable = editable
+        self.multiline = multiline
+        self.maxLength = maxLength
+        self.fontSizePt = fontSizePt
+        self.required = required
+    }
+
+    public var rect: CGRect { CGRect(x: xPt, y: yPt, width: widthPt, height: heightPt) }
+
+    /// The label to show when the document states no tooltip. `/TU` is not modelled this build,
+    /// so the fully-qualified name is the label; a blank name falls back to the object identity.
+    public var displayName: String { name.isEmpty ? id : name }
+
+    /// The text a text field holds, or the selected choice's label.
+    public var displayValue: String {
+        switch kind {
+        case .comboBox, .listBox:
+            if let first = selected.first, options.indices.contains(first) {
+                return options[first].label
+            }
+            return value ?? ""
+        default:
+            return value ?? ""
+        }
+    }
+}
+
+/// The form facts and fields of a document.
+public struct FormInfo: Sendable, Equatable {
+    public let fields: [FormField]
+    /// Encrypted documents are read (with the caller's password) but refused for filling.
+    public let encrypted: Bool
+    /// The file header's version, e.g. `1.7`.
+    public let pdfVersion: String
+    public let pageCount: Int
+    /// Why filling is disabled, when it is. The reader shows this sentence, not a generic error.
+    public let refusal: String?
+
+    public init(fields: [FormField], encrypted: Bool, pdfVersion: String, pageCount: Int,
+                refusal: String?) {
+        self.fields = fields
+        self.encrypted = encrypted
+        self.pdfVersion = pdfVersion
+        self.pageCount = pageCount
+        self.refusal = refusal
+    }
+
+    public static let empty = FormInfo(fields: [], encrypted: false, pdfVersion: "unknown",
+                                       pageCount: 0, refusal: nil)
+}
+
+/// One field value the shell asks the engine to write.
+public struct FormFieldValue: Sendable, Equatable {
+    public let fieldID: String
+    public let text: String?
+    public let checked: Bool?
+    public let selected: Int?
+
+    public init(fieldID: String, text: String? = nil, checked: Bool? = nil, selected: Int? = nil) {
+        self.fieldID = fieldID
+        self.text = text
+        self.checked = checked
+        self.selected = selected
+    }
+}
+
+/// What a successful form save did.
+public struct FormSaveReport: Sendable, Equatable {
+    public let destination: URL
+    public let writtenFieldIDs: [String]
+    public let appendedBytes: UInt64
+    public let backupPath: URL?
+    public let cleanedTemporaryFiles: Int
+    public let sourceBytesPreserved: Bool
+}
+
+/// The document facts and editable `/Info` entries the information panel shows.
+public struct DocumentInfo: Sendable, Equatable {
+    public let title: String
+    public let author: String
+    public let subject: String
+    public let keywords: String
+    /// Read-only facts.
+    public let pageCount: Int
+    /// The file header's version, e.g. `1.7`.
+    public let pdfVersion: String
+    public let isEncrypted: Bool
+    public let hasInfoDictionary: Bool
+
+    public static let empty = DocumentInfo(title: "", author: "", subject: "", keywords: "",
+                                           pageCount: 0, pdfVersion: "unknown",
+                                           isEncrypted: false, hasInfoDictionary: false)
+}
+
+/// The four `/Info` entries the information panel edits.
+public struct DocumentProperties: Sendable, Equatable {
+    public var title: String
+    public var author: String
+    public var subject: String
+    public var keywords: String
+
+    public init(title: String = "", author: String = "", subject: String = "",
+                keywords: String = "") {
+        self.title = title
+        self.author = author
+        self.subject = subject
+        self.keywords = keywords
+    }
+
+    public var isEmpty: Bool {
+        [title, author, subject, keywords].allSatisfy { $0.isEmpty }
+    }
+}
+
+/// The four document information entries the panel edits.
+public enum DocumentPropertyKey: String, CaseIterable, Sendable {
+    case title
+    case author
+    case subject
+    case keywords
+
+    public var label: String {
+        switch self {
+        case .title: return "Title"
+        case .author: return "Author"
+        case .subject: return "Subject"
+        case .keywords: return "Keywords"
+        }
+    }
+
+    public var prompt: String {
+        switch self {
+        case .title: return "Document title"
+        case .author: return "Author or authors"
+        case .subject: return "Subject"
+        case .keywords: return "Keywords, separated by commas"
+        }
+    }
+}
+
+/// What a successful properties save did.
+public struct PropertiesSaveReport: Sendable, Equatable {
+    public let destination: URL
+    public let writtenKeys: [String]
+    public let appendedBytes: UInt64
+    public let backupPath: URL?
+    public let cleanedTemporaryFiles: Int
+    public let sourceBytesPreserved: Bool
+}
+
 /// One page operation the reader asked for, in 0-based page numbers.
 ///
 /// Every case is applied to a **copy**: the file on disk changes only through the explicit
@@ -1067,6 +1336,31 @@ public protocol PDFEngine: AnyObject {
         _ annotations: [AnnotationWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
+    /// The document's AcroForm fields, read from the widget dictionaries and reported in view
+    /// space. Reading never writes; an encrypted file is reported with `encrypted: true` and a
+    /// readable `refusal`.
+    func formInfo() async throws -> FormInfo
+    /// Writes `values` into a new PDF at `url`; the open document is untouched. The writer is
+    /// the verified incremental save used by annotations, so the source bytes stay the prefix
+    /// and every unfilled field is verified unchanged.
+    func saveFilledForm(to url: URL, values: [FormFieldValue]) async throws -> FormSaveReport
+    /// Replaces the open document with one carrying `values`, after a verified backup.
+    func replaceWithFilledForm(_ values: [FormFieldValue]) async throws -> FormSaveReport
+    /// The name to offer for a filled copy: `<name> (filled).pdf`.
+    func suggestedFilledCopyURL(for url: URL) -> URL
+    /// The read-only facts and the four editable `/Info` entries.
+    func documentInfo() async throws -> DocumentInfo
+    /// Writes the four `/Info` entries into a new PDF at `url`.
+    func saveDocumentProperties(
+        to url: URL,
+        properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport
+    /// Replaces the open document's `/Info` entries, after a verified backup.
+    func replaceWithDocumentProperties(
+        _ properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport
+    /// The name to offer for an edited-properties copy: `<name> (properties).pdf`.
+    func suggestedPropertiesCopyURL(for url: URL) -> URL
     /// The `/Rotate` of every page, in quarter turns (0–3).
     func pageRotations() async throws -> [Int]
     /// Applies a page operation to a copy of the open document and writes it to `destination`.
@@ -1175,6 +1469,75 @@ public extension PDFEngine {
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "This engine cannot write annotations into a PDF"]
         )
+    }
+
+    /// Engines without a PDF form writer refuse instead of pretending to fill.
+    func formInfo() async throws -> FormInfo {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot read PDF forms"]
+        )
+    }
+
+    func saveFilledForm(to url: URL, values: [FormFieldValue]) async throws -> FormSaveReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot fill PDF forms"]
+        )
+    }
+
+    func replaceWithFilledForm(_ values: [FormFieldValue]) async throws -> FormSaveReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot fill PDF forms"]
+        )
+    }
+
+    func suggestedFilledCopyURL(for url: URL) -> URL {
+        Self.suggestedCopyURL(for: url, suffix: "filled")
+    }
+
+    func documentInfo() async throws -> DocumentInfo {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot read document properties"]
+        )
+    }
+
+    func saveDocumentProperties(
+        to url: URL,
+        properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot write document properties"]
+        )
+    }
+
+    func replaceWithDocumentProperties(
+        _ properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport {
+        throw NSError(
+            domain: "Lyra",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot write document properties"]
+        )
+    }
+
+    func suggestedPropertiesCopyURL(for url: URL) -> URL {
+        Self.suggestedCopyURL(for: url, suffix: "properties")
+    }
+
+    /// `<name> (suffix).pdf` beside `url`; the same naming rule Rust's suggested paths use.
+    static func suggestedCopyURL(for url: URL, suffix: String) -> URL {
+        let stem = url.deletingPathExtension().lastPathComponent
+        return url.deletingLastPathComponent()
+            .appendingPathComponent("\(stem) (\(suffix)).pdf")
     }
 
     func pageRotations() async throws -> [Int] {
@@ -1749,6 +2112,178 @@ public final class RustEngine: PDFEngine {
         return Self.writeReport(from: report)
     }
 
+    public func formInfo() async throws -> FormInfo {
+        guard let document else { return .empty }
+        let record: FormInfoRecord = try await withCheckedThrowingContinuation { continuation in
+            // Reading the dictionaries and the page geometries is file work; keep it off the
+            // main thread and serialised with the other document calls.
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.formInfo())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.formInfo(from: record)
+    }
+
+    public func saveFilledForm(
+        to url: URL,
+        values: [FormFieldValue]
+    ) async throws -> FormSaveReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = values.map { value in
+            FormFieldValueRecord(
+                fieldId: value.fieldID,
+                text: value.text,
+                checked: value.checked,
+                selected: value.selected.map(UInt32.init)
+            )
+        }
+        let report: ArisReaderBindings.FormSaveReport =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.saveFilledFormCopy(
+                            destination: url.path,
+                            values: records
+                        ))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        invalidateCachedCopy(at: url)
+        return Self.formSaveReport(from: report)
+    }
+
+    public func replaceWithFilledForm(_ values: [FormFieldValue]) async throws -> FormSaveReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = values.map { value in
+            FormFieldValueRecord(
+                fieldId: value.fieldID,
+                text: value.text,
+                checked: value.checked,
+                selected: value.selected.map(UInt32.init)
+            )
+        }
+        let report: ArisReaderBindings.FormSaveReport =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.replaceWithFilledForm(
+                            values: records
+                        ))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
+        return Self.formSaveReport(from: report)
+    }
+
+    public func suggestedFilledCopyURL(for url: URL) -> URL {
+        guard let document else {
+            return Self.suggestedCopyURL(for: url, suffix: "filled")
+        }
+        return URL(fileURLWithPath: document.suggestedFilledCopyPath())
+    }
+
+    public func documentInfo() async throws -> DocumentInfo {
+        guard let document else { return .empty }
+        let record: DocumentInfoRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.documentInfo())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return Self.documentInfo(from: record)
+    }
+
+    public func saveDocumentProperties(
+        to url: URL,
+        properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let report: ArisReaderBindings.PropertiesSaveReport =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.saveDocumentPropertiesCopy(
+                            destination: url.path,
+                            title: properties.title,
+                            author: properties.author,
+                            subject: properties.subject,
+                            keywords: properties.keywords
+                        ))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        invalidateCachedCopy(at: url)
+        return Self.propertiesSaveReport(from: report)
+    }
+
+    public func replaceWithDocumentProperties(
+        _ properties: DocumentProperties
+    ) async throws -> PropertiesSaveReport {
+        guard let document else {
+            throw NSError(
+                domain: "Lyra",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let report: ArisReaderBindings.PropertiesSaveReport =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.replaceWithDocumentProperties(
+                            title: properties.title,
+                            author: properties.author,
+                            subject: properties.subject,
+                            keywords: properties.keywords
+                        ))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
+        return Self.propertiesSaveReport(from: report)
+    }
+
+    public func suggestedPropertiesCopyURL(for url: URL) -> URL {
+        guard let document else {
+            return Self.suggestedCopyURL(for: url, suffix: "properties")
+        }
+        return URL(fileURLWithPath: document.suggestedPropertiesCopyPath())
+    }
+
     public func pageRotations() async throws -> [Int] {
         guard let document else {
             throw NSError(
@@ -2213,6 +2748,87 @@ public final class RustEngine: PDFEngine {
                 doi: draft.doi,
                 arxivId: draft.arxivID
             )
+        )
+    }
+
+    private static func formInfo(from record: FormInfoRecord) -> FormInfo {
+        FormInfo(
+            fields: record.fields.map { field in
+                FormField(
+                    id: field.id,
+                    name: field.name,
+                    kind: FormFieldKind(rawValue: field.kind) ?? .text,
+                    page: Int(field.page),
+                    xPt: CGFloat(field.xPt),
+                    yPt: CGFloat(field.yPt),
+                    widthPt: CGFloat(field.widthPt),
+                    heightPt: CGFloat(field.heightPt),
+                    value: field.value,
+                    selected: field.selected.map(Int.init),
+                    checked: field.checked,
+                    widgets: field.widgets.map { widget in
+                        FormWidgetBox(
+                            page: Int(widget.page),
+                            xPt: CGFloat(widget.xPt),
+                            yPt: CGFloat(widget.yPt),
+                            widthPt: CGFloat(widget.widthPt),
+                            heightPt: CGFloat(widget.heightPt),
+                            state: widget.state
+                        )
+                    },
+                    options: field.options.map { option in
+                        FormOption(value: option.value, label: option.label)
+                    },
+                    editable: field.editable,
+                    multiline: field.multiline,
+                    maxLength: field.maxLength.map(Int.init),
+                    fontSizePt: CGFloat(field.fontSizePt),
+                    required: field.required
+                )
+            },
+            encrypted: record.encrypted,
+            pdfVersion: record.pdfVersion,
+            pageCount: Int(record.pageCount),
+            refusal: record.refusal
+        )
+    }
+
+    private static func formSaveReport(
+        from record: ArisReaderBindings.FormSaveReport
+    ) -> FormSaveReport {
+        FormSaveReport(
+            destination: URL(fileURLWithPath: record.destinationPath),
+            writtenFieldIDs: record.writtenFieldIds,
+            appendedBytes: record.appendedBytes,
+            backupPath: record.backupPath.map { URL(fileURLWithPath: $0) },
+            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
+            sourceBytesPreserved: record.sourceBytesPreserved
+        )
+    }
+
+    private static func documentInfo(from record: DocumentInfoRecord) -> DocumentInfo {
+        DocumentInfo(
+            title: record.title,
+            author: record.author,
+            subject: record.subject,
+            keywords: record.keywords,
+            pageCount: Int(record.pageCount),
+            pdfVersion: record.pdfVersion,
+            isEncrypted: record.isEncrypted,
+            hasInfoDictionary: record.hasInfoDictionary
+        )
+    }
+
+    private static func propertiesSaveReport(
+        from record: ArisReaderBindings.PropertiesSaveReport
+    ) -> PropertiesSaveReport {
+        PropertiesSaveReport(
+            destination: URL(fileURLWithPath: record.destinationPath),
+            writtenKeys: record.writtenKeys,
+            appendedBytes: record.appendedBytes,
+            backupPath: record.backupPath.map { URL(fileURLWithPath: $0) },
+            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
+            sourceBytesPreserved: record.sourceBytesPreserved
         )
     }
 
