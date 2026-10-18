@@ -783,7 +783,7 @@ public struct SidebarView: View {
         switch annotation.kind {
         case "highlight": return "Highlight"
         case "underline": return "Underline"
-        case "strikeout": return "Strikeout"
+        case "strikeout": return "Strikethrough"
         case "squiggly": return "Squiggly underline"
         case "text": return "Sticky note (no text)"
         case "freeText": return "Free text (no text)"

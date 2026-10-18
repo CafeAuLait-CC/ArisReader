@@ -595,6 +595,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case highlight
         case underline
+        /// A line through the middle of the selected glyphs. A text-markup kind like the two
+        /// above: same range model, same `/QuadPoints` write path, different `/Subtype`.
+        case strikeout
         case ink
         case square
         case circle
@@ -608,7 +611,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// Whether this kind is stored as geometry rather than as a character range.
         public var isGeometry: Bool {
             switch self {
-            case .highlight, .underline: return false
+            case .highlight, .underline, .strikeout: return false
             case .ink, .square, .circle, .line, .arrow: return true
             case .stickyNote, .textBox: return false
             }
@@ -623,7 +626,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         public var isPlacedText: Bool {
             switch self {
             case .stickyNote, .textBox: return true
-            case .highlight, .underline, .ink, .square, .circle, .line, .arrow: return false
+            case .highlight, .underline, .strikeout, .ink, .square, .circle, .line, .arrow:
+                return false
             }
         }
     }
@@ -781,7 +785,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 && rect.width >= Self.minimumTextBoxSize.width
                 && rect.height >= Self.minimumTextBoxSize.height
                 && fontSize.isFinite && fontSize >= 1 && fontSize <= 400
-        case .highlight, .underline:
+        case .highlight, .underline, .strikeout:
             return false
         }
     }
@@ -808,7 +812,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                           height: max(abs(end.y - start.y), 0.01))
         case .stickyNote, .textBox:
             return shapeRect
-        case .highlight, .underline:
+        case .highlight, .underline, .strikeout:
             return nil
         }
     }
@@ -945,7 +949,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     try values.encode(StoredPoint(x: Double(end.x), y: Double(end.y)),
                                       forKey: .lineEnd)
                 }
-            case .stickyNote, .textBox, .highlight, .underline:
+            case .stickyNote, .textBox, .highlight, .underline, .strikeout:
                 break
             }
         } else if kind.isPlacedText {
@@ -1250,8 +1254,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
     /// `AnnotationSidecar`).
     @Published public private(set) var annotations: [Annotation] = []
-    /// The tool the canvas is in. Text markup is still selection-based; the tools here are the
-    /// ones that change what a pointer drag on the page means.
+    /// The one active canvas tool. A text-markup case makes finished text selections mark
+    /// themselves; the pen and shape cases draw on a drag. The two cannot both be active.
     @Published public var annotationTool: AnnotationTool = .select
     /// The colour a newly created mark is stored in.
     ///
@@ -2647,7 +2651,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// highlighting reuses the selection machinery.
     // MARK: - Annotations
 
+    /// True while a finished selection is being turned into a mark, so the canvas' mouse-up
+    /// path cannot recursively add a second annotation for the same selection.
+    private var isMarkingTextSelection = false
+
     /// Turns the current selection into an annotation.
+    ///
+    /// This is the **only** creation path for a text mark: the sticky tools' automatic marking,
+    /// the toolbar activation and the context menu all call it. It leaves the text selection in
+    /// place — the context menu can then attach a note to the same words — while the sticky
+    /// path clears it after a successful mark (``markSelectionWithActiveTool``).
     @discardableResult
     public func addAnnotationFromSelection(
         kind: Annotation.Kind = .highlight,
@@ -2669,13 +2682,71 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
         var updated = annotations
         updated.append(annotation)
-        guard saveAnnotations(updated, trigger: "add") else { return false }
+        guard saveAnnotations(updated, trigger: "add-\(kind.rawValue)") else { return false }
         undoStack.append(.added(annotation))
         redoStack.removeAll()
         reloadVisiblePages()
-        statusMessage = kind == .highlight
-            ? "Highlighted \(selection.range.count) characters"
-            : "Underlined \(selection.range.count) characters"
+        let count = selection.range.count
+        statusMessage = switch kind {
+        case .highlight: "Highlighted \(count) characters"
+        case .underline: "Underlined \(count) characters"
+        case .strikeout: "Struck through \(count) characters"
+        default: "Added a \(kind.rawValue) annotation over \(count) characters"
+        }
+        return true
+    }
+
+    /// Activates a sticky text-markup tool, or turns it off when it is already active.
+    ///
+    /// Activating one markup tool replaces whatever tool was active, including another markup
+    /// kind or a pen/shape tool: the canvas has one mode, so "highlight, then underline" cannot
+    /// leave two tools claiming the next selection. A selection that already exists is marked
+    /// immediately, which is the old select-then-click behaviour and is still the fastest path.
+    public func toggleTextMarkupTool(_ kind: Annotation.Kind) {
+        guard let tool = AnnotationTool(textMarkup: kind) else { return }
+        if annotationTool == tool {
+            annotationTool = .select
+            return
+        }
+        annotationTool = tool
+        _ = markSelectionWithActiveTool()
+    }
+
+    /// Marks the current selection with the active markup tool, if there is one.
+    ///
+    /// Returns false when no markup tool is active, when nothing is selected, or when the save
+    /// fails. Called by the toolbar after activation and by the canvas when a text-selection
+    /// drag ends; both use ``addAnnotationFromSelection(kind:color:note:)`` underneath.
+    @discardableResult
+    public func markSelectionWithActiveTool() -> Bool {
+        guard !isMarkingTextSelection, let kind = annotationTool.textMarkupKind else { return false }
+        guard selection != nil else { return false }
+        isMarkingTextSelection = true
+        defer { isMarkingTextSelection = false }
+        let added = addAnnotationFromSelection(kind: kind, color: annotationColor)
+        if added {
+            // The finished selection has become a mark. Keeping the blue selection on top of it
+            // would make the canvas look as if a second mark were about to land, and the next
+            // click would try to mark the same words again.
+            clearSelection()
+        }
+        return added
+    }
+
+    /// The Select button leaves whatever mode is active, including a sticky markup tool.
+    public func selectTool() {
+        annotationTool = .select
+    }
+
+    /// Escape and the Select button leave the sticky markup mode.
+    ///
+    /// Returns whether a mode was actually left, so the canvas can consume the Escape key only
+    /// when it did something. Pen and shape tools keep their existing Escape behaviour (the
+    /// live draft is cancelled; the tool stays selected).
+    @discardableResult
+    public func cancelTextMarkupTool() -> Bool {
+        guard annotationTool.isTextMarkup else { return false }
+        annotationTool = .select
         return true
     }
 
@@ -2744,7 +2815,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .line, .arrow:
             guard let start = lineStart, let end = lineEnd,
                   hypot(end.x - start.x, end.y - start.y) >= 1 else { return false }
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             return false
         }
 
@@ -2811,7 +2882,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .ink:
             return addInkAnnotation(page: page, points: [start, end], color: color,
                                     strokeWidth: strokeWidth)
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             return false
         }
     }
@@ -4042,10 +4113,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
             }
             let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
+            let writeKind: AnnotationWriteRequest.Kind = switch annotation.kind {
+            case .highlight: .highlight
+            case .underline: .underline
+            case .strikeout: .strikeout
+            default: .highlight
+            }
             requests.append(AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
-                kind: annotation.kind == .highlight ? .highlight : .underline,
+                kind: writeKind,
                 rect: union,
                 quads: quads,
                 color: annotation.color,
@@ -4139,7 +4216,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .arrow:
             let head = max(width * 5, 8)
             outer = outer.insetBy(dx: -(width / 2 + head), dy: -(width / 2 + head))
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             break
         }
         guard outer.width > 0.5, outer.height > 0.5 else {
@@ -4163,7 +4240,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .square: kind = .square
         case .circle: kind = .circle
         case .line, .arrow: kind = .line
-        case .highlight, .underline: kind = .highlight
+        case .highlight: kind = .highlight
+        case .underline: kind = .underline
+        case .strikeout: kind = .strikeout
         case .stickyNote, .textBox:
             throw NSError(
                 domain: "Lyra",
@@ -5746,6 +5825,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard wasClick else {
             extendSelection(to: point)
+            // A drag is a finished text selection. When a sticky markup tool is active, the
+            // selection becomes its mark here, without a second click; when none is active this
+            // is the no-op it has always been.
+            _ = markSelectionWithActiveTool()
             return
         }
         // Before the target is resolved, not after: a click that opens a citation or a figure
@@ -7736,6 +7819,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // Geometry marks are drawn by the annotation overlay, and placed text is drawn from
             // its own glyph below; neither is a tinted text box.
             guard !annotation.kind.isGeometry, !annotation.kind.isPlacedText else { continue }
+            // A highlight fills the quad; an underline is a thin bar on the baseline and a
+            // strikeout is the same bar through the middle of the glyphs.
+            let verticalScale: CGFloat = switch annotation.kind {
+            case .highlight: 1.0
+            case .underline: 0.1
+            case .strikeout: 0.12
+            default: 1.0
+            }
+            let verticalOffset: CGFloat = switch annotation.kind {
+            case .underline: 0.9
+            case .strikeout: 0.45
+            default: 0.0
+            }
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
@@ -7746,9 +7842,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // this quad's texture under, so it must not collide with a page raster or with a
                 // loaded annotation (see `PlacementIndex`).
                 idBase: PlacementIndex.ownAnnotation(annotationIndex),
-                // An underline is a thin bar on the baseline instead of a filled box.
-                verticalScale: annotation.kind == .underline ? 0.1 : 1.0,
-                verticalOffset: annotation.kind == .underline ? 0.9 : 0.0,
+                verticalScale: verticalScale,
+                verticalOffset: verticalOffset,
                 to: &pages
             )
         }

@@ -1985,7 +1985,9 @@ impl ArisDocument {
                         alignment,
                     )
                 }
-                AnnotationWriteKind::Highlight | AnnotationWriteKind::Underline => {
+                AnnotationWriteKind::Highlight
+                | AnnotationWriteKind::Underline
+                | AnnotationWriteKind::StrikeOut => {
                     if quads.is_empty() {
                         return Err(ArisFfiError::InvalidArgument {
                             message: format!("annotation {:?} has no quads to write", record.id),
@@ -2006,6 +2008,7 @@ impl ArisDocument {
                     let kind = match record.kind {
                         AnnotationWriteKind::Highlight => WriteAnnotationKind::Highlight,
                         AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
+                        AnnotationWriteKind::StrikeOut => WriteAnnotationKind::StrikeOut,
                         _ => unreachable!("handled by the outer match"),
                     };
                     (
@@ -2798,12 +2801,15 @@ pub struct AnnotationColorRecord {
 /// The PDF annotation a pending write becomes.
 ///
 /// `Note` is a sticky note (`/Subtype /Text`): its `rect` is the icon box and its contents are
-/// the note. `Highlight`/`Underline` are the quad-based text marks: their `quads` are the text
-/// boxes and `contents` is the comment attached to the mark (what the shell's `note` field is).
+/// the note. `Highlight`/`Underline`/`StrikeOut` are the quad-based text marks: their `quads`
+/// are the text boxes and `contents` is the comment attached to the mark (what the shell's
+/// `note` field is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum AnnotationWriteKind {
     Highlight,
     Underline,
+    /// `/StrikeOut`: a line through the middle of the selected glyphs.
+    StrikeOut,
     Note,
     /// `/FreeText`: text in `rect`, at `font_size_pt`, aligned by `text_alignment`, with
     /// `/DA` and an appearance stream.

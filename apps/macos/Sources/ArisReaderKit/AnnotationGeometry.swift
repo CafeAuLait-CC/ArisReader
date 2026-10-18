@@ -3,8 +3,10 @@ import CoreGraphics
 
 /// The tool the canvas is in.
 ///
-/// Text markup stays selection-based (select text, then Highlight), so it is not a canvas tool.
-/// The six tools here are the modes that change what a pointer drag on the page means.
+/// One value selects exactly one tool. The text-markup cases (`highlight`, `underline`,
+/// `strikeout`) do not change what a drag *draws*: a drag still selects text, and the selection
+/// is turned into that kind of mark when it is released. Keeping them in this enum is what makes
+/// "pen, then highlight" leave one tool active rather than two modes that could both apply.
 public enum AnnotationTool: String, CaseIterable, Sendable {
     case select
     case pen
@@ -14,16 +16,46 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     case ellipse
     case note
     case textBox
+    /// A sticky text-markup mode: every finished text selection is marked with this kind.
+    case highlight
+    case underline
+    case strikeout
 
     /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select, .note, .textBox: return nil
+        case .select, .note, .textBox, .highlight, .underline, .strikeout: return nil
         case .pen: return .ink
         case .line: return .line
         case .arrow: return .arrow
         case .rectangle: return .square
         case .ellipse: return .circle
+        }
+    }
+
+    /// The markup kind a finished text selection becomes, or `nil` for every other tool.
+    ///
+    /// The three kinds are text marks, not glyphs drawn by a pointer: they live in the sidecar,
+    /// are written as `/QuadPoints`, and are hit-tested/selected through their text range.
+    public var textMarkupKind: AppState.Annotation.Kind? {
+        switch self {
+        case .highlight: return .highlight
+        case .underline: return .underline
+        case .strikeout: return .strikeout
+        case .select, .pen, .line, .arrow, .rectangle, .ellipse, .note, .textBox: return nil
+        }
+    }
+
+    /// Whether this tool turns every finished text selection into a mark.
+    public var isTextMarkup: Bool { textMarkupKind != nil }
+
+    /// The tool for one text-markup kind, or `nil` for a kind that is not markup.
+    public init?(textMarkup kind: AppState.Annotation.Kind) {
+        switch kind {
+        case .highlight: self = .highlight
+        case .underline: self = .underline
+        case .strikeout: self = .strikeout
+        case .ink, .square, .circle, .line, .arrow, .stickyNote, .textBox: return nil
         }
     }
 
@@ -49,6 +81,9 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "Ellipse"
         case .note: return "Sticky Note"
         case .textBox: return "Text Box"
+        case .highlight: return "Highlight"
+        case .underline: return "Underline"
+        case .strikeout: return "Strikethrough"
         }
     }
 
@@ -62,6 +97,9 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "circle"
         case .note: return "note.text"
         case .textBox: return "textbox"
+        case .highlight: return "highlighter"
+        case .underline: return "underline"
+        case .strikeout: return "strikethrough"
         }
     }
 }
@@ -159,7 +197,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
             return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
                           width: max(abs(end.x - start.x), 0.01),
                           height: max(abs(end.y - start.y), 0.01))
-        case .highlight, .underline:
+        case .highlight, .underline, .strikeout:
             return nil
         }
     }
@@ -241,7 +279,7 @@ public enum AnnotationGeometry {
                     path.closeSubpath()
                 }
             }
-        case .highlight, .underline:
+        case .highlight, .underline, .strikeout:
             break
         case .stickyNote, .textBox:
             // These are drawn from a bitmap (the note icon or the laid-out text), not a stroke;
@@ -274,7 +312,7 @@ public enum AnnotationGeometry {
         case .circle:
             guard let rect = mark.shapeRect else { return false }
             return distance(point, toEllipseIn: rect) <= reach
-        case .highlight, .underline:
+        case .highlight, .underline, .strikeout:
             return false
         case .stickyNote:
             guard let rect = mark.shapeRect else { return false }

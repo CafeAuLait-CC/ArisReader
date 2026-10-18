@@ -38,11 +38,13 @@
 //! tint the glyphs instead of multiplying into the page — strictly worse than no appearance at
 //! all, because the two viewers would then disagree about the same file.
 //!
-//! This writer therefore does **not** write `/AP` for the quad-based kinds. Both PDFium and
-//! PDFKit synthesize the appearance from `/QuadPoints` and `/C`; the macOS test suite renders a
-//! saved copy with PDFKit and asserts that the highlight covers the line while the glyph pixels
-//! stay black, which is the multiply-like result Preview is expected to show. A viewer that
-//! requires an explicit `/AP` (some older readers do) will show nothing; the alternative was to
+//! This writer therefore does **not** write `/AP` for the quad-based kinds, which now includes
+//! `/StrikeOut`: it has the same `/QuadPoints` and `/C` contract as an underline, just a
+//! different line position. Both PDFium and PDFKit synthesize the appearance from those keys;
+//! the macOS test suite renders a saved copy with PDFKit and asserts that the highlight covers
+//! the line while the glyph pixels stay black, which is the multiply-like result Preview is
+//! expected to show. A viewer that requires an explicit `/AP` (some older readers do) will show
+//! nothing; the alternative was to
 //! write a state that is knowingly wrong. See the task report and `README.md` for the measurement.
 //!
 //! Ink, shapes, sticky notes and free text are different: they have no blend mode to get wrong,
@@ -655,7 +657,9 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                     ));
                 }
             }
-            WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
+            WriteAnnotationKind::Highlight
+            | WriteAnnotationKind::Underline
+            | WriteAnnotationKind::StrikeOut => {
                 if annotation.quads.is_empty() {
                     return Err(ArisError::new(
                         ErrorCode::InvalidArgument,
@@ -997,6 +1001,7 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
     let kind = match expected.kind {
         WriteAnnotationKind::Highlight => RawAnnotationKind::Highlight,
         WriteAnnotationKind::Underline => RawAnnotationKind::Underline,
+        WriteAnnotationKind::StrikeOut => RawAnnotationKind::Strikeout,
         WriteAnnotationKind::Text => RawAnnotationKind::Text,
         WriteAnnotationKind::FreeText => RawAnnotationKind::FreeText,
         WriteAnnotationKind::Ink => RawAnnotationKind::Ink,
@@ -1072,9 +1077,9 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
     // multiplied by the reader and by every renderer that implements table 164's default for
     // these kinds; a note is alpha-over. Assert the effective blend, not the absence of a key.
     let expected_blend = match expected.kind {
-        WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
-            aris_reader_core::AnnotationBlend::Multiply
-        }
+        WriteAnnotationKind::Highlight
+        | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::StrikeOut => aris_reader_core::AnnotationBlend::Multiply,
         WriteAnnotationKind::Text
         | WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Ink
@@ -1203,6 +1208,7 @@ fn verify_geometry(
         WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {}
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::StrikeOut
         | WriteAnnotationKind::Text
         | WriteAnnotationKind::FreeText => {
             unreachable!("only called for a stroked kind")
@@ -1555,6 +1561,27 @@ mod tests {
         }
     }
 
+    fn strikeout() -> WriteAnnotation {
+        WriteAnnotation {
+            id: "55555555-5555-5555-5555-555555555555".to_string(),
+            page: PageIndex(0),
+            kind: WriteAnnotationKind::StrikeOut,
+            rect: Rect::new(72.0, 641.0, 388.0, 15.0),
+            quads: vec![Rect::new(72.0, 641.0, 388.0, 15.0)],
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 0.0,
+            font_size: 0.0,
+            alignment: AnnotationAlignment::Left,
+            color: [230, 80, 40],
+            opacity: 0.9,
+            contents: Some("Lyra round-trip strikeout.".to_string()),
+            author: Some("Lyra Test".to_string()),
+            modified: Some("D:20261018101500-07'00'".to_string()),
+        }
+    }
+
     fn note() -> WriteAnnotation {
         WriteAnnotation {
             id: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -1713,6 +1740,82 @@ mod tests {
                 assert!(saved[page].contains(original));
             }
         }
+    }
+
+    #[test]
+    fn strikeout_round_trips_as_strikeout_and_leaves_preexisting_annotations_alone() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("strikeout-round-trip");
+        let source = copy_fixture(&directory, "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let original_bytes = fs::read(&source).expect("read fixture");
+
+        let report =
+            save_annotated_pdf(&source, &destination, &[strikeout()], None, SaveMode::Copy)
+                .expect("save a strikeout");
+
+        assert_eq!(report.written_ids, vec![strikeout().id]);
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(report.source_bytes_preserved);
+        assert!(
+            fs::read(&destination)
+                .expect("saved")
+                .starts_with(&original_bytes),
+            "the source bytes are preserved as the output's prefix"
+        );
+
+        let saved = read_annotations(&destination, None, 2).expect("read saved");
+        let records: Vec<&RawAnnotation> = saved.iter().flatten().collect();
+        assert_eq!(records.len(), 8, "seven pre-existing plus the strikeout");
+
+        let written = records
+            .iter()
+            .find(|record| record.id == format!("nm:{}", strikeout().id))
+            .expect("strikeout in saved file");
+        assert_eq!(written.kind, RawAnnotationKind::Strikeout);
+        assert_eq!(written.rect, strikeout().rect);
+        assert_eq!(written.quads, strikeout().quads);
+        assert_eq!(
+            written
+                .color
+                .map(|color| [color.red, color.green, color.blue]),
+            Some(strikeout().color)
+        );
+        assert!((written.opacity.expect("opacity") - 0.9).abs() < 0.01);
+        assert_eq!(
+            written.contents.as_deref(),
+            Some("Lyra round-trip strikeout.")
+        );
+
+        // No duplicate identities, and every pre-existing annotation is the exact record it was.
+        let mut ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "no annotation identity appears twice");
+        let before = read_annotations(&source, None, 2).expect("read source");
+        for (page, page_records) in before.iter().enumerate() {
+            for original in page_records {
+                assert!(
+                    saved[page].contains(original),
+                    "pre-existing annotation {} on page {page} changed",
+                    original.id
+                );
+            }
+        }
+
+        // The saved bytes name the PDF subtype explicitly. No appearance stream is written for
+        // any quad-based markup kind; the honesty note in `writeback` says what that costs.
+        let bytes = fs::read(&destination).expect("saved bytes");
+        assert!(
+            bytes
+                .windows(b"/StrikeOut".len())
+                .any(|window| window == b"/StrikeOut"),
+            "the saved file carries /Subtype /StrikeOut"
+        );
     }
 
     #[test]
