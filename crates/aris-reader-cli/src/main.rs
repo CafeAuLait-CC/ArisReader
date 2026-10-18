@@ -194,6 +194,15 @@ pub(crate) fn opt_usize(options: &[(String, String)], names: &[&str], default: u
         .unwrap_or(default)
 }
 
+/// The last page (exclusive) a diagnostic scan reads.
+///
+/// `cap == 0` means every page: that is the default for the figure and table reports now that the
+/// index no longer stops at 120 pages. A non-zero `--pages` keeps a diagnostic bound, which is
+/// what the corpus tests' page-by-page checks want when they are not asserting the whole index.
+fn page_scan_end(total: u32, cap: u32) -> u32 {
+    if cap == 0 { total } else { total.min(cap) }
+}
+
 /// Opens a document, reporting the engine error (with its detail) on failure.
 fn open_document(path: &str) -> Result<PdfiumBackend, ExitCode> {
     match PdfiumBackend::open(Path::new(path), None) {
@@ -1757,12 +1766,15 @@ fn fragment_mark(entry: &aris_reader_text::ReferenceEntry) -> String {
 fn cmd_figures(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
     if positional.is_empty() {
-        eprintln!("usage: aris-reader-cli figures <file.pdf>... [--pages N]");
+        eprintln!(
+            "usage: aris-reader-cli figures <file.pdf>... [--pages N]  (default: every page; 0 = every page)"
+        );
         return ExitCode::from(64);
     }
-    // A figure index is wanted for the whole readable body, so the cap is flat; the same 120
-    // pages bound the reference scan in `cite` and in the FFI.
-    let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
+    // A figure index is wanted for the whole readable body; `--pages` is only a diagnostic
+    // bound. The FFI and `tables` scan every page too (the reference-list locator keeps its own
+    // window — see `REFERENCE_SCAN_PAGES` in the FFI).
+    let page_cap = opt_usize(&options, &["--pages"], 0) as u32;
 
     let mut found = 0usize;
     let mut with_image = 0usize;
@@ -1797,7 +1809,7 @@ fn figures_of_file(path: &str, page_cap: u32) -> Result<(usize, usize, usize), E
     };
 
     let total = backend.page_count();
-    let scan_end = total.min(page_cap);
+    let scan_end = page_scan_end(total, page_cap);
     println!("{path}: {total} page(s), scanning {scan_end}");
 
     let mut found = 0usize;
@@ -1933,10 +1945,12 @@ fn cmd_blocks(args: &[String]) -> ExitCode {
 fn cmd_tables(args: &[String]) -> ExitCode {
     let (positional, options) = parse(args);
     if positional.is_empty() {
-        eprintln!("usage: aris-reader-cli tables <file.pdf>... [--pages N] [--all]");
+        eprintln!(
+            "usage: aris-reader-cli tables <file.pdf>... [--pages N] [--all]  (default: every page; 0 = every page)"
+        );
         return ExitCode::from(64);
     }
-    let page_cap = opt_usize(&options, &["--pages"], 120) as u32;
+    let page_cap = opt_usize(&options, &["--pages"], 0) as u32;
     let show_all = options.iter().any(|(key, _)| key == "--all");
 
     let mut caption_total = 0usize;
@@ -1961,7 +1975,7 @@ fn cmd_tables(args: &[String]) -> ExitCode {
         let mut file_captions = 0usize;
         let mut file_grids = 0usize;
 
-        for index in 0..backend.page_count().min(page_cap) {
+        for index in 0..page_scan_end(backend.page_count(), page_cap) {
             let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
                 continue;
             };

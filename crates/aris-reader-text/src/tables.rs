@@ -43,7 +43,10 @@
 //! # What it finds, measured
 //!
 //! `aris-reader-cli tables <the 12 sample papers>`, 2026-10-13: **41 `Table` captions, 20 of them
-//! with a grid region, 21 falling back to the full page**. Region sizes: width min 241 / median
+//! with a grid region, 21 falling back to the full page**. T4.12 removed one of the 41 on
+//! 2026-10-17 — page 9 of the Leader paper prints `… before and after correction in / Table 3.
+//! Our correction …`, and that label is the end of a prose sentence — so the count is now **40
+//! captions, the same 20 with a grid region, 20 fallbacks**. Region sizes: width min 241 / median
 //! 396 / max 504 pt, height min 67 / median 121 / max 234 pt — a table-sized rectangle, not a
 //! page (612 × 792 pt).
 //!
@@ -53,7 +56,7 @@
 //! | `Zhang et al. 2025` (HumanMM) | 7 | 1 |
 //! | `Ye et al. 2024` | 6 | 4 |
 //! | `[HumanML3D] Guo …` | 4 | 3 |
-//! | `Wang et al. 2025` (Leader) | 4 | 0 |
+//! | `Wang et al. 2025` (Leader) | 3 | 0 |
 //! | `Wang et al. 2025` (InstructAvatar) | 3 | 1 |
 //! | `Zhong et al. 2025` (SMooDi) | 3 | 3 |
 //! | `Yin et al. 2023` | 1 | 0 |
@@ -64,7 +67,7 @@
 //! figure. The twentieth, `Zhang et al. 2025` page 7 `Table 2`, was fixed by the anchor rule
 //! above and is now a fallback like its two neighbours.
 //!
-//! The 21 fallbacks are **not** 21 failures of the detector: the CLI prints the reason for each.
+//! The 20 fallbacks are **not** 20 failures of the detector: the CLI prints the reason for each.
 //! They split into tables with too few rules to be a grid (a two-rule `booktabs` table has one
 //! row), three small tables that share full-width rules as their borders (`Zhang`, pages 7–8),
 //! and pages where the caption is narrower than its table by more than half again.

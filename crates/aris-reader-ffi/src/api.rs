@@ -37,6 +37,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Pages the reference-list locator reads.
+///
+/// The locator compares several candidate runs across the pages it is given (a paper's own
+/// bibliography, an appendix's independent one, a list continued under a second numbering), so it
+/// needs those pages' text together; that is the one index component whose working set grows with
+/// its window. It is deliberately kept at the historical 120 pages for a document longer than
+/// that: the reference list of a real paper is near its body, and pages beyond this window are
+/// still read once, for the citation index ([`ArisDocument::citations`]). The visible
+/// consequence for a book whose bibliography is printed after page 120 is stated by
+/// [`ArisDocument::references`]: the locator returns no entries, and citations are derived from
+/// the page shapes alone. Captions have no such window; see [`ArisDocument::figures`].
+const REFERENCE_SCAN_PAGES: u32 = 120;
+
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
 pub enum ArisFfiError {
@@ -794,13 +807,16 @@ impl ArisDocument {
     /// A page's citations are not a page-local question any more: a superscript numeral is only
     /// a citation when the document's bibliography carries its label, so this call depends on
     /// the document's reference list and its citation style. The first access builds that index
-    /// (or loads it from the sidecar); the reference scan already holds every scanned page's
-    /// text, so it records each page's spans at the same time. A cached index therefore makes
-    /// this call independent of the PDF text layer for every page inside the scan window.
+    /// (or loads it from the sidecar); the reference scan already holds the scanned pages' text,
+    /// so it records each page's spans at the same time and reads the pages past its window for
+    /// this purpose. A cached index therefore makes this call independent of the PDF text layer
+    /// for every page of the document.
     ///
-    /// Pages outside the 120-page scan window still read that one page, exactly as before; the
-    /// result stays identical because it is produced by the same `find_citations_with` call with
-    /// the same style.
+    /// Every page is in the index: the reference scan reads the whole document once and stores
+    /// one record per page, so this call is a lookup for a page 800 as it is for page 8. The
+    /// one-page read below remains as the fallback for a page the index could not read (and for
+    /// documents opened before the index exists, where it is the first read). The result is
+    /// produced by the same `find_citations_with` call with the same style either way.
     pub fn citations(&self, page: u32) -> Result<Vec<CitationRecord>, ArisFfiError> {
         self.ensure_index_loaded();
 
@@ -929,8 +945,9 @@ impl ArisDocument {
     /// while the document is open.
     ///
     /// Unlike the reference scan there is nothing to stop early on: a figure index is wanted for
-    /// the whole readable body, so the scan is a flat cap of the first 120 pages (the cap that
-    /// `references` and the CLI already use for a 2000-page manual).
+    /// the whole readable body, so every page is scanned. The scan keeps no page's text or
+    /// geometry after the page is read — only the caption records themselves — so a 900-page
+    /// document costs one page of working memory, not nine hundred.
     ///
     /// The box is the region `aris_reader_text::caption_region_from` derives, converted to **view
     /// space** so it can be handed straight to [`ArisDocument::rasterize_region`]: the caption
@@ -947,9 +964,8 @@ impl ArisDocument {
 
         let started = Instant::now();
         let total = self.backend.page_count();
-        let scan_end = total.min(120);
         let mut records = Vec::new();
-        for index in 0..scan_end {
+        for index in 0..total {
             let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
                 continue;
             };
@@ -1855,9 +1871,12 @@ impl ArisDocument {
     /// answers come from this one scan, so the detector can never disagree with the resolver
     /// about which labels exist.
     ///
-    /// The scan already reads every page's text, so it records each page's citation spans here
-    /// as well. That is the same work a first click on a page would do, done once for the whole
-    /// scan window, and it is what the persistent cache stores.
+    /// The scan reads every page's text and records each page's citation spans here as well.
+    /// That is the same work a first click on a page would do, done once for the whole document
+    /// and stored in the persistent cache: a citation on page 800 costs a map lookup, not a text
+    /// extraction, and a 900-page book holds one citation record per span rather than one text
+    /// layer per page. The reference-list locator itself still reads the first
+    /// [`REFERENCE_SCAN_PAGES`] pages (see that constant).
     fn reference_cache(&self) -> Result<Arc<ReferenceCache>, ArisFfiError> {
         self.ensure_index_loaded();
         if let Ok(cache) = self.references.lock()
@@ -1867,12 +1886,12 @@ impl ArisDocument {
         }
 
         let started = Instant::now();
-        // Scanning from the front with a cap, rather than only the tail: real papers put the
+        // Scanning from the front with a window, rather than only the tail: real papers put the
         // list anywhere from a third of the way in (with appendices after it) to the very end.
-        // `find_references` stops as soon as the list ends, so the cost is bounded by the list's
-        // position, and the cap keeps a 2000-page manual from being read page by page.
+        // The window is what keeps a 2000-page manual's reference locator from holding every
+        // page's text at once; the citation index still reads the remaining pages below.
         let total = self.backend.page_count();
-        let scan_end = total.min(120);
+        let scan_end = total.min(REFERENCE_SCAN_PAGES);
         let mut pages = Vec::new();
         for index in 0..scan_end {
             if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
@@ -1987,6 +2006,19 @@ impl ArisDocument {
                 continue;
             };
             citations.insert(*index, citation_records(text, &style, *index, transform));
+        }
+        // The reference locator stops at its window, but the citation index does not: every page
+        // past it is read once here, with the style the document's own list implied, and stored
+        // in the same map (and in the cache). This is the difference between a 900-page book
+        // indexing every page once and re-extracting a page on every click.
+        for index in scan_end..total {
+            let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
+                continue;
+            };
+            let Some(transform) = document_page_view(&self.backend, &mut transforms, index) else {
+                continue;
+            };
+            citations.insert(index, citation_records(&text, &style, index, transform));
         }
 
         let cache = Arc::new(ReferenceCache { records, style });

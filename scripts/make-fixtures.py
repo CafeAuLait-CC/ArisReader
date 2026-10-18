@@ -1074,6 +1074,97 @@ def numeric_references_page() -> str:
     return "\n".join(parts)
 
 
+def caption_false_positive_pages() -> list[tuple[str, int]]:
+    """The T4.12 shape: a label that only *ends* a sentence at the start of a printed line.
+
+    Page 1 is running prose. The extractor breaks the paragraph at the printer's line end, so the
+    second line begins `Table 3. We observe ...` — the label is the tail of the sentence above,
+    not a caption. The real `Figure 1` caption sits lower on the same page, after a paragraph
+    break, and the real `Table 3` caption is on page 2. A detector that only looks at line-start
+    punctuation reports three captions here; the right answer is two, with the page-1 `Table 3`
+    occurrence left in the mention stream.
+    """
+    body = [
+        (742, "The previous section established the baseline method and"),
+        (727, "Table 3. We observe that the correction halves the error."),
+        (712, "This paragraph continues with more observations."),
+    ]
+    caption = [
+        (640, "Figure 1: Overview of the pipeline in three stages."),
+        (629, "The stages share one encoder."),
+    ]
+    parts = ["0 0 0 rg"]
+    for y, text in body:
+        parts.append(f"BT /F1 11 Tf 72 {y} Td ({escape_pdf_string(text)}) Tj ET")
+    for y, text in caption:
+        parts.append(f"BT /F1 8 Tf 72 {y} Td ({escape_pdf_string(text)}) Tj ET")
+    page_one = "\n".join(parts)
+
+    page_two = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 11 Tf 72 742 Td (Every run used the same schedule and settings.) Tj ET",
+            "BT /F1 8 Tf 72 700 Td (Table 3: Settings used by every run.) Tj ET",
+        ]
+    )
+    return [(page_one, 0), (page_two, 0)]
+
+
+def index_past_120_pages(page_count: int = 130) -> list[tuple[str, int]]:
+    """A 130-page document with a caption and a citation past the old 120-page window.
+
+    The reference list is on page 2 (inside the old window, so the citation style is known) and
+    page 1 already cites it. Everything after that is filler until page 121, which carries a real
+    `Figure 1` caption, and page 125, which carries a real `Table 1` caption and a `[1]` citation.
+    Before T4.13 the figure index stopped at page 120, so neither late caption was in it, and the
+    citation map stopped there too, so page 125 was not cached. The filler is deliberate: the
+    point of the fixture is the page number, not the content.
+    """
+    pages: list[tuple[str, int]] = []
+
+    page_one = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 20 Tf 72 790 Td (Long index fixture) Tj ET",
+            "BT /F1 11 Tf 72 740 Td (Prior work established the baseline method [1].) Tj ET",
+            "BT /F1 11 Tf 72 715 Td (This document exists to carry content past page 120.) Tj ET",
+        ]
+    )
+    pages.append((page_one, 0))
+
+    references = "\n".join(
+        [
+            "0 0 0 rg",
+            "BT /F1 14 Tf 72 790 Td (References) Tj ET",
+            "BT /F1 10 Tf 72 760 Td (1. Alpha, A. 2019. A first work on motion.) Tj ET",
+            "BT /F1 10 Tf 72 745 Td (2. Beta, B. 2020. A second work on shape.) Tj ET",
+        ]
+    )
+    pages.append((references, 0))
+
+    for number in range(3, page_count + 1):
+        parts = [
+            "0 0 0 rg",
+            f"BT /F1 16 Tf 72 790 Td (Long fixture page {number} of {page_count}) Tj ET",
+            f"BT /F1 10 Tf 72 750 Td (Filler line {number}: the page number is the content.) Tj ET",
+            f"BT /F1 10 Tf 72 735 Td (Nothing here is a caption, a table or a citation.) Tj ET",
+        ]
+        if number == 121:
+            parts += [
+                "BT /F1 10 Tf 72 700 Td (The result below is stated on a page past the old window.) Tj ET",
+                f"BT /F1 8 Tf 72 660 Td (Figure 1: Late figure on page {number}.) Tj ET",
+                f"BT /F1 8 Tf 72 649 Td (It exists only to be found past page 120.) Tj ET",
+            ]
+        if number == 125:
+            parts += [
+                "BT /F1 10 Tf 72 700 Td (A later result extends the first work [1].) Tj ET",
+                f"BT /F1 8 Tf 72 660 Td (Table 1: Late table on page {number}.) Tj ET",
+            ]
+        pages.append(("\n".join(parts), 0))
+
+    return pages
+
+
 def long_document(page_count: int) -> list[tuple[str, int]]:
     """A synthetic long document for the T1.13 measurement (~300 pages).
 
@@ -1240,7 +1331,13 @@ def main() -> int:
                 0,
             ),
         ],
-        # 8) A parenthesised-numeral paper: a Nature-like `1.` … `14.` bibliography and one body
+        # 8) T4.12: a wrapped prose line that starts with a label must stay a mention, while the
+        #    real label of the same number on another page is still a caption.
+        "caption-false-positive.pdf": caption_false_positive_pages(),
+        # 9) T4.13: captions and citations on pages 121 and 125 of a 130-page document, past the
+        #    120-page window the index used to stop at.
+        "index-past-120.pdf": index_past_120_pages(),
+        # 10) A parenthesised-numeral paper: a Nature-like `1.` … `14.` bibliography and one body
         #    page holding every accepted form and every non-citation form the detector must
         #    classify. The test (`paren_fixture.rs`) asserts one decision per case.
         "numeric-citations.pdf": [

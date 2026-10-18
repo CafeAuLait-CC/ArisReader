@@ -172,7 +172,7 @@ fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let backend = PdfiumBackend::open(&path, None).expect("open PDF");
-        let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count().min(120))
+        let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count())
             .map(|page| {
                 (
                     page,

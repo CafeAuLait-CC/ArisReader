@@ -49,7 +49,7 @@ fn sample_citations_resolve_to_bibliography_entries() {
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
             .expect(prefix);
         let backend = PdfiumBackend::open(path, None).expect("open PDF");
-        let pages: Vec<_> = (0..backend.page_count().min(120))
+        let pages: Vec<_> = (0..backend.page_count())
             .map(|p| {
                 (
                     p,

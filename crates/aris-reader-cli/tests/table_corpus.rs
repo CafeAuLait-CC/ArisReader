@@ -38,7 +38,7 @@ fn table_captions_get_a_grid_region_when_the_page_draws_one() {
         let mut file_grids = 0usize;
         let mut file_captions = 0usize;
 
-        for index in 0..backend.page_count().min(120) {
+        for index in 0..backend.page_count() {
             let Ok(text) = backend.raw_text_page(PageIndex(index)) else {
                 continue;
             };
@@ -90,8 +90,11 @@ fn table_captions_get_a_grid_region_when_the_page_draws_one() {
     println!("total: {captions} table caption(s), {grids} with a grid region");
 
     // Measured 2026-10-13 on the 12-paper corpus: 41 `Table` captions, 20 of them with a grid.
-    // The other 21 fall back to the page, and the CLI reports why for each.
-    assert_eq!(captions, 41, "the corpus's table caption count changed");
+    // T4.12 removed one of the 41 on 2026-10-17 — the wrapped prose `Table 3. Our correction
+    // reduce …` on page 9 of the Leader paper, which was never a caption — leaving 40 captions,
+    // the same 20 grid regions (the removed line was a fallback) and 20 fallbacks. A change that
+    // finds *more* tables is still welcome; this pins the count so a loss is not mistaken for it.
+    assert_eq!(captions, 40, "the corpus's table caption count changed");
     assert!(
         grids >= 20,
         "the corpus had 20 grid-derived tables; found {grids}"
