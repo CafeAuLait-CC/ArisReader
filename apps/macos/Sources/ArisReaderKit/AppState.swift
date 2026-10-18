@@ -595,7 +595,15 @@ public final class AppState: ObservableObject {
     private var renderEpoch: UInt64 = 0
 
     /// Text layers, fetched once per page.
-    private var textPages: [Int: TextPage] = [:]
+    private var textPages: [Int: TextPage] = [:] {
+        didSet {
+            if textPages.isEmpty { passageTextMaps = [:] }
+            rebuildAnnotationPassages()
+        }
+    }
+    private var passageTextMaps: [Int: AnnotationSentenceMap] = [:]
+    @Published package private(set) var annotationPassages: [AnnotationPassage] = []
+    @Published package private(set) var annotationSidebarPages: [AnnotationSidebarPage] = []
     private var textPagesInFlight: Set<Int> = []
     /// Page placements from the last layout pass (hit-testing needs them).
     private var visiblePagePlacements: [PagePlacement] = []
@@ -638,6 +646,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             case .stickyNote, .textBox: return false
             }
         }
+
+        public var isTextMarkup: Bool { self == .highlight || self == .underline || self == .strikeout }
 
         /// Whether this kind is a placed text annotation (a sticky note or a text box).
         ///
@@ -1224,9 +1234,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// else made (or the reader made in another viewer).
     ///
     /// A different thing from `annotations` below: that is what this reader wrote to its sidecar,
-    /// this is what the file says. The two are shown together on the canvas and listed separately
-    /// in the sidebar, because only one of them can be edited here.
-    @Published public private(set) var documentAnnotations: [DocumentAnnotation] = []
+    /// this is what the file says. Both sources share sentence excerpts in the sidebar, while
+    /// only the sidecar annotations can be edited here.
+    @Published public private(set) var documentAnnotations: [DocumentAnnotation] = [] {
+        didSet { passageTextMaps = [:]; rebuildAnnotationPassages() }
+    }
     /// True while the document's own annotations are being read (the sidebar shows it).
     @Published public private(set) var documentAnnotationsLoading = false
     /// Why the document's annotations could not be read, if they could not.
@@ -1275,7 +1287,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// a shape this one does not understand are not in here: they live in
     /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
     /// `AnnotationSidecar`).
-    @Published public private(set) var annotations: [Annotation] = []
+    @Published public private(set) var annotations: [Annotation] = [] {
+        didSet { rebuildAnnotationPassages() }
+    }
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The two cannot both be active.
     @Published public var annotationTool: AnnotationTool = .select {
@@ -1311,6 +1325,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var editingAnnotationID: UUID?
     private var editingWasCreated = false
     private var editingOriginalText = ""
+    private var editingOriginalAnnotation: Annotation?
+    private var editingTextBoxWidth: CGFloat = 320
     private var editingUndoDepth = 0
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
@@ -2822,6 +2838,82 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         addAnnotationFromSelection(kind: .highlight, note: note)
     }
 
+    /// The context menu starts a themed paper editor directly beside the selected line.
+    public func beginNoteFromSelection() {
+        guard let selected = selection else { return }
+        let existing = annotations.first {
+            $0.kind.isTextMarkup && $0.page == selected.page
+                && $0.start == selected.range.lowerBound && $0.end == selected.range.upperBound
+        }
+        let id: UUID
+        if let existing { id = existing.id }
+        else {
+            guard addAnnotationFromSelection(kind: .highlight, color: annotationColor),
+                  let created = annotations.last else { return }
+            id = created.id
+        }
+        annotationTool = .select
+        beginEditingAnnotation(id, created: existing == nil)
+        sidebarTab = .annotations
+        sidebarVisible = true
+    }
+
+    public var ownInlineNoteMarkers: [InlineNoteMarker] {
+        InlineNoteMarker.layoutOwn(annotations: annotations, textPages: textPages, editingID: editingAnnotationID,
+                                  occupied: inlineNoteMarkers)
+    }
+
+    public var editingAnnotationAnchor: CGRect? {
+        guard let annotation = editingAnnotation else { return nil }
+        let rect = annotation.shapeRect ?? ownInlineNoteMarkers.first(where: { $0.id == annotation.id.uuidString })?.rect
+        return anchorViewRect(page: annotation.page, region: rect)
+    }
+
+    private func rebuildAnnotationPassages() {
+        let wanted = Set(documentAnnotations.filter { $0.drawing == .markup }.map(\.page)
+            + annotations.filter { $0.kind.isTextMarkup }.map(\.page))
+        for page in wanted where passageTextMaps[page] == nil {
+            if let text = textPages[page] { passageTextMaps[page] = AnnotationSentenceMap(text) }
+        }
+        annotationPassages = AnnotationPassage.build(document: documentAnnotations, own: annotations,
+            pages: textPages, maps: &passageTextMaps)
+        annotationSidebarPages = AnnotationSidebarPage.build(passages: annotationPassages,
+            document: documentAnnotations, own: annotations)
+    }
+
+    /// Only the pages with text markup need extraction, and only when the annotation list opens.
+    public func loadAnnotationPassages() async {
+        let epoch = documentEpoch
+        let pages = Set(documentAnnotations.filter { $0.drawing == .markup }.map(\.page)
+            + annotations.filter { $0.kind.isTextMarkup }.map(\.page))
+        for page in pages.sorted() {
+            guard epoch == documentEpoch, !Task.isCancelled else { return }
+            guard textPages[page] == nil, !textPagesInFlight.contains(page) else { continue }
+            textPagesInFlight.insert(page)
+            if let text = try? await engine.textPage(page), epoch == documentEpoch { textPages[page] = text }
+            if epoch == documentEpoch { textPagesInFlight.remove(page) }
+        }
+    }
+
+    package func openPassageNote(_ source: AnnotationSource) {
+        jump(to: source)
+        switch source {
+        case .document(let id):
+            selectedDocumentAnnotationID = id
+            openDocumentNoteID = id
+        case .own(let id): beginEditingAnnotation(id)
+        }
+    }
+
+    package func jump(to source: AnnotationSource) {
+        switch source {
+        case .document(let id):
+            if let annotation = documentAnnotations.first(where: { $0.id == id }) { jump(toDocumentAnnotation: annotation) }
+        case .own(let id):
+            if let annotation = annotations.first(where: { $0.id == id }) { jump(to: annotation) }
+        }
+    }
+
     // MARK: - Ink and shapes (T3.4)
 
     /// The opaque colour a pen or shape is drawn in: the current annotation colour's hue at full
@@ -3152,20 +3244,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return annotations.first { $0.id == id }
     }
 
-    /// Opens the text editor for a placed-text annotation.
+    /// Opens the text editor for a placed-text annotation or text-linked note.
     public func beginEditingAnnotation(_ id: UUID, created: Bool = false) {
+        guard editingAnnotationID != id else { return }
         guard let annotation = annotations.first(where: { $0.id == id }),
-              annotation.kind.isPlacedText else { return }
-        if editingAnnotationID != nil, editingAnnotationID != id {
-            commitTextEditing()
-        }
+              annotation.kind.isPlacedText || annotation.kind.isTextMarkup else { return }
+        guard commitTextEditing() else { return }
         selectedAnnotationID = id
+        if annotation.kind == .textBox { annotationTool = .select }
         selection = nil
         selectionAnchor = nil
         closeDocumentNote()
         editingAnnotationID = id
         editingWasCreated = created
         editingOriginalText = annotation.note
+        editingOriginalAnnotation = annotation
+        editingTextBoxWidth = created ? max(120, annotation.shapeRect?.width ?? 320)
+            : max(320, annotation.shapeRect?.width ?? 320)
         editingUndoDepth = undoStack.count
         refreshSelectionOverlay()
     }
@@ -3173,19 +3268,51 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Applies text typed in the editor. Sidecar writes are coalesced by `updateNote`; undo
     /// merges consecutive keystrokes into one step for the session.
     public func updateEditingText(_ text: String) {
-        guard let id = editingAnnotationID else { return }
-        // The editor itself shows what is being typed; the page glyph for a text box is hidden
-        // during editing and a note's icon does not change with its text. Rebuilding the canvas
-        // per keystroke would buy nothing and cost a tile pass.
-        updateNote(text, for: id)
+        guard let id = editingAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        guard annotations[index].kind == .textBox, let box = annotations[index].shapeRect else {
+            updateNote(text, for: id)
+            refreshSelectionOverlay()
+            return
+        }
+        let before = annotations[index]
+        let placement = visiblePagePlacements.first { $0.index == before.page }
+        let pageSize = CGSize(width: placement?.widthPt ?? box.maxX + 320, height: placement?.heightPt ?? box.maxY + 600)
+        var after = before
+        after.note = text
+        after.shapeRect = TextBoxLayout.fittedRect(text: text, fontSize: before.fontSize,
+            origin: box.origin, maximumWidth: max(1, min(editingTextBoxWidth, pageSize.width - box.minX)),
+            maximumHeight: max(1, pageSize.height - box.minY))
+        guard after != before else { return }
+        var updated = annotations
+        updated[index] = after
+        if noteFlushTask == nil {
+            guard saveAnnotations(updated, trigger: "edit-text-box") else { return }
+            scheduleNoteFlush()
+        } else {
+            annotations = updated
+            hasPendingAnnotationWrite = true
+            noteWindowSawKeystrokes = true
+        }
+        if undoStack.count > editingUndoDepth,
+           case .replaced(let original, _) = undoStack.last, original.id == id {
+            undoStack.removeLast()
+            undoStack.append(.replaced(before: original, after: after))
+        } else { undoStack.append(.replaced(before: before, after: after)) }
+        redoStack.removeAll()
+        refreshSelectionOverlay()
     }
 
     /// Commits the open editor: flushes the coalesced sidecar write and closes the editor.
     @discardableResult
     public func commitTextEditing() -> Bool {
         guard editingAnnotationID != nil else { return true }
+        let isTextBox = editingAnnotation?.kind == .textBox
         let written = flushPendingAnnotationWrite()
+        guard written else { return false }
         editingAnnotationID = nil
+        editingOriginalAnnotation = nil
+        if isTextBox { selectedAnnotationID = nil }
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
@@ -3205,6 +3332,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         noteWindowSawKeystrokes = false
         let wasCreated = editingWasCreated
         let originalText = editingOriginalText
+        let originalAnnotation = editingOriginalAnnotation
+        editingOriginalAnnotation = nil
         let depth = editingUndoDepth
         editingAnnotationID = nil
         editingWasCreated = false
@@ -3215,7 +3344,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if wasCreated {
             updated.removeAll { $0.id == id }
         } else if let index = updated.firstIndex(where: { $0.id == id }) {
-            updated[index].note = originalText
+            if let originalAnnotation { updated[index] = originalAnnotation }
+            else { updated[index].note = originalText }
         }
         guard saveAnnotations(updated, trigger: wasCreated ? "cancel-new-text" : "cancel-text") else {
             return
@@ -3345,7 +3475,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 lineEnd: annotation.lineEnd,
                 color: annotation.color,
                 strokeWidth: annotation.strokeWidth,
-                isSelected: annotation.id == selectedAnnotationID,
+                isSelected: annotation.id == selectedAnnotationID
+                    && !(editingAnnotationID == annotation.id && annotation.kind == .textBox),
                 isEditable: true
             )
         }
@@ -6543,6 +6674,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func openInlineNote(at point: CGPoint) -> Bool {
+        for marker in ownInlineNoteMarkers.reversed() {
+            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            guard marker.rect.contains(local), annotations.indices.contains(marker.annotationIndex) else { continue }
+            beginEditingAnnotation(annotations[marker.annotationIndex].id)
+            return true
+        }
         for marker in inlineNoteMarkers.reversed() {
             guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
             let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
@@ -8495,15 +8633,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             appendHighlight(
                 page: annotation.page,
                 range: annotation.start...max(annotation.start, annotation.end),
-                // Our own annotations are drawn alpha-over: the sidecar colour already carries
-                // the opacity the reader chose, and it was chosen against a white page.
-                image: annotationTexture(for: annotation.color, opacity: 1.0, blend: .normal),
+                // Multiply preserves black glyphs while tinting the paper, just like PDF markup.
+                image: annotationTexture(for: annotation.color, opacity: 1.0, blend: .multiply),
                 // Its own index block, one slot per line: the index is the key the canvas caches
                 // this quad's texture under, so it must not collide with a page raster or with a
                 // loaded annotation (see `PlacementIndex`).
                 idBase: PlacementIndex.ownAnnotation(annotationIndex),
                 verticalScale: verticalScale,
                 verticalOffset: verticalOffset,
+                blend: .multiply,
                 to: &pages
             )
         }
@@ -8532,6 +8670,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ))
         }
 
+        for marker in ownInlineNoteMarkers {
+            let annotation = annotations[marker.annotationIndex]
+            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }),
+                  let image = ownInlineGlyph(annotation: annotation, index: marker.annotationIndex, size: marker.rect.size)
+            else { continue }
+            pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.ownNote(marker.annotationIndex),
+                topPt: placement.topPt + marker.rect.minY, leftPt: placement.leftPt + marker.rect.minX,
+                widthPt: marker.rect.width, heightPt: marker.rect.height), image: image))
+        }
         appendDocumentAnnotations(to: &pages)
     }
 
@@ -8797,7 +8944,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                fontSizePt: annotation.fontSize > 0
                                    ? annotation.fontSize : Annotation.defaultTextBoxFontSize,
                                alignment: "left", boxPt: box.size, scale: scale,
-                               generation: generation)
+                               generation: generation, useAppearanceFont: true)
         default:
             nil
         }
@@ -8828,6 +8975,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let scale: CGFloat
     }
 
+    private func ownInlineGlyph(annotation: Annotation, index: Int, size: CGSize) -> PageImage? {
+        let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let key = PlacedGlyphKey(index: index, kind: "inline-comment", color: annotation.color,
+            text: "", fontSize: 0, boxPt: size, scale: scale)
+        if let image = placedGlyphTextures[key] { return image }
+        placedGlyphTextures = placedGlyphTextures.filter { $0.key.index != index }
+        nextAnnotationTextureGeneration &+= 1
+        let image = NoteGlyph.inlineComment(color: annotation.color, boxPt: size, scale: scale,
+            generation: nextAnnotationTextureGeneration)
+        if let image { placedGlyphTextures[key] = image }
+        return image
+    }
+
     private func appendHighlight(
         page: Int,
         range: ClosedRange<Int>,
@@ -8835,6 +8995,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         idBase: Int,
         verticalScale: CGFloat = 1.0,
         verticalOffset: CGFloat = 0.0,
+        blend: QuadBlend = .normal,
         to pages: inout [CanvasPage]
     ) {
         guard let textPage = textPages[page],
@@ -8850,7 +9011,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     widthPt: rect.width,
                     heightPt: max(rect.height * verticalScale, 1)
                 ),
-                image: image
+                image: image,
+                blend: blend
             ))
         }
     }

@@ -114,7 +114,7 @@ extension ReaderChecks {
         // 4. The AppKit menu is built from the same items, disables AppKit's auto-enabling, and
         //    has no dead entries; a point outside every page has no menu at all.
         guard let menu = CanvasContextMenu.menu(
-            state: state, at: point, promptForNote: { "menu note" }
+            state: state, at: point
         ) else { fatalError("FAIL: the canvas menu is missing where the page is") }
         require(!menu.autoenablesItems, "the canvas menu keeps the states it built")
         require(menu.items.filter { !$0.isSeparatorItem }.allSatisfy(\.isEnabled),
@@ -123,7 +123,7 @@ extension ReaderChecks {
                 "the built menu carries the selection commands")
         state.clearSelection()
         require(CanvasContextMenu.menu(
-            state: state, at: CGPoint(x: -500, y: -500), promptForNote: { nil }
+            state: state, at: CGPoint(x: -500, y: -500)
         ) == nil, "a right-click away from every page offers no menu")
 
         // 5. No document: no page command at all.

@@ -127,14 +127,15 @@ enum NoteGlyph {
     ///
     /// `alignment` is `/Q` as the reader reports it (`left`, `center`, `right`); the text is
     /// wrapped to the box, which is what a free-text annotation's own appearance stream does.
-    static func freeText(
+    @MainActor static func freeText(
         _ text: String,
         color: AnnotationColor,
         fontSizePt: CGFloat,
         alignment: String,
         boxPt: CGSize,
         scale: CGFloat,
-        generation: UInt64
+        generation: UInt64,
+        useAppearanceFont: Bool = false
     ) -> PageImage? {
         guard let (width, height) = pixelSize(boxPt, scale: scale),
               let context = context(width: width, height: height)
@@ -142,7 +143,7 @@ enum NoteGlyph {
 
         // Only the size comes from the file; the face is the system's (see the type's comment).
         let size = max(fontSizePt, 1) * scale
-        let font = NSFont.systemFont(ofSize: size)
+        let font = useAppearanceFont ? AnnotationTextFont.font(size: size) : NSFont.systemFont(ofSize: size)
         var quadding: CTTextAlignment = switch alignment {
         case "center": .center
         case "right": .right
@@ -162,6 +163,7 @@ enum NoteGlyph {
             string: text,
             attributes: [
                 .font: font,
+                .kern: 0,
                 .foregroundColor: NSColor(
                     srgbRed: CGFloat(color.red) / 255,
                     green: CGFloat(color.green) / 255,
@@ -174,7 +176,8 @@ enum NoteGlyph {
 
         // A hair of padding, so a descender or an accent is not clipped by the box: a real
         // free-text appearance stream has the same problem and solves it the same way.
-        let padding = min(size * 0.12, CGFloat(min(width, height)) * 0.1)
+        let padding = useAppearanceFont ? AnnotationTextFont.padding(size: fontSizePt) * scale
+            : min(size * 0.12, CGFloat(min(width, height)) * 0.1)
         let frame = CGRect(
             x: padding,
             y: padding,

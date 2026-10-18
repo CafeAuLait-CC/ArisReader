@@ -95,7 +95,7 @@ struct FormOverlay: View {
         let shape = RoundedRectangle(cornerRadius: radius)
         let border = filled ? LyraTheme.accentBorder : LyraTheme.controlBorder.opacity(0.62)
         return shape
-            .fill(filled ? LyraTheme.accentSoft.opacity(0.70) : Color.white.opacity(0.58))
+            .fill(filled ? LyraTheme.accentSoft.opacity(0.70) : LyraTheme.fieldBg.opacity(0.78))
             .overlay {
                 if dashed {
                     shape.strokeBorder(border, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
@@ -137,17 +137,28 @@ struct FormOverlay: View {
         return ZStack(alignment: .topLeading) {
             chrome(field, rect: rect, focused: focused, filled: filled)
             if focused {
-                FormFieldTextEditor(
-                    text: Binding(
-                        get: { state.formCurrentText(field) },
-                        set: { state.updateFormText(field.id, text: $0) }
-                    ),
-                    fontSize: scaledFont(field),
-                    onTab: { backwards in state.focusNextFormField(backwards: backwards) },
-                    onEscape: { state.blurFormField() }
-                )
+                Group {
+                    if field.multiline {
+                        InlineTextBoxEditor(text: Binding(
+                            get: { state.formCurrentText(field) },
+                            set: { state.updateFormText(field.id, text: $0) }),
+                            fontSize: scaledFont(field), color: .labelColor,
+                            onCommit: { state.blurFormField() }, onCancel: { state.blurFormField() },
+                            onTab: { state.focusNextFormField(backwards: $0) }, accessibilityName: field.displayName, useAppearanceFont: false)
+                    } else {
+                        FormFieldTextEditor(
+                            text: Binding(
+                                get: { state.formCurrentText(field) },
+                                set: { state.updateFormText(field.id, text: $0) }
+                            ),
+                            fontSize: scaledFont(field),
+                            onTab: { backwards in state.focusNextFormField(backwards: backwards) },
+                            onEscape: { state.blurFormField() }
+                        )
+                    }
+                }
                 .padding(.horizontal, 4)
-                .frame(width: rect.width - 8, height: rect.height - 4, alignment: .leading)
+                .frame(width: max(1, rect.width - 8), height: max(1, rect.height - 4), alignment: .leading)
                 .offset(x: 4, y: 2)
             } else {
                 Text(text.isEmpty ? " " : text)
@@ -169,7 +180,7 @@ struct FormOverlay: View {
         .contentShape(Rectangle())
         .onTapGesture { state.focusFormField(field.id) }
         .help("\(field.kind.title): \(field.displayName)")
-        .accessibilityElement(children: .ignore)
+        .accessibilityElement(children: focused ? .contain : .ignore)
         .accessibilityLabel("\(field.kind.title) \(field.displayName)")
         .accessibilityValue(text)
         .accessibilityAddTraits(.isButton)
@@ -215,7 +226,7 @@ struct FormOverlay: View {
                         HStack(spacing: 0) {
                             ZStack {
                                 Circle()
-                                    .fill(Color.white.opacity(0.72))
+                                    .fill(LyraTheme.fieldBg.opacity(0.9))
                                 Circle()
                                     .strokeBorder(selected == index
                                                   ? LyraTheme.accentBorder
@@ -295,7 +306,7 @@ struct FormOverlay: View {
         .contentShape(Rectangle())
         .onTapGesture { state.toggleFormChoiceMenu(field.id) }
         .help("\(field.kind.title): \(field.displayName)")
-        .accessibilityElement(children: .ignore)
+        .accessibilityElement(children: focused ? .contain : .ignore)
         .accessibilityLabel("\(field.kind.title) \(field.displayName)")
         .accessibilityValue(label)
         .accessibilityAddTraits(.isButton)
@@ -369,7 +380,7 @@ struct FormOverlay: View {
             }
         }
         .frame(width: rect.width, height: rect.height)
-        .background(Color.white.opacity(0.58))
+        .background(LyraTheme.fieldBg.opacity(0.78))
         .overlay(RoundedRectangle(cornerRadius: 3)
             .strokeBorder(focused ? LyraTheme.focusRing
                                   : (selected == nil ? LyraTheme.controlBorder.opacity(0.62)

@@ -201,9 +201,8 @@ extension ReaderChecks {
         let placement = futureEngine.visiblePages(scrollYPt: futureState.scrollYPt,
             viewportHeightPt: 500, gapPt: futureState.pageGapPt, marginPt: 0)
             .first { $0.index == known.page }!
-        // The tint texture holds the stored colour straight (this annotation is drawn
-        // alpha-over), so the bytes to look for are the annotation's own colour.
-        let expectedColor = Data(known.color.bgra)
+        // Multiply folds opacity into the tint rather than replacing the source glyphs.
+        let expectedColor = Data(known.color.baked(opacity: 1).bgra)
         require(!expectedRects.isEmpty, "known annotation has nonempty text geometry")
         // Texture-cache IDs are private allocation details. Assert that the actual
         // annotation-colored quads cover the expected text, not a numeric ID range
@@ -212,7 +211,7 @@ extension ReaderChecks {
             expectedRects.allSatisfy { rect in
                 futureState.canvasPages.contains { canvas in
                     canvas.image.pixelWidth == 1 && canvas.image.pixelHeight == 1
-                        && canvas.image.bgra == expectedColor
+                        && canvas.image.bgra == expectedColor && canvas.blend == .multiply
                         && canvas.placement.leftPt == placement.leftPt + rect.minX
                         && canvas.placement.topPt == placement.topPt + rect.minY
                         && canvas.placement.widthPt == rect.width
@@ -838,11 +837,11 @@ extension ReaderChecks {
         require(customState.annotations.count == 2, "both annotations reload")
         let reloaded = customState.annotations.first { $0.note.isEmpty }
         require(reloaded?.color == chosen, "the exact colour survives a save and a reopen")
-        // …and the canvas quad carries those bytes: the colour is not just stored, it is drawn.
-        let expected = Data(chosen.bgra)
+        // The stored hue/opacity is folded into the Multiply tint used on the canvas.
+        let expected = Data(chosen.baked(opacity: 1).bgra)
         try await eventually("the custom colour is the one drawn on the canvas", {
             customState.canvasPages.contains { page in
-                page.image.pixelWidth == 1 && page.image.bgra == expected
+                page.image.pixelWidth == 1 && page.image.bgra == expected && page.blend == .multiply
             }
         })
     }

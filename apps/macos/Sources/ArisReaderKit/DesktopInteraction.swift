@@ -148,13 +148,12 @@ public enum CanvasContextMenu {
     /// there is nothing to offer. AppKit does not present this as a system menu.
     ///
     /// Nothing to offer is a real answer: a right-click in the gap between two pages should not
-    /// pop an empty menu. `promptForNote` is the app's only UI contribution; everything else runs
-    /// through ``perform(_:state:at:note:)``.
+    /// pop an empty menu. Notes begin an inline editing session; the other commands run through
+    /// ``perform(_:state:at:note:)``.
     @MainActor
     public static func menu(
         state: AppState,
-        at point: CGPoint,
-        promptForNote: @escaping () -> String?
+        at point: CGPoint
     ) -> NSMenu? {
         let sections = sections(state: state, at: point)
         guard !sections.isEmpty else { return nil }
@@ -170,8 +169,7 @@ public enum CanvasContextMenu {
                 let handler = ContextMenuHandler { [weak state] in
                     guard let state else { return }
                     if item.action == .addNoteToSelection {
-                        guard let note = promptForNote() else { return }
-                        _ = perform(item.action, state: state, at: point, note: note)
+                        state.beginNoteFromSelection()
                     } else {
                         _ = perform(item.action, state: state, at: point)
                     }

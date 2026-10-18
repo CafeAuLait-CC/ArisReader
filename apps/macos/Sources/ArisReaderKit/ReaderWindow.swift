@@ -205,9 +205,7 @@ public struct ReaderWindow: View {
                 // the link under the pointer, or stage a page command. The items are built from
                 // the reader's state (`CanvasContextMenu`), so no item is shown dead.
                 onContextMenu: { point in
-                    CanvasContextMenu.menu(state: state, at: point) {
-                        ReaderWindow.promptForNote()
-                    }
+                    CanvasContextMenu.menu(state: state, at: point)
                 }
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
@@ -416,30 +414,6 @@ public struct ReaderWindow: View {
             .padding(.vertical, 6)
             .background(LyraTheme.raisedBg, in: Capsule())
             .opacity(state.document == nil ? 0 : 1)
-    }
-
-    /// Asks for the text of a note attached to the current selection.
-    ///
-    /// This is the context menu's only piece of UI: the note itself is stored by
-    /// ``AppState/addNoteFromSelection(note:)``, exactly like a highlight added from the toolbar,
-    /// so the menu item is a prompt in front of an existing command and not a second annotation
-    /// path. An empty note is not stored: a highlight with no note is what "Highlight Selection"
-    /// already does.
-    @MainActor
-    static func promptForNote() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Add a Note"
-        alert.informativeText =
-            "The note is attached to the selected text and can be edited in the Annotations sidebar."
-        alert.addButton(withTitle: "Add Note")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "Note"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
     }
 }
 
