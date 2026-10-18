@@ -129,6 +129,15 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// Redaction rectangles that are pending on the page, drawn above the page but below the
+    /// selection chrome. Empty after the reader applies or clears them.
+    public var redactionMarks: [CanvasRedactionMark] = [] {
+        didSet {
+            guard redactionMarks != oldValue else { return }
+            syncAnnotationOverlay()
+        }
+    }
+
     /// Colour and width of the mark a drag creates. `AppState` owns both; the canvas only draws.
     public var annotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255)
     public var annotationStrokeWidth: CGFloat = 2 {
@@ -137,6 +146,8 @@ public final class MetalCanvasView: NSView {
 
     /// A finished stroke or shape, handed to the shell once, on mouse-up.
     public var onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    /// A finished redaction rectangle: page index and page-local (top-left) rectangle.
+    public var onRedactionDraft: ((Int, CGRect) -> Void)?
     /// The eraser gesture, in content points. `dragged` receives the segment's previous and
     /// current points, so the model tests the path the pointer travelled, not isolated samples.
     public var onEraseGestureBegan: ((CGPoint) -> Void)?
@@ -160,6 +171,7 @@ public final class MetalCanvasView: NSView {
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
     private var drawingPlacesTextBox = false
+    private var drawingPlacesRedaction = false
     private var annotationSelectGesture = false
     /// The press was the sticky-note tool's; placement happens on mouse-up if it stayed a click.
     private var notePlacementPending = false
@@ -665,6 +677,17 @@ public final class MetalCanvasView: NSView {
             return
         }
 
+        // The redaction tool owns the gesture from press to release. Like the shapes, its live
+        // preview stays in the overlay; only a finished rectangle reaches AppState, and even then
+        // it is pending until the explicit apply command.
+        if annotationTool == .redact, let hit = pageLocalPoint(atContent: content) {
+            drawingPage = hit.page
+            drawingKind = .square
+            drawingPlacesRedaction = true
+            annotationOverlay?.beginLiveStroke(kind: .square, page: hit.page, at: hit.point)
+            return
+        }
+
         // A drawing tool owns the gesture from press to release. The live preview lives entirely
         // inside the overlay: nothing reaches AppState until mouse-up. The text-box tool uses the
         // rectangle preview and turns it into a text box when the drag ends.
@@ -672,6 +695,7 @@ public final class MetalCanvasView: NSView {
             drawingPage = hit.page
             drawingKind = .square
             drawingPlacesTextBox = true
+            drawingPlacesRedaction = false
             annotationOverlay?.beginLiveStroke(kind: .square, page: hit.page, at: hit.point)
             return
         }
@@ -680,6 +704,7 @@ public final class MetalCanvasView: NSView {
             drawingPage = hit.page
             drawingKind = kind
             drawingPlacesTextBox = false
+            drawingPlacesRedaction = false
             annotationOverlay?.beginLiveStroke(kind: kind, page: hit.page, at: hit.point)
             return
         }
@@ -771,11 +796,17 @@ public final class MetalCanvasView: NSView {
         if drawingKind != nil {
             let draft = annotationOverlay?.finishLiveStroke(in: annotationPageFrames)
             let placesTextBox = drawingPlacesTextBox
+            let placesRedaction = drawingPlacesRedaction
             drawingKind = nil
             drawingPage = nil
             drawingPlacesTextBox = false
+            drawingPlacesRedaction = false
             if let draft {
-                if placesTextBox, let rect = draft.shapeRect {
+                if placesRedaction {
+                    if let rect = draft.shapeRect, rect.width >= 1, rect.height >= 1 {
+                        onRedactionDraft?(draft.page, rect)
+                    }
+                } else if placesTextBox, let rect = draft.shapeRect {
                     onAnnotationDraft?(AnnotationDraft(kind: .textBox, page: draft.page,
                                                        shapeRect: rect))
                 } else {
@@ -838,6 +869,7 @@ public final class MetalCanvasView: NSView {
             drawingKind = nil
             drawingPage = nil
             drawingPlacesTextBox = false
+            drawingPlacesRedaction = false
             notePlacementPending = false
             if eraserGestureActive {
                 eraserGestureActive = false
@@ -1186,6 +1218,7 @@ public final class MetalCanvasView: NSView {
             themeColor: NSColor.controlAccentColor,
             paperAppearance: paperAppearance
         )
+        overlay.updateRedactions(redactionMarks, frames: annotationPageFrames)
     }
 
     // MARK: - Geometry
@@ -1237,10 +1270,12 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let canvasClearColor: NSColor?
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
+    private let redactionMarks: [CanvasRedactionMark]
     private let annotationTool: AnnotationTool
     private let annotationColor: AnnotationColor
     private let annotationStrokeWidth: CGFloat
     private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
+    private let onRedactionDraft: ((Int, CGRect) -> Void)?
     private let onEraseGestureBegan: ((CGPoint) -> Void)?
     private let onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)?
     private let onEraseGestureEnded: (() -> Void)?
@@ -1280,10 +1315,12 @@ public struct PDFCanvasView: NSViewRepresentable {
         canvasClearColor: NSColor? = nil,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
+        redactionMarks: [CanvasRedactionMark] = [],
         annotationTool: AnnotationTool = .select,
         annotationColor: AnnotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255),
         annotationStrokeWidth: CGFloat = 2,
         onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
+        onRedactionDraft: ((Int, CGRect) -> Void)? = nil,
         onEraseGestureBegan: ((CGPoint) -> Void)? = nil,
         onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)? = nil,
         onEraseGestureEnded: (() -> Void)? = nil,
@@ -1319,10 +1356,12 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.canvasClearColor = canvasClearColor
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
+        self.redactionMarks = redactionMarks
         self.annotationTool = annotationTool
         self.annotationColor = annotationColor
         self.annotationStrokeWidth = annotationStrokeWidth
         self.onAnnotationDraft = onAnnotationDraft
+        self.onRedactionDraft = onRedactionDraft
         self.onEraseGestureBegan = onEraseGestureBegan
         self.onEraseGestureDragged = onEraseGestureDragged
         self.onEraseGestureEnded = onEraseGestureEnded
@@ -1386,10 +1425,12 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.canvasClearColor = canvasClearColor
         view.annotationMarks = annotationMarks
         view.annotationPageFrames = annotationPageFrames
+        view.redactionMarks = redactionMarks
         view.annotationTool = annotationTool
         view.annotationColor = annotationColor
         view.annotationStrokeWidth = annotationStrokeWidth
         view.onAnnotationDraft = onAnnotationDraft
+        view.onRedactionDraft = onRedactionDraft
         view.onEraseGestureBegan = onEraseGestureBegan
         view.onEraseGestureDragged = onEraseGestureDragged
         view.onEraseGestureEnded = onEraseGestureEnded

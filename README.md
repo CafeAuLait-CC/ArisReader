@@ -237,6 +237,114 @@ leftover temporary in the status line; the document is intact because only the f
 a save take effect. The next save removes the leftovers (the engine's
 `interruptedSaveNote(at:)` is the detection point).
 
+## Redaction that removes content
+
+**Redaction tool** in the annotation row (or **Redaction ▸ Redact Tool**) arms a drag that marks a
+rectangle. **Redaction ▸ Mark Selection for Redaction** turns the current text selection into one
+rectangle per selected line. Marks are drawn on the page as a dark translucent fill with a dashed
+red edge and a banner says how many are pending; they are not annotations and nothing has been
+written yet. **Apply to Copy…** writes `<name> (redacted).pdf`, **Replace Original…** changes the
+file on disk after a verified backup, and **Clear** throws the marks away. Both apply commands are
+explicit and confirm what will be lost: area and page counts, the characters under the marks and
+an excerpt of them, and how many vector/image objects they touch.
+
+What "removal" covers, per page content stream:
+
+* **Glyphs whose PDFium loose box intersects a mark are removed from the text-showing operator
+  itself** (`Tj`, `TJ`, `'`, `"`). A `TJ` spacing adjustment replaces each removed run, so the
+  surviving glyphs on that line stay where they were. Text outside the marks is untouched and
+  stays extractable.
+* **Vector paths whose painted bounding box intersects a mark lose their painting operator.** The
+  whole path is removed even when only part of it intersects; this is observable, because a stroke
+  that continues beyond the black mark disappears too.
+* **Images and form XObjects whose placed bounding box intersects a mark are removed as whole
+  objects.**
+* **A page that cannot be attributed is rasterised** at 300 dpi with the marks burned in black and
+  its content replaced by that one image. This happens when the text layer cannot be mapped
+  one-to-one onto the page's text operators (text inside a form XObject is the common case) or
+  when the page contains inline images or shadings. Rasterising loses **the whole page's text
+  layer**, which is why the confirmation says so and why the preview counts the characters.
+* Every mark is finally painted with a black fill rectangle, so the saved page shows it. (The
+  rasterised fallback burns the same rectangle into the image.)
+
+The output is a **complete rewritten document**: page content streams are replaced and
+`prune_objects` drops the unreferenced old streams, so the removed text is not left in the file's
+prefix as an unreferenced object. Encrypted documents are refused rather than silently decrypted.
+
+**Safety.** A copy may not be the source. The replace path writes
+`<name>.lyra-backup-<unix>-<n>.pdf`, verifies it byte-for-byte, and refuses to run if it cannot be
+written; the replacement is then an atomic rename of a temporary file that has already been
+reopened and verified. On any error the original is untouched.
+
+**Proof.** The writer reopens its own output and refuses to rename it unless: the page count is
+unchanged, **no extractable character intersects any mark**, the characters outside every mark are
+exactly the ones that were outside it before (whitespace is compared loosely because removing a run
+leaves a gap that extractors may fill with a space), and the centre of every mark renders black.
+The same proof is available by hand:
+
+```bash
+# What will be removed (PDF user space, origin bottom-left)
+cargo run -p aris-reader-cli -- redact page.pdf --rect 158,687,32,14 --preview
+
+# Write a redacted copy (the original is not touched)
+cargo run -p aris-reader-cli -- redact page.pdf --rect 158,687,32,14 -o redacted.pdf
+
+# Prove it from another extractor, not from Lyra
+pdftotext redacted.pdf - | grep -c brown   # 0: gone
+pdftotext page.pdf    - | grep -c brown    # 1: still in the original
+pdftotext redacted.pdf -                    # the rest of the line/paragraph is still there
+```
+
+The native check `ArisReaderChecks --check-redaction .` runs the same path through the real engine
+and FFI: it removes the word `brown` from the fixture copy while `quick`, `jumps`, the title and
+the last line still extract; samples the black mark; redacts a small area inside the fixture's
+long blue vector rule and requires the rule's pixels *outside* the mark to turn white (the path
+was removed, not painted over); replaces a copy and checks the byte-identical backup; and exercises
+the pending-mark model the canvas and confirmation use. The Rust tests in
+`crates/aris-reader-pdfium/src/redaction.rs` additionally cover the rasterised fallback on a page
+whose text lives in a form XObject (all page text gone, mark black, `rasterized: true`).
+
+**Limits.** The raster fallback refuses a rotated page rather than writing an image with the wrong
+orientation; text glyph removal itself operates on the page's text operators and has no such
+restriction. Page annotations already in the PDF (`/Annots`, e.g. somebody's highlight or a form
+field) are not page content and are left alone; their dictionaries are not covered by the text
+extraction proof. Mixed crop boxes and non-identity page rotations have not been exercised by the
+native checks.
+
+## Printing
+
+**File ▸ Print… (⌘P)** runs a normal `NSPrintOperation` over `ReaderPrintView`. The print panel is
+the system's, so the page range and the copy count are its own; the view supplies the document's
+page count through `knowsPageRange`, and AppKit only calls it for the selected pages. Each page is
+rasterised **at 300 dpi** (4.17× the 72 dpi page geometry, more than twice a Retina screen raster)
+when the print system asks for it. The page raster is produced with the PDF's own annotations
+burned in (the thumbnail path), and the reader's own highlights, underlines, strikeouts, ink,
+shapes, lines/arrows, sticky notes and text boxes are drawn on top in page coordinates: highlights
+are multiplied into the page at their stored colour and opacity, strokes keep their width and
+colour, and a text box prints its text.
+
+Only the page being drawn and the one just drawn are cached (`ReaderPrintView.maximumCachedPages`
+= 2). A 900-page document prints one page at a time; nothing loads the document's pages into
+memory up front. Text layers needed by highlights are loaded before the print panel appears.
+
+`ArisReaderChecks --check-printing .` inspects the same view headlessly (no printer, no dialog):
+`knowsPageRange` reports 3 pages for `multipage.pdf` and 130 for `index-past-120.pdf`; a one-page
+range selects exactly `[0]`, a five-page range of the 130-page document selects exactly
+`[9,10,11,12,13]`, each rendered bitmap is 300 dpi, the reader's red ink and yellow highlight are
+sampled in the bitmap, and the cache never exceeds two pages while five are printed. The print
+panel's `firstPage`/`lastPage`/`copies` attributes are carried by the operation.
+
+**Limits.** The paper size is set to the first page's size (the page-setup panel can still change
+it), so a mixed-size PDF prints every page into that paper rectangle. The print view rasterises
+rather than sending vector content; 300 dpi is the resolution it promises. The mirror surface
+(Metal) is not involved in the print path at all.
+
+**Needs a human eye.** The redaction drag's feel and the dashed pending style; the confirmation
+wording and layout at 100% and with many marks; how the black mark looks against a real paper's
+text at 100%/200%; and the printed sheet itself — colour, highlight multiply behaviour on the real
+printer, margin fit and whether a mixed-size document needs per-page paper. These are visual
+judgements the headless checks cannot make.
+
 ## Annotation text export
 
 **File ▸ Export Annotations… (⌘E)** writes the annotations to a separate Markdown (`.md`) or CSV

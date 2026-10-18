@@ -150,6 +150,12 @@ struct ReaderCommands: Commands {
             }
         }
 
+        CommandGroup(replacing: .printItem) {
+            Button("Print…") { session?.state.printDocument() }
+                .keyboardShortcut("p", modifiers: .command)
+                .disabled(session?.state.document == nil)
+        }
+
         CommandGroup(after: .toolbar) {
             Divider()
             Picker("Paper Appearance", selection: $readingAppearance.mode) {
@@ -255,6 +261,32 @@ struct ReaderCommands: Commands {
                 session?.state.revealSidecarBackupInFinder()
             }
             .disabled(session?.state.lastSidecarBackupURL == nil)
+        }
+
+        // Redaction (T3.12). Marks are pending until one of the two explicit apply commands;
+        // the confirmation says what will be lost, and neither command runs in the background.
+        CommandMenu("Redaction") {
+            Button("Redact Tool") { session?.state.toggleRedactionTool() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(session?.state.canMarkRedactions != true)
+            Button("Mark Selection for Redaction") {
+                _ = session?.state.markSelectionForRedaction()
+            }
+            .keyboardShortcut("r", modifiers: [.command, .option])
+            .disabled(session == nil)
+            Button("Remove Last Mark") { session?.state.removeLastPendingRedaction() }
+                .disabled(session?.state.pendingRedactions.isEmpty != false)
+
+            Divider()
+
+            Button("Apply to Copy…") { session?.state.presentApplyRedactionsPanel() }
+                .disabled(session?.state.canApplyRedactions != true)
+            Button("Replace Original…") {
+                session?.state.presentReplaceRedactionsConfirmation()
+            }
+            .disabled(session?.state.canApplyRedactions != true)
+            Button("Clear Pending Redactions") { session?.state.clearPendingRedactions() }
+                .disabled(session?.state.pendingRedactions.isEmpty != false)
         }
 
         // Page operations (T3.9). Everything here is staged in a working copy until one of the

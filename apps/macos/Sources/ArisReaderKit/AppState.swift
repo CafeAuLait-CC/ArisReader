@@ -1014,6 +1014,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @Published public private(set) var selection: Selection?
 
+    /// A rectangle the reader marked for redaction, pending until the explicit apply command.
+    public struct PendingRedaction: Identifiable, Equatable, Sendable {
+        public let id: UUID
+        public let page: Int
+        /// Page-local view space (points, top-left origin, 100% zoom).
+        public let rect: CGRect
+
+        public init(id: UUID = UUID(), page: Int, rect: CGRect) {
+            self.id = id
+            self.page = page
+            self.rect = rect
+        }
+    }
+
+    /// Areas marked for redaction but not applied yet. They are drawn on the canvas, and
+    /// clearing them leaves the file completely untouched.
+    @Published public private(set) var pendingRedactions: [PendingRedaction] = []
+    @Published public private(set) var redactionBusy = false
+    /// The last applied redaction, for the status line and the checks.
+    @Published public private(set) var lastRedactionReport: RedactionReport?
+
     /// What a floating preview is *for*. It decides what the panel's body shows, because the
     /// four cases genuinely want four different things.
     public enum ReferencePreviewKind: Equatable, Sendable {
@@ -1711,6 +1732,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var statusMessage: String
         var pageSelection: Set<Int>
         var pageSelectionAnchor: Int?
+        var pendingRedactions: [PendingRedaction]
         var pageEditSession: PageEditSession?
         var pageEditPendingOperations: [String]
         var pageEditIsApplied: Bool
@@ -2438,6 +2460,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         canvasPages = []
         canvasTiles = []
         visiblePagePlacements = []
+        pendingRedactions = []
+        redactionBusy = false
         textPages = [:]
         textPagesInFlight = []
         linkCache = [:]
@@ -3009,6 +3033,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
         if cancelTextMarkupTool() { return true }
+        if annotationTool == .redact {
+            annotationTool = .select
+            statusMessage = "Redaction tool off · pending marks were kept"
+            return true
+        }
         guard annotationTool == .eraser else { return false }
         cancelEraserGesture()
         annotationTool = .select
@@ -6058,6 +6087,361 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: - Redaction (T3.12)
+
+    /// The pending marks as canvas rectangles, for the warning overlay.
+    public var pendingRedactionMarks: [CanvasRedactionMark] {
+        pendingRedactions.map {
+            CanvasRedactionMark(id: $0.id.uuidString, page: $0.page, rect: $0.rect)
+        }
+    }
+
+    /// The pending marks as engine requests, in page-local view space at 100%.
+    public var pendingRedactionAreas: [RedactionArea] {
+        pendingRedactions.map { RedactionArea(page: $0.page, rect: $0.rect) }
+    }
+
+    public var pendingRedactionPageCount: Int {
+        Set(pendingRedactions.map(\.page)).count
+    }
+
+    public var canMarkRedactions: Bool {
+        document != nil && !redactionBusy && pageEditSession == nil
+    }
+
+    public var canApplyRedactions: Bool {
+        canMarkRedactions && !pendingRedactions.isEmpty && !annotationSaveInProgress
+    }
+
+    /// Arms the redaction tool, or leaves it when it is already armed.
+    public func toggleRedactionTool() {
+        guard canMarkRedactions else {
+            lastError = pageEditSession != nil
+                ? "Finish or discard the pending page changes before redacting."
+                : "Open a document before marking redactions."
+            return
+        }
+        if annotationTool == .redact {
+            annotationTool = .select
+            statusMessage = "Redaction tool off · pending marks were kept"
+        } else {
+            annotationTool = .redact
+            statusMessage =
+                "Redaction tool · drag over content to mark it; nothing is removed until you apply"
+        }
+    }
+
+    /// Adds every line rectangle of the current text selection as a pending redaction.
+    @discardableResult
+    public func markSelectionForRedaction() -> Bool {
+        guard let selection, let document else {
+            lastError = "Select text before marking it for redaction."
+            return false
+        }
+        guard selection.page >= 0, selection.page < document.pageCount else {
+            lastError = "The selection is outside the document."
+            return false
+        }
+        guard let text = textPages[selection.page] else {
+            lastError = "The selected page's text is still loading; try again in a moment."
+            return false
+        }
+        let rects = text.selectionRects(in: selection.range)
+        guard !rects.isEmpty else {
+            lastError = "The selection has no drawable rectangles."
+            return false
+        }
+        for rect in rects {
+            addPendingRedaction(page: selection.page, rect: rect)
+        }
+        statusMessage =
+            "Marked \(rects.count) text line(s) for redaction · still pending, the file is unchanged"
+        return true
+    }
+
+    /// Adds one pending rectangle, clipped to the page's visible box.
+    public func addPendingRedaction(page: Int, rect: CGRect) {
+        guard let document, page >= 0, page < document.pageCount else { return }
+        var clipped = rect
+        if let frame = visiblePagePlacements.first(where: { $0.index == page }) {
+            let pageBox = CGRect(x: 0, y: 0, width: frame.widthPt, height: frame.heightPt)
+            clipped = rect.intersection(pageBox)
+        }
+        guard clipped.width >= 1, clipped.height >= 1,
+              clipped.minX.isFinite, clipped.minY.isFinite else { return }
+        let normalized = CGRect(
+            x: clipped.minX,
+            y: clipped.minY,
+            width: clipped.width,
+            height: clipped.height
+        )
+        guard !pendingRedactions.contains(where: {
+            $0.page == page && $0.rect.equalTo(normalized)
+        }) else { return }
+        pendingRedactions.append(PendingRedaction(page: page, rect: normalized))
+        statusMessage = pendingRedactions.count == 1
+            ? "Marked 1 area for redaction · pending, the file is unchanged"
+            : "Marked \(pendingRedactions.count) areas for redaction · pending, the file is unchanged"
+    }
+
+    public func removeLastPendingRedaction() {
+        guard !pendingRedactions.isEmpty else { return }
+        pendingRedactions.removeLast()
+        statusMessage = pendingRedactions.isEmpty
+            ? "No pending redactions"
+            : "Removed the last redaction mark · \(pendingRedactions.count) pending"
+    }
+
+    public func clearPendingRedactions() {
+        guard !pendingRedactions.isEmpty else { return }
+        pendingRedactions = []
+        statusMessage = "Cleared the pending redaction marks · the file is unchanged"
+    }
+
+    /// The confirmation wording. It states what the file loses, not just that something happens.
+    private func redactionConfirmation(replacing: Bool) -> (title: String, message: String) {
+        let areas = pendingRedactions.count
+        let pages = pendingRedactionPageCount
+        let name = document?.title ?? "the document"
+        let title = replacing
+            ? "Replace “\(name)” with the redacted version?"
+            : "Apply \(areas) redaction\(areas == 1 ? "" : "s") to a copy of “\(name)”?"
+        var message =
+            "\(areas) marked area\(areas == 1 ? "" : "s") on \(pages) page\(pages == 1 ? "" : "s"). "
+            + "The covered text is deleted from the page content, not merely covered: it cannot be "
+            + "extracted or copied from the saved file. Vector graphics and images that intersect a "
+            + "mark are removed whole; a page whose content cannot be attributed is rasterised and "
+            + "loses its whole text layer. Every mark is painted black."
+        if replacing {
+            message +=
+                "\n\nThis is irreversible and changes the file on disk. A byte-identical backup is "
+                + "written and verified first; if it cannot be written, nothing is replaced. The "
+                + "replacement is an atomic rename of a verified temporary file."
+        } else {
+            message +=
+                "\n\nThe original file is not touched; you will choose where to save the copy. The "
+                + "copy is written atomically: a temporary file, reopened and verified, then renamed."
+        }
+        return (title, message)
+    }
+
+    private func redactionPreviewSummary(_ preview: RedactionPreview?) -> String {
+        guard let preview else { return "" }
+        var lines: [String] = []
+        for page in preview.pages.prefix(8) {
+            var line = "Page \(page.page + 1): \(page.characters) character\(page.characters == 1 ? "" : "s")"
+            if page.graphics > 0 {
+                line += " + \(page.graphics) graphic object\(page.graphics == 1 ? "" : "s")"
+            }
+            if !page.textPreview.isEmpty {
+                line += " — “\(page.textPreview.prefix(120))”"
+            }
+            lines.append(line)
+        }
+        if preview.pages.count > 8 {
+            lines.append("…and \(preview.pages.count - 8) more page(s)")
+        }
+        guard !lines.isEmpty else { return "" }
+        return "\n\nWhat is under the marks:\n" + lines.joined(separator: "\n")
+    }
+
+    /// Presents the "apply to a copy" confirmation and, on approval, a save panel.
+    public func presentApplyRedactionsPanel() {
+        guard canApplyRedactions else {
+            lastError = pendingRedactions.isEmpty
+                ? "Mark at least one area before applying redactions."
+                : "Redactions cannot be applied while another write is in progress."
+            return
+        }
+        let areas = pendingRedactionAreas
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = try? await self.engine.previewRedactions(areas)
+            if preview == nil {
+                self.lastError = "Could not read the text under the marks; nothing was changed."
+                return
+            }
+            let confirmation = self.redactionConfirmation(replacing: false)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = confirmation.title
+            alert.informativeText = confirmation.message
+                + self.redactionPreviewSummary(preview)
+            alert.addButton(withTitle: "Choose Copy Destination…")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            guard let source = self.document?.url else { return }
+            let panel = NSSavePanel()
+            panel.title = "Save Redacted Copy"
+            panel.message =
+                "Writes the redacted document to a new PDF and leaves the original untouched."
+            panel.nameFieldStringValue =
+                self.engine.suggestedRedactionCopyURL(for: source).lastPathComponent
+            panel.directoryURL = source.deletingLastPathComponent()
+            panel.allowedContentTypes = [.pdf]
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let destination = panel.url else { return }
+            await self.redactCopy(to: destination, areas: areas)
+        }
+    }
+
+    /// Presents the destructive confirmation for replacing the file on disk.
+    public func presentReplaceRedactionsConfirmation() {
+        guard canApplyRedactions else {
+            lastError = pendingRedactions.isEmpty
+                ? "Mark at least one area before replacing the document."
+                : "Redactions cannot be applied while another write is in progress."
+            return
+        }
+        let areas = pendingRedactionAreas
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = try? await self.engine.previewRedactions(areas)
+            if preview == nil {
+                self.lastError = "Could not read the text under the marks; nothing was changed."
+                return
+            }
+            let confirmation = self.redactionConfirmation(replacing: true)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = confirmation.title
+            alert.informativeText = confirmation.message
+                + self.redactionPreviewSummary(preview)
+            alert.addButton(withTitle: "Replace Original")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            await self.redactReplacingOriginal(areas: areas)
+        }
+    }
+
+    @discardableResult
+    private func redactCopy(to destination: URL, areas: [RedactionArea]) async -> Bool {
+        guard let source = document?.url else { return false }
+        guard !Self.resolvesToSameFile(destination, source) else {
+            lastError = "The redacted copy cannot overwrite the document it came from."
+            return false
+        }
+        redactionBusy = true
+        defer { redactionBusy = false }
+        do {
+            let report = try await engine.redactToCopy(to: destination, areas: areas)
+            lastRedactionReport = report
+            pendingRedactions = []
+            annotationTool = .select
+            let pages = report.pages.count
+            statusMessage =
+                "Saved redacted copy \(destination.lastPathComponent) · \(report.removedCharacters) "
+                + "character(s) removed on \(pages) page(s) · verified · the original is unchanged"
+            FileHandle.standardError.write(Data((
+                "aris-redact: copy \(destination.path) · \(report.removedCharacters) character(s) "
+                + "on \(pages) page(s) · \(report.outputBytes) bytes · verified\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not write the redacted copy: \(error.localizedDescription)"
+            statusMessage = "Could not write the redacted copy"
+            FileHandle.standardError.write(Data("aris-redact: copy failed: \(error)\n".utf8))
+            return false
+        }
+    }
+
+    @discardableResult
+    private func redactReplacingOriginal(areas: [RedactionArea]) async -> Bool {
+        guard let url = document?.url else { return false }
+        redactionBusy = true
+        defer { redactionBusy = false }
+        do {
+            let report = try await engine.replaceWithRedactions(areas)
+            lastRedactionReport = report
+            let backup = report.backupPath.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? "none"
+            pendingRedactions = []
+            annotationTool = .select
+            _ = open(url: url)
+            statusMessage =
+                "Replaced \(url.lastPathComponent) with redacted content · "
+                + "\(report.removedCharacters) character(s) removed on \(report.pages.count) page(s) "
+                + "· backup: \(backup)"
+            FileHandle.standardError.write(Data((
+                "aris-redact: replaced \(url.path) · \(report.removedCharacters) character(s) "
+                + "on \(report.pages.count) page(s) · backup \(backup)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not replace the document; it was left untouched: \(error.localizedDescription)"
+            statusMessage = "Could not replace the document"
+            FileHandle.standardError.write(Data("aris-redact: replace failed: \(error)\n".utf8))
+            return false
+        }
+    }
+
+    // MARK: - Printing (T3.12)
+
+    /// File > Print: a print operation over a view that renders one page at print resolution
+    /// when the print system asks for it.
+    ///
+    /// The page range and the copy count are the print panel's own, because the panel is the
+    /// system's; the view supplies the page count through `knowsPageRange`. Only the pages the
+    /// panel selected are rendered, one at a time, by [`ReaderPrintView`].
+    public func printDocument() {
+        guard let document, document.pageCount > 0 else {
+            lastError = "Open a document before printing."
+            return
+        }
+        let pageCount = document.pageCount
+        let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
+            ? document.firstPageSize
+            : CGSize(width: 612, height: 792)
+        let snapshot = annotations.map(PrintAnnotation.init)
+        let markupPages = Set(snapshot.filter { $0.kind.isTextMarkup }.map(\.page))
+        let engine = self.engine
+        // The print system draws synchronously; the text layers a highlight needs are loaded
+        // before the operation starts, so `draw` never waits for one.
+        var texts = textPages
+        Task { @MainActor [weak self] in
+            for page in markupPages where texts[page] == nil {
+                if let text = try? await engine.textPage(page) {
+                    texts[page] = text
+                }
+            }
+            guard let self else { return }
+            let view = ReaderPrintView(
+                pageCount: pageCount,
+                pageSizePt: pageSize,
+                annotations: snapshot,
+                pageImage: { page, scale in
+                    engine.renderPageForPrint(page, scale: scale)
+                },
+                textPage: { texts[$0] }
+            )
+            let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+            info.paperSize = pageSize
+            info.topMargin = 0
+            info.bottomMargin = 0
+            info.leftMargin = 0
+            info.rightMargin = 0
+            info.horizontalPagination = .fit
+            info.verticalPagination = .fit
+            info.orientation = pageSize.width > pageSize.height ? .landscape : .portrait
+            let operation = NSPrintOperation(view: view, printInfo: info)
+            operation.showsPrintPanel = true
+            operation.showsProgressPanel = true
+            let printed = operation.run()
+            guard printed else {
+                self.statusMessage = "Printing cancelled"
+                return
+            }
+            let count = view.printedPages.count
+            self.statusMessage =
+                "Sent \(count) page\(count == 1 ? "" : "s") to the printer"
+                + " · rendered at \(Int(ReaderPrintView.printDPI)) dpi as the printer asked"
+            FileHandle.standardError.write(Data((
+                "aris-print: \(count) page(s) rendered at \(Int(ReaderPrintView.printDPI)) dpi"
+                + " · peak cached pages \(ReaderPrintView.maximumCachedPages)\n"
+            ).utf8))
+        }
+    }
+
     // MARK: - Page editing (T3.9)
     //
     // The original file is never modified until the reader chooses "Replace Original". Every
@@ -8170,6 +8554,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage: statusMessage,
             pageSelection: pageSelection,
             pageSelectionAnchor: pageSelectionAnchor,
+            pendingRedactions: pendingRedactions,
             pageEditSession: pageEditSession,
             pageEditPendingOperations: pageEditPendingOperations,
             pageEditIsApplied: pageEditIsApplied,
@@ -8272,6 +8657,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage = state.statusMessage
         pageSelection = state.pageSelection
         pageSelectionAnchor = state.pageSelectionAnchor
+        pendingRedactions = state.pendingRedactions
         pageEditSession = state.pageEditSession
         pageEditPendingOperations = state.pageEditPendingOperations
         pageEditIsApplied = state.pageEditIsApplied

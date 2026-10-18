@@ -25,6 +25,7 @@ import QuartzCore
 final class AnnotationOverlayView: NSView {
     private let container = CALayer()
     private let marksLayer = CALayer()
+    private let redactionsLayer = CALayer()
     private let selectionLayer = CAShapeLayer()
     /// The same halo language as `selectionLayer`, drawn for the ink stroke an armed eraser is
     /// over. A separate layer so a selected mark and the eraser's target can both be visible.
@@ -36,6 +37,8 @@ final class AnnotationOverlayView: NSView {
     private var frames: [Int: PagePlacement] = [:]
     private var framesList: [PagePlacement] = []
     private var marks: [CanvasAnnotationMark] = []
+    private var redactionMarks: [CanvasRedactionMark] = []
+    private var redactionFrames: [Int: PagePlacement] = [:]
     private var zoom: CGFloat = 1
     private var scrollYPt: CGFloat = 0
     private var contentWidthPt: CGFloat = 0
@@ -57,6 +60,7 @@ final class AnnotationOverlayView: NSView {
         layer?.isGeometryFlipped = true
         layer?.addSublayer(container)
         container.addSublayer(marksLayer)
+        container.addSublayer(redactionsLayer)
         container.addSublayer(selectionLayer)
         container.addSublayer(eraserTargetLayer)
         container.addSublayer(liveLayer)
@@ -114,7 +118,46 @@ final class AnnotationOverlayView: NSView {
             self.marks = marks
             rebuildMarkLayers()
         }
+        if framesChanged {
+            self.redactionFrames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
+            rebuildRedactionLayers()
+        }
         updateTransform()
+    }
+
+    /// Draws the redaction rectangles that are still pending.
+    ///
+    /// A pending mark is not an annotation: it is a warning that this area will be removed if
+    /// the reader confirms. The fill is dark and the outline is dashed so it can never be
+    /// mistaken for the finished black mark.
+    func updateRedactions(_ marks: [CanvasRedactionMark], frames: [PagePlacement]) {
+        let framesChanged = frames != framesList
+        self.redactionFrames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
+        guard marks != redactionMarks || framesChanged else { return }
+        self.redactionMarks = marks
+        rebuildRedactionLayers()
+    }
+
+    private func rebuildRedactionLayers() {
+        for layer in redactionsLayer.sublayers ?? [] {
+            layer.removeFromSuperlayer()
+        }
+        for mark in redactionMarks {
+            guard let frame = redactionFrames[mark.page] else { continue }
+            let content = CGRect(
+                x: frame.leftPt + mark.rect.minX,
+                y: frame.topPt + mark.rect.minY,
+                width: mark.rect.width,
+                height: mark.rect.height
+            )
+            let fill = CAShapeLayer()
+            fill.path = CGPath(rect: content, transform: nil)
+            fill.fillColor = NSColor(calibratedWhite: 0.08, alpha: 0.55).cgColor
+            fill.strokeColor = NSColor.systemRed.withAlphaComponent(0.9).cgColor
+            fill.lineWidth = 1.2 / max(zoom, 0.01)
+            fill.lineDashPattern = [4, 3]
+            redactionsLayer.addSublayer(fill)
+        }
     }
 
     /// The page-local points of the mark under a content point, or `nil`.

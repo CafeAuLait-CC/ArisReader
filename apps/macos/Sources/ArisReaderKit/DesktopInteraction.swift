@@ -13,6 +13,7 @@ public enum CanvasContextMenuAction: Equatable, Sendable {
     case copySelection
     case highlightSelection
     case addNoteToSelection
+    case redactSelection
     case openLink
     case rotatePage(Int, clockwise: Bool)
     case extractPage(Int)
@@ -55,6 +56,10 @@ public enum CanvasContextMenu {
                     title: "Highlight Selection", action: .highlightSelection, isEnabled: true),
                 CanvasContextMenuItem(
                     title: "Add Note to Selection…", action: .addNoteToSelection, isEnabled: true),
+                CanvasContextMenuItem(
+                    title: "Mark Selection for Redaction",
+                    action: .redactSelection,
+                    isEnabled: true),
             ])
         }
 
@@ -126,6 +131,9 @@ public enum CanvasContextMenu {
         case .addNoteToSelection:
             guard state.selection != nil, let note else { return false }
             return state.addNoteFromSelection(note: note)
+        case .redactSelection:
+            guard state.selection != nil else { return false }
+            return state.markSelectionForRedaction()
         case .openLink:
             guard state.link(at: point) != nil else { return false }
             return state.followLink(at: point)
@@ -188,6 +196,7 @@ public enum CanvasContextMenu {
                 case .copySelection: icon = "doc.on.doc"
                 case .highlightSelection: icon = "highlighter"
                 case .addNoteToSelection: icon = "text.bubble"
+                case .redactSelection: icon = "rectangle.dashed"
                 case .openLink: icon = "link"
                 case .rotatePage(_, let clockwise): icon = clockwise ? "rotate.right" : "rotate.left"
                 case .extractPage: icon = "square.and.arrow.up"

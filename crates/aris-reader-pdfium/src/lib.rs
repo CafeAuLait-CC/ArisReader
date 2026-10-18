@@ -56,6 +56,8 @@ mod forms;
 mod geometry_write;
 #[cfg(feature = "pdfium")]
 mod page_ops;
+#[cfg(feature = "pdfium")]
+mod redaction;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 #[cfg(feature = "pdfium")]
@@ -86,6 +88,12 @@ pub use forms::{
 pub use page_ops::{
     PageOperation, PageOperationReport, apply_page_operation, extract_pages, publish_edited_copy,
     replace_original_with_edit,
+};
+#[cfg(feature = "pdfium")]
+pub use redaction::{
+    RASTER_DPI, RedactionArea, RedactionMode, RedactionPagePreview, RedactionPageReport,
+    RedactionPreview, RedactionReport, preview_redactions, redact_pdf,
+    suggested_redaction_copy_path,
 };
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;

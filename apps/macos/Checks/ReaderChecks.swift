@@ -254,6 +254,18 @@ struct ReaderChecks {
             print("Interaction checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-redaction") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await redactionChecks(root: root)
+            return
+        }
+        if CommandLine.arguments.contains("--check-printing") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await printingChecks(root: root)
+            return
+        }
         if CommandLine.arguments.contains("--check-page-operations") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -520,6 +532,8 @@ struct ReaderChecks {
         // Registered before the frame-scheduling checks: those need a presentable surface and
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)
+        try await redactionChecks(root: root)
+        try await printingChecks(root: root)
         try await thumbnailDragChecks(root: root)
         tabRowLayoutChecks()
         titlebarResizeChecks()
