@@ -15,16 +15,18 @@ public enum TabRowLayout {
     /// restores the proportion the reader asked for and matches the platform's standard 20 pt
     /// content inset, while the 6 pt between buttons still reads as a group.
     public static let trafficLightsLeadingInset: CGFloat = 20
-    /// Width of one standard window button on the current platform, in points. The buttons are
-    /// native views, so this is documentation for the geometry checks, not something the layout
-    /// forces: the leading inset and the 20 pt origin pitch are what the row owns.
-    public static let trafficLightButtonSize: CGFloat = 16
+    /// The standard window button's frame on the macOS this was measured on: 14 × 16 pt. The
+    /// buttons are native views, so these are documentation for the geometry checks, not
+    /// something the layout forces: the leading inset and the 20 pt origin pitch are what the
+    /// row owns.
+    public static let trafficLightButtonWidth: CGFloat = 14
+    public static let trafficLightButtonHeight: CGFloat = 16
     /// Distance between two consecutive button origins. It is deliberately larger than the
     /// visible gap (pitch minus the button's own width), so the group reads as a group.
     public static let trafficLightOriginPitch: CGFloat = 20
-    /// Visible gap between two traffic-light buttons (20 pt pitch − 16 pt button).
+    /// Visible gap between two traffic-light buttons (20 pt pitch − 14 pt button width).
     public static var trafficLightSpacing: CGFloat {
-        trafficLightOriginPitch - trafficLightButtonSize
+        trafficLightOriginPitch - trafficLightButtonWidth
     }
     /// The native buttons are centred in the row, i.e. on y = 22 from the row's top.
     public static let contentCenterY: CGFloat = height / 2
@@ -50,9 +52,9 @@ public enum TabRowLayout {
     public static let minimumTabWidth: CGFloat = 96
     public static let maximumTabWidth: CGFloat = 250
 
-    /// Right edge of the last traffic light (20 pt inset, two 20 pt pitches, one button width).
+    /// Right edge of the last traffic light: 20 + 2 × 20 + 14 = 74 pt.
     public static var trafficLightsTrailingEdge: CGFloat {
-        trafficLightsLeadingInset + 2 * trafficLightOriginPitch + trafficLightButtonSize
+        trafficLightsLeadingInset + 2 * trafficLightOriginPitch + trafficLightButtonWidth
     }
 
     /// Origins of the three traffic-light buttons from the window's left edge: 20 / 40 / 60.
@@ -60,9 +62,11 @@ public enum TabRowLayout {
         (0..<3).map { trafficLightsLeadingInset + CGFloat($0) * trafficLightOriginPitch }
     }
 
-    /// A button's y origin inside a 44 pt titlebar, for its own height. The actual standard
-    /// button is 16 pt high on the macOS this was measured on, giving y = 14 and a centre at 22.
-    public static func trafficLightOriginY(buttonHeight: CGFloat = trafficLightButtonSize) -> CGFloat {
+    /// A button's y origin inside a 44 pt titlebar, for its own height: (44 − 16) / 2 = 14,
+    /// giving a centre at y = 22.
+    public static func trafficLightOriginY(
+        buttonHeight: CGFloat = trafficLightButtonHeight
+    ) -> CGFloat {
         (height - buttonHeight) / 2
     }
 

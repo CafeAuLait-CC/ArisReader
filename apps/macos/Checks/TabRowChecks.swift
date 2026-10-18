@@ -29,15 +29,22 @@ extension ReaderChecks {
                 "the close button sits 20 pt from the window's left edge")
         require(TabRowLayout.trafficLightOriginPitch == 20,
                 "the three traffic lights sit on a 20 pt origin pitch")
+        require(TabRowLayout.trafficLightButtonWidth == 14
+                    && TabRowLayout.trafficLightButtonHeight == 16,
+                "the standard button frame is 14 pt wide and 16 pt high on this platform")
+        require(TabRowLayout.trafficLightSpacing == 6,
+                "the buttons' visible gaps are 6 pt (20 pt pitch minus the 14 pt width)")
         require(TabRowLayout.trafficLightsLeadingInset > TabRowLayout.trafficLightSpacing,
-                "the edge gap (20) is larger than the visible gaps between the buttons")
+                "the edge gap (20) is larger than the visible gaps between the buttons (6)")
         require(TabRowLayout.trafficLightOriginsX == [20, 40, 60],
                 "traffic-light origins are 20 / 40 / 60 pt from the left edge")
-        require(TabRowLayout.trafficLightsTrailingEdge == 76,
-                "the last traffic light ends at 76 pt on this platform")
+        require(TabRowLayout.trafficLightsTrailingEdge == 74,
+                "the last traffic light ends at 74 pt on this platform")
+        require(TabRowLayout.trafficLightOriginY() == 14,
+                "the 16 pt high button is centred in the 44 pt row at y = 14")
         require(TabRowLayout.contentCenterY
                     == TabRowLayout.trafficLightOriginY()
-                    + TabRowLayout.trafficLightButtonSize / 2,
+                    + TabRowLayout.trafficLightButtonHeight / 2,
                 "the button group and the row content share the y = 22 centre line")
 
         // Tabs start where they did before the inset changed (78 pt strip inset + 10 pt padding),
@@ -132,8 +139,10 @@ extension ReaderChecks {
             abs($0.midY - TabRowLayout.contentCenterY) < 0.001
         }, "the group is centred in the 44 pt row")
         require(initial.allSatisfy {
-            $0.origin.y == TabRowLayout.trafficLightOriginY(buttonHeight: $0.height)
-        }, "each button's y comes from the row height and its own height")
+            $0.size.width == TabRowLayout.trafficLightButtonWidth
+                && $0.size.height == TabRowLayout.trafficLightButtonHeight
+                && $0.origin.y == TabRowLayout.trafficLightOriginY(buttonHeight: $0.height)
+        }, "each button keeps its standard frame and derives y from the row height")
         let edgeGap = initial[0].minX
         let visualGap = initial[1].minX - initial[0].maxX
         require(edgeGap > visualGap,
