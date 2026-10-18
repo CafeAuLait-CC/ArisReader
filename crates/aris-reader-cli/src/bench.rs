@@ -1490,8 +1490,20 @@ mod review_tests {
 
     #[test]
     fn baseline_checks_page_identity_not_line_count() {
-        let path =
-            std::env::temp_dir().join(format!("aris-baseline-review-{}.txt", std::process::id()));
+        // A path that is unique to this test invocation: the pid alone would be shared by
+        // every test in this process, and the wall clock alone can repeat.
+        let path = {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir().join(format!(
+                "aris-baseline-review-{}-{}-{nanos}.txt",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+        };
         let records: Vec<_> = (0..2)
             .map(|page| BaselineRecord {
                 page,

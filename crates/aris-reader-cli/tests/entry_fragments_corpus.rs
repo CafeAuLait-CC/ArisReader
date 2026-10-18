@@ -25,6 +25,8 @@ use aris_reader_text::{
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod common;
+
 /// What one paper's bibliography looks like once it is cut into fragments.
 #[derive(Default)]
 struct Report {
@@ -154,9 +156,7 @@ fn measure(entries: &[ReferenceEntry], pages: &[(u32, RawTextPage)]) -> Report {
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
 fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
-    let directory = std::env::var_os("ARIS_READER_PDF_SAMPLES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples"));
+    let directory = common::samples_dir();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)
         .expect("local PDF samples")
         .map(|entry| entry.unwrap().path())

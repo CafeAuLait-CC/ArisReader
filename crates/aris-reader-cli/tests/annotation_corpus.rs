@@ -36,6 +36,8 @@ use aris_reader_core::{
 use aris_reader_pdfium::PdfiumBackend;
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// How far a drawn pixel may sit from the prediction. PDFium writes the appearance stream at the
 /// page's own scale and our sample lands on a glyph edge now and then; the measured deviation on
 /// a clean sample is ≤2/255, and the alpha-over prediction is off by 20-160/255, so a small
@@ -50,10 +52,7 @@ const DISCRIMINATING: f64 = 24.0;
 
 /// Where the seven review PDFs live, unless `ARIS_READER_PDF_SAMPLES` says otherwise.
 fn corpus_directory() -> PathBuf {
-    std::env::var_os("ARIS_READER_PDF_SAMPLES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdf-samples"))
-        .join("with_annotations")
+    common::samples_dir().join("with_annotations")
 }
 
 /// The review PDFs, sorted by name, or an announced skip.

@@ -10,16 +10,15 @@
 use aris_reader_core::{DocumentBackend, PageIndex};
 use aris_reader_pdfium::PdfiumBackend;
 use aris_reader_text::{ReferenceEntry, find_references, lines_from, tables::column_gutter};
-use std::path::Path;
+mod common;
 
 /// The fixture page's gutter, or `None` when PDFium is unavailable in this build.
 fn fixture_gutter() -> Option<(PdfiumBackend, f64)> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/two-column-references.pdf");
-    if !fixture.exists() || !aris_reader_pdfium::is_available() {
-        eprintln!("skipping: no fixture or no PDFium");
+    if !aris_reader_pdfium::is_available() {
+        eprintln!("skipping: no PDFium");
         return None;
     }
+    let fixture = common::fixture("two-column-references.pdf");
     let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
     let page = backend.raw_text_page(PageIndex(0)).expect("extract text");
     let gutter = column_gutter(&lines_from(&page), None).expect("the fixture shows a gutter");

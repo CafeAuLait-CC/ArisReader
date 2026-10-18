@@ -18,18 +18,18 @@ use aris_reader_text::{
     CitationStyle, ParenthesisedCandidate, find_citations, find_citations_with, find_references,
     inspect_parenthesised_citations, resolve_reference,
 };
-use std::path::Path;
+mod common;
 
 fn fixture_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/numeric-citations.pdf")
+    common::fixture("numeric-citations.pdf")
 }
 
 fn open_fixture() -> Option<(PdfiumBackend, Vec<(u32, RawTextPage)>)> {
-    let fixture = fixture_path();
-    if !fixture.exists() || !aris_reader_pdfium::is_available() {
-        eprintln!("skipping: no numeric-citations fixture or no PDFium");
+    if !aris_reader_pdfium::is_available() {
+        eprintln!("skipping: no PDFium");
         return None;
     }
+    let fixture = fixture_path();
     let backend = PdfiumBackend::open(&fixture, None).expect("open fixture");
     let pages = (0..backend.page_count())
         .map(|page| {

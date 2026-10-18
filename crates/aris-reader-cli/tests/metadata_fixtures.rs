@@ -18,17 +18,16 @@
 use aris_reader_core::{DocumentBackend, PageIndex};
 use aris_reader_metadata::{MetadataSource, RecognizedMetadata, recognize};
 use aris_reader_pdfium::PdfiumBackend;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+mod common;
 
 fn fixture(name: &str) -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(name);
-    if !path.exists() || !aris_reader_pdfium::is_available() {
-        eprintln!("skipping metadata fixtures: {name} or PDFium is unavailable");
+    if !aris_reader_pdfium::is_available() {
+        eprintln!("skipping metadata fixtures: PDFium is unavailable");
         return None;
     }
-    Some(path)
+    Some(common::fixture(name))
 }
 
 fn recognize_fixture(name: &str) -> Option<RecognizedMetadata> {

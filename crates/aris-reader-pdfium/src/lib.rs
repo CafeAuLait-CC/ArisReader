@@ -108,5 +108,8 @@ pub fn backend_description() -> &'static str {
 #[cfg(all(test, feature = "pdfium"))]
 mod link_border_tests;
 
+#[cfg(all(test, feature = "pdfium"))]
+mod test_support;
+
 #[cfg(feature = "pdfium")]
 mod link_borders;
