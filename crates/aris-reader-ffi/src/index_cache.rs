@@ -84,6 +84,7 @@ const HASH_BUFFER_BYTES: usize = 256 * 1024;
 
 /// The content identity a cache is bound to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ContentIdentity {
     /// Lowercase hex SHA-256 over every byte of the PDF.
     pub sha256: String,

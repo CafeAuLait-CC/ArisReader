@@ -2065,6 +2065,16 @@ impl ArisDocument {
 
         let path = cache_path(Path::new(&self.path));
         runtime.cache_path = Some(path.clone());
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            // The file on disk is no longer the file the backend parsed. A cache bound to
+            // either set of bytes would be a guess; let the shell reopen first.
+            runtime.outcome = IndexCacheOutcome::Unreadable;
+            runtime.write_disabled = true;
+            runtime.write_error = Some(
+                "the document was replaced on disk before the index cache was read".to_string(),
+            );
+            return;
+        }
         if disabled_by_environment() {
             runtime.outcome = IndexCacheOutcome::Disabled;
             runtime.write_disabled = true;
@@ -2187,6 +2197,9 @@ impl ArisDocument {
             Ok(runtime) => runtime,
             Err(_) => return,
         };
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if !runtime.attempted
             || runtime.write_disabled
             || matches!(

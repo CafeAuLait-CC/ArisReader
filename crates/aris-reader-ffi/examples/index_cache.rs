@@ -15,7 +15,7 @@
 //! Copy the PDF under `build/` before running: the sidecar belongs beside the document, and
 //! committed samples/corpora must not collect cache files.
 
-use aris_reader_ffi::api::{ArisDocument, ArisEngine, IndexCacheOutcome};
+use aris_reader_ffi::api::{ArisDocument, ArisEngine};
 use std::path::Path;
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ fn run(engine: &ArisEngine, path: &str, label: &str) {
     // The report performs the one lazy lookup, so its validation time belongs to the index
     // path, not to opening the PDF.
     let lookup_started = Instant::now();
-    let before = document.index_cache_report();
+    let _ = document.index_cache_report();
     let lookup_ms = lookup_started.elapsed().as_secs_f64() * 1000.0;
     let (index_ms, counts, page_one_citations) = read_index(&document);
     let after = document.index_cache_report();
@@ -65,8 +65,6 @@ fn run(engine: &ArisEngine, path: &str, label: &str) {
         counts[2],
         after.content_sha256.as_deref().unwrap_or("none"),
     );
-    let _ = before;
-    let _ = matches!(after.outcome, IndexCacheOutcome::Hit);
     drop(document);
 }
 
