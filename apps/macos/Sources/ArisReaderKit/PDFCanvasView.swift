@@ -151,6 +151,9 @@ public final class MetalCanvasView: NSView {
     /// A double-click on a placed text annotation; true means the shell opened its editor and
     /// the gesture must not become text selection.
     public var onAnnotationDoubleClick: ((CGPoint) -> Bool)?
+    /// The text-box tool's double-click: place a box with its top-left at this content point, or
+    /// open the box already under it. Returns whether the shell acted.
+    public var onPlaceTextBox: ((CGPoint) -> Bool)?
     /// Escape while the canvas is the first responder: leave a mode (sticky markup or the
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
@@ -159,10 +162,12 @@ public final class MetalCanvasView: NSView {
     private var annotationOverlay: AnnotationOverlayView?
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
-    private var drawingPlacesTextBox = false
     private var annotationSelectGesture = false
     /// The press was the sticky-note tool's; placement happens on mouse-up if it stayed a click.
     private var notePlacementPending = false
+    /// The text-box tool owns a press from down to up, but only a double-click creates a box.
+    /// The flag keeps a drag with the tool armed from falling through to text selection.
+    private var textBoxPlacementPending = false
     /// The press opened an editor on a double-click; the release must not also select text.
     private var annotationDoubleClickConsumed = false
     /// An eraser drag is in flight, and where its last sample landed (content points).
@@ -665,21 +670,24 @@ public final class MetalCanvasView: NSView {
             return
         }
 
-        // A drawing tool owns the gesture from press to release. The live preview lives entirely
-        // inside the overlay: nothing reaches AppState until mouse-up. The text-box tool uses the
-        // rectangle preview and turns it into a text box when the drag ends.
-        if annotationTool.placesTextBox, let hit = pageLocalPoint(atContent: content) {
-            drawingPage = hit.page
-            drawingKind = .square
-            drawingPlacesTextBox = true
-            annotationOverlay?.beginLiveStroke(kind: .square, page: hit.page, at: hit.point)
+        // The text-box tool places on a double-click, not by dragging a rectangle. The first
+        // press of the pair does nothing; the second creates the one-line box at the click (or
+        // reopens the box already there) and opens its editor with the caret at that point.
+        // Holding the press for release keeps a drag with the tool armed inert.
+        if annotationTool.placesTextBox {
+            textBoxPlacementPending = true
+            if event.clickCount == 2 {
+                _ = onPlaceTextBox?(content)
+            }
             return
         }
+
+        // A drawing tool owns the gesture from press to release. The live preview lives entirely
+        // inside the overlay: nothing reaches AppState until mouse-up.
         if annotationTool.draws, let kind = annotationTool.kind,
            let hit = pageLocalPoint(atContent: content) {
             drawingPage = hit.page
             drawingKind = kind
-            drawingPlacesTextBox = false
             annotationOverlay?.beginLiveStroke(kind: kind, page: hit.page, at: hit.point)
             return
         }
@@ -715,6 +723,11 @@ public final class MetalCanvasView: NSView {
                      location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt {
                 pointerMoved = true
             }
+            return
+        }
+        if textBoxPlacementPending {
+            // Dragging with the text-box tool armed is deliberately not a gesture: it neither
+            // creates a rectangle nor starts a text selection.
             return
         }
         if drawingKind != nil, drawingPage != nil {
@@ -768,20 +781,17 @@ public final class MetalCanvasView: NSView {
             pointerMoved = false
             return
         }
+        if textBoxPlacementPending {
+            textBoxPlacementPending = false
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
         if drawingKind != nil {
             let draft = annotationOverlay?.finishLiveStroke(in: annotationPageFrames)
-            let placesTextBox = drawingPlacesTextBox
             drawingKind = nil
             drawingPage = nil
-            drawingPlacesTextBox = false
-            if let draft {
-                if placesTextBox, let rect = draft.shapeRect {
-                    onAnnotationDraft?(AnnotationDraft(kind: .textBox, page: draft.page,
-                                                       shapeRect: rect))
-                } else {
-                    onAnnotationDraft?(draft)
-                }
-            }
+            if let draft { onAnnotationDraft?(draft) }
             pressLocation = nil
             pointerMoved = false
             return
@@ -837,8 +847,8 @@ public final class MetalCanvasView: NSView {
             annotationOverlay?.cancelLiveStroke()
             drawingKind = nil
             drawingPage = nil
-            drawingPlacesTextBox = false
             notePlacementPending = false
+            textBoxPlacementPending = false
             if eraserGestureActive {
                 eraserGestureActive = false
                 eraserLastContentPoint = nil
@@ -1248,6 +1258,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onDeleteAnnotation: (() -> Bool)?
     private let onPlaceStickyNote: ((CGPoint) -> Bool)?
     private let onAnnotationDoubleClick: ((CGPoint) -> Bool)?
+    private let onPlaceTextBox: ((CGPoint) -> Bool)?
     private let onCancelTool: (() -> Bool)?
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
@@ -1291,6 +1302,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onDeleteAnnotation: (() -> Bool)? = nil,
         onPlaceStickyNote: ((CGPoint) -> Bool)? = nil,
         onAnnotationDoubleClick: ((CGPoint) -> Bool)? = nil,
+        onPlaceTextBox: ((CGPoint) -> Bool)? = nil,
         onCancelTool: (() -> Bool)? = nil,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
@@ -1330,6 +1342,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onDeleteAnnotation = onDeleteAnnotation
         self.onPlaceStickyNote = onPlaceStickyNote
         self.onAnnotationDoubleClick = onAnnotationDoubleClick
+        self.onPlaceTextBox = onPlaceTextBox
         self.onCancelTool = onCancelTool
         self.onFrame = onFrame
         self.onFailure = onFailure
@@ -1397,6 +1410,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onDeleteAnnotation = onDeleteAnnotation
         view.onPlaceStickyNote = onPlaceStickyNote
         view.onAnnotationDoubleClick = onAnnotationDoubleClick
+        view.onPlaceTextBox = onPlaceTextBox
         view.onCancelTool = onCancelTool
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the

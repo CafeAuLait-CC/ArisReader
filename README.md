@@ -178,6 +178,13 @@ sidecar's per-entry compatibility rules are untouched; a replace removes exactly
 saved and preserves foreign entries, bookmarks and their order. If the sidecar update fails after
 the PDF was written, reopening reconciles by `/NM` and shows the PDF's copy only.
 
+**Placing a text box.** With the Text Box tool armed, a double-click places a one-line box whose
+top-left corner — and caret — is the click point, so a box placed beside a paragraph grows to the
+right and down instead of covering the text it was placed next to. Dragging with the tool armed
+does nothing. The box sizes itself to its text: its width follows the longest line and its height
+the number of lines, and text does not wrap until a line would run off the page. A finished box
+keeps that size, can be moved and resized by its handles, and opens for editing on a double-click.
+
 **Appearance streams, and what to expect in Preview.** The text-markup writer
 (highlight/underline/strikeout) does not write `/AP`. PDFium's C ABI has only one way to attach
 one (`FPDFAnnot_SetAP`), and its generated `/ExtGState` is hard-coded to `/BM /Normal`; writing

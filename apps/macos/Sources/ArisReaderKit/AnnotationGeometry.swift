@@ -78,7 +78,10 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// Whether a click with this tool places a sticky note instead of selecting text.
     public var placesNote: Bool { self == .note }
 
-    /// Whether a drag with this tool creates a text box.
+    /// Whether this tool places a text box on a double-click.
+    ///
+    /// It deliberately does not draw: dragging with it armed is inert, because the box's size
+    /// comes from its text, not from a rectangle the reader hauls out first.
     public var placesTextBox: Bool { self == .textBox }
 
     public var title: String {

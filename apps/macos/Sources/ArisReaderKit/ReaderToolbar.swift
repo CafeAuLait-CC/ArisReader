@@ -396,7 +396,7 @@ struct ReaderSecondaryToolbar: View {
                  selected: state.annotationTool == .note) {
                 state.annotationTool = state.annotationTool == .note ? .select : .note
             }.disabled(state.document == nil)
-            tool("Draw a text box", "textbox",
+            tool("Place a text box (double-click)", "textbox",
                  selected: state.annotationTool == .textBox) {
                 state.annotationTool = state.annotationTool == .textBox ? .select : .textBox
             }.disabled(state.document == nil)
