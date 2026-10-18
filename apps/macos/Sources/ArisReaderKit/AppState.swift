@@ -3611,6 +3611,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Eraser
 
+    // The eraser removes **whole ink strokes**: the annotation is removed as a unit, never split
+    // into two shorter strokes. Partial erase (splitting a stroke and re-joining it on undo) is a
+    // separately scoped later task and is deliberately not attempted here.
+
     /// What an armed eraser is over, and therefore what a press would do.
     ///
     /// Sidecar strokes are erasable. A stroke the PDF itself carries is reported separately so
