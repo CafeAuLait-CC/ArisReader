@@ -11,6 +11,7 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
+    @ObservedObject private var appearance = ReadingAppearanceStore.shared
     /// Documents arriving at *this* window: its own coordinator, so a drop on its canvas becomes a
     /// tab here and nowhere else. Files dropped on the canvas also drive its hover hint.
     @ObservedObject private var opener: DocumentOpenCoordinator
@@ -46,18 +47,24 @@ public struct ReaderWindow: View {
                     // A sliding drawer, not a conditional: the panel keeps its content width
                     // while the frame around it closes, so the canvas gets the freed width frame
                     // by frame and the document's vertical position never changes.
-                    ReaderSidebarTransition(isVisible: state.sidebarVisible) {
+                    ReaderSidebarTransition(isVisible: state.sidebarVisible && state.document != nil) {
                         SidebarView(state: state, opener: opener)
                     }
+                    .accessibilityHidden(state.document == nil || !state.sidebarVisible)
                     // The edge shadow is drawn just outside the sidebar's frame; it has to be
                     // above the canvas to be visible over the page.
                     .zIndex(1)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if state.searchSidebarVisible && state.document != nil {
+                        SearchResultSidebar(state: state).frame(width: 290)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
                 // HStack's layout that must interpolate, so the canvas width moves with the
                 // panel instead of jumping to the final width on the first frame.
                 .animation(sidebarAnimation, value: state.sidebarVisible)
+                .animation(sidebarAnimation, value: state.searchSidebarVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -75,7 +82,19 @@ public struct ReaderWindow: View {
         .background(WindowLiveResizeReporter { isLiveResizing = $0 })
         .foregroundStyle(LyraTheme.textPrimary)
         .tint(LyraTheme.accent)
+        .preferredColorScheme(appearance.mode.colorScheme)
+        .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
         .onAppear { state.installTerminationHandling() }
+        .onChange(of: activeDocumentURL, initial: true) { _, url in
+            guard AppState.recordsRecentDocuments, let url else { return }
+            RecentDocumentStore.shared.record(url)
+            if let cover = state.thumbnails[0] { RecentDocumentStore.shared.saveCover(cover, for: url) }
+        }
+        .onChange(of: state.thumbnails[0]?.generation) { _, _ in
+            guard AppState.recordsRecentDocuments, let url = activeDocumentURL,
+                  let cover = state.thumbnails[0] else { return }
+            RecentDocumentStore.shared.saveCover(cover, for: url)
+        }
         .onChange(of: state.document?.url) { _, url in
             if url == nil { state.pageOverviewVisible = false }
         }
@@ -112,6 +131,11 @@ public struct ReaderWindow: View {
         }
     }
 
+    private var activeDocumentURL: URL? {
+        guard state.document != nil, let index = state.activeTabIndex, state.tabs.indices.contains(index) else { return nil }
+        return state.tabs[index].url
+    }
+
     // MARK: - Canvas
 
     private var canvas: some View {
@@ -121,6 +145,7 @@ public struct ReaderWindow: View {
                 scrollYPt: state.scrollYPt,
                 zoom: state.zoomFactor,
                 contentWidthPt: state.contentWidthPt,
+                paperAppearance: appearance.mode,
                 annotationMarks: state.canvasAnnotationMarks,
                 annotationPageFrames: state.canvasPageFrames,
                 annotationTool: state.annotationTool,
@@ -256,6 +281,7 @@ public struct ReaderWindow: View {
             }
         }
         // Same rule as the sidebar: the animation has to own the layout that changes.
+        .padding(.trailing, state.searchSidebarVisible && !state.pageOverviewVisible ? 290 : 0)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
     }
 
@@ -324,21 +350,7 @@ public struct ReaderWindow: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "doc.richtext")
-                .font(.system(size: 46, weight: .light))
-                .foregroundStyle(.tertiary)
-            Text("Open a paper to start reading")
-                .font(.title3)
-            Text("⌘O to open a file, or drop one anywhere on the page")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button("Open PDF…") {
-                state.showFileImporter = true
-            }
-            .controlSize(.large)
-        }
-        .padding(40)
+        ReaderHomeView(state: state, opener: opener)
     }
 
     /// The floating preview lives in its own panel (`ReferencePreviewPanelController`): it has to

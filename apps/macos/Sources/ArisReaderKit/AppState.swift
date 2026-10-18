@@ -276,9 +276,13 @@ public enum ReadingLayoutPreferences {
 
 @MainActor
 public final class AppState: ObservableObject {
+    /// Enabled by the application entry point; library/check hosts never alter user history.
+    public static var recordsRecentDocuments = false
     @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails
     @Published public var sidebarVisible: Bool = true
+    @Published public var searchSidebarVisible = false
+    @Published public var showDocumentInformation = false
     @Published public var pageOverviewVisible: Bool = false
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
@@ -2494,6 +2498,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
 
+        searchSidebarVisible = true
         isSearching = true
         Task { @MainActor [weak self] in
             guard let self else { return }

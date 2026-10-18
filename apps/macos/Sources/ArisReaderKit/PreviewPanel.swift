@@ -10,8 +10,8 @@ import SwiftUI
 /// or over the maximum — are exactly the part that is easy to get subtly wrong and exactly the
 /// part a native check can assert without a display.
 public enum PreviewPanelGeometry {
-    /// 480×360 pt, per `docs/04-ui-ux.md` §5.1.
-    public static let defaultSize = CGSize(width: 480, height: 360)
+    /// A readable citation column; the height is fitted to each preview.
+    public static let defaultSize = CGSize(width: 520, height: 360)
     /// 320×240 pt: small enough to tuck into a corner, large enough for a reference to stay
     /// readable.
     public static let minimumSize = CGSize(width: 320, height: 240)
@@ -108,56 +108,40 @@ public enum PreviewPanelGeometry {
 
 // MARK: - Entry text
 
-/// How a reference preview's body is laid out: the truncation policy and the height it asks for.
-///
-/// The policy lives here rather than inside the view so it can be driven directly, and so the
-/// panel's height and the text on screen are computed from the same numbers.
+/// Citation title extraction and text measurement shared by the preview model and view.
 public enum ReferencePreviewLayout {
-    /// Entry text longer than this shows its opening and offers the rest.
-    ///
-    /// A bibliography entry is a handful of lines: on the twelve sample papers the longest entry
-    /// is 1035 characters and the median is far below that, so 320 characters is already an
-    /// unusually long entry and well past "a wall of text" at this width.
-    public static let collapsedCharacterLimit = 320
-    /// The one font size the measurement and the view share; a mismatch here is a panel that
-    /// clips its own last line.
     public static let textFontSize: CGFloat = 12
-    /// Header, footer and card padding: everything that is not entry text.
-    public static let chromeHeightPt: CGFloat = 96
-    public static let labelHeightPt: CGFloat = 16
     public static let entrySpacingPt: CGFloat = 12
-    /// Height the Show more / Show less button adds to an entry that has one.
-    public static let disclosureHeightPt: CGFloat = 18
-    /// Text column inside the card: card padding plus the scroll indicator's lane.
+    /// Card padding plus the scroll indicator's lane.
     public static let textInsetPt: CGFloat = 30
 
     public static func textColumnWidth(panelWidthPt: CGFloat) -> CGFloat {
         max(80, panelWidthPt - textInsetPt)
     }
 
-    /// Whether the full text is too long to show at once.
-    public static func isTruncatable(_ text: String) -> Bool {
-        text.count > collapsedCharacterLimit
-    }
-
-    /// The opening of a long entry, cut at a word boundary and marked with an ellipsis.
-    ///
-    /// A single long token (a URL, a DOI) has no boundary to cut at, and is cut where the limit
-    /// falls rather than shown whole.
-    public static func collapsed(_ text: String) -> String {
-        guard isTruncatable(text) else { return text }
-        let prefix = text.prefix(collapsedCharacterLimit)
-        let minimumBoundary = collapsedCharacterLimit / 2
-        if let boundary = prefix.lastIndex(where: \.isWhitespace),
-           prefix.distance(from: prefix.startIndex, to: boundary) >= minimumBoundary {
-            return prefix[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    /// Extracts a title only when the entry has a clear author/title sentence boundary.
+    /// Initials and common author suffixes do not split a sentence. Unstructured entries keep
+    /// a neutral heading instead of inventing bibliographic metadata.
+    public static func citationTitle(from raw: String) -> String? {
+        let text = raw.replacingOccurrences(of: #"^\s*\[?\d+\]?\.?\s+"#,
+                                           with: "", options: .regularExpression)
+        guard let regex = try? NSRegularExpression(pattern: #"[.!?](?=\s+\S|$)"#) else { return nil }
+        let ns = text as NSString
+        let boundaries = regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).filter { match in
+            let prefix = ns.substring(to: match.range.location)
+            let token = prefix.components(separatedBy: .whitespacesAndNewlines).last ?? ""
+            if ["Jr", "Sr", "Dr", "Prof", "vs", "e.g", "i.e"].contains(token) { return false }
+            if token.range(of: #"^(?:[A-Z]\.)*[A-Z]$"#, options: .regularExpression) != nil { return false }
+            return true
         }
-        return prefix + "…"
-    }
-
-    /// What the panel shows for one entry right now.
-    public static func visibleText(_ text: String, expanded: Bool) -> String {
-        expanded ? text : collapsed(text)
+        guard boundaries.count >= 2 else { return nil }
+        let start = boundaries[0].range.location + 1
+        let end = boundaries[1].range.location + 1
+        let title = ns.substring(with: NSRange(location: start, length: end - start))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard title.split(whereSeparator: \.isWhitespace).count >= 3, title.count <= 400,
+              !title.lowercased().hasPrefix("in "), !title.lowercased().hasPrefix("proceedings ") else { return nil }
+        return title
     }
 
     /// Height of `text` wrapped to `widthPt`, in points.
@@ -173,40 +157,11 @@ public enum ReferencePreviewLayout {
         )
         return ceil(bounds.height)
     }
-
-    /// One entry's share of the panel: its label line, its text, its spacing, and the disclosure
-    /// button when it has one.
-    public static func entryHeight(_ text: String, expanded: Bool, widthPt: CGFloat) -> CGFloat {
-        let disclosure = isTruncatable(text) ? disclosureHeightPt : 0
-        return labelHeightPt + disclosure
-            + textHeight(visibleText(text, expanded: expanded), widthPt: widthPt)
-            + entrySpacingPt
-    }
-
-    /// The height a reference panel asks for: enough for every entry as it is shown now.
-    ///
-    /// This is the "grow to fit its content" half of the requirement. The other half is
-    /// `PreviewPanelGeometry.clampSize`: past the panel's maximum the body scrolls instead.
-    public static func panelHeight(
-        entries: [AppState.CitationEntry],
-        expanded: Set<Int> = [],
-        panelWidthPt: CGFloat = PreviewPanelGeometry.defaultSize.width
-    ) -> CGFloat {
-        let width = textColumnWidth(panelWidthPt: panelWidthPt)
-        let body = entries.enumerated().reduce(CGFloat(0)) { total, pair in
-            total + entryHeight(pair.element.text, expanded: expanded.contains(pair.offset),
-                                widthPt: width)
-        }
-        return chromeHeightPt + max(body, labelHeightPt + entrySpacingPt)
-    }
 }
 
 // MARK: - Model
 
-/// The reference panel's body: one entry per resolved work, each with its own Show more state.
-///
-/// Owned by the panel controller rather than by the view, which is what lets a toggle re-fit the
-/// panel, and which is what the native checks drive when they assert the truncation policy.
+/// Complete bibliography entries and their title headings for the current preview.
 @MainActor
 public final class ReferencePreviewModel: ObservableObject {
     /// One resolved bibliography entry, as the panel shows it.
@@ -214,6 +169,7 @@ public final class ReferencePreviewModel: ObservableObject {
         public let id: Int
         public let label: String
         public let text: String
+        public var heading: String { ReferencePreviewLayout.citationTitle(from: text) ?? "Reference" }
         /// Page the entry is on, when clicking its label should preview that page.
         public let page: Int?
         public let region: CGRect?
@@ -224,12 +180,6 @@ public final class ReferencePreviewModel: ObservableObject {
     }
 
     @Published public private(set) var entries: [Entry] = []
-    @Published public private(set) var expandedEntryIDs: Set<Int> = []
-
-    /// Called when a toggle changes how tall the body wants to be, so a panel the reader has not
-    /// resized can grow or shrink with it.
-    var onLayoutChange: (() -> Void)?
-
     public init() {}
 
     public func update(entries citationEntries: [AppState.CitationEntry]) {
@@ -237,44 +187,15 @@ public final class ReferencePreviewModel: ObservableObject {
             Entry(id: index, label: entry.label, text: entry.text,
                   page: entry.page, region: entry.region)
         }
-        expandedEntryIDs = []
     }
 
-    public func isTruncatable(_ entry: Entry) -> Bool {
-        ReferencePreviewLayout.isTruncatable(entry.text)
-    }
-
-    public func isExpanded(_ entry: Entry) -> Bool {
-        expandedEntryIDs.contains(entry.id)
-    }
-
-    public func visibleText(_ entry: Entry) -> String {
-        ReferencePreviewLayout.visibleText(entry.text, expanded: isExpanded(entry))
-    }
-
-    /// The disclosure button's own label.
-    public func toggleTitle(_ entry: Entry) -> String {
-        isExpanded(entry) ? "Show less" : "Show more"
-    }
-
-    /// Shows the rest of a long entry, or hides it again.
-    public func toggle(_ entry: Entry) {
-        guard isTruncatable(entry) else { return }
-        if expandedEntryIDs.contains(entry.id) {
-            expandedEntryIDs.remove(entry.id)
-        } else {
-            expandedEntryIDs.insert(entry.id)
+    /// Full citation text, with a title heading; large bibliographies scroll at the screen limit.
+    public func fullContentHeight(panelWidthPt: CGFloat) -> CGFloat {
+        let width = ReferencePreviewLayout.textColumnWidth(panelWidthPt: panelWidthPt)
+        return 80 + entries.reduce(CGFloat(0)) { total, entry in
+            total + ReferencePreviewLayout.textHeight(entry.heading, widthPt: width)
+                + ReferencePreviewLayout.textHeight(entry.text, widthPt: width) + 16
         }
-        onLayoutChange?()
-    }
-
-    /// Height the body asks for with the current expansion state.
-    public func heightPt(panelWidthPt: CGFloat) -> CGFloat {
-        ReferencePreviewLayout.panelHeight(
-            entries: entries.map(\.citationEntry),
-            expanded: expandedEntryIDs,
-            panelWidthPt: panelWidthPt
-        )
     }
 }
 
@@ -292,6 +213,7 @@ public final class ReferencePreviewPanel: NSPanel, NSWindowDelegate {
     /// Called when the *reader* moved or resized the panel (never for the placements the
     /// controller applies itself).
     package var onUserFrameChange: ((CGRect) -> Void)?
+    package var onCancel: (() -> Void)?
 
     /// The screen area the panel must stay inside. Injectable so the check harness can assert the
     /// limits without depending on the displays of the machine running it.
@@ -313,14 +235,14 @@ public final class ReferencePreviewPanel: NSPanel, NSWindowDelegate {
             defer: false
         )
         visibleFrameOverride = screen
-        isFloatingPanel = true
-        level = .floating
+        isFloatingPanel = false
+        level = .normal
         // The SwiftUI card draws the rounded material background; the window is only its frame.
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
         isMovableByWindowBackground = true
-        hidesOnDeactivate = false
+        hidesOnDeactivate = true
         animationBehavior = .utilityWindow
         collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
         minSize = PreviewPanelGeometry.minimumSize
@@ -337,6 +259,11 @@ public final class ReferencePreviewPanel: NSPanel, NSWindowDelegate {
     /// selected) without ever becoming the document window.
     public override var canBecomeKey: Bool { true }
     public override var canBecomeMain: Bool { false }
+
+    public override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() }
+        else { super.keyDown(with: event) }
+    }
 
     /// The area the panel is kept inside: the screen its own visible frame, or the injected one
     /// the checks use.
@@ -445,12 +372,8 @@ final class PreviewResizeGrip: NSView {
 
 // MARK: - Controller
 
-/// Owns the floating preview panel and the session-scoped memory of where the reader put it.
-///
-/// One panel per controller, created when a preview opens and torn down when it closes. Its frame
-/// is remembered for the rest of the run once the reader has moved or resized it — a preview is
-/// ephemeral state, so nothing about it is written to disk — and until then every preview opens
-/// next to the rectangle it belongs to and sized to its own content.
+/// Owns one child preview per reader window. Each new preview fits its own content; a manual
+/// resize is respected only while that preview remains open. No geometry is persisted.
 ///
 /// **One controller per reader window** (`ReaderSession.previewPanels`). It used to be a
 /// process-wide singleton (`shared`) that each window's `ReferencePreviewHost` re-synced with its
@@ -470,6 +393,7 @@ public final class ReferencePreviewPanelController {
 
     private var hosting: NSHostingView<ReferencePreviewPanelContent>?
     private var grip: PreviewResizeGrip?
+    private var escapeMonitor: Any?
 
     /// What the current frame was fitted to. A change here is what re-fits an untouched panel;
     /// ordinary state changes (a raster arriving, a status line) do not.
@@ -483,9 +407,7 @@ public final class ReferencePreviewPanelController {
 
     /// A fresh panel owner. The app makes one per reader window; ``shared`` remains for callers
     /// without a window.
-    public init() {
-        model.onLayoutChange = { [weak self] in self?.fitToContent() }
-    }
+    public init() {}
 
     /// Creates, moves, re-fits or closes the panel to match the state.
     ///
@@ -495,7 +417,8 @@ public final class ReferencePreviewPanelController {
         state: AppState,
         canvasOnScreen: CGRect? = nil,
         canvasHeightPt: CGFloat = 0,
-        screen: CGRect? = nil
+        screen: CGRect? = nil,
+        parentWindow: NSWindow? = nil
     ) {
         guard let preview = state.referencePreview else {
             close()
@@ -506,43 +429,53 @@ public final class ReferencePreviewPanelController {
 
         let existed = panel != nil
         let panel = self.panel ?? makePanel(state: state, screen: area)
+        if let parentWindow, panel.parent !== parentWindow {
+            panel.parent?.removeChildWindow(panel)
+            panel.level = parentWindow.level
+            parentWindow.addChildWindow(panel, ordered: .above)
+        }
+        panel.appearance = parentWindow?.effectiveAppearance
+        let isNewPreview = !existed || fittedKey?.preview != preview
+        if isNewPreview {
+            userAdjustedFrame = false
+            rememberedFrame = nil
+        }
         let key = FitKey(preview: preview,
                          imageSize: state.referencePreviewPages.first?.image.pointSize)
         if key != fittedKey {
             model.update(entries: preview.entries)
             fittedKey = key
             let size = desiredSize(preview: preview, key: key, area: area)
-            if !existed {
-                // A brand new panel opens next to the rectangle that was clicked, or wherever the
-                // reader left the last one in this session.
+            if isNewPreview {
+                // Each new preview opens next to the rectangle that was clicked.
                 applyGeometry(initialFrame(state: state, size: size, preview: preview,
                                            canvasOnScreen: canvasOnScreen,
                                            canvasHeightPt: canvasHeightPt, area: area),
                               to: panel)
             } else if !userAdjustedFrame {
-                // Already on screen and a different preview arrived: stay where the reader can
-                // see the panel and only take the height the new content asks for.
-                refitHeight(size.height, of: panel, area: area)
+                // A raster arrived for this preview; fit its aspect ratio without moving the top edge.
+                refit(size: size, of: panel, area: area)
             }
         }
-        if !panel.isVisible { panel.orderFrontRegardless() }
+        if !panel.isVisible {
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
-    /// Closes the panel, remembering where it was for the next preview in this session.
+    /// Closes the panel and releases its child-window relationship and keyboard monitor.
     public func close() {
         guard let panel else { return }
-        if userAdjustedFrame { rememberedFrame = panel.frame }
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        escapeMonitor = nil
+        panel.parent?.removeChildWindow(panel)
         panel.orderOut(nil)
         panel.delegate = nil
         panel.onUserFrameChange = nil
+        panel.onCancel = nil
         self.panel = nil
         hosting = nil
         grip = nil
         fittedKey = nil
-    }
-
-    /// Forgets the remembered frame (a check needs a clean session; the app never does).
-    package func resetSessionMemory() {
         rememberedFrame = nil
         userAdjustedFrame = false
     }
@@ -551,6 +484,20 @@ public final class ReferencePreviewPanelController {
 
     private func makePanel(state: AppState, screen: CGRect) -> ReferencePreviewPanel {
         let panel = ReferencePreviewPanel(screen: screen)
+        panel.onCancel = { [weak state, weak self] in
+            state?.closeReferencePreview()
+            self?.close()
+        }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak state, weak panel, weak self] event in
+            let handled = MainActor.assumeIsolated {
+                guard event.keyCode == 53, let panel, panel.isVisible,
+                      event.window === panel || (panel.parent != nil && event.window === panel.parent) else { return false }
+                state?.closeReferencePreview()
+                self?.close()
+                return true
+            }
+            return handled ? nil : event
+        }
         panel.onUserFrameChange = { [weak self] frame in
             self?.userAdjustedFrame = true
             self?.rememberedFrame = frame
@@ -575,8 +522,7 @@ public final class ReferencePreviewPanelController {
         return panel
     }
 
-    /// The frame a new panel opens with: the remembered one once the reader has taken over,
-    /// otherwise placed against the anchor.
+    /// Places a new preview against its source anchor.
     private func initialFrame(
         state: AppState,
         size: CGSize,
@@ -585,9 +531,6 @@ public final class ReferencePreviewPanelController {
         canvasHeightPt: CGFloat,
         area: CGRect
     ) -> CGRect {
-        if userAdjustedFrame, let rememberedFrame {
-            return PreviewPanelGeometry.confinedFrame(rememberedFrame, onScreen: area)
-        }
         if let anchor = anchorRect(state: state, preview: preview,
                                    canvasOnScreen: canvasOnScreen, canvasHeightPt: canvasHeightPt) {
             return PreviewPanelGeometry.anchoredFrame(size: size, anchor: anchor, onScreen: area)
@@ -626,12 +569,14 @@ public final class ReferencePreviewPanelController {
         key: FitKey,
         area: CGRect
     ) -> CGSize {
-        let width = panel?.frame.width ?? PreviewPanelGeometry.defaultSize.width
+        let preferredWidth: CGFloat = preview.kind == .reference ? 520 : 560
+        let width = userAdjustedFrame ? (panel?.frame.width ?? preferredWidth)
+            : min(preferredWidth, PreviewPanelGeometry.maximumSize(onScreen: area).width)
         let height: CGFloat
         switch preview.kind {
         case .reference:
-            // The model, not the preview: it also knows which entries are expanded right now.
-            height = model.heightPt(panelWidthPt: width)
+            // Measure the full citation and its title using the same column as the view.
+            height = model.fullContentHeight(panelWidthPt: width)
         case .figure, .page:
             let imageHeight: CGFloat
             if let region = preview.region {
@@ -641,33 +586,21 @@ public final class ReferencePreviewPanelController {
             } else {
                 imageHeight = 320
             }
-            // Header, footer, the caption strip and the image itself.
-            let caption: CGFloat = preview.entries.isEmpty ? 0 : 96
-            height = 150 + min(max(120, imageHeight), 600) + caption
+            // The raster crop already includes the figure/table caption.
+            height = 80 + min(max(120, imageHeight), 600)
         }
         return PreviewPanelGeometry.clampSize(CGSize(width: width, height: height), onScreen: area)
     }
 
     /// Re-fits the height to what the body now wants, keeping the top edge where it is.
-    private func refitHeight(_ height: CGFloat, of panel: ReferencePreviewPanel, area: CGRect) {
-        let size = PreviewPanelGeometry.clampSize(
-            CGSize(width: panel.frame.width, height: height), onScreen: area
-        )
+    private func refit(size requestedSize: CGSize, of panel: ReferencePreviewPanel, area: CGRect) {
+        let size = PreviewPanelGeometry.clampSize(requestedSize, onScreen: area)
         var frame = panel.frame
         // Growing downward would push the panel off the bottom of the screen, so the top edge
         // stays put and the panel grows upward from it instead.
         frame.origin.y = frame.maxY - size.height
         frame.size = size
         applyGeometry(PreviewPanelGeometry.confinedFrame(frame, onScreen: area), to: panel)
-    }
-
-    /// Re-fits after the body changed height (a Show more / Show less toggle).
-    private func fitToContent() {
-        guard let panel, !userAdjustedFrame, let preview = fittedKey?.preview else { return }
-        let area = panel.screenArea
-        let key = FitKey(preview: preview, imageSize: fittedKey?.imageSize)
-        let size = desiredSize(preview: preview, key: key, area: area)
-        refitHeight(size.height, of: panel, area: area)
     }
 
     private func applyGeometry(_ frame: CGRect, to panel: ReferencePreviewPanel) {
@@ -683,6 +616,7 @@ public final class ReferencePreviewPanelController {
 struct ReferencePreviewPanelContent: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: ReferencePreviewModel
+    @ObservedObject private var appearance = ReadingAppearanceStore.shared
 
     var body: some View {
         if let preview = state.referencePreview {
@@ -692,8 +626,6 @@ struct ReferencePreviewPanelContent: View {
                 case .reference: referenceBody(preview)
                 case .figure, .page: imageBody(preview)
                 }
-                entriesBody(preview)
-                footer(preview)
             }
             .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -729,28 +661,22 @@ struct ReferencePreviewPanelContent: View {
         }
     }
 
-    /// A reference: the entry as text, sized to its content, long entries truncated behind an
-    /// explicit Show more.
+    /// Complete citation entries, with title headings; the body scrolls at the screen limit.
     private func referenceBody(_ preview: AppState.ReferencePreview) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: ReferencePreviewLayout.entrySpacingPt) {
                 ForEach(model.entries) { entry in
                     VStack(alignment: .leading, spacing: 4) {
                         if entry.page != nil {
-                            Button(entry.label) { state.selectPreviewEntry(entry.citationEntry) }
+                            Button(entry.heading) { state.selectPreviewEntry(entry.citationEntry) }
                                 .buttonStyle(.link)
                         } else {
-                            Text(entry.label).bold()
+                            Text(entry.heading).bold()
                         }
-                        Text(model.visibleText(entry))
+                        Text(entry.text)
                             .font(.system(size: ReferencePreviewLayout.textFontSize))
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
-                        if model.isTruncatable(entry) {
-                            Button(model.toggleTitle(entry)) { model.toggle(entry) }
-                                .buttonStyle(.link)
-                                .font(.caption)
-                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -769,6 +695,7 @@ struct ReferencePreviewPanelContent: View {
                 scrollYPt: state.referencePreviewScrollYPt,
                 zoom: state.referencePreviewZoom,
                 contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
+                paperAppearance: appearance.mode,
                 onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onViewportSize: { size in state.setReferencePreviewViewport(size) },
@@ -784,45 +711,10 @@ struct ReferencePreviewPanelContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.white)
+        .background(LyraTheme.canvasBg)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    /// The caption strip a figure or a page preview carries. Unchanged in shape from the overlay
-    /// this replaced: a figure's caption is its own entry, so it reads below the picture.
-    @ViewBuilder
-    private func entriesBody(_ preview: AppState.ReferencePreview) -> some View {
-        if preview.kind != .reference, !preview.entries.isEmpty {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(preview.entries.indices, id: \.self) { index in
-                        let entry = preview.entries[index]
-                        VStack(alignment: .leading, spacing: 4) {
-                            if entry.page != nil {
-                                Button(entry.label) { state.selectPreviewEntry(entry) }
-                                    .buttonStyle(.link)
-                            } else {
-                                Text(entry.label).bold()
-                            }
-                            Text(entry.text)
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .font(.callout)
-            }
-            .frame(maxHeight: 140)
-        }
-    }
-
-    private func footer(_ preview: AppState.ReferencePreview) -> some View {
-        Text(preview.kind == .reference
-             ? "Esc closes this preview. Drag the panel by its background; drag the corner to resize."
-             : "Scroll inside the preview to read more. Drag the panel by its background; drag the corner to resize.")
-            .font(.caption2).foregroundStyle(.secondary)
-    }
 }
 
 // MARK: - Host
@@ -837,6 +729,7 @@ struct ReferencePreviewHost: NSViewRepresentable {
     // its publications here: otherwise SwiftUI can skip updateNSView for this unchanged value,
     // leaving parsed preview content in AppState with no AppKit panel to display it.
     @ObservedObject var state: AppState
+    @ObservedObject private var appearance = ReadingAppearanceStore.shared
     /// The controller of the window this host is in (`ReaderSession.previewPanels`); `shared` for
     /// a caller that has no window of its own.
     var panels: ReferencePreviewPanelController = .shared
@@ -853,7 +746,8 @@ struct ReferencePreviewHost: NSViewRepresentable {
             state: state,
             canvasOnScreen: canvasOnScreen,
             canvasHeightPt: nsView.bounds.height,
-            screen: nsView.window?.screen?.visibleFrame
+            screen: nsView.window?.screen?.visibleFrame,
+            parentWindow: nsView.window
         )
     }
 }

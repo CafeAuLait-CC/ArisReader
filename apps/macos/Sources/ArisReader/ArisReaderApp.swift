@@ -24,6 +24,7 @@ struct ArisReaderApp: App {
     private static var quitWatchdog: DispatchSourceTimer?
 
     init() {
+        AppState.recordsRecentDocuments = true
         // A packaged app must use its own PDFium before the engine's development-directory
         // fallback. That fallback may point into a protected Documents checkout and block
         // dlopen on first open. Preserve an explicit, nonempty developer override.
@@ -105,7 +106,9 @@ struct ArisReaderApp: App {
 /// The keymap lives on the Rust side (aris-reader-session::keymap, docs/04-ui-ux.md §4);
 /// this is a minimal set consistent with it, to be generated from engine queries after M1 T1.9.
 struct ReaderCommands: Commands {
+    @ObservedObject private var readingAppearance = ReadingAppearanceStore.shared
     @FocusedValue(\.readerSession) private var session
+    @FocusedObject private var focusedState: AppState?
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -147,6 +150,18 @@ struct ReaderCommands: Commands {
             }
         }
 
+        CommandGroup(after: .toolbar) {
+            Divider()
+            Picker("Paper Appearance", selection: $readingAppearance.mode) {
+                ForEach(PaperAppearance.allCases) { mode in Text(mode.title).tag(mode) }
+            }
+            Button("Search Results") { focusedState?.searchSidebarVisible.toggle() }
+                .disabled(focusedState?.document == nil)
+            Button("Document Information…") { focusedState?.showDocumentInformation = true }
+                .keyboardShortcut("i", modifiers: [.command, .option])
+                .disabled(focusedState?.document == nil)
+        }
+
         CommandMenu("Reading") {
             Button("Previous Page") { session?.state.previousPage() }
                 .keyboardShortcut(.leftArrow, modifiers: .command)
@@ -169,7 +184,7 @@ struct ReaderCommands: Commands {
 
             Button("Add Bookmark") { session?.state.addBookmarkAtCurrentPage() }
                 .keyboardShortcut("d", modifiers: .command)
-                .disabled(session?.state.document == nil)
+                .disabled(focusedState?.document == nil)
 
             Divider()
 
@@ -273,7 +288,7 @@ struct ReaderCommands: Commands {
             Button("Extract Selected Pages…") {
                 session?.state.presentExtractPagesPanel()
             }
-            .disabled(session?.state.document == nil)
+            .disabled(focusedState?.document == nil)
 
             Divider()
 

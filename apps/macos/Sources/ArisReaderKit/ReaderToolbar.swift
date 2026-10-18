@@ -107,6 +107,12 @@ public struct TabStrip: View {
         .overlay(alignment: .bottom) {
             if active { LyraTheme.accent.frame(height: 2) }
         }
+        .overlay(alignment: .trailing) {
+            if !active {
+                LyraTheme.controlBorder.opacity(0.45)
+                    .frame(width: 1, height: 22).padding(.trailing, -2)
+            }
+        }
         .help(tab.title)
     }
 }
@@ -203,6 +209,9 @@ struct ReaderToolbar: View {
                 .separator("more"),
                 LyraMenuItem("Undo", icon: "arrow.uturn.backward", shortcut: "⌘Z", enabled: state.canUndo) { state.undo() },
                 LyraMenuItem("Close Reference Preview", icon: "rectangle.on.rectangle", enabled: state.referencePreview != nil) { state.closeReferencePreview() },
+                LyraMenuItem("Document Information…", icon: "info.circle", shortcut: "⌥⌘I", enabled: state.document != nil) {
+                    state.showDocumentInformation = true
+                },
                 LyraMenuItem("Settings…", icon: "gearshape", shortcut: "⌘,") { openSettings() },
             ]) { Image(systemName: "ellipsis.circle") }
             Spacer(minLength: 4)
@@ -224,12 +233,7 @@ struct ReaderToolbar: View {
                 .textFieldStyle(.plain).font(.system(size: 12))
                 .frame(width: compact ? 100 : 150)
                 .onSubmit { state.pageOverviewVisible = false; state.runSearch() }
-            if !state.searchHits.isEmpty {
-                Text(state.currentHitIndex.map { "\($0 + 1)/\(state.searchHits.count)" } ?? "")
-                    .font(.caption2).monospacedDigit().foregroundStyle(LyraTheme.textSecondary)
-                tool("Previous match (⇧⌘G)", "chevron.up") { state.findPrevious() }
-                tool("Next match (⌘G)", "chevron.down") { state.findNext() }
-            }
+
         }
         .padding(.leading, 9).padding(.trailing, 5).frame(height: 32)
         .background(LyraTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))

@@ -5,10 +5,11 @@ import UniformTypeIdentifiers
 
 /// Sidebar: tab switching plus the content of each tab (`docs/04-ui-ux.md` §2.2).
 ///
-/// Thumbnails, outline and search results are real as of M2; the remaining tabs
-/// (bookmarks, annotations, AI) keep their empty state until their milestone.
+/// Bookmarks, outline, annotations, thumbnails and AI share the horizontal navigator.
+/// Search results and document information have their own surfaces.
 public struct SidebarView: View {
     @ObservedObject private var state: AppState
+    @ObservedObject private var appearance = ReadingAppearanceStore.shared
     /// The window this sidebar belongs to. A file dropped on the sidebar opens in a **new**
     /// window through this coordinator; `nil` in previews/checks that only want the panel, in
     /// which case the sidebar is not a drop target.
@@ -49,16 +50,27 @@ public struct SidebarView: View {
                 thumbnailStrip
             } else {
                 VStack(spacing: 0) {
-                    Picker("Sidebar", selection: $state.sidebarTab) {
-                        ForEach(SidebarTab.allCases) { tab in
-                            Label(tab.title, systemImage: tab.systemImage).tag(tab)
+                    HStack(spacing: 2) {
+                        ForEach([SidebarTab.bookmarks, .outline, .annotations, .thumbnails, .ai]) { tab in
+                            Button { state.sidebarTab = tab } label: {
+                                Image(systemName: tab.systemImage)
+                                    .frame(maxWidth: .infinity, minHeight: 30)
+                            }
+                            .buttonStyle(LyraToolStyle(selected: state.sidebarTab == tab))
+                            .accessibilityLabel(tab.title).help(tab.title)
+                            .accessibilityValue(state.sidebarTab == tab ? "Selected" : "")
                         }
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-
+                    .padding(8)
+                    HStack {
+                        Text(state.sidebarTab.title).font(.headline)
+                        Spacer(minLength: 0)
+                        if state.sidebarTab == .bookmarks {
+                            Button { state.addBookmarkAtCurrentPage() } label: { Image(systemName: "plus") }
+                                .buttonStyle(LyraToolStyle()).disabled(state.document == nil)
+                                .accessibilityLabel("Add Bookmark").help("Bookmark this page (⌘D)")
+                        }
+                    }.padding(.horizontal, 12).padding(.bottom, 7)
                     Divider()
 
                     content
@@ -94,157 +106,15 @@ public struct SidebarView: View {
         case .outline:
             outlineList
         case .search:
-            searchResults
+            SearchResultSidebar(state: state)
         case .bookmarks:
             bookmarkList
         case .annotations:
             annotationList
         case .metadata:
-            metadataPanel
+            DocumentInformationContent(state: state)
         case .ai:
             AIAssistantPanel(state: state, model: aiAssistant)
-        }
-    }
-
-    // MARK: - Metadata
-
-    /// Title, authors, venue, year, DOI and arXiv id, each editable and each labelled with the
-    /// source that produced it. An empty field stays empty; the note at the bottom says so, and
-    /// the panel never fills a value from the filename or the file's creation date.
-    private var metadataPanel: some View {
-        Group {
-            if state.document == nil {
-                VStack(spacing: 10) {
-                    Image(systemName: "text.badge.checkmark")
-                        .font(.system(size: 30, weight: .light))
-                        .foregroundStyle(LyraTheme.textTertiary)
-                    Text("No document")
-                        .font(.callout)
-                        .foregroundStyle(LyraTheme.textSecondary)
-                    Text("Open a PDF to read and correct its title, authors, venue, year, DOI and arXiv id.")
-                        .font(.caption)
-                        .foregroundStyle(LyraTheme.textTertiary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(20)
-            } else if state.metadataLoading {
-                VStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Reading metadata…")
-                        .font(.caption)
-                        .foregroundStyle(LyraTheme.textSecondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let failure = state.metadataError {
-                VStack(spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 26, weight: .light))
-                        .foregroundStyle(LyraTheme.warningFg)
-                    Text("Metadata could not be read")
-                        .font(.callout)
-                        .foregroundStyle(LyraTheme.textSecondary)
-                    Text(failure)
-                        .font(.caption2)
-                        .foregroundStyle(LyraTheme.textTertiary)
-                        .lineLimit(4)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(20)
-            } else {
-                List {
-                    Section {
-                        ForEach(MetadataFieldKey.allCases, id: \.self) { key in
-                            metadataRow(key)
-                        }
-                    } header: {
-                        Text("Found in this PDF")
-                    } footer: {
-                        if state.metadataIsEmpty() {
-                            Text(
-                                "No metadata was found. An empty field stays empty rather than "
-                                + "being filled with a plausible-looking guess."
-                            )
-                        } else {
-                            Text(
-                                "“Guessed” fields come from the page layout. Correct anything "
-                                + "that is wrong; edits regenerate the entry below."
-                            )
-                        }
-                    }
-
-                    Section("Generated BibTeX") {
-                        Text(state.metadataBibtex)
-                            .font(.system(size: 10, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        HStack(spacing: 10) {
-                            Button {
-                                state.copyMetadataBibtex()
-                            } label: {
-                                Label("Copy", systemImage: "doc.on.doc")
-                            }
-                            .disabled(!state.canCopyMetadataBibtex)
-                            Button {
-                                state.presentSaveBibtexPanel()
-                            } label: {
-                                Label("Save…", systemImage: "square.and.arrow.down")
-                            }
-                            .disabled(!state.canCopyMetadataBibtex)
-                        }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                    }
-                }
-                .listStyle(.sidebar)
-            }
-        }
-    }
-
-    private func metadataRow(_ key: MetadataFieldKey) -> some View {
-        let field = state.metadata?.field(key) ?? .empty
-        return VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(key.label)
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                Spacer(minLength: 0)
-                metadataBadge(field)
-            }
-            TextField(key.prompt, text: metadataBinding(key))
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .accessibilityLabel(key.label)
-        }
-        .padding(.vertical, 2)
-    }
-
-    private func metadataBinding(_ key: MetadataFieldKey) -> Binding<String> {
-        Binding(
-            get: { state.metadataDraft.text(for: key) },
-            set: { state.updateMetadata(key, text: $0) }
-        )
-    }
-
-    @ViewBuilder
-    private func metadataBadge(_ field: MetadataField) -> some View {
-        if field.source == .absent {
-            Text("empty")
-                .font(.caption2)
-                .foregroundStyle(LyraTheme.textTertiary)
-        } else if field.source == .edited {
-            Text("Edited")
-                .font(.caption2)
-                .foregroundStyle(LyraTheme.textSecondary)
-        } else if field.guessed || field.source.isGuessed {
-            Label(field.source.label, systemImage: "questionmark.circle")
-                .font(.caption2)
-                .foregroundStyle(LyraTheme.warningFg)
-        } else {
-            Text(field.source.label)
-                .font(.caption2)
-                .foregroundStyle(field.source.isEmbedded ? Color.secondary : Color.blue)
         }
     }
 
@@ -409,6 +279,7 @@ public struct SidebarView: View {
                 .aspectRatio(contentMode: .fit)
                 .frame(width: thumbnailWidth)
                 .background(Color.white)
+                .modifier(PaperImageAppearance(mode: appearance.mode))
                 .overlay(Rectangle().stroke(LyraTheme.pageEdge, lineWidth: 0.5))
         } else {
             RoundedRectangle(cornerRadius: 2)
@@ -563,36 +434,6 @@ public struct SidebarView: View {
 
     // MARK: - Search
 
-    private var searchResults: some View {
-        Group {
-            if state.searchHits.isEmpty {
-                emptyState("Search results", "magnifyingglass", task: "T2.6")
-            } else {
-                List(Array(state.searchHits.enumerated()), id: \.offset) { index, hit in
-                    Button {
-                        state.showSearchHit(index)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Page \(hit.page + 1)")
-                                .font(.caption2)
-                                .foregroundStyle(LyraTheme.textSecondary)
-                            Text(hit.snippet)
-                                .font(.caption)
-                                .lineLimit(3)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(
-                        index == state.currentHitIndex ? Color.accentColor.opacity(0.15) : .clear
-                    )
-                }
-                .listStyle(.sidebar)
-            }
-        }
-    }
-
     // MARK: - Bookmarks
 
     /// The reader's own bookmarks: one section per page, in the order the reader set.
@@ -603,23 +444,6 @@ public struct SidebarView: View {
     /// a drag in a grouped `List` cannot say whether the reader meant to reorder or to regroup.
     private var bookmarkList: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Button {
-                    state.addBookmarkAtCurrentPage()
-                } label: {
-                    Label("Add Bookmark", systemImage: "bookmark.badge.plus")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .disabled(state.document == nil)
-                .help("Bookmark the current page and position (⌘D)")
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-
-            Divider()
-
             if state.bookmarks.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "bookmark")

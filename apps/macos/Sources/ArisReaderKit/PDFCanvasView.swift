@@ -199,6 +199,15 @@ public final class MetalCanvasView: NSView {
     /// `AppState` commands the toolbar and the Pages menu use.
     public var onContextMenu: ((CGPoint) -> NSMenu?)?
 
+    /// Display-only conversion; changing the profile redraws without uploading source pixels again.
+    public var paperAppearance: PaperAppearance = .original {
+        didSet {
+            guard oldValue != paperAppearance else { return }
+            syncAnnotationOverlay()
+            markNeedsRender()
+        }
+    }
+
     /// Width of the widest page in points; used to centre narrow documents.
     public var contentWidthPt: CGFloat = 0 {
         didSet {
@@ -905,13 +914,13 @@ public final class MetalCanvasView: NSView {
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
                 blends.withUnsafeBufferPointer { modes in
-                    aris_reader_surface_draw_pages_on_background(
+                    aris_reader_surface_draw_pages_with_appearance(
                         surfaceId,
                         ids.baseAddress,
                         rectangles.baseAddress,
                         modes.baseAddress,
                         textureIds.count,
-                        clear[0], clear[1], clear[2],
+                        clear[0], clear[1], clear[2], paperAppearance.code,
                         &stats
                     )
                 }
@@ -962,7 +971,8 @@ public final class MetalCanvasView: NSView {
             contentWidthPt: contentWidthPt,
             color: color,
             strokeWidth: annotationStrokeWidth,
-            themeColor: NSColor.controlAccentColor
+            themeColor: NSColor.controlAccentColor,
+            paperAppearance: paperAppearance
         )
     }
 
@@ -1011,6 +1021,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let scrollYPt: CGFloat
     private let zoom: CGFloat
     private let contentWidthPt: CGFloat
+    private let paperAppearance: PaperAppearance
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
     private let annotationTool: AnnotationTool
@@ -1045,6 +1056,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         scrollYPt: CGFloat = 0,
         zoom: CGFloat = 1.0,
         contentWidthPt: CGFloat = 0,
+        paperAppearance: PaperAppearance = .original,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
         annotationTool: AnnotationTool = .select,
@@ -1075,6 +1087,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.scrollYPt = scrollYPt
         self.zoom = zoom
         self.contentWidthPt = contentWidthPt
+        self.paperAppearance = paperAppearance
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
         self.annotationTool = annotationTool
@@ -1133,6 +1146,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
+        view.paperAppearance = paperAppearance
         view.annotationMarks = annotationMarks
         view.annotationPageFrames = annotationPageFrames
         view.annotationTool = annotationTool

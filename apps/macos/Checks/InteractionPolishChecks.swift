@@ -304,11 +304,10 @@ extension ReaderChecks {
 
     // MARK: - Panel behaviour
 
-    /// A reference preview opens against its anchor, and the panel's place survives the session.
+    /// New reference previews fit their own content; manual changes last for one preview.
     @MainActor static func previewPanelSessionChecks(url: URL) async throws {
         let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
         let controller = ReferencePreviewPanelController.shared
-        controller.resetSessionMemory()
         controller.close()
 
         let state = AppState(engine: PreviewEngine())
@@ -336,23 +335,14 @@ extension ReaderChecks {
         require(screen.contains(panel.frame), "the panel opens inside the screen")
         require(panel.frame.width == PreviewPanelGeometry.defaultSize.width,
                 "the panel opens at its default width")
-        let anchorScreenY = canvas.minY + (canvas.height - click.maxY)
-        require(abs(panel.frame.maxY - (anchorScreenY - PreviewPanelGeometry.anchorGap)) < 0.5,
-                "the panel opens just below the rectangle the reader clicked "
-                + "(panel \(panel.frame.maxY), anchor \(anchorScreenY))")
+        let fittedHeight = PreviewPanelGeometry.clampSize(
+            CGSize(width: panel.frame.width, height: controller.model.fullContentHeight(panelWidthPt: panel.frame.width)),
+            onScreen: screen).height
+        require(abs(panel.frame.height - fittedHeight) < 1,
+                "the panel fits the full long citation up to its screen limit")
         require(panel.frame.height >= PreviewPanelGeometry.minimumSize.height
                     && panel.frame.height <= PreviewPanelGeometry.maximumSize(onScreen: screen).height,
                 "the panel's height is inside its limits")
-
-        // Show more asks for a taller panel while the reader has not resized it.
-        let collapsedHeight = panel.frame.height
-        controller.model.toggle(controller.model.entries[0])
-        require(panel.frame.height >= collapsedHeight,
-                "Show more grows the panel to fit the entry (\(collapsedHeight) → \(panel.frame.height))")
-        require(panel.frame.height <= PreviewPanelGeometry.maximumSize(onScreen: screen).height,
-                "a very long entry is capped at the panel's maximum and scrolls instead")
-        controller.model.toggle(controller.model.entries[0])
-        require(panel.frame.height == collapsedHeight, "Show less gives the height back")
 
         // The reader drags it somewhere else; that frame is the session's from then on.
         let moved = CGRect(x: 60, y: 90, width: 520, height: 320)
@@ -362,14 +352,15 @@ extension ReaderChecks {
         require(panel.frame == moved, "the panel is where the reader put it")
         controller.close()
         require(controller.panel == nil, "closing the preview closes the panel")
-        require(controller.rememberedFrame == moved, "the frame survives the close")
+        require(controller.rememberedFrame == nil && !controller.userAdjustedFrame,
+                "closing forgets the manual size so the next preview fits its own content")
 
         state.openReferencePreview(page: 1, title: "[8]", from: "page 2", kind: .reference,
                                    entries: [entries[1]])
         controller.sync(state: state, canvasOnScreen: canvas, canvasHeightPt: canvas.height,
                         screen: screen)
-        require(controller.panel?.frame == moved,
-                "the next preview opens where the reader left the panel, not at the anchor")
+        require(controller.panel?.frame != moved && controller.panel?.frame.height == PreviewPanelGeometry.minimumSize.height,
+                "a short new preview automatically shrinks after a manually resized long preview")
 
         // A frame dragged clean off the screen comes back.
         controller.panel?.applyUserFrame(CGRect(x: 9000, y: 9000, width: 520, height: 320))
@@ -536,79 +527,27 @@ extension ReaderChecks {
     }
 
     // MARK: - Reference entry text
-    /// A long entry is truncated at the threshold, and Show more reveals the rest.
+    /// Full entries stay intact, and their measured height controls sizing and scrolling.
     @MainActor static func referenceEntryTextChecks() throws {
-        // Short entry: no disclosure, no truncation.
-        let short = String(repeating: "Short reference. ", count: 3)
-        require(!ReferencePreviewLayout.isTruncatable(short), "an ordinary entry is shown whole")
-        require(ReferencePreviewLayout.collapsed(short) == short,
-                "collapsing a short entry changes nothing")
-
-        // Exactly at the threshold is still whole; one past it is not.
-        let atLimit = String(repeating: "x", count: ReferencePreviewLayout.collapsedCharacterLimit)
-        let overLimit = String(repeating: "word ", count: 300)
-        require(!ReferencePreviewLayout.isTruncatable(atLimit),
-                "an entry exactly at the threshold is not truncated")
-        require(ReferencePreviewLayout.isTruncatable(overLimit),
-                "an entry past the threshold is truncated")
-
-        let entry = AppState.CitationEntry(label: "42", text: overLimit, page: 3)
         let model = ReferencePreviewModel()
-        model.update(entries: [entry])
-        guard let modelEntry = model.entries.first else { fatalError("FAIL: the model took the entry") }
-        require(model.isTruncatable(modelEntry), "the model offers a disclosure for a long entry")
-        require(model.visibleText(modelEntry).count
-                    <= ReferencePreviewLayout.collapsedCharacterLimit + 1,
-                "the collapsed text stops at the threshold")
-        require(model.visibleText(modelEntry).hasSuffix("…"),
-                "the collapsed text is marked as truncated")
-        require(overLimit.hasPrefix(model.visibleText(modelEntry).dropLast()),
-                "the collapsed text is the entry's own opening, not a summary")
-        require(model.toggleTitle(modelEntry) == "Show more", "the affordance reads Show more")
-
-        let collapsedHeight = model.heightPt(panelWidthPt: 480)
+        let short = AppState.CitationEntry(label: "1", text: "An ordinary citation.", page: 1)
+        let long = AppState.CitationEntry(label: "2", text: String(repeating: "A complete bibliography entry. ", count: 200), page: 2)
+        model.update(entries: [short])
+        let shortHeight = model.fullContentHeight(panelWidthPt: 520)
+        model.update(entries: [short, long])
+        require(model.entries.map(\.text) == [short.text, long.text],
+                "all citation entries preserve their full text without truncation")
+        require(model.entries.map(\.citationEntry) == [short, long],
+                "title headings retain original entry destinations and text")
+        let height = model.fullContentHeight(panelWidthPt: 520)
+        require(height > shortHeight, "long citations increase the automatic content height")
+        require(model.fullContentHeight(panelWidthPt: 320) > height,
+                "citation height accounts for wrapping when the column gets narrower")
         let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let collapsedPanel = PreviewPanelGeometry.clampSize(CGSize(width: 480, height: collapsedHeight),
-                                                            onScreen: screen)
-        require(collapsedPanel.height >= collapsedHeight
-                    && collapsedPanel.height <= PreviewPanelGeometry.maximumSize(onScreen: screen).height,
-                "a long entry's collapsed height fits inside the panel's limits")
-
-        model.toggle(modelEntry)
-        require(model.isExpanded(modelEntry), "Show more expands the entry")
-        require(model.visibleText(modelEntry) == overLimit,
-                "the expanded entry is the whole entry text, character for character")
-        require(model.toggleTitle(modelEntry) == "Show less", "the affordance becomes Show less")
-        let expandedHeight = model.heightPt(panelWidthPt: 480)
-        require(expandedHeight > collapsedHeight,
-                "the panel grows to fit the expanded entry (\(collapsedHeight) → \(expandedHeight))")
-        // An entry of novel length is capped: past the panel's maximum the body scrolls instead
-        // of growing, which is the "up to a sensible maximum" half of the requirement.
-        let huge = AppState.CitationEntry(label: "99", text: String(repeating: "word ", count: 1200),
-                                          page: 6)
-        let hugeModel = ReferencePreviewModel()
-        hugeModel.update(entries: [huge])
-        hugeModel.toggle(hugeModel.entries[0])
-        let hugeHeight = hugeModel.heightPt(panelWidthPt: 480)
-        require(hugeHeight > PreviewPanelGeometry.maximumSize(onScreen: screen).height,
-                "an enormous entry wants more height than the panel may have (\(hugeHeight) pt)")
-        require(PreviewPanelGeometry.clampSize(CGSize(width: 480, height: hugeHeight),
-                                               onScreen: screen).height
+        require(height > PreviewPanelGeometry.maximumSize(onScreen: screen).height,
+                "a very long citation exceeds the allowed window height")
+        require(PreviewPanelGeometry.clampSize(CGSize(width: 520, height: height), onScreen: screen).height
                     == PreviewPanelGeometry.maximumSize(onScreen: screen).height,
-                "and is capped at the panel's maximum, where the body scrolls instead")
-
-        model.toggle(modelEntry)
-        require(!model.isExpanded(modelEntry) && model.heightPt(panelWidthPt: 480) == collapsedHeight,
-                "Show less restores the collapsed text and the smaller panel")
-
-        // A group keeps one disclosure per entry.
-        let long = AppState.CitationEntry(label: "7", text: overLimit, page: 4)
-        let shortEntry = AppState.CitationEntry(label: "8", text: "A short one.", page: 5)
-        model.update(entries: [long, shortEntry])
-        require(model.entries.count == 2 && model.entries.allSatisfy { !model.isExpanded($0) },
-                "a new preview starts collapsed")
-        require(model.entries.map { model.isTruncatable($0) } == [true, false],
-                "each entry decides its own disclosure")
-        print("PASS: reference entries truncate at the threshold and Show more reveals the rest")
+                "large citations stop at the screen limit and use scrolling")
     }
 }
