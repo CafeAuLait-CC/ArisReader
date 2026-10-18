@@ -235,6 +235,15 @@ struct ReaderChecks {
             try await measureWindowEngineCost()
             return
         }
+        // Lets the titlebar's appearance/theme checks run on their own while they are being
+        // worked on (`ArisReaderChecks --check-titlebar-theme .`).
+        if CommandLine.arguments.contains("--check-titlebar-theme") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await titlebarThemeChecks(root: root)
+            print("Titlebar theme checks passed")
+            return
+        }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`ArisReaderChecks --check-tab-row .`).
         if CommandLine.arguments.contains("--check-tab-row") {
@@ -242,6 +251,7 @@ struct ReaderChecks {
                 ?? FileManager.default.currentDirectoryPath)
             tabRowLayoutChecks()
             titlebarResizeChecks()
+            try await titlebarThemeChecks(root: root)
             try await tabRetentionChecks(root: root)
             print("Tab-row checks passed")
             return
@@ -466,6 +476,7 @@ struct ReaderChecks {
         try await thumbnailDragChecks(root: root)
         tabRowLayoutChecks()
         titlebarResizeChecks()
+        try await titlebarThemeChecks(root: root)
         try await tabRetentionChecks(root: root)
         try await documentOpeningChecks(a: a, b: b)
         try await desktopInteractionChecks(

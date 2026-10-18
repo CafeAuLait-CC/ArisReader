@@ -97,21 +97,46 @@ public enum TabRowLayout {
 /// Positions the existing AppKit window buttons in the custom tab row. Keeping them in their
 /// native view hierarchy preserves their targets, accessibility and full-screen behaviour.
 ///
-/// The placement is deliberately computed from the *frame view's* top edge and the button's own
-/// parent height, never from SwiftUI geometry and never from the content view's bounds. During a
+/// The placement is deliberately computed from the *frame view's* top edge and the fixed 44 pt
+/// row height, never from SwiftUI geometry and never from the content view's bounds. During a
 /// live resize those two can be a layout pass apart: deriving the row's top from a content rect
 /// whose height is still the previous one, then correcting on the next pass, is exactly what made
-/// the buttons visibly jump. The frame view's bounds and the (fixed 44 pt) titlebar height are
-/// settled in the same AppKit layout pass, so each button's vertical origin is constant
-/// ((row height − button height) / 2, currently 14 pt for the 16 pt standard button) while the
-/// window's *width* changes.
+/// the buttons visibly jump. The frame view's bounds are settled when the window frame is, and the
+/// row height is a constant, so each button's vertical origin is constant ((row height − button
+/// height) / 2, currently 14 pt for the 16 pt standard button) while the window's *width* changes.
+///
+/// AppKit also re-runs its own titlebar layout when the window's effective appearance changes — a
+/// system light/dark switch, or SwiftUI applying a reading theme through `preferredColorScheme`.
+/// That pass restores the standard 28 pt titlebar and leaves the buttons' local origins where they
+/// were, so the group jumps up 16 pt and stays there until something asks for another placement.
+/// The effective-appearance observation installed in ``init(window:)`` is what asks.
 @MainActor public final class ReaderTitlebarLayout {
     private weak var window: NSWindow?
     private var alignmentPending = false
+    private var appearanceObservation: NSKeyValueObservation?
 
     public init(window: NSWindow) {
         self.window = window
+        // AppKit re-runs the native titlebar layout when the window's effective appearance
+        // changes: a system light/dark switch, or SwiftUI applying a reading theme through
+        // `preferredColorScheme`. That pass restores the standard 28 pt titlebar while the
+        // buttons keep the local y they had in our 44 pt row, so the group jumps up and stays
+        // there. KVO on `effectiveAppearance` is the public hook for exactly this change (the
+        // AppKit headers recommend it for appearance observation); it fires for a per-window
+        // appearance and for the inherited application/system one, including a theme change that
+        // leaves the resolved appearance the same (it is a new `NSAppearance` either way). The
+        // placement itself is scheduled for the next main-queue turn, after AppKit has finished
+        // the titlebar layout that comes with the appearance.
+        appearanceObservation = window.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            // KVO delivers on the thread that changed the appearance, and a window's
+            // appearance is changed on the main thread.
+            MainActor.assumeIsolated { self?.scheduleAlignment() }
+        }
         scheduleAlignment()
+    }
+
+    deinit {
+        appearanceObservation?.invalidate()
     }
 
     public func scheduleAlignment() {
@@ -151,12 +176,13 @@ public enum TabRowLayout {
                                          height: TabRowLayout.height))
         }
 
-        // Each button is placed from its own parent's height. A 44 pt titlebar and a 14 pt
-        // button therefore always give y = 15, whether or not a resize is in flight.
+        // Each button is placed from the fixed row height, not from a parent height that may
+        // still be mid-layout. A 44 pt titlebar and a 16 pt button therefore always give y = 14,
+        // whether or not a resize or an appearance transition is in flight.
         let originsX = TabRowLayout.trafficLightOriginsX
         for (index, kind) in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].enumerated() {
-            guard let button = window.standardWindowButton(kind), let parent = button.superview else { continue }
-            let y = (parent.bounds.height - button.frame.height) / 2
+            guard let button = window.standardWindowButton(kind), button.superview != nil else { continue }
+            let y = TabRowLayout.trafficLightOriginY(buttonHeight: button.frame.height)
             let origin = NSPoint(x: originsX[index], y: y)
             if button.frame.origin != origin { button.setFrameOrigin(origin) }
         }
