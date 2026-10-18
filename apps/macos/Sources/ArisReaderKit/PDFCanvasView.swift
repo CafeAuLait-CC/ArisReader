@@ -277,6 +277,17 @@ public final class MetalCanvasView: NSView {
     /// to be zero, which catches the regression where the model empties but the old page stays
     /// on screen because no new frame was submitted.
     package private(set) var lastSubmittedQuadCount: Int?
+    /// Frames this view has handed to the engine, whether or not the WindowServer allowed the
+    /// surface to present them.
+    ///
+    /// Presentation depends on the environment, not on the reader: another app's window in
+    /// front, a full-screen Space, or an inactive display makes wgpu report the surface as
+    /// occluded and skip the present. The submission still runs and is exactly what replaces a
+    /// stale drawable, so checks observe this counter when presentation is not observable.
+    package private(set) var frameAttemptCount: UInt64 = 0
+    /// Page quads in the most recent frame handed to the engine, presented or not. `0` means the
+    /// submission was a clearing frame: the background with nothing drawn over it.
+    package private(set) var lastAttemptedQuadCount: Int?
     /// Whether this view's layer is attached to an engine surface. Checks use it where they
     /// cannot ask for a presented frame (an occluded window never presents).
     package var hasAttachedSurface: Bool { surfaceId != 0 }
@@ -937,6 +948,12 @@ public final class MetalCanvasView: NSView {
             let line = "aris-scroll-trace: {\"kind\":\"frame\",\"time\":\(now),\"surface\":\(surfaceId),\"sequence\":\(sequence),\"presented\":\(stats.presented),\"cpu_us\":\(stats.elapsed_us),\"y\":\(scrollYPt)}\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
+
+        // Count the submission before presentation is decided: an occluded window still runs
+        // this path, and the emitted frame (with its quad count) is what replaces a stale
+        // drawable once the window can present again.
+        frameAttemptCount += 1
+        lastAttemptedQuadCount = textureIds.count
 
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
