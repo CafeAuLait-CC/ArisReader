@@ -205,6 +205,7 @@ private struct LyraMenuAnchor: NSViewRepresentable {
         let y = contextMenu ? max(visible.minY + 5, top - height) : top - height
         let panel = CommandPanel(contentRect: NSRect(x: x, y: y, width: width, height: height),
                                  styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.appearance = window.effectiveAppearance
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true

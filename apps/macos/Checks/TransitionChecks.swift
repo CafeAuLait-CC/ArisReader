@@ -212,7 +212,14 @@ extension ReaderChecks {
                     + "(\(coalesced) rebuilds for 26 width updates)")
 
         // ── First layout: no animation ───────────────────────────────────────────────────
+        let homeState = AppState(engine: try RustEngine())
+        let homeHarness = TransitionHarness(state: homeState)
+        try await homeHarness.mount()
+        require(abs(homeHarness.sidebarWidth) < 0.5,
+                "the empty Home page uses the full content width without a blank document sidebar")
+        homeHarness.close()
         let state = AppState(engine: try RustEngine())
+        require(state.open(url: fixture), "the hosted transition fixture opens")
         let harness = TransitionHarness(state: state)
         defer { harness.close() }
         try await harness.mount()
@@ -232,7 +239,6 @@ extension ReaderChecks {
                     + "(\(firstHiddenWidth) pt, no close animation)")
         hiddenHarness.close()
 
-        require(state.open(url: fixture), "the hosted transition fixture opens")
         try await eventually("the hosted canvas receives its page placements", {
             state.canvasPageFrames.contains { $0.index == 0 }
         })

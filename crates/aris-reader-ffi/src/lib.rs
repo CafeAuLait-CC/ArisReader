@@ -446,6 +446,46 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages_on_background(
     blue: f64,
     stats: *mut ArisFrameStats,
 ) -> i32 {
+    unsafe {
+        aris_reader_surface_draw_pages_with_appearance(
+            surface_id,
+            texture_ids,
+            rects,
+            blend_modes,
+            count,
+            red,
+            green,
+            blue,
+            0,
+            stats,
+        )
+    }
+}
+
+/// Draws with a display-only paper profile: 0 original, 1 warm, 2 grayscale night.
+///
+/// # Safety
+/// Same array and stats contract as [`aris_reader_surface_draw_pages`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn aris_reader_surface_draw_pages_with_appearance(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    appearance: u8,
+    stats: *mut ArisFrameStats,
+) -> i32 {
+    let appearance = match appearance {
+        0 => aris_reader_gpu::PaperAppearance::Original,
+        1 => aris_reader_gpu::PaperAppearance::Warm,
+        2 => aris_reader_gpu::PaperAppearance::Night,
+        _ => return code::ERR_INVALID_ARGUMENT,
+    };
     if [red, green, blue]
         .iter()
         .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
@@ -481,11 +521,12 @@ pub unsafe extern "C" fn aris_reader_surface_draw_pages_on_background(
 
     let mut report = None;
     let result = with_context(|context| {
-        let frame = context.render_pages(
+        let frame = context.render_pages_with_appearance(
             SurfaceId(surface_id),
             &draws,
             // The shell supplies a linear-light semantic surface color.
             [red, green, blue, 1.0],
+            appearance,
         )?;
         // Frame time is only logged for the first frames and then rarely: an idle window must
         // not spam a terminal. `ARIS_READER_RENDER_STATS=1` (the switch docs/09 §9 documents)
@@ -615,6 +656,26 @@ mod tests {
         let version = aris_reader_abi_version();
         assert_eq!(version, ABI_VERSION);
         assert!(version > 0, "ABI versions start at 1; 0 is reserved");
+    }
+
+    #[test]
+    fn invalid_paper_profile_is_rejected_before_gpu_access() {
+        // SAFETY: empty arrays are valid for count 0; no stats output is requested.
+        let rc = unsafe {
+            aris_reader_surface_draw_pages_with_appearance(
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0.0,
+                0.0,
+                0.0,
+                255,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, code::ERR_INVALID_ARGUMENT);
     }
 
     #[test]

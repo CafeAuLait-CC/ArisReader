@@ -33,6 +33,7 @@ final class AnnotationOverlayView: NSView {
     private var scrollYPt: CGFloat = 0
     private var contentWidthPt: CGFloat = 0
     private var strokeColor = NSColor(calibratedRed: 0.15, green: 0.15, blue: 0.15, alpha: 1)
+    private var paperAppearance: PaperAppearance = .original
     private var strokeWidth: CGFloat = 2
     private var themeColor = NSColor.controlAccentColor
 
@@ -84,7 +85,8 @@ final class AnnotationOverlayView: NSView {
         contentWidthPt: CGFloat,
         color: NSColor,
         strokeWidth: CGFloat,
-        themeColor: NSColor
+        themeColor: NSColor,
+        paperAppearance: PaperAppearance = .original
     ) {
         let framesChanged = frames != framesList
         self.framesList = frames
@@ -92,10 +94,12 @@ final class AnnotationOverlayView: NSView {
         self.zoom = zoom
         self.scrollYPt = scrollYPt
         self.contentWidthPt = contentWidthPt
-        self.strokeColor = color
+        let appearanceChanged = self.paperAppearance != paperAppearance
+        self.paperAppearance = paperAppearance
+        self.strokeColor = paperAppearance.displayColor(color)
         self.strokeWidth = strokeWidth
         self.themeColor = themeColor
-        if marks != self.marks || framesChanged {
+        if marks != self.marks || framesChanged || appearanceChanged {
             self.marks = marks
             rebuildMarkLayers()
         }
@@ -277,8 +281,8 @@ final class AnnotationOverlayView: NSView {
 
         let layer = CAShapeLayer()
         layer.path = paths.stroke
-        layer.strokeColor = mark.color.nsColor.cgColor
-        layer.fillColor = mark.kind == .arrow ? mark.color.nsColor.cgColor : nil
+        layer.strokeColor = paperAppearance.displayColor(mark.color.nsColor).cgColor
+        layer.fillColor = mark.kind == .arrow ? paperAppearance.displayColor(mark.color.nsColor).cgColor : nil
         layer.lineWidth = mark.strokeWidth
         layer.lineJoin = .round
         layer.lineCap = .round

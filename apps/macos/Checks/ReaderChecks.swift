@@ -27,6 +27,10 @@ struct ReaderChecks {
 
         let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
             ?? FileManager.default.currentDirectoryPath)
+        if CommandLine.arguments.contains("--check-reading-polish") {
+            try await readingPolishChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-bookmarks") {
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("aris-bookmarks-\(UUID())")
@@ -402,6 +406,7 @@ struct ReaderChecks {
         try await aiAssistantChecks(root: root)
         try await chatGPTChecks(root: root)
         await appearanceChecks()
+        try await readingPolishChecks(root: root)
         // Registered before the frame-scheduling checks: those need a presentable surface and
         // stop the run where the display is unavailable (an occluded window never presents).
         try await pageOperationChecks(root: root)

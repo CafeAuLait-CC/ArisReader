@@ -27,6 +27,34 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TextureId(pub u64);
 
+/// Display-only paper conversion. Uploaded document textures and exported PDF colours stay intact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PaperAppearance {
+    #[default]
+    Original = 0,
+    Warm = 1,
+    Night = 2,
+}
+
+impl PaperAppearance {
+    fn draw_blend(self, blend: QuadBlend) -> QuadBlend {
+        if self == Self::Night && blend == QuadBlend::Multiply {
+            QuadBlend::Normal
+        } else {
+            blend
+        }
+    }
+
+    fn uniform_mode(self, blend: QuadBlend) -> f32 {
+        if self == Self::Night && blend == QuadBlend::Multiply {
+            3.0
+        } else {
+            self as u8 as f32
+        }
+    }
+}
+
 /// Uniform block layout: `dest: vec4<f32>` + `surface: vec2<f32>` + padding.
 const UNIFORM_BYTES: u64 = 32;
 
@@ -41,7 +69,8 @@ struct Uniforms {
     dest: vec4<f32>,
     // Surface size in physical pixels.
     surface: vec2<f32>,
-    _padding: vec2<f32>,
+    paper_mode: f32,
+    _padding: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -78,9 +107,28 @@ fn vs_page(@builtin(vertex_index) index: u32) -> VertexOutput {
     return out;
 }
 
+fn paper_colour(rgb: vec3<f32>) -> vec3<f32> {
+    if uniforms.paper_mode == 1.0 {
+        return mix(vec3<f32>(0.029556834, 0.024157632, 0.018500220), vec3<f32>(0.973445290, 0.930110858, 0.846873232), rgb);
+    }
+    if uniforms.paper_mode == 2.0 {
+        let lightness = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return mix(vec3<f32>(0.584078418, 0.558340390, 0.508881321), vec3<f32>(0.017641954, 0.015996293, 0.012983032), vec3<f32>(lightness));
+    }
+    return rgb;
+}
+
 @fragment
 fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(page_texture, page_sampler, in.uv);
+    let colour = textureSample(page_texture, page_sampler, in.uv);
+    if uniforms.paper_mode == 3.0 {
+        // For night ink A and source page x, f(x)=A+(B-A)x. A multiply coefficient c
+        // becomes f(cx)=c*f(x)+(1-c)*A: alpha-over toward the ink keeps glyphs intact
+        // and lifts the dark paper to a visible gray. Transparent tint pixels stay clear.
+        let coefficient = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return vec4<f32>(vec3<f32>(0.584078418, 0.558340390, 0.508881321), (1.0-coefficient)*colour.a);
+    }
+    return vec4<f32>(paper_colour(colour.rgb), colour.a);
 }
 
 // `/BM /Multiply`, the blend mode a PDF highlight is normally stored with.
@@ -179,7 +227,7 @@ impl PageState {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -409,6 +457,16 @@ impl GpuContext {
         draws: &[(TextureId, [f32; 4], QuadBlend)],
         clear: [f64; 4],
     ) -> Result<FrameReport> {
+        self.render_pages_with_appearance(surface_id, draws, clear, PaperAppearance::Original)
+    }
+
+    pub fn render_pages_with_appearance(
+        &mut self,
+        surface_id: SurfaceId,
+        draws: &[(TextureId, [f32; 4], QuadBlend)],
+        clear: [f64; 4],
+        appearance: PaperAppearance,
+    ) -> Result<FrameReport> {
         let started = std::time::Instant::now();
 
         let (frame, format, width, height, settings, surface_frame_index) = {
@@ -458,7 +516,8 @@ impl GpuContext {
 
         // One pipeline per blend mode in use, created before the shared borrows below.
         for (_, _, blend) in draws {
-            self.page.ensure_pipeline(&self.device, format, *blend);
+            self.page
+                .ensure_pipeline(&self.device, format, appearance.draw_blend(*blend));
         }
 
         // Per-quad uniform buffers and bind groups. Each quad needs its own buffer because
@@ -466,7 +525,7 @@ impl GpuContext {
         // inside a single encoder; the buffers stay alive until after the submit below.
         let mut bind_groups = Vec::with_capacity(draws.len());
         let mut uniform_buffers = Vec::with_capacity(draws.len());
-        for (texture_id, rect, _) in draws {
+        for (texture_id, rect, blend) in draws {
             let uniforms: [f32; 8] = [
                 rect[0],
                 rect[1],
@@ -474,7 +533,7 @@ impl GpuContext {
                 rect[3],
                 width as f32,
                 height as f32,
-                0.0,
+                appearance.uniform_mode(*blend),
                 0.0,
             ];
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -518,7 +577,7 @@ impl GpuContext {
             .iter()
             .map(|(_, _, blend)| {
                 self.page
-                    .pipeline(format, *blend)
+                    .pipeline(format, appearance.draw_blend(*blend))
                     .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -598,6 +657,16 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
+        self.offscreen_probe_layers_with_appearance(draws, width, height, PaperAppearance::Original)
+    }
+
+    pub fn offscreen_probe_layers_with_appearance(
+        &mut self,
+        draws: &[(TextureId, [f32; 4], QuadBlend)],
+        width: u32,
+        height: u32,
+        appearance: PaperAppearance,
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 {
             return Err(ArisError::new(
                 ErrorCode::InvalidArgument,
@@ -633,7 +702,7 @@ impl GpuContext {
 
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         let mut bind_groups = Vec::with_capacity(draws.len());
-        for (texture_id, rect, _) in draws {
+        for (texture_id, rect, blend) in draws {
             let uniforms: [f32; 8] = [
                 rect[0],
                 rect[1],
@@ -641,7 +710,7 @@ impl GpuContext {
                 rect[3],
                 width as f32,
                 height as f32,
-                0.0,
+                appearance.uniform_mode(*blend),
                 0.0,
             ];
             let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -681,13 +750,14 @@ impl GpuContext {
         }
 
         for (_, _, blend) in draws {
-            self.page.ensure_pipeline(&self.device, format, *blend);
+            self.page
+                .ensure_pipeline(&self.device, format, appearance.draw_blend(*blend));
         }
         let pipelines = draws
             .iter()
             .map(|(_, _, blend)| {
                 self.page
-                    .pipeline(format, *blend)
+                    .pipeline(format, appearance.draw_blend(*blend))
                     .ok_or_else(|| ArisError::new(ErrorCode::Internal, "page pipeline missing"))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -814,6 +884,104 @@ fn f32s_to_bytes(values: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paper_appearance_is_display_only_and_has_soft_night_contrast() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let source = [
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255,
+        ];
+        let texture = context.upload_page_texture(4, 1, &source).unwrap();
+        let draws = [(texture, [0.0, 0.0, 4.0, 1.0], QuadBlend::Normal)];
+        let original = context.offscreen_probe_layers(&draws, 4, 1).unwrap();
+        let warm = context
+            .offscreen_probe_layers_with_appearance(&draws, 4, 1, PaperAppearance::Warm)
+            .unwrap();
+        let night = context
+            .offscreen_probe_layers_with_appearance(&draws, 4, 1, PaperAppearance::Night)
+            .unwrap();
+        for (actual, expected) in [
+            (&warm[..3], [48_u8, 43, 37]),
+            (&warm[4..7], [252, 247, 237]),
+            (&night[..3], [201, 197, 189]),
+            (&night[4..7], [36, 34, 30]),
+        ] {
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+                "{actual:?} != {expected:?}"
+            );
+        }
+        assert!(
+            night[0] < 220 && night[0] > night[4] + 120,
+            "soft ink remains readable, without white glare"
+        );
+        assert!(
+            night[8].abs_diff(night[9]) < 12 && night[12].abs_diff(night[13]) < 12,
+            "coloured content becomes warm grayscale"
+        );
+        assert_ne!(
+            night[8], night[12],
+            "different source luminances remain distinguishable"
+        );
+        assert_eq!(
+            context.offscreen_probe_layers(&draws, 4, 1).unwrap(),
+            original,
+            "switching back uses untouched source textures"
+        );
+    }
+
+    #[test]
+    fn night_multiply_highlights_lift_paper_without_dimming_ink() {
+        let Ok(mut context) = GpuContext::new(false) else {
+            return;
+        };
+        let page = context
+            .upload_page_texture(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255])
+            .unwrap();
+        let tint = context
+            .upload_page_texture(2, 1, &[0, 255, 255, 255, 0, 255, 255, 255])
+            .unwrap();
+        let rect = [0.0, 0.0, 2.0, 1.0];
+        let plain = context
+            .offscreen_probe_layers_with_appearance(
+                &[(page, rect, QuadBlend::Normal)],
+                2,
+                1,
+                PaperAppearance::Night,
+            )
+            .unwrap();
+        let marked = context
+            .offscreen_probe_layers_with_appearance(
+                &[
+                    (page, rect, QuadBlend::Normal),
+                    (tint, rect, QuadBlend::Multiply),
+                ],
+                2,
+                1,
+                PaperAppearance::Night,
+            )
+            .unwrap();
+        for channel in 0..3 {
+            assert!(
+                marked[channel].abs_diff(plain[channel]) <= 2,
+                "night ink must remain intact"
+            );
+            assert!(
+                marked[4 + channel] > plain[4 + channel] + 15,
+                "gray highlight must be visible on dark paper"
+            );
+        }
+        assert!(
+            marked[4] < marked[0],
+            "highlight background remains darker than the ink"
+        );
+    }
 
     /// A 2×2 texture with four distinct colours.
     fn checkerboard() -> (u32, u32, Vec<u8>) {

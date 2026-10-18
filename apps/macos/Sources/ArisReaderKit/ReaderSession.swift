@@ -187,6 +187,7 @@ public struct ReaderWindowRoot: View {
             // The reading commands (⌘O, ⌘←/→, ⌘G, zoom, sidebar) are app-wide menu items, so they
             // read the session of the *focused* window rather than a single global one.
             .focusedSceneValue(\.readerSession, session)
+            .focusedSceneObject(session.state)
             .background(ReaderWindowAttachment { session.attach(window: $0) })
             .onAppear {
                 session.register()
