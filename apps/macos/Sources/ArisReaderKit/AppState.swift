@@ -2617,6 +2617,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    /// Clearing invalidates in-flight work as well as the visible result list.
+    public func clearSearch() {
+        let hadSearchSelection = currentHitIndex != nil
+        searchQuery = ""
+        runSearch()
+        searchSidebarVisible = false
+        if hadSearchSelection { clearSelection() }
+    }
+
     /// Moves to the next (or previous) hit, wrapping around.
     public func findNext() {
         advanceHit(by: 1)

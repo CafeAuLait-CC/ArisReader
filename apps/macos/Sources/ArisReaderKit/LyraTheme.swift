@@ -17,7 +17,7 @@ public enum LyraTheme {
     public static let titlebarBg = Color(nsColor: adaptive(0xF4F1EC, 0x24221F))
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
-    public static let sidebarBg = Color(nsColor: adaptive(0xF3EFE8, 0x24221E))
+    public static let sidebarBg = Color(nsColor: sidebarColor)
     public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
     public static let raisedBg = Color(nsColor: adaptive(0xFFFDFA, 0x343029))
     public static let menuBg = Color(nsColor: adaptive(0xFFFDFA, 0x343029))
@@ -35,9 +35,9 @@ public enum LyraTheme {
     public static let border = Color(nsColor: adaptive(0xDDD6CA, 0x494237))
     public static let separator = Color(nsColor: adaptive(0xE5DFD5, 0x3C362E))
     public static let controlBorder = Color(nsColor: adaptive(0x8C8173, 0x9A8B73))
-    public static let pageEdge = Color(nsColor: adaptive(0xC7BFAF, 0x5C5345))
-    public static let scrollThumb = Color(nsColor: adaptive(0x837968, 0x8D806D))
-    public static let scrollThumbHover = Color(nsColor: adaptive(0x746653, 0xAD9A7A))
+    public static let pageEdge = Color(nsColor: pageEdgeColor)
+    public static let scrollThumb = Color(nsColor: scrollThumbColor)
+    public static let scrollThumbHover = Color(nsColor: scrollThumbHoverColor)
     public static let accent = Color(nsColor: adaptive(0x88611B, 0xE7C07B))
     public static let accentHover = Color(nsColor: adaptive(0x6E4C10, 0xF2D49F))
     public static let accentPressed = Color(nsColor: adaptive(0x573B09, 0xD6A654))
@@ -71,6 +71,10 @@ public enum LyraTheme {
     public static let infoBg = Color(nsColor: adaptive(0xEAF1F5, 0x293841))
     public static let infoFg = Color(nsColor: adaptive(0x386783, 0xA6C8DE))
 
+    public static let sidebarColor = adaptive(0xF3EFE8, 0x24221E)
+    public static let pageEdgeColor = adaptive(0xC7BFAF, 0x5C5345)
+    public static let scrollThumbColor = adaptive(0x837968, 0x8D806D)
+    public static let scrollThumbHoverColor = adaptive(0x746653, 0xAD9A7A)
     public static let canvasColor = adaptive(0xE7E2D9, 0x171716)
     public static let noteTextColor = adaptive(0x8A4C26, 0xF3BD94)
     public static let titlebarColor = adaptive(0xF4F1EC, 0x24221F)
@@ -113,5 +117,20 @@ struct LyraToolStyle: ButtonStyle {
                 .contentShape(RoundedRectangle(cornerRadius: 6))
                 .onHover { hovered = $0 }
         }
+    }
+}
+
+/// Contiguous sidebar segments keep their surface visible, including without a pointer.
+struct LyraSidebarTabStyle: ButtonStyle {
+    var selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .medium))
+            .frame(minHeight: 32)
+            .foregroundStyle(selected ? LyraTheme.selectedFg : LyraTheme.iconPrimary)
+            .background(configuration.isPressed ? LyraTheme.pressedBg :
+                (selected ? LyraTheme.selectedBg : LyraTheme.hoverBg))
+            .contentShape(Rectangle())
     }
 }

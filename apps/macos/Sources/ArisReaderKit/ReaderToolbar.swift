@@ -100,10 +100,15 @@ public struct TabStrip: View {
             .help("Close \(tab.title)")
             .accessibilityLabel("Close \(tab.title)")
         }
-        .frame(width: width, height: TabRowLayout.contentHeight)
+        .frame(width: width, height: TabRowLayout.height)
         .foregroundStyle(active ? LyraTheme.textPrimary : LyraTheme.textSecondary)
-        .background(active ? LyraTheme.raisedBg : .clear,
-                    in: UnevenRoundedRectangle(topLeadingRadius: 7, topTrailingRadius: 7))
+        .background {
+            if active {
+                UnevenRoundedRectangle(topLeadingRadius: 7, topTrailingRadius: 7)
+                    .fill(LyraTheme.raisedBg)
+                    .padding(.top, (TabRowLayout.height - TabRowLayout.contentHeight) / 2)
+            }
+        }
         .overlay(alignment: .bottom) {
             if active { LyraTheme.accent.frame(height: 2) }
         }
@@ -229,13 +234,24 @@ struct ReaderToolbar: View {
     private func search(compact: Bool) -> some View {
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass").foregroundStyle(LyraTheme.iconSecondary)
-            TextField("Search document", text: $state.searchQuery)
+            TextField("Search", text: $state.searchQuery)
                 .textFieldStyle(.plain).font(.system(size: 12))
-                .frame(width: compact ? 100 : 150)
+                .frame(maxWidth: .infinity)
                 .onSubmit { state.pageOverviewVisible = false; state.runSearch() }
-
+            if !state.searchQuery.isEmpty {
+                Button { state.clearSearch() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(LyraTheme.iconSecondary)
+                        .frame(width: 20, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search").help("Clear search")
+            }
         }
-        .padding(.leading, 9).padding(.trailing, 5).frame(height: 32)
+        .padding(.leading, 9).padding(.trailing, 5)
+        .frame(width: compact ? 140 : 190, height: 32)
         .background(LyraTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(LyraTheme.controlBorder, lineWidth: 0.5))
     }

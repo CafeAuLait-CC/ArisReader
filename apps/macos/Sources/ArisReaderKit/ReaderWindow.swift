@@ -51,12 +51,9 @@ public struct ReaderWindow: View {
                         SidebarView(state: state, opener: opener)
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
-                    // The edge shadow is drawn just outside the sidebar's frame; it has to be
-                    // above the canvas to be visible over the page.
-                    .zIndex(1)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
                     if state.searchSidebarVisible && state.document != nil {
-                        SearchResultSidebar(state: state).frame(width: 290)
+                        SearchResultSidebar(state: state).frame(width: ReaderChrome.sidebarTotalWidthPt)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
                 }
@@ -291,7 +288,7 @@ public struct ReaderWindow: View {
             }
         }
         // Same rule as the sidebar: the animation has to own the layout that changes.
-        .padding(.trailing, state.searchSidebarVisible && !state.pageOverviewVisible ? 290 : 0)
+        .padding(.trailing, state.searchSidebarVisible && !state.pageOverviewVisible ? ReaderChrome.sidebarTotalWidthPt : 0)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
     }
 

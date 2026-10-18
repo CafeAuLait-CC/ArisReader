@@ -129,6 +129,7 @@ public final class MetalCanvasView: NSView {
     /// the gesture must not become text selection.
     public var onAnnotationDoubleClick: ((CGPoint) -> Bool)?
 
+    private var pageChrome: PageChromeOverlayView?
     private var annotationOverlay: AnnotationOverlayView?
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
@@ -321,6 +322,10 @@ public final class MetalCanvasView: NSView {
         // Ink and shapes are vector overlays above the Metal surface: a `CAShapeLayer` path is
         // re-used across zoom and scroll, and the live pen is updated from the pointer event
         // itself rather than through a SwiftUI pass.
+        let chrome = PageChromeOverlayView(frame: bounds)
+        chrome.autoresizingMask = [.width, .height]
+        addSubview(chrome)
+        pageChrome = chrome
         let overlay = AnnotationOverlayView(frame: bounds)
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
@@ -347,11 +352,13 @@ public final class MetalCanvasView: NSView {
 
     public override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        syncPageChrome()
         markNeedsRender()
     }
 
     public override func layout() {
         super.layout()
+        pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
         syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
@@ -1046,7 +1053,13 @@ public final class MetalCanvasView: NSView {
     ///
     /// Called from every setter that changes the view mapping and from the event path after a
     /// live gesture. The overlay owns the actual layer tree; this method contains no drawing.
+    private func syncPageChrome() {
+        pageChrome?.update(frames: annotationPageFrames, contentWidthPt: contentWidthPt,
+                           zoom: zoom, scrollYPt: scrollYPt, scale: backingScale())
+    }
+
     private func syncAnnotationOverlay() {
+        syncPageChrome()
         guard let overlay = annotationOverlay else { return }
         let color = annotationColor.nsColor
         overlay.update(

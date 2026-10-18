@@ -1,13 +1,33 @@
 import SwiftUI
 
-struct SearchResultSidebar: View {
+package struct SearchResultSidebar: View {
     @ObservedObject var state: AppState
-    private var groups: [(page: Int, results: [Int])] {
-        Dictionary(grouping: Array(state.searchHits.indices), by: { state.searchHits[$0].page })
-            .map { (page: $0.key, results: $0.value) }.sorted { $0.page < $1.page }
+    private let reportRowFrames: (([String: CGRect]) -> Void)?
+
+    package init(state: AppState, reportRowFrames: (([String: CGRect]) -> Void)? = nil) {
+        self.state = state
+        self.reportRowFrames = reportRowFrames
     }
 
-    var body: some View {
+    private enum Row: Identifiable {
+        case page(Int, Int), hit(Int)
+        var id: String {
+            switch self {
+            case .page(let page, _): "page-\(page)"
+            case .hit(let index): "hit-\(index)"
+            }
+        }
+    }
+
+    private var rows: [Row] {
+        let groups = Dictionary(grouping: Array(state.searchHits.indices), by: { state.searchHits[$0].page })
+        return groups.keys.sorted().flatMap { page in
+            let hits = groups[page]!
+            return [Row.page(page, hits.count)] + hits.map(Row.hit)
+        }
+    }
+
+    package var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 Button { state.findPrevious() } label: { Image(systemName: "chevron.left") }
@@ -35,12 +55,23 @@ struct SearchResultSidebar: View {
             } else {
                 ScrollViewReader { scroll in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: .sectionHeaders) {
-                            ForEach(groups, id: \.page) { group in
-                                let page = group.page
-                                let results = group.results
-                                Section {
-                                    ForEach(results, id: \.self) { index in
+                        // Each identity owns exactly one row. Nested Sections with multiple
+                        // children per result give the lazy stack unstable height estimates;
+                        // page numbers and hit indices must also have distinct scroll IDs.
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(rows) { row in
+                                VStack(spacing: 0) {
+                                    switch row {
+                                    case .page(let page, let count):
+                                        HStack {
+                                            Text("Page \(page + 1)")
+                                            Spacer()
+                                            Text("\(count) \(count == 1 ? "item" : "items")")
+                                                .foregroundStyle(LyraTheme.textTertiary)
+                                        }
+                                        .font(.caption).padding(.horizontal, 12).padding(.vertical, 9)
+                                        .background(LyraTheme.panelBg)
+                                    case .hit(let index):
                                         let hit = state.searchHits[index]
                                         Button { state.showSearchHit(index) } label: {
                                             Text(highlighted(hit.snippet.split(whereSeparator: \.isWhitespace).joined(separator: " ")))
@@ -52,32 +83,35 @@ struct SearchResultSidebar: View {
                                                 .background(index == state.currentHitIndex ? LyraTheme.selectedBg : .clear)
                                                 .contentShape(Rectangle())
                                         }
-                                        .buttonStyle(.plain).id(index)
-                                        .accessibilityLabel("Page \(page + 1): \(hit.snippet)")
-                                        Divider()
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel("Page \(hit.page + 1): \(hit.snippet)")
                                     }
-                                } header: {
-                                    HStack {
-                                        Text("Page \(page + 1)")
-                                        Spacer()
-                                        Text("\(results.count) \(results.count == 1 ? "item" : "items")")
-                                            .foregroundStyle(LyraTheme.textTertiary)
+                                    LyraTheme.separator.frame(height: 1)
+                                }
+                                .id(row.id)
+                                .background {
+                                    if reportRowFrames != nil {
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(key: SearchRowFrameKey.self,
+                                                value: [row.id: geometry.frame(in: .named("search-results"))])
+                                        }
                                     }
-                                    .font(.caption).padding(.horizontal, 12).padding(.vertical, 9)
-                                    .background(LyraTheme.panelBg)
                                 }
                             }
                         }
+                        .onPreferenceChange(SearchRowFrameKey.self) { reportRowFrames?($0) }
                     }
+                    .coordinateSpace(name: "search-results")
                     .onChange(of: state.currentHitIndex) { _, index in
-                        if let index { scroll.scrollTo(index, anchor: .center) }
+                        if let index { scroll.scrollTo("hit-\(index)") }
                     }
                 }
             }
         }
         .background(LyraTheme.sidebarBg)
         .foregroundStyle(LyraTheme.textPrimary)
-        .overlay(alignment: .leading) { LyraTheme.separator.frame(width: 1) }
+        .background(SidebarScrollTheme().id(state.searchHits.count))
+        .overlay(alignment: .leading) { LyraTheme.border.frame(width: 1).allowsHitTesting(false) }
         .accessibilityElement(children: .contain).accessibilityLabel("Search results")
     }
 
@@ -92,5 +126,12 @@ struct SearchResultSidebar: View {
             remaining = range.upperBound..<text.endIndex
         }
         return text
+    }
+}
+
+private struct SearchRowFrameKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }

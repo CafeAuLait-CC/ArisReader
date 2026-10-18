@@ -60,8 +60,7 @@ public enum ReaderMotion {
 ///
 /// * the sidebar's own layout does not run at intermediate widths - thumbnails, lists and the
 ///   tab picker keep their geometry while only the cut edge moves, so nothing reflows per frame;
-/// * the separator travels with the content's trailing edge, and a small gradient just outside it
-///   marks the edge against the page while the panel is only partly open;
+/// * the separator travels with the content's trailing edge while the panel is partly open;
 /// * the canvas gets the remaining width as it changes, so the document's vertical position is
 ///   untouched and the page simply re-centres horizontally frame by frame.
 ///
@@ -92,19 +91,6 @@ struct ReaderSidebarTransition<Content: View>: View {
         // frame closes, instead of being squeezed or re-laid out.
         .frame(width: isVisible ? ReaderChrome.sidebarTotalWidthPt : 0, alignment: .trailing)
         .clipped()
-        .overlay(alignment: .trailing) {
-            // The edge shadow falls on the canvas, so this overlay is outside the clip above and
-            // the whole panel draws above the canvas (`.zIndex(1)` at the call site).
-            LinearGradient(
-                colors: [Color.black.opacity(0.16), Color.black.opacity(0)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(width: 8)
-            .offset(x: 8)
-            .opacity(isVisible ? 1 : 0)
-            .allowsHitTesting(false)
-        }
         // A closing panel must not keep the pointer: the width already disables its area, but
         // its content is still in the hierarchy until the animation ends.
         .allowsHitTesting(isVisible)
