@@ -55,8 +55,8 @@ with reply threads, highlight/underline/note/ink/shape creation with a colour an
 annotations inside the PDF, staged page editing, facing pages and bookmarks,
 citation/figure/table/algorithm previews with draggable panels, paper metadata and BibTeX export,
 and the AI assistant described above. Known gaps are listed in the project's design notes:
-standalone sticky notes and text boxes, form filling, redaction and printing, an index cache,
-thumbnail drag reordering, and cross-platform shells.
+standalone sticky notes and text boxes, form filling, redaction and printing, and the Linux and
+Windows shells.
 
 ---
 
