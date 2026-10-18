@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 aris-reader-core = { workspace = true }
+# CitationStyle is persisted in the document index cache; the cache is invalidated by
+# content hash, so a style can only be read back for the bytes that produced it.
+serde = { version = "1", features = ["derive"] }

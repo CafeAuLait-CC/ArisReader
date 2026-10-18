@@ -33,3 +33,9 @@ aris-reader-pdfium = { workspace = true }
 # hand-written — see docs/adr/0004. `cli` pulls in the bindings generator used by the
 # `uniffi-bindgen` binary above.
 uniffi = { version = "0.32", features = ["cli"] }
+# The document index cache persists typed records as JSON and binds them to the PDF's bytes
+# with SHA-256. Both are library code, not shell code: validation and serialization must stay
+# in Rust so the CLI, the checks and the app share one implementation.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.11"

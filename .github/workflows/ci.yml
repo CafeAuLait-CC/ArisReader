@@ -180,6 +180,12 @@ jobs:
       - name: ArisReaderChecks (native regression suite)
         if: steps.pdfium.outcome == 'success'
         shell: bash
+        # The harness opens fixtures by their committed paths. The document index cache writes
+        # beside the PDF by design, so disable it here: otherwise this step would leave sidecars
+        # in the checkout (and later runs would silently test a warm index). The cache is covered
+        # by `cargo test` above, whose integration tests copy fixtures into scratch directories.
+        env:
+          ARIS_READER_INDEX_CACHE: disabled
         run: |
           set -o pipefail
           "$GITHUB_WORKSPACE/apps/macos/.build/debug/ArisReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"

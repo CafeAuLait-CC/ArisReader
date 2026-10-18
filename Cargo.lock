@@ -102,6 +102,9 @@ dependencies = [
  "aris-reader-pdfium",
  "aris-reader-session",
  "aris-reader-text",
+ "serde",
+ "serde_json",
+ "sha2",
  "uniffi",
 ]
 
@@ -152,6 +155,7 @@ name = "aris-reader-text"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+ "serde",
 ]
 
 [[package]]
