@@ -147,7 +147,7 @@ final class AnnotationOverlayView: NSView {
             liveLayer.path = nil
             liveStart = content
             liveEnd = content
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             break
         }
         liveKind = kind
@@ -175,7 +175,7 @@ final class AnnotationOverlayView: NSView {
             let path = CGMutablePath()
             if kind == .square { path.addRect(rect) } else { path.addEllipse(in: rect) }
             liveLayer.path = path
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             break
         }
     }
@@ -207,7 +207,7 @@ final class AnnotationOverlayView: NSView {
                               width: abs(end.x - start.x), height: abs(end.y - start.y))
             guard rect.width >= 1, rect.height >= 1 else { return nil }
             return AnnotationDraft(kind: kind, page: page, shapeRect: rect)
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             return nil
         }
     }
@@ -282,7 +282,7 @@ final class AnnotationOverlayView: NSView {
                                        width: mark.strokeWidth)
             paths.stroke = path
             if mark.kind == .arrow { paths.fill = path }
-        case .highlight, .underline, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
             return []
         }
 

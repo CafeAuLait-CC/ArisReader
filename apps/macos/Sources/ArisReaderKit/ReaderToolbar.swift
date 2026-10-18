@@ -326,17 +326,29 @@ struct ReaderSecondaryToolbar: View {
 
     private var annotationRow: some View {
         HStack(spacing: 5) {
-            tool("Highlight selected text", "highlighter") {
-                state.addAnnotationFromSelection(kind: .highlight, color: annotationColor)
-            }.disabled(state.selection == nil)
-            tool("Underline selected text", "underline") {
-                state.addAnnotationFromSelection(kind: .underline, color: annotationColor)
-            }.disabled(state.selection == nil)
-            pending("Strikethrough", "strikethrough")
+            // Sticky markup tools: click once to arm, then every finished text selection is
+            // marked in the palette colour. Clicking the active one again (or Select/Escape)
+            // leaves the mode. The selection that exists when the tool is activated is marked
+            // immediately, so the old select-then-click flow still takes one click.
+            tool("Highlight", "highlighter",
+                 selected: state.annotationTool == .highlight,
+                 help: "Highlight tool: new selections are highlighted until you turn it off") {
+                state.toggleTextMarkupTool(.highlight)
+            }.disabled(state.document == nil)
+            tool("Underline", "underline",
+                 selected: state.annotationTool == .underline,
+                 help: "Underline tool: new selections are underlined until you turn it off") {
+                state.toggleTextMarkupTool(.underline)
+            }.disabled(state.document == nil)
+            tool("Strikethrough", "strikethrough",
+                 selected: state.annotationTool == .strikeout,
+                 help: "Strikethrough tool: new selections are struck through until you turn it off") {
+                state.toggleTextMarkupTool(.strikeout)
+            }.disabled(state.document == nil)
             separator
             tool("Select a mark", "arrow.up.left",
                  selected: state.annotationTool == .select) {
-                state.annotationTool = .select
+                state.selectTool()
             }.disabled(state.document == nil)
             tool("Draw with the pen", "pencil.tip",
                  selected: state.annotationTool == .pen) {
@@ -407,10 +419,11 @@ struct ReaderSecondaryToolbar: View {
     }
 
     private func tool(_ title: String, _ icon: String, selected: Bool = false,
+                      help: String? = nil,
                       action: @escaping () -> Void) -> some View {
         Button(action: action) { Image(systemName: icon) }
             .buttonStyle(LyraToolStyle(selected: selected))
-            .help(title).accessibilityLabel(title)
+            .help(help ?? title).accessibilityLabel(title)
             .accessibilityValue(selected ? "Selected" : "")
     }
 

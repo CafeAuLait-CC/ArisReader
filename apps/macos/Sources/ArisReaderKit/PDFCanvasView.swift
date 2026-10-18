@@ -128,6 +128,9 @@ public final class MetalCanvasView: NSView {
     /// A double-click on a placed text annotation; true means the shell opened its editor and
     /// the gesture must not become text selection.
     public var onAnnotationDoubleClick: ((CGPoint) -> Bool)?
+    /// Escape while the canvas is the first responder: leave the sticky markup mode. Returns
+    /// whether a mode was left, so Escape is only consumed when it did something.
+    public var onCancelTextMarkup: (() -> Bool)?
 
     private var pageChrome: PageChromeOverlayView?
     private var annotationOverlay: AnnotationOverlayView?
@@ -735,6 +738,7 @@ public final class MetalCanvasView: NSView {
             drawingPage = nil
             drawingPlacesTextBox = false
             notePlacementPending = false
+            if onCancelTextMarkup?() == true { return }
             super.keyDown(with: event)
         case " ":
             // Keyboard paging animates to its destination.
@@ -1130,6 +1134,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onDeleteAnnotation: (() -> Bool)?
     private let onPlaceStickyNote: ((CGPoint) -> Bool)?
     private let onAnnotationDoubleClick: ((CGPoint) -> Bool)?
+    private let onCancelTextMarkup: (() -> Bool)?
     private let onFrame: (ArisFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
@@ -1167,6 +1172,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onDeleteAnnotation: (() -> Bool)? = nil,
         onPlaceStickyNote: ((CGPoint) -> Bool)? = nil,
         onAnnotationDoubleClick: ((CGPoint) -> Bool)? = nil,
+        onCancelTextMarkup: (() -> Bool)? = nil,
         onFrame: @escaping (ArisFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
@@ -1200,6 +1206,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onDeleteAnnotation = onDeleteAnnotation
         self.onPlaceStickyNote = onPlaceStickyNote
         self.onAnnotationDoubleClick = onAnnotationDoubleClick
+        self.onCancelTextMarkup = onCancelTextMarkup
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
@@ -1261,6 +1268,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onDeleteAnnotation = onDeleteAnnotation
         view.onPlaceStickyNote = onPlaceStickyNote
         view.onAnnotationDoubleClick = onAnnotationDoubleClick
+        view.onCancelTextMarkup = onCancelTextMarkup
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
         // coordinator is the one long-lived object (it also serves the Dock and Finder paths).

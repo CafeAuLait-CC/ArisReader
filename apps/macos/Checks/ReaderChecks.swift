@@ -133,6 +133,18 @@ struct ReaderChecks {
             try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             return
         }
+        // The sticky markup tools and /StrikeOut write-back on their own.
+        if CommandLine.arguments.contains("--check-sticky-markup") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await stickyMarkupChecks(
+                fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+            try await strikeoutChecks(
+                textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
+            print("Sticky markup and strikeout checks passed")
+            return
+        }
         // The write-back suite on its own (`ArisReaderChecks --check-annotation-writeback .`).
         if CommandLine.arguments.contains("--check-annotation-writeback") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -391,6 +403,11 @@ struct ReaderChecks {
         try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
         try await linkBorderCanvasChecks(url: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
         try await annotationChecks(a: a, b: b)
+        try await stickyMarkupChecks(
+            fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await strikeoutChecks(
+            textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await annotationRecoveryChecks(a: a, b: b)
         try await annotationColourChecks(a: a)
         try await annotationReadingChecks(

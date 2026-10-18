@@ -351,6 +351,9 @@ pub enum WriteAnnotationKind {
     /// `/Underline`: the same shape as a highlight, drawn along the baseline. Not required by
     /// the write-back task, but the sidecar already models underlines and the code is the same.
     Underline,
+    /// `/StrikeOut`: the same quads and colour as an underline, drawn through the middle of the
+    /// glyphs by the viewer that synthesises its appearance.
+    StrikeOut,
     /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
     Text,
     /// `/FreeText`: text laid out in `/Rect`, with `/DA`, `/Q` and an appearance stream.
@@ -370,6 +373,7 @@ impl WriteAnnotationKind {
         match self {
             Self::Highlight => ANNOT_HIGHLIGHT,
             Self::Underline => ANNOT_UNDERLINE,
+            Self::StrikeOut => ANNOT_STRIKEOUT,
             Self::Text => ANNOT_TEXT,
             Self::FreeText => ANNOT_FREETEXT,
             Self::Ink => ANNOT_INK,
@@ -384,6 +388,7 @@ impl WriteAnnotationKind {
         match self {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
+            Self::StrikeOut => "StrikeOut",
             Self::Text => "Text",
             Self::FreeText => "FreeText",
             Self::Ink => "Ink",
@@ -398,6 +403,7 @@ impl WriteAnnotationKind {
         match self {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
+            Self::StrikeOut => "StrikeOut",
             Self::Text => "Note",
             Self::FreeText => "Free Text",
             Self::Ink => "Ink",
@@ -415,11 +421,11 @@ impl WriteAnnotationKind {
     /// rather than a form XObject. A sticky note has the same problem with `/Name` (the icon
     /// name), and a free-text annotation needs `/DA`, `/Q` and a real `/AP` form XObject.
     ///
-    /// Those facts are why highlights and underlines keep the PDFium path and every kind whose
+    /// Those facts are why highlights, underlines and strikeouts keep the PDFium path and every kind whose
     /// appearance matters is written by the dictionary writer in `geometry_write` (which now
     /// writes `/Text` and `/FreeText` too, despite the file's historical name).
     pub(crate) fn uses_pdfium(self) -> bool {
-        matches!(self, Self::Highlight | Self::Underline)
+        matches!(self, Self::Highlight | Self::Underline | Self::StrikeOut)
     }
 
     /// Whether this kind is written by the direct (lopdf) writer.

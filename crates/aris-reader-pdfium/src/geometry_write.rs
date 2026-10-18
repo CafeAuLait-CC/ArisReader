@@ -475,7 +475,9 @@ fn append_one(incremental: &mut IncrementalDocument, annotation: &WriteAnnotatio
             dictionary.set("LE", Object::Array(vec![name("None"), ending]));
         }
         WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {}
-        WriteAnnotationKind::Highlight | WriteAnnotationKind::Underline => {
+        WriteAnnotationKind::Highlight
+        | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::StrikeOut => {
             return Err(ArisError::new(
                 ErrorCode::InvalidArgument,
                 "a quad-based annotation reached the direct writer",
@@ -640,6 +642,7 @@ fn appearance_content(annotation: &WriteAnnotation) -> Vec<u8> {
         }
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::StrikeOut
         | WriteAnnotationKind::Text => {}
         WriteAnnotationKind::FreeText => unreachable!("handled at the top of this function"),
     }

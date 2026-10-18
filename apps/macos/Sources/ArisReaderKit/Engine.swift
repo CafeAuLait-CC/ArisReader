@@ -724,6 +724,8 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         case highlight
         /// `/Subtype /Underline`.
         case underline
+        /// `/Subtype /StrikeOut`: a line through the middle of the selected glyphs.
+        case strikeout
         /// `/Subtype /Text`: a sticky note icon carrying the contents.
         case note
         /// `/Subtype /FreeText`: text in `rect`, laid out at `fontSizePt` and aligned by
@@ -1954,6 +1956,7 @@ public final class RustEngine: PDFEngine {
             let kind: AnnotationWriteKind = switch request.kind {
             case .highlight: .highlight
             case .underline: .underline
+            case .strikeout: .strikeOut
             case .note: .note
             case .freeText: .freeText
             case .ink: .ink
