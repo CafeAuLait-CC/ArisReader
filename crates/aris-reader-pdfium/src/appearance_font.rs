@@ -206,7 +206,12 @@ impl AppearanceSubset {
         // A sorted set makes the CID assignment and the resulting PDF deterministic.
         let characters: BTreeSet<char> = texts
             .iter()
-            .flat_map(|text| text.chars())
+            .flat_map(|text| {
+                // The appearance lays a tab out as a space (see `wrap_free_text`), so the subset
+                // must contain the space glyph for extraction to keep the column gap.
+                text.chars()
+                    .map(|character| if character == '\t' { ' ' } else { character })
+            })
             .filter(|character| !is_layout_control(*character))
             .collect();
 
@@ -501,6 +506,16 @@ mod tests {
             "a non-BMP fallback keeps a surrogate pair in ToUnicode"
         );
         assert_ne!(subset.cid('😀'), subset.cid('中'));
+    }
+
+    #[test]
+    fn a_tab_is_laid_out_as_a_space_and_keeps_an_extractable_gap() {
+        let subset = subset_for("a\tb");
+        assert!(
+            subset.cid(' ').is_some(),
+            "the space glyph is included when a tab is laid out as a space"
+        );
+        assert_eq!(subset.missing(), &[] as &[char]);
     }
 
     #[test]

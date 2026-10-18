@@ -1038,7 +1038,14 @@ fn free_text_appearance(annotation: &WriteAnnotation, font: Option<&AppearanceSu
     let size = annotation.font_size.max(1.0);
     let padding = (size * 0.15).clamp(1.0, 6.0);
     let max_width = (annotation.rect.size.width - 2.0 * padding).max(1.0);
-    let text = annotation.contents.as_deref().unwrap_or("");
+    // Normalise line endings for layout only; `/Contents` keeps the original bytes as a PDF
+    // string. A tab is laid out as a space by `wrap_free_text`.
+    let text = annotation
+        .contents
+        .as_deref()
+        .unwrap_or("")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let leading = size * 1.2;
     let mut content = String::from("q\n");
     content.push_str(&format!(
@@ -1052,7 +1059,7 @@ fn free_text_appearance(annotation: &WriteAnnotation, font: Option<&AppearanceSu
         content.push_str("Q\n");
         return content.into_bytes();
     };
-    let lines = wrap_free_text(text, size, max_width, font);
+    let lines = wrap_free_text(&text, size, max_width, font);
     content.push_str("BT\n");
     content.push_str(&format!(
         "/F1 {:.4} Tf\n{:.4} {:.4} {:.4} rg\n{:.4} TL\n",
