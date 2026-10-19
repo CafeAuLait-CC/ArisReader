@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 import SwiftUI
 
@@ -180,7 +180,7 @@ extension ReaderChecks {
     @MainActor static func tabRetentionChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-tabs-\(UUID())")
+            .appendingPathComponent("lyra-reader-tabs-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -197,7 +197,7 @@ extension ReaderChecks {
         // fixtures. These copies are in a temporary directory, so enable the cache for this check
         // and restore the previous environment value afterwards: it must be a hit, not a rewrite,
         // when an evicted tab is selected again.
-        let cacheEnvironmentKey = "ARIS_READER_INDEX_CACHE"
+        let cacheEnvironmentKey = "LYRA_READER_INDEX_CACHE"
         let previousCacheSetting = ProcessInfo.processInfo.environment[cacheEnvironmentKey]
         setenv(cacheEnvironmentKey, "enabled", 1)
         defer {
@@ -239,9 +239,9 @@ extension ReaderChecks {
         let scrollB = state.scrollYPt
         require(scrollB > 0, "the second tab is scrolled away from the top")
         try await eventually("the second tab's index sidecar is written", {
-            fileManager.fileExists(atPath: b.appendingPathExtension("aris-index.json").path)
+            fileManager.fileExists(atPath: b.appendingPathExtension("lyra-reader-index.json").path)
         })
-        let indexURLB = b.appendingPathExtension("aris-index.json")
+        let indexURLB = b.appendingPathExtension("lyra-reader-index.json")
         let indexAfterFirstWrite = try fileManager.attributesOfItem(atPath: indexURLB.path)
 
         // 2. Switching to the first tab is a document activation, never an open, and presents the
@@ -344,7 +344,7 @@ extension ReaderChecks {
             color: AppState.highlightPalette[0].color,
             note: "survives a tab switch", createdAt: Date()
         )
-        let annotationSidecar = annotated.appendingPathExtension("aris-annotations.json")
+        let annotationSidecar = annotated.appendingPathExtension("lyra-reader-annotations.json")
         try JSONEncoder().encode([note]).write(to: annotationSidecar)
         let annotationState = AppState(engine: try RustEngine())
         annotationState.setViewportSize(CGSize(width: 700, height: 500))

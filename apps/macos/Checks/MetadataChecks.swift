@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
@@ -72,7 +72,7 @@ extension ReaderChecks {
                 "the clipboard carries the corrected value, not the original XMP one")
 
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-bibtex-\(UUID()).bib")
+            .appendingPathComponent("lyra-reader-bibtex-\(UUID()).bib")
         defer { try? FileManager.default.removeItem(at: scratch) }
         require(state.saveMetadataBibtex(to: scratch), "Save BibTeX writes a .bib file")
         let written = try String(contentsOf: scratch, encoding: .utf8)

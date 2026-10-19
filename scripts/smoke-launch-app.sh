@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Launch the packaged Lyra.app through LaunchServices — once with a document, once without — and
+# Launch the packaged LyraReader.app through LaunchServices — once with a document, once without — and
 # fail when the real application cannot survive its own launch.
 #
 # Usage: ./scripts/smoke-launch-app.sh [--app=PATH] [--document=PATH] [--rebuild|--no-build]
@@ -11,23 +11,23 @@
 # `@NSApplicationDelegateAdaptor` instantiates the app delegate through the plain `init()`. A
 # change that offered only `init(state:)` trapped the real application at launch — "Use of
 # unimplemented initializer 'init()'", EXC_BREAKPOINT/SIGTRAP, crash report
-# `~/Library/Logs/DiagnosticReports/ArisReader-<stamp>.ips` — while the in-process harness (423
+# `~/Library/Logs/DiagnosticReports/LyraReader-<stamp>.ips` — while the in-process harness (423
 # assertions, scripts/check.sh) stayed green: the harness constructs the delegate itself, so it
 # never asks SwiftUI to build one through the Objective-C runtime. Only launching the real bundle
 # sees that class of failure: a trap before the first window, a delegate that cannot be
 # constructed, a resource the bundle needs at startup.
 #
 # ── what it asserts, per case ────────────────────────────────────────────────
-# 1. liveness  the launched process is still alive after $ARIS_READER_SMOKE_ALIVE_SECONDS (3).
+# 1. liveness  the launched process is still alive after $LYRA_READER_SMOKE_ALIVE_SECONDS (3).
 #              A trap kills the process in milliseconds, so this is the primary detector; the
 #              process is also what a crash report is written about, so the two agree.
 # 2. evidence  the app printed its own startup line, captured from the process LaunchServices
 #              launched:
-#                * with a document: "aris-open: 1 url(s) → N opened", N ≥ 1 — the delegate was
+#                * with a document: "lyra-reader-open: 1 url(s) → N opened", N ≥ 1 — the delegate was
 #                  built, the open-documents Apple event arrived, and the engine opened the file;
-#                * without one:     "aris-gpu: device ready" — the window's canvas exists, which
+#                * without one:     "lyra-reader-gpu: device ready" — the window's canvas exists, which
 #                  is only reachable after init and the delegate succeeded.
-# 3. crashes   no new ArisReader-*.ips appeared in the DiagnosticReports directories. This is a
+# 3. crashes   no new LyraReader-*.ips appeared in the DiagnosticReports directories. This is a
 #              measured trap detector, not an inference: a Swift trap writes one within ~2 s.
 # 4. shutdown  the process exits on SIGTERM inside the grace period (the app's own documented
 #              signal path flushes and exits; measured ~1 s). A process that ignores SIGTERM — a
@@ -35,7 +35,7 @@
 #              with a diagnostic, so a hang costs bounded time instead of blocking CI forever.
 #
 # ── when the launch output cannot be captured ────────────────────────────────
-# `open --stdout/--stderr` is how the app's `aris-…` lines are read. A restricted (sandboxed)
+# `open --stdout/--stderr` is how the app's `lyra-reader-…` lines are read. A restricted (sandboxed)
 # shell makes `open` drop its launch options silently: the app still starts, but launchd connects
 # it to /dev/null. The script detects that from the process's own file descriptors, prints a
 # `::notice::` naming the reason, and falls back to filesystem evidence — the launched process
@@ -44,15 +44,15 @@
 # normal terminal use the capture-based evidence.
 #
 # ── environment ──────────────────────────────────────────────────────────────
-#   ARIS_READER_PDFIUM_PATH          passed to the app through `open --env` (CI sets it to the
+#   LYRA_READER_PDFIUM_PATH          passed to the app through `open --env` (CI sets it to the
 #                                    checkout's copy). A checkout under ~/Documents otherwise
 #                                    blocks the engine's dlopen on a TCC consent prompt no locked
 #                                    console can answer; point this at a copy outside it.
-#   ARIS_READER_SMOKE_ALIVE_SECONDS      liveness wait (default 3)
-#   ARIS_READER_SMOKE_EVIDENCE_SECONDS   how long the startup line may take (default 20)
-#   ARIS_READER_SMOKE_TERM_GRACE_SECONDS SIGTERM grace before SIGKILL (default 5)
-#   ARIS_READER_SMOKE_APPEAR_SECONDS     how long LaunchServices may take to start it (default 10)
-#   ARIS_READER_SMOKE_KEEP_LOGS=1        keep the temporary directory (the document copy)
+#   LYRA_READER_SMOKE_ALIVE_SECONDS      liveness wait (default 3)
+#   LYRA_READER_SMOKE_EVIDENCE_SECONDS   how long the startup line may take (default 20)
+#   LYRA_READER_SMOKE_TERM_GRACE_SECONDS SIGTERM grace before SIGKILL (default 5)
+#   LYRA_READER_SMOKE_APPEAR_SECONDS     how long LaunchServices may take to start it (default 10)
+#   LYRA_READER_SMOKE_KEEP_LOGS=1        keep the temporary directory (the document copy)
 #
 # Exit status: 0 when both launches survived (or when the environment cannot launch a GUI app at
 # all — announced with a ::notice::), 1 on a trap, a crash, a dead or unkillable process, or a
@@ -64,14 +64,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 mkdir -p "$ROOT/build"   # the capture logs live there; a fresh clone has no build/ yet
 
-APP="$ROOT/build/Lyra.app"
+APP="$ROOT/build/LyraReader.app"
 DOCUMENT=""
 BUILD_MODE="auto"   # auto | always | never
 
-ALIVE_SECONDS="${ARIS_READER_SMOKE_ALIVE_SECONDS:-3}"
-EVIDENCE_SECONDS="${ARIS_READER_SMOKE_EVIDENCE_SECONDS:-20}"
-TERM_GRACE_SECONDS="${ARIS_READER_SMOKE_TERM_GRACE_SECONDS:-5}"
-APPEAR_SECONDS="${ARIS_READER_SMOKE_APPEAR_SECONDS:-10}"
+ALIVE_SECONDS="${LYRA_READER_SMOKE_ALIVE_SECONDS:-3}"
+EVIDENCE_SECONDS="${LYRA_READER_SMOKE_EVIDENCE_SECONDS:-20}"
+TERM_GRACE_SECONDS="${LYRA_READER_SMOKE_TERM_GRACE_SECONDS:-5}"
+APPEAR_SECONDS="${LYRA_READER_SMOKE_APPEAR_SECONDS:-10}"
 
 PASS=0
 FAIL=0
@@ -154,9 +154,9 @@ if [ -n "$STALE_SWIFT" ]; then
     build_bundle
   fi
 fi
-RUST_LIB="$ROOT/apps/macos/.rust/lib/libaris_reader_ffi.a"
+RUST_LIB="$ROOT/apps/macos/.rust/lib/liblyra_reader_ffi.a"
 if [ -f "$RUST_LIB" ] && [ "$RUST_LIB" -nt "$EXE" ] && [ "$BUILD_MODE" != "always" ]; then
-  warn "apps/macos/.rust/lib/libaris_reader_ffi.a is newer than the app: run ./scripts/build-rust.sh if Rust changed"
+  warn "apps/macos/.rust/lib/liblyra_reader_ffi.a is newer than the app: run ./scripts/build-rust.sh if Rust changed"
 fi
 
 # ── the document ─────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ if [ ! -f "$DOCUMENT" ]; then
 fi
 DOCUMENT="$(cd "$(dirname "$DOCUMENT")" && pwd -P)/$(basename "$DOCUMENT")"
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/lyra-launch-smoke.XXXXXXXX")" || exit 1
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/lyra-reader-launch-smoke.XXXXXXXX")" || exit 1
 TMP="$(cd "$TMP" && pwd -P)"
 STARTED_PIDS=""
 CONTROL_PID=""
@@ -190,7 +190,7 @@ cleanup() {
     alive "$pid" || continue
     kill -KILL "$pid" 2>/dev/null
   done
-  [ "${ARIS_READER_SMOKE_KEEP_LOGS:-0}" = "1" ] || rm -rf "$TMP"
+  [ "${LYRA_READER_SMOKE_KEEP_LOGS:-0}" = "1" ] || rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
 
@@ -208,10 +208,10 @@ info "executable : $EXE"
 info "bundle id  : $BUNDLE_ID"
 info "document   : $DOCUMENT"
 info "             copied to $DOC (outside the checkout: a TCC-protected folder can block reads)"
-if [ -n "${ARIS_READER_PDFIUM_PATH:-}" ]; then
-  info "PDFium     : $ARIS_READER_PDFIUM_PATH (passed to the app through 'open --env')"
+if [ -n "${LYRA_READER_PDFIUM_PATH:-}" ]; then
+  info "PDFium     : $LYRA_READER_PDFIUM_PATH (passed to the app through 'open --env')"
 else
-  info "PDFium     : ARIS_READER_PDFIUM_PATH is unset: the app resolves the engine itself"
+  info "PDFium     : LYRA_READER_PDFIUM_PATH is unset: the app resolves the engine itself"
 fi
 info "logs       : $LOG_PREFIX-<case>.std{out,err}.log"
 printf '  alive %ss · evidence ≤%ss · SIGTERM grace %ss · LaunchServices appear ≤%ss\n' \
@@ -230,7 +230,7 @@ new_pids() { comm -13 <(printf '%s\n' "${1:-}" | sort) <(running_pids); }
 
 # Crash reports already on disk. DiagnosticReports holds the per-user reports and, for
 # launchd-spawned processes, the system-wide ones; the app's reports are named after
-# CFBundleExecutable (ArisReader-<stamp>.ips — never ArisReaderChecks-…).
+# CFBundleExecutable (LyraReader-<stamp>.ips — never LyraReaderChecks-…).
 crash_snapshot() {
   local dir
   for dir in "$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports"; do
@@ -296,13 +296,13 @@ process_evidence() {
 required_evidence() {  # $1 case name, $2 stdout file, $3 stderr file
   local name="$1" out="$2" err="$3" line count
   if [ "$name" = "with-document" ]; then
-    line="$(grep -h -m1 -F 'aris-open:' "$err" "$out" 2>/dev/null | head -1)"
+    line="$(grep -h -m1 -F 'lyra-reader-open:' "$err" "$out" 2>/dev/null | head -1)"
     [ -n "$line" ] || return 0
     case "$line" in
       *"1 url(s)"*) ;;
       *) printf 'LaunchServices delivered a different set of URLs: %s' "$line"; return 0 ;;
     esac
-    # The line is "aris-open: 1 url(s) → N opened, M tab(s)": read N as the token before the
+    # The line is "lyra-reader-open: 1 url(s) → N opened, M tab(s)": read N as the token before the
     # "opened" word, punctuation stripped, so the check does not depend on the arrow's encoding.
     count="$(printf '%s' "$line" | awk '{
       for (i = 2; i <= NF; i++) {
@@ -312,7 +312,7 @@ required_evidence() {  # $1 case name, $2 stdout file, $3 stderr file
     if [ -n "$count" ] && [ "$count" -ge 1 ] 2>/dev/null; then printf '%s' "$line"; fi
     return 0
   fi
-  line="$(grep -h -m1 -F 'aris-gpu: device ready' "$out" "$err" 2>/dev/null | head -1)"
+  line="$(grep -h -m1 -F 'lyra-reader-gpu: device ready' "$out" "$err" 2>/dev/null | head -1)"
   [ -n "$line" ] && printf '%s' "$line"
   return 0
 }
@@ -320,7 +320,7 @@ required_evidence() {  # $1 case name, $2 stdout file, $3 stderr file
 # What the captured output does say, for the failure message.
 evidence_diagnosis() {  # $1 case name, $2 stdout file, $3 stderr file
   local name="$1" out="$2" err="$3" line
-  line="$(grep -h -m1 -F 'aris-open:' "$err" "$out" 2>/dev/null | head -1)"
+  line="$(grep -h -m1 -F 'lyra-reader-open:' "$err" "$out" 2>/dev/null | head -1)"
   if [ -n "$line" ]; then printf 'the app reported: %s' "$line"; return; fi
   printf ''
 }
@@ -416,8 +416,8 @@ open_case() {  # $1 case name, $2 document path or ""
   before_crashes="$(crash_snapshot)"
 
   local args=(-n -a "$APP")
-  if [ -n "${ARIS_READER_PDFIUM_PATH:-}" ]; then
-    args+=(--env "ARIS_READER_PDFIUM_PATH=$ARIS_READER_PDFIUM_PATH")
+  if [ -n "${LYRA_READER_PDFIUM_PATH:-}" ]; then
+    args+=(--env "LYRA_READER_PDFIUM_PATH=$LYRA_READER_PDFIUM_PATH")
   fi
   args+=(--stdout "$out" --stderr "$err")
   [ -n "$doc" ] && args+=("$doc")
@@ -485,7 +485,7 @@ open_case() {  # $1 case name, $2 document path or ""
   elif [ "$capture" = "null" ]; then
     if [ "$DEGRADED_NOTICE_SHOWN" = "0" ]; then
       notice "Launch output not capturable" \
-        "'open' dropped --stdout/--stderr in this shell (a restricted/sandboxed shell does; launchd then connects the app to /dev/null), so the app's own 'aris-…' startup lines cannot be read here. Both cases used filesystem evidence instead: what the launched process has open. CI and a normal terminal run the capture-based checks."
+        "'open' dropped --stdout/--stderr in this shell (a restricted/sandboxed shell does; launchd then connects the app to /dev/null), so the app's own 'lyra-reader-…' startup lines cannot be read here. Both cases used filesystem evidence instead: what the launched process has open. CI and a normal terminal run the capture-based checks."
       DEGRADED_NOTICE_SHOWN=1
     fi
     warn "launch output not capturable: 'open' ignored --stdout/--stderr (restricted shell)"
@@ -504,7 +504,7 @@ open_case() {  # $1 case name, $2 document path or ""
     if [ -n "$doc" ]; then
       info "hint: a main thread blocked before its first line is usually the engine's dlopen waiting"
       info "      on a TCC consent prompt for a library under ~/Documents — point"
-      info "      ARIS_READER_PDFIUM_PATH at a copy outside the protected folder and re-run."
+      info "      LYRA_READER_PDFIUM_PATH at a copy outside the protected folder and re-run."
     fi
     describe_evidence_tail "$out" "$err"
   fi

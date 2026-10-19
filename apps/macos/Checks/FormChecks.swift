@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import PDFKit
@@ -19,7 +19,7 @@ extension ReaderChecks {
         let fixture = root.appendingPathComponent("tests/fixtures/form-fields.pdf")
         let encrypted = root.appendingPathComponent("tests/fixtures/form-fields-encrypted.pdf")
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-forms-\(UUID())")
+            .appendingPathComponent("lyra-reader-forms-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
 
@@ -181,7 +181,7 @@ extension ReaderChecks {
                 == "Replaced on disk"
         })
         let backups = try FileManager.default.contentsOfDirectory(atPath: scratch.path)
-            .filter { $0.contains(".lyra-backup-") && $0.hasSuffix(".pdf") }
+            .filter { $0.contains(".lyra-reader-backup-") && $0.hasSuffix(".pdf") }
         require(!backups.isEmpty, "the replace wrote a backup beside the file")
         let sourceBytesAfterReplace = try Data(contentsOf: replaceSource)
         require(sourceBytesAfterReplace.count > sourceBytes.count,
@@ -308,11 +308,11 @@ extension ReaderChecks {
         require(documentInfo.pageCount == 2, "the information view reads the page count")
         require(documentInfo.pdfVersion == "1.7", "the information view reads the PDF version")
         require(documentInfo.hasInfoDictionary, "the fixture has an /Info dictionary")
-        require(documentInfo.title == "Lyra Form Fixture", "the /Title entry is read")
+        require(documentInfo.title == "LyraReader Form Fixture", "the /Title entry is read")
         require(documentInfo.author == "Fixture Author", "the /Author entry is read")
         require(documentInfo.subject == "AcroForm fields for the reader's form tool",
                 "the /Subject entry is read")
-        require(documentInfo.keywords == "forms, fixture, lyra", "the /Keywords entry is read")
+        require(documentInfo.keywords == "forms, fixture, lyrareader", "the /Keywords entry is read")
 
         let propertiesState = AppState(engine: try RustEngine())
         propertiesState.setViewportSize(CGSize(width: 900, height: 650))
@@ -382,7 +382,7 @@ extension ReaderChecks {
             replacePropertiesState.documentInfo?.title == "Replaced title"
         })
         let propertiesBackups = try FileManager.default.contentsOfDirectory(atPath: scratch.path)
-            .filter { $0.contains(".lyra-backup-") && $0.hasSuffix(".pdf") }
+            .filter { $0.contains(".lyra-reader-backup-") && $0.hasSuffix(".pdf") }
         require(propertiesBackups.count >= backups.count + 1,
                 "the properties replace wrote another verified backup")
 
@@ -460,7 +460,7 @@ extension ReaderChecks {
         url: URL
     ) throws -> [(subtype: String, value: String?, state: Int)] {
         guard let document = PDFDocument(url: url) else {
-            throw NSError(domain: "Lyra", code: 6, userInfo: [
+            throw NSError(domain: "LyraReader", code: 6, userInfo: [
                 NSLocalizedDescriptionKey: "PDFKit could not open the saved form",
             ])
         }
@@ -483,7 +483,7 @@ extension ReaderChecks {
     @MainActor
     private static func fillCopyWithPDFKit(source: URL, destination: URL) throws {
         guard let document = PDFDocument(url: source), let page = document.page(at: 0) else {
-            throw NSError(domain: "Lyra", code: 7, userInfo: [
+            throw NSError(domain: "LyraReader", code: 7, userInfo: [
                 NSLocalizedDescriptionKey: "PDFKit could not open the form fixture",
             ])
         }
@@ -513,7 +513,7 @@ extension ReaderChecks {
             }
         }
         guard document.write(to: destination) else {
-            throw NSError(domain: "Lyra", code: 8, userInfo: [
+            throw NSError(domain: "LyraReader", code: 8, userInfo: [
                 NSLocalizedDescriptionKey: "PDFKit could not write the filled copy",
             ])
         }
@@ -555,7 +555,7 @@ extension ReaderChecks {
         let text = String(decoding: data, as: UTF8.self)
             + String(decoding: errorData, as: UTF8.self)
         guard process.terminationStatus == 0 else {
-            throw NSError(domain: "Lyra", code: 9, userInfo: [
+            throw NSError(domain: "LyraReader", code: 9, userInfo: [
                 NSLocalizedDescriptionKey:
                     "\(tool) failed (\(process.terminationStatus)): \(text)",
             ])

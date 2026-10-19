@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -15,7 +15,7 @@ extension ReaderChecks {
     @MainActor static func redactionChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-redaction-\(UUID())")
+            .appendingPathComponent("lyra-reader-redaction-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -80,7 +80,7 @@ extension ReaderChecks {
                 "the covered word is not extractable from the saved file")
         require(savedPage.text.contains("quick") && savedPage.text.contains("jumps"),
                 "text before and after the mark survives")
-        require(savedPage.text.contains("ArisReader fixture") && savedPage.text.contains("Line 6:"),
+        require(savedPage.text.contains("LyraReader fixture") && savedPage.text.contains("Line 6:"),
                 "text outside the mark on other lines survives")
 
         let scale: CGFloat = 2

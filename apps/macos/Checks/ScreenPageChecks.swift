@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 @MainActor private final class ScreenPageEngine: PreviewEngine {
@@ -106,10 +106,10 @@ extension ReaderChecks {
         try await eventually("lower zoom retains a wider sharp neighborhood", { low.pageRasterCacheCount >= 5 })
         require(low.pageRasterCacheUsedBytes <= low.tileCacheBudgetBytes,
                 "lower zoom expands by byte cost rather than a fixed unbounded page count")
-        low.applyCacheBudgetSetting(environment: ["ARIS_READER_CACHE_BUDGET_MB": "16"])
+        low.applyCacheBudgetSetting(environment: ["LYRA_READER_CACHE_BUDGET_MB": "16"])
         require(low.pageRasterCacheUsedBytes + low.tileCacheUsedBytes <= 16 * 1024 * 1024,
                 "reducing the live budget immediately shrinks the page neighborhood")
-        low.applyCacheBudgetSetting(environment: ["ARIS_READER_CACHE_BUDGET_MB": "48"])
+        low.applyCacheBudgetSetting(environment: ["LYRA_READER_CACHE_BUDGET_MB": "48"])
         try await eventually("raising the live budget refills more nearby pages", { low.pageRasterCacheCount >= 5 })
         low.zoomPercent = 400
         low.reloadVisiblePages()
@@ -173,7 +173,7 @@ extension ReaderChecks {
                 "the reason names the page size, the per-page ceiling and the budget it needs; got: \(note)")
         require(state.screenPagePathSummary == "off(page \(pageMiB)>8.0 MiB; budget <\(neededMiB) MiB)",
                 "the render-stats field names the threshold; got: \(state.screenPagePathSummary)")
-        state.applyCacheBudgetSetting(environment: ["ARIS_READER_CACHE_BUDGET_MB": "48"])
+        state.applyCacheBudgetSetting(environment: ["LYRA_READER_CACHE_BUDGET_MB": "48"])
         try await eventually("raising the budget restores the screen-resolution path",
                              { state.usesScreenPageRasters })
         require(state.screenPagePathNote == nil && state.screenPagePathSummary == "on",

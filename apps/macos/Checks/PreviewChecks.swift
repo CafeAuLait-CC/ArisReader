@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 // Deliberately completes the earlier request last to exercise the actual race.
@@ -213,7 +213,7 @@ extension ReaderChecks {
 
     @MainActor static func previewTransparencyChecks(root: URL) async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-alpha-\(UUID())")
+            .appendingPathComponent("lyra-reader-alpha-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         let fixture = scratch.appendingPathComponent("alpha-crop.pdf")
@@ -308,7 +308,7 @@ extension ReaderChecks {
     /// A section link opens a text-only preview; a figure link still opens an image.
     @MainActor static func previewSectionChecks(root: URL) async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-section-\(UUID())")
+            .appendingPathComponent("lyra-reader-section-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         for name in ["section-references.pdf", "cross-references.pdf"] {

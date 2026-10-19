@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import PDFKit
@@ -14,13 +14,13 @@ extension ReaderChecks {
     @MainActor static func stickyMarkupChecks(fixture: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-sticky-\(UUID())")
+            .appendingPathComponent("lyra-reader-sticky-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
         let document = scratch.appendingPathComponent("sticky.pdf")
         try fileManager.copyItem(at: fixture, to: document)
-        let sidecar = document.appendingPathExtension("aris-annotations.json")
+        let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
 
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
@@ -251,17 +251,17 @@ extension ReaderChecks {
                 "opening another document clears the sticky tool, as it clears the ink tool")
     }
 
-    /// `/StrikeOut` end to end: Lyra writes it, Lyra reads it back, another viewer draws it, and
+    /// `/StrikeOut` end to end: LyraReader writes it, LyraReader reads it back, another viewer draws it, and
     /// a file annotated by another application is the reading fixture.
     @MainActor static func strikeoutChecks(textPage: URL, annotated: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-strikeout-\(UUID())")
+            .appendingPathComponent("lyra-reader-strikeout-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
@@ -287,7 +287,7 @@ extension ReaderChecks {
         let red = AnnotationColor(red: 200, green: 30, blue: 40, alpha: 255)
         let strikeoutID = UUID()
 
-        // ── 1. Lyra's own write: a real gesture creates the sidecar entry, save writes it ──
+        // ── 1. LyraReader's own write: a real gesture creates the sidecar entry, save writes it ──
         let source = try copy(textPage, "strikeout-source.pdf")
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
@@ -342,11 +342,11 @@ extension ReaderChecks {
             require(false, "a successful strikeout save publishes a report")
         }
 
-        let copySidecar = copyURL.appendingPathExtension("aris-annotations.json")
+        let copySidecar = copyURL.appendingPathExtension("lyra-reader-annotations.json")
         require(!fileManager.fileExists(atPath: copySidecar.path),
                 "an annotated copy carries no sidecar")
 
-        // ── 2. Lyra reads its own /StrikeOut back as a strikeout ──────────────────────
+        // ── 2. LyraReader reads its own /StrikeOut back as a strikeout ──────────────────────
         let reopened = AppState(engine: try RustEngine())
         reopened.setViewportSize(CGSize(width: 700, height: 500))
         reopened.newTab(url: copyURL)
@@ -354,7 +354,7 @@ extension ReaderChecks {
             reopened.documentAnnotations.count == 1
         })
         let written = reopened.documentAnnotations[0]
-        require(written.kind == "strikeout", "Lyra's own /StrikeOut reads back as strikeout")
+        require(written.kind == "strikeout", "LyraReader's own /StrikeOut reads back as strikeout")
         require(written.drawing == .markup, "the written strikeout is classified as text markup")
         require(written.quads.count == rects.count, "the written strikeout keeps its quads")
         require(written.color?.red == red.red && written.color?.green == red.green
@@ -383,11 +383,11 @@ extension ReaderChecks {
         require(band.top + band.bottom < max(8, band.middle / 3),
                 "PDFKit does not fill the quad: the mark is a line, not a highlight (top \(band.top), bottom \(band.bottom))")
         FileHandle.standardError.write(Data(
-            "aris-strikeout: PDFKit middle=\(band.middle) top=\(band.top) bottom=\(band.bottom)\n".utf8
+            "lyra-reader-strikeout: PDFKit middle=\(band.middle) top=\(band.top) bottom=\(band.bottom)\n".utf8
         ))
 
         // ── 4. Write-back over a file another producer annotated ──────────────────────
-        // The committed fixture is hand-written by `scripts/make-fixtures.py`, not by Lyra, and
+        // The committed fixture is hand-written by `scripts/make-fixtures.py`, not by LyraReader, and
         // carries seven annotations (including its own `/StrikeOut`). Replacing it must add the
         // new mark once, leave every pre-existing annotation unchanged and produce a verified
         // byte-identical backup.
@@ -419,7 +419,7 @@ extension ReaderChecks {
             start: replaceLine1,
             end: replaceLine1 + 5,
             color: red,
-            note: "written by Lyra",
+            note: "written by LyraReader",
             createdAt: Date()
         )
         let encoded = String(decoding: try encoder.encode([entry]), as: UTF8.self)
@@ -465,7 +465,7 @@ extension ReaderChecks {
             $0.id == "nm:\(strikeoutID.uuidString)"
         }
         require(found.count == 1 && found[0].kind == "strikeout",
-                "the strikeout written by Lyra is present exactly once")
+                "the strikeout written by LyraReader is present exactly once")
         for original in originalExternal {
             guard let current = afterExternal.documentAnnotations.first(where: {
                 $0.id == original.id
@@ -488,7 +488,7 @@ extension ReaderChecks {
     ) throws -> (middle: Int, top: Int, bottom: Int) {
         guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "PDFKit could not open the saved strikeout"]
             )
@@ -501,7 +501,7 @@ extension ReaderChecks {
             bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            throw NSError(domain: "Lyra", code: 4,
+            throw NSError(domain: "LyraReader", code: 4,
                           userInfo: [NSLocalizedDescriptionKey: "no PDFKit bitmap"])
         }
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))

@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 /// An engine whose 10 pages are laid out like `PreviewEngine`'s (`pageTopPt = 1200 × index`),

@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import PDFKit
@@ -19,7 +19,7 @@ extension ReaderChecks {
     ) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-ink-\(UUID())")
+            .appendingPathComponent("lyra-reader-ink-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -30,7 +30,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func json(_ document: URL) throws -> String {
             String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)
@@ -333,7 +333,7 @@ extension ReaderChecks {
         let wrote = await writer.saveAnnotatedCopy(to: copyURL)
         if !wrote {
             FileHandle.standardError.write(Data(
-                "aris-ink: write failed: \(writer.lastError ?? "no error")\n".utf8))
+                "lyra-reader-ink: write failed: \(writer.lastError ?? "no error")\n".utf8))
         }
         require(wrote, "the ink and square are written into a copy")
         let writtenBytes = try Data(contentsOf: copyURL)
@@ -414,7 +414,7 @@ extension ReaderChecks {
         require(bluePixels > 40, "PDFKit draws the square (\(bluePixels) blue px)")
         require(emptyPixels == 0, "nothing is drawn away from the marks (\(emptyPixels) px)")
         FileHandle.standardError.write(Data(
-            "aris-ink: PDFKit pixels ink=\(redPixels) square=\(bluePixels) empty=\(emptyPixels)\n".utf8))
+            "lyra-reader-ink: PDFKit pixels ink=\(redPixels) square=\(bluePixels) empty=\(emptyPixels)\n".utf8))
 
         // ── 7. Read a fixture written by another producer ─────────────────────────────
         let external = AppState(engine: try RustEngine())
@@ -498,7 +498,7 @@ extension ReaderChecks {
         predicate: (Int, Int, Int) -> Bool
     ) throws -> Int {
         guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
-            throw NSError(domain: "Lyra", code: 5, userInfo: [
+            throw NSError(domain: "LyraReader", code: 5, userInfo: [
                 NSLocalizedDescriptionKey: "PDFKit could not open the saved copy",
             ])
         }
@@ -510,7 +510,7 @@ extension ReaderChecks {
             bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            throw NSError(domain: "Lyra", code: 5, userInfo: [
+            throw NSError(domain: "LyraReader", code: 5, userInfo: [
                 NSLocalizedDescriptionKey: "could not create a PDFKit bitmap",
             ])
         }

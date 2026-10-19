@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 /// The overlay scroll indicator, checked where it can be checked without a hand on the mouse.

@@ -1,0 +1,52 @@
+[package]
+name = "lyra-reader-pdfium"
+description = "PDFium backend implementation (feature = \"pdfium\"); slot for a pure-Rust backend reserved"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-core = { workspace = true }
+
+# Safe wrapper around Chromium's PDFium. The dynamic library is loaded at runtime
+# (see `library_candidates()`), so nothing is linked at build time and no PDFium
+# SDK is required to compile this crate. See docs/09-dev-setup.md §4.
+#
+# Feature notes: `pdfium_latest` selects which PDFium C API level gets bound (without
+# it the crate does not compile at all), and `thread_safe` adds `unsafe impl Send/Sync`
+# for handle types. The default `image_*` integration is deliberately not enabled:
+# the engine deals in raw BGRA buffers and `lyra-reader-cli` owns PNG encoding.
+pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["pdfium_latest", "thread_safe"] }
+
+# Dynamic loading of the same library, for the annotation dictionary accessors that
+# `pdfium-render` does not expose (`/BM`, `/CA`) — see `src/annotations.rs`. Pinned to the
+# same 0.8 line the wrapper uses so the process keeps one copy of the crate. Only compiled
+# with the `pdfium` feature.
+libloading = { version = "0.8", optional = true }
+# PDFium does not paint legacy /Link borders without an appearance stream. Read their
+# dictionaries (including compressed objects) and stroke them into the existing raster.
+lopdf = { version = "0.45", default-features = false, optional = true }
+tiny-skia = { version = "0.11", default-features = false, features = ["std"], optional = true }
+
+# XMP metadata streams are usually FlateDecode-compressed (see `src/xmp.rs`). PDFium's C
+# ABI has no XMP accessor, so the backend inflates the packet itself.
+flate2 = "1"
+
+# Reading the bundled appearance font (cmap, advances, metrics) and subsetting it per
+# document. `subsetter` is the PDF-oriented subsetter from Typst: it remaps glyph IDs into a
+# contiguous sequence and drops `cmap`, which is exactly the shape a Type0/Identity-H font
+# embedded with `CIDToGIDMap` needs. The variable-font path is not needed because the
+# committed font is already instantiated at wght=400, so its optional dependencies stay out.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"], optional = true }
+subsetter = { version = "0.2", default-features = false, optional = true }
+
+[features]
+default = ["pdfium"]
+# Enables the real PDFium implementation. With `--no-default-features` only the stub
+# is built, which keeps `cargo check --target x86_64-unknown-linux-gnu` (and any
+# machine without PDFium) working.
+pdfium = ["dep:pdfium-render", "dep:libloading", "dep:lopdf", "dep:tiny-skia", "dep:ttf-parser", "dep:subsetter"]

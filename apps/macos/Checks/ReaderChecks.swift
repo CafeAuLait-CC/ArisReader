@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 // Executable regressions run with Command Line Tools; no XCTest/Xcode dependency.
@@ -42,6 +42,10 @@ struct ReaderChecks {
 
         let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
             ?? FileManager.default.currentDirectoryPath)
+        if CommandLine.arguments.contains("--check-rename") {
+            try renameCompatibilityChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-sidebar-polish") {
             try await sidebarPolishChecks(root: fastRoot)
             return
@@ -52,7 +56,7 @@ struct ReaderChecks {
         }
         if CommandLine.arguments.contains("--check-bookmarks") {
             let scratch = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aris-bookmarks-\(UUID())")
+                .appendingPathComponent("lyra-reader-bookmarks-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: scratch) }
             let fixture = scratch.appendingPathComponent("a.pdf")
@@ -126,7 +130,7 @@ struct ReaderChecks {
             return
         }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
-        // (`ArisReaderChecks --check-transitions .`).
+        // (`LyraReaderChecks --check-transitions .`).
         if CommandLine.arguments.contains("--check-transitions") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -142,7 +146,7 @@ struct ReaderChecks {
             return
         }
         // The live text-markup preview on its own
-        // (`ArisReaderChecks --check-live-markup .`).
+        // (`LyraReaderChecks --check-live-markup .`).
         if CommandLine.arguments.contains("--check-live-markup") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -186,7 +190,7 @@ struct ReaderChecks {
             print("Sticky markup and strikeout checks passed")
             return
         }
-        // The write-back suite on its own (`ArisReaderChecks --check-annotation-writeback .`).
+        // The write-back suite on its own (`LyraReaderChecks --check-annotation-writeback .`).
         if CommandLine.arguments.contains("--check-annotation-writeback") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -195,7 +199,7 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
-        // The eraser on its own (`ArisReaderChecks --check-eraser .`).
+        // The eraser on its own (`LyraReaderChecks --check-eraser .`).
         if CommandLine.arguments.contains("--check-eraser") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -204,7 +208,7 @@ struct ReaderChecks {
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
             return
         }
-        // Ink and shapes on their own (`ArisReaderChecks --check-ink-annotations .`).
+        // Ink and shapes on their own (`LyraReaderChecks --check-ink-annotations .`).
         if CommandLine.arguments.contains("--check-ink-annotations") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -216,7 +220,7 @@ struct ReaderChecks {
             return
         }
         // Placeable notes and text boxes on their own
-        // (`ArisReaderChecks --check-placed-text .`).
+        // (`LyraReaderChecks --check-placed-text .`).
         if CommandLine.arguments.contains("--check-placed-text") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -228,7 +232,7 @@ struct ReaderChecks {
             return
         }
         // The text-box creation flow on its own
-        // (`ArisReaderChecks --check-textbox-placement .`).
+        // (`LyraReaderChecks --check-textbox-placement .`).
         if CommandLine.arguments.contains("--check-textbox-placement") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -238,7 +242,7 @@ struct ReaderChecks {
             return
         }
         // Click-to-select for text markup and text boxes on its own
-        // (`ArisReaderChecks --check-mark-selection .`).
+        // (`LyraReaderChecks --check-mark-selection .`).
         if CommandLine.arguments.contains("--check-mark-selection") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -249,7 +253,7 @@ struct ReaderChecks {
             print("Mark-selection checks passed")
             return
         }
-        // The annotation text export on its own (`ArisReaderChecks --check-annotation-export .`).
+        // The annotation text export on its own (`LyraReaderChecks --check-annotation-export .`).
         if CommandLine.arguments.contains("--check-annotation-export") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -257,7 +261,7 @@ struct ReaderChecks {
             print("Annotation export checks passed")
             return
         }
-        // The cold-click regression on its own (`ArisReaderChecks --check-cold-click .`).
+        // The cold-click regression on its own (`LyraReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -268,7 +272,7 @@ struct ReaderChecks {
             return
         }
         // The two interaction fixes, on their own, while they are being worked on
-        // (`ArisReaderChecks --check-click-intent .`).
+        // (`LyraReaderChecks --check-click-intent .`).
         if CommandLine.arguments.contains("--check-click-intent")
             || CommandLine.arguments.contains("--check-scroll-tail") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -307,7 +311,7 @@ struct ReaderChecks {
             return
         }
         // Lets the thumbnail drag/reorder checks run on their own
-        // (`ArisReaderChecks --check-thumbnail-drag .`).
+        // (`LyraReaderChecks --check-thumbnail-drag .`).
         if CommandLine.arguments.contains("--check-thumbnail-drag") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -320,7 +324,7 @@ struct ReaderChecks {
             return
         }
         // Lets the titlebar's appearance/theme checks run on their own while they are being
-        // worked on (`ArisReaderChecks --check-titlebar-theme .`).
+        // worked on (`LyraReaderChecks --check-titlebar-theme .`).
         if CommandLine.arguments.contains("--check-titlebar-theme") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -329,7 +333,7 @@ struct ReaderChecks {
             return
         }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
-        // worked on (`ArisReaderChecks --check-tab-row .`).
+        // worked on (`LyraReaderChecks --check-tab-row .`).
         if CommandLine.arguments.contains("--check-tab-row") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -345,7 +349,7 @@ struct ReaderChecks {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
                 ?? FileManager.default.currentDirectoryPath)
             let scratch = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aris-open-\(UUID())")
+                .appendingPathComponent("lyra-reader-open-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: scratch) }
             let first = scratch.appendingPathComponent("a.pdf")
@@ -357,12 +361,12 @@ struct ReaderChecks {
             return
         }
         // Lets the context-menu/new-window checks be run on their own while they are being
-        // worked on (`ArisReaderChecks --check-desktop-interaction .`).
+        // worked on (`LyraReaderChecks --check-desktop-interaction .`).
         if CommandLine.arguments.contains("--check-desktop-interaction") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
             let scratch = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aris-desktop-\(UUID())")
+                .appendingPathComponent("lyra-reader-desktop-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: scratch) }
             let first = scratch.appendingPathComponent("a.pdf")
@@ -383,7 +387,7 @@ struct ReaderChecks {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
                 ?? FileManager.default.currentDirectoryPath)
             let scratch = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aris-windows-\(UUID())")
+                .appendingPathComponent("lyra-reader-windows-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: scratch) }
             let first = scratch.appendingPathComponent("a.pdf")
@@ -400,7 +404,7 @@ struct ReaderChecks {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
                 ?? FileManager.default.currentDirectoryPath)
             let scratch = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aris-canvas-clear-\(UUID())")
+                .appendingPathComponent("lyra-reader-canvas-clear-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: scratch) }
             let first = scratch.appendingPathComponent("a.pdf")
@@ -412,7 +416,7 @@ struct ReaderChecks {
             return
         }
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("aris-checks-\(UUID())")
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let a = temporary.appendingPathComponent("a.pdf")
@@ -424,7 +428,7 @@ struct ReaderChecks {
         state.newTab(url: a)
         require(state.document?.pageCount == 1 && state.tabs.count == 1, "normal open initializes document/tab")
         try await eventually("normal open loads thumbnail", { state.thumbnails[0] != nil })
-        state.searchQuery = "ArisReader"
+        state.searchQuery = "LyraReader"
         state.runSearch()
         try await eventually("normal open searches", { !state.isSearching && !state.searchHits.isEmpty })
         state.searchQuery = "fixture"
@@ -567,6 +571,7 @@ struct ReaderChecks {
         try await scrollIndicatorChecks(scrollable: b, singlePage: a)
         try await tileCacheChecks(url: b)
         try await prefetchBandChecks(url: b)
+        try renameCompatibilityChecks(root: root)
         try await aiAssistantChecks(root: root)
         try await chatGPTChecks(root: root)
         await appearanceChecks()

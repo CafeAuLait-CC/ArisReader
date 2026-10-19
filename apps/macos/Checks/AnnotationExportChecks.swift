@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -7,7 +7,7 @@ extension ReaderChecks {
     /// path, document order, source labelling, suggested names and the real fixtures.
     @MainActor static func annotationExportChecks(root: URL) async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-annotation-export-\(UUID())")
+            .appendingPathComponent("lyra-reader-annotation-export-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
 
@@ -126,7 +126,7 @@ extension ReaderChecks {
         - **Colour:** #FFD84066
         - **Author:** Alex
         - **Date:** 2024-06-01T10:00:00Z
-        - **Source:** Lyra annotation sidecar (saved beside the PDF)
+        - **Source:** LyraReader annotation sidecar (saved beside the PDF)
 
         **Quote**
 
@@ -144,7 +144,7 @@ extension ReaderChecks {
         - **Colour:** #60A0F0AA
         - **Author:** Alex
         - **Date:** 2024-06-01T10:05:00Z
-        - **Source:** Lyra annotation sidecar (saved beside the PDF)
+        - **Source:** LyraReader annotation sidecar (saved beside the PDF)
 
         **Quote**
 
@@ -382,7 +382,7 @@ extension ReaderChecks {
         )
         let encoder = JSONEncoder()
         try encoder.encode([sidecarAnnotation]).write(
-            to: documentURL.appendingPathExtension("aris-annotations.json")
+            to: documentURL.appendingPathExtension("lyra-reader-annotations.json")
         )
         let expectedQuote = AnnotationExport.normalized(
             AnnotationExport.text(in: textPage, range: range) ?? ""
@@ -443,7 +443,7 @@ extension ReaderChecks {
                 "the document heading counts every exported annotation")
         require(markdown.contains("- **Exported:** 2026-10-17T17:40:00Z"),
                 "the document heading carries the export date")
-        require(markdown.contains("- **Source:** Lyra annotation sidecar (saved beside the PDF)"),
+        require(markdown.contains("- **Source:** LyraReader annotation sidecar (saved beside the PDF)"),
                 "sidecar annotations say where they came from")
         require(markdown.contains("- **Source:** PDF annotation (read from the file)"),
                 "the file's annotations are marked as such")
@@ -506,8 +506,8 @@ extension ReaderChecks {
 
         // Human-eye evidence: the same fixtures' export, kept outside the scratch directory so
         // it can be opened in a Markdown viewer or spreadsheet (the full check suite uses
-        // ARIS_READER_CHECK_SNAPSHOT_DIR for its other visual artifacts too).
-        if let directory = ProcessInfo.processInfo.environment["ARIS_READER_CHECK_SNAPSHOT_DIR"] {
+        // LYRA_READER_CHECK_SNAPSHOT_DIR for its other visual artifacts too).
+        if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] {
             let snapshots = URL(fileURLWithPath: directory)
             try? FileManager.default.createDirectory(at: snapshots, withIntermediateDirectories: true)
             try? FileManager.default.copyItem(

@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 /// A press that never moved is a **click**, not a selection.

@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import SwiftUI
 
 @MainActor private final class GatedSearchEngine: PreviewEngine {
@@ -59,7 +59,7 @@ extension ReaderChecks {
         }
         try await eventually("hosted SwiftUI scrollbars receive the palette scroller", {
             let views = nativeScrollViews(in: host)
-            return !views.isEmpty && views.allSatisfy { $0.verticalScroller is LyraSidebarScroller }
+            return !views.isEmpty && views.allSatisfy { $0.verticalScroller is LyraReaderSidebarScroller }
         })
         window.appearance = NSAppearance(named: .darkAqua)
         state.showSearchHit(min(12, hits.count - 1))
@@ -79,7 +79,7 @@ extension ReaderChecks {
         func sidebarScrollersAreThemed() -> Bool {
             sidebarHost.layoutSubtreeIfNeeded()
             let views = nativeScrollViews(in: sidebarHost)
-            return !views.isEmpty && views.allSatisfy { $0.verticalScroller is LyraSidebarScroller }
+            return !views.isEmpty && views.allSatisfy { $0.verticalScroller is LyraReaderSidebarScroller }
         }
         try await eventually("opening a document themes the existing sidebar", sidebarScrollersAreThemed)
         documentState.sidebarTab = .annotations
@@ -91,8 +91,8 @@ extension ReaderChecks {
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .legacy
         scroll.documentView = NSView(frame: CGRect(x: 0, y: 0, width: 230, height: 2000))
-        LyraSidebarScroller.install(on: scroll)
-        require(scroll.verticalScroller is LyraSidebarScroller && scroll.scrollerStyle == .legacy,
+        LyraReaderSidebarScroller.install(on: scroll)
+        require(scroll.verticalScroller is LyraReaderSidebarScroller && scroll.scrollerStyle == .legacy,
                 "themed scrollbars retain the user's legacy scrollbar style")
         scroll.contentView.scroll(to: CGPoint(x: 0, y: 800))
         scroll.reflectScrolledClipView(scroll.contentView)
@@ -110,7 +110,7 @@ extension ReaderChecks {
         require(scroll.contentView.bounds.minY == 800 && (scroll.verticalScroller?.floatValue ?? 0) > 0,
                 "the themed native scroller still reflects document scrolling")
         scroll.scrollerStyle = .overlay
-        require(scroll.verticalScroller is LyraSidebarScroller,
+        require(scroll.verticalScroller is LyraReaderSidebarScroller,
                 "the custom scroller also supports native overlay scrolling")
 
         let pages = [PagePlacement(index: 0, topPt: 10, leftPt: 0, widthPt: 100, heightPt: 200),

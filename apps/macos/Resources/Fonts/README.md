@@ -1,6 +1,6 @@
 # Bundled appearance font
 
-`LyraSansSC-Regular.ttf` is the font Lyra embeds in `/FreeText` annotation appearance streams.
+`LyraReaderSansSC-Regular.ttf` is the font LyraReader embeds in `/FreeText` annotation appearance streams.
 It is a **subset of Noto Sans SC** (SIL Open Font License 1.1), not a system font, and no glyph
 outlines were copied out of a system font.
 
@@ -10,7 +10,7 @@ outlines were copied out of a system font.
 | Licence | SIL Open Font License 1.1 — see `OFL.txt` |
 | Shipped file | 3,628,760 bytes |
 | Glyphs | 11,973 (12,007 mapped characters) |
-| Reserved name | The OFL copyright line reserves the name “Source”; this Modified Version is therefore renamed `Lyra Sans SC` and keeps the upstream copyright/licence records in its name table. |
+| Reserved name | The OFL copyright line reserves the name “Source”; this Modified Version is therefore renamed `LyraReader Sans SC` and keeps the upstream copyright/licence records in its name table. |
 | Regenerate | `scripts/build-appearance-font.py` (needs `fonttools`; the app build does not) |
 
 The shipped subset covers the complete GB 2312 repertoire (6,763 Simplified Chinese hanzi plus
@@ -26,4 +26,4 @@ encoded through the `.notdef` glyph with its exact Unicode in `ToUnicode`, and t
 that it will appear as a missing-glyph box in other viewers. `/Contents` always keeps the exact
 string.
 
-`make-app-bundle.sh` copies this directory to `Lyra.app/Contents/Resources/Fonts/`.
+`make-app-bundle.sh` copies this directory to `LyraReader.app/Contents/Resources/Fonts/`.

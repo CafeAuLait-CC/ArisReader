@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import PDFKit
@@ -17,7 +17,7 @@ extension ReaderChecks {
     @MainActor static func annotationWritebackChecks(fixture: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-writeback-\(UUID())")
+            .appendingPathComponent("lyra-reader-writeback-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -79,13 +79,13 @@ extension ReaderChecks {
             return String(encoded.dropFirst(2).dropLast(2))
         }
         let foreignID = UUID()
-        let foreignEntry = #"{"colorIndex":1,"id":"\#(foreignID.uuidString)","kind":"ink","page":0,"note":"from a newer Lyra","start":0,"end":1,"strokes":[[1,2],[3,4]]}"#
+        let foreignEntry = #"{"colorIndex":1,"id":"\#(foreignID.uuidString)","kind":"ink","page":0,"note":"from a newer LyraReader","start":0,"end":1,"strokes":[[1,2],[3,4]]}"#
         let bookmark = Bookmark(page: 0, title: "write-back bookmark", yPt: 12)
 
         func makeDocument(named name: String, withStaleTemporary: Bool) throws -> URL {
             let document = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: fixture, to: document)
-            let sidecar = document.appendingPathExtension("aris-annotations.json")
+            let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
             let sidecarText = "[\n"
                 + [try entry(first), try entry(second), try entry(bookmark), foreignEntry]
                     .joined(separator: ",\n")
@@ -95,7 +95,7 @@ extension ReaderChecks {
                 // A crashed save leaves this behind; the rename is the last step, so the
                 // document itself is still the last good file.
                 let temporary = scratch.appendingPathComponent(
-                    "\(document.lastPathComponent).lyra-save-999-1.tmp"
+                    "\(document.lastPathComponent).lyra-reader-save-999-1.tmp"
                 )
                 try Data("partial PDF".utf8).write(to: temporary)
             }
@@ -104,11 +104,11 @@ extension ReaderChecks {
 
         // ── 1. Save an annotated copy; the original and its sidecar are untouched ──────
         let copySource = try makeDocument(named: "copy-source.pdf", withStaleTemporary: true)
-        let copySourceSidecar = copySource.appendingPathExtension("aris-annotations.json")
+        let copySourceSidecar = copySource.appendingPathExtension("lyra-reader-annotations.json")
         let copyOriginalBytes = try Data(contentsOf: copySource)
         let copySidecarBytes = try Data(contentsOf: copySourceSidecar)
         let staleTemporary = scratch.appendingPathComponent(
-            "\(copySource.lastPathComponent).lyra-save-999-1.tmp"
+            "\(copySource.lastPathComponent).lyra-reader-save-999-1.tmp"
         )
 
         let copyState = AppState(engine: try RustEngine())
@@ -143,7 +143,7 @@ extension ReaderChecks {
         }
 
         // ── 2. Reopening the copy: one copy of each annotation, from the PDF, no sidecar ──
-        let copySidecarURL = copyURL.appendingPathExtension("aris-annotations.json")
+        let copySidecarURL = copyURL.appendingPathExtension("lyra-reader-annotations.json")
         require(!fileManager.fileExists(atPath: copySidecarURL.path),
                 "a copy carries no sidecar, so reopening it cannot duplicate entries")
         let copyReopen = AppState(engine: try RustEngine())
@@ -204,7 +204,7 @@ extension ReaderChecks {
         require(pixels.dark > 20,
                 "PDFKit keeps the glyphs black under the highlight (\(pixels.dark) dark px)")
         FileHandle.standardError.write(Data(
-            "aris-writeback: PDFKit highlight pixels yellow=\(pixels.yellow) dark=\(pixels.dark)\n".utf8
+            "lyra-reader-writeback: PDFKit highlight pixels yellow=\(pixels.yellow) dark=\(pixels.dark)\n".utf8
         ))
 
         // ── 3b. A /Text note: the writer supports it, and Preview shows an icon ────────
@@ -252,7 +252,7 @@ extension ReaderChecks {
 
         // ── 4. Replace the original: verified backup, exact sidecar removal, no duplicates ──
         let replaceSource = try makeDocument(named: "replace-source.pdf", withStaleTemporary: false)
-        let replaceSidecar = replaceSource.appendingPathExtension("aris-annotations.json")
+        let replaceSidecar = replaceSource.appendingPathExtension("lyra-reader-annotations.json")
         let replaceOriginalBytes = try Data(contentsOf: replaceSource)
         let replaceState = AppState(engine: try RustEngine())
         replaceState.setViewportSize(CGSize(width: 700, height: 500))
@@ -346,7 +346,7 @@ extension ReaderChecks {
     ) throws -> (yellow: Int, dark: Int) {
         guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "PDFKit could not open the saved copy"]
             )
@@ -364,7 +364,7 @@ extension ReaderChecks {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "could not create a PDFKit bitmap"]
             )
@@ -376,7 +376,7 @@ extension ReaderChecks {
 
         guard let data = context.data else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "PDFKit produced no bitmap"]
             )
@@ -416,7 +416,7 @@ extension ReaderChecks {
     ) throws -> Int {
         guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "PDFKit could not open the saved note copy"]
             )
@@ -434,7 +434,7 @@ extension ReaderChecks {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             throw NSError(
-                domain: "Lyra",
+                domain: "LyraReader",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "could not create a PDFKit bitmap"]
             )

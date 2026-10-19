@@ -1,0 +1,41 @@
+[package]
+name = "lyra-reader-ffi"
+description = "Public FFI: UniFFI control plane + hand-written C ABI (GPU surface handoff)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "lyra_reader_ffi"
+# staticlib → SwiftPM static linking; cdylib → future C#/Kotlin shells; rlib → Rust-internal tests
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# `uniffi-bindgen` lives in this crate so that generating bindings never requires a
+# separately installed tool: scripts/build-rust.sh runs `cargo run -p lyra-reader-ffi
+# --bin uniffi-bindgen -- generate --library …` (docs/05-ffi.md §8).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-text = { path = "../lyra-reader-text" }
+lyra-reader-ai = { workspace = true }
+lyra-reader-metadata = { workspace = true }
+lyra-reader-core = { workspace = true }
+lyra-reader-session = { workspace = true }
+lyra-reader-gpu = { workspace = true }
+lyra-reader-pdfium = { workspace = true }
+# The control plane (object handles, records, errors, events) is generated, not
+# hand-written — see docs/adr/0004. `cli` pulls in the bindings generator used by the
+# `uniffi-bindgen` binary above.
+uniffi = { version = "0.32", features = ["cli"] }
+# The document index cache persists typed records as JSON and binds them to the PDF's bytes
+# with SHA-256. Both are library code, not shell code: validation and serialization must stay
+# in Rust so the CLI, the checks and the app share one implementation.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.11"

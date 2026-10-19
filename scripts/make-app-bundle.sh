@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Assemble Lyra.app (SwiftPM artifacts + Info.plist + optional PDFium + code signing).
+# Assemble LyraReader.app (SwiftPM artifacts + Info.plist + optional PDFium + code signing).
 #
 # Usage: ./scripts/make-app-bundle.sh [--debug] [--no-sign]
 #
-# Artifacts: build/Lyra.app
+# Artifacts: build/LyraReader.app
 #
-# The bundle is named after the user-visible app (Lyra); the executable copied into
-# Contents/MacOS stays `ArisReader` (SwiftPM product name, matches CFBundleExecutable).
+# The bundle and its SwiftPM executable are both named LyraReader.
 #
 # Works under Command Line Tools (no actool / stapler; see docs/09-dev-setup.md §2.1).
 set -euo pipefail
@@ -24,7 +23,7 @@ for arg in "$@"; do
   esac
 done
 
-APP="$ROOT/build/Lyra.app"
+APP="$ROOT/build/LyraReader.app"
 PDFIUM_LIB="$ROOT/vendor/pdfium/lib/libpdfium.dylib"
 
 mkdir -p "$ROOT/build"
@@ -42,13 +41,13 @@ if ! (cd apps/macos && swift build "${BUILD_ARGS[@]}") >"$ROOT/build/swift-bundl
   fi
 fi
 BIN_DIR="$(cd apps/macos && swift build "${BUILD_ARGS[@]}" --show-bin-path)"
-BIN="$BIN_DIR/ArisReader"
+BIN="$BIN_DIR/LyraReader"
 [ -x "$BIN" ] || { echo "Executable not found: $BIN" >&2; exit 1; }
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
-cp "$BIN" "$APP/Contents/MacOS/ArisReader"
+cp "$BIN" "$APP/Contents/MacOS/LyraReader"
 cp apps/macos/Support/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
@@ -57,7 +56,7 @@ if [ -f "$ROOT/apps/macos/Support/AppIcon.icns" ]; then
 fi
 
 # The appearance font and its licence ship side by side. The Rust writer resolves this path at
-# run time (see crates/aris-reader-pdfium/src/appearance_font.rs), so the bundle is the source of
+# run time (see crates/lyra-reader-pdfium/src/appearance_font.rs), so the bundle is the source of
 # truth and the executable does not carry a second copy.
 if [ -d "$ROOT/apps/macos/Resources/Fonts" ]; then
   echo "==> Bundling appearance font"
@@ -70,8 +69,8 @@ if [ -f "$PDFIUM_LIB" ]; then
   echo "==> Bundling PDFium"
   cp "$PDFIUM_LIB" "$APP/Contents/Frameworks/libpdfium.dylib"
   install_name_tool -id @rpath/libpdfium.dylib "$APP/Contents/Frameworks/libpdfium.dylib"
-  if ! otool -l "$APP/Contents/MacOS/ArisReader" | grep -q "@executable_path/../Frameworks"; then
-    install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/ArisReader"
+  if ! otool -l "$APP/Contents/MacOS/LyraReader" | grep -q "@executable_path/../Frameworks"; then
+    install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/LyraReader"
   fi
   if [ -d "$ROOT/vendor/pdfium/licenses" ]; then
     mkdir -p "$APP/Contents/Resources/ThirdPartyLicenses"

@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
@@ -138,7 +138,7 @@ extension ReaderChecks {
         //
         //    7a. macOS made a window for this request: its session registers before (or while)
         //        AppKit delivers the URLs, and that window may not be key yet — measured:
-        //        `aris-window: 1 url(s) → session 2 of 3` with the key window still the second one.
+        //        `lyra-reader-window: 1 url(s) → session 2 of 3` with the key window still the second one.
         //        The document must go to the new window, not to the one the reader was using.
         let beforeRequest = (left: left.state.tabs.count, right: right.state.tabs.count)
         let requestWindow = window("request window")
@@ -205,7 +205,7 @@ extension ReaderChecks {
         // 10. A launch that arrives with documents, before any window exists: the URLs wait in the
         //    registry (never dropped) and the first window that appears opens them.
         let launchRegistry = ReaderWindowRegistry()
-        let launchDelegate = ArisReaderAppDelegate(registry: launchRegistry)
+        let launchDelegate = LyraReaderAppDelegate(registry: launchRegistry)
         launchDelegate.application(NSApplication.shared, open: [a, b])
         require(launchRegistry.pendingCount == 2 && launchRegistry.sessions.isEmpty,
                 "documents delivered before any window exists wait instead of being lost")
@@ -310,7 +310,7 @@ extension ReaderChecks {
 /// A pasteboard holding file URLs for a check drag.
 enum CheckPasteboard {
     @MainActor static func files(_ urls: [URL]) -> NSPasteboard {
-        let pasteboard = NSPasteboard(name: NSPasteboard.Name("aris-checks-drop-\(UUID().uuidString)"))
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-reader-checks-drop-\(UUID().uuidString)"))
         pasteboard.clearContents()
         pasteboard.writeObjects(urls.map { $0 as NSURL })
         return pasteboard

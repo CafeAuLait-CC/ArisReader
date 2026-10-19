@@ -56,111 +56,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "aris-reader-ai"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "rcgen",
- "rustls",
- "rustls-native-certs",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "aris-reader-cli"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "aris-reader-metadata",
- "aris-reader-pdfium",
- "aris-reader-render",
- "aris-reader-text",
- "image",
- "libc",
-]
-
-[[package]]
-name = "aris-reader-core"
-version = "0.0.0"
-
-[[package]]
-name = "aris-reader-edit"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
-]
-
-[[package]]
-name = "aris-reader-ffi"
-version = "0.0.0"
-dependencies = [
- "aris-reader-ai",
- "aris-reader-core",
- "aris-reader-gpu",
- "aris-reader-metadata",
- "aris-reader-pdfium",
- "aris-reader-session",
- "aris-reader-text",
- "serde",
- "serde_json",
- "sha2",
- "uniffi",
-]
-
-[[package]]
-name = "aris-reader-gpu"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "wgpu",
-]
-
-[[package]]
-name = "aris-reader-metadata"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "aris-reader-text",
-]
-
-[[package]]
-name = "aris-reader-pdfium"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "flate2",
- "libloading 0.8.9",
- "lopdf",
- "pdfium-render",
- "subsetter",
- "tiny-skia",
- "ttf-parser",
-]
-
-[[package]]
-name = "aris-reader-render"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
-]
-
-[[package]]
-name = "aris-reader-session"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
-]
-
-[[package]]
-name = "aris-reader-text"
-version = "0.0.0"
-dependencies = [
- "aris-reader-core",
- "serde",
-]
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,6 +889,111 @@ dependencies = [
  "stringprep",
  "thiserror",
  "weezl",
+]
+
+[[package]]
+name = "lyra-reader-ai"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "lyra-reader-cli"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "libc",
+ "lyra-reader-core",
+ "lyra-reader-metadata",
+ "lyra-reader-pdfium",
+ "lyra-reader-render",
+ "lyra-reader-text",
+]
+
+[[package]]
+name = "lyra-reader-core"
+version = "0.0.0"
+
+[[package]]
+name = "lyra-reader-edit"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+]
+
+[[package]]
+name = "lyra-reader-ffi"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-ai",
+ "lyra-reader-core",
+ "lyra-reader-gpu",
+ "lyra-reader-metadata",
+ "lyra-reader-pdfium",
+ "lyra-reader-session",
+ "lyra-reader-text",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uniffi",
+]
+
+[[package]]
+name = "lyra-reader-gpu"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+ "wgpu",
+]
+
+[[package]]
+name = "lyra-reader-metadata"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+ "lyra-reader-text",
+]
+
+[[package]]
+name = "lyra-reader-pdfium"
+version = "0.0.0"
+dependencies = [
+ "flate2",
+ "libloading 0.8.9",
+ "lopdf",
+ "lyra-reader-core",
+ "pdfium-render",
+ "subsetter",
+ "tiny-skia",
+ "ttf-parser",
+]
+
+[[package]]
+name = "lyra-reader-render"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+]
+
+[[package]]
+name = "lyra-reader-session"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+]
+
+[[package]]
+name = "lyra-reader-text"
+version = "0.0.0"
+dependencies = [
+ "lyra-reader-core",
+ "serde",
 ]
 
 [[package]]

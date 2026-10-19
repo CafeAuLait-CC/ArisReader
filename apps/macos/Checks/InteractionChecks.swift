@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 
 extension ReaderChecks {
     @MainActor static func lineGapHitChecks() {
