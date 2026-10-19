@@ -423,10 +423,21 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
         println!("  ! {line}");
     }
 
-    // Measured 2026-10-17, after T4.12, on the twelve sample papers and the twenty evaluation
-    // papers: 416 captions, 324 of them multi-line, 389 closing a sentence, 0 dropped lines,
-    // 0 dropped text, 185 white-edge regions, 0 lines taken in by one. Every caption's run is
-    // inside its range and every continuation line's words are in its text.
+    // Measured 2026-10-19, after the formula-fragment / merged-line / split-segment fixes, on the
+    // twelve sample papers and the twenty evaluation papers: 416 captions, 324 of them multi-line,
+    // 393 closing a sentence, 0 dropped lines, 0 dropped text, 185 white-edge regions, 0 lines
+    // taken in by one. Every caption's run is inside its range and every continuation line's words
+    // are in its text.
+    //
+    // The four captions that now close are named by page in
+    // `caption_runs_survive_formula_fragments_and_merged_lines` below: Planck page 22
+    // `Table 3` (the `√` fragment of its formula), HumanML3D page 4 `Figure 3` (a text-layer line
+    // that merged two printed lines), 2110.12477 page 6 `Figure 1` (a median-size spike on the
+    // label line), and CLIP page 47 `Table 16` (the footnote markers after the caption, split off
+    // to the right). The same run added a split segment to three more captions that already
+    // closed (Dvorožňák page 3 `Figure 2`, Planck page 55 `Figures 40` and `41`) and completed
+    // the pseudocode text of 1909.05722 page 5 `Algorithm 1`; no caption's words were removed in
+    // any of those (the before/after word multisets are a superset).
     //
     // Before T4.12 the same instrument counted 429 / 330 / 399 / 185: 13 lines were prose that
     // began at a printed line break with a label (`Table 3. We observe …`), and they are gone,
@@ -657,6 +668,144 @@ fn wrapped_prose_lines_are_mentions_and_the_real_captions_survive() {
             .iter()
             .all(|caption| !(caption.kind == "Table" && caption.label == "4")),
         "the wrapped prose Table 4 on GW170817 page 17 is still a caption"
+    );
+}
+
+/// Captions cut short by a formula fragment or a merged text-layer line, on the real pages.
+///
+/// Four defects kept the run from reaching the end of a caption on 2026-10-19; each line here
+/// is the page's own printed text, read on the rendered page, and each assertion names the tail
+/// the extractor used to lose. They are separate from the rule re-derivation above: that harness
+/// applies the same rule the crate documents, so a rule that stops early is invisible to it.
+#[test]
+#[ignore = "requires the local PDF corpora and a PDFium shared library"]
+fn caption_runs_survive_formula_fragments_and_merged_lines() {
+    let files = corpus_files();
+    assert!(!files.is_empty(), "point the corpus variables at the PDFs");
+
+    // Planck page 22: the caption's formula has a radical printed as a line of its own, 16.2 pt
+    // tall against the caption's 8.9 pt type. The run used to stop after `(χ2min − Ndof)/` and
+    // lose the rest of the formula and the sentence that closes the caption.
+    let planck: Vec<Caption> = captions_on(&files, "1807.06209", 22)
+        .into_iter()
+        .filter(|caption| caption.kind == "Table" && caption.label == "3")
+        .collect();
+    assert_eq!(planck.len(), 1, "{planck:?}");
+    let text = planck[0]
+        .text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("The last two columns give") && text.ends_with("associated PTEs."),
+        "the Planck Table 3 caption is cut at the radical: {text:?}"
+    );
+    println!(
+        "Planck p22 Table 3: …{}",
+        text.chars()
+            .rev()
+            .take(110)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+
+    // HumanML3D page 4: PDFium merged the tail of one printed caption line with the start of
+    // the next, so the text-layer line carries a 163 pt internal gap. The run used to stop
+    // before `except different inputs.` because that gap looked like a table gutter.
+    let humanml: Vec<Caption> = captions_on(&files, "[HumanML3D] Guo", 4)
+        .into_iter()
+        .filter(|caption| caption.kind == "Figure" && caption.label == "3")
+        .collect();
+    assert_eq!(humanml.len(), 1, "{humanml:?}");
+    let text = humanml[0]
+        .text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Prior network") && text.ends_with("except different inputs."),
+        "the HumanML3D Figure 3 caption is cut at the merged line: {text:?}"
+    );
+    println!(
+        "HumanML3D p4 Figure 3: …{}",
+        text.chars()
+            .rev()
+            .take(110)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+
+    // 2110.12477 page 6: the label line is mostly x-height letters (median 4.2 pt), while its
+    // continuation carries ascenders and digits (median 5.4 pt). The size guard read that as a
+    // larger type and stopped after `gradient based channel`; the printed caption continues to
+    // `convolutional layer.` in the same size.
+    let sst: Vec<Caption> = captions_on(&files, "2110.12477", 6)
+        .into_iter()
+        .filter(|caption| caption.kind == "Figure" && caption.label == "1")
+        .collect();
+    assert_eq!(sst.len(), 1, "{sst:?}");
+    let text = sst[0]
+        .text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("VGGNet-16") && text.ends_with("convolutional layer."),
+        "the 2110.12477 Figure 1 caption is cut at the size change: {text:?}"
+    );
+    println!(
+        "2110.12477 p6 Figure 1: …{}",
+        text.chars()
+            .rev()
+            .take(110)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+
+    // CLIP page 47: the caption's footnote markers and their references are the right-hand pieces
+    // of the same printed line, split off by the extractor. The run used to stop after the first
+    // marker (`…ImageNet. a`); the pieces join at 0.5 pt.
+    let clip: Vec<Caption> = captions_on(&files, "2103.00020", 47)
+        .into_iter()
+        .filter(|caption| caption.kind == "Table" && caption.label == "16")
+        .collect();
+    assert_eq!(clip.len(), 1, "{clip:?}");
+    let text = clip[0]
+        .text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.ends_with("(Touvron et al., 2019)"),
+        "the CLIP Table 16 note is cut at the footnote split: {text:?}"
+    );
+    println!(
+        "2103.00020 p47 Table 16: …{}",
+        text.chars()
+            .rev()
+            .take(110)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
     );
 }
 
