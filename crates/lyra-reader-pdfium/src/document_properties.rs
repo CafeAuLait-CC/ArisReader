@@ -571,6 +571,10 @@ mod tests {
         use crate::xmp_write::read_metadata_packet;
         use lyra_reader_core::DocumentBackend;
 
+        if !crate::is_available() {
+            eprintln!("skipping the created-packet backend read: PDFium is unavailable");
+            return;
+        }
         let scratch = ScratchDir::new("properties-no-xmp");
         let source = fixture("form-fields.pdf");
         let destination = scratch.join("with-metadata.pdf");
