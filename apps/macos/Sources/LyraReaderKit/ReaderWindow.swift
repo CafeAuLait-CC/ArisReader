@@ -254,11 +254,13 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.pageEditSessionActive || state.formHasPendingChanges
+            if state.isReadOnlyDocument || state.pageEditSessionActive
+                || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil {
                 VStack(spacing: 8) {
+                    if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
                     if state.pageEditSessionActive { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
@@ -343,6 +345,50 @@ public struct ReaderWindow: View {
     private var secondaryToolbarInset: CGFloat {
         guard !state.pageOverviewVisible, state.sidebarVisible else { return 0 }
         return ReaderChrome.sidebarTotalWidthPt
+    }
+
+    /// The read-only explanation for a digitally signed document.
+    ///
+    /// This is a *permanent* banner, not a pending-state one: the restriction belongs to the
+    /// file, so it stays visible for as long as the document is open. It names the evidence the
+    /// engine found and says what still works (copying/exporting), because a banner that only
+    /// said "read-only" would leave the reader guessing whether reading is affected too.
+    private var readOnlyBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "lock.doc")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(state.readOnlyBannerTitle)
+                    .font(.callout.weight(.semibold))
+                Text(state.readOnlyReason ?? "This PDF is digitally signed, so it is read-only.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 640, alignment: .leading)
+                if !state.readOnlyBannerEvidence.isEmpty {
+                    Text(state.readOnlyBannerEvidence)
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .frame(maxWidth: 640, alignment: .leading)
+                }
+            }
+            Spacer(minLength: 0)
+            Text("Saving a copy still works")
+                .font(.caption2)
+                .foregroundStyle(LyraReaderTheme.textSecondary)
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.warningFg.opacity(0.55), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
+        )
     }
 
     /// The one place the interface states, without qualification, that the file on disk is not

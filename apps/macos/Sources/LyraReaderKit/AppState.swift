@@ -3326,6 +3326,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         color: AnnotationColor = AppState.annotationPalette[0].color,
         note: String = ""
     ) -> Bool {
+        guard guardWritable() else { return false }
         guard let selection, let url = document?.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
 
@@ -3362,6 +3363,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// leave two tools claiming the next selection. A selection that already exists is marked
     /// immediately, which is the old select-then-click behaviour and is still the fastest path.
     public func toggleTextMarkupTool(_ kind: Annotation.Kind) {
+        guard guardWritable() else { return }
         guard let tool = AnnotationTool(textMarkup: kind) else { return }
         if annotationTool == tool {
             annotationTool = .select
@@ -3401,10 +3403,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The button used to be a disabled `pending("Eraser")` placeholder. It is enabled exactly
     /// when a document is open, and arming it is the only way to enter the mode.
-    public var canUseEraserTool: Bool { document != nil }
+    public var canUseEraserTool: Bool { canEditAnnotations }
 
     /// The toolbar's eraser button: arms the mode, or leaves it when it is already active.
     public func toggleEraserTool() {
+        guard guardWritable() else { return }
         guard canUseEraserTool else { return }
         annotationTool = annotationTool == .eraser ? .select : .eraser
     }
@@ -3580,6 +3583,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         color: AnnotationColor? = nil,
         strokeWidth: CGFloat = AppState.defaultAnnotationStrokeWidth
     ) -> Bool {
+        guard guardWritable() else { return false }
         guard kind.isGeometry, let document, page >= 0, page < document.pageCount,
               let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
@@ -3790,6 +3794,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// margin is still reachable.
     @discardableResult
     public func placeStickyNote(page: Int, at point: CGPoint) -> Bool {
+        guard guardWritable() else { return false }
         guard let document, page >= 0, page < document.pageCount,
               let placement = visiblePagePlacements.first(where: { $0.index == page }),
               let url = document.url else { return false }
@@ -3867,6 +3872,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// older sidecar or a restored session. Its contents then grow from that box.
     @discardableResult
     public func addTextBox(page: Int, rect: CGRect) -> Bool {
+        guard guardWritable() else { return false }
         guard let document, page >= 0, page < document.pageCount,
               let placement = visiblePagePlacements.first(where: { $0.index == page }),
               let url = document.url else { return false }
@@ -3921,6 +3927,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Opens the text editor for a placed-text annotation or text-linked note.
     public func beginEditingAnnotation(_ id: UUID, created: Bool = false) {
+        guard guardWritable() else { return }
         guard editingAnnotationID != id else { return }
         guard let annotation = annotations.first(where: { $0.id == id }),
               annotation.kind.isPlacedText || annotation.kind.isTextMarkup else { return }
@@ -4660,6 +4667,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Every kind goes through the same removal: one sidecar write, one undo step, one reload.
     @discardableResult
     public func deleteSelectedAnnotation() -> Bool {
+        guard guardWritable() else { return false }
         guard let id = selectedAnnotationID else { return false }
         cancelPendingMarkSelection()
         selectedAnnotationID = nil
@@ -4670,6 +4678,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Moves a geometry annotation by a page-space delta and persists it as one undo step.
     @discardableResult
     public func moveAnnotation(_ id: UUID, by delta: CGPoint) -> Bool {
+        guard guardWritable() else { return false }
         guard delta.x != 0 || delta.y != 0,
               let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
         let before = annotations[index]
@@ -4770,6 +4779,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// thread and `/Popup` window with it so no reply is left pointing at nothing.
     @discardableResult
     public func deleteDocumentAnnotation(_ documentID: String) -> Bool {
+        guard guardWritable() else { return false }
         guard let index = documentAnnotations.firstIndex(where: { $0.id == documentID }) else {
             return false
         }
@@ -4797,6 +4807,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Changes a colour on the reader's own or an adopted annotation as one undo step.
     @discardableResult
     public func setAnnotationColor(_ id: UUID, to color: AnnotationColor) -> Bool {
+        guard guardWritable() else { return false }
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
         let before = annotations[index]
         guard before.color != color else { return true }
@@ -4873,6 +4884,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// window resize and a continuous↔facing switch without drifting inside the page.
     @discardableResult
     public func addBookmarkAtCurrentPage(name: String? = nil) -> Bool {
+        guard guardWritable() else { return false }
         guard let document, document.pageCount > 0, let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
         if annotationWritesBlockedReason != nil {
@@ -4906,6 +4918,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Deletes a bookmark. Its slot is left in the file; the encoder skips an id that is no
     /// longer present, so a later save cannot accidentally revive it.
     public func removeBookmark(_ id: UUID) {
+        guard guardWritable() else { return }
         guard let index = bookmarks.firstIndex(where: { $0.id == id }) else { return }
         let title = bookmarks[index].title
         var updated = bookmarks
@@ -4922,6 +4935,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Renames a bookmark. An empty title is allowed; the sidebar falls back to "Page N" when
     /// displaying it, and nothing is silently rewritten.
     public func renameBookmark(_ id: UUID, to title: String) {
+        guard guardWritable() else { return }
         guard let index = bookmarks.firstIndex(where: { $0.id == id }),
               bookmarks[index].title != title else { return }
         var updated = bookmarks
@@ -4938,6 +4952,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// and it is persisted by reordering the bookmark slots in the sidecar in place, so
     /// foreign entries keep their positions.
     public func moveBookmark(_ id: UUID, by offset: Int) {
+        guard guardWritable() else { return }
         guard let index = bookmarks.firstIndex(where: { $0.id == id }), offset != 0 else { return }
         let target = min(max(index + offset, 0), bookmarks.count - 1)
         guard target != index else { return }
@@ -5222,6 +5237,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// within `noteCoalescingWindow` are carried to disk by one scheduled flush. Committing the
     /// field, blurring it, undo/redo, switching documents and quitting all flush immediately.
     public func updateNote(_ note: String, for id: UUID) {
+        guard guardWritable() else { return }
         guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         let oldNote = annotations[index].note
         guard oldNote != note else { return }
@@ -5546,17 +5562,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveFilledForm: Bool {
-        document != nil && formHasPendingChanges && !formSaveInProgress && !formInfo.encrypted
+        document != nil && !isReadOnlyDocument && formHasPendingChanges
+            && !formSaveInProgress && !formInfo.encrypted
     }
 
     /// Whether the Fill & Sign placeholder has something to offer.
     public var canUseFormTool: Bool {
-        document != nil && !formInfo.encrypted && formInfo.fields.contains(where: { $0.editable })
+        document != nil && !isReadOnlyDocument && !formInfo.encrypted
+            && formInfo.fields.contains(where: { $0.editable })
     }
 
     /// The toolbar button. Activating the form tool leaves the annotation tool in its normal
     /// selection mode, so a click on a field is an edit and a click elsewhere still reads.
     public func toggleFormTool() {
+        guard guardWritable() else { return }
         guard document != nil else { return }
         if formInfo.encrypted {
             lastError = formInfo.refusal
@@ -5716,6 +5735,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSaveFilledFormPanel() {
+        guard guardWritable() else { return }
         guard let url = document?.url else { return }
         guard formHasPendingChanges else {
             statusMessage = "There are no form changes to save"
@@ -5739,6 +5759,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Writes the pending values into a new PDF through the verified incremental save.
     @discardableResult
     public func saveFilledForm(to destination: URL) async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before filling its form"
             return false
@@ -5777,6 +5798,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithFilledFormConfirmation() {
+        guard guardWritable() else { return }
         guard let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -5795,6 +5817,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithFilledForm() async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before filling its form"
             return false
@@ -5888,12 +5911,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveDocumentProperties: Bool {
-        document != nil && documentInfo != nil && documentPropertiesAreDirty
-            && !propertiesSaveInProgress && !(documentInfo?.isEncrypted ?? true)
+        document != nil && !isReadOnlyDocument && documentInfo != nil
+            && documentPropertiesAreDirty && !propertiesSaveInProgress
+            && !(documentInfo?.isEncrypted ?? true)
     }
 
     /// Why the Save buttons are disabled, shown in the panel. Nil when they are available.
     public var documentPropertiesRefusal: String? {
+        if isReadOnlyDocument { return readOnlyReason }
         guard let info = documentInfo else { return nil }
         if info.isEncrypted {
             return "This PDF is encrypted. The reader will not write its document information: "
@@ -5904,6 +5929,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSaveDocumentPropertiesPanel() {
+        guard guardWritable() else { return }
         guard let url = document?.url else { return }
         guard documentPropertiesAreDirty else {
             statusMessage = "The document information has no changes to save"
@@ -5926,6 +5952,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func saveDocumentProperties(to destination: URL) async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before editing its properties"
             return false
@@ -5965,6 +5992,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPropertiesConfirmation() {
+        guard guardWritable() else { return }
         guard let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -5982,6 +6010,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithProperties() async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before editing its properties"
             return false
@@ -6014,6 +6043,47 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: - Signed documents (read-only)
+
+    /// The signature evidence for the open document, read by the engine once at open.
+    public var documentSignature: DocumentSignature { document?.signature ?? .unsigned }
+
+    /// True when the file carries a digital signature and every write command is refused.
+    ///
+    /// The decision lives in Rust; the shell mirrors it only to disable controls and explain
+    /// them. A direct engine call is still refused by the same gate, so a stale button cannot
+    /// write into a signed file.
+    public var isReadOnlyDocument: Bool { documentSignature.signed }
+
+    /// The one sentence every write command refuses with.
+    public var readOnlyReason: String? { documentSignature.readOnlyReason }
+
+    /// The banner's headline. The reason below it names the evidence.
+    public var readOnlyBannerTitle: String { "Signed PDF · read-only" }
+
+    /// The evidence, one line, for the banner's second line.
+    public var readOnlyBannerEvidence: String {
+        documentSignature.evidence.map(\.detail).joined(separator: " · ")
+    }
+
+    /// True when annotation tools may create or remove marks. False for a signed document.
+    public var canEditAnnotations: Bool { document != nil && !isReadOnlyDocument }
+
+    /// Refuses a write and states the shared reason. Returns true when the document is writable.
+    ///
+    /// Every public write entry point calls this before doing anything, so a call that bypasses
+    /// a disabled button still gets the same answer as the UI.
+    @discardableResult
+    private func guardWritable() -> Bool {
+        guard let reason = readOnlyReason else { return true }
+        lastError = reason
+        statusMessage = "Signed PDF · read-only"
+        FileHandle.standardError.write(Data(
+            "lyra-reader-signature: write refused · \(reason)\n".utf8
+        ))
+        return false
+    }
+
     // MARK: - Saving annotations into the PDF
 
     /// Whether the two PDF-writing commands can run.
@@ -6042,8 +6112,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// last annotation (it is the source bytes), but replacing a file with an identical copy
     /// would be a destructive no-op with a backup.
     public var canReplaceOriginalWithAnnotations: Bool {
-        canSaveAnnotationsToPDF && (!annotations.isEmpty || !bookmarks.isEmpty
-            || hasEmbeddedBookmarkSubtree || hasPendingFileDeletions)
+        canSaveAnnotationsToPDF && !isReadOnlyDocument
+            && (!annotations.isEmpty || !bookmarks.isEmpty
+                || hasEmbeddedBookmarkSubtree || hasPendingFileDeletions)
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -6182,13 +6253,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 bookmarks: report.writtenBookmarkIDs.count
             )
             let deleted = changes.deletions.count
+            let outcome = report.fullRewrite
+                ? " · pruned the removed annotations out of the saved bytes"
+                : " · \(report.appendedBytes) bytes appended"
             statusMessage =
                 "Saved \(written) to \(destination.lastPathComponent)"
                 + (deleted > 0 ? " · \(deleted) annotation(s) deleted" : "")
-                + " · \(report.appendedBytes) bytes appended · the original is unchanged\(backup)"
+                + "\(outcome) · the original is unchanged\(backup)"
             FileHandle.standardError.write(Data((
                 "lyra-reader-annotate: saved \(written), \(deleted) annotation deletion(s) to \(destination.path)"
-                + " (append \(report.appendedBytes) bytes)\(backup)\n"
+                + " (\(outcome))\(backup)\n"
             ).utf8))
             return true
         } catch {
@@ -6210,6 +6284,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Returns `false` when nothing was replaced.
     @discardableResult
     public func replaceOriginalWithSavedAnnotations() async -> Bool {
+        guard guardWritable() else { return false }
         guard !annotationSaveInProgress else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before saving annotations"
@@ -6299,6 +6374,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage =
                 "Saved \(written) into \(url.lastPathComponent)"
                 + (deletedCount > 0 ? " · \(deletedCount) annotation(s) deleted" : "")
+                + (report.fullRewrite ? " · removed content pruned from the file" : "")
                 + " · backup: \(backup)"
             if report.deletedReplyCount > 0 {
                 statusMessage += " · \(report.deletedReplyCount) repl\(report.deletedReplyCount == 1 ? "y" : "ies") removed with their thread"
@@ -7154,7 +7230,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canMarkRedactions: Bool {
-        document != nil && !redactionBusy && pageEditSession == nil
+        document != nil && !isReadOnlyDocument && !redactionBusy && pageEditSession == nil
     }
 
     public var canApplyRedactions: Bool {
@@ -7163,6 +7239,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Arms the redaction tool, or leaves it when it is already armed.
     public func toggleRedactionTool() {
+        guard guardWritable() else { return }
         guard canMarkRedactions else {
             lastError = pageEditSession != nil
                 ? "Finish or discard the pending page changes before redacting."
@@ -7295,6 +7372,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Presents the "apply to a copy" confirmation and, on approval, a save panel.
     public func presentApplyRedactionsPanel() {
+        guard guardWritable() else { return }
         guard canApplyRedactions else {
             lastError = pendingRedactions.isEmpty
                 ? "Mark at least one area before applying redactions."
@@ -7335,6 +7413,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Presents the destructive confirmation for replacing the file on disk.
     public func presentReplaceRedactionsConfirmation() {
+        guard guardWritable() else { return }
         guard canApplyRedactions else {
             lastError = pendingRedactions.isEmpty
                 ? "Mark at least one area before replacing the document."
@@ -7364,6 +7443,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     private func redactCopy(to destination: URL, areas: [RedactionArea]) async -> Bool {
+        guard guardWritable() else { return false }
         guard let source = document?.url else { return false }
         guard !Self.resolvesToSameFile(destination, source) else {
             lastError = "The redacted copy cannot overwrite the document it came from."
@@ -7395,6 +7475,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     private func redactReplacingOriginal(areas: [RedactionArea]) async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else { return false }
         redactionBusy = true
         defer { redactionBusy = false }
@@ -7534,21 +7615,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the page commands can run at all.
     public var canPageEdit: Bool {
-        document != nil && !annotationSaveInProgress && !pageEditBusy
+        document != nil && !isReadOnlyDocument && !annotationSaveInProgress && !pageEditBusy
     }
+
+    /// Page operations that write a new file (extract, merge, split) are still page edits of a
+    /// signed document, so a signed file disables them too.
+    public var canPageOperations: Bool { document != nil && !isReadOnlyDocument }
 
     public var pageEditSessionActive: Bool { pageEditSession != nil }
     public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
     public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
     public var canApplyPageEdits: Bool {
-        pageEditSession != nil && !pageEditBusy && !annotationSaveInProgress
+        pageEditSession != nil && !isReadOnlyDocument && !pageEditBusy && !annotationSaveInProgress
     }
 
     /// The entry point behind the menu commands, exposed separately so the headless checks can
     /// exercise the real session without driving AppKit menus or modal alerts.
     @discardableResult
     public func applyPageEditOperation(_ operation: PageEditOperation, label: String) async -> Bool {
-        await applyPageEdit(operation, label: label)
+        guard guardWritable() else { return false }
+        return await applyPageEdit(operation, label: label)
     }
 
     /// What the interface must say about the staged state. Nil when nothing is pending.
@@ -7811,6 +7897,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentExtractPagesPanel() {
+        guard guardWritable() else { return }
         guard let source = pageEditDisplayURL else { return }
         let pages = selectedPageIndices
         guard !pages.isEmpty else { return }
@@ -7870,6 +7957,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // sidecar holds exactly the marks whose pages that output contains, at their new indices.
 
     public func presentMergeDocumentsPanel() {
+        guard guardWritable() else { return }
         guard let source = pageEditDisplayURL else { return }
         let open = NSOpenPanel()
         open.title = "Append PDFs"
@@ -8001,6 +8089,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSplitPagesPanel() {
+        guard guardWritable() else { return }
         guard let source = pageEditDisplayURL, let pageCount = document?.pageCount, pageCount > 0 else {
             return
         }
@@ -8235,6 +8324,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSavePageEditsCopyPanel() {
+        guard guardWritable() else { return }
         guard let source = pageEditDisplayURL, pageEditSession != nil else { return }
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
@@ -8305,6 +8395,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPageEditsConfirmation() {
+        guard guardWritable() else { return }
         guard let session = pageEditSession else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical

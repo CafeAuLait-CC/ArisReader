@@ -1,0 +1,75 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R/Names << /EmbeddedFiles << /Names [(notes.txt) 7 0 R] >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>
+endobj
+5 0 obj
+<< /Length 753 >>
+stream
+BT /F1 28 Tf 72 760 Td (Embedded attachment with an annotation) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (a file attachment and a mark that can be deleted) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Deleting the mark must not cost the attachment.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 686 300 701] /QuadPoints [72 686 300 686 300 701 72 701] /C [1 1 0] /Contents (A highlight that can be deleted.) /NM (doomed-highlight) /F 4 >>
+endobj
+7 0 obj
+<< /Type /Filespec /F (notes.txt) /UF (notes.txt) /EF << /F 8 0 R >> >>
+endobj
+8 0 obj
+<< /Type /EmbeddedFile /Subtype /text#2Fplain /Length 40 >>
+stream
+LyraReader embedded attachment fixture.
+
+endstream
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000124 00000 n 
+0000000181 00000 n 
+0000000278 00000 n 
+0000000420 00000 n 
+0000001224 00000 n 
+0000001429 00000 n 
+0000001516 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R >>
+startxref
+1649
+%%EOF

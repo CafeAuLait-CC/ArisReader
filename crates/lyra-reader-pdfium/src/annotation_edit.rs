@@ -115,6 +115,10 @@ pub struct AppliedChangesReport {
     pub deleted_popup_count: usize,
     /// Identities that were given an `/NM` because the file had none.
     pub assigned_names: Vec<String>,
+    /// Object numbers of every dictionary the removal detached (the targets, their replies and
+    /// their popups). A full rewrite uses them to delete the objects themselves rather than
+    /// leaving their bytes unreachable in the file.
+    pub(crate) removed_objects: Vec<(u32, u16)>,
 }
 
 /// One annotation found in the source, for planning and verification.
@@ -496,6 +500,7 @@ fn plan_removal(
         }
     }
     report.deleted_ids.sort();
+    report.removed_objects = removed.iter().copied().collect();
     Ok(RemovalPlan { removed, report })
 }
 

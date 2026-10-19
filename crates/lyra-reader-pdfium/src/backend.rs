@@ -789,6 +789,21 @@ impl PdfiumBackend {
             .map(|form| matches!(form.form_type(), PdfFormType::Acrobat))
             .unwrap_or(false)
     }
+
+    /// How many digital signatures PDFium sees in this document.
+    ///
+    /// A document-state read with no parse: PDFium has already built the document when it was
+    /// opened. [`crate::detect_signature`] uses it as a fallback signal when the dictionary
+    /// read finds nothing (or cannot run), never as the only evidence.
+    pub fn signature_count(&self) -> u32 {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(document) = self.document.as_ref() else {
+            return 0;
+        };
+        u32::from(document.signatures().len())
+    }
 }
 
 impl DocumentBackend for PdfiumBackend {

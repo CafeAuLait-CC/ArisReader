@@ -57,6 +57,7 @@
 
 use crate::backend::PDFIUM_LOCK;
 use crate::page_ops::replace_original_with_edit;
+use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -282,7 +283,11 @@ pub fn redact_pdf(
             &rasterized,
             &verify_stats,
             page_count,
-        )
+        )?;
+        // The redaction verifier owns the text claim (outside the marks unchanged, inside the
+        // marks gone). Everything a redaction does not intend to touch still has to survive the
+        // prune-and-rewrite: page count, forms, outline, XMP/Info and embedded files.
+        verify_document_equivalence(source, path, None, TextComparison::CallerVerified)
     };
 
     let (destination_path, backup_path, output_bytes, cleaned_temporaries, original_unchanged) =

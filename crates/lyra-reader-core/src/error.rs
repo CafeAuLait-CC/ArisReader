@@ -28,6 +28,8 @@ pub enum ErrorCode {
     Encrypted,
     WrongPassword,
     CorruptDocument,
+    /// The document is read-only by policy (a signed PDF), so writing is refused.
+    ReadOnly,
     UnsupportedFeature,
     BackendUnavailable,
     RenderFailed,
@@ -48,6 +50,7 @@ impl ErrorCode {
             Self::Encrypted => "error.encrypted",
             Self::WrongPassword => "error.encrypted.wrong_password",
             Self::CorruptDocument => "error.corrupt_document",
+            Self::ReadOnly => "error.read_only",
             Self::UnsupportedFeature => "error.unsupported_feature",
             Self::BackendUnavailable => "error.backend_unavailable",
             Self::RenderFailed => "error.render_failed",

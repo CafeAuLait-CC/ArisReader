@@ -905,6 +905,42 @@ impl OutlineNodeView {
     }
 }
 
+/// The document's own outline as `(title, page, depth)`, excluding the reader's marked subtree.
+///
+/// This is the signature a full rewrite must preserve. The reader's own subtree is skipped
+/// because the same save may legitimately add, rewrite or remove it; [`verify_outline`] is the
+/// check that owns those entries. Titles are decoded (not raw bytes) so the comparison is about
+/// what a person sees, and destinations are reduced to the page index because object numbers are
+/// renumbered by a full rewrite and would make every entry look changed.
+pub(crate) fn outline_equivalence(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<Vec<(String, Option<u32>, usize)>> {
+    let document = load_document(path, password)?;
+    let catalog = catalog_id(&document)?;
+    let view = OutlineView {
+        old: &document,
+        new: &document,
+    };
+    let root = outline_root(&document, catalog)?;
+    let pages = page_ids(&document);
+    let nodes = existing_nodes(&view, &root, &pages)?;
+    let mut flattened = Vec::new();
+    flatten_equivalence(&nodes, 0, &mut flattened);
+    Ok(flattened)
+}
+
+fn flatten_equivalence(
+    nodes: &[OutlineNodeView],
+    depth: usize,
+    flattened: &mut Vec<(String, Option<u32>, usize)>,
+) {
+    for node in nodes {
+        flattened.push((decode_text_string(&node.title), node.page, depth));
+        flatten_equivalence(&node.children, depth + 1, flattened);
+    }
+}
+
 fn existing_nodes(
     view: &OutlineView<'_>,
     root: &OutlineRoot<'_>,

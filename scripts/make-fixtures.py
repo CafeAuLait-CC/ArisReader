@@ -49,6 +49,7 @@ def build_pdf(
     outline: list[dict] | None = None,
     info: dict[str, str] | None = None,
     xmp: bytes | None = None,
+    catalog_extra: bytes = b"",
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -68,6 +69,11 @@ def build_pdf(
     `info` writes the document information dictionary and `xmp` an XMP metadata stream
     (compressed with `/FlateDecode`, as real producers write it). Both are optional and come
     after every other object, so a file that passes neither is unchanged.
+
+    `catalog_extra` is appended to the catalog dictionary verbatim, for entries that name an
+    object the caller numbers through `first_extra_object_id` (a `/Names /EmbeddedFiles`
+    tree, a `/Perms /DocMDP` dictionary). It is empty by default, so the existing fixtures
+    stay byte-identical.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
@@ -90,6 +96,7 @@ def build_pdf(
     catalog = b"<< /Type /Catalog /Pages 2 0 R"
     if outline:
         catalog += f" /Outlines {outline_root_id} 0 R /PageMode /UseOutlines".encode("ascii")
+    catalog += catalog_extra
     catalog += b" >>"
     objects.append(catalog)
     kids = " ".join(f"{pid} 0 R" for pid in page_object_ids)
@@ -502,6 +509,7 @@ def build_form_pdf(
     fields: list[dict],
     info: dict[str, str] | None = None,
     encrypt: bool = False,
+    sig_flags: int | None = None,
 ) -> bytes:
     """Assemble the form fixture: pages, AcroForm fields, their widget appearances and `/Info`.
 
@@ -509,6 +517,11 @@ def build_form_pdf(
     its appearance streams refer to each other. The layout matches `build_pdf`'s first four
     objects (catalog, page tree, Helvetica) so the fixture stays easy to read with the other
     generators; everything after the page/content pairs is specific to this builder.
+
+    `/SigFlags` is written only when `sig_flags` says so. A form with an **unsigned**
+    signature field is not a signed document, and the reader's signature policy treats the
+    "signatures exist" bit as evidence; omitting the bit keeps the ordinary form fixtures
+    writable. The signed fixture passes 3 (signatures exist, append-only).
     """
     page_count = len(pages)
     page_ids = [4 + 2 * index for index in range(page_count)]
@@ -536,6 +549,11 @@ def build_form_pdf(
                 next_id += 3
         elif kind in ("text", "combo", "list"):
             plan["ap"] = next_id
+            next_id += 1
+        elif kind == "signature" and field.get("value"):
+            # A signature dictionary, referenced by the field's `/V`. It is what makes the
+            # field signed; parsing/validating the PKCS#7 blob is not the reader's job.
+            plan["signature"] = next_id
             next_id += 1
         plans.append(plan)
 
@@ -652,8 +670,19 @@ def build_form_pdf(
                 f"/AP << /N {plan['ap']} 0 R >> >>"
             ).encode("ascii")
         elif kind == "signature":
+            value = ""
+            if field.get("value"):
+                signature_id = plan["signature"]
+                objects[signature_id] = (
+                    "<< /Type /Sig /Filter /Adobe.PPKLite "
+                    "/SubFilter /adbe.pkcs7.detached /ByteRange [0 0 0 0] "
+                    "/Contents <3082010a06092a864886f70d010702> "
+                    "/M (D:20240102030405Z) /Name (Fixture Signer) /Reason (fixture) >>"
+                ).encode("ascii")
+                value = f" /V {signature_id} 0 R"
             objects[plan["field_id"]] = (
-                f"<< {common}/FT /Sig /Ff 1 /Rect {rect_array(widget_rect(field))} >>"
+                f"<< {common}/FT /Sig /Ff 1 "
+                f"/Rect {rect_array(widget_rect(field))}{value} >>"
             ).encode("ascii")
         elif kind == "checkbox":
             checked = bool(field.get("value"))
@@ -692,11 +721,12 @@ def build_form_pdf(
                 ).encode("ascii")
 
     field_refs = " ".join(f"{plan['field_id']} 0 R" for plan in plans)
+    sig_flags_entry = "" if sig_flags is None else f" /SigFlags {sig_flags}"
     objects[acroform_id] = (
         f"<< /Fields [{field_refs}] "
         f"/DA (/Helv {FORM_TEXT_FONT_SIZE} Tf 0 g) "
         f"/DR << /Font << /Helv 3 0 R >> >> "
-        f"/NeedAppearances false /SigFlags 3 >>"
+        f"/NeedAppearances false{sig_flags_entry} >>"
     ).encode("ascii")
 
     if info:
@@ -2439,6 +2469,161 @@ def main() -> int:
     path = out_dir / "form-fields-encrypted.pdf"
     path.write_bytes(build_form_pdf(form_pages, FORM_FIELDS, info=form_info, encrypt=True))
     print(f"  {path}  ({path.stat().st_size} bytes, encrypted with an empty user password)")
+
+    # 10c) Signature evidence. The reader opens a document read-only when any evidence of a
+    #      digital signature is present; these two fixtures isolate the evidence kinds:
+    #
+    #      * `signed-signature.pdf` — `/AcroForm /SigFlags 3` plus a `/FT /Sig` field whose
+    #        `/V` names a signature dictionary.
+    #      * `signed-docmdp.pdf` — `/Perms << /DocMDP … >>` in the catalog, no SigFlags and no
+    #        signature field, so DocMDP is the only reason the file is signed.
+    #
+    #      `text-page.pdf` and `form-fields.pdf` (a signature field with no `/V` and no
+    #      SigFlags) are the unsigned controls.
+    signed_page = text_page(
+        "Signed fixture",
+        "a digital signature in the form dictionary",
+        ["A signed document must never be written by this reader."],
+    )
+    signed_fields = [
+        {
+            "name": "ApprovalSignature",
+            "kind": "signature",
+            "page": 0,
+            "rect": (72, 630, 300, 680),
+            "value": True,
+        },
+        {
+            "name": "reviewerName",
+            "kind": "text",
+            "page": 0,
+            "rect": (72, 580, 300, 604),
+            "value": None,
+            "max_len": 80,
+        },
+    ]
+    path = out_dir / "signed-signature.pdf"
+    path.write_bytes(
+        build_form_pdf(
+            [(signed_page, 0)],
+            signed_fields,
+            info={"Title": "Signed fixture"},
+            sig_flags=3,
+        )
+    )
+    print(
+        f"  {path}  ({path.stat().st_size} bytes, 1 page, /SigFlags + signed /FT /Sig field)"
+    )
+
+    docmdp_signature = (
+        b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached "
+        b"/ByteRange [0 0 0 0] /Contents <3082010a06092a864886f70d010702> "
+        b"/M (D:20240102030405Z) /Name (Fixture Certifier) /P 2 >>"
+    )
+    path = out_dir / "signed-docmdp.pdf"
+    path.write_bytes(
+        build_pdf(
+            [
+                (
+                    text_page(
+                        "Certified fixture",
+                        "a DocMDP policy without a signature field",
+                        ["The catalog carries /Perms /DocMDP."],
+                    ),
+                    0,
+                )
+            ],
+            extra_objects=[docmdp_signature],
+            catalog_extra=(
+                f"/Perms << /DocMDP {first_extra_object_id(1, 0)} 0 R >>"
+            ).encode("ascii"),
+        )
+    )
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, /Perms /DocMDP)")
+
+    # 10d) An embedded file, for the full-rewrite equivalence check. A rewrite that cannot carry
+    #      the name tree must be refused, so the fixture is the document the refusal protects.
+    embedded_bytes = b"LyraReader embedded attachment fixture.\n"
+    filespec_id = first_extra_object_id(1, 0)
+    embedded_stream = (
+        b"<< /Type /EmbeddedFile /Subtype /text#2Fplain /Length "
+        + str(len(embedded_bytes)).encode("ascii")
+        + b" >>\nstream\n"
+        + embedded_bytes
+        + b"\nendstream"
+    )
+    filespec = (
+        b"<< /Type /Filespec /F (notes.txt) /UF (notes.txt) "
+        + b"/EF << /F "
+        + str(filespec_id + 1).encode("ascii")
+        + b" 0 R >> >>"
+    )
+    path = out_dir / "embedded-file.pdf"
+    path.write_bytes(
+        build_pdf(
+            [
+                (
+                    text_page(
+                        "Embedded attachment",
+                        "a document that carries a file in its name tree",
+                        ["The attachment must survive a prune-and-rewrite."],
+                    ),
+                    0,
+                )
+            ],
+            extra_objects=[filespec, embedded_stream],
+            catalog_extra=(
+                f"/Names << /EmbeddedFiles << /Names [(notes.txt) {filespec_id} 0 R] >> >>"
+            ).encode("ascii"),
+        )
+    )
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, 1 embedded file)")
+
+    # The same document with one annotation to delete. The equivalence check must refuse the
+    # rewrite if the attachment would be lost, and the save path must leave no output behind.
+    annotated_filespec_id = first_extra_object_id(1, 1)
+    annotated_filespec = (
+        b"<< /Type /Filespec /F (notes.txt) /UF (notes.txt) "
+        + b"/EF << /F "
+        + str(annotated_filespec_id + 1).encode("ascii")
+        + b" 0 R >> >>"
+    )
+    path = out_dir / "embedded-file-annotated.pdf"
+    path.write_bytes(
+        build_pdf(
+            [
+                (
+                    text_page(
+                        "Embedded attachment with an annotation",
+                        "a file attachment and a mark that can be deleted",
+                        ["Deleting the mark must not cost the attachment."],
+                    ),
+                    0,
+                )
+            ],
+            annotations={
+                0: [
+                    annotation(
+                        "Highlight",
+                        body_line_box(0, 300),
+                        extra=(
+                            f"/QuadPoints {quad_points([body_line_box(0, 300)])} "
+                            "/C [1 1 0]"
+                        ),
+                        contents="A highlight that can be deleted.",
+                        name="doomed-highlight",
+                    )
+                ]
+            },
+            extra_objects=[annotated_filespec, embedded_stream],
+            catalog_extra=(
+                f"/Names << /EmbeddedFiles << /Names [(notes.txt) {annotated_filespec_id} 0 R] >> >>"
+            ).encode("ascii"),
+        )
+    )
+    print(
+        f"  {path}  ({path.stat().st_size} bytes, 1 page, 1 annotation, 1 embedded file)"
+    )
 
     if long_pages > 0:
         pages = long_document(long_pages)
