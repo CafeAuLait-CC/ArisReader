@@ -51,6 +51,10 @@ public final class ReaderWindowRegistry: ObservableObject {
     private var pendingNewWindow: [URL] = []
     /// The page the new window should show after opening, for a thumbnail menu request.
     private var pendingNewWindowPage: Int?
+    /// The page-local rectangle the new window should scroll to. A preview's "open in a new
+    /// window" carries one so a cited entry or a figure region arrives in view, not merely its
+    /// page.
+    private var pendingNewWindowRegion: CGRect?
 
     /// How the app asks SwiftUI for another reader window.
     ///
@@ -76,11 +80,13 @@ public final class ReaderWindowRegistry: ObservableObject {
     /// Returns `false` when there is no way to make a window; the caller then reports that, so a
     /// drop is never silently swallowed.
     @discardableResult
-    public func requestNewWindow(opening urls: [URL], page: Int? = nil) -> Bool {
+    public func requestNewWindow(opening urls: [URL], page: Int? = nil, reveal region: CGRect? = nil) -> Bool {
         guard !urls.isEmpty else { return false }
         guard let newWindow else { return false }
         pendingNewWindow.append(contentsOf: urls)
+        // The newest request is the one the next window serves, so page and region move together.
         pendingNewWindowPage = page
+        pendingNewWindowRegion = region
         newWindowRequestCount += 1
         // Last, so a closure that registers its session synchronously finds the URLs waiting.
         newWindow()
@@ -185,10 +191,12 @@ public final class ReaderWindowRegistry: ObservableObject {
         if !pendingNewWindow.isEmpty {
             let batch = pendingNewWindow
             let page = pendingNewWindowPage
+            let region = pendingNewWindowRegion
             pendingNewWindow.removeAll()
             pendingNewWindowPage = nil
+            pendingNewWindowRegion = nil
             traceNewWindow(batch, to: session, page: page)
-            session.opener.receive(batch, startingAt: page)
+            session.opener.receive(batch, startingAt: page, revealing: region)
             return
         }
         // A held delivery belongs to a window that is not identified yet; `sessionAttached` is what

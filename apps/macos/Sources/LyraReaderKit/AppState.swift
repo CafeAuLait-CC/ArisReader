@@ -1170,6 +1170,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
+    /// A pinned preview stays exactly as it is while the reader keeps working.
+    ///
+    /// Pinning is a property of the preview, not of a second panel: while it is set, a new
+    /// interaction in the document that would normally replace the preview is refused instead of
+    /// replacing it (`openReferencePreview`). Unpinning only clears the flag; the next preview
+    /// request updates the panel again. Closing the preview or leaving the document clears it, so
+    /// a pin can never outlive the content it protects.
+    @Published public private(set) var referencePreviewPinned = false
     /// Page content for the preview panel (its own render surface).
     @Published public private(set) var referencePreviewPages: [CanvasPage] = []
     @Published public private(set) var referencePreviewZoom: CGFloat = 1
@@ -1233,6 +1241,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// A `.reference` or `.section` preview never rasterizes anything: the entry or section title
     /// *is* the body, so the panel opens immediately and no page, tile or prefetch work is
     /// started for it.
+    ///
+    /// Returns `false` when the request was refused. The only refusal that is not an invalid
+    /// target is a **pinned** preview: a new interaction in the document must not replace what
+    /// the reader pinned, so the panel keeps its original content until it is unpinned. A request
+    /// for the preview already on screen (a viewport re-fit, for instance) is not a replacement
+    /// and still runs.
+    @discardableResult
     public func openReferencePreview(
         page: Int,
         title: String,
@@ -1243,19 +1258,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         entries: [CitationEntry] = [],
         sectionTitle: String? = nil,
         sectionReference: String? = nil
-    ) {
-        guard let document, page >= 0, page < document.pageCount else { return }
+    ) -> Bool {
+        guard let document, page >= 0, page < document.pageCount else { return false }
         if let region {
             guard region.minX.isFinite, region.minY.isFinite, region.width.isFinite,
-                  region.height.isFinite, region.width > 0, region.height > 0 else { return }
+                  region.height.isFinite, region.width > 0, region.height > 0 else { return false }
         }
-        previewEpoch &+= 1
-        let request = previewEpoch
-        referencePreviewPages = []
-        referencePreviewScrollYPt = 0
-        referencePreviewError = nil
-        referencePreviewLoading = true
-        referencePreview = ReferencePreview(
+        let requested = ReferencePreview(
             page: page,
             title: title,
             source: source,
@@ -1266,6 +1275,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             sectionTitle: sectionTitle,
             sectionReference: sectionReference
         )
+        if referencePreviewPinned, let current = referencePreview, current != requested {
+            statusMessage = "Preview pinned — unpin it to preview a new reference"
+            return false
+        }
+        previewEpoch &+= 1
+        let request = previewEpoch
+        referencePreviewPages = []
+        referencePreviewScrollYPt = 0
+        referencePreviewError = nil
+        referencePreviewLoading = true
+        referencePreview = requested
 
         if !entries.isEmpty {
             // stderr, not print: it is flushed immediately and survives SIGTERM, which is how
@@ -1290,7 +1310,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     Data("lyra-reader-preview: section text for \"\(title)\" on page \(page + 1) (no crop)\n".utf8)
                 )
             }
-            return
+            return true
         }
 
         let widthPt = max(region?.width ?? engine.contentWidthPt(gapPt: pageGapPt), 1)
@@ -1339,15 +1359,105 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-preview: page \(page + 1) ready (\(image.pixelWidth)x\(image.pixelHeight) px)\n".utf8)
             )
         }
+        return true
     }
 
     public func closeReferencePreview() {
         previewEpoch &+= 1
+        referencePreviewPinned = false
         referencePreviewLoading = false
         referencePreviewError = nil
         referencePreviewScrollYPt = 0
         referencePreview = nil
         referencePreviewPages = []
+    }
+
+    // MARK: - Preview actions (T4.8)
+
+    /// Whether the current preview can be pinned. Every preview kind can: pinning protects the
+    /// panel, not one body.
+    public var canPinReferencePreview: Bool { referencePreview != nil }
+
+    /// Pins or unpins the current preview. A pinned preview is frozen: new interactions in the
+    /// document are refused instead of replacing it. Unpinning re-arms the ordinary update path;
+    /// the next preview request lands in the same panel.
+    public func toggleReferencePreviewPin() {
+        guard referencePreview != nil else { return }
+        referencePreviewPinned.toggle()
+        statusMessage = referencePreviewPinned
+            ? "Preview pinned — new interactions will not replace it"
+            : "Preview unpinned — the next preview replaces it"
+    }
+
+    /// Whether a citation preview can copy a BibTeX entry.
+    ///
+    /// Only a `.reference` preview has bibliography entries, and the only BibTeX the app can
+    /// generate is the open document's (the same string Document Information shows). A printed
+    /// bibliography entry is unstructured text, not recognised metadata, so there is nothing
+    /// honest to synthesise for the cited work when the document itself has no metadata.
+    public var canCopyPreviewBibtex: Bool {
+        referencePreview?.kind == .reference && canCopyMetadataBibtex
+    }
+
+    /// Copies the open document's generated BibTeX from a citation preview: the **same** payload
+    /// `copyMetadataBibtex` puts on the clipboard. Returns `false` — and leaves the clipboard
+    /// alone — when this is not a citation preview or no metadata (and therefore no entry) is
+    /// available; the status line says which.
+    @discardableResult
+    public func copyPreviewBibtex() -> Bool {
+        guard referencePreview?.kind == .reference else {
+            statusMessage = "BibTeX is available only from a citation preview"
+            return false
+        }
+        guard canCopyMetadataBibtex else {
+            statusMessage = "No BibTeX is available for this document"
+            return false
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(metadataBibtex, forType: .string)
+        statusMessage = "Copied \(metadataBibtex.count) characters of BibTeX"
+        return true
+    }
+
+    /// Copies one bibliography entry's text. The panel already lets the reader select the text;
+    /// this is the explicit affordance next to it.
+    @discardableResult
+    public func copyPreviewEntryText(_ entry: CitationEntry) -> Bool {
+        guard referencePreview?.kind == .reference else {
+            statusMessage = "Entry text is available only from a citation preview"
+            return false
+        }
+        guard !entry.text.isEmpty else {
+            statusMessage = "This entry has no text to copy"
+            return false
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(entry.text, forType: .string)
+        statusMessage = "Copied \(entry.text.count) characters of entry text"
+        return true
+    }
+
+    /// Moves a freshly opened window to the page and position a preview points at.
+    ///
+    /// The preview carries the target rectangle in page view space, so this is the same
+    /// arithmetic a preview raster uses: page top plus the rectangle's top, less a small reading
+    /// margin. The offset is clamped by the same `scrollYPt` rules as every other scroll, so a
+    /// target near the end of a page still lands on it. A preview without a region (a plain page
+    /// or a section) starts at the page top.
+    public func reveal(page: Int, region: CGRect?) {
+        guard let document, page >= 0, page < document.pageCount else { return }
+        guard let region, region.width > 0, region.height > 0,
+              region.minY.isFinite else {
+            gotoPage(page)
+            return
+        }
+        cancelScrollGlide()
+        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let margin: CGFloat = 24
+        scrollYPt = clampedScrollOffset(top + region.minY - margin)
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = "Opened page \(page + 1) at the referenced position"
     }
 
     // MARK: - Preview jumps and Back
@@ -9007,7 +9117,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 return
             }
 
-            self.openReferencePreview(
+            let opened = self.openReferencePreview(
                 page: first.page,
                 // The panel names the citation as it appears in the text, so a group
                 // is recognisable at a glance.
@@ -9026,6 +9136,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         region: CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
                 }
             )
+            // A pinned panel keeps its own content and has already said so; the citation must not
+            // overwrite that message with a preview that did not happen.
+            guard opened else { return }
             if resolved.count == 1 {
                 self.statusMessage = "Reference [\(first.label)]: \(first.text.prefix(48))"
             } else {
@@ -9144,7 +9257,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ).utf8)
         )
 
-        openReferencePreview(
+        guard openReferencePreview(
             page: figure.page,
             title: title,
             from: "page \(page + 1)",
@@ -9159,7 +9272,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The panel's body is the reference-entry list, so the caption rides in it as a
             // single entry rather than a second text path in the panel.
             entries: [CitationEntry(label: title, text: figure.captionText)]
-        )
+        ) else { return false }
         statusMessage = "Previewing \(title)"
         return true
     }
@@ -9283,7 +9396,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // citation can be read without losing the place in the text. When the
             // destination names a region (/FitR), only that region is shown -- which
             // is what a citation to a figure or table means.
-            openReferencePreview(
+            let opened = openReferencePreview(
                 page: page,
                 title: link.region == nil
                     ? "Page \(page + 1)"
@@ -9293,7 +9406,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 anchor: viewRect(local: box, on: placement),
                 region: link.region
             )
-            statusMessage = "Previewing page \(page + 1)"
+            if opened { statusMessage = "Previewing page \(page + 1)" }
             return true
         }
         return false
@@ -9326,7 +9439,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let title = SectionReferenceText.title(
             from: outline, page: page, designation: reference.designation
         )
-        openReferencePreview(
+        let opened = openReferencePreview(
             page: page,
             title: title ?? reference.printed,
             from: "page \(sourcePage + 1)",
@@ -9336,6 +9449,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             sectionTitle: title,
             sectionReference: reference.printed
         )
+        guard opened else { return }
         let resolved = title.map { "\"\($0)\"" } ?? "from the reference text"
         let line = "lyra-reader-section: \"\(reference.printed)\" -> page \(page + 1) title \(resolved)\n"
         FileHandle.standardError.write(Data(line.utf8))
