@@ -233,6 +233,19 @@ extension ReaderChecks {
                 "adding a bookmark is refused on a signed document")
         require(state.lastError == reason,
                 "the bookmark command reports the read-only reason")
+
+        // The one write-shaped command the shell keeps: exporting a copy. With no sidecar
+        // annotations it is a byte copy of the signed file, which is exactly what "export a
+        // copy" means and why it cannot invalidate the signature.
+        require(state.canSaveAnnotationsToPDF,
+                "the signed document still offers a copy export")
+        let signedExport = scratch.appendingPathComponent("signed-export.pdf")
+        let exported = await state.saveAnnotatedCopy(to: signedExport)
+        require(exported, "exporting a copy of the signed PDF succeeds")
+        let exportedBytes = try bytes(signedExport)
+        require(exportedBytes == originalBytes,
+                "the exported copy of the signed PDF is byte-identical")
+
         let afterShellCommands = try bytes(signedURL)
         require(afterShellCommands == originalBytes,
                 "no shell command modified the signed original")

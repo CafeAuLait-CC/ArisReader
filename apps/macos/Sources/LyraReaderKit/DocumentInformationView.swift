@@ -161,7 +161,19 @@ struct DocumentInformationContent: View {
                         .foregroundStyle(LyraReaderTheme.warningFg)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.vertical, 2)
-                } else {
+                }
+                if state.isReadOnlyDocument {
+                    // Reading the properties stays available on a signed document; only the
+                    // two write buttons disappear. The fields show the file's values and are
+                    // disabled, so a click cannot start an edit that will be refused.
+                    ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
+                        propertyRow(key)
+                    }
+                    .disabled(true)
+                    Text("Read-only: this signed file's information can be read but not written.")
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                } else if state.documentPropertiesRefusal == nil {
                     ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
                         propertyRow(key)
                     }

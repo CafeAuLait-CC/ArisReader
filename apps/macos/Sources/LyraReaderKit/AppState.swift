@@ -6093,10 +6093,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// erasure counts even when it removed the last annotation: the copy must still be
     /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
-        document != nil
-            && (!annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure || hasPendingFileDeletions)
-            && !annotationSaveInProgress
+        guard document != nil, !annotationSaveInProgress else { return false }
+        // A signed document cannot be edited, but exporting a copy (with whatever sidecar
+        // annotations it already carries, or none) never touches the signed original.
+        if isReadOnlyDocument { return true }
+        return !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
+            || hasPendingInkErasure || hasPendingFileDeletions
     }
 
     /// Whether the open document's outline already contains the reader's marked bookmark
@@ -6176,7 +6178,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure || hasPendingFileDeletions else {
+                || hasPendingInkErasure || hasPendingFileDeletions
+                || isReadOnlyDocument else {
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -6207,10 +6210,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarkWriteRequests()
             if changes.isEmpty && bookmarkRequests.isEmpty {
-                // The eraser removed the last annotation and there is no bookmark to write:
-                // the engine deliberately refuses an empty request. The honest copy is the
-                // source bytes. It still matters: the pending banner offers "Save Copy…" and
-                // that action must work precisely in this case.
+                // The eraser removed the last annotation and there is no bookmark to write, or
+                // the document is signed and has nothing the reader may add: the engine
+                // deliberately refuses an empty request. The honest copy is the source bytes.
+                // It still matters: the pending banner (or the signed banner's copy promise)
+                // offers "Save Copy…" and that action must work precisely in this case.
                 let source = try Data(contentsOf: documentURL, options: .mappedIfSafe)
                 try source.write(to: destination, options: .atomic)
                 lastAnnotationWriteReport = AnnotationWriteReport(
@@ -6226,11 +6230,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     sourceBytesPreserved: true
                 )
                 erasedInkStrokeIDs.removeAll()
-                statusMessage =
-                    "Saved a copy without annotations to \(destination.lastPathComponent)"
-                    + " · the original is unchanged"
+                statusMessage = isReadOnlyDocument
+                    ? "Saved a copy of the signed PDF to \(destination.lastPathComponent)"
+                        + " · the original is unchanged"
+                    : "Saved a copy without annotations to \(destination.lastPathComponent)"
+                        + " · the original is unchanged"
                 FileHandle.standardError.write(Data((
-                    "lyra-reader-annotate: saved a byte copy without annotations to \(destination.path)\n"
+                    "lyra-reader-annotate: saved a byte copy to \(destination.path)"
+                    + (isReadOnlyDocument ? " (signed, export only)\n" : " (without annotations)\n")
                 ).utf8))
                 return true
             }
