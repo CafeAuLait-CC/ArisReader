@@ -162,18 +162,7 @@ struct DocumentInformationContent: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.vertical, 2)
                 }
-                if state.isReadOnlyDocument {
-                    // Reading the properties stays available on a signed document; only the
-                    // two write buttons disappear. The fields show the file's values and are
-                    // disabled, so a click cannot start an edit that will be refused.
-                    ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
-                        propertyRow(key)
-                    }
-                    .disabled(true)
-                    Text("Read-only: this signed file's information can be read but not written.")
-                        .font(.caption2)
-                        .foregroundStyle(LyraReaderTheme.textTertiary)
-                } else if state.documentPropertiesRefusal == nil {
+                if state.documentPropertiesRefusal == nil {
                     ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
                         propertyRow(key)
                     }
@@ -189,7 +178,10 @@ struct DocumentInformationContent: View {
                         } label: {
                             Label("Write to This File…", systemImage: "doc.badge.arrow.up")
                         }
-                        .disabled(!state.canSaveDocumentProperties)
+                        .disabled(!state.canReplaceOriginalWithDocumentProperties)
+                        .help(state.isReadOnlyDocument
+                              ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                              : "Back up and replace the original file's information")
                         Spacer()
                         if state.documentPropertiesAreDirty {
                             Text("Unsaved")
@@ -199,14 +191,24 @@ struct DocumentInformationContent: View {
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    Text(
-                        "Save Copy writes the entries into a new PDF and leaves this file "
-                        + "untouched; Write to This File backs it up first and then replaces it. "
-                        + "Changing the recognized metadata above does not write anything."
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    if state.isReadOnlyDocument {
+                        Text(
+                            "Signed PDF: edits here can be saved to a copy. A modified copy "
+                            + "has its signature fields removed, so it does not look signed."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.warningFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(
+                            "Save Copy writes the entries into a new PDF and leaves this file "
+                            + "untouched; Write to This File backs it up first and then replaces it. "
+                            + "Changing the recognized metadata above does not write anything."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 if state.documentInfo?.hasInfoDictionary == false {
                     Text("This PDF has no information dictionary yet; a save adds one.")

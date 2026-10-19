@@ -1,14 +1,17 @@
 import AppKit
 import LyraReaderKit
+import LyraReaderBindings
 import Foundation
 
 /// Signature-aware write policy.
 ///
-/// A document that carries a digital signature is read-only: the engine refuses every command
-/// that would write into the file, and the shell disables those commands and states the same
-/// reason in a permanent banner. An unsigned document is written exactly as before, except that
-/// a save which removes annotations prunes the file so the removed content cannot be recovered
-/// from the bytes.
+/// A document that carries a digital signature is read-only **in place**: every command that
+/// would rewrite the file is refused, while commands whose destination is a new file (extract,
+/// merge, split, save edited copy, filled-form/properties copy, redaction to a copy, annotation
+/// copy export) are allowed. Those copies are stripped of signature fields, because their bytes
+/// are no longer covered by the signature. An unsigned document is written exactly as before,
+/// except that a save which removes annotations prunes the file so the removed content cannot be
+/// recovered from the bytes.
 ///
 /// The checks run through the real `RustEngine`/`AppState`; the read-only refusal is asserted on
 /// the engine itself (not only on the disabled buttons) so a UI regression cannot hide a write.
@@ -66,10 +69,12 @@ extension ReaderChecks {
         require(!formDocument.signature.signed,
                 "a form with an unsigned signature field (no /V, no /SigFlags) is not signed")
 
-        // ── 2. The engine gate: every write command refuses, the copy save does not ───────
+        // ── 2. In-place writes refuse; copies are allowed and carry no signature ─────────
         let gateEngine = try engine()
         let gateDocument = try gateEngine.openDocument(at: signedURL)
         let reason = gateDocument.signature.readOnlyReason ?? ""
+        require(reason.contains("edits can be saved to a copy"),
+                "the read-only reason says where edits can go: \(reason)")
         let originalBytes = try bytes(signedURL)
 
         func expectRefusal(_ label: String, _ body: () async throws -> Void) async {
@@ -77,7 +82,19 @@ extension ReaderChecks {
                 try await body()
                 require(false, "\(label) must be refused for a signed document")
             } catch {
-                let message = String(describing: error)
+                // Read the associated value rather than `String(describing:)`: the debug
+                // description escapes quotes inside the message, which would hide the exact
+                // sentence the shell shows.
+                let message: String
+                if let ffi = error as? LyraReaderFfiError {
+                    switch ffi {
+                    case .Document(let value), .Backend(let value),
+                         .InvalidArgument(let value), .Ai(let value):
+                        message = value
+                    }
+                } else {
+                    message = error.localizedDescription
+                }
                 require(message.contains(reason),
                         "\(label) refused with the shared explanation (got: \(message))")
             }
@@ -90,70 +107,67 @@ extension ReaderChecks {
             _ = try await gateEngine.replaceWithAnnotationChanges(
                 [], bookmarks: [], updates: [], deletions: [], zoom: 1)
         }
-        await expectRefusal("applyPageOperation") {
-            _ = try await gateEngine.applyPageOperation(
-                .rotate(pages: [0], quarterTurns: 1),
-                to: scratch.appendingPathComponent("never-page-op.pdf"))
-        }
-        await expectRefusal("extractPages") {
-            _ = try await gateEngine.extractPages(
-                [0], to: scratch.appendingPathComponent("never-extract.pdf"))
-        }
-        await expectRefusal("mergeDocuments") {
-            _ = try await gateEngine.mergeDocuments(
-                others: [unsignedURL],
-                to: scratch.appendingPathComponent("never-merge.pdf"))
-        }
-        await expectRefusal("splitPages") {
-            _ = try await gateEngine.splitPages([
-                PageSplitPart(pages: [0], destination: scratch.appendingPathComponent("never-split.pdf"))
-            ])
-        }
-        await expectRefusal("saveEditedCopy") {
-            _ = try await gateEngine.saveEditedCopy(
-                to: scratch.appendingPathComponent("never-edited.pdf"))
-        }
-        await expectRefusal("replaceOriginalWithPageEdits") {
-            _ = try await gateEngine.replaceOriginalWithPageEdits(original: signedURL)
-        }
-        await expectRefusal("redactToCopy") {
-            _ = try await gateEngine.redactToCopy(
-                to: scratch.appendingPathComponent("never-redacted.pdf"),
-                areas: [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
-        }
-        await expectRefusal("replaceWithRedactions") {
-            _ = try await gateEngine.replaceWithRedactions(
-                [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
-        }
-        await expectRefusal("saveFilledForm") {
-            _ = try await gateEngine.saveFilledForm(
-                to: scratch.appendingPathComponent("never-filled.pdf"), values: [])
-        }
         await expectRefusal("replaceWithFilledForm") {
             _ = try await gateEngine.replaceWithFilledForm([])
-        }
-        await expectRefusal("saveDocumentProperties") {
-            _ = try await gateEngine.saveDocumentProperties(
-                to: scratch.appendingPathComponent("never-properties.pdf"),
-                properties: DocumentProperties(title: "x", author: "", subject: "", keywords: ""))
         }
         await expectRefusal("replaceWithDocumentProperties") {
             _ = try await gateEngine.replaceWithDocumentProperties(
                 DocumentProperties(title: "x", author: "", subject: "", keywords: ""))
         }
+        await expectRefusal("replaceWithRedactions") {
+            _ = try await gateEngine.replaceWithRedactions(
+                [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
+        }
+        await expectRefusal("replaceOriginalWithPageEdits") {
+            _ = try await gateEngine.replaceOriginalWithPageEdits(original: signedURL)
+        }
         let afterRefusals = try bytes(signedURL)
         require(afterRefusals == originalBytes,
-                "every refused command left the signed original byte-identical")
-        for name in ["never-page-op", "never-extract", "never-merge", "never-split",
-                     "never-edited", "never-redacted", "never-filled", "never-properties"] {
-            require(!fileManager.fileExists(
-                atPath: scratch.appendingPathComponent("\(name).pdf").path),
-                "the refused \(name) command wrote no output")
+                "every refused in-place command left the signed original byte-identical")
+
+        /// Opens a derived copy and asserts it carries no signature evidence at all.
+        func requireUnsignedCopy(_ url: URL, _ label: String) throws {
+            require(fileManager.fileExists(atPath: url.path), "\(label) wrote its output")
+            let output = try engine().openDocument(at: url)
+            require(!output.signature.signed, "\(label)'s output does not look signed")
+            require(output.signature.evidence.isEmpty,
+                    "\(label)'s output carries no signature evidence")
         }
 
-        // Saving an annotated copy is the exception: it writes a new file and never touches the
-        // signed original.
-        let annotatedCopy = scratch.appendingPathComponent("signed-annotated-copy.pdf")
+        // Extract: a new file with the selected page.
+        let extractCopy = scratch.appendingPathComponent("copy-extract.pdf")
+        let extractReport = try await gateEngine.extractPages([0], to: extractCopy)
+        require(extractReport.pageCount == 1, "extract writes the selected page to a copy")
+        try requireUnsignedCopy(extractCopy, "extractPages")
+
+        // Merge: the signed document is an input; the output is a new document.
+        let mergeCopy = scratch.appendingPathComponent("copy-merge.pdf")
+        let mergeReport = try await gateEngine.mergeDocuments(others: [unsignedURL], to: mergeCopy)
+        require(mergeReport.pageCount == 2, "merge writes both documents into a new file")
+        try requireUnsignedCopy(mergeCopy, "mergeDocuments")
+
+        // Split: one verified output per part.
+        let splitCopy = scratch.appendingPathComponent("copy-split.pdf")
+        _ = try await gateEngine.splitPages([
+            PageSplitPart(pages: [0], destination: splitCopy)
+        ])
+        try requireUnsignedCopy(splitCopy, "splitPages")
+
+        // Save edited copy: publishing the page-edit revision never touches the source.
+        let editedCopy = scratch.appendingPathComponent("copy-edited.pdf")
+        let editedReport = try await gateEngine.saveEditedCopy(to: editedCopy)
+        require(editedReport.pageCount == 1, "saveEditedCopy writes the revision")
+        try requireUnsignedCopy(editedCopy, "saveEditedCopy")
+
+        // Redaction to a copy.
+        let redactedCopy = scratch.appendingPathComponent("copy-redacted.pdf")
+        _ = try await gateEngine.redactToCopy(
+            to: redactedCopy,
+            areas: [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
+        try requireUnsignedCopy(redactedCopy, "redactToCopy")
+
+        // Annotation copy: the new mark is written, the signature fields are not.
+        let annotatedCopy = scratch.appendingPathComponent("copy-annotated.pdf")
         let highlight = AnnotationWriteRequest(
             id: "a-signed-copy-highlight",
             page: 0,
@@ -167,90 +181,183 @@ extension ReaderChecks {
             modified: "D:20240102030405Z",
             fontSizePt: 12,
             textAlignment: "left")
-        let copyReport = try await gateEngine.saveAnnotationChanges(
+        let annotationReport = try await gateEngine.saveAnnotationChanges(
             to: annotatedCopy,
             additions: [highlight],
             bookmarks: [],
             updates: [],
             deletions: [],
             zoom: 1)
-        require(fileManager.fileExists(atPath: annotatedCopy.path),
-                "saving an annotated copy of a signed document is still allowed")
-        require(copyReport.writtenIDs == [highlight.id],
-                "the copy reports the annotation it wrote")
-        let afterAnnotatedCopy = try bytes(signedURL)
-        require(afterAnnotatedCopy == originalBytes,
-                "saving the annotated copy left the signed original byte-identical")
+        require(annotationReport.writtenIDs == [highlight.id],
+                "the annotated copy reports the annotation it wrote")
+        try requireUnsignedCopy(annotatedCopy, "annotation copy")
         let annotatedBytes = try bytes(annotatedCopy)
         require(contains(annotatedBytes, "a-signed-copy-highlight"),
-                "the annotated copy carries the new annotation")
+                "the annotated copy keeps the new annotation")
+        require(annotationReport.sourceBytesPreserved == false,
+                "a signature-stripped copy does not claim the source prefix")
 
-        // ── 3. The shell mirrors the same decision, with the same sentence ───────────────
+        // The signature field is gone, the non-signature form field survives, and the page text
+        // is unchanged.
+        let annotatedProbe = try engine()
+        _ = try annotatedProbe.openDocument(at: annotatedCopy)
+        let annotatedForm = try await annotatedProbe.formInfo()
+        require(!annotatedForm.fields.contains(where: { $0.kind == .signature }),
+                "the annotated copy carries no signature field")
+        require(annotatedForm.fields.contains(where: { $0.name == "reviewerName" }),
+                "the annotated copy keeps the ordinary form field")
+        let signedText = try await gateEngine.textPage(0).text
+        let copyText = try await annotatedProbe.textPage(0).text
+        require(copyText == signedText, "the annotated copy's page text is unchanged")
+
+        // Filled-form copy: the value is written, the signature is stripped.
+        let formInfo = try await gateEngine.formInfo()
+        guard let textField = formInfo.fields.first(where: { $0.kind == .text }) else {
+            require(false, "the signed fixture carries a text form field")
+            return
+        }
+        let formCopy = scratch.appendingPathComponent("copy-form.pdf")
+        _ = try await gateEngine.saveFilledForm(
+            to: formCopy,
+            values: [FormFieldValue(fieldID: textField.id, text: "Edited on a copy")])
+        try requireUnsignedCopy(formCopy, "saveFilledForm")
+        let formProbe = try engine()
+        _ = try formProbe.openDocument(at: formCopy)
+        let copiedForm = try await formProbe.formInfo()
+        require(!copiedForm.fields.contains(where: { $0.kind == .signature }),
+                "the filled-form copy carries no signature field")
+        require(copiedForm.fields.first(where: { $0.name == textField.name })?.value
+                == "Edited on a copy",
+                "the filled-form copy carries the new value")
+
+        // Properties copy: the new title is written, the signature is stripped.
+        let propertiesCopy = scratch.appendingPathComponent("copy-properties.pdf")
+        _ = try await gateEngine.saveDocumentProperties(
+            to: propertiesCopy,
+            properties: DocumentProperties(title: "Derived Copy Title"))
+        try requireUnsignedCopy(propertiesCopy, "saveDocumentProperties")
+        let propertiesProbe = try engine()
+        _ = try propertiesProbe.openDocument(at: propertiesCopy)
+        let copiedInfo = try await propertiesProbe.documentInfo()
+        require(copiedInfo.title == "Derived Copy Title",
+                "the properties copy carries the new title")
+        let copiedPropertiesForm = try await propertiesProbe.formInfo()
+        require(!copiedPropertiesForm.fields.contains(where: { $0.kind == .signature }),
+                "the properties copy carries no signature field")
+
+        let afterCopies = try bytes(signedURL)
+        require(afterCopies == originalBytes,
+                "every copy command left the signed original byte-identical")
+
+        // ── 3. The shell mirrors the same decision: edit to a copy, never in place ────────
         let state = AppState(engine: try engine())
         state.setViewportSize(CGSize(width: 700, height: 500))
         state.newTab(url: signedURL)
         require(state.document != nil, "the signed fixture opens in the reader")
-        require(state.isReadOnlyDocument, "the reader reports the document as read-only")
+        require(state.isReadOnlyDocument, "the reader reports the document as read-only in place")
         require(state.readOnlyReason == reason,
                 "the reader's reason is the engine's reason, verbatim")
-        require(state.readOnlyBannerTitle == "Signed PDF · read-only",
+        require(state.readOnlyBannerTitle == "Signed PDF · read-only in place",
                 "the banner has a human title")
         require(!state.readOnlyBannerEvidence.isEmpty,
                 "the banner names the evidence it found")
-        require(!state.canEditAnnotations, "annotation tools are disabled on a signed document")
-        require(!state.canPageEdit && !state.canPageOperations,
-                "page editing and page operations are disabled")
-        require(!state.canMarkRedactions, "redaction is disabled")
-        require(!state.canUseEraserTool, "the eraser is disabled")
-        require(!state.canUseFormTool && !state.canSaveFilledForm, "forms are disabled")
+        require(state.readOnlyBannerNote.contains("signature fields"),
+                "the banner says a copy leaves the signature fields out")
+        require(state.canEditAnnotations && state.canUseEraserTool,
+                "annotation tools stay usable: edits go to a copy")
+        require(state.canPageEdit && state.canPageOperations,
+                "page editing is staged and page copies are available")
+        require(state.canMarkRedactions, "redaction can be staged")
+        require(state.canSaveAnnotationsToPDF, "copy export is available")
         require(!state.canReplaceOriginalWithAnnotations,
-                "replacing the signed original is disabled")
+                "in-place annotation writing is disabled")
+        require(!state.canReplaceOriginalWithPageEdits,
+                "applying a page revision to the signed original is disabled")
+        require(!state.canReplaceOriginalWithRedactions,
+                "replacing the signed original with a redaction is disabled")
+        require(!state.canReplaceOriginalWithFilledForm,
+                "writing form values into the signed original is disabled")
+        require(!state.canReplaceOriginalWithDocumentProperties,
+                "writing properties into the signed original is disabled")
 
+        // Annotation and bookmark edits are sidecar work; the copy export carries them.
+        let addedInk = state.addInkAnnotation(
+            page: 0, points: [CGPoint(x: 40, y: 40), CGPoint(x: 140, y: 80)])
+        require(addedInk, "an annotation can be added to the signed document's sidecar")
+        guard let inkID = state.annotations.last?.id else {
+            require(false, "the added ink stroke has an identity")
+            return
+        }
+        require(state.addBookmarkAtCurrentPage(name: "Copy bookmark"),
+                "a bookmark can be added to the signed document's sidecar")
         state.toggleEraserTool()
-        require(state.annotationTool == .select && state.lastError == reason,
-                "the eraser command reports the read-only reason")
-        state.lastError = nil
-        state.toggleRedactionTool()
-        require(state.annotationTool != .redact && state.lastError == reason,
-                "the redaction command reports the read-only reason")
-        state.lastError = nil
-        state.toggleFormTool()
-        require(!state.formToolActive && state.lastError == reason,
-                "the form command reports the read-only reason")
-        state.lastError = nil
-        state.toggleTextMarkupTool(.highlight)
-        require(state.annotationTool == .select && state.lastError == reason,
-                "a markup tool reports the read-only reason")
-        state.lastError = nil
-        require(!state.addGeometryAnnotation(
-                    kind: .ink, page: 0,
-                    inkPaths: [[CGPoint(x: 20, y: 20), CGPoint(x: 100, y: 60)]]),
-                "annotation creation is refused on a signed document")
-        require(state.lastError == reason,
-                "annotation creation reports the read-only reason")
-        state.lastError = nil
-        require(!state.addBookmarkAtCurrentPage(),
-                "adding a bookmark is refused on a signed document")
-        require(state.lastError == reason,
-                "the bookmark command reports the read-only reason")
+        require(state.annotationTool == .eraser, "the eraser can be armed")
+        state.selectTool()
 
-        // The one write-shaped command the shell keeps: exporting a copy. With no sidecar
-        // annotations it is a byte copy of the signed file, which is exactly what "export a
-        // copy" means and why it cannot invalidate the signature.
-        require(state.canSaveAnnotationsToPDF,
-                "the signed document still offers a copy export")
-        let signedExport = scratch.appendingPathComponent("signed-export.pdf")
-        let exported = await state.saveAnnotatedCopy(to: signedExport)
-        require(exported, "exporting a copy of the signed PDF succeeds")
-        let exportedBytes = try bytes(signedExport)
-        require(exportedBytes == originalBytes,
-                "the exported copy of the signed PDF is byte-identical")
+        // A redaction can be marked and applied to a copy; replacing is disabled.
+        state.addPendingRedaction(page: 0, rect: CGRect(x: 20, y: 20, width: 60, height: 30))
+        require(!state.pendingRedactions.isEmpty && state.canApplyRedactions,
+                "a redaction can be marked for a copy")
+        require(!state.canReplaceOriginalWithRedactions,
+                "the marked redaction cannot be applied in place")
+        state.clearPendingRedactions()
 
+        // Form drafts and property drafts are allowed; only their in-place save is disabled.
+        try await eventually("the signed fixture's form loads", {
+            !state.formLoading && (state.formError != nil || !state.formInfo.fields.isEmpty)
+        })
+        require(state.canUseFormTool, "form filling can be staged")
+        if let editable = state.formInfo.fields.first(where: { $0.editable && $0.kind == .text }) {
+            state.updateFormText(editable.id, text: "Draft on a signed PDF")
+            require(state.canSaveFilledForm,
+                    "a form draft can be saved to a copy")
+            require(!state.canReplaceOriginalWithFilledForm,
+                    "a form draft cannot be written into the signed original")
+        } else {
+            require(false, "the signed fixture exposes an editable text field")
+        }
+        state.loadDocumentInfo(force: true)
+        try await eventually("the signed fixture's information loads", {
+            !state.documentInfoLoading
+                && (state.documentInfoError != nil || state.documentInfo != nil)
+        })
+        state.updateDocumentProperty(.title, text: "Draft Title")
+        require(state.canSaveDocumentProperties,
+                "a properties draft can be saved to a copy")
+        require(!state.canReplaceOriginalWithDocumentProperties,
+                "a properties draft cannot be written into the signed original")
+
+        // The shell's annotated-copy export writes the sidecar marks into a new, unsigned file.
+        let shellCopy = scratch.appendingPathComponent("shell-annotated-copy.pdf")
+        let exported = await state.saveAnnotatedCopy(to: shellCopy)
+        require(exported, "the shell exports an annotated copy of the signed document")
+        try requireUnsignedCopy(shellCopy, "shell annotated copy")
+        let shellCopyBytes = try bytes(shellCopy)
+        require(contains(shellCopyBytes, "a-signed-copy-highlight") == false,
+                "the shell copy is a new file, not the engine test's copy")
+        require(contains(shellCopyBytes, inkID.uuidString),
+                "the shell copy carries the sidecar ink stroke")
+        require(contains(shellCopyBytes, "Copy bookmark"),
+                "the shell copy carries the sidecar bookmark")
+        require(state.lastAnnotationWriteReport?.sourceBytesPreserved == false,
+                "the shell reports that the signed copy was rewritten")
+
+        // A staged page edit is allowed; applying it to the original is not.
+        // An inserted blank page has no text-position conflict with the sidecar marks.
+        let staged = await state.applyPageEditOperation(
+            .insertBlank(index: 1), label: "insert blank page")
+        require(staged, "a page edit can be staged on a signed document")
+        require(state.canSavePageEditsCopy,
+                "the staged page edit can be saved to a copy")
+        require(!state.canReplaceOriginalWithPageEdits,
+                "the staged page edit cannot be applied to the signed original")
+        let stagedCopy = scratch.appendingPathComponent("shell-edited-copy.pdf")
+        let savedStagedCopy = await state.savePageEditsCopy(to: stagedCopy)
+        require(savedStagedCopy, "the staged page edit saves to a copy")
+        try requireUnsignedCopy(stagedCopy, "shell edited copy")
         let afterShellCommands = try bytes(signedURL)
         require(afterShellCommands == originalBytes,
                 "no shell command modified the signed original")
-        require(state.documentAnnotations.isEmpty,
-                "the signed fixture's annotation list did not gain anything")
 
         // ── 4. A deletion on an unsigned document prunes the removed bytes ──────────────
         let deleteURL = try copy("annotated-replies.pdf", "delete-source.pdf")

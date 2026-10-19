@@ -213,14 +213,14 @@ struct ReaderToolbar: View {
                                    enabled: state.canReplaceOriginalWithAnnotations,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentReplaceOriginalConfirmation() },
                 .separator("export"),
-                LyraReaderMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canApplyPageEdits,
+                LyraReaderMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canSavePageEditsCopy,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentSavePageEditsCopyPanel() },
                 .separator("forms"),
                 LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
                     state.presentSaveFilledFormPanel()
                 },
-                LyraReaderMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canSaveFilledForm,
+                LyraReaderMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canReplaceOriginalWithFilledForm,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
                     state.presentReplaceOriginalWithFilledFormConfirmation()
                 },
@@ -228,9 +228,9 @@ struct ReaderToolbar: View {
             tool("Fill & Sign", "signature", selected: state.formToolActive) {
                 state.toggleFormTool()
             }
-            .disabled(state.document == nil || state.isReadOnlyDocument)
+            .disabled(state.document == nil)
             .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only")
+                  ? "Fill & Sign · fill this PDF's form fields · changes can be saved to a copy"
                   : (state.formToolActive
                      ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
                      : "Fill & Sign · fill this PDF's form fields"))
@@ -242,8 +242,7 @@ struct ReaderToolbar: View {
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
                 LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",
-                                   enabled: state.document != nil && !state.isReadOnlyDocument,
-                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.addBookmarkAtCurrentPage() },
+                                   enabled: state.document != nil) { state.addBookmarkAtCurrentPage() },
                 LyraReaderMenuItem("Previous Page", icon: "chevron.up", enabled: state.document != nil) { state.previousPage() },
                 LyraReaderMenuItem("Next Page", icon: "chevron.down", enabled: state.document != nil) { state.nextPage() },
                 .separator("more"),
@@ -336,9 +335,9 @@ struct ReaderSecondaryToolbar: View {
         .buttonStyle(LyraReaderToolStyle())
     }
 
-    /// Help for a tool that writes into the document: a signed file explains itself.
+    /// Help for a tool that changes the document: a signed file says where the edit can go.
     private func writeHelp(_ normal: String) -> String {
-        state.isReadOnlyDocument ? (state.readOnlyReason ?? "Signed PDF · read-only") : normal
+        state.isReadOnlyDocument ? normal + " · edits are saved to a copy" : normal
     }
 
     private var overviewRow: some View {

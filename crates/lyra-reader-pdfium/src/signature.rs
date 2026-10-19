@@ -1,9 +1,11 @@
 //! Digital-signature detection for the write policy.
 //!
-//! A signed PDF is opened **read-only**: writing into it would invalidate the signature even
-//! when the new bytes are semantically harmless, and a reader that quietly breaks a signature
-//! is worse than one that says it will not write. The shell needs the decision at open time,
-//! so detection is structural and paid once per document.
+//! A signed PDF is opened **read-only in place**: rewriting it would invalidate the signature
+//! even when the new bytes are semantically harmless, and a reader that quietly breaks a
+//! signature is worse than one that says it will not write. Deriving a **new file** is allowed;
+//! the derived copy is stripped of signature material because its bytes are no longer covered
+//! by the signature. The shell needs the decision at open time, so detection is structural and
+//! paid once per document.
 //!
 //! # Evidence
 //!
@@ -91,7 +93,8 @@ impl SignatureStatus {
     }
 
     /// `"signature flags in the form dictionary; a signed signature field"`, or an empty
-    /// string for an unsigned document. The same words reach the banner and the write refusal.
+    /// string for an unsigned document. The same words reach the banner and every in-place
+    /// write refusal.
     pub fn summary(&self) -> String {
         self.evidence
             .iter()
@@ -107,9 +110,10 @@ impl SignatureStatus {
             return None;
         }
         Some(format!(
-            "This PDF is digitally signed ({}). LyraReader opens signed documents read-only: \
-             writing into the file would invalidate its signature. Saving a copy or exporting \
-             still works and leaves the signed original untouched.",
+            "This document is digitally signed ({}); it opens read-only in place — edits can be \
+             saved to a copy, and the signed original is never modified. A modified copy has its \
+             signature fields removed, because the copy's bytes are no longer covered by the \
+             signature.",
             self.summary()
         ))
     }
@@ -343,6 +347,7 @@ mod tests {
         let reason = status.read_only_reason().expect("a refusal reason");
         assert!(reason.contains("signature flags"), "{reason}");
         assert!(reason.contains("signed signature field"), "{reason}");
+        assert!(reason.contains("edits can be saved to a copy"), "{reason}");
     }
 
     #[test]

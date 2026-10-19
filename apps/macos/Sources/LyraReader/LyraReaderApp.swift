@@ -362,11 +362,11 @@ struct ReaderCommands: Commands {
             Button("Save Edited Copy…") {
                 session?.state.presentSavePageEditsCopyPanel()
             }
-            .disabled(session?.state.canApplyPageEdits != true)
+            .disabled(session?.state.canSavePageEditsCopy != true)
             Button("Replace Original with Page Changes…") {
                 session?.state.presentReplaceOriginalWithPageEditsConfirmation()
             }
-            .disabled(session?.state.canApplyPageEdits != true)
+            .disabled(session?.state.canReplaceOriginalWithPageEdits != true)
             Button("Discard Page Changes…") {
                 session?.state.presentDiscardPageEditsConfirmation()
             }

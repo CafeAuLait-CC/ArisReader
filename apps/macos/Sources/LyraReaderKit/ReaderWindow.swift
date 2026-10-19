@@ -372,9 +372,10 @@ public struct ReaderWindow: View {
                 }
             }
             Spacer(minLength: 0)
-            Text("Saving a copy still works")
+            Text(state.readOnlyBannerNote)
                 .font(.caption2)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
+                .frame(maxWidth: 220, alignment: .trailing)
         }
         .controlSize(.small)
         .padding(.horizontal, 14)
@@ -416,9 +417,12 @@ public struct ReaderWindow: View {
             Button("Apply to Original…") {
                 state.presentReplaceOriginalWithPageEditsConfirmation()
             }
-            .disabled(!state.canApplyPageEdits)
+            .disabled(!state.canReplaceOriginalWithPageEdits)
+            .help(state.isReadOnlyDocument
+                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                  : "Replace the original file with the staged page changes")
             Button("Save Copy…") { state.presentSavePageEditsCopyPanel() }
-                .disabled(!state.canApplyPageEdits)
+                .disabled(!state.canSavePageEditsCopy)
             Button("Discard…") { state.presentDiscardPageEditsConfirmation() }
         }
         .controlSize(.small)
@@ -455,7 +459,10 @@ public struct ReaderWindow: View {
             Button("Apply to Copy…") { state.presentApplyRedactionsPanel() }
                 .disabled(!state.canApplyRedactions)
             Button("Replace Original…") { state.presentReplaceRedactionsConfirmation() }
-                .disabled(!state.canApplyRedactions)
+                .disabled(!state.canReplaceOriginalWithRedactions)
+                .help(state.isReadOnlyDocument
+                      ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                      : "Replace the original file with the redacted version")
             Button("Clear") { state.clearPendingRedactions() }
         }
         .controlSize(.small)
@@ -488,7 +495,10 @@ public struct ReaderWindow: View {
             Button("Apply to Original…") {
                 state.presentReplaceOriginalWithFilledFormConfirmation()
             }
-            .disabled(!state.canSaveFilledForm)
+            .disabled(!state.canReplaceOriginalWithFilledForm)
+            .help(state.isReadOnlyDocument
+                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                  : "Write the form values into the original file")
             Button("Discard") { state.discardFormChanges() }
                 .disabled(!state.formHasPendingChanges)
         }

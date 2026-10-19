@@ -129,15 +129,16 @@ pub struct SignatureEvidenceRecord {
 
 /// What the signature check found when a document was opened.
 ///
-/// A signed document is read-only: every command that would write into the file is refused by
-/// the engine with [`Self::read_only_reason`], and the shell disables those commands and shows
-/// the same sentence. Saving an annotated **copy** remains available because it writes a new
-/// file and never touches the signed original.
+/// A signed document is read-only **in place**: every command that would rewrite the file itself
+/// is refused by the engine with [`Self::read_only_reason`], and the shell disables those
+/// commands and shows the same sentence. Commands that write a new file (extract, merge, split,
+/// save edited/filled/properties/redacted copy, annotation copy export) remain available; a
+/// modified copy has its signature material stripped so it cannot look signed but be invalid.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SignatureStatusRecord {
     pub signed: bool,
     pub evidence: Vec<SignatureEvidenceRecord>,
-    /// The one explanation every write refusal uses; `None` for an unsigned document.
+    /// The one explanation every in-place write refusal uses; `None` for an unsigned document.
     pub read_only_reason: Option<String>,
 }
 
@@ -716,10 +717,10 @@ impl LyraReaderDocument {
 
     /// The digital-signature evidence this document was opened with.
     ///
-    /// `signed: true` means every command that would write into the file is refused with
+    /// `signed: true` means every command that would rewrite the file itself is refused with
     /// `read_only_reason`; the shell uses the same record to disable those commands and show
-    /// the banner. Reading, selection, search, previews and saving an annotated **copy** stay
-    /// available.
+    /// the banner. Reading, selection, search, previews, copy exports and saving an annotated
+    /// **copy** stay available.
     pub fn signature_status(&self) -> SignatureStatusRecord {
         SignatureStatusRecord {
             signed: self.signature.is_signed(),
@@ -1643,9 +1644,6 @@ impl LyraReaderDocument {
                     .to_string(),
             });
         }
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
                 message:
@@ -1653,6 +1651,9 @@ impl LyraReaderDocument {
                         .to_string(),
             });
         }
+        // This writes a page-edit **revision**, not a user-facing copy: a signed document may
+        // be edited in the staged session (the final copy is sanitised by `save_edited_copy`,
+        // and applying the revision to the original is refused by `replace_with_edited_pages`).
         let operation = page_operation(operation);
         let report = lyra_reader_pdfium::apply_page_operation(
             Path::new(&self.path),
@@ -1676,15 +1677,13 @@ impl LyraReaderDocument {
                         .to_string(),
             });
         }
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         let report = lyra_reader_pdfium::extract_pages(
             Path::new(&self.path),
             Path::new(&destination),
             &pages,
             self.password.as_deref(),
         )?;
+        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(page_edit_report(report))
     }
 
@@ -1709,9 +1708,6 @@ impl LyraReaderDocument {
                         .to_string(),
             });
         }
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         let others: Vec<PathBuf> = others.into_iter().map(PathBuf::from).collect();
         let report = merge_documents(
             Path::new(&self.path),
@@ -1719,6 +1715,9 @@ impl LyraReaderDocument {
             Path::new(&destination),
             self.password.as_deref(),
         )?;
+        // Any input may be signed; the output is a new document whose bytes are not covered by
+        // that signature, so it must not carry signature fields.
+        self.sanitize_derived_copy(&report.destination, true)?;
         Ok(merge_report(report))
     }
 
@@ -1738,9 +1737,6 @@ impl LyraReaderDocument {
                         .to_string(),
             });
         }
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         let parts: Vec<SplitPart> = parts
             .into_iter()
             .map(|part| SplitPart {
@@ -1749,6 +1745,9 @@ impl LyraReaderDocument {
             })
             .collect();
         let report = split_pages(Path::new(&self.path), &parts, self.password.as_deref())?;
+        for part in &report.parts {
+            self.sanitize_derived_copy(&part.destination, false)?;
+        }
         Ok(split_report(report))
     }
 
@@ -1757,14 +1756,12 @@ impl LyraReaderDocument {
         &self,
         destination: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         let report = lyra_reader_pdfium::publish_edited_copy(
             Path::new(&self.path),
             Path::new(&destination),
             self.backend.page_count(),
         )?;
+        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(page_edit_report(report))
     }
 
@@ -1778,8 +1775,14 @@ impl LyraReaderDocument {
         &self,
         original_path: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
+        // The revision is a working copy, so its own signature status (normally signed) is not
+        // the authority for an in-place write: check the file that would actually change.
+        let original = Path::new(&original_path);
+        if let Some(reason) =
+            lyra_reader_pdfium::detect_signature(original, None, 0).read_only_reason()
+        {
+            return Err(LyraReaderFfiError::Document { message: reason });
+        }
         self.ensure_writable()?;
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
@@ -1843,9 +1846,6 @@ impl LyraReaderDocument {
         destination: String,
         areas: Vec<RedactionAreaRecord>,
     ) -> Result<RedactionReportRecord, LyraReaderFfiError> {
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
         let areas = redaction_areas_for(&self.backend, &areas)?;
         let report = redact_pdf(
             Path::new(&self.path),
@@ -1854,6 +1854,7 @@ impl LyraReaderDocument {
             self.password.as_deref(),
             RedactionMode::Copy,
         )?;
+        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(redaction_report(report))
     }
 
@@ -2611,18 +2612,53 @@ fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
 }
 
 impl LyraReaderDocument {
-    /// The one read-only gate for every command that writes into the signed file.
+    /// The one gate for every command that would **rewrite the signed file itself**.
     ///
-    /// A future write command must call this before it touches the path. Keeping the decision
-    /// in exactly one place is what makes "the same explanation" true: the shell gets the
-    /// sentence from [`Self::signature_status`] and an error carries the same string, so a
-    /// disabled button and a refused direct call cannot disagree.
+    /// The policy is "a signed document must not be modified", not "nothing may be derived from
+    /// it": `extract_pages`, `merge_documents`, `split_pages`, `save_edited_copy`,
+    /// `redact_to_copy`, and the annotation/form/properties copy saves write a new file and are
+    /// allowed. Every `replace_*` command (and applying a staged page edit to the original) must
+    /// call this before it touches the path. Keeping the decision in one place is what makes
+    /// "the same explanation" true: the shell gets the sentence from
+    /// [`Self::signature_status`] and an error carries the same string, so a disabled button and
+    /// a refused direct call cannot disagree.
     fn ensure_writable(&self) -> Result<(), LyraReaderFfiError> {
         match self.signature.read_only_reason() {
             Some(message) => {
                 Err(lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message).into())
             }
             None => Ok(()),
+        }
+    }
+
+    /// Makes a modified derived copy signature-free, and reports whether it did.
+    ///
+    /// A copy whose bytes no longer match a signature field's `/V` must not look signed. The
+    /// stripper removes the signature fields, their widgets and signature dictionaries, clears
+    /// `/SigFlags`, and drops `/Perms` and `/DSS`; it verifies pages, text, non-signature form
+    /// fields, outline, metadata and embedded files before atomically replacing the copy. A
+    /// byte-identical export is not touched (the signature still covers those bytes).
+    ///
+    /// `force` is for merge, where any *input* may be signed even when the open document is not.
+    fn sanitize_derived_copy(
+        &self,
+        destination: &Path,
+        force: bool,
+    ) -> Result<bool, LyraReaderFfiError> {
+        if !force && !self.signature.is_signed() {
+            return Ok(false);
+        }
+        match lyra_reader_pdfium::strip_signature_from_copy(destination)? {
+            Some(report) => {
+                eprintln!(
+                    "lyra-reader-signature: removed {} signature field(s)/{} object(s) from derived copy {} (its bytes are no longer covered by the signature)",
+                    report.signature_fields,
+                    report.removed_objects,
+                    destination.display()
+                );
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -2635,9 +2671,11 @@ impl LyraReaderDocument {
         values: Vec<FormFieldValueRecord>,
         mode: SaveMode,
     ) -> Result<FormSaveReport, LyraReaderFfiError> {
-        // Forms are listed among the write commands a signed document disables, including the
-        // copy variant: filling a copy would still be an edit of the signed form.
-        self.ensure_writable()?;
+        // Writing values into the signed file is refused; a filled **copy** is a new file and
+        // is allowed (and stripped of the signature material it would otherwise carry).
+        if mode == SaveMode::ReplaceOriginal {
+            self.ensure_writable()?;
+        }
         let updates: Vec<lyra_reader_pdfium::FormValueUpdate> = values
             .into_iter()
             .map(|value| lyra_reader_pdfium::FormValueUpdate {
@@ -2647,13 +2685,17 @@ impl LyraReaderDocument {
                 selected: value.selected,
             })
             .collect();
-        let report = lyra_reader_pdfium::save_form_pdf(
+        let mut report = lyra_reader_pdfium::save_form_pdf(
             Path::new(&self.path),
             &destination,
             &updates,
             self.password.as_deref(),
             mode,
         )?;
+        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
+            report.appended_bytes = 0;
+            report.source_bytes_preserved = false;
+        }
         if mode == SaveMode::ReplaceOriginal {
             self.replaced
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -2680,22 +2722,28 @@ impl LyraReaderDocument {
         keywords: String,
         mode: SaveMode,
     ) -> Result<PropertiesSaveReport, LyraReaderFfiError> {
-        // Properties are an edit of the signed document, so even the copy variant is refused:
-        // the panel stays readable, the write commands do not.
-        self.ensure_writable()?;
+        // In-place property writing is refused; a properties **copy** is a new file and is
+        // allowed (and stripped of signature material).
+        if mode == SaveMode::ReplaceOriginal {
+            self.ensure_writable()?;
+        }
         let properties = lyra_reader_pdfium::DocumentProperties {
             title,
             author,
             subject,
             keywords,
         };
-        let report = lyra_reader_pdfium::save_document_properties(
+        let mut report = lyra_reader_pdfium::save_document_properties(
             Path::new(&self.path),
             &destination,
             &properties,
             self.password.as_deref(),
             mode,
         )?;
+        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
+            report.appended_bytes = 0;
+            report.source_bytes_preserved = false;
+        }
         if mode == SaveMode::ReplaceOriginal {
             self.replaced
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -2768,8 +2816,9 @@ impl LyraReaderDocument {
         zoom: f64,
         mode: SaveMode,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
-        // A copy writes a new file and is the one annotation command a signed document keeps.
-        // Replacing the original would invalidate the signature, so it is refused here.
+        // A copy writes a new file and is allowed for a signed document. Replacing the original
+        // would invalidate the signature, so it is refused here; the copy is then stripped of
+        // the signature material it would otherwise carry.
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -2841,7 +2890,7 @@ impl LyraReaderDocument {
                 target: deletion.target.clone(),
             })
             .collect::<Vec<_>>();
-        let report = lyra_reader_pdfium::save_annotation_changes(
+        let mut report = lyra_reader_pdfium::save_annotation_changes(
             Path::new(&self.path),
             &destination,
             &lyra_reader_pdfium::AnnotationChanges {
@@ -2853,6 +2902,10 @@ impl LyraReaderDocument {
             self.password.as_deref(),
             mode,
         )?;
+        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
+            report.appended_bytes = 0;
+            report.source_bytes_preserved = false;
+        }
         if mode == SaveMode::ReplaceOriginal {
             // The open backend still holds the pre-replacement in-memory document; the shell
             // reopens it after a replace, and every read before that reopen is refused rather

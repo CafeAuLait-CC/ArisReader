@@ -72,11 +72,9 @@ public struct SidebarView: View {
                         if state.sidebarTab == .bookmarks {
                             Button { state.addBookmarkAtCurrentPage() } label: { Image(systemName: "plus") }
                                 .buttonStyle(LyraReaderToolStyle())
-                                .disabled(state.document == nil || state.isReadOnlyDocument)
+                                .disabled(state.document == nil)
                                 .accessibilityLabel("Add Bookmark")
-                                .help(state.isReadOnlyDocument
-                                      ? (state.readOnlyReason ?? "Signed PDF · read-only")
-                                      : "Bookmark this page (⌘D)")
+                                .help("Bookmark this page (⌘D)")
                         }
                     }.padding(.horizontal, 12).padding(.bottom, 7)
                     Divider()
@@ -513,10 +511,7 @@ public struct SidebarView: View {
                     .font(.caption2)
             }
             .buttonStyle(.plain)
-            .disabled(state.isReadOnlyDocument)
-            .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only")
-                  : "Move bookmark up")
+            .help("Move bookmark up")
 
             Button {
                 state.moveBookmark(bookmark.id, by: 1)
@@ -525,10 +520,7 @@ public struct SidebarView: View {
                     .font(.caption2)
             }
             .buttonStyle(.plain)
-            .disabled(state.isReadOnlyDocument)
-            .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only")
-                  : "Move bookmark down")
+            .help("Move bookmark down")
 
             Button {
                 state.removeBookmark(bookmark.id)
@@ -537,10 +529,7 @@ public struct SidebarView: View {
                     .font(.caption2)
             }
             .buttonStyle(.plain)
-            .disabled(state.isReadOnlyDocument)
-            .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only")
-                  : "Delete bookmark")
+            .help("Delete bookmark")
         }
     }
 
@@ -896,7 +885,6 @@ private struct BookmarkNameField: View {
             .textFieldStyle(.plain)
             .font(.caption)
             .focused($isFocused)
-            .disabled(state.isReadOnlyDocument)
             .onAppear { draft = bookmark.title }
             .onChange(of: bookmark.title) { _, title in
                 // Do not clobber what the reader is typing when another change lands.

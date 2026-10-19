@@ -12,8 +12,9 @@
 //!
 //! The rewrite is deliberately not used for an ordinary append or edit: an incremental save is
 //! cheaper, keeps every original byte at its original offset, and is the correct default when
-//! nothing is removed. A signed document never reaches this module at all — the FFI gate refuses
-//! the write before the file is opened.
+//! nothing is removed. A signed document is never rewritten in place; a **modified derived
+//! copy** of one is passed to [`strip_signature_from_copy`], which also uses the pruned-rewrite
+//! machinery to remove signature material before the copy is renamed.
 //!
 //! # Equivalence, not hope
 //!
@@ -474,6 +475,421 @@ fn stream_bytes(stream: &Stream) -> Vec<u8> {
     stream.content.clone()
 }
 
+/// What a signature strip removed from a modified derived copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureStripReport {
+    /// Signature fields (and their `/V` dictionaries) removed from the copy.
+    pub signature_fields: usize,
+    /// Objects detached from the document (the fields, their widgets and signature dictionaries).
+    pub removed_objects: usize,
+}
+
+#[derive(Default)]
+struct SignatureMaterial {
+    objects: std::collections::BTreeSet<ObjectId>,
+    remove_perms: bool,
+    remove_dss: bool,
+    remove_sig_flags: bool,
+    signature_fields: usize,
+}
+
+impl SignatureMaterial {
+    fn is_empty(&self) -> bool {
+        self.objects.is_empty() && !self.remove_perms && !self.remove_dss && !self.remove_sig_flags
+    }
+}
+
+/// Removes every trace of a digital signature from a **modified copy**, atomically.
+///
+/// A derived file whose bytes no longer match a signature field's `/V` must not look signed:
+/// a reader that trusts the field would report a valid signature over different content. The
+/// strip removes the signature fields (with their widgets and signature dictionaries), clears
+/// `/AcroForm /SigFlags`, and drops the catalog's `/Perms` and `/DSS`. Non-signature form fields,
+/// pages, text, outline, metadata and embedded files are verified unchanged before the copy is
+/// replaced; a verification failure deletes the copy and refuses instead of keeping a misleading
+/// file.
+///
+/// Returns `Ok(None)` for a copy that carries no signature material (an ordinary unsigned
+/// export) and does not touch it.
+pub fn strip_signature_from_copy(path: &Path) -> Result<Option<SignatureStripReport>> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        LyraReaderError::new(ErrorCode::Io, "could not read the derived copy")
+            .with_detail(format!("{}: {error}", path.display()))
+    })?;
+    let mut document = Document::load_mem(&bytes).map_err(|error| {
+        LyraReaderError::new(
+            ErrorCode::CorruptDocument,
+            "the derived copy could not be parsed",
+        )
+        .with_detail(error.to_string())
+    })?;
+    let material = signature_material(&document);
+    if material.is_empty() {
+        return Ok(None);
+    }
+    remove_signature_material(&mut document, &material);
+    document.prune_objects();
+    let mut sanitized = Vec::new();
+    document.save_to(&mut sanitized).map_err(|error| {
+        LyraReaderError::new(
+            ErrorCode::Io,
+            "the signature-free copy could not be written",
+        )
+        .with_detail(error.to_string())
+    })?;
+
+    let staging = signature_staging_path(path)?;
+    let result = (|| -> Result<()> {
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&staging).map_err(|error| {
+                LyraReaderError::new(ErrorCode::Io, "could not create the signature-strip source")
+                    .with_detail(format!("{}: {error}", staging.display()))
+            })?;
+            file.write_all(&sanitized).map_err(|error| {
+                LyraReaderError::new(ErrorCode::Io, "could not write the signature-strip source")
+                    .with_detail(format!("{}: {error}", staging.display()))
+            })?;
+            file.sync_all().map_err(|error| {
+                LyraReaderError::new(ErrorCode::Io, "could not fsync the signature-strip source")
+                    .with_detail(format!("{}: {error}", staging.display()))
+            })?;
+        }
+        let verify = |candidate: &Path| verify_signature_strip(path, candidate, &material);
+        let build = |file: &mut std::fs::File| -> Result<()> {
+            use std::io::Write;
+            file.write_all(&sanitized).map_err(|error| {
+                LyraReaderError::new(ErrorCode::Io, "could not write the signature-free copy")
+                    .with_detail(error.to_string())
+            })
+        };
+        crate::writeback::write_rewritten_pdf(
+            &staging,
+            path,
+            crate::writeback::OutputMode::Copy,
+            build,
+            verify,
+        )?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staging);
+    if let Err(error) = result {
+        // The copy on disk is the writer's signed-looking file. Keeping it would be the one
+        // outcome the policy forbids, so remove it rather than return an error next to it.
+        let _ = std::fs::remove_file(path);
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the derived copy could not be made signature-free; nothing was kept",
+        )
+        .with_detail(error.to_string()));
+    }
+    Ok(Some(SignatureStripReport {
+        signature_fields: material.signature_fields,
+        removed_objects: material.objects.len(),
+    }))
+}
+
+fn signature_staging_path(destination: &Path) -> Result<std::path::PathBuf> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination.file_name().ok_or_else(|| {
+        LyraReaderError::new(ErrorCode::InvalidArgument, "the copy has no file name")
+    })?;
+    for attempt in 0..100 {
+        let candidate = parent.join(format!(
+            ".{}.lyra-reader-signature-strip-{}-{attempt}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(LyraReaderError::new(
+                    ErrorCode::Io,
+                    "could not create a signature-strip staging file",
+                )
+                .with_detail(format!("{}: {error}", candidate.display())));
+            }
+        }
+    }
+    Err(LyraReaderError::new(
+        ErrorCode::Io,
+        "could not choose a unique signature-strip staging file",
+    ))
+}
+
+fn signature_material(document: &Document) -> SignatureMaterial {
+    let mut material = SignatureMaterial::default();
+    let mut evidence = false;
+    let Some(catalog_id) = document
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|object| object.as_reference().ok())
+    else {
+        return material;
+    };
+    let Some(catalog) = document.get_dictionary(catalog_id).ok() else {
+        return material;
+    };
+    material.remove_perms = catalog.get(b"Perms").is_ok();
+    material.remove_dss = catalog.get(b"DSS").is_ok();
+    if material.remove_perms || material.remove_dss {
+        evidence = true;
+    }
+    if let Some(form) = catalog
+        .get(b"AcroForm")
+        .ok()
+        .and_then(|object| crate::forms::resolve(document, object))
+        .and_then(|object| object.as_dict().ok())
+    {
+        material.remove_sig_flags = form.get(b"SigFlags").is_ok();
+        if material.remove_sig_flags
+            && form
+                .get(b"SigFlags")
+                .ok()
+                .and_then(|object| crate::forms::resolve(document, object))
+                .and_then(|object| object.as_i64().ok())
+                .is_some_and(|flags| flags & 1 != 0)
+        {
+            evidence = true;
+        }
+        if let Ok(fields) = form.get(b"Fields").and_then(Object::as_array) {
+            evidence |= collect_signature_fields(document, fields, None, &mut material);
+        }
+    }
+    // A signature dictionary copied without its `/AcroForm` parent is still signature material:
+    // a viewer may find it through a page annotation or a structure tree.
+    for (&id, object) in &document.objects {
+        let Some(dictionary) = object.as_dict().ok() else {
+            continue;
+        };
+        let is_signature = dictionary
+            .get(b"FT")
+            .ok()
+            .and_then(|object| crate::forms::resolve(document, object))
+            .and_then(|object| object.as_name().ok())
+            == Some(b"Sig");
+        if is_signature {
+            evidence |= signature_value(document, dictionary);
+            if material.objects.insert(id) {
+                material.signature_fields += 1;
+            }
+        }
+    }
+    // An unsigned signature field (no `/V`, no SigFlags/Perms/DSS) does not make a document
+    // look signed; do not rewrite an ordinary form copy just because it has one.
+    if !evidence {
+        return SignatureMaterial::default();
+    }
+    material
+}
+
+fn signature_value(document: &Document, dictionary: &Dictionary) -> bool {
+    dictionary
+        .get(b"V")
+        .ok()
+        .and_then(|object| crate::forms::resolve(document, object))
+        .is_some_and(|value| match value {
+            Object::Null => false,
+            Object::String(bytes, _) => !bytes.is_empty(),
+            Object::Array(array) => !array.is_empty(),
+            Object::Dictionary(dictionary) => !dictionary.is_empty(),
+            Object::Stream(stream) => !stream.content.is_empty(),
+            _ => true,
+        })
+}
+
+const MAX_SIGNATURE_FIELD_DEPTH: usize = 64;
+
+fn collect_signature_fields(
+    document: &Document,
+    fields: &[Object],
+    inherited_type: Option<&[u8]>,
+    material: &mut SignatureMaterial,
+) -> bool {
+    let mut evidence = false;
+    for field in fields {
+        let Some(dictionary) =
+            crate::forms::resolve(document, field).and_then(|object| object.as_dict().ok())
+        else {
+            continue;
+        };
+        let field_type = dictionary
+            .get(b"FT")
+            .ok()
+            .and_then(|object| crate::forms::resolve(document, object))
+            .and_then(|object| object.as_name().ok())
+            .or(inherited_type);
+        if field_type == Some(b"Sig") {
+            material.signature_fields += 1;
+            evidence |= signature_value(document, dictionary);
+            if let Ok(id) = field.as_reference() {
+                material.objects.insert(id);
+            }
+            collect_signature_descendants(document, dictionary, material, 0);
+        } else if let Ok(kids) = dictionary.get(b"Kids").and_then(Object::as_array) {
+            evidence |= collect_signature_fields(document, kids, field_type, material);
+        }
+    }
+    evidence
+}
+
+fn collect_signature_descendants(
+    document: &Document,
+    dictionary: &Dictionary,
+    material: &mut SignatureMaterial,
+    depth: usize,
+) {
+    if depth > MAX_SIGNATURE_FIELD_DEPTH {
+        return;
+    }
+    if let Ok(kids) = dictionary.get(b"Kids").and_then(Object::as_array) {
+        for kid in kids {
+            if let Ok(id) = kid.as_reference() {
+                material.objects.insert(id);
+            }
+            if let Some(dictionary) =
+                crate::forms::resolve(document, kid).and_then(|object| object.as_dict().ok())
+            {
+                collect_signature_descendants(document, dictionary, material, depth + 1);
+            }
+        }
+    }
+}
+
+fn remove_signature_material(document: &mut Document, material: &SignatureMaterial) {
+    for id in &material.objects {
+        if document.objects.contains_key(id) {
+            document.delete_object(*id);
+        }
+    }
+    let Some(catalog_id) = document
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|object| object.as_reference().ok())
+    else {
+        return;
+    };
+    let acro_form_id = document
+        .get_dictionary(catalog_id)
+        .ok()
+        .and_then(|catalog| catalog.get(b"AcroForm").ok())
+        .and_then(|object| object.as_reference().ok());
+    let form_is_empty = {
+        let form = match acro_form_id {
+            Some(id) => document.get_dictionary(id).ok(),
+            None => document
+                .get_dictionary(catalog_id)
+                .ok()
+                .and_then(|catalog| catalog.get(b"AcroForm").ok())
+                .and_then(|object| object.as_dict().ok()),
+        };
+        form.is_none_or(|form| {
+            form.get(b"Fields")
+                .and_then(Object::as_array)
+                .map(|fields| fields.is_empty())
+                .unwrap_or(true)
+        })
+    };
+    if let Some(id) = acro_form_id
+        && let Ok(form) = document.get_object_mut(id).and_then(Object::as_dict_mut)
+    {
+        form.remove(b"SigFlags");
+    }
+    let Ok(catalog) = document
+        .get_object_mut(catalog_id)
+        .and_then(Object::as_dict_mut)
+    else {
+        return;
+    };
+    if let Ok(form) = catalog
+        .get_mut(b"AcroForm")
+        .and_then(|object| object.as_dict_mut())
+    {
+        form.remove(b"SigFlags");
+    }
+    if material.remove_perms {
+        catalog.remove(b"Perms");
+    }
+    if material.remove_dss {
+        catalog.remove(b"DSS");
+    }
+    if form_is_empty {
+        catalog.remove(b"AcroForm");
+    }
+}
+
+fn verify_signature_strip(
+    before: &Path,
+    after: &Path,
+    _material: &SignatureMaterial,
+) -> Result<()> {
+    compare_page_text(before, after, None, TextComparison::Exact)?;
+    compare_outline(before, after, None)?;
+    compare_metadata_and_info(before, after, None)?;
+    compare_embedded_files(before, after, None)?;
+
+    let before_form = read_form_document(before, None)?;
+    let after_form = read_form_document(after, None)?;
+    let signature = |field: &crate::forms::FormField| {
+        (
+            field.name.clone(),
+            field.kind,
+            field.value.clone(),
+            field.checked,
+            field.selected.clone(),
+        )
+    };
+    let mut before_kept: Vec<_> = before_form
+        .fields
+        .iter()
+        .filter(|field| field.kind != crate::forms::FormFieldKind::Signature)
+        .map(signature)
+        .collect();
+    let mut after_fields: Vec<_> = after_form.fields.iter().map(signature).collect();
+    before_kept.sort_by(|a, b| a.0.cmp(&b.0));
+    after_fields.sort_by(|a, b| a.0.cmp(&b.0));
+    if after_form
+        .fields
+        .iter()
+        .any(|field| field.kind == crate::forms::FormFieldKind::Signature)
+    {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the signature-free copy still contains a signature field",
+        ));
+    }
+    if before_kept != after_fields {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the signature-free copy changed a non-signature form field",
+        ));
+    }
+
+    if crate::detect_signature(after, None, 0).is_signed() {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the signature-free copy still reports signature evidence",
+        ));
+    }
+    if crate::PdfiumBackend::open(after, None)?.signature_count() != 0 {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "PDFium still sees a signature in the signature-free copy",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +1050,116 @@ mod tests {
     }
 
     /// The fault is injected into the rewrite only; the save must still leave nothing behind.
+    fn signature_field_count(path: &Path) -> usize {
+        crate::forms::read_form_document(path, None)
+            .expect("read form")
+            .fields
+            .iter()
+            .filter(|field| field.kind == crate::forms::FormFieldKind::Signature)
+            .count()
+    }
+
+    /// A modified copy must not keep a signature field whose `/V` no longer covers its bytes.
+    #[test]
+    fn a_modified_copy_loses_its_signature_material() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let scratch = ScratchDir::new("signature-strip");
+        for (name, expected_fields) in [("signed-signature.pdf", 1), ("signed-docmdp.pdf", 0)] {
+            let copy = scratch.join(format!("copy-{name}"));
+            fs::copy(fixture(name), &copy).expect("copy the fixture");
+            let before = crate::detect_signature(&copy, None, 0);
+            assert!(before.is_signed(), "{name} must start signed");
+            let before_pages = crate::PdfiumBackend::open(&copy, None)
+                .expect("open before")
+                .page_count();
+            let before_form = crate::forms::read_form_document(&copy, None).expect("form");
+            let before_text = (0..before_pages)
+                .map(|page| {
+                    use lyra_reader_core::DocumentBackend;
+                    crate::PdfiumBackend::open(&copy, None)
+                        .expect("open before")
+                        .raw_text_page(PageIndex(page))
+                        .expect("text")
+                        .text
+                })
+                .collect::<Vec<_>>();
+
+            let report = strip_signature_from_copy(&copy)
+                .expect("strip the signature")
+                .expect("signature material was found");
+            assert_eq!(report.signature_fields, expected_fields, "{name}");
+            assert!(
+                !crate::detect_signature(&copy, None, 0).is_signed(),
+                "{name}"
+            );
+            assert_eq!(
+                crate::PdfiumBackend::open(&copy, None)
+                    .expect("open after")
+                    .signature_count(),
+                0,
+                "{name}: PDFium still sees a signature"
+            );
+            // The bytes may legitimately contain the words "/Perms" or "SigFlags" in page
+            // content (the DocMDP fixture's text says so), so assert on the document's
+            // dictionaries instead of a raw substring scan.
+            let stripped_document = Document::load(&copy).expect("parse the stripped copy");
+            assert!(
+                signature_material(&stripped_document).is_empty(),
+                "{name}: signature material is still reachable"
+            );
+            let after_form = crate::forms::read_form_document(&copy, None).expect("form");
+            assert_eq!(
+                signature_field_count(&copy),
+                0,
+                "{name}: a signature field survived"
+            );
+            assert_eq!(
+                before_form.fields.len() - expected_fields,
+                after_form.fields.len(),
+                "{name}: a non-signature field was lost"
+            );
+            let after_pages = crate::PdfiumBackend::open(&copy, None)
+                .expect("open after")
+                .page_count();
+            assert_eq!(before_pages, after_pages, "{name}: page count changed");
+            let after_text = (0..after_pages)
+                .map(|page| {
+                    use lyra_reader_core::DocumentBackend;
+                    crate::PdfiumBackend::open(&copy, None)
+                        .expect("open after")
+                        .raw_text_page(PageIndex(page))
+                        .expect("text")
+                        .text
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(before_text, after_text, "{name}: page text changed");
+        }
+    }
+
+    /// An ordinary unsigned copy is not rewritten at all; a byte-identical export of a signed
+    /// file keeps its valid signature and is therefore not touched either.
+    #[test]
+    fn a_copy_without_signature_material_is_untouched() {
+        let scratch = ScratchDir::new("signature-strip-none");
+        // `annotated.pdf` has no form at all; `form-fields.pdf` has an unsigned signature field
+        // (no `/V`, no `/SigFlags`), which must not trigger a rewrite either.
+        for name in ["annotated.pdf", "form-fields.pdf"] {
+            let copy = scratch.join(name);
+            fs::copy(fixture(name), &copy).expect("copy the fixture");
+            let before = fs::read(&copy).expect("read");
+            assert!(
+                strip_signature_from_copy(&copy)
+                    .expect("strip attempts")
+                    .is_none(),
+                "{name}: an unsigned copy has nothing to strip"
+            );
+            assert_eq!(fs::read(&copy).expect("reread"), before, "{name}");
+        }
+    }
+
     #[test]
     fn an_equivalence_failure_is_refused_and_writes_nothing() {
         if !crate::is_available() {
