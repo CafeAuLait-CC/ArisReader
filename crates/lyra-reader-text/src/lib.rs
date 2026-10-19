@@ -780,14 +780,23 @@ const CAPTION_INK_GAP_SHARE: f64 = 2.0;
 /// How much *larger* than the caption's own type a following line may measure (points) and still
 /// belong to the caption. A line of a smaller size is never refused.
 ///
-/// The asymmetry is what the corpus shows. Body text is set a size up from the caption on the
-/// papers that separate them at all (`Table 2` of the ResNet paper: caption 8.0 pt, body 8.9 pt;
-/// `Figure 6` of CLIP: 8.0 against 8.9), and that difference is the last guard behind
-/// [`CAPTION_LINE_GAP_SHARE`] when a paragraph follows a caption at the caption's own leading.
-/// Smaller lines are not neighbours but *parts* of a line: a subscript or superscript inside a
-/// caption arrives as a line of its own in the text layer, 1.4–3.1 pt under the size of the text it
-/// belongs to (`Fig. 5` of the Dvorožňák paper, `Fig. 44` of the Planck paper), and refusing those
-/// would cut the caption at the first formula it contains.
+/// "Larger" is measured twice, and both measurements must agree. The median follows the
+/// ordinary x-height glyphs and is the right stand-in for leading, but a caption line can be
+/// almost all x-height letters while its continuation carries ascenders and digits; on
+/// `Figure 1` of 2110.12477 that reads as 4.2 pt against 5.4 pt in the same printed size. The
+/// 90th percentile sees the ascenders on both lines, but it alone over-reads a line carrying one
+/// tall formula glyph (`0 using θw + (1 − θ)w` in the FedAvg caption, 8.9 pt by median against
+/// 8.9 by type). Requiring *both* to exceed the caption's own keeps the body-text asymmetry and
+/// ignores a spike in either measurement. The guard still has its corpus asymmetry:
+/// body text is set a size up from the caption on the papers that separate them at all
+/// (`Table 2` of the ResNet paper: caption 8.0 pt, body 8.9 pt; `Figure 6` of CLIP: 8.0 against
+/// 8.9), and that difference is the last guard behind [`CAPTION_LINE_GAP_SHARE`] when a
+/// paragraph follows a caption at the caption's own leading. Smaller lines are not neighbours but
+/// *parts* of a line: a subscript or superscript inside a caption arrives as a line of its own in
+/// the text layer, 1.4–3.1 pt under the size of the text it belongs to (`Fig. 5` of the Dvorožňák
+/// paper, `Fig. 44` of the Planck paper), and refusing those would cut the caption at the first
+/// formula it contains. A tall line with no letters at all is a formula fragment rather than a
+/// larger type, and is handled in [`caption_block`].
 const CAPTION_TYPE_TOLERANCE_PT: f64 = 0.75;
 
 /// How wide the line above a label must be, as a share of the label line's width, for the label
@@ -803,6 +812,16 @@ const CAPTION_TYPE_TOLERANCE_PT: f64 = 0.75;
 /// the empty band between those and the smallest prose continuation.
 const CAPTION_CONTINUATION_WIDTH_SHARE: f64 = 0.5;
 
+/// The widest horizontal gap between a caption's ink and a following text-layer line that can
+/// still be the *same printed line*, as a share of the caption's glyph height.
+///
+/// The extractor splits one printed line into several text-layer lines when a formula or a
+/// footnote boundary interrupts it. The pieces meet at 0–0.5 pt on the corpus (`Table 3` of the
+/// Planck paper, `Table 16` of the CLIP paper, whose caption's footnote markers start 0.5 pt
+/// after the caption text). A column gutter is 20–70 pt, so 0.5 glyph heights sits in the empty
+/// band and keeps the other column out.
+const CAPTION_SAME_LINE_GAP_SHARE: f64 = 0.5;
+
 /// One line of the text layer, as the caption scanner needs it.
 ///
 /// The scanner works on the extraction order of the character array (lines split at `\n`), because
@@ -814,8 +833,16 @@ struct CaptionLine {
     end: usize,
     /// Box of the line's non-whitespace characters, in page space.
     rect: Rect,
-    /// Median height of those characters: the crate's stand-in for the type size.
+    /// Median height of those characters: the crate's stand-in for the leading.
     height: f64,
+    /// 90th percentile of those heights, for the "larger type" guard.
+    ///
+    /// The median is the right stand-in for leading (a line's ordinary glyphs), but it is not a
+    /// fair type size when a caption line happens to be dominated by x-height letters while its
+    /// continuation carries ascenders and digits: `Figure 1` of 2110.12477 measures 4.2 pt by
+    /// median against 5.4 pt on its continuation, in the same printed size. The high percentile
+    /// sees the ascenders on both lines, so the guard compares like with like.
+    type_height: f64,
     /// The line's characters with whitespace runs collapsed, for the caption's text.
     compact: String,
     /// The line as extracted, for the label grammar.
@@ -855,6 +882,12 @@ fn caption_lines(text: &RawTextPage, chars: &[char]) -> Vec<CaptionLine> {
             values.sort_by(f64::total_cmp);
             values.get(values.len() / 2).copied().unwrap_or(0.0)
         };
+        let high = |values: &[f64]| {
+            values
+                .get((values.len() * 9 / 10).min(values.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0.0)
+        };
         let mut boxes: Vec<Rect> = text.chars
             [start.min(text.chars.len())..end.min(text.chars.len())]
             .iter()
@@ -874,11 +907,14 @@ fn caption_lines(text: &RawTextPage, chars: &[char]) -> Vec<CaptionLine> {
             }
             right = right.max(box_rect.max_x());
         }
+        let height = median(&mut heights);
+        let type_height = high(&heights);
         lines.push(CaptionLine {
             start,
             end,
             rect: rect.unwrap_or_default(),
-            height: median(&mut heights),
+            height,
+            type_height,
             compact: raw.split_whitespace().collect::<Vec<_>>().join(" "),
             raw,
             gap,
@@ -1018,7 +1054,11 @@ fn ends_a_sentence(text: &str) -> bool {
 ///
 /// * **another column** — a line that does not overlap the caption horizontally is the page's
 ///   other column (a two-column content stream prints both columns of a row together), and the
-///   walk steps over it rather than treating it as the caption's end;
+///   walk steps over it rather than treating it as the caption's end. A line *does* join when it
+///   is the other piece of the same printed line: its ink band overlaps the block's and the
+///   horizontal distance is at most [`CAPTION_SAME_LINE_GAP_SHARE`] of the caption's type (the
+///   extractor splits a line at a formula or a footnote boundary on Planck page 22 and CLIP
+///   page 47);
 /// * **a paragraph break** — a line further below than [`CAPTION_LEADING_SHARE`] of the caption's
 ///   glyph height;
 /// * **a different type size** — more than [`CAPTION_TYPE_TOLERANCE_PT`] away from the label
@@ -1028,6 +1068,10 @@ fn caption_block(lines: &[CaptionLine], anchor: usize) -> (Vec<usize>, Rect) {
     let mut included = vec![anchor];
     let mut block = lines[anchor].rect;
     let reference = lines[anchor].height;
+    let reference_type = lines[anchor].type_height;
+    // Algorithms are set as a pseudocode block, so a tall line inside one is a step, not a
+    // formula fragment of a prose caption. The tall-line exception below is for figures/tables.
+    let algorithm = caption_label(&lines[anchor].raw).is_some_and(|(kind, _)| kind == "Algorithm");
 
     loop {
         let last = *included.last().expect("the anchor line");
@@ -1039,9 +1083,24 @@ fn caption_block(lines: &[CaptionLine], anchor: usize) -> (Vec<usize>, Rect) {
         // up with it.
         let next = (last + 1..lines.len()).find(|index| {
             let line = &lines[*index];
-            !line.compact.is_empty()
-                && line.rect.size.width > 0.0
-                && crate::figures::overlaps_horizontally(block, line.rect)
+            if line.compact.is_empty() || line.rect.size.width <= 0.0 {
+                return false;
+            }
+            if crate::figures::overlaps_horizontally(block, line.rect) {
+                return true;
+            }
+            // A printed line split by the text layer at a formula or a footnote boundary: its
+            // pieces are on the same ink band and meet within a word space. A line in the other
+            // column shares neither the small gap nor (usually) the ink band.
+            let vertical = block.origin.y < line.rect.max_y() && line.rect.origin.y < block.max_y();
+            let horizontal_gap = if line.rect.origin.x >= block.max_x() {
+                line.rect.origin.x - block.max_x()
+            } else if block.origin.x >= line.rect.max_x() {
+                block.origin.x - line.rect.max_x()
+            } else {
+                0.0
+            };
+            vertical && horizontal_gap <= CAPTION_SAME_LINE_GAP_SHARE * reference
         });
         let Some(next) = next else { break };
         let line = &lines[next];
@@ -1053,9 +1112,22 @@ fn caption_block(lines: &[CaptionLine], anchor: usize) -> (Vec<usize>, Rect) {
         // from the block's lowest ink and the candidate's highest, which is the same quantity on
         // every one of them.
         let gap = block.origin.y - line.rect.max_y();
+        // A line that starts above the block's lowest ink overlaps the caption rather than
+        // following it. Two text-layer artefacts take that shape and are not block boundaries:
+        // a tall formula fragment (the radical on Planck page 22 is a 16.2 pt line of its own
+        // against 8.9 pt type) and a line where PDFium merged the tail of one printed line with
+        // the start of the next (HumanML3D page 4, a 163 pt internal gap). Neither can be a
+        // table row under the caption, because a row is below it.
+        let overlaps_vertically = gap < 0.0;
+        let larger_type = line.height - reference > CAPTION_TYPE_TOLERANCE_PT
+            && line.type_height - reference_type > CAPTION_TYPE_TOLERANCE_PT;
+        let tall_formula_fragment = larger_type
+            && overlaps_vertically
+            && !algorithm
+            && !line.compact.chars().any(char::is_alphabetic);
         if gap > CAPTION_LINE_GAP_SHARE * reference
-            || line.height - reference > CAPTION_TYPE_TOLERANCE_PT
-            || line.gap > CAPTION_INK_GAP_SHARE * reference
+            || (larger_type && !tall_formula_fragment)
+            || (line.gap > CAPTION_INK_GAP_SHARE * reference && !overlaps_vertically)
             || caption_label(&line.raw).is_some()
         {
             break;

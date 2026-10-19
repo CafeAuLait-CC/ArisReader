@@ -44,7 +44,7 @@ use lyra_reader_pdfium::PdfiumBackend;
 use lyra_reader_text::{
     AttributionReason, Citation, CitationStyle, ReferenceEntry, SectionKind, attribute_citation,
     find_citations_with, find_reference_lists, find_references, find_references_with_landings,
-    resolve_reference, resolve_references,
+    inspect_parenthesised_citations, resolve_reference, resolve_references,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1886,6 +1886,106 @@ fn gpt4_main_text_resolves_into_the_reports_own_bibliography() {
         "GPT-4 two-bibliography check: {} entries on pages 18–23; [1] Brown, [13] Kojima; \
          {labels} label(s) over {spans} main-text span(s), every one inside the report's list",
         references.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.19 — parenthesised numerals on wrapped lines and paragraph tails
+// ---------------------------------------------------------------------------
+
+/// `1712.01815` cites as bare `(n)` at body size. Three real citations were still missed on
+/// 2026-10-19 because of the two positional guards: one opens a line after the paragraph wraps
+/// (`(18, 23).` on page 12), and two close a paragraph whose last line holds only the final word
+/// (`Zero (29).` on page 14, `values (29).` on page 15). The equation number on page 3 must stay
+/// refused, which is the guard the relaxation is not allowed to loosen.
+#[test]
+#[ignore = "needs the arXiv corpus and PDFium"]
+fn science_wrapped_line_citations_are_found() {
+    let root = repo_root();
+    let path = corpus_dir(&root).join("1712.01815.pdf");
+    if !path.is_file() {
+        println!(
+            "skipping the Science wrapped-line citation check: {} is not present",
+            path.display()
+        );
+        if std::env::var_os("CI").is_some() {
+            println!(
+                "::notice title=Science wrapped-line citation check NOT run::{} is not present, so the check that the three wrapped-line `(n)` citations are found — and that page 3's equation number is still refused — did NOT run. The PDFs are never committed; ./scripts/fetch-eval-papers.sh downloads the corpus that holds it.",
+                path.display()
+            );
+        }
+        return;
+    }
+    let backend = PdfiumBackend::open(&path, None).expect("Science paper must be readable");
+    let pages: Vec<(u32, RawTextPage)> = (0..backend.page_count())
+        .map(|page| {
+            (
+                page,
+                backend
+                    .raw_text_page(PageIndex(page))
+                    .expect("extract Science paper"),
+            )
+        })
+        .collect();
+    let references = find_references(pages.iter().map(|(page, text)| (*page, text)), MAX_ENTRIES);
+    assert_eq!(
+        references.len(),
+        32,
+        "the Science paper's printed bibliography"
+    );
+    let style = CitationStyle::for_document(&pages, &references);
+    assert!(
+        style.accepts_parenthesised_numerals(),
+        "the Science paper must prove its numeric bibliography"
+    );
+
+    for (page, labels) in [
+        (11u32, vec!["18".to_string(), "23".to_string()]),
+        (13, vec!["29".to_string()]),
+        (14, vec!["29".to_string()]),
+    ] {
+        let found = find_citations_with(&pages[page as usize].1, &style);
+        let citation = found
+            .iter()
+            .find(|citation| citation.labels == labels)
+            .unwrap_or_else(|| {
+                panic!(
+                    "page {}: the citation {labels:?} is missing; found {:?}",
+                    page + 1,
+                    found.iter().map(|c| &c.text).collect::<Vec<_>>()
+                )
+            });
+        let entry = resolve_reference(&citation.labels, &references)
+            .unwrap_or_else(|| panic!("page {}: {labels:?} must resolve", page + 1));
+        assert!(
+            (6..=8).contains(&entry.page),
+            "page {}: {labels:?} resolved to page {}",
+            page + 1,
+            entry.page + 1
+        );
+        println!(
+            "page {}: {} -> [{}] {}",
+            page + 1,
+            citation.text,
+            entry.label,
+            entry.text.chars().take(48).collect::<String>()
+        );
+    }
+
+    // The page-3 `(1)` is a display-equation number: the relaxation must not turn it into a
+    // citation. The reason is the positional one, which is what the guard is for.
+    let equation = inspect_parenthesised_citations(&pages[2].1, &style);
+    let one = equation
+        .iter()
+        .find(|candidate| candidate.text == "(1)")
+        .expect("page 3's equation number");
+    assert!(!one.accepted, "{one:?}");
+    assert!(
+        one.reason.contains("equation"),
+        "page 3's (1) was rejected for the wrong reason: {one:?}"
+    );
+    println!(
+        "Science wrapped-line check: 3 wrapped-line citations found, page 3's (1) still an equation number"
     );
 }
 

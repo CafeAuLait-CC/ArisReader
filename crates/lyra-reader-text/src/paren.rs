@@ -45,9 +45,17 @@
 //!    candidate: its inside is not a numeral.)
 //! 5. **In prose, not in a formula.** The candidate must sit inside a line that has at least
 //!    [`PROSE_MIN`] letters besides it; it must not touch the preceding token (`f(3)`), follow a
-//!    formula operator (`x = (3)`), or be drawn in a mathematical face.
+//!    formula operator (`x = (3)`), or be drawn in a mathematical face. A paragraph's last line
+//!    can hold only its final word and the citation that closes the sentence (`Zero (29).` on
+//!    page 14 of the Science paper); that line is admitted when the citation is followed by the
+//!    clause's punctuation, the text before it is words without digits or operators, and the line
+//!    above in the same column runs into it instead of ending a sentence.
 //! 6. **Not at the line's left edge.** A candidate with no text before it on its line is an
-//!    enumeration (`(1) First item`, `(2) Second item`), not a citation to entry 1 or 2.
+//!    enumeration (`(1) First item`, `(2) Second item`), not a citation to entry 1 or 2. The
+//!    exception is the citation that opens a line because the paragraph wrapped or the page
+//!    broke (`(18, 23).` at the top of page 12 of the Science paper): it is followed by the
+//!    clause's punctuation and the line carries [`PROSE_MIN`] letters or more. A list marker is
+//!    followed by the item's first word, not by punctuation.
 //! 7. **Not right-aligned at the margin.** A display equation's number is set apart at the right
 //!    edge of a line that is mostly formula, so it either ends a line with too little prose or is
 //!    separated from the preceding text by more than [`DETACHED_GAP_PT`]. A citation at the end
@@ -513,13 +521,14 @@ fn evaluate(
         {
             return (false, "drawn in a mathematical face, like a formula");
         }
-        if prose < PROSE_MIN {
+        let structural = structural_reference(text, &before);
+        if prose < PROSE_MIN && !short_paragraph_tail(text, candidate, &before, &after) {
             return (
                 false,
                 "a line with too little prose, like a formula or a caption",
             );
         }
-        if let Some(reason) = structural_reference(text, &before) {
+        if let Some(reason) = structural {
             return (false, reason);
         }
         if after.is_empty() {
@@ -541,8 +550,21 @@ fn evaluate(
     }
 
     // Nothing before it on its run: either the line starts here (an enumeration) or the numeral
-    // was pushed to the right of a display line (an equation number).
+    // was pushed to the right of a display line (an equation number). A citation can also start
+    // a line when the paragraph wraps or the page breaks: that one is followed by the punctuation
+    // that closes its clause and shares its line with prose, while a list marker is followed by
+    // the item's first word.
     if left - layout.left_margin <= LEFT_MARGIN_PT {
+        if prose >= PROSE_MIN
+            && after
+                .first()
+                .is_some_and(|index| is_clause_punctuation(decode(&text.chars[*index])))
+        {
+            return (
+                true,
+                "a numeral at the start of a wrapped line, followed by its clause's punctuation",
+            );
+        }
         (false, "opens its line, like a list enumeration")
     } else {
         (
@@ -550,6 +572,124 @@ fn evaluate(
             "set apart at the right of its line, like an equation number",
         )
     }
+}
+
+/// Whether a character is punctuation that closes the clause a citation ends.
+fn is_clause_punctuation(character: char) -> bool {
+    matches!(character, '.' | ',' | ';' | ':')
+}
+
+/// The half-open character range of the text-layer line containing `position`.
+fn line_bounds(text: &RawTextPage, position: usize) -> (usize, usize) {
+    let chars = &text.chars;
+    let mut start = position.min(chars.len());
+    while start > 0 && decode(&chars[start - 1]) != '\n' {
+        start -= 1;
+    }
+    let mut end = position.min(chars.len());
+    while end < chars.len() && decode(&chars[end]) != '\n' {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The horizontal ink range of one text-layer line.
+fn ink_range(text: &RawTextPage, start: usize, end: usize) -> Option<(f64, f64)> {
+    let mut x0 = f64::MAX;
+    let mut x1 = f64::MIN;
+    for character in &text.chars[start.min(text.chars.len())..end.min(text.chars.len())] {
+        if visible(character) {
+            x0 = x0.min(character.rect.origin.x);
+            x1 = x1.max(character.rect.max_x());
+        }
+    }
+    (x1 > x0).then_some((x0, x1))
+}
+
+/// Whether two text-layer lines sit in the same column: their ink ranges overlap by half.
+fn same_column(text: &RawTextPage, above: (usize, usize), line: (usize, usize)) -> bool {
+    let Some((a0, a1)) = ink_range(text, above.0, above.1) else {
+        return false;
+    };
+    let Some((b0, b1)) = ink_range(text, line.0, line.1) else {
+        return false;
+    };
+    let overlap = a1.min(b1) - a0.max(b0);
+    overlap > 0.0 && overlap / (a1 - a0).min(b1 - b0).max(1e-6) >= 0.5
+}
+
+/// Whether a line too short to reach [`PROSE_MIN`] is the last line of a paragraph.
+///
+/// [`PROSE_MIN`] keeps a display formula's numbered line out; a paragraph's last line, however,
+/// can hold only its final word and the citation that closes the sentence. The corpus case is
+/// `values (29).` on page 15 of the Science paper: one word on the line, the citation after it,
+/// and the line above running into this one. Three things separate that from a formula or a
+/// caption: the citation is followed by the clause's punctuation; the text before it is words
+/// without digits or operators; and the line above, in the same column, does not end a sentence.
+/// The caller still applies the structural-token guard (a figure or table reference is not a
+/// citation).
+fn short_paragraph_tail(
+    text: &RawTextPage,
+    candidate: &RawCandidate,
+    before: &[usize],
+    after: &[usize],
+) -> bool {
+    if !after
+        .first()
+        .is_some_and(|index| is_clause_punctuation(decode(&text.chars[*index])))
+    {
+        return false;
+    }
+    let mut letters = 0usize;
+    for index in before {
+        let character = decode(&text.chars[*index]);
+        if character.is_ascii_digit()
+            || matches!(
+                character,
+                '=' | '+'
+                    | '−'
+                    | '-'
+                    | '×'
+                    | '÷'
+                    | '/'
+                    | '^'
+                    | '_'
+                    | '<'
+                    | '>'
+                    | '≤'
+                    | '≥'
+                    | '≈'
+                    | '∼'
+            )
+        {
+            return false;
+        }
+        if character.is_alphabetic() {
+            letters += 1;
+        }
+    }
+    if letters < 3 {
+        return false;
+    }
+    let line = line_bounds(text, candidate.start);
+    if line.0 == 0 {
+        return false;
+    }
+    let above = line_bounds(text, line.0 - 1);
+    let Some(last) = text.chars[above.0..above.1]
+        .iter()
+        .rev()
+        .find(|character| visible(character))
+    else {
+        return false;
+    };
+    if matches!(
+        decode(last),
+        '.' | ':' | ';' | '?' | '!' | ')' | ']' | '"' | '\u{201d}' | '\u{2019}'
+    ) {
+        return false;
+    }
+    same_column(text, above, line)
 }
 
 fn candidate_font_is_math(text: &RawTextPage, candidate: &RawCandidate) -> bool {
@@ -912,6 +1052,50 @@ mod tests {
         let style = numeric_style(14, "Body text.");
         let page = page(&["The value f(3) is plotted for reference here."]);
         assert!(find(&page, &style).is_empty());
+    }
+
+    #[test]
+    fn a_citation_at_the_start_of_a_wrapped_line_is_a_citation() {
+        // Science 1712.01815 page 12: the paragraph wraps and the citation that ends the clause
+        // opens the next line at the body's left edge. It is not a list enumeration: the marker
+        // is followed by the clause's full stop, and the line carries the rest of the sentence.
+        let style = numeric_style(32, "Body text.");
+        let page = page(&[
+            "For at least four decades the strongest computer chess programs have used alpha-beta search",
+            "(18, 23). AlphaZero uses a markedly different approach that averages over the position evaluations",
+        ]);
+        let found = find(&page, &style);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].labels, ["18", "23"].map(String::from));
+    }
+
+    #[test]
+    fn a_short_paragraph_tail_that_ends_in_a_citation_is_a_citation() {
+        // Science 1712.01815 pages 14 and 15: the last line of a paragraph holds only the last
+        // word and the citation (`Zero (29).`, `values (29).`). The line above continues into
+        // it, and the citation is followed by the sentence's full stop.
+        let style = numeric_style(32, "Body text.");
+        let page = page(&[
+            "The Elo rating of the baseline players was anchored to publicly available",
+            "values (29).",
+        ]);
+        let found = find(&page, &style);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].labels, ["29"]);
+    }
+
+    #[test]
+    fn a_short_caption_line_that_ends_in_a_number_is_still_not_a_citation() {
+        // The short-line relaxation is for a paragraph's last line, not for a caption or a
+        // formula: a display formula with an equation number at the end of a short line is still
+        // refused, and so is a figure caption naming a numbered object.
+        let style = numeric_style(32, "Body text.");
+        let page = page(&[
+            "The balance condition is",
+            "x + y = z (3).",
+            "Figure 3 (4) shows the pipeline.",
+        ]);
+        assert!(find(&page, &style).is_empty(), "{:?}", find(&page, &style));
     }
 
     #[test]
