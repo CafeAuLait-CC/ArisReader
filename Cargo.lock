@@ -914,6 +914,8 @@ dependencies = [
  "lyra-reader-pdfium",
  "lyra-reader-render",
  "lyra-reader-text",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
