@@ -15,6 +15,7 @@ use aris_reader_pdfium::{SaveMode, WriteAnnotation, WriteAnnotationKind, save_an
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CHINESE: &str = "中文 α";
 const JAPANESE: &str = "β 日本語";
@@ -27,12 +28,18 @@ fn fixture() -> PathBuf {
 }
 
 fn scratch() -> PathBuf {
+    // The two tests in this binary run in parallel. A clock-derived suffix alone is not unique
+    // on a runner whose clock ticks coarsely: both tests can sample the same nanosecond, share
+    // a scratch directory, and then one test's cleanup removes the other's saved PDF. The
+    // write-back's `TempFile::nonce` pairs its clock with a counter for the same reason.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "lyra-cjk-appearance-{}-{unique}",
+        "lyra-cjk-appearance-{}-{unique}-{sequence}",
         std::process::id()
     ));
     std::fs::create_dir_all(&path).expect("create scratch directory");
