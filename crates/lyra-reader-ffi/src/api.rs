@@ -92,6 +92,11 @@ impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
         match error.code {
             ErrorCode::BackendUnavailable | ErrorCode::GpuUnavailable => Self::Backend { message },
             ErrorCode::InvalidArgument => Self::InvalidArgument { message },
+            // A read-only document is a policy refusal, not a parse failure; keep the sentence
+            // exactly as the signature status reports it (no `ReadOnly:` prefix).
+            ErrorCode::ReadOnly => Self::Document {
+                message: error.message,
+            },
             _ => Self::Document { message },
         }
     }
@@ -2614,7 +2619,9 @@ impl LyraReaderDocument {
     /// disabled button and a refused direct call cannot disagree.
     fn ensure_writable(&self) -> Result<(), LyraReaderFfiError> {
         match self.signature.read_only_reason() {
-            Some(message) => Err(LyraReaderFfiError::Document { message }),
+            Some(message) => {
+                Err(lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message).into())
+            }
             None => Ok(()),
         }
     }
