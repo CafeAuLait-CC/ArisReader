@@ -1771,8 +1771,59 @@ impl LyraReaderDocument {
             std::path::PathBuf::from(destination),
             annotations,
             bookmarks,
+            Vec::new(),
+            Vec::new(),
             zoom,
             SaveMode::Copy,
+        )
+    }
+
+    /// Writes a new PDF at `destination` with additions, edits and deletions of annotations.
+    ///
+    /// Additions behave exactly like [`Self::save_annotations_copy`]. `updates` name annotations
+    /// the file already carries by the identity [`Self::annotations`] reported; only the fields
+    /// this reader models are changed and every other key of the foreign annotation is preserved.
+    /// `deletions` remove the annotation, its `/IRT` reply thread and its `/Popup` window from
+    /// the page's `/Annots`. The document that is open is not modified.
+    pub fn save_annotation_changes_copy(
+        &self,
+        destination: String,
+        annotations: Vec<WriteAnnotationRecord>,
+        bookmarks: Vec<WriteBookmarkRecord>,
+        updates: Vec<AnnotationUpdateRecord>,
+        deletions: Vec<AnnotationDeleteRecord>,
+        zoom: f64,
+    ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
+        self.save_annotations_to(
+            std::path::PathBuf::from(destination),
+            annotations,
+            bookmarks,
+            updates,
+            deletions,
+            zoom,
+            SaveMode::Copy,
+        )
+    }
+
+    /// Replaces the document that is open with a version carrying additions, edits and deletions.
+    ///
+    /// The same verified-backup and atomic-rename contract as [`Self::replace_with_annotations`].
+    pub fn replace_with_annotation_changes(
+        &self,
+        annotations: Vec<WriteAnnotationRecord>,
+        bookmarks: Vec<WriteBookmarkRecord>,
+        updates: Vec<AnnotationUpdateRecord>,
+        deletions: Vec<AnnotationDeleteRecord>,
+        zoom: f64,
+    ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
+        self.save_annotations_to(
+            std::path::PathBuf::from(&self.path),
+            annotations,
+            bookmarks,
+            updates,
+            deletions,
+            zoom,
+            SaveMode::ReplaceOriginal,
         )
     }
 
@@ -1792,6 +1843,8 @@ impl LyraReaderDocument {
             std::path::PathBuf::from(&self.path),
             annotations,
             bookmarks,
+            Vec::new(),
+            Vec::new(),
             zoom,
             SaveMode::ReplaceOriginal,
         )
@@ -2504,11 +2557,17 @@ impl LyraReaderDocument {
         Ok((text, chars))
     }
 
+    // The result of merging three independent write-back features (annotations, edits/deletes,
+    // bookmarks) into one verified save: one argument per record list, plus the destination,
+    // zoom and mode. Splitting it would only move the same values into a struct.
+    #[allow(clippy::too_many_arguments)]
     fn save_annotations_to(
         &self,
         destination: std::path::PathBuf,
         annotations: Vec<WriteAnnotationRecord>,
         bookmarks: Vec<WriteBookmarkRecord>,
+        updates: Vec<AnnotationUpdateRecord>,
+        deletions: Vec<AnnotationDeleteRecord>,
         zoom: f64,
         mode: SaveMode,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
@@ -2551,59 +2610,134 @@ impl LyraReaderDocument {
                 y_pt: record.y_pt,
             });
         }
-        let mut specs = Vec::with_capacity(annotations.len());
-        for record in annotations {
-            if record.page >= page_count {
+        let mut additions = Vec::with_capacity(annotations.len());
+        for record in &annotations {
+            additions.push(self.convert_write_annotation(
+                record,
+                page_count,
+                zoom,
+                &mut geometries,
+            )?);
+        }
+        let mut changed = Vec::with_capacity(updates.len());
+        for update in &updates {
+            let values = self.convert_write_annotation(
+                &update.annotation,
+                page_count,
+                zoom,
+                &mut geometries,
+            )?;
+            changed.push(lyra_reader_pdfium::AnnotationUpdate {
+                target: update.target.clone(),
+                values,
+                assign_name: update.assign_name.clone(),
+            });
+        }
+        let removed = deletions
+            .iter()
+            .map(|deletion| lyra_reader_pdfium::AnnotationDelete {
+                target: deletion.target.clone(),
+            })
+            .collect::<Vec<_>>();
+        let report = lyra_reader_pdfium::save_annotation_changes(
+            Path::new(&self.path),
+            &destination,
+            &lyra_reader_pdfium::AnnotationChanges {
+                additions,
+                updates: changed,
+                deletions: removed,
+            },
+            &bookmark_specs,
+            self.password.as_deref(),
+            mode,
+        )?;
+        if mode == SaveMode::ReplaceOriginal {
+            // The open backend still holds the pre-replacement in-memory document; the shell
+            // reopens it after a replace, and every read before that reopen is refused rather
+            // than answered from the old file.
+            self.replaced
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Ok(mut cache) = self.annotations.lock() {
+                *cache = None;
+            }
+        }
+        Ok(AnnotationSaveReport {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            written_ids: report.written_ids,
+            appended_bytes: report.appended_bytes,
+            backup_path: report
+                .backup_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
+                .unwrap_or(u32::MAX),
+            written_bookmark_ids: report.written_bookmark_ids,
+            bookmark_outline_title: report.bookmark_outline_title,
+            preexisting_outline_entry_count: u32::try_from(report.preexisting_outline_entry_count)
+                .unwrap_or(u32::MAX),
+            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            deleted_file_ids: report.deleted_ids,
+            deleted_reply_count: u32::try_from(report.deleted_reply_count).unwrap_or(u32::MAX),
+            deleted_popup_count: u32::try_from(report.deleted_popup_count).unwrap_or(u32::MAX),
+            assigned_names: report.assigned_names,
+            source_bytes_preserved: report.source_bytes_preserved,
+        })
+    }
+
+    /// Converts one shell write record into the page-space annotation the writer expects.
+    ///
+    /// Geometry crosses the FFI in view space at `zoom`, exactly what the canvas draws; the page
+    /// geometry inverts that once, so a mark saved at 100% and the same mark saved at 300% land
+    /// in the same PDF coordinates. Split out of the save loop so an edit and an addition go
+    /// through exactly the same conversion.
+    fn convert_write_annotation(
+        &self,
+        record: &WriteAnnotationRecord,
+        page_count: u32,
+        zoom: f64,
+        geometries: &mut std::collections::HashMap<u32, PageGeometry>,
+    ) -> Result<WriteAnnotation, LyraReaderFfiError> {
+        if record.page >= page_count {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: format!(
+                    "annotation {:?} names page {}, but the document has {page_count} page(s)",
+                    record.id,
+                    record.page + 1
+                ),
+            });
+        }
+        let geometry = match geometries.get(&record.page) {
+            Some(geometry) => *geometry,
+            None => {
+                let geometry = self.backend.page_info(PageIndex(record.page))?.geometry;
+                geometries.insert(record.page, geometry);
+                geometry
+            }
+        };
+        let inverse =
+            geometry
+                .view_to_page(zoom)
+                .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                    message: format!("page {} has no invertible geometry", record.page + 1),
+                })?;
+        let quads = record
+            .quads
+            .iter()
+            .map(|quad| view_box_to_page_rect(quad, inverse, &geometry))
+            .collect::<Result<Vec<_>, _>>()?;
+        let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
+        let geometry_border = |id: &str, width: f64| -> Result<f64, LyraReaderFfiError> {
+            if !width.is_finite() || width <= 0.0 || width > 200.0 {
                 return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!(
-                        "annotation {:?} names page {}, but the document has {page_count} page(s)",
-                        record.id,
-                        record.page + 1
-                    ),
+                    message: format!("annotation {id:?} has a border width outside 0…200 pt"),
                 });
             }
-            let geometry = match geometries.get(&record.page) {
-                Some(geometry) => *geometry,
-                None => {
-                    let geometry = self.backend.page_info(PageIndex(record.page))?.geometry;
-                    geometries.insert(record.page, geometry);
-                    geometry
-                }
-            };
-            let inverse =
-                geometry
-                    .view_to_page(zoom)
-                    .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
-                        message: format!("page {} has no invertible geometry", record.page + 1),
-                    })?;
-            let quads = record
-                .quads
-                .iter()
-                .map(|quad| view_box_to_page_rect(quad, inverse, &geometry))
-                .collect::<Result<Vec<_>, _>>()?;
-            let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
-            let geometry_border = |id: &str, width: f64| -> Result<f64, LyraReaderFfiError> {
-                if !width.is_finite() || width <= 0.0 || width > 200.0 {
-                    return Err(LyraReaderFfiError::InvalidArgument {
-                        message: format!("annotation {id:?} has a border width outside 0…200 pt"),
-                    });
-                }
-                Ok(width)
-            };
-            let view_point = |point: &AnnotationPoint| -> Point {
-                inverse.apply(Point::new(point.x_pt, point.y_pt))
-            };
-            let (
-                kind,
-                rect,
-                quads,
-                ink_paths,
-                line,
-                line_arrow,
-                border_width,
-                font_size,
-                alignment,
-            ) = match record.kind {
+            Ok(width)
+        };
+        let view_point = |point: &AnnotationPoint| -> Point {
+            inverse.apply(Point::new(point.x_pt, point.y_pt))
+        };
+        let (kind, rect, quads, ink_paths, line, line_arrow, border_width, font_size, alignment) =
+            match record.kind {
                 AnnotationWriteKind::Note => (
                     WriteAnnotationKind::Text,
                     supplied_rect,
@@ -2762,59 +2896,23 @@ impl LyraReaderDocument {
                     )
                 }
             };
-            specs.push(WriteAnnotation {
-                id: record.id,
-                page: PageIndex(record.page),
-                kind,
-                rect,
-                quads,
-                ink_paths,
-                line,
-                line_arrow,
-                border_width,
-                font_size,
-                alignment,
-                color: [record.color.red, record.color.green, record.color.blue],
-                opacity: record.opacity,
-                contents: text_or_none(&record.contents),
-                author: text_or_none(&record.author),
-                modified: text_or_none(&record.modified),
-            });
-        }
-
-        let report = lyra_reader_pdfium::save_annotated_pdf(
-            Path::new(&self.path),
-            &destination,
-            &specs,
-            &bookmark_specs,
-            self.password.as_deref(),
-            mode,
-        )?;
-        if mode == SaveMode::ReplaceOriginal {
-            // The open backend still holds the pre-replacement in-memory document; the shell
-            // reopens it after a replace, and every read before that reopen is refused rather
-            // than answered from the old file.
-            self.replaced
-                .store(true, std::sync::atomic::Ordering::Release);
-            if let Ok(mut cache) = self.annotations.lock() {
-                *cache = None;
-            }
-        }
-        Ok(AnnotationSaveReport {
-            destination_path: report.destination.to_string_lossy().into_owned(),
-            written_ids: report.written_ids,
-            appended_bytes: report.appended_bytes,
-            backup_path: report
-                .backup_path
-                .map(|path| path.to_string_lossy().into_owned()),
-            preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
-                .unwrap_or(u32::MAX),
-            written_bookmark_ids: report.written_bookmark_ids,
-            bookmark_outline_title: report.bookmark_outline_title,
-            preexisting_outline_entry_count: u32::try_from(report.preexisting_outline_entry_count)
-                .unwrap_or(u32::MAX),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
-            source_bytes_preserved: report.source_bytes_preserved,
+        Ok(WriteAnnotation {
+            id: record.id.clone(),
+            page: PageIndex(record.page),
+            kind,
+            rect,
+            quads,
+            ink_paths,
+            line,
+            line_arrow,
+            border_width,
+            font_size,
+            alignment,
+            color: [record.color.red, record.color.green, record.color.blue],
+            opacity: record.opacity,
+            contents: text_or_none(&record.contents),
+            author: text_or_none(&record.author),
+            modified: text_or_none(&record.modified),
         })
     }
 
@@ -3553,6 +3651,30 @@ pub struct WriteAnnotationRecord {
     pub text_alignment: String,
 }
 
+/// One annotation the shell asks the writer to **edit** in place.
+///
+/// `target` is the identity [`AnnotationRecord::id`] reported for the file's annotation
+/// (`nm:<NM>` or `fp:<fingerprint>`). `annotation` is the full replacement model; the writer keeps
+/// the file's `/NM` (unless `assign_name` fills in a missing one), author, flags, popup, parent,
+/// reply links and every key this reader does not model.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnnotationUpdateRecord {
+    pub target: String,
+    pub annotation: WriteAnnotationRecord,
+    /// `/NM` to assign when the file's annotation has none. Required for an `fp:` target: the
+    /// fingerprint is derived from `/Contents` and `/M`, which this edit changes.
+    pub assign_name: Option<String>,
+}
+
+/// One annotation the shell asks the writer to remove, with its reply thread and popup.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnnotationDeleteRecord {
+    pub target: String,
+    /// Page the annotation is on, for a clearer refusal when it has moved. The writer resolves
+    /// the identity across the document because replies live on their own pages.
+    pub page: u32,
+}
+
 /// What a successful write did. Every value is about the *file that was written*, not about the
 /// request: `written_ids` comes back so the shell removes exactly those sidecar entries.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3563,7 +3685,8 @@ pub struct AnnotationSaveReport {
     pub appended_bytes: u64,
     /// Present only when the original was replaced; the file is verified byte-identical.
     pub backup_path: Option<String>,
-    /// Content annotations the source already had; all were verified unchanged.
+    /// Content annotations the source already had; every one the save did not edit or delete
+    /// was verified unchanged.
     pub preexisting_annotation_count: u32,
     /// Bookmark identities written into the outline, so the shell removes exactly those sidecar
     /// entries after a replacement.
@@ -3573,6 +3696,15 @@ pub struct AnnotationSaveReport {
     /// Outline nodes the document already had outside the reader's subtree; all were verified
     /// unchanged.
     pub preexisting_outline_entry_count: u32,
+    /// Identities of every annotation removed from the annotation tree, including the `/IRT`
+    /// replies and `/Popup` window that depended on it. Empty for an append-only save.
+    pub deleted_file_ids: Vec<String>,
+    /// Replies among [`Self::deleted_file_ids`].
+    pub deleted_reply_count: u32,
+    /// Popup windows among [`Self::deleted_file_ids`].
+    pub deleted_popup_count: u32,
+    /// Identities given an `/NM` because the file had none and the edit needed a stable one.
+    pub assigned_names: Vec<String>,
     /// Stale `.lyra-reader-save-*.tmp` files removed before this save.
     pub cleaned_temporary_files: u32,
     /// True when the written file's prefix equals the source byte-for-byte.

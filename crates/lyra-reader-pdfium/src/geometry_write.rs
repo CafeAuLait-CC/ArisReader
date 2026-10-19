@@ -129,7 +129,7 @@ pub(crate) struct EmbeddedFreeTextFont {
 }
 
 /// Builds the shared free-text font, or `None` when the save contains no visible text at all.
-fn build_free_text_font(
+pub(crate) fn build_free_text_font(
     document: &mut Document,
     annotations: &[WriteAnnotation],
 ) -> Result<Option<EmbeddedFreeTextFont>> {
@@ -723,7 +723,43 @@ impl WriteAnnotationKind {
     }
 }
 
-fn append_one(
+/// Appends the form XObject an annotation's `/AP /N` points at, and returns its object id.
+///
+/// A `/Text` note has no appearance stream (its icon is drawn by the viewer from `/Name`); every
+/// other directly written kind gets one. The appearance is generated from the same
+/// [`WriteAnnotation`] the dictionary is, so the two descriptions of the mark cannot disagree.
+pub(crate) fn add_appearance_object(
+    document: &mut Document,
+    annotation: &WriteAnnotation,
+    free_text_font: Option<&EmbeddedFreeTextFont>,
+) -> ObjectId {
+    let mut resources = Dictionary::new();
+    if annotation.kind == WriteAnnotationKind::FreeText
+        && let Some(font) = free_text_font
+    {
+        // The appearance's own font: Type0/Identity-H, subset for this document. `/DA`
+        // keeps Helvetica as the standard-14 fallback for a viewer that ignores `/AP`; the
+        // appearance itself no longer uses WinAnsi and never writes `?`.
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(font.type0));
+        resources.set("Font", Object::Dictionary(fonts));
+    }
+    let mut stream_dictionary = Dictionary::new();
+    stream_dictionary.set("Type", name("XObject"));
+    stream_dictionary.set("Subtype", name("Form"));
+    stream_dictionary.set("BBox", rect_array(annotation.rect));
+    stream_dictionary.set("Resources", Object::Dictionary(resources));
+    let mut stream = Stream::new(
+        stream_dictionary,
+        appearance_content(annotation, free_text_font.map(|font| &font.subset)),
+    );
+    // Keep the content legible in the saved file; the whole document is already compressed
+    // where its producer chose to compress it, and this stream is a few hundred bytes.
+    stream.allows_compression = false;
+    add_object(document, Object::Stream(stream))
+}
+
+pub(crate) fn append_one(
     incremental: &mut IncrementalDocument,
     annotation: &WriteAnnotation,
     free_text_font: Option<&EmbeddedFreeTextFont>,
@@ -745,36 +781,15 @@ fn append_one(
 
     // A `/Text` note's picture is its icon, which the viewer draws from `/Name`; every other
     // directly written kind carries a form XObject here.
-    let mut appearance_id = None;
-    if annotation.kind != WriteAnnotationKind::Text {
-        let mut resources = Dictionary::new();
-        if annotation.kind == WriteAnnotationKind::FreeText
-            && let Some(font) = free_text_font
-        {
-            // The appearance's own font: Type0/Identity-H, subset for this document. `/DA`
-            // keeps Helvetica as the standard-14 fallback for a viewer that ignores `/AP`; the
-            // appearance itself no longer uses WinAnsi and never writes `?`.
-            let mut fonts = Dictionary::new();
-            fonts.set("F1", Object::Reference(font.type0));
-            resources.set("Font", Object::Dictionary(fonts));
-        }
-        let mut stream_dictionary = Dictionary::new();
-        stream_dictionary.set("Type", name("XObject"));
-        stream_dictionary.set("Subtype", name("Form"));
-        stream_dictionary.set("BBox", rect_array(annotation.rect));
-        stream_dictionary.set("Resources", Object::Dictionary(resources));
-        let mut stream = Stream::new(
-            stream_dictionary,
-            appearance_content(annotation, free_text_font.map(|font| &font.subset)),
-        );
-        // Keep the content legible in the saved file; the whole document is already compressed
-        // where its producer chose to compress it, and this stream is a few hundred bytes.
-        stream.allows_compression = false;
-        appearance_id = Some(add_object(
+    let appearance_id = if annotation.kind == WriteAnnotationKind::Text {
+        None
+    } else {
+        Some(add_appearance_object(
             &mut incremental.new_document,
-            Object::Stream(stream),
-        ));
-    }
+            annotation,
+            free_text_font,
+        ))
+    };
 
     let mut dictionary = Dictionary::new();
     dictionary.set("Type", name("Annot"));
@@ -907,8 +922,8 @@ fn append_one(
     Ok(())
 }
 
-/// The page's `/Annots`, cloned into the new revision and ready to append to.
-fn annots_array(
+/// The page's `/Annots`, cloned into the new revision and ready to edit.
+pub(crate) fn annots_array(
     incremental: &mut IncrementalDocument,
     page_id: ObjectId,
 ) -> Result<&mut Vec<Object>> {
@@ -961,14 +976,14 @@ fn annots_array(
     }
 }
 
-fn add_object(document: &mut Document, object: Object) -> ObjectId {
+pub(crate) fn add_object(document: &mut Document, object: Object) -> ObjectId {
     let id = (document.max_id + 1, 0);
     document.max_id = id.0;
     document.objects.insert(id, object);
     id
 }
 
-fn appearance_content(
+pub(crate) fn appearance_content(
     annotation: &WriteAnnotation,
     free_text_font: Option<&AppearanceSubset>,
 ) -> Vec<u8> {
@@ -1243,7 +1258,7 @@ fn is_opening_punctuation(character: char) -> bool {
     )
 }
 
-fn quadding(alignment: AnnotationAlignment) -> i64 {
+pub(crate) fn quadding(alignment: AnnotationAlignment) -> i64 {
     match alignment {
         AnnotationAlignment::Left => 0,
         AnnotationAlignment::Center => 1,
@@ -1310,7 +1325,7 @@ fn arrow_head(start: Point, end: Point, width: f64) -> String {
     )
 }
 
-fn rect_array(rect: Rect) -> Object {
+pub(crate) fn rect_array(rect: Rect) -> Object {
     Object::Array(vec![
         Object::Real(rect.min_x() as f32),
         Object::Real(rect.min_y() as f32),
@@ -1319,7 +1334,7 @@ fn rect_array(rect: Rect) -> Object {
     ])
 }
 
-fn colour_array(color: [u8; 3]) -> Object {
+pub(crate) fn colour_array(color: [u8; 3]) -> Object {
     Object::Array(
         color
             .into_iter()
@@ -1328,7 +1343,7 @@ fn colour_array(color: [u8; 3]) -> Object {
     )
 }
 
-fn line_array(start: Point, end: Point) -> Object {
+pub(crate) fn line_array(start: Point, end: Point) -> Object {
     Object::Array(vec![
         Object::Real(start.x as f32),
         Object::Real(start.y as f32),
@@ -1337,11 +1352,11 @@ fn line_array(start: Point, end: Point) -> Object {
     ])
 }
 
-fn name(value: &str) -> Object {
+pub(crate) fn name(value: &str) -> Object {
     Object::Name(value.as_bytes().to_vec())
 }
 
-fn text_string(value: &str) -> Object {
+pub(crate) fn text_string(value: &str) -> Object {
     if value.is_ascii() {
         Object::String(value.as_bytes().to_vec(), StringFormat::Literal)
     } else {
@@ -1354,11 +1369,11 @@ fn text_string(value: &str) -> Object {
     }
 }
 
-fn deref<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
+pub(crate) fn deref<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
     document.dereference(object).ok().map(|(_, object)| object)
 }
 
-fn number(object: &Object) -> Option<f32> {
+pub(crate) fn number(object: &Object) -> Option<f32> {
     match object {
         Object::Integer(value) => Some(*value as f32),
         Object::Real(value) if value.is_finite() => Some(*value),
@@ -1366,7 +1381,7 @@ fn number(object: &Object) -> Option<f32> {
     }
 }
 
-fn load_document(path: &Path, password: Option<&str>) -> Result<Document> {
+pub(crate) fn load_document(path: &Path, password: Option<&str>) -> Result<Document> {
     let options = LoadOptions {
         password: password.map(str::to_owned),
         ..LoadOptions::default()
@@ -1375,10 +1390,10 @@ fn load_document(path: &Path, password: Option<&str>) -> Result<Document> {
         .map_err(|error| lopdf_error("could not read the document for the stroked writer", error))
 }
 
-fn lopdf_error(action: &str, error: lopdf::Error) -> LyraReaderError {
+pub(crate) fn lopdf_error(action: &str, error: lopdf::Error) -> LyraReaderError {
     LyraReaderError::new(ErrorCode::Io, action).with_detail(error.to_string())
 }
 
-fn io_error(action: &str, path: &Path, error: std::io::Error) -> LyraReaderError {
+pub(crate) fn io_error(action: &str, path: &Path, error: std::io::Error) -> LyraReaderError {
     LyraReaderError::new(ErrorCode::Io, action).with_detail(format!("{}: {error}", path.display()))
 }

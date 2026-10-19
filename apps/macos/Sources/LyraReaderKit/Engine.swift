@@ -896,8 +896,45 @@ public struct AnnotationWriteReport: Sendable, Equatable {
     /// Present only for a replacement; the backup is verified byte-identical.
     public let backupPath: String?
     public let preexistingAnnotationCount: Int
+    /// Identities of every annotation removed from the annotation tree, including the `/IRT`
+    /// replies and `/Popup` window that depended on it. Empty for an append-only save.
+    public var deletedFileIDs: [String] = []
+    /// Replies among `deletedFileIDs`.
+    public var deletedReplyCount: Int = 0
+    /// Popup windows among `deletedFileIDs`.
+    public var deletedPopupCount: Int = 0
+    /// Identities given an `/NM` because the file had none and the edit needed a stable one.
+    public var assignedNames: [String] = []
     public let cleanedTemporaryFiles: Int
     public let sourceBytesPreserved: Bool
+}
+
+/// One annotation the shell asks the engine to **edit** in a PDF that already carries it.
+public struct AnnotationUpdateRequest: Sendable, Equatable {
+    /// The identity `DocumentAnnotation.id` reported (`nm:<NM>` or `fp:<fingerprint>`).
+    public let target: String
+    /// The full replacement model. The writer keeps the file's `/NM`, author, flags, popup,
+    /// parent, reply links and every key this reader does not model.
+    public let annotation: AnnotationWriteRequest
+    /// `/NM` to assign when the file's annotation has none. Required for an `fp:` target.
+    public let assignedName: String?
+
+    public init(target: String, annotation: AnnotationWriteRequest, assignedName: String?) {
+        self.target = target
+        self.annotation = annotation
+        self.assignedName = assignedName
+    }
+}
+
+/// One annotation the shell asks the engine to delete from a PDF that carries it.
+public struct AnnotationDeleteRequest: Sendable, Equatable {
+    public let target: String
+    public let page: Int
+
+    public init(target: String, page: Int) {
+        self.target = target
+        self.page = page
+    }
 }
 
 /// The kind of an AcroForm field, as the engine reports it.
@@ -1446,12 +1483,30 @@ public protocol PDFEngine: AnyObject {
         bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
+    /// Applies additions, edits and deletions to a new PDF at `url`.
+    func saveAnnotationChanges(
+        to url: URL,
+        additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying `annotations` and `bookmarks`; the engine
     /// writes and verifies a backup first and refuses the replacement if the backup cannot be
     /// written.
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
         bookmarks: [BookmarkWriteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport
+    /// Replaces the open document with one carrying additions, edits and deletions, after a
+    /// verified backup.
+    func replaceWithAnnotationChanges(
+        _ additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
     /// The document's AcroForm fields, read from the widget dictionaries and reported in view
@@ -1630,6 +1685,35 @@ public extension PDFEngine {
             domain: "LyraReader",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "This engine cannot write annotations into a PDF"]
+        )
+    }
+
+    func saveAnnotationChanges(
+        to url: URL,
+        additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit annotations in a PDF"]
+        )
+    }
+
+    func replaceWithAnnotationChanges(
+        _ additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot edit annotations in a PDF"]
         )
     }
 
@@ -2289,6 +2373,98 @@ public final class RustEngine: PDFEngine {
         return Self.writeReport(from: report)
     }
 
+    public func saveAnnotationChanges(
+        to url: URL,
+        additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let additionRecords = Self.writeRecords(from: additions)
+        let bookmarkRecords = Self.writeBookmarkRecords(from: bookmarks)
+        let updateRecords = updates.map { update in
+            AnnotationUpdateRecord(
+                target: update.target,
+                annotation: Self.writeRecords(from: [update.annotation])[0],
+                assignName: update.assignedName
+            )
+        }
+        let deleteRecords = deletions.map {
+            AnnotationDeleteRecord(target: $0.target, page: UInt32($0.page))
+        }
+        let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.saveAnnotationChangesCopy(
+                        destination: url.path,
+                        annotations: additionRecords,
+                        bookmarks: bookmarkRecords,
+                        updates: updateRecords,
+                        deletions: deleteRecords,
+                        zoom: Double(zoom)
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        invalidateCachedCopy(at: url)
+        return Self.writeReport(from: report)
+    }
+
+    public func replaceWithAnnotationChanges(
+        _ additions: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
+        updates: [AnnotationUpdateRequest],
+        deletions: [AnnotationDeleteRequest],
+        zoom: CGFloat
+    ) async throws -> AnnotationWriteReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let additionRecords = Self.writeRecords(from: additions)
+        let bookmarkRecords = Self.writeBookmarkRecords(from: bookmarks)
+        let updateRecords = updates.map { update in
+            AnnotationUpdateRecord(
+                target: update.target,
+                annotation: Self.writeRecords(from: [update.annotation])[0],
+                assignName: update.assignedName
+            )
+        }
+        let deleteRecords = deletions.map {
+            AnnotationDeleteRecord(target: $0.target, page: UInt32($0.page))
+        }
+        let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.replaceWithAnnotationChanges(
+                        annotations: additionRecords,
+                        bookmarks: bookmarkRecords,
+                        updates: updateRecords,
+                        deletions: deleteRecords,
+                        zoom: Double(zoom)
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
+        return Self.writeReport(from: report)
+    }
+
     public func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
         bookmarks: [BookmarkWriteRequest],
@@ -2895,6 +3071,10 @@ public final class RustEngine: PDFEngine {
             appendedBytes: report.appendedBytes,
             backupPath: report.backupPath,
             preexistingAnnotationCount: Int(report.preexistingAnnotationCount),
+            deletedFileIDs: report.deletedFileIds,
+            deletedReplyCount: Int(report.deletedReplyCount),
+            deletedPopupCount: Int(report.deletedPopupCount),
+            assignedNames: report.assignedNames,
             cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles),
             sourceBytesPreserved: report.sourceBytesPreserved
         )

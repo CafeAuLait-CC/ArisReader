@@ -12,9 +12,11 @@ opens real PDFs, rasterizes tiled pages off the main thread, and supports select
 tabs, sidecar highlights/underlines/strikeouts/notes/ink/shapes, citation/figure/table/algorithm previews, and
 document metadata recognition with per-field provenance plus BibTeX export.
 Those annotations can be written back into a PDF: saving an annotated copy, or replacing the
-original after a verified backup, appends real PDF annotations with quads or stroke geometry,
-colour, opacity, author and date through an incremental save that leaves every pre-existing
-annotation byte-identical.
+original after a verified backup, adds, edits and deletes real PDF annotations through an
+incremental save that leaves every untouched pre-existing annotation byte-identical. Annotations
+another application wrote (Preview, Acrobat, anything) are editable and deletable too: they are
+identified by `/NM` or a stable fallback, adopted into the same model, and written back without
+losing their identity, popup, parent, reply links or flags.
 Replacing the original also removes exactly the sidecar entries it saved, so nothing appears twice;
 a saved copy carries no sidecar and shows each annotation once, from the file. An eraser removes
 whole ink strokes only: a drag removes every stroke its path passes within reach of, the stroke a
@@ -55,9 +57,10 @@ panels, a per-window Back for preview jumps, transparent figure crops and text-o
 references; paper metadata with BibTeX export; annotation export as Markdown or CSV; a persistent index
 cache keyed by the document's bytes; and the AI assistant described above.
 Known gaps are listed in the project's design notes: bookmarks are stored beside the PDF but not written into
-its outline; annotations the PDF itself carries cannot be deleted, because the writer only appends; partial
-stroke erasing, stamps and signature images, in-place text editing, AI document chat and region questions,
-and the Linux and Windows shells remain.
+its outline; text-markup geometry cannot be moved (it belongs to the text selection); `/Squiggly`, stamps
+and annotations of a kind this reader does not model can be deleted but not edited; partial stroke
+erasing, signature images, in-place text editing, AI document chat and region questions, and the Linux
+and Windows shells remain.
 
 ---
 
@@ -175,6 +178,34 @@ author and date, and every annotation the file already carried must read back un
 sidecar's per-entry compatibility rules are untouched; a replace removes exactly the entries it
 saved and preserves foreign entries, bookmarks and their order. If the sidecar update fails after
 the PDF was written, reopening reconciles by `/NM` and shows the PDF's copy only.
+
+**Editing and deleting annotations the file carries.** A highlight, underline, strikeout, sticky
+note, free text, ink stroke, square, circle or line another application wrote is *adopted* into
+the editable model when the reader selects it (a click on markup or a stroke, a double-click on a
+note or text box, or the sidebar row). Adoption is a pending sidecar entry like any other: the PDF
+on disk is untouched until an explicit save. The annotation is identified by `/NM`; when the file
+carries none, a stable fingerprint is used and the writer assigns the sidecar's identity as `/NM`
+on the first save, so later edits have a name to find. Editable fields are `/Contents`, `/C`,
+`/CA`, `/M` and, where the kind has geometry the reader owns, the geometry: sticky notes, text
+boxes, ink and shapes can be moved, a text box can be resized and reflowed, and a text mark's
+`/Rect`/`/QuadPoints` are deliberately left alone because its geometry is the text selection's.
+Replies are not edited directly; editing the parent leaves the `/IRT` chain, `/Popup`, `/Parent`,
+`/F` flags, `/T`, `/Subj` and every unknown key untouched.
+
+Deletion removes the annotation's reference from the page's `/Annots` in the same incremental
+revision and takes its `/IRT` replies (transitively) and its `/Popup` window with it, so no reply
+is left pointing at nothing. The objects remain in the file as unreachable bytes — an incremental
+update cannot free an object — but they are no longer part of the document's annotation tree; a
+full rewrite would drop them at the cost of invalidating signatures. Undo restores a deletion
+made in the session before any save.
+
+What is regenerated: a text mark's stale `/AP` is removed when its colour or opacity changes, so
+viewers synthesize the new mark from `/C` (a comment-only edit keeps the producer's `/AP`).
+`/FreeText` and the stroked kinds get a fresh appearance stream when a visual field changes; a
+comment-only edit on ink or a shape keeps the producer's own appearance. `/Text` note appearances
+are left untouched (their icon comes from `/Name`). What is preserved: `/NM` (or an assigned one),
+`/Popup`, `/Parent`, `/IRT`, `/F`, `/T`, `/Subj`, `/Name`, `/Open`, `/IC`, `/DS` and every key this
+reader does not model.
 
 **Placing a text box.** With the Text Box tool armed, a double-click places a one-line box whose
 top-left corner — and caret — is the click point, so a box placed beside a paragraph grows to the

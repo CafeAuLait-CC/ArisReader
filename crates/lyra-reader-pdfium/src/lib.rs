@@ -43,6 +43,8 @@
 //!    rpath (`@executable_path/../Frameworks`) when running from `LyraReader.app`.
 
 #[cfg(feature = "pdfium")]
+mod annotation_edit;
+#[cfg(feature = "pdfium")]
 mod annotations;
 #[cfg(feature = "pdfium")]
 mod appearance_font;
@@ -67,6 +69,10 @@ mod writeback;
 #[cfg(feature = "pdfium")]
 mod xmp;
 
+#[cfg(feature = "pdfium")]
+pub use annotation_edit::{
+    AnnotationChanges, AnnotationDelete, AnnotationUpdate, AppliedChangesReport,
+};
 #[cfg(feature = "pdfium")]
 pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind};
 #[cfg(feature = "pdfium")]
@@ -107,7 +113,7 @@ pub use stub::PdfiumBackend;
 #[cfg(feature = "pdfium")]
 pub use writeback::{
     SaveMode, SaveReport, cleanup_interrupted_save_temporaries, interrupted_save_note,
-    interrupted_save_temporaries, save_annotated_pdf, suggested_copy_path,
+    interrupted_save_temporaries, save_annotated_pdf, save_annotation_changes, suggested_copy_path,
 };
 
 /// Environment variable that overrides the PDFium library location.

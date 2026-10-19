@@ -63,6 +63,9 @@
 //! [`AnnotationReader`], which serialise on `PDFIUM_LOCK`. The file-system half of this module
 //! holds no lock.
 
+use crate::annotation_edit::{
+    AnnotationChanges, AnnotationDelete, AnnotationUpdate, apply_changes, verify_changes,
+};
 use crate::annotations::{
     AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind,
 };
@@ -110,6 +113,16 @@ pub struct SaveReport {
     /// Outline nodes the document already had outside the reader's subtree; all verified
     /// unchanged.
     pub preexisting_outline_entry_count: usize,
+    /// Identities of every annotation removed from the annotation tree, including replies and
+    /// popups removed because they depended on a deleted annotation. Empty for an append-only
+    /// save.
+    pub deleted_ids: Vec<String>,
+    /// Replies among [`Self::deleted_ids`].
+    pub deleted_reply_count: usize,
+    /// Popup windows among [`Self::deleted_ids`].
+    pub deleted_popup_count: usize,
+    /// Ids given an `/NM` because the file had none and the edit needed a stable identity.
+    pub assigned_names: Vec<String>,
     /// Stale `*.lyra-reader-save-*.tmp` files removed from the destination directory before this save.
     pub cleaned_temporaries: usize,
     /// True when the output's prefix equals the source byte-for-byte. Always true on `Ok`.
@@ -162,6 +175,32 @@ const MAX_ID_BYTES: usize = 128;
 
 /// Appends `annotations` to `source` and writes the result to `destination`.
 ///
+/// The append-only form of [`save_annotation_changes`], kept because it is the operation every
+/// caller before cross-reader editing used.
+pub fn save_annotated_pdf(
+    source: &Path,
+    destination: &Path,
+    annotations: &[WriteAnnotation],
+    bookmarks: &[WriteBookmark],
+    password: Option<&str>,
+    mode: SaveMode,
+) -> Result<SaveReport> {
+    save_annotation_changes(
+        source,
+        destination,
+        &AnnotationChanges {
+            additions: annotations.to_vec(),
+            ..AnnotationChanges::default()
+        },
+        bookmarks,
+        password,
+        mode,
+    )
+}
+
+/// Applies additions, edits and deletions to annotations in `source` and writes the result to
+/// `destination`.
+///
 /// Does nothing to `source` for [`SaveMode::Copy`]. For [`SaveMode::ReplaceOriginal`],
 /// `destination` must name the same file as `source`, and a verified backup is written before
 /// the original is replaced.
@@ -171,18 +210,21 @@ const MAX_ID_BYTES: usize = 128;
 /// * On `Err`, `source` is untouched unless the error says the rename itself failed — and even
 ///   then the original is still the old inode, because rename is the last step.
 /// * On `Ok`, `destination` has been reopened and verified to contain every requested
-///   annotation exactly once, every annotation that was already in the file unchanged, and the
-///   source's bytes as a prefix.
+///   annotation exactly once, every annotation the save did not edit or delete unchanged, the
+///   deletions absent (with their replies and popups), and the source's bytes as a prefix.
 /// * Temporary files are removed on every error path on a best-effort basis; leftovers are
 ///   cleaned by the next save and reported by [`interrupted_save_note`].
-pub fn save_annotated_pdf(
+pub fn save_annotation_changes(
     source: &Path,
     destination: &Path,
-    annotations: &[WriteAnnotation],
+    changes: &AnnotationChanges,
     bookmarks: &[WriteBookmark],
     password: Option<&str>,
     mode: SaveMode,
 ) -> Result<SaveReport> {
+    let annotations = &changes.additions;
+    let (updates, deletions): (&[AnnotationUpdate], &[AnnotationDelete]) =
+        (&changes.updates, &changes.deletions);
     let source = fs::canonicalize(source)
         .map_err(|error| io_error("could not resolve the document being saved", source, error))?;
     if !source.is_file() {
@@ -230,9 +272,18 @@ pub fn save_annotated_pdf(
     // any file is created. The source handle stays open for the whole operation.
     let mut appender = AnnotationAppender::open(&source, password)?;
     let page_count = appender.page_count();
-    validate(annotations, page_count)?;
+    if !annotations.is_empty() {
+        validate(annotations, page_count)?;
+    }
+    validate_updates(updates, page_count)?;
+    validate_deletions(deletions)?;
     validate_bookmarks(bookmarks, page_count)?;
-    if annotations.is_empty() && bookmarks.is_empty() && !has_bookmark_subtree(&source, password)? {
+    if annotations.is_empty()
+        && updates.is_empty()
+        && deletions.is_empty()
+        && bookmarks.is_empty()
+        && !has_bookmark_subtree(&source, password)?
+    {
         return Err(LyraReaderError::new(
             ErrorCode::InvalidArgument,
             "there are no annotations or bookmarks to save",
@@ -240,8 +291,10 @@ pub fn save_annotated_pdf(
     }
     // Two writers, one save contract. PDFium creates the quad-based markup kinds; the rest need
     // `/BS`, `/L`, `/Name`, `/DA`, `/Q` or a real appearance XObject, none of which its C API can
-    // write (see `geometry_write`). Both write into the same temporary file and are verified
-    // together before the rename.
+    // write (see `geometry_write`). Edits and deletions always go through the incremental lopdf
+    // writer: PDFium has no accessor that preserves a foreign annotation's unknown keys, and its
+    // removal API cannot take a reply chain with it. Both write into the same temporary file and
+    // are verified together before the rename.
     let (pdfium_annotations, direct_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
         annotations
             .iter()
@@ -250,6 +303,8 @@ pub fn save_annotated_pdf(
 
     let preexisting = read_annotations(&source, password, page_count)?;
     let preexisting_annotation_count: usize = preexisting.iter().map(Vec::len).sum();
+    // Additions must not collide with an identity the file already has. Edits and deletions name
+    // existing identities by definition.
     reject_identities_already_in_the_pdf(&preexisting, annotations)?;
 
     // A backup must exist and be byte-identical before the original can be replaced.
@@ -266,11 +321,15 @@ pub fn save_annotated_pdf(
             appender.add(annotation)?;
         }
         let mut written_bytes = if pdfium_annotations.is_empty() {
+            // No PDFium update: the direct writer starts from the source, so this empty temp
+            // file is only the destination it will truncate and fill.
+            drop(file);
             0
         } else {
             appender.save_incremental(file)?
         };
-        if !direct_annotations.is_empty() {
+        let mut applied = crate::annotation_edit::AppliedChangesReport::default();
+        if !direct_annotations.is_empty() || !updates.is_empty() || !deletions.is_empty() {
             // With no PDFium update the temporary file is still empty; the direct writer starts
             // from the source. With one, it starts from the already-appended file, so the final
             // document has the source and the PDFium update as its prefix.
@@ -279,21 +338,41 @@ pub fn save_annotated_pdf(
             } else {
                 temp.path()
             };
-            append_direct_annotations(base, temp.path(), &direct_annotations, password)?;
+            if updates.is_empty() && deletions.is_empty() {
+                append_direct_annotations(base, temp.path(), &direct_annotations, password)?;
+            } else {
+                let direct_changes = AnnotationChanges {
+                    additions: direct_annotations.clone(),
+                    updates: updates.to_vec(),
+                    deletions: deletions.to_vec(),
+                };
+                applied = apply_changes(base, temp.path(), &direct_changes, password)?;
+            }
+            written_bytes = fs::metadata(temp.path())
+                .map_err(|error| io_error("could not measure the saved file", temp.path(), error))?
+                .len();
         }
         // Bookmarks live in the outline, which PDFium's C API cannot write; the same direct
         // incremental writer appends them to the file the annotations produced. An empty list
         // removes a subtree an earlier save wrote, so a reader who deletes the last bookmark and
         // saves again gets a file without it.
         let outline_report = {
-            let base = if pdfium_annotations.is_empty() && direct_annotations.is_empty() {
+            let base = if pdfium_annotations.is_empty()
+                && direct_annotations.is_empty()
+                && updates.is_empty()
+                && deletions.is_empty()
+            {
                 source.as_path()
             } else {
                 temp.path()
             };
             append_bookmarks(base, temp.path(), bookmarks, password)?
         };
-        if !direct_annotations.is_empty() || outline_report.is_some() {
+        if !direct_annotations.is_empty()
+            || !updates.is_empty()
+            || !deletions.is_empty()
+            || outline_report.is_some()
+        {
             written_bytes = fs::metadata(temp.path())
                 .map_err(|error| io_error("could not measure the saved file", temp.path(), error))?
                 .len();
@@ -312,8 +391,9 @@ pub fn save_annotated_pdf(
         verify_prefix(&source, temp.path(), source_len)?;
 
         let saved = read_annotations(temp.path(), password, page_count)?;
-        verify_all(&preexisting, &saved, annotations)?;
-        verify_direct_annotations(temp.path(), annotations, password)?;
+        verify_all(&preexisting, &saved, changes, &applied.deleted_ids)?;
+        verify_direct_annotations(temp.path(), &direct_annotations, password)?;
+        verify_changes(&source, temp.path(), changes, password)?;
         let outline = verify_outline(
             &source,
             temp.path(),
@@ -352,13 +432,21 @@ pub fn save_annotated_pdf(
 
         Ok(SaveReport {
             destination: destination.clone(),
-            written_ids: annotations.iter().map(|a| a.id.clone()).collect(),
+            written_ids: annotations
+                .iter()
+                .map(|annotation| annotation.id.clone())
+                .chain(updates.iter().map(|update| update.values.id.clone()))
+                .collect(),
             appended_bytes: written_bytes.saturating_sub(source_len),
             backup_path: backup_path.clone(),
             preexisting_annotation_count,
             written_bookmark_ids: outline.written_ids,
             bookmark_outline_title: outline.title,
             preexisting_outline_entry_count: outline.preexisting_entry_count,
+            deleted_ids: applied.deleted_ids,
+            deleted_reply_count: applied.deleted_reply_count,
+            deleted_popup_count: applied.deleted_popup_count,
+            assigned_names: applied.assigned_names,
             cleaned_temporaries,
             source_bytes_preserved: true,
         })
@@ -977,6 +1065,104 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
     Ok(())
 }
 
+fn validate_updates(updates: &[AnnotationUpdate], page_count: u32) -> Result<()> {
+    if updates.len() > MAX_ANNOTATIONS {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!("{MAX_ANNOTATIONS} annotations is the most one save can edit"),
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut targets = HashSet::new();
+    for update in updates {
+        // An update carries the full replacement model, so it has to satisfy every rule a new
+        // annotation does (row counts, geometry, opacity, dates).
+        validate(std::slice::from_ref(&update.values), page_count)?;
+        let target = &update.target;
+        if target.is_empty() || target.len() > 512 || target.contains('\0') {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "an edited annotation's identity is empty, too long or contains a NUL",
+            ));
+        }
+        if !target.starts_with("nm:") && !target.starts_with("fp:") {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "an edited annotation's identity must be nm:<name> or fp:<fingerprint>",
+            )
+            .with_detail(target.clone()));
+        }
+        if !targets.insert(target.clone()) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!("the same annotation is edited twice in one save: {target:?}"),
+            ));
+        }
+        if !ids.insert(update.values.id.clone()) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "two edited annotations in one save share the entry identity {:?}",
+                    update.values.id
+                ),
+            ));
+        }
+        if target.starts_with("fp:") {
+            let Some(name) = update.assign_name.as_deref() else {
+                return Err(LyraReaderError::new(
+                    ErrorCode::InvalidArgument,
+                    "an annotation without /NM needs a name before it can be edited",
+                )
+                .with_detail(target.clone()));
+            };
+            if name.is_empty()
+                || name.len() > MAX_ID_BYTES
+                || !name.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(LyraReaderError::new(
+                    ErrorCode::InvalidArgument,
+                    "the name assigned to an annotation without /NM must be 1–128 printable ASCII characters",
+                )
+                .with_detail(format!("id: {name:?}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_deletions(deletions: &[AnnotationDelete]) -> Result<()> {
+    if deletions.len() > MAX_ANNOTATIONS {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!("{MAX_ANNOTATIONS} annotations is the most one save can delete"),
+        ));
+    }
+    let mut targets = HashSet::new();
+    for deletion in deletions {
+        let target = &deletion.target;
+        if target.is_empty() || target.len() > 512 || target.contains('\0') {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "a deleted annotation's identity is empty, too long or contains a NUL",
+            ));
+        }
+        if !target.starts_with("nm:") && !target.starts_with("fp:") {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "a deleted annotation's identity must be nm:<name> or fp:<fingerprint>",
+            )
+            .with_detail(target.clone()));
+        }
+        if !targets.insert(target.clone()) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!("the same annotation is deleted twice in one save: {target:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_rect(rect: &lyra_reader_core::Rect, id: &str, what: &str) -> Result<()> {
     let values = [
         rect.origin.x,
@@ -1094,8 +1280,10 @@ fn read_annotations(
 fn verify_all(
     preexisting: &[Vec<RawAnnotation>],
     saved: &[Vec<RawAnnotation>],
-    annotations: &[WriteAnnotation],
+    changes: &AnnotationChanges,
+    removed_by_writer: &[String],
 ) -> Result<()> {
+    let annotations = &changes.additions;
     let mut saved_by_id: HashMap<&str, (&RawAnnotation, usize)> = HashMap::new();
     for (page, records) in saved.iter().enumerate() {
         for record in records {
@@ -1110,8 +1298,72 @@ fn verify_all(
         }
     }
 
+    // The writer's removal plan is the authority on what a deletion took with it: a parent's
+    // replies are not named in the request, but they are gone and must not be expected back.
+    let deleted: HashSet<&str> = changes
+        .deletions
+        .iter()
+        .map(|deletion| deletion.target.as_str())
+        .chain(removed_by_writer.iter().map(String::as_str))
+        .collect();
+    let mut updated_by_target: HashMap<&str, &AnnotationUpdate> = HashMap::new();
+    for update in &changes.updates {
+        updated_by_target.insert(update.target.as_str(), update);
+    }
+
+    let mut deleted_preexisting = 0usize;
     for (page, records) in preexisting.iter().enumerate() {
         for original in records {
+            let update = updated_by_target.get(original.id.as_str());
+            if let Some(update) = update {
+                let identity = if update.target.starts_with("nm:") {
+                    update.target.clone()
+                } else if let Some(name) = update.assign_name.as_deref() {
+                    format!("nm:{name}")
+                } else {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "an edited annotation without /NM was saved without a name",
+                    )
+                    .with_detail(update.target.clone()));
+                };
+                let Some((record, saved_page)) = saved_by_id.get(identity.as_str()) else {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "the saved file lost an annotation the save edited",
+                    )
+                    .with_detail(format!("{} (page {page})", update.target)));
+                };
+                if *saved_page != page {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "an edited annotation moved to another page",
+                    )
+                    .with_detail(format!("{}: {page} -> {saved_page}", update.target)));
+                }
+                let mut expected = update.values.clone();
+                // An edit keeps the file's author, geometry policy and blend mode. A text mark's
+                // geometry is the text selection's, not the editor's; `values` carries it only so
+                // the request is self-contained.
+                expected.author = original.author.clone();
+                if expected.kind.uses_pdfium() {
+                    expected.rect = original.rect;
+                    expected.quads = original.quads.clone();
+                }
+                verify_one(record, &expected, Some(original))?;
+                continue;
+            }
+            if deleted.contains(original.id.as_str()) {
+                deleted_preexisting += 1;
+                if saved_by_id.contains_key(original.id.as_str()) {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "a deleted annotation is still in the saved file",
+                    )
+                    .with_detail(format!("{} (page {page})", original.id)));
+                }
+                continue;
+            }
             let Some((saved_original, saved_page)) = saved_by_id.get(original.id.as_str()) else {
                 return Err(LyraReaderError::new(
                     ErrorCode::Internal,
@@ -1132,7 +1384,22 @@ fn verify_all(
         }
     }
 
-    let expected = preexisting.iter().map(Vec::len).sum::<usize>() + annotations.len();
+    // A reply may not point at an annotation the save removed, even if the reply itself survived
+    // (which the count below would not catch).
+    for record in saved.iter().flatten() {
+        if let Some(parent) = record.parent_id.as_deref()
+            && deleted.contains(parent)
+        {
+            return Err(LyraReaderError::new(
+                ErrorCode::Internal,
+                "a saved reply points at an annotation the save deleted",
+            )
+            .with_detail(format!("{} -> {parent}", record.id)));
+        }
+    }
+
+    let expected =
+        preexisting.iter().map(Vec::len).sum::<usize>() - deleted_preexisting + annotations.len();
     let actual: usize = saved.iter().map(Vec::len).sum();
     if actual != expected {
         return Err(LyraReaderError::new(
@@ -1160,12 +1427,16 @@ fn verify_all(
                 occurrences.len()
             )));
         }
-        verify_one(occurrences[0], annotation)?;
+        verify_one(occurrences[0], annotation, None)?;
     }
     Ok(())
 }
 
-fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> {
+fn verify_one(
+    record: &RawAnnotation,
+    expected: &WriteAnnotation,
+    original: Option<&RawAnnotation>,
+) -> Result<()> {
     let mismatch = |field: &str, detail: String| {
         LyraReaderError::new(
             ErrorCode::Internal,
@@ -1259,20 +1530,24 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
             format!("expected {alpha}, got {opacity}"),
         ));
     }
-    // The writer deliberately does not set /BM: a highlight/underline with no /BM is
-    // multiplied by the reader and by every renderer that implements table 164's default for
-    // these kinds; a note is alpha-over. Assert the effective blend, not the absence of a key.
-    let expected_blend = match expected.kind {
-        WriteAnnotationKind::Highlight
-        | WriteAnnotationKind::Underline
-        | WriteAnnotationKind::StrikeOut => lyra_reader_core::AnnotationBlend::Multiply,
-        WriteAnnotationKind::Text
-        | WriteAnnotationKind::FreeText
-        | WriteAnnotationKind::Ink
-        | WriteAnnotationKind::Square
-        | WriteAnnotationKind::Circle
-        | WriteAnnotationKind::Line => lyra_reader_core::AnnotationBlend::Normal,
-    };
+    // The writer deliberately does not set /BM on a new annotation: a highlight/underline with
+    // no /BM is multiplied by the reader and by every renderer that implements table 164's
+    // default for these kinds; a note is alpha-over. An edit inherits the file's own /BM instead
+    // of changing it, so an edit is checked against the blend the source reported.
+    let expected_blend = original.map_or_else(
+        || match expected.kind {
+            WriteAnnotationKind::Highlight
+            | WriteAnnotationKind::Underline
+            | WriteAnnotationKind::StrikeOut => lyra_reader_core::AnnotationBlend::Multiply,
+            WriteAnnotationKind::Text
+            | WriteAnnotationKind::FreeText
+            | WriteAnnotationKind::Ink
+            | WriteAnnotationKind::Square
+            | WriteAnnotationKind::Circle
+            | WriteAnnotationKind::Line => lyra_reader_core::AnnotationBlend::Normal,
+        },
+        |original| original.blend.clone(),
+    );
     if record.blend != expected_blend {
         return Err(mismatch(
             "blend",
@@ -1326,10 +1601,15 @@ fn verify_one(record: &RawAnnotation, expected: &WriteAnnotation) -> Result<()> 
             ));
         }
     }
-    if !record.visible {
+    let expected_visible = original.is_none_or(|original| original.visible);
+    if record.visible != expected_visible {
         return Err(mismatch(
             "visible",
-            "the written annotation is hidden".into(),
+            if expected_visible {
+                "the written annotation is hidden".into()
+            } else {
+                "the edit made a hidden annotation visible".into()
+            },
         ));
     }
     Ok(())
@@ -1719,6 +1999,7 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> LyraReaderError
 mod tests {
     use super::*;
     use crate::test_support::scratch;
+    use lopdf::{Dictionary, Document, Object};
     use lyra_reader_core::{AnnotationAlignment, Rect};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1918,7 +2199,7 @@ mod tests {
                 .filter(|record| record.id == identity)
                 .collect();
             assert_eq!(matches.len(), 1, "{} appears exactly once", expected.id);
-            verify_one(matches[0], &expected).expect("the written annotation verifies");
+            verify_one(matches[0], &expected, None).expect("the written annotation verifies");
         }
         // The source's own annotations are byte-for-byte the same records they were.
         let before = read_annotations(&source, None, 2).expect("read source");
@@ -2571,6 +2852,418 @@ mod tests {
             in_destination.is_err(),
             "an identity already in the file must not be duplicated"
         );
+    }
+
+    fn read_all(path: &Path, page_count: u32) -> Vec<RawAnnotation> {
+        read_annotations(path, None, page_count)
+            .expect("read annotations")
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn update_from(record: &RawAnnotation, contents: &str, colour: [u8; 3]) -> AnnotationUpdate {
+        AnnotationUpdate {
+            target: record.id.clone(),
+            assign_name: Some(record.id.trim_start_matches("fp:").to_string()),
+            values: WriteAnnotation {
+                id: format!("edit-{}", record.id),
+                page: record.page,
+                kind: match &record.kind {
+                    RawAnnotationKind::Highlight => WriteAnnotationKind::Highlight,
+                    RawAnnotationKind::Underline => WriteAnnotationKind::Underline,
+                    RawAnnotationKind::Strikeout => WriteAnnotationKind::StrikeOut,
+                    RawAnnotationKind::Text => WriteAnnotationKind::Text,
+                    RawAnnotationKind::FreeText => WriteAnnotationKind::FreeText,
+                    RawAnnotationKind::Ink => WriteAnnotationKind::Ink,
+                    RawAnnotationKind::Square => WriteAnnotationKind::Square,
+                    RawAnnotationKind::Circle => WriteAnnotationKind::Circle,
+                    RawAnnotationKind::Line => WriteAnnotationKind::Line,
+                    other => panic!("no write kind for {other:?}"),
+                },
+                rect: record.rect,
+                quads: record.quads.clone(),
+                ink_paths: record.ink_paths.clone(),
+                line: record.line,
+                line_arrow: record.line_arrow,
+                border_width: record.border_width.unwrap_or(1.0),
+                font_size: record.font_size_pt.unwrap_or(14.0),
+                alignment: record.alignment,
+                color: colour,
+                opacity: 1.0,
+                contents: Some(contents.to_string()),
+                author: None,
+                modified: Some("D:20261019120000-07'00'".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn a_foreign_highlight_can_be_edited_without_detaching_its_replies() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("edit-foreign-highlight");
+        let source =
+            crate::test_support::copy_fixture(&directory, "annotated-replies.pdf", "source.pdf");
+        let destination = directory.join("edited.pdf");
+        let original = fs::read(&source).expect("read source");
+        let before = read_all(&source, 2);
+        let parent = before
+            .iter()
+            .find(|record| record.id == "nm:parent-highlight")
+            .expect("the fixture has the threaded highlight");
+        let replies_before: Vec<&RawAnnotation> = before
+            .iter()
+            .filter(|record| record.parent_id.as_deref() == Some("nm:parent-highlight"))
+            .collect();
+        assert_eq!(replies_before.len(), 3, "fixture reply count");
+
+        let update = update_from(parent, "Edited by LyraReader.", [12, 200, 40]);
+        let report = save_annotation_changes(
+            &source,
+            &destination,
+            &AnnotationChanges {
+                additions: Vec::new(),
+                updates: vec![update],
+                deletions: Vec::new(),
+            },
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("edit the foreign highlight");
+        assert!(
+            fs::read(&destination)
+                .expect("saved")
+                .starts_with(&original)
+        );
+        assert_eq!(report.written_ids.len(), 1);
+        assert!(report.deleted_ids.is_empty());
+
+        let after = read_all(&destination, 2);
+        let edited = after
+            .iter()
+            .find(|record| record.id == "nm:parent-highlight")
+            .expect("the highlight keeps its /NM");
+        assert_eq!(edited.contents.as_deref(), Some("Edited by LyraReader."));
+        assert_eq!(
+            edited
+                .color
+                .map(|color| [color.red, color.green, color.blue]),
+            Some([12, 200, 40])
+        );
+        assert_eq!(edited.author.as_deref(), Some("Reviewer A"));
+        // The reply chain is untouched and still points at the same identity.
+        for reply in &replies_before {
+            let saved = after
+                .iter()
+                .find(|record| record.id == reply.id)
+                .unwrap_or_else(|| panic!("reply {} disappeared", reply.id));
+            assert_eq!(saved.parent_id.as_deref(), Some("nm:parent-highlight"));
+            assert_eq!(saved.contents, reply.contents);
+        }
+        // Every annotation the save did not edit is byte-for-byte the same model.
+        for record in &before {
+            if record.id == "nm:parent-highlight" {
+                continue;
+            }
+            let saved = after
+                .iter()
+                .find(|saved| saved.id == record.id)
+                .unwrap_or_else(|| panic!("{} disappeared", record.id));
+            assert_eq!(saved, record);
+        }
+    }
+
+    #[test]
+    fn deleting_a_foreign_parent_removes_its_reply_thread() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("delete-foreign-thread");
+        let source =
+            crate::test_support::copy_fixture(&directory, "annotated-replies.pdf", "source.pdf");
+        let destination = directory.join("deleted.pdf");
+        let before = read_all(&source, 2);
+        let doomed: Vec<String> = before
+            .iter()
+            .filter(|record| {
+                record.id == "nm:parent-highlight"
+                    || record.parent_id.as_deref() == Some("nm:parent-highlight")
+                    || record.id == "nm:reply-two"
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        assert!(doomed.len() >= 5);
+
+        let report = save_annotation_changes(
+            &source,
+            &destination,
+            &AnnotationChanges {
+                additions: Vec::new(),
+                updates: Vec::new(),
+                deletions: vec![AnnotationDelete {
+                    target: "nm:parent-highlight".to_string(),
+                }],
+            },
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("delete the thread root");
+        assert_eq!(report.deleted_reply_count, 4);
+        for identity in &doomed {
+            assert!(
+                report.deleted_ids.contains(identity),
+                "{identity} should be part of the removal report"
+            );
+        }
+
+        let after = read_all(&destination, 2);
+        for identity in &doomed {
+            assert!(
+                !after.iter().any(|record| record.id == *identity),
+                "{identity} survived the deletion"
+            );
+        }
+        assert!(
+            after
+                .iter()
+                .all(|record| record.parent_id.as_deref() != Some("nm:parent-highlight")),
+            "no reply still points at the deleted parent"
+        );
+        // A cross-page reply belongs to the same thread and goes with it; an independent note
+        // and a reply to a *different* (hidden) parent are untouched.
+        assert!(
+            !after
+                .iter()
+                .any(|record| record.id == "nm:reply-cross-page")
+        );
+        assert!(after.iter().any(|record| record.id == "nm:parent-note"));
+        assert!(after.iter().any(|record| record.id == "nm:reply-to-hidden"));
+    }
+
+    #[test]
+    fn deleting_an_annotation_removes_its_popup_window() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("delete-popup");
+        let source = crate::test_support::copy_fixture(
+            &directory,
+            "annotated-replies.pdf",
+            "with-popup.pdf",
+        );
+        // Give the highlighted note a popup window, the way a viewer writes an open note.
+        let (popup_identity, popup_number) = {
+            let mut document = Document::load(&source).expect("load fixture for popup");
+            let page_id = *document.get_pages().get(&1).expect("page one");
+            let page = document.get_dictionary(page_id).expect("page dict");
+            let annots = page
+                .get(b"Annots")
+                .and_then(Object::as_array)
+                .expect("page annots");
+            let parent_id = annots
+                .iter()
+                .filter_map(|object| object.as_reference().ok())
+                .find(|id| {
+                    document
+                        .get_dictionary(*id)
+                        .ok()
+                        .and_then(|dict| dict.get(b"NM").ok())
+                        .and_then(|object| object.as_str().ok())
+                        == Some(b"parent-highlight".as_slice())
+                })
+                .expect("thread parent");
+            let (popup_id, popup_number) = (document.max_id + 1, 0u16);
+            document.max_id = popup_id;
+            let mut popup = Dictionary::new();
+            popup.set("Type", Object::Name(b"Annot".to_vec()));
+            popup.set("Subtype", Object::Name(b"Popup".to_vec()));
+            popup.set(
+                "Rect",
+                Object::Array(vec![
+                    Object::Integer(400),
+                    Object::Integer(500),
+                    Object::Integer(600),
+                    Object::Integer(650),
+                ]),
+            );
+            popup.set("Parent", Object::Reference(parent_id));
+            popup.set(
+                "NM",
+                Object::String(
+                    b"popup-for-highlight".to_vec(),
+                    lopdf::StringFormat::Literal,
+                ),
+            );
+            document
+                .objects
+                .insert((popup_id, popup_number), Object::Dictionary(popup));
+            document
+                .get_dictionary_mut(page_id)
+                .expect("page dict")
+                .get_mut(b"Annots")
+                .and_then(Object::as_array_mut)
+                .expect("annots")
+                .push(Object::Reference((popup_id, popup_number)));
+            let mut parent = document
+                .get_dictionary_mut(parent_id)
+                .expect("parent dict")
+                .clone();
+            parent.set("Popup", Object::Reference((popup_id, popup_number)));
+            document
+                .objects
+                .insert(parent_id, Object::Dictionary(parent));
+            let mut file = File::create(&source).expect("write fixture with popup");
+            document
+                .save_to(&mut file)
+                .expect("save fixture with popup");
+            (
+                "nm:popup-for-highlight".to_string(),
+                (popup_id, popup_number),
+            )
+        };
+
+        let destination = directory.join("deleted.pdf");
+        let report = save_annotation_changes(
+            &source,
+            &destination,
+            &AnnotationChanges {
+                additions: Vec::new(),
+                updates: Vec::new(),
+                deletions: vec![AnnotationDelete {
+                    target: "nm:parent-highlight".to_string(),
+                }],
+            },
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("delete an annotation with a popup");
+        assert_eq!(report.deleted_popup_count, 1);
+        assert!(report.deleted_ids.contains(&popup_identity));
+
+        let saved = Document::load(&destination).expect("load saved");
+        for page_id in saved.get_pages().values() {
+            let page = saved.get_dictionary(*page_id).expect("page");
+            for object in page
+                .get(b"Annots")
+                .ok()
+                .and_then(|object| object.as_array().ok())
+                .into_iter()
+                .flatten()
+            {
+                assert_ne!(
+                    object.as_reference().ok(),
+                    Some(popup_number),
+                    "the popup is still in a page's /Annots"
+                );
+            }
+        }
+        let _ = popup_identity;
+        // The object may remain in the file as unreachable bytes (an incremental update cannot
+        // free it), but no annotation that is still part of a page may open it as a popup.
+        for page_id in saved.get_pages().values() {
+            let page = saved.get_dictionary(*page_id).expect("page");
+            for object in page
+                .get(b"Annots")
+                .ok()
+                .and_then(|object| object.as_array().ok())
+                .into_iter()
+                .flatten()
+            {
+                let Some(annotation) = object
+                    .as_reference()
+                    .ok()
+                    .and_then(|id| saved.get_dictionary(id).ok())
+                else {
+                    continue;
+                };
+                assert_ne!(
+                    annotation.get(b"Popup").and_then(Object::as_reference).ok(),
+                    Some(popup_number),
+                    "a surviving annotation still points at the deleted popup"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_annotation_without_nm_gets_a_stable_name_when_edited() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("edit-fingerprint");
+        let source =
+            crate::test_support::copy_fixture(&directory, "annotated-notes.pdf", "source.pdf");
+        let before = read_all(&source, 1);
+        let free_text = before
+            .iter()
+            .find(|record| {
+                record.kind == RawAnnotationKind::FreeText && record.id.starts_with("fp:")
+            })
+            .expect("a free-text annotation without /NM");
+        let assigned = "adopted-free-text".to_string();
+        let mut update = update_from(
+            free_text,
+            "Edited free text from another producer.",
+            [10, 40, 200],
+        );
+        update.assign_name = Some(assigned.clone());
+        update.values.kind = WriteAnnotationKind::FreeText;
+        update.values.rect = free_text.rect;
+        update.values.quads.clear();
+        update.values.font_size = free_text.font_size_pt.unwrap_or(14.0);
+        update.values.alignment = free_text.alignment;
+
+        let destination = directory.join("edited.pdf");
+        let report = save_annotation_changes(
+            &source,
+            &destination,
+            &AnnotationChanges {
+                additions: Vec::new(),
+                updates: vec![update],
+                deletions: Vec::new(),
+            },
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("edit an annotation without /NM");
+        assert_eq!(report.assigned_names, vec![assigned.clone()]);
+
+        let after = read_all(&destination, 1);
+        let edited = after
+            .iter()
+            .find(|record| record.id == format!("nm:{assigned}"))
+            .expect("the edited free text has the assigned /NM");
+        assert_eq!(
+            edited.contents.as_deref(),
+            Some("Edited free text from another producer.")
+        );
+        assert_eq!(
+            edited
+                .color
+                .map(|color| [color.red, color.green, color.blue]),
+            Some([10, 40, 200])
+        );
+        // The other annotations in the file are still there, unchanged.
+        for record in &before {
+            if record.id == free_text.id {
+                continue;
+            }
+            let saved = after
+                .iter()
+                .find(|saved| saved.id == record.id)
+                .unwrap_or_else(|| panic!("{} disappeared", record.id));
+            assert_eq!(saved, record);
+        }
     }
 
     #[test]

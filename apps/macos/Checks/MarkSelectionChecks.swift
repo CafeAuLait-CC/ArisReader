@@ -401,7 +401,7 @@ extension ReaderChecks {
         require(state.selectedAnnotationID == nil, "switching tools deselects the mark")
         state.annotationTool = .select
 
-        // ── 9. A file-owned markup is refused with the eraser's policy, not ignored ────
+        // ── 9. A file-owned markup is adopted and selected by a plain click ───────────
         let external = try copy(annotated, "file-owned-markup.pdf")
         let externalState = AppState(engine: try RustEngine())
         externalState.setViewportSize(viewport)
@@ -438,20 +438,33 @@ extension ReaderChecks {
         externalCanvas.onDeleteAnnotation = { externalState.deleteSelectedAnnotation() }
         externalCanvas.mouseDown(with: event(.leftMouseDown, at: filePoint))
         externalCanvas.mouseUp(with: event(.leftMouseUp, at: filePoint))
-        require(externalState.selectedAnnotationID == nil,
-                "a file-owned markup is not claimed as an editable selection")
-        require(externalState.markSelectionRefusalNotice
-                    == AppState.markSelectionFileOwnedMessage,
-                "clicking file-owned markup states why it cannot be selected")
-        require(AppState.markSelectionFileOwnedMessage.contains("belongs to the PDF"),
-                "the refusal says the markup belongs to the PDF, like the eraser's")
-        require(externalState.documentAnnotations.contains(where: { $0.id == fileMarkup.id }),
-                "the refused file-owned markup is still part of the document")
-        require(!externalState.deleteSelectedAnnotation(),
-                "Delete has no sidecar mark to remove after the refusal")
-        externalState.dismissMarkSelectionRefusal()
+        guard let selectedID = externalState.selectedAnnotationID,
+              let adopted = externalState.annotations.first(where: { $0.id == selectedID }) else {
+            require(false, "a click adopts the file-owned markup into the editable model")
+            return
+        }
+        require(adopted.fileIdentity == fileMarkup.id,
+                "the adopted entry names the file's annotation by its stable identity")
+        require(adopted.kind.isTextMarkup,
+                "the adopted entry is a text mark, like the file's own")
         require(externalState.markSelectionRefusalNotice == nil,
-                "the selection refusal can be dismissed")
+                "an editable file-owned mark is no longer refused")
+        require(!externalState.documentAnnotations.contains(where: { $0.id == fileMarkup.id }),
+                "the PDF's copy is hidden while the adopted entry is open, so it is drawn once")
+        require(externalState.deleteSelectedAnnotation(),
+                "Delete removes the adopted file-owned markup")
+        require(externalState.pendingFileDeletions.contains(where: {
+            $0.identity == fileMarkup.id
+        }), "the deletion is pending until the explicit save")
+        require(!externalState.documentAnnotations.contains(where: { $0.id == fileMarkup.id }),
+                "the deleted file-owned markup is gone from the page")
+        externalState.undo()
+        require(externalState.annotations.first(where: { $0.id == adopted.id })?.fileIdentity
+                    == fileMarkup.id,
+                "undo restores the adopted entry as the editable representation")
+        require(!externalState.pendingFileDeletions.contains(where: {
+            $0.identity == fileMarkup.id
+        }), "undo cancels the pending file deletion")
 
         // ── 10. Changing page or document drops the selected mark ─────────────────────
         let multipageDocument = try copy(multipage, "multipage-mark-selection.pdf")

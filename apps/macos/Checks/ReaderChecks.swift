@@ -74,6 +74,19 @@ struct ReaderChecks {
             try await annotationEditingChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-placed-text") {
+            try await placedTextChecks(
+                drawing: fastRoot.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                annotated: fastRoot.appendingPathComponent("tests/fixtures/annotated.pdf"),
+                external: fastRoot.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+            return
+        }
+        if CommandLine.arguments.contains("--check-cross-reader") {
+            try await crossReaderAnnotationChecks(
+                replies: fastRoot.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),
+                notes: fastRoot.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+            return
+        }
         if CommandLine.arguments.contains("--check-forms") {
             try await formChecks(root: fastRoot)
             return
@@ -528,6 +541,9 @@ struct ReaderChecks {
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
         try await bookmarkWritebackChecks(root: root)
+        try await crossReaderAnnotationChecks(
+            replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),
+            notes: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
         try await inkAnnotationChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
