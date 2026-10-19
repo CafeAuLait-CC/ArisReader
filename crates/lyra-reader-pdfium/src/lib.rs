@@ -68,6 +68,8 @@ mod stub;
 mod writeback;
 #[cfg(feature = "pdfium")]
 mod xmp;
+#[cfg(feature = "pdfium")]
+mod xmp_write;
 
 #[cfg(feature = "pdfium")]
 pub use annotation_edit::{

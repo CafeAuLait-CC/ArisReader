@@ -45,16 +45,62 @@ pub(crate) fn parse_xmp_bytes(bytes: &[u8]) -> XmpMetadata {
     let mut result = XmpMetadata::default();
     for packet in packets(bytes) {
         let text = String::from_utf8_lossy(&packet);
-        merge(&mut result, parse_packet(&text));
+        let presence = packet_presence(&text);
+        merge(&mut result, parse_packet(&text), presence);
     }
     result
 }
 
-fn merge(into: &mut XmpMetadata, from: XmpMetadata) {
-    if from.title.is_some() {
+/// Which of the revision-merged properties a packet states at all.
+///
+/// A later incremental revision that *states* `dc:title` but gives it an empty value is an
+/// explicit clear; one that does not mention the property keeps whatever an earlier revision
+/// said. [`crate::xmp_write`] relies on this when it clears a value in place.
+struct PacketPresence {
+    title: bool,
+    creators: bool,
+}
+
+fn packet_presence(text: &str) -> PacketPresence {
+    PacketPresence {
+        title: mentions(text, "dc:title"),
+        creators: mentions(text, "dc:creator"),
+    }
+}
+
+fn mentions(text: &str, name: &str) -> bool {
+    let opening = format!("<{name}");
+    let mut cursor = 0usize;
+    while let Some(offset) = text[cursor..].find(&opening) {
+        let after = cursor + offset + opening.len();
+        if matches!(
+            text.as_bytes().get(after),
+            Some(byte) if byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/'
+        ) {
+            return true;
+        }
+        cursor = after;
+    }
+    let attribute = format!("{name}=\"");
+    let mut cursor = 0usize;
+    while let Some(offset) = text[cursor..].find(&attribute) {
+        let at = cursor + offset;
+        if at == 0
+            || text.as_bytes()[at - 1].is_ascii_whitespace()
+            || text.as_bytes()[at - 1] == b'<'
+        {
+            return true;
+        }
+        cursor = at + 1;
+    }
+    false
+}
+
+fn merge(into: &mut XmpMetadata, from: XmpMetadata, presence: PacketPresence) {
+    if presence.title {
         into.title = from.title;
     }
-    if !from.authors.is_empty() {
+    if presence.creators {
         into.authors = from.authors;
     }
     if from.doi.is_some() {
@@ -211,7 +257,7 @@ fn raw_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Parses one XMP packet into the properties this reader understands.
-fn parse_packet(text: &str) -> XmpMetadata {
+pub(crate) fn parse_packet(text: &str) -> XmpMetadata {
     let title = property(text, "dc:title").or_else(|| attribute(text, "dc:title"));
     let authors = creator_list(text);
     let doi = property(text, "prism:doi").or_else(|| attribute(text, "prism:doi"));
