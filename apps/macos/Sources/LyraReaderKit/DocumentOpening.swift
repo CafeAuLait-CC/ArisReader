@@ -143,6 +143,9 @@ public final class DocumentOpenCoordinator: ObservableObject {
     private var queued: [URL] = []
     /// The page a queued delivery should show once it opens (a thumbnail's "Open in New Window").
     private var queuedStartPage: Int?
+    /// The page-local rectangle a queued delivery should scroll to. Carried next to the page so a
+    /// preview's "open in a new window" arrives at the cited entry or figure, not only at its page.
+    private var queuedStartRegion: CGRect?
     /// Set by ``markReady()``; until then, deliveries are queued rather than opened.
     private var isReady = false
 
@@ -169,7 +172,7 @@ public final class DocumentOpenCoordinator: ObservableObject {
     /// `startingAt` is for a request that also names a page — a thumbnail's “Open in New Window”.
     /// It is kept with the queued batch, so a delivery that waits for its window still lands on
     /// the page the reader asked for.
-    public func receive(_ urls: [URL], startingAt page: Int? = nil) {
+    public func receive(_ urls: [URL], startingAt page: Int? = nil, revealing region: CGRect? = nil) {
         guard !urls.isEmpty else { return }
         var files: [URL] = []
         for url in urls {
@@ -180,7 +183,14 @@ public final class DocumentOpenCoordinator: ObservableObject {
             files.append(file)
         }
         guard !files.isEmpty else { return }
-        if let page { queuedStartPage = page }
+        if let page {
+            // A new page target replaces both parts of the old target; otherwise a region from a
+            // previous queued request could be applied to a page it does not belong to.
+            queuedStartPage = page
+            queuedStartRegion = region
+        } else if let region {
+            queuedStartRegion = region
+        }
         queued.append(contentsOf: files)
         flushQueue()
     }
@@ -189,13 +199,15 @@ public final class DocumentOpenCoordinator: ObservableObject {
         guard isReady, !queued.isEmpty else { return }
         let batch = queued
         let startPage = queuedStartPage
+        let startRegion = queuedStartRegion
         queued.removeAll()
         queuedStartPage = nil
+        queuedStartRegion = nil
         let opened = openDocuments(batch)
         // Only after a document actually opened: jumping a page in whatever was already on screen
         // would be a side effect the reader never asked for.
         if opened > 0, let startPage, startPage >= 0 {
-            state.gotoPage(startPage)
+            state.reveal(page: startPage, region: startRegion)
         }
     }
 
@@ -292,8 +304,11 @@ public final class DocumentOpenCoordinator: ObservableObject {
     /// for one and delivers the URLs to the session that registers for it. Validation happens
     /// before the window is requested so a drag of the wrong file produces a sentence, not an
     /// empty window.
+    ///
+    /// `page` and `revealing` are the preview action's target: the new window opens the same
+    /// document and then moves to the page and the page-local rectangle the preview points at.
     @discardableResult
-    public func openInNewWindow(_ urls: [URL], page: Int? = nil) -> Bool {
+    public func openInNewWindow(_ urls: [URL], page: Int? = nil, revealing region: CGRect? = nil) -> Bool {
         let files = urls.compactMap(Self.normalizedFileURL)
         guard !files.isEmpty else {
             report(FileOpenRefusal.notAFile.message(for: urls.first ?? URL(fileURLWithPath: "/")))
@@ -312,7 +327,7 @@ public final class DocumentOpenCoordinator: ObservableObject {
             report("LyraReader can’t open a new window right now, so nothing was opened.")
             return false
         }
-        guard registry.requestNewWindow(opening: openable, page: page) else {
+        guard registry.requestNewWindow(opening: openable, page: page, reveal: region) else {
             report("LyraReader can’t open a new window right now, so nothing was opened.")
             return false
         }
@@ -321,6 +336,32 @@ public final class DocumentOpenCoordinator: ObservableObject {
             : "Opening \(openable.count) documents in a new window"
         traceNewWindowRequest(openable, page: page)
         return true
+    }
+
+    /// The preview panel's "open in a new window" action.
+    ///
+    /// The target is the preview's own page and rectangle: a figure or table region, a cited
+    /// entry's fragment, or a plain page top. It is the same document, opened in a second
+    /// independent reader window through ``ReaderWindowRegistry``; this window's document, scroll
+    /// offset and tabs are never touched. A second window rather than an in-window split, because
+    /// the reader window has one canvas and no split layout to put a second one in.
+    @discardableResult
+    public func openPreviewTargetInNewWindow() -> Bool {
+        guard let preview = state.referencePreview else {
+            report("There is no preview to open in a new window.")
+            return false
+        }
+        guard let url = state.document?.url else {
+            report("There is no document to open in a new window.")
+            return false
+        }
+        return openInNewWindow([url], page: preview.page, revealing: preview.region)
+    }
+
+    /// Whether the preview action can run: a preview and a document must exist, and the app must
+    /// be able to make a reader window.
+    public var canOpenPreviewInNewWindow: Bool {
+        state.referencePreview != nil && state.document?.url != nil && canOpenInNewWindow
     }
 
     /// Whether a drop on the sidebar can actually create a window. The sidebar omits “Open in New

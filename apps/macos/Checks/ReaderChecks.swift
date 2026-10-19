@@ -129,6 +129,12 @@ struct ReaderChecks {
             print("Section preview checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-preview-actions") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await previewActionChecks(root: root)
+            return
+        }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`LyraReaderChecks --check-transitions .`).
         if CommandLine.arguments.contains("--check-transitions") {
@@ -569,6 +575,7 @@ struct ReaderChecks {
         try await previewHistoryChecks(url: b)
         try await previewTransparencyChecks(root: root)
         try await previewSectionChecks(root: root)
+        try await previewActionChecks(root: root)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()
         try await previewPanelSessionChecks(url: b)

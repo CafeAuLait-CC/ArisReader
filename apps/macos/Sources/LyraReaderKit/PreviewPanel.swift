@@ -474,6 +474,13 @@ public final class ReferencePreviewPanelController {
     public private(set) var panel: ReferencePreviewPanel?
     public let model = ReferencePreviewModel()
 
+    /// The window's "open this preview in a new reader window" action.
+    ///
+    /// Installed by ``ReaderSession`` from that window's ``DocumentOpenCoordinator``; `nil` for
+    /// the process-wide controller a check uses, which has no window to open. The panel shows the
+    /// control disabled rather than offering an action that cannot run.
+    public var openInNewWindow: (() -> Bool)?
+
     /// Where the reader last put the panel, and whether they are the reason it is there.
     public private(set) var rememberedFrame: CGRect?
     public private(set) var userAdjustedFrame = false
@@ -591,7 +598,9 @@ public final class ReferencePreviewPanelController {
             self?.rememberedFrame = frame
         }
         panel.onGoBack = { [weak state] in state?.goBack() }
-        let hosting = NSHostingView(rootView: ReferencePreviewPanelContent(state: state, model: model))
+        let hosting = NSHostingView(rootView: ReferencePreviewPanelContent(
+            state: state, model: model, openInNewWindow: openInNewWindow
+        ))
         hosting.autoresizingMask = [.width, .height]
         let container = NSView(frame: CGRect(origin: .zero, size: PreviewPanelGeometry.defaultSize))
         hosting.frame = container.bounds
@@ -717,6 +726,8 @@ struct ReferencePreviewPanelContent: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: ReferencePreviewModel
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
+    /// The window's new-window action; `nil` when this controller belongs to no window.
+    var openInNewWindow: (() -> Bool)?
 
     var body: some View {
         if let preview = state.referencePreview {
@@ -758,6 +769,28 @@ struct ReferencePreviewPanelContent: View {
 
                 Text(preview.title).font(.headline).lineLimit(1)
                 Spacer(minLength: 0)
+                // Pin keeps this preview while the reader works; a pinned panel refuses any
+                // interaction that would replace it (see `AppState.toggleReferencePreviewPin`).
+                Button { state.toggleReferencePreviewPin() } label: {
+                    Image(systemName: state.referencePreviewPinned ? "pin.fill" : "pin")
+                }
+                .buttonStyle(.plain)
+                .disabled(!state.canPinReferencePreview)
+                .help(state.referencePreviewPinned
+                      ? "Unpin: new interactions may replace this preview again"
+                      : "Pin: keep this preview while you read")
+                .accessibilityLabel(state.referencePreviewPinned ? "Unpin preview" : "Pin preview")
+
+                // A second reader window, not an in-window split: the window has one canvas.
+                // The target page and rectangle travel with the request through the registry.
+                Button { _ = openInNewWindow?() } label: {
+                    Image(systemName: "rectangle.split.2x1")
+                }
+                .buttonStyle(.plain)
+                .disabled(openInNewWindow == nil)
+                .help("Open this reference at the same page and position in a new reader window")
+                .accessibilityLabel("Open in New Window")
+
                 Button { state.closeReferencePreview() } label: {
                     Image(systemName: "xmark")
                 }
@@ -775,7 +808,27 @@ struct ReferencePreviewPanelContent: View {
                 .buttonStyle(.link)
                 .font(.caption)
                 Spacer()
+                // Copying the generated entry is a citation action: only a `.reference` preview
+                // has bibliography entries, and the entry is the open document's recognised
+                // metadata. It is absent (not just disabled) for every other preview kind.
+                if preview.kind == .reference {
+                    Button {
+                        state.copyPreviewBibtex()
+                    } label: {
+                        Label("BibTeX", systemImage: "doc.on.doc")
+                    }
+                    .font(.caption)
+                    .disabled(!state.canCopyPreviewBibtex)
+                    .help(state.canCopyPreviewBibtex
+                          ? "Copy this document's generated BibTeX (the same entry Document Information copies)"
+                          : "No BibTeX is available for this document")
+                    .accessibilityLabel("Copy BibTeX")
+                }
                 Button("Full page") { state.showFullPreviewPage() }
+                    .disabled(state.referencePreviewPinned)
+                    .help(state.referencePreviewPinned
+                          ? "Unpin the preview to switch it to the full page"
+                          : "Show the preview's whole page")
                 Button("Go to page") {
                     state.jumpFromPreview(to: preview.page)
                 }
@@ -789,17 +842,39 @@ struct ReferencePreviewPanelContent: View {
         ScrollView {
             VStack(alignment: .leading, spacing: ReferencePreviewLayout.entrySpacingPt) {
                 ForEach(model.entries) { entry in
-                    VStack(alignment: .leading, spacing: 4) {
-                        if entry.page != nil {
-                            Button(entry.heading) { state.selectPreviewEntry(entry.citationEntry) }
-                                .buttonStyle(.link)
-                        } else {
-                            Text(entry.heading).bold()
+                    HStack(alignment: .top, spacing: 6) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if entry.page != nil {
+                                Button(entry.heading) { state.selectPreviewEntry(entry.citationEntry) }
+                                    .buttonStyle(.link)
+                                    .disabled(state.referencePreviewPinned)
+                            } else {
+                                Text(entry.heading).bold()
+                            }
+                            Text(entry.text)
+                                .font(.system(size: ReferencePreviewLayout.textFontSize))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Text(entry.text)
-                            .font(.system(size: ReferencePreviewLayout.textFontSize))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        // The explicit copy affordance next to the (already selectable) text.
+                        // BibTeX is the document's generated entry, so it is offered only when
+                        // metadata exists; copying the entry text always works.
+                        Menu {
+                            Button("Copy Entry Text") {
+                                state.copyPreviewEntryText(entry.citationEntry)
+                            }
+                            Button("Copy BibTeX") {
+                                state.copyPreviewBibtex()
+                            }
+                            .disabled(!state.canCopyPreviewBibtex)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Copy this entry")
+                        .accessibilityLabel("Copy citation entry")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
