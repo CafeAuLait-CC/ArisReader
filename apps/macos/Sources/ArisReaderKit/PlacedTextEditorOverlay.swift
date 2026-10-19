@@ -8,17 +8,18 @@ import SwiftUI
 /// expects after clicking a note icon. A text box opens **over its own box**, at the size the
 /// text is drawn at, so typing shows the line breaks and size the page will show.
 ///
-/// The text reaches `AppState` on every keystroke so the canvas can lay it out live, but the
-/// sidecar write is coalesced and the whole session becomes one undoable change. Notes have a
-/// Done button; text boxes finish on a page click or Command-Return. Escape restores the session.
-struct PlacedTextEditorOverlay: View {
-    @ObservedObject var state: AppState
+/// The text reaches `AppState` on every keystroke so the canvas can lay it out live and the box
+/// can grow with the text, but the sidecar write is coalesced and the whole session becomes one
+/// undoable change. Notes have a Done button; text boxes finish on a page click or
+/// Command-Return. Escape restores the session.
+package struct PlacedTextEditorOverlay: View {
+    @ObservedObject package var state: AppState
     @State private var text = ""
     @State private var loadedID: UUID?
     @State private var missingGlyphs: [String] = []
     @FocusState private var focused: Bool
 
-    var body: some View {
+    package var body: some View {
         GeometryReader { geometry in
             if let annotation = state.editingAnnotation,
                let anchor = state.editingAnnotationAnchor {

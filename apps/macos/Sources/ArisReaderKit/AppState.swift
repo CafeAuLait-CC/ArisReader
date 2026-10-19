@@ -715,7 +715,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public static let defaultTextBoxFontSize: CGFloat = 14
 
     /// The smallest text box the reader may create or resize to, in points.
-    public static let minimumTextBoxSize = CGSize(width: 48, height: 24)
+    ///
+    /// The width is wide enough for a few narrow glyphs but small enough for the box a
+    /// double-click creates (about three characters, see `TextBoxLayout.creationSize`); the
+    /// height is one line at the smallest font. Older sidecars' larger boxes stay valid.
+    public static let minimumTextBoxSize = CGSize(width: 24, height: 24)
 
     public let id: UUID
     /// Defaults to `.highlight` for sidecars written before kinds existed.
@@ -1526,7 +1530,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var editingWasCreated = false
     private var editingOriginalText = ""
     private var editingOriginalAnnotation: Annotation?
-    private var editingTextBoxWidth: CGFloat = 320
     private var editingUndoDepth = 0
     /// The annotations as they were when the current eraser drag began, and the ones it has
     /// removed so far (keyed by their index in that base array, so undo can restore their order).
@@ -3444,7 +3447,45 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return true
     }
 
+    /// The text-box tool's double-click: open an existing box under the pointer, or place a new
+    /// one at the page point the pointer names.
+    ///
+    /// A double-click inside an existing box edits it instead of stacking a second box on top;
+    /// the select tool's double-click uses the same `beginEditingAnnotation`.
+    @discardableResult
+    public func placeOrOpenTextBox(atContentPoint point: CGPoint) -> Bool {
+        guard let pageHit = pagePoint(atContentPoint: point) else { return false }
+        for annotation in annotations.reversed() where annotation.kind == .textBox {
+            guard annotation.page == pageHit.page,
+                  let rect = annotation.shapeRect, rect.contains(pageHit.point) else { continue }
+            selectedAnnotationID = annotation.id
+            beginEditingAnnotation(annotation.id)
+            return true
+        }
+        return placeTextBox(page: pageHit.page, at: pageHit.point)
+    }
+
+    /// Places an empty, one-line text box whose **top-left corner is `point`** (page space).
+    ///
+    /// The click lands where the caret will be, and the box grows right and down from there, so
+    /// a box placed beside existing text does not cover it. Near a page edge the origin is
+    /// shifted just enough to keep the whole box on the page.
+    @discardableResult
+    public func placeTextBox(page: Int, at point: CGPoint) -> Bool {
+        guard let placement = visiblePagePlacements.first(where: { $0.index == page })
+        else { return false }
+        let size = TextBoxLayout.creationSize(fontSize: Annotation.defaultTextBoxFontSize)
+        var origin = point
+        origin.x = min(max(0, origin.x), max(0, placement.widthPt - size.width))
+        origin.y = min(max(0, origin.y), max(0, placement.heightPt - size.height))
+        return addTextBox(page: page, rect: CGRect(origin: origin, size: size))
+    }
+
     /// Creates an empty text box in `rect` (page space) and opens its editor.
+    ///
+    /// The double-click path (`placeTextBox`) computes the one-line-high creation rect; this
+    /// rectangle-based entry point remains for callers that already have a box, such as an
+    /// older sidecar or a restored session. Its contents then grow from that box.
     @discardableResult
     public func addTextBox(page: Int, rect: CGRect) -> Bool {
         guard let document, page >= 0, page < document.pageCount,
@@ -3514,8 +3555,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = created
         editingOriginalText = annotation.note
         editingOriginalAnnotation = annotation
-        editingTextBoxWidth = created ? max(120, annotation.shapeRect?.width ?? 320)
-            : max(320, annotation.shapeRect?.width ?? 320)
         editingUndoDepth = undoStack.count
         refreshSelectionOverlay()
     }
@@ -3536,7 +3575,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var after = before
         after.note = text
         after.shapeRect = TextBoxLayout.fittedRect(text: text, fontSize: before.fontSize,
-            origin: box.origin, maximumWidth: max(1, min(editingTextBoxWidth, pageSize.width - box.minX)),
+            origin: box.origin,
+            maximumWidth: max(1, pageSize.width - box.minX),
             maximumHeight: max(1, pageSize.height - box.minY))
         guard after != before else { return }
         var updated = annotations

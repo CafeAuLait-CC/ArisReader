@@ -184,6 +184,9 @@ public struct ReaderWindow: View {
                 onAnnotationDoubleClick: { point in
                     state.beginEditingTextBox(atContentPoint: point)
                 },
+                onPlaceTextBox: { point in
+                    state.placeOrOpenTextBox(atContentPoint: point)
+                },
                 // Escape leaves the sticky markup mode or the eraser. It is consumed only when a
                 // mode was active; the canvas keeps its existing Escape handling for a live draft.
                 onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },
