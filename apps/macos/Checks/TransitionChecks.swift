@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import SwiftUI
 
 /// Show/hide transitions for the sidebar and the secondary toolbar row.
@@ -153,7 +153,7 @@ extension ReaderChecks {
         ReaderMotion.reduceMotionOverride = false
 
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aris-transitions-\(UUID())")
+            .appendingPathComponent("lyra-reader-transitions-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         let fixture = scratch.appendingPathComponent("multipage.pdf")

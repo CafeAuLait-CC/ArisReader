@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -15,7 +15,7 @@ extension ReaderChecks {
         async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-mark-select-\(UUID())")
+            .appendingPathComponent("lyra-reader-mark-select-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -26,7 +26,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func sidecarText(_ document: URL) throws -> String {
             String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)

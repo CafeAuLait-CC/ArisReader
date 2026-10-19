@@ -1,16 +1,16 @@
-import ArisReaderKit
+import LyraReaderKit
 import Combine
 import Foundation
 
 extension ReaderChecks {
     /// Model/raster readiness, not display presentation/FPS. Uses real PDFium/FFI.
-    /// Usage: ArisReaderChecks --measure-page-navigation PDF zoom-percent
+    /// Usage: LyraReaderChecks --measure-page-navigation PDF zoom-percent
     @MainActor static func measurePageNavigation() async throws {
         let args = CommandLine.arguments
         guard args.count == 4, let zoom = Int(args[3]), (10...800).contains(zoom) else {
             throw NSError(domain: "PageNavigationMeasurement", code: 1)
         }
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-navigation-\(UUID())")
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-navigation-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let copy = temporary.appendingPathComponent("document.pdf")

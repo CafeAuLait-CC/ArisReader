@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 import PDFKit
 
@@ -16,7 +16,7 @@ extension ReaderChecks {
     @MainActor static func printingChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-printing-\(UUID())")
+            .appendingPathComponent("lyra-reader-printing-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
         let shortURL = root.appendingPathComponent("tests/fixtures/multipage.pdf")

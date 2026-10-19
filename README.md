@@ -1,19 +1,11 @@
-# Lyra
-
-> The application is called **Lyra**. The repository, the Rust crates (`aris-reader-*`), the Swift
-> modules (`ArisReaderKit`, `ArisReaderFFI`), the C ABI symbols (`aris_reader_*`) and the developer
-> environment variables (`ARIS_READER_*`) keep the original `aris` naming: it is the shared toolkit
-> prefix, it is an explicit project constraint, and renaming it would touch the FFI header, the
-> generated bindings and every test for no user-visible gain. Only what a reader sees — the app
-> name, its icon, its window titles and the bundle — says Lyra.
+# LyraReader
 
 A **native macOS PDF reader** for papers and technical documents: Rust engine + GPU-composited rendering + native SwiftUI/AppKit interface.
 The goal is PDF Expert-level simplicity and fluidity, with two advanced capabilities layered on top of the reading experience: citation/figure popovers and an AI assistant.
 
-> **Naming convention**: `Aris` is the shared prefix of the toolkit. This project is **ArisReader**, so every module uses
-> the **`aris-reader-`** prefix (crate names `aris-reader-core` …, C ABI symbols `aris_reader_*`, environment variables
-> `ARIS_READER_*`, Swift targets `ArisReaderKit` / `ArisReaderFFI`). Suite-level shared modules will claim the `aris-*`
-> prefix later, to avoid ambiguity.
+> **Naming convention**: The application and Swift modules use `LyraReader`; Rust crates use
+> `lyra-reader-*`, C ABI symbols use `lyra_reader_*`, and developer environment variables use
+> `LYRA_READER_*`. See [rename compatibility](RENAMING.md) for existing user data.
 
 Current status: **M1–M5 have working core paths and remain under active development**. The reader
 opens real PDFs, rasterizes tiled pages off the main thread, and supports selection/search,
@@ -69,7 +61,7 @@ printing, and the Linux and Windows shells.
 | --- | --- | --- |
 | Rendering & compositing | **wgpu 30** (macOS → Metal; future Windows → DX12, Linux → Vulkan) | One GPU layer reused across all three platforms · [ADR-0003](docs/adr/0003-gpu-wgpu-shared-device.md) |
 | PDF engine | **Backend trait abstraction + PDFium as the first implementation** (BSD-3), with a slot reserved for a pure-Rust backend | The only engine that supports rendering, per-glyph text boxes, links, forms and incremental save at once · [ADR-0002](docs/adr/0002-pdf-engine-backend.md) |
-| UI | **SwiftUI + AppKit** (native macOS), with UI logic pushed down into the platform-independent `aris-reader-session` | Native look and feel, input methods and accessibility; a future shell swap won't require rewriting the engine · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
+| UI | **SwiftUI + AppKit** (native macOS), with UI logic pushed down into the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap won't require rewriting the engine · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
 | Bridging | **UniFFI** (control plane) + hand-written C ABI (GPU surface/device handoff) | Generates Swift bindings automatically, supports async and callback streams · [ADR-0004](docs/adr/0004-rust-swift-ffi.md) |
 | License | This project is **MIT**; all dependencies use permissive licenses | [ADR-0005](docs/adr/0005-licensing.md) |
 | Build | Cargo workspace + SwiftPM (**Command Line Tools only**, CLT 26.3 on this machine) | Develop without a full Xcode install · [ADR-0006](docs/adr/0006-build-without-xcode.md) |
@@ -77,22 +69,22 @@ printing, and the Linux and Windows shells.
 ## Directory layout
 
 ```
-ArisReader/
+LyraReader/
 ├── Cargo.toml                  # Rust workspace (11 crates)
 ├── rust-toolchain.toml         # Pinned toolchain
 ├── crates/
-│   ├── aris-reader-core/              # Document model, geometry/coordinates, errors, backend traits (zero platform deps)
-│   ├── aris-reader-pdfium/            # PDFium implementation of DocumentBackend (feature-gated)
-│   ├── aris-reader-text/              # Text pages, per-glyph boxes, selection, search, reading order
-│   ├── aris-reader-edit/              # Annotation model, page operations, forms, incremental save
-│   ├── aris-reader-render/            # Tile pyramid, LOD, scheduling, cache, prefetch
-│   ├── aris-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
-│   ├── aris-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
-│   ├── aris-reader-ai/                # LLM provider abstraction, context building, citation index
-│   ├── aris-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
-│   ├── aris-reader-ffi/               # UniFFI interface definitions + C ABI exports
-│   └── aris-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
-├── apps/macos/                 # SwiftPM package: ArisReaderKit (UI library) + ArisReader (executable app)
+│   ├── lyra-reader-core/              # Document model, geometry/coordinates, errors, backend traits (zero platform deps)
+│   ├── lyra-reader-pdfium/            # PDFium implementation of DocumentBackend (feature-gated)
+│   ├── lyra-reader-text/              # Text pages, per-glyph boxes, selection, search, reading order
+│   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save
+│   ├── lyra-reader-render/            # Tile pyramid, LOD, scheduling, cache, prefetch
+│   ├── lyra-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
+│   ├── lyra-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
+│   ├── lyra-reader-ai/                # LLM provider abstraction, context building, citation index
+│   ├── lyra-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
+│   ├── lyra-reader-ffi/               # UniFFI interface definitions + C ABI exports
+│   └── lyra-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
+├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (executable app)
 ├── scripts/                    # Build, packaging, PDFium fetch and check scripts
 ├── docs/                       # Design and planning documents (see below)
 └── vendor/                     # Third-party binaries (pdfium, git-ignored)
@@ -114,26 +106,26 @@ cargo check --workspace
 ./scripts/build-rust.sh
 
 # 3) Build and run the native macOS shell
-cd apps/macos && swift build && swift run ArisReader
+cd apps/macos && swift build && swift run LyraReader
 #    In a sandboxed shell (CI, agent runners) add --disable-sandbox: SwiftPM's nested
 #    sandbox-exec is rejected there. scripts/check.sh retries automatically.
-#    Tip: ARIS_READER_OPEN=/path/to.pdf swift run ArisReader opens a document at launch.
+#    Tip: LYRA_READER_OPEN=/path/to.pdf swift run LyraReader opens a document at launch.
 #    Dev hooks for headless checks (all optional, all logged on stderr):
-#      ARIS_READER_ANNOTATE="x1,y1;x2,y2"  highlight the text between two content points
-#      ARIS_READER_NOTE="text"             type into the first note, one keystroke at a time
-#                                          (ARIS_READER_NOTE_INTERVAL_MS, ARIS_READER_NOTE_COMMIT=1)
-#      ARIS_READER_RECOVER_SIDECAR=1       back up an unreadable sidecar and start fresh
-#      ARIS_READER_QUIT_AFTER=<ms>         quit through the normal flush path
-#    Sidecar writes are instrumented as `aris-annotate: saved N annotation(s) … write #K [trigger]`,
+#      LYRA_READER_ANNOTATE="x1,y1;x2,y2"  highlight the text between two content points
+#      LYRA_READER_NOTE="text"             type into the first note, one keystroke at a time
+#                                          (LYRA_READER_NOTE_INTERVAL_MS, LYRA_READER_NOTE_COMMIT=1)
+#      LYRA_READER_RECOVER_SIDECAR=1       back up an unreadable sidecar and start fresh
+#      LYRA_READER_QUIT_AFTER=<ms>         quit through the normal flush path
+#    Sidecar writes are instrumented as `lyra-reader-annotate: saved N annotation(s) … write #K [trigger]`,
 #    which is what makes note-write coalescing measurable (at most one write per ~500 ms of typing).
-#    PDF write-back is instrumented as `aris-annotate: saved … to … (append N bytes)` and
-#    `aris-annotate: replaced … , backup …`; the checks can run it alone with
-#    `ArisReaderChecks --check-annotation-writeback .
+#    PDF write-back is instrumented as `lyra-reader-annotate: saved … to … (append N bytes)` and
+#    `lyra-reader-annotate: replaced … , backup …`; the checks can run it alone with
+#    `LyraReaderChecks --check-annotation-writeback .
 #    Form filling, its cross-viewer evidence and the properties editor:
-#    `ArisReaderChecks --check-forms .
+#    `LyraReaderChecks --check-forms .
 
 # 3) Package a .app bundle
-./scripts/make-app-bundle.sh          # output: build/Lyra.app
+./scripts/make-app-bundle.sh          # output: build/LyraReader.app
 
 # 4) Fetch and sign the PDFium dynamic library (needed for rendering)
 ./scripts/fetch-pdfium.sh
@@ -142,17 +134,17 @@ cd apps/macos && swift build && swift run ArisReader
 python3 scripts/make-fixtures.py
 
 # 6) Render a page and compare against a reference rasterizer
-cargo run -p aris-reader-cli -- info tests/fixtures/text-page.pdf
-cargo run -p aris-reader-cli -- render tests/fixtures/text-page.pdf --dpi 144 -o /tmp/page.png
+cargo run -p lyra-reader-cli -- info tests/fixtures/text-page.pdf
+cargo run -p lyra-reader-cli -- render tests/fixtures/text-page.pdf --dpi 144 -o /tmp/page.png
 pdftoppm -r 144 -png tests/fixtures/text-page.pdf /tmp/poppler
-cargo run -p aris-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
+cargo run -p lyra-reader-cli -- compare /tmp/page.png /tmp/poppler-1.png --max-mae 1.0
 
 # 7) See what a PDF somebody else annotated carries, page by page: subtype, /Rect, /QuadPoints
 #    count, /C, /CA, the blend mode it is drawn with, /Contents, and the tint the canvas uploads
-cargo run -p aris-reader-cli -- annotations tests/fixtures/annotated-appearance.pdf
+cargo run -p lyra-reader-cli -- annotations tests/fixtures/annotated-appearance.pdf
 
 # 8) Recognise title/authors/venue/year/DOI/arXiv and print each field with its source
-cargo run -p aris-reader-cli -- metadata tests/fixtures/metadata-text-layer.pdf
+cargo run -p lyra-reader-cli -- metadata tests/fixtures/metadata-text-layer.pdf
 ```
 
 ## Annotation write-back
@@ -166,7 +158,7 @@ explicit command:
   The open document and its sidecar are not touched. The copy has no sidecar, so reopening it
   shows each annotation once, from the file.
 * **File ▸ Save and Replace Original… (⇧⌘S)** replaces the document. It first writes
-  `<name>.lyra-backup-<unix>-<n>.pdf`, verifies that the backup is byte-identical, and refuses to
+  `<name>.lyra-reader-backup-<unix>-<n>.pdf`, verifies that the backup is byte-identical, and refuses to
   run if the backup cannot be written. The replacement itself is an atomic rename of a verified
   temporary file, so a crash leaves the original readable.
 
@@ -204,10 +196,10 @@ the `/Name` icon, so viewers show their default note icon rather than `/Comment`
 **Free-text appearance and CJK.** A `/FreeText` text box is written with a real `/AP /N` stream
 whose text is a Type0/Identity-H CID font embedded with `FontFile2`, `CIDToGIDMap`, `/W` widths
 and a `/ToUnicode` CMap. The font is a committed subset of **Noto Sans SC** (SIL OFL 1.1),
-renamed **Lyra Sans SC** because the OFL reserves the name “Source”, 3,628,760 bytes and 11,973
+renamed **LyraReader Sans SC** because the OFL reserves the name “Source”, 3,628,760 bytes and 11,973
 glyphs covering GB 2312, 6,878 of the 6,879 JIS X 0208 characters (≒ falls back), Latin, Greek
 and the maths symbols papers use. It lives at `apps/macos/Resources/Fonts/` with its licence and ships in
-`Lyra.app/Contents/Resources/Fonts/`; it is not a system font. The writer subsets it again **per
+`LyraReader.app/Contents/Resources/Fonts/`; it is not a system font. The writer subsets it again **per
 document** to the glyphs the appearances actually use, so two text boxes share one font object and
 a save appends kilobytes, not megabytes. Text extraction through the appearance's `/ToUnicode`
 returns the exact string, including for a character outside the font: that character gets its own
@@ -215,7 +207,7 @@ CID, maps to `.notdef` (a visible missing-glyph box, never `?`) and keeps its ex
 `/ToUnicode`; `/Contents` is always exact, and the text editor warns while typing.
 
 Ink, square, circle and line/arrow annotations are different: they have no blend-mode problem, so
-Lyra writes a real `/AP /N` Form XObject for them (the stroke path in the annotation's colour and
+LyraReader writes a real `/AP /N` Form XObject for them (the stroke path in the annotation's colour and
 `/BS` width, with `/BS` matching what the stream draws) in addition to `/InkList` or `/L`/`/LE`.
 PDFKit renders both the stroke and the shape from that file — the regression suite samples the
 saved page and requires the ink's red pixels and the square's blue pixels inside their marks and
@@ -226,7 +218,7 @@ named in the evidence.
 
 `tests/fixtures/annotated-strokes.pdf` is the committed fixture for the reading side: its
 `/InkList`, `/L`, `/LE`, `/BS` and `/AP` were hand-written by `scripts/make-fixtures.py`, not by
-Lyra. The reader must report the five marks as `ink`, `square`, `circle`, `line` and `arrow`, read
+LyraReader. The reader must report the five marks as `ink`, `square`, `circle`, `line` and `arrow`, read
 the ink's four points and the 3 pt `/BS`, treat `/LE [/None /ClosedArrow]` as an arrow, and draw
 each from the dictionary (the appearance stream is there, but it is not the reader's source). The
 native checks assert exactly that, including the Y flip.
@@ -234,11 +226,11 @@ native checks assert exactly that, including the Y flip.
 **Ink and shape storage.** Their sidecar entries carry `"version": 1` and page-space geometry
 (`paths`, `rect`, `lineStart`/`lineEnd`, `strokeWidth`). The page-space rule is what makes a mark
 land in the same place at every zoom, and it is checked by drawing the same gesture at 100% and
-300%. A build that does not know the geometry schema — an older Lyra, or a newer build with a
+300%. A build that does not know the geometry schema — an older LyraReader, or a newer build with a
 higher version — preserves the entry verbatim instead of misreading it; that is the same
 per-entry rule the sidecar has always used for colours and bookmarks.
 
-**Crash recovery.** A save writes `<destination>.lyra-save-<pid>-<n>.tmp` in the destination's
+**Crash recovery.** A save writes `<destination>.lyra-reader-save-<pid>-<n>.tmp` in the destination's
 directory and removes the temporary on every error. On the next open, the reader reports any
 leftover temporary in the status line; the document is intact because only the final rename makes
 a save take effect. The next save removes the leftovers (the engine's
@@ -279,7 +271,7 @@ The output is a **complete rewritten document**: page content streams are replac
 prefix as an unreferenced object. Encrypted documents are refused rather than silently decrypted.
 
 **Safety.** A copy may not be the source. The replace path writes
-`<name>.lyra-backup-<unix>-<n>.pdf`, verifies it byte-for-byte, and refuses to run if it cannot be
+`<name>.lyra-reader-backup-<unix>-<n>.pdf`, verifies it byte-for-byte, and refuses to run if it cannot be
 written; the replacement is then an atomic rename of a temporary file that has already been
 reopened and verified. On any error the original is untouched.
 
@@ -291,24 +283,24 @@ The same proof is available by hand:
 
 ```bash
 # What will be removed (PDF user space, origin bottom-left)
-cargo run -p aris-reader-cli -- redact page.pdf --rect 158,687,32,14 --preview
+cargo run -p lyra-reader-cli -- redact page.pdf --rect 158,687,32,14 --preview
 
 # Write a redacted copy (the original is not touched)
-cargo run -p aris-reader-cli -- redact page.pdf --rect 158,687,32,14 -o redacted.pdf
+cargo run -p lyra-reader-cli -- redact page.pdf --rect 158,687,32,14 -o redacted.pdf
 
-# Prove it from another extractor, not from Lyra
+# Prove it from another extractor, not from LyraReader
 pdftotext redacted.pdf - | grep -c brown   # 0: gone
 pdftotext page.pdf    - | grep -c brown    # 1: still in the original
 pdftotext redacted.pdf -                    # the rest of the line/paragraph is still there
 ```
 
-The native check `ArisReaderChecks --check-redaction .` runs the same path through the real engine
+The native check `LyraReaderChecks --check-redaction .` runs the same path through the real engine
 and FFI: it removes the word `brown` from the fixture copy while `quick`, `jumps`, the title and
 the last line still extract; samples the black mark; redacts a small area inside the fixture's
 long blue vector rule and requires the rule's pixels *outside* the mark to turn white (the path
 was removed, not painted over); replaces a copy and checks the byte-identical backup; and exercises
 the pending-mark model the canvas and confirmation use. The Rust tests in
-`crates/aris-reader-pdfium/src/redaction.rs` additionally cover the rasterised fallback on a page
+`crates/lyra-reader-pdfium/src/redaction.rs` additionally cover the rasterised fallback on a page
 whose text lives in a form XObject (all page text gone, mark black, `rasterized: true`).
 
 **Limits.** The raster fallback refuses a rotated page rather than writing an image with the wrong
@@ -334,7 +326,7 @@ Only the page being drawn and the one just drawn are cached (`ReaderPrintView.ma
 = 2). A 900-page document prints one page at a time; nothing loads the document's pages into
 memory up front. Text layers needed by highlights are loaded before the print panel appears.
 
-`ArisReaderChecks --check-printing .` inspects the same view headlessly (no printer, no dialog):
+`LyraReaderChecks --check-printing .` inspects the same view headlessly (no printer, no dialog):
 `knowsPageRange` reports 3 pages for `multipage.pdf` and 130 for `index-past-120.pdf`; a one-page
 range selects exactly `[0]`, a five-page range of the 130-page document selects exactly
 `[9,10,11,12,13]`, each rendered bitmap is 300 dpi, the reader's red ink and yellow highlight are
@@ -401,7 +393,7 @@ unchanged", and only **Save Filled Form Copy…** or **Write Form Values to Orig
   Ghostscript.
 * **Evidence.** `tests/fixtures/form-fields.pdf` (two pages, eight fields, generated by
   `scripts/make-fixtures.py`) carries values written by the generator; `form-fields-encrypted.pdf`
-  is the same form with an empty user password. `ArisReaderChecks --check-forms .` reads the
+  is the same form with an empty user password. `LyraReaderChecks --check-forms .` reads the
   fixture's types, rectangles and values, fills six fields through `AppState`, saves a copy, reads
   it back with this engine, with PDFKit's widget model and renderer (text ink, check-mark pixels),
   with Poppler's `pdftotext` and with Ghostscript's `txtwrite`; it also fills a copy with
@@ -419,7 +411,7 @@ reading, and XMP remains its highest-priority source.
 
 ## Document metadata and BibTeX
 
-The Document Information window (View > Document Information…, ⌥⌘I; also `aris-reader-cli metadata <file.pdf>`) reads the open document
+The Document Information window (View > Document Information…, ⌥⌘I; also `lyra-reader-cli metadata <file.pdf>`) reads the open document
 offline, in this priority order:
 
 1. **XMP** — `dc:title`, `dc:creator`, `prism:doi`, `prism:publicationName`, `prism:coverDate`;
@@ -446,25 +438,25 @@ The accuracy of the recognition is measured in the pull request that introduced 
 author, venue, year and DOI of the twelve sample papers and seven review PDFs were compared by hand
 with the produced fields, and the fixtures `metadata-embedded.pdf`, `metadata-info.pdf`,
 `metadata-text-layer.pdf` and `metadata-arxiv.pdf` pin the known answers (XMP priority, `/Info`
-fallback, page-one fallback, arXiv-only) in `crates/aris-reader-cli/tests/metadata_fixtures.rs` and
+fallback, page-one fallback, arXiv-only) in `crates/lyra-reader-cli/tests/metadata_fixtures.rs` and
 `apps/macos/Checks/MetadataChecks.swift`.
 
 ## Reader interface
 
-Lyra follows the system appearance with a warm cream/gold light palette and warm charcoal dark
+LyraReader follows the system appearance with a warm cream/gold light palette and warm charcoal dark
 palette. Document tabs share the top window row with the native window controls; the separate
 native title strip is hidden and the empty tab-bar area moves the window. The native window
 buttons are centred vertically in that row, with the new-tab button following the document tabs.
 Inactive tabs have vertical separators. Tabs start at a fixed 250pt width and share the available space equally when the row fills;
 very large tab sets scroll horizontally at a readable minimum width.
-Toolbar drop-downs open below their controls in compact Lyra panels; document and thumbnail
+Toolbar drop-downs open below their controls in compact LyraReader panels; document and thumbnail
 context menus use the same styling. Icons, grouped commands, hover states, and
 arrow-key/Return/Escape navigation are supported. The second toolbar button opens a full-window
 page overview with adaptive thumbnails, selection, reordering and page operations. Double-click
 a page to return to reading, or choose Done; the sidebar remains a separate control.
 The tab row is followed by grouped view/zoom controls,
 annotation tools, page operations, export, AI, and search. **Annotate** expands a second row for
-highlights, underlines, strikethrough, selection notes, and six Lyra color presets. Existing indexed sidecar
+highlights, underlines, strikethrough, selection notes, and six LyraReader color presets. Existing indexed sidecar
 colors retain their original values. Tools that are not implemented yet are disabled in their
 reserved positions.
 **View > Paper Appearance** offers Original Colours, Warm Paper and Night Reading. Warm Paper
@@ -492,7 +484,7 @@ Settings > Performance uses a grouped, wrapping layout for engine information an
 In **Settings > AI > Use AI with**, choose one connection:
 
 - **ChatGPT plan:** press **Continue with ChatGPT**, finish the browser sign-in, and authorize
-  Lyra to use your eligible ChatGPT plan. Choose a model from your account's catalog. Each saved
+  LyraReader to use your eligible ChatGPT plan. Choose a model from your account's catalog. Each saved
   connection keeps its own client registration and validated identity; **Add Account** creates
   another connection. **Manage usage in ChatGPT** opens the page for reviewing shared plan usage
   and app limits. Availability and remaining allowance depend on the account and plan.
@@ -503,7 +495,7 @@ ChatGPT connections use OpenAI's official [open-source Sign in with ChatGPT flow
 loopback callback, PKCE, state/nonce validation, and RS256 identity signature verification against
 OpenAI's published keys. Credentials stay in the macOS Keychain and refresh tokens rotate atomically.
 Sign Out cancels active requests, attempts remote revocation, and clears credentials; if remote
-revocation cannot be confirmed, Lyra points to ChatGPT Settings to disconnect the app.
+revocation cannot be confirmed, LyraReader points to ChatGPT Settings to disconnect the app.
 
 ChatGPT inference uses the public Responses API with `store: false` and `stream: true`, as required
 by the [official inference contract](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
@@ -538,7 +530,7 @@ that exact form with an in-range page becomes a clickable page jump. Bare number
 provider exposes several request extensions. Settings > AI has two controls: a **mode**
 (`provider default`, `off`, `low`, `high`, `max`) and an **encoding** (`none`, `thinking`,
 `reasoning_effort`, `output_config`, `reasoning.effort`). The default is **off via thinking**
-(`{"thinking":{"type":"disabled"}}`), because reasoning changes cost and latency. Lyra sends
+(`{"thinking":{"type":"disabled"}}`), because reasoning changes cost and latency. LyraReader sends
 exactly one chosen field and nothing else; unsupported combinations (such as an intensity with
 the thinking toggle, or `off` via `output_config`) are rejected in Settings rather than silently
 sending a different value. The request preview states in plain words what is sent
@@ -553,7 +545,7 @@ mode is `off`, the answer footer says so: the provider may have ignored the togg
 
 **Reasoning is not the answer.** DeepSeek's thinking-mode models stream their analysis in
 `choices[0].delta.reasoning_content` (the [DeepSeek streaming guide](https://api-docs.deepseek.com/guides/thinking_mode_api_example_streaming/)
-shows a chunk carrying either `reasoning_content` or `content`). Lyra accumulates that channel
+shows a chunk carrying either `reasoning_content` or `content`). LyraReader accumulates that channel
 separately and never concatenates it into the answer, the translation, or the page linkifier.
 If a stream ends with no content but the provider reported usage, the panel says so explicitly,
 names `finish_reason` and the frame/delta counts, shows the HTTP status, content shape, byte
@@ -592,14 +584,14 @@ auto-retry, no background requests, and no automatic consolidation. A scanned PD
 layer gets a clear message rather than a fabricated answer. The panel renders only the small
 Markdown subset above; other Markdown is shown literally.
 
-**Where the code lives.** The platform-independent half is Rust (`crates/aris-reader-ai`):
+**Where the code lives.** The platform-independent half is Rust (`crates/lyra-reader-ai`):
 settings validation, page/block selection and BM25-style retrieval, prompt assembly, the exact
 request body, the HTTP request, incremental SSE parsing, timeouts, cancellation and HTTP
 status/API-error-body parsing. It is tested with a real loopback mock HTTP server. A
 deterministic mock provider (preset strings, no socket) lets the Swift panel checks run without a
 network. The Swift shell (`apps/macos`) owns the panel, the settings form, the request preview,
 the Keychain, the answer renderer, and a polling handle over UniFFI (`startAiRequest` returns an
-`ArisAiRequest`; `poll()` returns delta/usage/done/error events and `cancel()` stops the worker).
+`LyraReaderAiRequest`; `poll()` returns delta/usage/done/error events and `cancel()` stops the worker).
 
 **Credential storage is the one per-platform piece.** The macOS shell implements this four-method
 protocol (`AIAPIKeyStore` in `AIAssistantTypes.swift`):
@@ -611,7 +603,7 @@ deleteKey()
 hasKey() -> Bool
 ```
 
-macOS uses a generic-password item in the login Keychain (service `com.alex.lyra.ai`, account
+macOS uses a generic-password item in the login Keychain (service `com.alex.lyrareader.ai`, account
 `openai-compatible-api-key`). A Windows shell should implement the same four methods with
 Credential Manager/DPAPI; a Linux shell with the Secret Service. The key is read from the store
 only when the reader presses Send, passed across the FFI for that one request, moved into the
@@ -643,7 +635,7 @@ and for the SSE body.
 
 **Protocol.** `POST {base}/chat/completions` with
 `Content-Type: application/json`, `Accept: text/event-stream`,
-`Authorization: Bearer <key>` and `User-Agent: Lyra/0.0`. The body contains `model`, `messages`
+`Authorization: Bearer <key>` and `User-Agent: LyraReader/0.0`. The body contains `model`, `messages`
 (system + user), `stream: true`, and optionally `temperature`, `max_tokens` and exactly one
 reasoning extension. The response is parsed as SSE: each `data:` line is JSON,
 `choices[0].delta.content` and `delta.reasoning_content` are accumulated in separate channels,
@@ -656,8 +648,8 @@ points at the Keychain setting and an unsupported reasoning parameter points at 
 `stream_options` is not sent, so token usage appears only when a provider reports it in its
 stream.
 
-**Raw-stream trace.** Set `ARIS_READER_AI_TRACE=1` (any non-empty value except `0`) to print one
-`aris-ai-trace:` line per response frame and one `request summary` line per request to stderr.
+**Raw-stream trace.** Set `LYRA_READER_AI_TRACE=1` (any non-empty value except `0`) to print one
+`lyra-reader-ai-trace:` line per response frame and one `request summary` line per request to stderr.
 Each frame line names the frame type (`data` or `done`), the JSON keys it carried, and character
 counts for content/reasoning. The summary has HTTP status, bytes, frame/data counts, delta-kind
 counts, content shape, `finish_reason`, usage (including reasoning tokens) and no content
@@ -665,7 +657,7 @@ values. It never prints header values, the Authorization header, document text, 
 reasoning text; it is safe to send the log when asking why a provider produced no answer. The
 environment variable is read once per process.
 
-**Tests.** `cargo test -p aris-reader-ai` covers split JSON across SSE chunks, `[DONE]`, HTTP
+**Tests.** `cargo test -p lyra-reader-ai` covers split JSON across SSE chunks, `[DONE]`, HTTP
 401 with an error body, a mid-stream disconnect, cancellation (the loopback server observes the
 connection closing), idle timeouts, and that the wire body equals the previewed body. The TLS
 path is tested with a loopback `rustls` server and a generated CA: a full streaming round trip
@@ -677,7 +669,7 @@ numbered-margin fixture (and the live manuscript when the local corpus is mounte
 testing, copy and both prompt paths must produce identical characters, while page context loses
 the margin run and keeps the abstract. Consolidation tests cover the one-request merge, its
 prompt/cost, and a missing part naming the gap.
-`ArisReaderChecks --check-ai-assistant .` covers settings validation, Keychain-hygiene (the key
+`LyraReaderChecks --check-ai-assistant .` covers settings validation, Keychain-hygiene (the key
 never appears in UserDefaults or captured stdout/stderr; a real Keychain round-trip runs when the
 login Keychain is available and is skipped, not faked, when it is not), the citation rules, the
 reasoning settings, reasoning/empty-answer panel state, the truncated-at-limit message, the
@@ -734,9 +726,9 @@ minimum ring can still exceed that target. Record the commit, PDFium version, in
 command, build profile and hardware with each result.
 
 **The cache figure names what it covers.** The 48 MiB budget is shared by tiles and whole-page rasters;
-sidebar thumbnails and text layers are held outside it. `aris-stats:` therefore prints
+sidebar thumbnails and text layers are held outside it. `lyra-reader-stats:` therefore prints
 `tiles X/Y MiB`, `pageRasters Z MiB` and `shared X+Z/Y MiB` — the number the budget actually bounds —
-followed by `thumbnails`, `text` and `rasters total` for what it does not, and `aris-band:` uses the
+followed by `thumbnails`, `text` and `rasters total` for what it does not, and `lyra-reader-band:` uses the
 same names. On the real 115-page paper at 140% the line used to read `cache 0 tiles · 0.0/48.0 MiB`
 while three 14.5 MiB page rasters were resident: 43.5 MiB of page rasters + 8.3 MiB of thumbnails +
 0.5 MiB of text = 52.3 MiB held, of which the budget covered the 43.5 MiB of page rasters and none of
@@ -745,12 +737,12 @@ thumbnails + 1.4 MiB of text = 52.1 MiB. Peak RSS is unaffected by the wording; 
 460-499 MiB band across three runs before and three runs after.
 
 ```bash
-cargo run --release -p aris-reader-cli -- bench tests/fixtures/multipage.pdf
+cargo run --release -p lyra-reader-cli -- bench tests/fixtures/multipage.pdf
 ./scripts/fetch-eval-papers.sh
-ARIS_READER_REQUIRE_FULL_EVAL=1 cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture
+LYRA_READER_REQUIRE_FULL_EVAL=1 cargo test -p lyra-reader-cli --test reference_eval -- --ignored --nocapture
 ```
 
-`ARIS_READER_EVAL_PAPERS` can point at an existing corpus. Without strict mode, local evaluation
+`LYRA_READER_EVAL_PAPERS` can point at an existing corpus. Without strict mode, local evaluation
 may use a partial corpus or explicitly skip an absent one; so does the GPT-3 gold check, which
 needs one PDF rather than the corpus and announces its own absence with a `::notice::` instead of
 failing. Every mode fails if a present PDF cannot be opened or a page's text cannot be extracted.
@@ -765,10 +757,10 @@ page raster of at most `min(cache budget / 2, 32 MiB)`, at most 8192 px on the p
 most seven pages on screen, and the on-screen pages' rasters together inside the whole budget. A US
 Letter page at 140% on a 2x display is 1714x2218 px = 14.5 MiB, so a cache budget below 29.0 MiB
 (30 MiB as the first whole-MiB setting that fits) turns the path off and falls back to tiles. That is
-announced rather than silent: stderr gets one `aris-screen-page: off: ...` line per change naming the
-limit that failed and the budget it needs, `ARIS_READER_RENDER_STATS=1` carries
+announced rather than silent: stderr gets one `lyra-reader-screen-page: off: ...` line per change naming the
+limit that failed and the budget it needs, `LYRA_READER_RENDER_STATS=1` carries
 `screenPages off(page 14.5>8.0 MiB; budget <29.0 MiB)` (or `on`, or `off(feature-off)` for
-`ARIS_READER_SHARP_PAGE_RASTERS=0`), and `AppState.screenPagePathNote` exposes the same reason to the
+`LYRA_READER_SHARP_PAGE_RASTERS=0`), and `AppState.screenPagePathNote` exposes the same reason to the
 UI. The four thresholds are stated in `screenPagePathDecision`.
 
 The evaluation's historical “recall” column is **resolution rate among detected spans**, not
@@ -789,7 +781,7 @@ independently annotated GPT-3 gold set checks complete detection on three full p
 each of the 18 labels resolves to the entry that names the annotated first author: the surname must
 be one of the entry's opening words, and the year encoded in the citation key must label the same
 entry. Both are checks the resolver cannot satisfy by construction, and the predicate is
-mutation-tested (set `ARIS_READER_GPT3_GOLD` to a scratch copy of the TSV to try it);
+mutation-tested (set `LYRA_READER_GPT3_GOLD` to a scratch copy of the TSV to try it);
 corpus-wide labelled examples are still needed for the acceptance criteria. The arXiv revisions
 and SHA-256 hashes are locked in `tests/eval/arxiv-lock.tsv`;
 `python3 scripts/verify-eval-papers.py /path/to/corpus` checks existing files. Downloads verify
@@ -848,12 +840,12 @@ ordinary-zoom page-cache path.
 After a release build, the native checks executable can measure CPU raster retention for any local PDF:
 
 ```bash
-ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
-  apps/macos/.build/release/ArisReaderChecks --measure-page-rasters /path/to/paper.pdf 2.8 3
-ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
-  apps/macos/.build/release/ArisReaderChecks --measure-page-navigation /path/to/paper.pdf 140
-ARIS_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" \
-  apps/macos/.build/release/ArisReaderChecks --measure-page-fallback /path/to/paper.pdf 140
+LYRA_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
+  apps/macos/.build/release/LyraReaderChecks --measure-page-rasters /path/to/paper.pdf 2.8 3
+LYRA_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" /usr/bin/time -l \
+  apps/macos/.build/release/LyraReaderChecks --measure-page-navigation /path/to/paper.pdf 140
+LYRA_READER_PDFIUM_PATH="$PWD/vendor/pdfium/lib/libpdfium.dylib" \
+  apps/macos/.build/release/LyraReaderChecks --measure-page-fallback /path/to/paper.pdf 140
 ```
 
 `2.8` represents 140% on a 2x display. The first command totals actual BGRA bytes across all pages
@@ -861,7 +853,7 @@ while retaining at most three; it reports raster median/p95 and `/usr/bin/time` 
 The second uses a temporary document copy, a 959×715pt viewport at 2x, and measures model raster
 readiness on cold, neighbor, return and distant jumps (PDFs longer than eight pages). It reports partial
 sharp updates and immediate sharp cache hits. It excludes GPU upload and presentation, so it is not FPS
-or end-to-end visual latency. `ARIS_READER_SHARP_PAGE_RASTERS=0` disables the screen-page path for a
+or end-to-end visual latency. `LYRA_READER_SHARP_PAGE_RASTERS=0` disables the screen-page path for a
 feature-off comparison under the same pixel budget. Deep zoom remains on tiles.
 
 What a cold page shows *before* its sharp raster is measured, not assumed. The third command records the
@@ -901,7 +893,7 @@ resolve locally.
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: resolved in PR #6 |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/strikeouts/notes with undo/redo, sticky markup tools, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines, strikeouts and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight/underline/strikeout appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink and shape annotations are drawn in a vector overlay, stored as versioned page-space sidecar entries and written back as `/Ink`, `/Square`, `/Circle` and `/Line` (with `/L`, `/LE`, `/BS` and a real `/AP` appearance stream); they can be selected by their stroke, moved and deleted, with undo/redo covering all three. Free text is written as a `/FreeText` annotation whose appearance uses a per-document subset of the bundled Noto Sans SC (renamed Lyra Sans SC, SIL OFL 1.1) embedded as Type0/Identity-H with `FontFile2`, `CIDToGIDMap`, `/W` and `/ToUnicode`; Chinese, Japanese, Greek and maths characters render in the appearance, and a character outside the subset paints as `.notdef` while `/Contents` and extraction stay exact. Page operations and AcroForm forms remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/strikeouts/notes with undo/redo, sticky markup tools, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines, strikeouts and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight/underline/strikeout appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink and shape annotations are drawn in a vector overlay, stored as versioned page-space sidecar entries and written back as `/Ink`, `/Square`, `/Circle` and `/Line` (with `/L`, `/LE`, `/BS` and a real `/AP` appearance stream); they can be selected by their stroke, moved and deleted, with undo/redo covering all three. Free text is written as a `/FreeText` annotation whose appearance uses a per-document subset of the bundled Noto Sans SC (renamed LyraReader Sans SC, SIL OFL 1.1) embedded as Type0/Identity-H with `FontFile2`, `CIDToGIDMap`, `/W` and `/ToUnicode`; Chinese, Japanese, Greek and maths characters render in the appearance, and a character outside the subset paints as `.notdef` while `/Contents` and extraction stay exact. Page operations and AcroForm forms remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 40 table captions in the twelve sample papers, the rest falling back to the page. Captions and per-page citation spans are indexed for the whole document, not the first 120 pages, so a reference to a figure or a citation near the end of a 900-page book resolves like one on page 8. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. A document that prints more than one reference list (a main bibliography and an appendix's own, or a per-chapter thesis list) attributes each citation to the list its section cites — in the app's citation click as well as in the `cite` CLI, which prints the list and the reason, reports when a number exists only in an appendix list, and records an ambiguous choice instead of silently preferring the nearer list. On the **twenty-paper arXiv corpus**, 94.4% of 1826 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations remain unsupported. Bare parenthesised numerals - (12), (3-5), (7, 9) - are detected when the document proves its bibliography is numeric and its body does not already bracket those citations, with equation numbers, function calls, years, enumerations, figure sub-labels and out-of-range labels rejected by position and context; a Science paper in the evaluation set went from no spans to twenty resolved ones while every other row stayed identical. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation, pinning and index persistence remain. Document metadata (title, authors, venue, year, DOI, arXiv id) is recognised from XMP, `/Info` and page one, shown with per-field provenance in Document Information, editable, and exported as BibTeX with an offline generator. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | Partial: OpenAI-compatible streaming page/document summaries, selection Q&A and translation, local/remote visibility, request preview, Keychain, cancel/retry, usage and `[p.N]` page links. Document chat, vision/region discussion, summary merging and cross-platform credential stores remain. |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |
@@ -910,5 +902,5 @@ resolve locally.
 ## License
 
 This project is released under the MIT license ([LICENSE](LICENSE)); the components it ships or links and their licences are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (decision record: [ADR-0005](docs/adr/0005-licensing.md)).
-Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), **Noto Sans SC** (SIL Open Font License 1.1; shipped as the renamed, subsetted `Lyra Sans SC` in `apps/macos/Resources/Fonts/`, with its licence beside it). Interface icons are drawn from **SF Symbols**, used under Apple's SF Symbols license for in-app use on Apple platforms only: they may not be used as application icons or marks, redistributed as an icon set, and a future Linux or Windows shell must substitute its own icon set. The application icon is original artwork made for this project., ring (Apache-2.0 AND ISC), rustls-native-certs (Apache-2.0 OR ISC OR MIT), webpki-roots (CDLA-Permissive-2.0), rcgen (MIT OR Apache-2.0, tests only).
+Third-party components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT/Apache-2.0), UniFFI (MPL-2.0, build-time tooling only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), **Noto Sans SC** (SIL Open Font License 1.1; shipped as the renamed, subsetted `LyraReader Sans SC` in `apps/macos/Resources/Fonts/`, with its licence beside it). Interface icons are drawn from **SF Symbols**, used under Apple's SF Symbols license for in-app use on Apple platforms only: they may not be used as application icons or marks, redistributed as an icon set, and a future Linux or Windows shell must substitute its own icon set. The application icon is original artwork made for this project., ring (Apache-2.0 AND ISC), rustls-native-certs (Apache-2.0 OR ISC OR MIT), webpki-roots (CDLA-Permissive-2.0), rcgen (MIT OR Apache-2.0, tests only).
 **No AGPL components** (MuPDF is excluded).

@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 import PDFKit
 
@@ -13,7 +13,7 @@ extension ReaderChecks {
     @MainActor static func eraserChecks(drawing: URL, strokes: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-eraser-\(UUID())")
+            .appendingPathComponent("lyra-reader-eraser-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -24,7 +24,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
             guard let frame = state.canvasPageFrames.first(where: { $0.index == page }) else {

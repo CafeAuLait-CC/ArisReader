@@ -1,12 +1,12 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import SwiftUI
 
 extension ReaderChecks {
     /// Exercise the actual SwiftUI-to-AppKit bridge; model-only checks never show a window.
     @MainActor static func hostedPreviewChecks(root: URL) async throws {
         _ = NSApplication.shared
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("aris-hosted-preview-\(UUID())")
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-hosted-preview-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         for name in ["two-column-references.pdf", "cross-references.pdf"] {

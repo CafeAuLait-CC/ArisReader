@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Combine
 import Foundation
 import SwiftUI
@@ -386,7 +386,7 @@ extension ReaderChecks {
         if let hosted = firstCanvasView(controller.panel?.contentView) {
             require(hosted.hasAttachedSurface || hosted.submittedFrameCount > 0,
                     "the figure preview's canvas attaches a Metal surface inside the panel")
-            require(hosted.canvasClearColor === LyraTheme.raisedBgColor,
+            require(hosted.canvasClearColor === LyraReaderTheme.raisedBgColor,
                     "the figure preview clears to the panel colour behind transparent paper")
         } else {
             print("NOTE: the panel's canvas had not materialised in this environment; "

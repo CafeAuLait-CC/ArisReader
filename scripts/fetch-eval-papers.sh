@@ -125,7 +125,7 @@ for id in $(ids); do
   REQUESTED=$((REQUESTED + 1))
   printf '  > %-10s fetching  %s\n' "$id" "$note"
   if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
-        -A "ArisReader-eval-fetch/1.0 (local citation-index evaluation; +https://github.com/CafeAuLait-CC/ArisReader)" \
+        -A "LyraReader-eval-fetch/1.0 (local citation-index evaluation; +https://github.com/CafeAuLait-CC/LyraReader)" \
         -o "$tmp" "https://arxiv.org/pdf/$revision"; then
     echo "  x $id: download failed" >&2
     rm -f "$tmp"
@@ -165,4 +165,4 @@ if [ "$FAILED" -gt 0 ]; then
   exit 1
 fi
 echo
-echo "Next: cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture"
+echo "Next: cargo test -p lyra-reader-cli --test reference_eval -- --ignored --nocapture"

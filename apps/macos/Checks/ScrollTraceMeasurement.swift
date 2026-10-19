@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 /// What a scripted scroll actually does to the model offset, event by event.
@@ -11,13 +11,13 @@ import Foundation
 ///
 /// It is a measurement, not a check: nothing here asserts, it reports.
 ///
-/// Usage: ArisReaderChecks --measure-scroll-trace [root]
+/// Usage: LyraReaderChecks --measure-scroll-trace [root]
 extension ReaderChecks {
     @MainActor static func measureScrollTrace() async throws {
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
             ?? FileManager.default.currentDirectoryPath)
         let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lyra-scroll-trace-\(UUID())")
+            .appendingPathComponent("lyra-reader-scroll-trace-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let copy = temporary.appendingPathComponent("document.pdf")

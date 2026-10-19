@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 /// A tile engine whose tiles are exactly `tileSize × tileSize` pixels, so a check can predict
@@ -37,7 +37,7 @@ extension ReaderChecks {
     /// drops a tile that is visible or pinned.
     ///
     /// The cases below are the Swift port of the specification and test bed in
-    /// `crates/aris-reader-render/src/cache.rs` (`evicts_least_recently_used`,
+    /// `crates/lyra-reader-render/src/cache.rs` (`evicts_least_recently_used`,
     /// `pinned_entries_survive_eviction`, `all_pinned_never_evicts`,
     /// `newest_insert_is_protected_but_older_ones_are_not`,
     /// `replacing_same_key_does_not_double_count`, `hit_rate_is_reported`), plus the two rules
@@ -145,19 +145,19 @@ extension ReaderChecks {
         // The setting really sizes a live cache, and lowering it shrinks the cache immediately.
         // A dedicated suite keeps this hermetic: the checks must never write the reader's own
         // `cacheBudgetMB`, and a leftover value here would change every later check.
-        let suiteName = "aris-reader-checks-\(UUID().uuidString)"
+        let suiteName = "lyra-reader-checks-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         defaults.set(16, forKey: AppState.cacheBudgetSettingKey)
         require(AppState.configuredTileCacheBudgetBytes(environment: [:], defaults: defaults) == 16 * 1024 * 1024,
                 "the cacheBudgetMB setting is what sizes the cache (was hard-coded to 512 before ADR 0007)")
-        require(AppState.configuredTileCacheBudgetBytes(environment: ["ARIS_READER_CACHE_BUDGET_MB": "32"], defaults: defaults)
+        require(AppState.configuredTileCacheBudgetBytes(environment: ["LYRA_READER_CACHE_BUDGET_MB": "32"], defaults: defaults)
                     == 32 * 1024 * 1024,
                 "the measurement override wins over the stored setting")
         require(AppState.configuredTileCacheBudgetBytes(environment: [:], defaults: defaults) != 512 * 1024 * 1024,
                 "the old 512 MB default no longer applies")
-        require(AppState.configuredTileCacheBudgetBytes(environment: ["ARIS_READER_CACHE_BUDGET_MB": "0"], defaults: defaults)
+        require(AppState.configuredTileCacheBudgetBytes(environment: ["LYRA_READER_CACHE_BUDGET_MB": "0"], defaults: defaults)
                     == 1024 * 1024,
                 "a zero/garbage budget is clamped instead of disabling the cache")
 

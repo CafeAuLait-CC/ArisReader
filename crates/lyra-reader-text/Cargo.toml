@@ -1,0 +1,16 @@
+[package]
+name = "lyra-reader-text"
+description = "Text layer: per-glyph boxes, word/line/block aggregation, selection hit testing, search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-core = { workspace = true }
+# CitationStyle is persisted in the document index cache; the cache is invalidated by
+# content hash, so a style can only be read back for the bytes that produced it.
+serde = { version = "1", features = ["derive"] }

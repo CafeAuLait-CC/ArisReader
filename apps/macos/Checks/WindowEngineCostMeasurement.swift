@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Darwin
 import Foundation
 
@@ -6,7 +6,7 @@ extension ReaderChecks {
     /// Opt-in measurement, never part of the regression run: **what a second window's engine
     /// costs**, now that each window builds its own (`ReaderSession`).
     ///
-    /// Usage: ArisReaderChecks --measure-window-engine-cost PAPER.pdf [OTHER.pdf]
+    /// Usage: LyraReaderChecks --measure-window-engine-cost PAPER.pdf [OTHER.pdf]
     ///
     /// The question this answers is the one the multi-window change turns into a design decision:
     /// the app's memory floor (~330 MiB, ADR 0007: PDFium + wgpu/Metal + AppKit + window surfaces)

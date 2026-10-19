@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -9,11 +9,11 @@ extension ReaderChecks {
     ///
     /// Everything runs through the real `AppState` and the real engine. The zoom check uses the
     /// same content↔view arithmetic the canvas uses, and the PDF checks reopen the written file
-    /// with Lyra and with PDFKit, so "the note came back" is about the file, not about memory.
+    /// with LyraReader and with PDFKit, so "the note came back" is about the file, not about memory.
     @MainActor static func placedTextChecks(drawing: URL, annotated: URL, external: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-placed-text-\(UUID())")
+            .appendingPathComponent("lyra-reader-placed-text-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -24,7 +24,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func sidecarText(_ document: URL) throws -> String {
             String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)
@@ -330,12 +330,12 @@ extension ReaderChecks {
         let writeNotePoint = CGPoint(x: 520, y: 700)
         require(writer.placeStickyNote(page: 0, at: writeNotePoint), "a note is placed for writing")
         let writeNoteID = writer.editingAnnotationID
-        writer.updateEditingText("A note written by Lyra.")
+        writer.updateEditingText("A note written by LyraReader.")
         writer.commitTextEditing()
         let writeBox = CGRect(x: 310, y: 620, width: 220, height: 55)
         require(writer.addTextBox(page: 0, rect: writeBox), "a text box is created for writing")
         let writeBoxID = writer.editingAnnotationID
-        writer.updateEditingText("Free text written by Lyra.")
+        writer.updateEditingText("Free text written by LyraReader.")
         writer.commitTextEditing()
         guard let writeNoteID, let writeBoxID else {
             require(false, "both written annotations have identities")
@@ -345,7 +345,7 @@ extension ReaderChecks {
         let copyURL = scratch.appendingPathComponent("written-notes.pdf")
         let wrote = await writer.saveAnnotatedCopy(to: copyURL)
         if !wrote { FileHandle.standardError.write(Data(
-            "aris-placed-text: write failed: \(writer.lastError ?? "no error")\n".utf8)) }
+            "lyra-reader-placed-text: write failed: \(writer.lastError ?? "no error")\n".utf8)) }
         require(wrote, "the note and text box are written into a copy")
         let writtenBytes = try Data(contentsOf: copyURL)
         require(writtenBytes.count > originalBytes.count &&
@@ -396,7 +396,7 @@ extension ReaderChecks {
         }
         require(readNote.kind == "text" && readNote.drawing == .noteIcon,
                 "the written sticky note reads as a /Text note icon")
-        require(readNote.contents == "A note written by Lyra.", "the note's text survives")
+        require(readNote.contents == "A note written by LyraReader.", "the note's text survives")
         require(readNote.author == AppState.annotationAuthor, "the note's author survives")
         require(readNote.color?.red == 0xE8 && readNote.color?.green == 0xBC
                     && readNote.color?.blue == 0x55,
@@ -409,7 +409,7 @@ extension ReaderChecks {
         }
         require(readBox.kind == "freeText" && readBox.drawing == .freeText,
                 "the written text box reads as a /FreeText annotation")
-        require(readBox.contents == "Free text written by Lyra.", "the text box's text survives")
+        require(readBox.contents == "Free text written by LyraReader.", "the text box's text survives")
         require(abs((readBox.fontSizePt ?? 0) - AppState.Annotation.defaultTextBoxFontSize) < 0.01,
                 "the text box's /DA font size survives")
         require(readBox.alignment == "left", "the text box's /Q is read back")
@@ -520,7 +520,7 @@ extension ReaderChecks {
   "id" : "\(futureID.uuidString)",
   "kind" : "stickyNote",
   "page" : 0,
-  "note" : "from a newer Lyra",
+  "note" : "from a newer LyraReader",
   "rect" : { "x" : 20, "y" : 30, "width" : 22, "height" : 22 },
   "fontSize" : 0,
   "createdAt" : 804000000,

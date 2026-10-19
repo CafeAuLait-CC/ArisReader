@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 @MainActor private class SlowTileEngine: PreviewEngine {

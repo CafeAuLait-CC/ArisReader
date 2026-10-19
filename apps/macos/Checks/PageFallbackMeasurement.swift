@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import Combine
 import Foundation
 
@@ -14,13 +14,13 @@ extension ReaderChecks {
     /// model with a real PDFium engine and opens no window, so it runs while the display is
     /// locked.
     ///
-    /// Usage: ArisReaderChecks --measure-page-fallback PDF zoom-percent
+    /// Usage: LyraReaderChecks --measure-page-fallback PDF zoom-percent
     @MainActor static func measurePageFallback() async throws {
         let args = CommandLine.arguments
         guard args.count == 4, let zoom = Int(args[3]), (10...800).contains(zoom) else {
             throw NSError(domain: "PageFallbackMeasurement", code: 1)
         }
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-fallback-\(UUID())")
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-fallback-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let copy = temporary.appendingPathComponent("document.pdf")

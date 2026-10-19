@@ -1,12 +1,12 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
-    // MARK: - Documents macOS hands to Lyra (T2.12)
+    // MARK: - Documents macOS hands to LyraReader (T2.12)
 
     /// The entry points the app was missing: a PDF dropped on the Dock icon, Finder's “Open
-    /// With”, `open -a Lyra …`, the reopen request, and a file dropped on the window canvas.
+    /// With”, `open -a LyraReader …`, the reopen request, and a file dropped on the window canvas.
     ///
     /// The delegate methods are called directly with real file URLs — the only way to reach them
     /// without a display — and every assertion is about state a reader can also see: which
@@ -31,7 +31,7 @@ extension ReaderChecks {
         state.setViewportSize(CGSize(width: 700, height: 500))
         let registry = ReaderWindowRegistry()
         let session = ReaderSession(state: state, registry: registry)
-        let delegate = ArisReaderAppDelegate(registry: registry)
+        let delegate = LyraReaderAppDelegate(registry: registry)
         let app = NSApplication.shared
 
         // 0. The instance SwiftUI creates at launch. `@NSApplicationDelegateAdaptor` calls
@@ -39,7 +39,7 @@ extension ReaderChecks {
         //    `init(registry:)` traps before the first window — with no check able to see it unless
         //    this one asks for exactly that initializer. It must own no document state either:
         //    the registry starts empty, and the first *window* is what makes a session.
-        let swiftUIInstance = ArisReaderAppDelegate()
+        let swiftUIInstance = LyraReaderAppDelegate()
         require(swiftUIInstance.registry.sessions.isEmpty && swiftUIInstance.registry.pendingCount == 0,
                 "the delegate SwiftUI instantiates with init() owns an empty registry, not a document")
 
@@ -62,7 +62,7 @@ extension ReaderChecks {
         require(state.document?.url?.path == a.path && state.document?.pageCount == 1,
                 "the first queued document is still open and loads its own pages")
 
-        // 2. A document opened while the app is running (`open -a Lyra file.pdf` again).
+        // 2. A document opened while the app is running (`open -a LyraReader file.pdf` again).
         let openRequests = state.openRequestCount
         delegate.application(app, open: [a])
         require(state.tabs.count == 3 && state.document?.url?.path == a.path,
@@ -112,7 +112,7 @@ extension ReaderChecks {
         opener.connect(canvas)  // exactly the wiring PDFCanvasView gives the real window
 
         func dragging(_ urls: [URL]) -> CheckDraggingInfo {
-            let pasteboard = NSPasteboard(name: NSPasteboard.Name("aris-checks-drop-\(UUID().uuidString)"))
+            let pasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-reader-checks-drop-\(UUID().uuidString)"))
             pasteboard.clearContents()
             pasteboard.writeObjects(urls.map { $0 as NSURL })
             return CheckDraggingInfo(pasteboard: pasteboard)
@@ -136,7 +136,7 @@ extension ReaderChecks {
         require(opener.dropHint == nil, "the hover hint clears once the drop lands")
 
         // 8. A drag that carries no file at all is not our business: no highlight, no drop.
-        let textPasteboard = NSPasteboard(name: NSPasteboard.Name("aris-checks-drop-text-\(UUID().uuidString)"))
+        let textPasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-reader-checks-drop-text-\(UUID().uuidString)"))
         textPasteboard.clearContents()
         textPasteboard.setString("just some text", forType: .string)
         require(canvas.draggingEntered(CheckDraggingInfo(pasteboard: textPasteboard)).isEmpty,

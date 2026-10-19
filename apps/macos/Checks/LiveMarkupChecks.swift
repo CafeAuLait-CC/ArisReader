@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -48,7 +48,7 @@ extension ReaderChecks {
     @MainActor static func liveMarkupChecks(textPage: URL, twoColumn: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-live-markup-\(UUID())")
+            .appendingPathComponent("lyra-reader-live-markup-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 

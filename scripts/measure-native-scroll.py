@@ -20,7 +20,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-PREFIX = 'aris-scroll-trace: '
+PREFIX = 'lyra-reader-scroll-trace: '
 
 
 def percentile(values, fraction):
@@ -133,7 +133,7 @@ def presentation_summary(records, submitted, start, end):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('pdf', type=Path)
-    p.add_argument('--app', type=Path, default=ROOT / 'apps/macos/.build/release/ArisReader')
+    p.add_argument('--app', type=Path, default=ROOT / 'apps/macos/.build/release/LyraReader')
     p.add_argument('--pdfium', type=Path, default=ROOT / 'vendor/pdfium/lib/libpdfium.dylib')
     p.add_argument('--runs', type=int, default=3)
     p.add_argument('--seconds', type=float, default=8)
@@ -162,16 +162,16 @@ def main():
     }
     results = []
     for run in range(args.runs):
-        with tempfile.TemporaryDirectory(prefix='aris-scroll-') as directory:
+        with tempfile.TemporaryDirectory(prefix='lyra-reader-scroll-') as directory:
             doc = Path(directory) / 'document.pdf'
             shutil.copyfile(args.pdf, doc)
-            env = {k:v for k,v in os.environ.items() if not k.startswith('ARIS_READER_')}
-            env.update(ARIS_READER_OPEN=str(doc), ARIS_READER_PDFIUM_PATH=str(args.pdfium.resolve()),
-                       ARIS_READER_ZOOM=str(args.zoom), ARIS_READER_CACHE_BUDGET_MB='48',
-                       ARIS_READER_SPIKE_FORCE_FRONT='1', ARIS_READER_SCROLL_TRACE_SECONDS=str(args.seconds),
-                       ARIS_READER_SCROLL_TRACE_SPEED=str(args.speed),
-                       ARIS_READER_QUIT_AFTER=str(math.ceil((args.seconds + 4) * 1000)))
-            if args.scheduling_diagnostics: env['ARIS_READER_SCROLL_TRACE_SCHEDULING'] = '1'
+            env = {k:v for k,v in os.environ.items() if not k.startswith('LYRA_READER_')}
+            env.update(LYRA_READER_OPEN=str(doc), LYRA_READER_PDFIUM_PATH=str(args.pdfium.resolve()),
+                       LYRA_READER_ZOOM=str(args.zoom), LYRA_READER_CACHE_BUDGET_MB='48',
+                       LYRA_READER_SPIKE_FORCE_FRONT='1', LYRA_READER_SCROLL_TRACE_SECONDS=str(args.seconds),
+                       LYRA_READER_SCROLL_TRACE_SPEED=str(args.speed),
+                       LYRA_READER_QUIT_AFTER=str(math.ceil((args.seconds + 4) * 1000)))
+            if args.scheduling_diagnostics: env['LYRA_READER_SCROLL_TRACE_SCHEDULING'] = '1'
             log = args.output / f'run-{run + 1}.log'
             with log.open('w') as output:
                 proc = subprocess.Popen([str(args.app.resolve())], env=env, stdout=output, stderr=subprocess.STDOUT)

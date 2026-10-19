@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 
 extension ReaderChecks {
     @MainActor static func annotationChecks(a: URL, b: URL) async throws {
-        let sidecar = a.appendingPathExtension("aris-annotations.json")
+        let sidecar = a.appendingPathExtension("lyra-reader-annotations.json")
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "old", createdAt: Date())
         let encoder = JSONEncoder()
@@ -77,7 +77,7 @@ extension ReaderChecks {
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func readSidecar(_ document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
@@ -368,7 +368,7 @@ extension ReaderChecks {
         let lockedOnDisk = try JSONDecoder().decode([AppState.Annotation].self, from: lockedBytes)
         require(lockedOnDisk.first?.note == "first", "the sidecar bytes survive a refused write")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: lockedDirectory.path)
-            .filter { $0 != "locked.pdf" && $0 != "locked.pdf.aris-annotations.json" }
+            .filter { $0 != "locked.pdf" && $0 != "locked.pdf.lyra-reader-annotations.json" }
         require(leftovers.isEmpty, "a failed write leaves no temporary files behind")
     }
 
@@ -701,14 +701,14 @@ extension ReaderChecks {
 
         func fixture(_ name: String) throws -> URL {
             let document = directory.appendingPathComponent(name)
-            let sidecar = document.appendingPathExtension("aris-annotations.json")
+            let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
             try? FileManager.default.removeItem(at: document)
             try? FileManager.default.removeItem(at: sidecar)
             try FileManager.default.copyItem(at: a, to: document)
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func text(of document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
@@ -866,7 +866,7 @@ extension ReaderChecks {
     /// * and the composite of those quads — the same quads, the same blend modes, composited by
     ///   CoreGraphics instead of by Metal — has the note's colour where the note is and page white
     ///   where it is not. That is the pixel evidence a headless run can produce; it is written to
-    ///   `ARIS_READER_CHECK_SNAPSHOT_DIR` when that variable names a directory.
+    ///   `LYRA_READER_CHECK_SNAPSHOT_DIR` when that variable names a directory.
     @MainActor static func annotationNoteChecks(url: URL) async throws {
         guard FileManager.default.fileExists(atPath: url.path) else {
             print("INFO: skipping note annotation checks (no notes fixture at \(url.path))")
@@ -1060,7 +1060,7 @@ extension ReaderChecks {
         } else {
             fatalError("FAIL: the colourless note reached no quad")
         }
-        if let directory = ProcessInfo.processInfo.environment["ARIS_READER_CHECK_SNAPSHOT_DIR"] {
+        if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] {
             snapshot.write(to: URL(fileURLWithPath: directory)
                 .appendingPathComponent("annotated-notes.png"))
         }
@@ -1075,7 +1075,7 @@ extension ReaderChecks {
     /// glyph is a real bitmap, in the right place, in the right colour — which is where both of
     /// this area's defects have actually lived.
     ///
-    /// Blend modes mirror `aris-reader-gpu`'s shaders: alpha-over for `normal`, and CoreGraphics'
+    /// Blend modes mirror `lyra-reader-gpu`'s shaders: alpha-over for `normal`, and CoreGraphics'
     /// `multiply` for a tint whose `/CA` is already baked into its colour, which reproduces the
     /// GPU's `dst × (a·c + 1 − a)` exactly at alpha 255.
     struct CanvasSnapshot {

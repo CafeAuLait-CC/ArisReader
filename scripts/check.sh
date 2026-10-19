@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ArisReader environment self-check + build check.
+# LyraReader environment self-check + build check.
 #
 # Usage: ./scripts/check.sh [--no-swift]
 #
@@ -7,7 +7,7 @@
 #   1. Print toolchain facts (Rust / Swift / SDK / Xcode / PDFium)
 #   2. Diagnose known Swift toolchain mismatches (see docs/09-dev-setup.md §2)
 #   3. cargo check / test / clippy
-#   4. swift build + ArisReaderChecks (only when the Swift probe passes)
+#   4. swift build + LyraReaderChecks (only when the Swift probe passes)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -164,12 +164,12 @@ if [ "$SWIFT_BUILT" = "1" ]; then
   # writes beside the PDF by design, so the suite disables it rather than leaving sidecars in
   # tests/fixtures; the cache itself is covered by the Rust integration tests, which copy their
   # fixtures into a scratch directory first.
-  if ARIS_READER_INDEX_CACHE=disabled \
-    ARIS_READER_PDFIUM_PATH="${ARIS_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
-    "$ROOT/apps/macos/.build/debug/ArisReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then
-    ok "ArisReaderChecks (complete native regression suite)"
+  if LYRA_READER_INDEX_CACHE=disabled \
+    LYRA_READER_PDFIUM_PATH="${LYRA_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
+    "$ROOT/apps/macos/.build/debug/LyraReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then
+    ok "LyraReaderChecks (complete native regression suite)"
   else
-    bad "ArisReaderChecks failed (see build/reader-checks.log)"
+    bad "LyraReaderChecks failed (see build/reader-checks.log)"
     tail -30 "$ROOT/build/reader-checks.log"
   fi
 fi

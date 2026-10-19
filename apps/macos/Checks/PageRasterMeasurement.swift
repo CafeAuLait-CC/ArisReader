@@ -1,9 +1,9 @@
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
     /// Opt-in CPU-raster measurement, never part of CI's normal regression run.
-    /// Usage: ArisReaderChecks --measure-page-rasters PDF scale retained-page-count
+    /// Usage: LyraReaderChecks --measure-page-rasters PDF scale retained-page-count
     /// Run under /usr/bin/time -l to measure process peak RSS; this excludes GPU textures.
     @MainActor static func measurePageRasters() async throws {
         let args = CommandLine.arguments

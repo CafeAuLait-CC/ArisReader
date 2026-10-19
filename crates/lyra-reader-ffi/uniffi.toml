@@ -1,0 +1,11 @@
+# UniFFI bindings configuration.
+#
+# The generated Swift lands in a dedicated `LyraReaderBindings` module and talks to the
+# C module `LyraReaderFFI`, which also carries the hand-written data-plane header
+# (include/lyra_reader_ffi.h). Both live in the same Swift package, so callers do not
+# care which layer a symbol comes from.
+
+[bindings.swift]
+module_name = "LyraReaderBindings"
+ffi_module_name = "LyraReaderFFI"
+cdylib_name = "lyra_reader_ffi"

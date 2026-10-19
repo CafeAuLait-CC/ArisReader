@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import SwiftUI
 
 extension ReaderChecks {
@@ -63,7 +63,7 @@ extension ReaderChecks {
                     == "This is the marked sentence.",
                 "geometric paragraph gaps keep preceding headings out of annotation excerpts")
 
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-editing-\(UUID())")
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-editing-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         let file = scratch.appendingPathComponent("notes.pdf")

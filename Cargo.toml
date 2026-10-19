@@ -8,20 +8,20 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["Alex"]
-description = "ArisReader — native macOS PDF reader (Rust engine + GPU compositing + SwiftUI interface)"
+description = "LyraReader — native macOS PDF reader (Rust engine + GPU compositing + SwiftUI interface)"
 
 [workspace.dependencies]
 # ── Internal crates ───────────────────────────────────────────────────────────
-aris-reader-core    = { path = "crates/aris-reader-core" }
-aris-reader-pdfium  = { path = "crates/aris-reader-pdfium" }
-aris-reader-text    = { path = "crates/aris-reader-text" }
-aris-reader-edit    = { path = "crates/aris-reader-edit" }
-aris-reader-render  = { path = "crates/aris-reader-render" }
-aris-reader-gpu     = { path = "crates/aris-reader-gpu" }
-aris-reader-session = { path = "crates/aris-reader-session" }
-aris-reader-ai      = { path = "crates/aris-reader-ai" }
-aris-reader-ffi     = { path = "crates/aris-reader-ffi" }
-aris-reader-metadata = { path = "crates/aris-reader-metadata" }
+lyra-reader-core    = { path = "crates/lyra-reader-core" }
+lyra-reader-pdfium  = { path = "crates/lyra-reader-pdfium" }
+lyra-reader-text    = { path = "crates/lyra-reader-text" }
+lyra-reader-edit    = { path = "crates/lyra-reader-edit" }
+lyra-reader-render  = { path = "crates/lyra-reader-render" }
+lyra-reader-gpu     = { path = "crates/lyra-reader-gpu" }
+lyra-reader-session = { path = "crates/lyra-reader-session" }
+lyra-reader-ai      = { path = "crates/lyra-reader-ai" }
+lyra-reader-ffi     = { path = "crates/lyra-reader-ffi" }
+lyra-reader-metadata = { path = "crates/lyra-reader-metadata" }
 
 # ── External dependencies (from M1; versions in docs/09-dev-setup.md) ─────────
 # wgpu          = "30"          # GPU abstraction (Metal / Vulkan / DX12)

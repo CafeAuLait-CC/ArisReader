@@ -1,6 +1,6 @@
 import AppKit
-import ArisReaderBindings
-import ArisReaderKit
+import LyraReaderBindings
+import LyraReaderKit
 import Darwin
 import Foundation
 
@@ -152,7 +152,7 @@ extension ReaderChecks {
 
     @MainActor
     private static func makeSettings(key: String?) -> AISettingsFixture {
-        let suiteName = "aris-ai-checks-\(UUID().uuidString)"
+        let suiteName = "lyra-reader-ai-checks-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         let keyStore = InMemoryAPIKeyStore(key: key)
@@ -177,7 +177,7 @@ extension ReaderChecks {
                 "an empty base URL is rejected")
         require(store.invalidSettingsMessage?.hasPrefix("Enter a base URL") == true,
                 "the empty-URL message is reader-facing: \(store.invalidSettingsMessage ?? "nil")")
-        require(store.invalidSettingsMessage?.contains("ArisFfiError") == false,
+        require(store.invalidSettingsMessage?.contains("LyraReaderFfiError") == false,
                 "the settings message does not expose the generated error type")
         require(store.save(baseURL: "ftp://example.com/v1", model: "x", temperature: 0.2, maxTokens: 100, apiKey: nil) == false,
                 "a non-HTTP base URL is rejected")
@@ -285,7 +285,7 @@ extension ReaderChecks {
         require(!captured.contains("LEAK-CHECK"), "neither does a diagnostic substring appear")
     }
 
-    /// Every `[p.N]` citation the panel will link is one Lyra asked for; nothing else is linkified.
+    /// Every `[p.N]` citation the panel will link is one LyraReader asked for; nothing else is linkified.
     @MainActor
     private static func aiCitationChecks() throws {
         let answer = """
@@ -318,7 +318,7 @@ extension ReaderChecks {
     /// environment limitation rather than a product defect.
     @MainActor
     private static func aiKeychainRoundTripCheck() throws {
-        let service = "com.alex.lyra.ai.checks.\(UUID().uuidString)"
+        let service = "com.alex.lyrareader.ai.checks.\(UUID().uuidString)"
         let account = "check-\(UUID().uuidString)"
         let keychain = KeychainAPIKeyStore(service: service, account: account)
         let key = "sk-keychain-check-\(UUID().uuidString)"
@@ -333,6 +333,18 @@ extension ReaderChecks {
         require((try? keychain.readKey()) == key, "the Keychain round-trips the key")
         try keychain.deleteKey()
         require((try? keychain.hasKey()) == false, "the Keychain item is gone after clearing")
+        let legacy = KeychainAPIKeyStore(service: service + ".old", account: account)
+        let upgraded = KeychainAPIKeyStore(service: service, account: account, legacyService: service + ".old")
+        defer { try? upgraded.deleteKey() }
+        try legacy.saveKey(key)
+        require((try? upgraded.hasKey()) == true && (try? upgraded.readKey()) == key,
+                "rename finds an API key or ChatGPT token in the legacy Keychain service")
+        try upgraded.saveKey("new-key")
+        require((try? upgraded.readKey()) == "new-key", "a newly saved credential wins over the old service")
+        try upgraded.deleteKey()
+        require((try? legacy.hasKey()) == false && (try? upgraded.readKey()) == nil,
+                "signing out after rename removes both services without resurrecting an old token")
+
     }
 
     /// Compare the four action paths on the same settings. This is evidence, not inference: it
@@ -431,7 +443,7 @@ extension ReaderChecks {
             print("INFO: skipping numbered-margin selection fixture (missing)")
         }
 
-        let samples = ProcessInfo.processInfo.environment["ARIS_READER_PDF_SAMPLES"]
+        let samples = ProcessInfo.processInfo.environment["LYRA_READER_PDF_SAMPLES"]
             .map { URL(fileURLWithPath: $0) }
             ?? root.appendingPathComponent("pdf-samples")
         let manuscript = samples.appendingPathComponent("manuscript_0925.pdf")

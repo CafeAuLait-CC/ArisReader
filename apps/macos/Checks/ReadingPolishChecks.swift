@@ -1,11 +1,11 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 import SwiftUI
 
 extension ReaderChecks {
     @MainActor static func readingPolishChecks(root: URL) async throws {
-        let suite = "lyra-reading-polish-\(UUID())"
+        let suite = "lyra-reader-reading-polish-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         let cache = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
         defer {

@@ -1,0 +1,13 @@
+[package]
+name = "lyra-reader-session"
+description = "Session and viewport state machine: commands/events, scroll and zoom anchoring, navigation history, keybinding map (platform-independent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-core = { workspace = true }

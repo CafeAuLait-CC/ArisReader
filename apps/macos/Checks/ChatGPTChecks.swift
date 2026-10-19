@@ -1,6 +1,6 @@
 import AppKit
-import ArisReaderBindings
-import ArisReaderKit
+import LyraReaderBindings
+import LyraReaderKit
 import CryptoKit
 import Foundation
 import Security
@@ -38,8 +38,8 @@ extension ReaderChecks {
         let query = params(url)
         require(url.host == "auth.openai.com" && query["client_id"] == "dynamic_agent_client",
                 "first sign-in uses the official dynamic registration endpoint")
-        require(query["agent_name_hint"] == "Lyra" && query["redirect_uri"] == "http://127.0.0.1:1455/auth/callback",
-                "Lyra identifies itself and uses an exact loopback callback")
+        require(query["agent_name_hint"] == "LyraReader" && query["redirect_uri"] == "http://127.0.0.1:1455/auth/callback",
+                "LyraReader identifies itself and uses an exact loopback callback")
         require(query["scope"]?.contains("chatgpt.tokens.use.direct") == true && query["code_challenge_method"] == "S256",
                 "ChatGPT plan permission and PKCE are requested explicitly")
         rejects("a callback with the wrong state cannot be exchanged") {
@@ -113,8 +113,8 @@ extension ReaderChecks {
         var modulus = readElement(sequence, &offset)
         while modulus.first == 0 { modulus.removeFirst() }
         let exponent = readElement(sequence, &offset)
-        let jwks = try json(["keys": [["kty": "RSA", "kid": "lyra-test", "n": base64(Data(modulus)), "e": base64(Data(exponent))]]])
-        let signingHeader = base64(try json(["alg": "RS256", "kid": "lyra-test"]))
+        let jwks = try json(["keys": [["kty": "RSA", "kid": "lyra-reader-test", "n": base64(Data(modulus)), "e": base64(Data(exponent))]]])
+        let signingHeader = base64(try json(["alg": "RS256", "kid": "lyra-reader-test"]))
         func signedIdentity(nonce: String) throws -> String {
             let payload = try json(["iss": "https://auth.openai.com", "aud": "oaiapp_test", "sub": "test-user",
                                     "email": "reader@example.invalid", "nonce": nonce, "exp": Date().timeIntervalSince1970 + 3600])
@@ -122,7 +122,7 @@ extension ReaderChecks {
             let signature = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, Data(unsigned.utf8) as CFData, nil)! as Data
             return unsigned + "." + base64(signature)
         }
-        let suite = "lyra-chatgpt-checks-\(UUID())"
+        let suite = "lyra-reader-chatgpt-checks-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite); ChatGPTStubProtocol.route = nil }
         let vault = InMemoryAPIKeyStore()

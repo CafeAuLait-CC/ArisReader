@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
@@ -15,7 +15,7 @@ extension ReaderChecks {
     @MainActor static func pageOperationChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
-            .appendingPathComponent("aris-pages-\(UUID())")
+            .appendingPathComponent("lyra-reader-pages-\(UUID())")
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
@@ -43,7 +43,7 @@ extension ReaderChecks {
             for annotation in annotations { lines.append(try entry(annotation)) }
             for bookmark in bookmarks { lines.append(try entry(bookmark)) }
             try Data(("[\n" + lines.joined(separator: ",\n") + "\n]").utf8)
-                .write(to: document.appendingPathExtension("aris-annotations.json"))
+                .write(to: document.appendingPathExtension("lyra-reader-annotations.json"))
         }
 
         let pageOne = AppState.Annotation(
@@ -69,7 +69,7 @@ extension ReaderChecks {
         let bookmark = Bookmark(page: 1, title: "on page two", yPt: 12)
         let annotated = try copyFixture("annotated.pdf", to: "seeded.pdf")
         try writeSidecar([pageOne, pageTwo], [bookmark], to: annotated)
-        let sidecarURL = annotated.appendingPathExtension("aris-annotations.json")
+        let sidecarURL = annotated.appendingPathExtension("lyra-reader-annotations.json")
         let originalBytes = try Data(contentsOf: annotated)
         let originalSidecar = try Data(contentsOf: sidecarURL)
 
@@ -79,7 +79,7 @@ extension ReaderChecks {
                 "page-edit fixture's sidecar is loaded")
         require(state.document?.pageCount == 2, "page-edit fixture has two pages")
 
-        // ── Rotation is refused when it would invalidate Lyra's text-range marks ─────
+        // ── Rotation is refused when it would invalidate LyraReader's text-range marks ─────
         // Sidecar annotations address character ranges. A rotated page's text layer comes back
         // in a different order, so the honest rule is to refuse the rotation rather than move
         // the highlight onto different words. Embedded PDF annotations rotate with the page.
@@ -87,7 +87,7 @@ extension ReaderChecks {
             .rotate(pages: [0], quarterTurns: 1),
             label: "Rotate page 1"
         )
-        require(!rotationRefused, "rotating a page with Lyra annotations is refused")
+        require(!rotationRefused, "rotating a page with LyraReader annotations is refused")
         require(state.lastError?.contains("text positions") == true,
                 "the refusal explains the annotation rule")
         require(!state.pageEditSessionActive, "a refused rotation does not start a session")
@@ -223,7 +223,7 @@ extension ReaderChecks {
 
         // ── Explicit replace: backup, verify, remapped sidecar ─────────────────────
         let replaced = try copyFixture("annotated.pdf", to: "replaced.pdf")
-        let replacedSidecar = replaced.appendingPathExtension("aris-annotations.json")
+        let replacedSidecar = replaced.appendingPathExtension("lyra-reader-annotations.json")
         let replacedPageOne = AppState.Annotation(
             id: UUID(), kind: .highlight, page: 0, start: 0, end: 4,
             color: AppState.highlightPalette[0].color, note: "goes away", createdAt: Date()
@@ -249,7 +249,7 @@ extension ReaderChecks {
         let backups = try fileManager.contentsOfDirectory(
             at: replaced.deletingLastPathComponent(),
             includingPropertiesForKeys: nil
-        ).filter { $0.lastPathComponent.contains(".lyra-backup-") }
+        ).filter { $0.lastPathComponent.contains(".lyra-reader-backup-") }
         require(backups.count == 1, "a verified backup of the original is left beside it")
         let reopened = AppState(engine: try RustEngine())
         require(reopened.open(url: replaced), "the replaced PDF reopens in a fresh reader")

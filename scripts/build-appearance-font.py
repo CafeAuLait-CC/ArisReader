@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the CJK font Lyra ships for PDF free-text appearance streams.
+"""Build the CJK font LyraReader ships for PDF free-text appearance streams.
 
 The shipped font is a **subset of Noto Sans SC**, not a system font. It is reduced to the
 characters an annotation in this reader actually uses: common Simplified Chinese (the full
@@ -7,15 +7,15 @@ GB 2312 set), the JIS X 0208 repertoire so Japanese kanji in a Japanese sentence
 kana, Greek, Latin and the mathematical/typographic symbols papers use. The full family is
 never shipped.
 
-The result is committed as `apps/macos/Resources/Fonts/LyraSansSC-Regular.ttf` together with the
+The result is committed as `apps/macos/Resources/Fonts/LyraReaderSansSC-Regular.ttf` together with the
 upstream `OFL.txt`. The writer then subsets this file again, per document, to the glyphs the
-appearance actually contains (see `crates/aris-reader-pdfium/src/appearance_font.rs`).
+appearance actually contains (see `crates/lyra-reader-pdfium/src/appearance_font.rs`).
 
-Usage (fontTools is only needed to regenerate the committed font, not to build or run Lyra):
+Usage (fontTools is only needed to regenerate the committed font, not to build or run LyraReader):
 
-    python3 -m venv /tmp/lyra-font-venv
-    /tmp/lyra-font-venv/bin/pip install fonttools
-    /tmp/lyra-font-venv/bin/python scripts/build-appearance-font.py
+    python3 -m venv /tmp/lyra-reader-font-venv
+    /tmp/lyra-reader-font-venv/bin/pip install fonttools
+    /tmp/lyra-reader-font-venv/bin/python scripts/build-appearance-font.py
 
 The script downloads the upstream variable font and its licence into a temporary directory when
 they are not already present. The output is deterministic for a given upstream font.
@@ -32,8 +32,8 @@ from pathlib import Path
 
 SOURCE_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"
 LICENCE_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/OFL.txt"
-OUTPUT_NAME = "LyraSansSC-Regular.ttf"
-FAMILY = "Lyra Sans SC"
+OUTPUT_NAME = "LyraReaderSansSC-Regular.ttf"
+FAMILY = "LyraReader Sans SC"
 
 # Unicode ranges that are not part of GB 2312 or JIS X 0208 but matter in annotations:
 # Latin (including the accented names papers cite), Greek, punctuation, arrows, mathematical
@@ -136,10 +136,10 @@ def rename_and_embed(font_path: Path) -> None:
     values = {
         1: FAMILY,
         2: "Regular",
-        3: "1.000;LYRA;LyraSansSC-Regular;2026",
+        3: "1.000;LYRA_READER;LyraReaderSansSC-Regular;2026",
         4: f"{FAMILY} Regular",
         5: "Version 1.000",
-        6: "LyraSansSC-Regular",
+        6: "LyraReaderSansSC-Regular",
         16: FAMILY,
         17: "Regular",
     }
@@ -169,7 +169,7 @@ def main() -> int:
     output_dir: Path = arguments.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="lyra-appearance-font-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="lyra-reader-appearance-font-") as temporary:
         temporary_dir = Path(temporary)
         source = arguments.source
         licence = arguments.licence

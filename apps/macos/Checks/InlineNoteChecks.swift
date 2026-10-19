@@ -1,11 +1,11 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import SwiftUI
 
 extension ReaderChecks {
     @MainActor static func inlineNoteChecks(root: URL) async throws {
         _ = NSApplication.shared
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("aris-inline-notes-\(UUID())")
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-inline-notes-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         var inputs = [root.appendingPathComponent("tests/fixtures/annotated-inline-notes.pdf")]
@@ -109,7 +109,7 @@ extension ReaderChecks {
             state.closeDocumentNote()
             state.scroll(toFraction: 0)
             state.zoomActual()
-            if let directory = ProcessInfo.processInfo.environment["ARIS_READER_CHECK_SNAPSHOT_DIR"] {
+            if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] {
                 try await eventually("the first page is sharp for the comment-label snapshot", {
                     state.canvasPages.contains { PlacementIndex.isPageRaster($0.placement.index) && $0.image.pixelWidth > 1000 }
                 })

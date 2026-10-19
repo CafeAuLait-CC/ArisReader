@@ -5,15 +5,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>ArisReader</string>
+	<string>LyraReader</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.alex.lyra</string>
+	<string>com.alex.lyrareader</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Lyra</string>
+	<string>LyraReader</string>
 	<key>CFBundleDisplayName</key>
-	<string>Lyra</string>
+	<string>LyraReader</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -32,9 +32,7 @@
 	<string>NSApplication</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
-	<!-- Document types: let Finder open PDFs with Lyra (refined in M1 T1.10).
-	     The bundle's executable is still named `ArisReader` (CFBundleExecutable above); that
-	     internal name is intentionally unchanged — see the rename commit message. -->
+	<!-- Document types: let Finder open PDFs with LyraReader. -->
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

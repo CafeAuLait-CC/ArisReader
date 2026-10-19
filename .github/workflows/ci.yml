@@ -1,19 +1,19 @@
-# Continuous integration for ArisReader (Lyra).
+# Continuous integration for LyraReader (LyraReader).
 #
 # Two jobs:
 #   * rust-core   — the fast Rust signal (fmt, clippy, workspace tests) on ubuntu-latest.
 #                   The platform is part of the point, not an accident: this is the only job that
 #                   compiles the workspace for a non-Apple target, which is how it caught
-#                   `aris-reader-gpu` using an Apple-only wgpu surface target and failing to build
+#                   `lyra-reader-gpu` using an Apple-only wgpu surface target and failing to build
 #                   on Linux at all. It does not replace the macOS job, and the macOS job does not
 #                   replace it.
 #   * macos-shell — the gate that actually protects this project: scripts/check.sh plus the
-#                   ArisReaderChecks harness (the native regression suite)
+#                   LyraReaderChecks harness (the native regression suite)
 #
 # Pull requests are checked against the **merge result**, not against the head branch: that is
 # what `actions/checkout` does by default on `pull_request`, and it is the entire point of this
 # file. Two pull requests each passed their own runs here, yet the combination left
-# `ArisReaderChecks` failing with no PASS lines at all. Nothing below may change that default —
+# `LyraReaderChecks` failing with no PASS lines at all. Nothing below may change that default —
 # no explicit `ref:`, no `github.event.pull_request.head.sha`, no "merge commit" toggle.
 #
 # What this workflow cannot cover, said out loud instead of hidden (see the annotated steps):
@@ -87,11 +87,11 @@ jobs:
         run: cargo test --workspace
 
       # No Metal device here, and the workspace compiles only wgpu's Metal backend
-      # (crates/aris-reader-gpu/Cargo.toml), so the offscreen GPU probes report "skipping:" and
+      # (crates/lyra-reader-gpu/Cargo.toml), so the offscreen GPU probes report "skipping:" and
       # pass without rendering anything. A green Linux run is not evidence for the GPU path.
       - name: Record what a GPU-less Linux runner does not exercise
         run: |
-          echo "::notice title=GPU path not exercised on Linux::this runner has no Metal device and wgpu is built with the Metal backend only, so aris-reader-gpu's offscreen probe and the matching aris-reader-ffi test print \"skipping:\" instead of rendering. The GPU path runs in macos-shell (and in the ArisReaderChecks harness)."
+          echo "::notice title=GPU path not exercised on Linux::this runner has no Metal device and wgpu is built with the Metal backend only, so lyra-reader-gpu's offscreen probe and the matching lyra-reader-ffi test print \"skipping:\" instead of rendering. The GPU path runs in macos-shell (and in the LyraReaderChecks harness)."
 
       # `cargo test --workspace` above is green even though the corpus regressions were never
       # run: their two test targets are `#[ignore]`d and need the private samples. Say it.
@@ -99,22 +99,22 @@ jobs:
       # committed links, but this job still never fetches it, so recall stays unmeasured here.
       - name: Record that the corpus regression did not run
         run: |
-          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need ARIS_READER_PDF_SAMPLES. A green cargo test says nothing about them. Run them on a machine that holds the corpus: ARIS_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p aris-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need LYRA_READER_PDF_SAMPLES. A green cargo test says nothing about them. Run them on a machine that holds the corpus: LYRA_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p lyra-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
 
       - name: Record that the reference-index evaluation did not run
         run: |
-          echo "::notice title=Reference eval NOT run::The twenty-paper evaluation corpus is not in this repository (the PDFs are never committed; tests/eval/arxiv-links.txt is the list of links). reference_eval is #[ignore]d and needs eval-papers/, so recall and the precision audit were NOT measured here. Fetch it and measure on a machine that can hold it: ./scripts/fetch-eval-papers.sh && cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture"
+          echo "::notice title=Reference eval NOT run::The twenty-paper evaluation corpus is not in this repository (the PDFs are never committed; tests/eval/arxiv-links.txt is the list of links). reference_eval is #[ignore]d and needs eval-papers/, so recall and the precision audit were NOT measured here. Fetch it and measure on a machine that can hold it: ./scripts/fetch-eval-papers.sh && cargo test -p lyra-reader-cli --test reference_eval -- --ignored --nocapture"
 
   macos-shell:
-    name: macos-shell (check.sh · ArisReaderChecks)
+    name: macos-shell (check.sh · LyraReaderChecks)
     # macos-14 cannot build this package: its newest Xcode (16.2) ships Swift 6.1, while the
-    # sources use `isolated deinit` (apps/macos/Sources/ArisReaderKit/PDFCanvasView.swift),
+    # sources use `isolated deinit` (apps/macos/Sources/LyraReaderKit/PDFCanvasView.swift),
     # which needs Swift 6.2. macos-15 ships Xcode 26.x, and the step below selects it.
     runs-on: macos-15
     timeout-minutes: 60
     env:
-      # How the Rust engine finds the library at run time (crates/aris-reader-pdfium/src/lib.rs).
-      ARIS_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+      # How the Rust engine finds the library at run time (crates/lyra-reader-pdfium/src/lib.rs).
+      LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
     steps:
       - name: Check out the merge result
         uses: actions/checkout@v5
@@ -161,14 +161,14 @@ jobs:
         run: ./scripts/fetch-pdfium.sh
 
       # ---------------------------------------------------------------- the Rust artifacts
-      # apps/macos/.rust/lib/libaris_reader_ffi.a and Sources/ArisReaderBindings/ are build
+      # apps/macos/.rust/lib/liblyra_reader_ffi.a and Sources/LyraReaderBindings/ are build
       # products (git-ignored), so a fresh checkout has neither and `swift build` cannot link.
       # scripts/check.sh does NOT produce them; this step does, and duplicates nothing.
       - name: Build the Rust static library and the UniFFI Swift bindings
         run: ./scripts/build-rust.sh --debug
 
       # fmt, clippy, the workspace tests, the Swift compile probe and `swift build`.
-      # (Its own ArisReaderChecks run happens inside; the explicit step below is what puts the
+      # (Its own LyraReaderChecks run happens inside; the explicit step below is what puts the
       # harness output in the job log, because check.sh redirects it to build/reader-checks.log.)
       - name: Run ./scripts/check.sh
         if: steps.pdfium.outcome == 'success'
@@ -177,7 +177,7 @@ jobs:
       # The gate this workflow exists for. Argument is the repository root: the harness resolves
       # its fixtures as <root>/tests/fixtures/*.pdf (apps/macos/Checks/ReaderChecks.swift).
       # `set -o pipefail` keeps the exit status while still showing every line in the log.
-      - name: ArisReaderChecks (native regression suite)
+      - name: LyraReaderChecks (native regression suite)
         if: steps.pdfium.outcome == 'success'
         shell: bash
         # The harness opens fixtures by their committed paths. The document index cache writes
@@ -185,12 +185,12 @@ jobs:
         # in the checkout (and later runs would silently test a warm index). The cache is covered
         # by `cargo test` above, whose integration tests copy fixtures into scratch directories.
         env:
-          ARIS_READER_INDEX_CACHE: disabled
+          LYRA_READER_INDEX_CACHE: disabled
         run: |
           set -o pipefail
-          "$GITHUB_WORKSPACE/apps/macos/.build/debug/ArisReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
+          "$GITHUB_WORKSPACE/apps/macos/.build/debug/LyraReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
 
-      # The class of failure nothing above can see. ArisReaderChecks constructs the app delegate
+      # The class of failure nothing above can see. LyraReaderChecks constructs the app delegate
       # itself, so it never asks SwiftUI to build one through the Objective-C runtime; on
       # 2026-10-15 a delegate that offered only `init(state:)` trapped the real application at
       # launch ("Use of unimplemented initializer 'init()'", EXC_BREAKPOINT/SIGTRAP) while the
@@ -212,7 +212,7 @@ jobs:
       # covered it. Do not let a future reader assume otherwise.
       - name: Record that the corpus regression did not run
         run: |
-          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need ARIS_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need LYRA_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
 
       # ---------------------------------------------------------- the reference-index evaluation
       # One step, because "should the evaluation run?" is a question about the *filesystem*, not
@@ -223,7 +223,7 @@ jobs:
       # `eval-papers/*.pdf` is true wherever the corpus came from: fetched by the opt-in call
       # inside this step, restored from a cache, or already on the workspace.
       #
-      # The harness itself is the authority on a *partial* corpus: ARIS_READER_REQUIRE_FULL_EVAL=1
+      # The harness itself is the authority on a *partial* corpus: LYRA_READER_REQUIRE_FULL_EVAL=1
       # makes reference_eval fail when any listed PDF is missing, so a present-but-incomplete
       # corpus fails loudly here rather than being reported as "not run". The verification script
       # is deliberately not run before it: it reports a missing paper as a mismatch, and naming
@@ -236,7 +236,7 @@ jobs:
       - name: Evaluate the reference index, or say that it did not run
         shell: bash
         env:
-          ARIS_READER_REQUIRE_FULL_EVAL: "1"
+          LYRA_READER_REQUIRE_FULL_EVAL: "1"
         run: |
           set -o pipefail
           # The opt-in fetch: manual dispatch with fetch_eval_papers=true downloads the corpus.
@@ -244,18 +244,18 @@ jobs:
             && [ "${{ github.event.inputs.fetch_eval_papers }}" = "true" ]; then
             ./scripts/fetch-eval-papers.sh
           fi
-          # Symmetric glob: eval-papers/ (the default) or $ARIS_READER_EVAL_PAPERS. `compgen` is a
+          # Symmetric glob: eval-papers/ (the default) or $LYRA_READER_EVAL_PAPERS. `compgen` is a
           # bash builtin, so it needs no `shopt -s nullglob` and no subshell.
-          CORPUS_DIR="${ARIS_READER_EVAL_PAPERS:-eval-papers}"
+          CORPUS_DIR="${LYRA_READER_EVAL_PAPERS:-eval-papers}"
           if compgen -G "$CORPUS_DIR/*.pdf" > /dev/null; then
             echo "evaluation corpus present in $CORPUS_DIR; measuring the reference index"
-            cargo test -p aris-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
+            cargo test -p lyra-reader-cli --test reference_eval -- --ignored --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/reference-eval.log"
           else
             echo "::notice title=Reference eval NOT run::No evaluation corpus is present in $CORPUS_DIR, so the citation/reference index was NOT measured in this run: recall, the per-paper table and the precision audit are all missing. The PDFs are never committed — tests/eval/arxiv-links.txt is the record and ./scripts/fetch-eval-papers.sh downloads it. To measure here, dispatch this workflow with fetch_eval_papers=true (or run ./scripts/fetch-eval-papers.sh on a machine that holds the corpus). A green run says nothing about recall."
           fi
 
-      # Archiving diagnostics is not a gate. A run whose check.sh, ArisReaderChecks and
+      # Archiving diagnostics is not a gate. A run whose check.sh, LyraReaderChecks and
       # reference-eval steps were all green once went red here, at the very last step, with
       # `Failed to CreateArtifact: Unable to make request: ENOTFOUND` — a runner DNS flake.
       # A green gate reported as a failure is a false negative that trains people to ignore red,
