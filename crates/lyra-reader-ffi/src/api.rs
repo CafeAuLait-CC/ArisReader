@@ -30,9 +30,9 @@ use lyra_reader_core::{
 use lyra_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use lyra_reader_pdfium::{
     DEFAULT_BOOKMARK_TITLE, EmbeddedBookmarks, PageOperation, PdfiumBackend, RedactionArea,
-    RedactionMode, SaveMode, WriteAnnotation, WriteAnnotationKind, WriteBookmark,
-    backend_description, preview_redactions, read_embedded_bookmarks, redact_pdf,
-    suggested_redaction_copy_path,
+    RedactionMode, SaveMode, SplitPart, WriteAnnotation, WriteAnnotationKind, WriteBookmark,
+    backend_description, merge_documents, preview_redactions, read_embedded_bookmarks, redact_pdf,
+    split_pages, suggested_redaction_copy_path,
 };
 use lyra_reader_session::{DocumentLayout, LayoutMode};
 use std::path::{Path, PathBuf};
@@ -1625,6 +1625,64 @@ impl LyraReaderDocument {
         Ok(page_edit_report(report))
     }
 
+    /// Appends `others` to this document and writes a **new** file at `destination`.
+    ///
+    /// This document is not modified. Encrypted inputs, a document merged into itself, the same
+    /// document selected twice, and an output that would overwrite an input are refused with a
+    /// readable error and no file. The first document's outline is kept; the appended documents'
+    /// outlines are not imported (`dropped_outline_entries` counts them). File-owned annotations
+    /// on appended pages travel with their pages. The reader's sidecar marks are the shell's
+    /// concern: appending does not move existing pages, so their page indices are unchanged and
+    /// the appended pages start with no sidecar marks.
+    pub fn merge_documents(
+        &self,
+        others: Vec<String>,
+        destination: String,
+    ) -> Result<MergeReportRecord, LyraReaderFfiError> {
+        if self.backend.is_encrypted() {
+            return Err(LyraReaderFfiError::Document {
+                message:
+                    "this document is encrypted; merging an encrypted document is refused and no output was written"
+                        .to_string(),
+            });
+        }
+        let others: Vec<PathBuf> = others.into_iter().map(PathBuf::from).collect();
+        let report = merge_documents(
+            Path::new(&self.path),
+            &others,
+            Path::new(&destination),
+            self.password.as_deref(),
+        )?;
+        Ok(merge_report(report))
+    }
+
+    /// Writes disjoint selections of this document into separate files.
+    ///
+    /// This document is not modified. See [`lyra_reader_pdfium::split_pages`] for the failure
+    /// model: each output is individually verified and atomically renamed, and a later failure
+    /// leaves earlier outputs complete (the error says how many).
+    pub fn split_pages(
+        &self,
+        parts: Vec<SplitPartRecord>,
+    ) -> Result<SplitReportRecord, LyraReaderFfiError> {
+        if self.backend.is_encrypted() {
+            return Err(LyraReaderFfiError::Document {
+                message:
+                    "this document is encrypted; splitting an encrypted document is refused and no output was written"
+                        .to_string(),
+            });
+        }
+        let parts: Vec<SplitPart> = parts
+            .into_iter()
+            .map(|part| SplitPart {
+                destination: PathBuf::from(part.destination_path),
+                pages: part.pages,
+            })
+            .collect();
+        let report = split_pages(Path::new(&self.path), &parts, self.password.as_deref())?;
+        Ok(split_report(report))
+    }
+
     /// Publishes the current page-edit revision as a new file, without touching the original.
     pub fn save_edited_copy(
         &self,
@@ -2430,6 +2488,43 @@ fn page_edit_report(report: lyra_reader_pdfium::PageOperationReport) -> PageEdit
             .backup_path
             .map(|path| path.to_string_lossy().into_owned()),
         output_bytes: report.output_bytes,
+        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+    }
+}
+
+fn merge_report(report: lyra_reader_pdfium::MergeReport) -> MergeReportRecord {
+    MergeReportRecord {
+        destination_path: report.destination.to_string_lossy().into_owned(),
+        page_count: report.page_count,
+        first_page_count: report.first_page_count,
+        appended_page_counts: report.appended_page_counts,
+        appended_annotation_counts: report
+            .appended_annotation_counts
+            .into_iter()
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .collect(),
+        rotations: report.rotations,
+        first_outline_entries: u32::try_from(report.first_outline_entries).unwrap_or(u32::MAX),
+        dropped_outline_entries: u32::try_from(report.dropped_outline_entries).unwrap_or(u32::MAX),
+        output_bytes: report.output_bytes,
+        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+    }
+}
+
+fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
+    SplitReportRecord {
+        parts: report
+            .parts
+            .into_iter()
+            .map(|part| SplitOutputRecord {
+                destination_path: part.destination.to_string_lossy().into_owned(),
+                page_count: part.page_count,
+                source_pages: part.source_pages,
+                rotations: part.rotations,
+                output_bytes: part.output_bytes,
+            })
+            .collect(),
+        source_page_count: report.source_page_count,
         cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
     }
 }
@@ -3814,6 +3909,54 @@ pub struct PageEditReport {
     pub backup_path: Option<String>,
     pub output_bytes: u64,
     /// Stale `.lyra-reader-save-*.tmp` files removed before writing.
+    pub cleaned_temporary_files: u32,
+}
+
+/// One output of a split, as the shell requested it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SplitPartRecord {
+    /// Where this part should be written.
+    pub destination_path: String,
+    /// 0-based pages from the open document. Sorted ascending by the engine; duplicates refused.
+    pub pages: Vec<u32>,
+}
+
+/// What a split wrote for one part.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SplitOutputRecord {
+    pub destination_path: String,
+    pub page_count: u32,
+    /// The source pages this output carries, in output order (0-based).
+    pub source_pages: Vec<u32>,
+    pub rotations: Vec<u32>,
+    pub output_bytes: u64,
+}
+
+/// What a split wrote.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SplitReportRecord {
+    pub parts: Vec<SplitOutputRecord>,
+    pub source_page_count: u32,
+    pub cleaned_temporary_files: u32,
+}
+
+/// What a merge wrote.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MergeReportRecord {
+    pub destination_path: String,
+    /// Sum of every input's page count.
+    pub page_count: u32,
+    pub first_page_count: u32,
+    /// Pages each appended document contributed, in the order requested.
+    pub appended_page_counts: Vec<u32>,
+    /// File-owned content annotations on the appended pages, per appended document.
+    pub appended_annotation_counts: Vec<u32>,
+    pub rotations: Vec<u32>,
+    /// Flattened outline entries kept from the first document.
+    pub first_outline_entries: u32,
+    /// Flattened outline entries of the appended documents that were not imported.
+    pub dropped_outline_entries: u32,
+    pub output_bytes: u64,
     pub cleaned_temporary_files: u32,
 }
 

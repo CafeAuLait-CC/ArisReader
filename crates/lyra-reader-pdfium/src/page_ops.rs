@@ -1,4 +1,5 @@
-//! Page operations on a **copy** of a PDF: rotate, delete, reorder, insert blank, extract.
+//! Page operations on a **copy** of a PDF: rotate, delete, reorder, insert blank, extract, merge
+//! and split.
 //!
 //! # Why this uses PDFium's C ABI directly
 //!
@@ -27,6 +28,38 @@
 //! annotations, and importing pages copies them. The tests assert that, because it is the kind
 //! of behaviour a viewer must not assume from a page-tree edit.
 //!
+//! # Merge and split
+//!
+//! [`merge_documents`] appends every page of one or more other PDFs to the first document and
+//! writes a new file. [`split_pages`] extracts several disjoint selections into separate files.
+//! Both use the same verified write path as every other page operation: the input is read into
+//! memory, each output is built in a temporary file beside its destination, flushed and fsynced,
+//! reopened and checked, and only then renamed. The inputs are never modified.
+//!
+//! **Outline rule.** A merge keeps the first document's outline exactly as it was (its page
+//! numbers do not move because pages are appended), and does **not** import the other documents'
+//! outlines: PDFium's page-import call copies page dictionaries, not a document-level bookmark
+//! tree, and inventing destinations for another author's outline would be worse than leaving it
+//! out. [`MergeReport::dropped_outline_entries`] counts what was left out so the shell can say
+//! so. A split keeps no outline in any output for the same reason: the source outline's
+//! destinations refer to pages that may be in a different output; the shell's sidecar bookmarks
+//! are remapped per output instead.
+//!
+//! **Sidecar rule.** The reader's own annotations/bookmarks live outside this module, in a
+//! sidecar keyed by page index. Merge only appends, so the first document's pages keep their
+//! indices and every existing mark keeps pointing at its page; the appended pages are new
+//! indices with no sidecar marks, because this app has no sidecar for the other documents (their
+//! file-owned annotations do travel with them). Split outputs are renumbered, so the shell
+//! remaps the sidecar per output.
+//!
+//! **Split failure model.** The whole plan is validated before anything is written (indices,
+//! overlapping outputs, destinations). Outputs are then written one at a time, each with its own
+//! temporary file and atomic rename. If output *k* fails, outputs 1…*k*−1 are already complete
+//! and verified and are left in place; output *k* is not renamed (its temporary is removed);
+//! later outputs are not attempted; the source is unchanged. The split is therefore **not** one
+//! transaction across files — it is a sequence of atomic, verified steps, and the error says how
+//! many files were completed.
+//!
 //! # Rotation
 //!
 //! Page rotation is `/Rotate`, not baked-in geometry. Rotating a page rotates its content and
@@ -41,9 +74,15 @@
 //! * Page indices outside the document, duplicate indices, empty selections.
 //! * Password-protected documents (PDFium's re-save of an encrypted document cannot be verified
 //!   without the password and may drop encryption; refusing is safer than writing an output the
-//!   caller cannot check).
-//! * Any operation whose verified output does not have the expected page count, rotations and
-//!   page sizes. The destination is then untouched (and a backup, if one was made, still exists).
+//!   caller cannot check). This includes PDFs that open with an empty user password: they are
+//!   detected through `FPDF_GetSecurityHandlerRevision`, not only through a supplied password.
+//! * Merging a document into itself, merging the same file twice, and any output that would
+//!   overwrite one of the inputs.
+//! * A split plan with an empty part, a page named twice (within one part or across parts), or
+//!   two outputs at the same path.
+//! * Any operation whose verified output does not have the expected page count, rotations,
+//!   page sizes (and, for merge/split, page text and file-owned annotations). The destination
+//!   is then untouched (and a backup, if one was made, still exists).
 //!
 //! # Threading
 //!
@@ -52,10 +91,14 @@
 
 #![allow(unsafe_code)]
 
+use crate::annotations::AnnotationReader;
 use crate::backend::{PDFIUM_LOCK, PdfiumBackend};
 use crate::writeback::{OutputMode, RewrittenOutput, write_rewritten_pdf};
 use libloading::Library;
-use lyra_reader_core::{DocumentBackend, ErrorCode, LyraReaderError, PageIndex, Result};
+use lyra_reader_core::{
+    DocumentBackend, ErrorCode, LyraReaderError, OutlineNode, PageIndex, RawAnnotation, Result,
+};
+use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fs::{self, File};
 use std::io::Write;
@@ -115,6 +158,68 @@ pub struct PageOperationReport {
     pub cleaned_temporaries: usize,
 }
 
+/// One output of [`split_pages`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitPart {
+    /// Where this part is written.
+    pub destination: PathBuf,
+    /// 0-based pages from the source. The engine sorts them ascending and refuses duplicates;
+    /// pages may not appear in two parts.
+    pub pages: Vec<u32>,
+}
+
+/// What [`split_pages`] wrote for one part.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitPartReport {
+    pub destination: PathBuf,
+    pub page_count: u32,
+    /// The source pages this output carries, in output order (0-based).
+    pub source_pages: Vec<u32>,
+    /// `/Rotate` of every written page, as quarter turns (0–3).
+    pub rotations: Vec<u32>,
+    /// View size of every written page, in points.
+    pub page_sizes: Vec<(f64, f64)>,
+    pub output_bytes: u64,
+}
+
+/// What [`split_pages`] did.
+///
+/// The parts are returned in the caller's order. On error, the report is not returned; the
+/// error's detail says how many complete outputs were left in place.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitReport {
+    pub parts: Vec<SplitPartReport>,
+    pub source_page_count: u32,
+    pub cleaned_temporaries: usize,
+}
+
+/// What [`merge_documents`] did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeReport {
+    pub destination: PathBuf,
+    /// Page count of the written file: the sum of every input's page count.
+    pub page_count: u32,
+    /// Pages the first document contributed.
+    pub first_page_count: u32,
+    /// Pages each appended document contributed, in the order the caller named them.
+    pub appended_page_counts: Vec<u32>,
+    /// File-owned content annotations on the appended pages, per appended document.
+    ///
+    /// They are copied with their pages; the verification compares every appended page's
+    /// annotation list with its source page.
+    pub appended_annotation_counts: Vec<usize>,
+    /// `/Rotate` of every written page, as quarter turns (0–3).
+    pub rotations: Vec<u32>,
+    /// View size of every written page, in points.
+    pub page_sizes: Vec<(f64, f64)>,
+    /// Flattened outline entries the first document had and the output kept.
+    pub first_outline_entries: usize,
+    /// Flattened outline entries in the other documents that were **not** imported.
+    pub dropped_outline_entries: usize,
+    pub output_bytes: u64,
+    pub cleaned_temporaries: usize,
+}
+
 /// Applies `operation` to a copy of `source` and writes the result to `destination`.
 ///
 /// Never modifies `source`. If `destination` already exists and is not `source`, it is replaced
@@ -127,9 +232,8 @@ pub fn apply_page_operation(
     password: Option<&str>,
 ) -> Result<PageOperationReport> {
     reject_password(password)?;
-    let bytes = read_source(source)?;
     let api = api()?;
-    let document = RawDocument::load(api, bytes, password)?;
+    let document = open_editable(api, source, "the document being edited")?;
     let page_count = document.page_count();
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
@@ -190,9 +294,8 @@ pub fn extract_pages(
     password: Option<&str>,
 ) -> Result<PageOperationReport> {
     reject_password(password)?;
-    let bytes = read_source(source)?;
     let api = api()?;
-    let document = RawDocument::load(api, bytes, password)?;
+    let document = open_editable(api, source, "the document being extracted")?;
     let page_count = document.page_count();
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
@@ -205,7 +308,7 @@ pub fn extract_pages(
     }
 
     let imported = RawDocument::new_document(api)?;
-    imported.import_pages(&document, &selected)?;
+    imported.import_pages(&document, &selected, 0)?;
 
     let mut page_map = vec![None; page_count as usize];
     for (new, old) in selected.iter().enumerate() {
@@ -239,6 +342,272 @@ pub fn extract_pages(
         expected_sizes,
         None,
     ))
+}
+
+/// Appends every page of `others` to `source` and writes the result to `destination`.
+///
+/// The first document's pages keep their indices; every other document's pages follow in the
+/// order given. The source and every appended document are never modified, and the output may
+/// not be any of them. The result is verified before its atomic rename: page count, rotations,
+/// sizes, per-page text, per-page file-owned annotations, and the first document's outline.
+///
+/// What happens to the second document's outline, and to the reader's sidecar, is documented at
+/// the top of this module. In short: its outline is not imported (and is counted in the report),
+/// its embedded annotations travel, and the first document's sidecar marks keep their page
+/// indices because nothing before the appended pages moves.
+pub fn merge_documents(
+    source: &Path,
+    others: &[PathBuf],
+    destination: &Path,
+    password: Option<&str>,
+) -> Result<MergeReport> {
+    reject_password(password)?;
+    if others.is_empty() {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            "choose at least one document whose pages should be appended",
+        ));
+    }
+    let source = canonical_input(source, "the document to append to")?;
+    let mut inputs = vec![source.clone()];
+    for other in others {
+        let other = canonical_input(other, "a document being appended")?;
+        if same_file(&other, &source) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "a document cannot be merged into itself; choose a different file",
+            )
+            .with_detail(other.display().to_string()));
+        }
+        if inputs.iter().any(|input| same_file(input, &other)) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "the same document was selected to be appended twice",
+            )
+            .with_detail(other.display().to_string()));
+        }
+        inputs.push(other);
+    }
+    let destination_resolved = canonical_output(destination)?;
+    for input in &inputs {
+        if same_file(&destination_resolved, input) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "the merged output would overwrite one of its input documents; choose a new file",
+            )
+            .with_detail(input.display().to_string()));
+        }
+    }
+
+    let api = api()?;
+    let merged = open_editable(api, &source, "the document to append to")?;
+    let first_page_count = merged.page_count();
+    if first_page_count == 0 {
+        return Err(empty_document_error(&source));
+    }
+    let mut expected_rotations = merged.rotations()?;
+    let mut expected_sizes = merged.sizes()?;
+    let mut expected_texts = page_texts(&source)?;
+    let mut expected_annotations = page_annotations(&source)?;
+    let first_outline = outline_signature(&source)?;
+    let mut appended_page_counts = Vec::with_capacity(others.len());
+    let mut appended_annotation_counts = Vec::with_capacity(others.len());
+    let mut dropped_outline_entries = 0usize;
+
+    for other in inputs.iter().skip(1) {
+        let appended = open_editable(api, other, "a document being appended")?;
+        let count = appended.page_count();
+        if count == 0 {
+            return Err(empty_document_error(other));
+        }
+        let pages: Vec<u32> = (0..count).collect();
+        merged.import_pages(&appended, &pages, merged.page_count())?;
+        expected_rotations.extend(appended.rotations()?);
+        expected_sizes.extend(appended.sizes()?);
+        expected_texts.extend(page_texts(other)?);
+        let annotations = page_annotations(other)?;
+        appended_annotation_counts.push(annotations.iter().map(Vec::len).sum::<usize>());
+        expected_annotations.extend(annotations);
+        appended_page_counts.push(count);
+        dropped_outline_entries += outline_signature(other)?.len();
+    }
+
+    let page_count = expected_rotations.len() as u32;
+    let first_outline_entries = first_outline.len();
+    let rotations_for_report = expected_rotations.clone();
+    let sizes_for_report = expected_sizes.clone();
+    let rewritten = write_rewritten_pdf(
+        &source,
+        destination,
+        OutputMode::Copy,
+        |file| merged.save(file),
+        |path| {
+            verify_output(path, page_count, &expected_rotations, &expected_sizes)?;
+            verify_text_pages(path, &expected_texts)?;
+            verify_annotation_pages(path, &expected_annotations)?;
+            verify_outline(path, &first_outline)?;
+            Ok(())
+        },
+    )?;
+
+    Ok(MergeReport {
+        destination: rewritten.destination,
+        page_count,
+        first_page_count,
+        appended_page_counts,
+        appended_annotation_counts,
+        rotations: rotations_for_report,
+        page_sizes: sizes_for_report
+            .into_iter()
+            .map(|size| (size.width, size.height))
+            .collect(),
+        first_outline_entries,
+        dropped_outline_entries,
+        output_bytes: rewritten.output_bytes,
+        cleaned_temporaries: rewritten.cleaned_temporaries,
+    })
+}
+
+/// Splits `source` into `parts`, each written atomically to its own destination.
+///
+/// A part's pages are sorted ascending and must not overlap with another part's; parts may leave
+/// source pages out (that is what makes "1–5, 6–10" valid on an eleven-page document). All
+/// destinations are validated before the first output is built, so a bad plan writes nothing.
+///
+/// # Failure model
+///
+/// Each output is an independent verified atomic write. If a later output fails, the earlier
+/// outputs are complete, verified files that stay in place; the failed output's temporary file is
+/// removed and later outputs are not attempted. The error's message says how many outputs were
+/// completed. The source is never modified. There is no rollback of the completed outputs,
+/// because they are valid deliverables, not half-written state.
+pub fn split_pages(
+    source: &Path,
+    parts: &[SplitPart],
+    password: Option<&str>,
+) -> Result<SplitReport> {
+    reject_password(password)?;
+    if parts.is_empty() {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            "choose at least two pages or at least one range to split",
+        ));
+    }
+    let source = canonical_input(source, "the document being split")?;
+    let api = api()?;
+    let document = open_editable(api, &source, "the document being split")?;
+    let page_count = document.page_count();
+    if page_count == 0 {
+        return Err(empty_document_error(&source));
+    }
+    let rotations = document.rotations()?;
+    let sizes = document.sizes()?;
+    let texts = page_texts(&source)?;
+    let annotations = page_annotations(&source)?;
+
+    let mut seen_pages = HashSet::new();
+    let mut seen_destinations: Vec<PathBuf> = Vec::with_capacity(parts.len());
+    let mut validated: Vec<(PathBuf, Vec<u32>)> = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let pages = validate_split_pages(&part.pages, page_count, index, parts.len())?;
+        for page in &pages {
+            if !seen_pages.insert(*page) {
+                return Err(LyraReaderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "page {} appears in more than one split output; a page can only be written once",
+                        page + 1
+                    ),
+                ));
+            }
+        }
+        let destination = canonical_output(&part.destination)?;
+        if same_file(&destination, &source) {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "a split output would overwrite the document being split; choose new files",
+            )
+            .with_detail(destination.display().to_string()));
+        }
+        if seen_destinations
+            .iter()
+            .any(|seen| seen == &destination || same_file(seen, &destination))
+        {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                "two split outputs point at the same file; each part needs its own name",
+            )
+            .with_detail(destination.display().to_string()));
+        }
+        seen_destinations.push(destination.clone());
+        validated.push((destination, pages));
+    }
+
+    let mut written_parts = Vec::with_capacity(validated.len());
+    let mut cleaned_temporaries = 0usize;
+    for (index, (destination, pages)) in validated.iter().enumerate() {
+        let imported = RawDocument::new_document(api)?;
+        imported.import_pages(&document, pages, 0)?;
+        let expected_rotations: Vec<u32> =
+            pages.iter().map(|page| rotations[*page as usize]).collect();
+        let expected_sizes: Vec<PageSize> =
+            pages.iter().map(|page| sizes[*page as usize]).collect();
+        let expected_texts: Vec<String> = pages
+            .iter()
+            .map(|page| texts[*page as usize].clone())
+            .collect();
+        let expected_annotations: Vec<Vec<RawAnnotation>> = pages
+            .iter()
+            .map(|page| annotations[*page as usize].clone())
+            .collect();
+        let result = write_rewritten_pdf(
+            &source,
+            destination,
+            OutputMode::Copy,
+            |file| imported.save(file),
+            |path| {
+                verify_output(
+                    path,
+                    pages.len() as u32,
+                    &expected_rotations,
+                    &expected_sizes,
+                )?;
+                verify_text_pages(path, &expected_texts)?;
+                verify_annotation_pages(path, &expected_annotations)?;
+                Ok(())
+            },
+        );
+        match result {
+            Ok(output) => {
+                cleaned_temporaries += output.cleaned_temporaries;
+                written_parts.push(SplitPartReport {
+                    destination: output.destination,
+                    page_count: pages.len() as u32,
+                    source_pages: pages.clone(),
+                    rotations: expected_rotations,
+                    page_sizes: expected_sizes
+                        .into_iter()
+                        .map(|size| (size.width, size.height))
+                        .collect(),
+                    output_bytes: output.output_bytes,
+                });
+            }
+            Err(error) => {
+                return Err(split_output_error(
+                    error,
+                    index,
+                    validated.len(),
+                    written_parts.len(),
+                ));
+            }
+        }
+    }
+
+    Ok(SplitReport {
+        parts: written_parts,
+        source_page_count: page_count,
+        cleaned_temporaries,
+    })
 }
 
 /// Publishes the current page-edit revision as a new file, without applying another operation.
@@ -590,6 +959,322 @@ fn reject_password(password: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Resolves a file that an operation reads, refusing a missing or non-regular input.
+fn canonical_input(path: &Path, what: &str) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| io_error("could not resolve the document", path, error))?;
+    if !resolved.is_file() {
+        return Err(LyraReaderError::new(
+            ErrorCode::NotFound,
+            format!("{what} is not a regular file"),
+        )
+        .with_detail(path.display().to_string()));
+    }
+    Ok(resolved)
+}
+
+/// Resolves a destination the same way [`writeback::write_rewritten_pdf`] will, without
+/// requiring the destination itself to exist yet.
+fn canonical_output(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path)
+            .map_err(|error| io_error("could not resolve the destination", path, error));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| io_error("the destination directory does not exist", path, error))?;
+    let name = path.file_name().ok_or_else(|| {
+        LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            "the destination has no file name",
+        )
+        .with_detail(path.display().to_string())
+    })?;
+    Ok(parent.join(name))
+}
+
+/// Whether two existing paths name the same directory entry (canonical path or hard link).
+fn same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(left), fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// Opens a document for a page operation, with a readable refusal for encrypted files.
+///
+/// `PdfiumBackend::open` distinguishes "needs a password" from "corrupt", but a PDF encrypted
+/// with an **empty user password** opens without one. The security-handler revision is the only
+/// reliable signal in that case, so it is checked on the loaded raw document as well.
+fn open_editable(api: &'static PageApi, path: &Path, role: &str) -> Result<RawDocument> {
+    let bytes = read_source(path)?;
+    let document = match RawDocument::load(api, bytes, None) {
+        Ok(document) => document,
+        Err(error) => {
+            return match PdfiumBackend::open(path, None) {
+                Ok(_) => Err(error),
+                Err(backend_error) if backend_error.code == ErrorCode::Encrypted => {
+                    Err(encrypted_refusal(role, path))
+                }
+                Err(backend_error) => Err(backend_error),
+            };
+        }
+    };
+    if document.security_revision() >= 0 {
+        return Err(encrypted_refusal(role, path));
+    }
+    Ok(document)
+}
+
+fn encrypted_refusal(role: &str, path: &Path) -> LyraReaderError {
+    LyraReaderError::new(
+        ErrorCode::Encrypted,
+        format!(
+            "{role} is password-protected; encrypted documents cannot be merged or split and no output was written"
+        ),
+    )
+    .with_detail(path.display().to_string())
+}
+
+fn empty_document_error(path: &Path) -> LyraReaderError {
+    LyraReaderError::new(
+        ErrorCode::CorruptDocument,
+        "a document with no pages cannot be merged or split",
+    )
+    .with_detail(path.display().to_string())
+}
+
+/// Sorts a split part's pages and refuses empty, duplicate and out-of-range selections.
+fn validate_split_pages(
+    pages: &[u32],
+    page_count: u32,
+    part_index: usize,
+    part_count: usize,
+) -> Result<Vec<u32>> {
+    if pages.is_empty() {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "split output {} of {part_count} selects no pages",
+                part_index + 1
+            ),
+        ));
+    }
+    let mut unique = pages.to_vec();
+    unique.sort_unstable();
+    for window in unique.windows(2) {
+        if window[0] == window[1] {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "page {} is selected twice in split output {} of {part_count}",
+                    window[0] + 1,
+                    part_index + 1
+                ),
+            ));
+        }
+    }
+    for page in &unique {
+        if *page >= page_count {
+            return Err(LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "page {} is outside the document ({} page(s))",
+                    page + 1,
+                    page_count
+                ),
+            ));
+        }
+    }
+    Ok(unique)
+}
+
+/// Adds the split failure model to a per-output error: what is complete and what was not tried.
+fn split_output_error(
+    error: LyraReaderError,
+    failed_index: usize,
+    part_count: usize,
+    completed: usize,
+) -> LyraReaderError {
+    let completed = if completed == 0 {
+        "no output was completed".to_string()
+    } else {
+        format!("{completed} earlier output(s) are complete and verified and stay in place")
+    };
+    LyraReaderError::new(
+        error.code,
+        format!(
+            "split output {} of {part_count} failed; {completed}; the source is unchanged; later outputs were not attempted",
+            failed_index + 1
+        ),
+    )
+    .with_detail(error.to_string())
+}
+
+/// Every page's text, in page order, built from the character boxes the engine reports.
+///
+/// Matches the test helper this module already uses; it works for rotated pages, where the
+/// higher-level `text.all()` representation can come back empty.
+fn page_texts(path: &Path) -> Result<Vec<String>> {
+    let backend = PdfiumBackend::open(path, None)?;
+    (0..backend.page_count())
+        .map(|page| {
+            let raw = backend.raw_text_page(PageIndex(page))?;
+            Ok(raw
+                .chars
+                .iter()
+                .filter_map(|character| char::from_u32(character.unicode))
+                .collect())
+        })
+        .collect()
+}
+
+/// Every page's file-owned content annotations, in page order.
+fn page_annotations(path: &Path) -> Result<Vec<Vec<RawAnnotation>>> {
+    let backend = PdfiumBackend::open(path, None)?;
+    let count = backend.page_count();
+    drop(backend);
+    let reader = AnnotationReader::open(path, None)?;
+    let mut pages = Vec::with_capacity(count as usize);
+    for page in 0..count {
+        let records = {
+            let _guard = PDFIUM_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reader.page(PageIndex(page))?
+        };
+        pages.push(records);
+    }
+    Ok(pages)
+}
+
+fn verify_text_pages(path: &Path, expected: &[String]) -> Result<()> {
+    let actual = page_texts(path)?;
+    if actual.len() != expected.len() {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the rewritten document does not have the expected page count",
+        )
+        .with_detail(format!(
+            "expected {} page(s), reopened {}",
+            expected.len(),
+            actual.len()
+        )));
+    }
+    for (page, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+        if expected != actual {
+            return Err(LyraReaderError::new(
+                ErrorCode::Internal,
+                "a rewritten page's text does not match its source page",
+            )
+            .with_detail(format!(
+                "page {}: expected {} character(s), reopened {}",
+                page + 1,
+                expected.chars().count(),
+                actual.chars().count()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Annotation records read from a different page carry that page in `page`; compare content only.
+fn normalized_annotations(mut records: Vec<RawAnnotation>) -> Vec<RawAnnotation> {
+    for record in &mut records {
+        record.page = PageIndex(0);
+    }
+    records
+}
+
+fn verify_annotation_pages(path: &Path, expected: &[Vec<RawAnnotation>]) -> Result<()> {
+    let actual = page_annotations(path)?;
+    if actual.len() != expected.len() {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the rewritten document does not have the expected page count",
+        )
+        .with_detail(format!(
+            "expected {} page(s), reopened {}",
+            expected.len(),
+            actual.len()
+        )));
+    }
+    for (page, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+        if normalized_annotations(expected.clone()) != normalized_annotations(actual.clone()) {
+            return Err(LyraReaderError::new(
+                ErrorCode::Internal,
+                "a rewritten page's file-owned annotations do not match its source page",
+            )
+            .with_detail(format!(
+                "page {}: expected {} annotation(s), reopened {}",
+                page + 1,
+                expected.len(),
+                actual.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A flattened outline: title, target page and depth. Enough to prove structure and destinations
+/// survived, while ignoring destination view coordinates PDFium may normalise.
+fn outline_signature(path: &Path) -> Result<Vec<(String, Option<u32>, usize)>> {
+    let backend = PdfiumBackend::open(path, None)?;
+    let nodes = backend.outline()?;
+    let mut flattened = Vec::new();
+    flatten_outline(&nodes, 0, &mut flattened);
+    Ok(flattened)
+}
+
+fn flatten_outline(
+    nodes: &[OutlineNode],
+    depth: usize,
+    flattened: &mut Vec<(String, Option<u32>, usize)>,
+) {
+    for node in nodes {
+        flattened.push((node.title.clone(), node.page.map(|page| page.get()), depth));
+        flatten_outline(&node.children, depth + 1, flattened);
+    }
+}
+
+fn verify_outline(path: &Path, expected: &[(String, Option<u32>, usize)]) -> Result<()> {
+    let actual = outline_signature(path)?;
+    if actual != expected {
+        let first_difference = actual
+            .iter()
+            .zip(expected.iter())
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| actual.len().min(expected.len()));
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "the merged document's outline does not match the first document's outline",
+        )
+        .with_detail(format!(
+            "expected {} entr(ies), reopened {}; first difference at entry {}: expected {:?}, reopened {:?}",
+            expected.len(),
+            actual.len(),
+            first_difference + 1,
+            expected.get(first_difference),
+            actual.get(first_difference)
+        )));
+    }
+    Ok(())
+}
+
 fn read_source(source: &Path) -> Result<Vec<u8>> {
     let metadata = fs::metadata(source)
         .map_err(|error| io_error("could not read the document being edited", source, error))?;
@@ -700,6 +1385,7 @@ struct PageApi {
     close_document: unsafe extern "C" fn(FpdfDocument),
     create_new_document: unsafe extern "C" fn() -> FpdfDocument,
     get_page_count: unsafe extern "C" fn(FpdfDocument) -> c_int,
+    security_revision: unsafe extern "C" fn(FpdfDocument) -> c_int,
     load_page: unsafe extern "C" fn(FpdfDocument, c_int) -> FpdfPage,
     close_page: unsafe extern "C" fn(FpdfPage),
     page_delete: unsafe extern "C" fn(FpdfDocument, c_int),
@@ -741,7 +1427,7 @@ fn api() -> Result<&'static PageApi> {
                 "this PDFium build does not export the page-editing API",
             )
             .with_detail(
-                "missing one of FPDFPage_SetRotation / FPDFPage_Delete / FPDF_MovePages / FPDFPage_New / FPDF_ImportPagesByIndex / FPDF_SaveAsCopy",
+                "missing one of FPDFPage_SetRotation / FPDFPage_Delete / FPDF_MovePages / FPDFPage_New / FPDF_ImportPagesByIndex / FPDF_SaveAsCopy / FPDF_GetSecurityHandlerRevision",
             )
         })
 }
@@ -765,6 +1451,7 @@ unsafe fn resolve(library: Library) -> Option<PageApi> {
         close_document: unsafe { symbol(&library, b"FPDF_CloseDocument\0")? },
         create_new_document: unsafe { symbol(&library, b"FPDF_CreateNewDocument\0")? },
         get_page_count: unsafe { symbol(&library, b"FPDF_GetPageCount\0")? },
+        security_revision: unsafe { symbol(&library, b"FPDF_GetSecurityHandlerRevision\0")? },
         load_page: unsafe { symbol(&library, b"FPDF_LoadPage\0")? },
         close_page: unsafe { symbol(&library, b"FPDF_ClosePage\0")? },
         page_delete: unsafe { symbol(&library, b"FPDFPage_Delete\0")? },
@@ -910,6 +1597,19 @@ impl RawDocument {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: `document` is live.
         unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32
+    }
+
+    /// `FPDF_GetSecurityHandlerRevision`: -1 when the PDF carries no encryption dictionary.
+    ///
+    /// Unlike `PdfiumBackend::is_encrypted` (which records whether a password was supplied),
+    /// this detects a document encrypted with an empty user password, which PDFium opens
+    /// without asking. That is the case the merge/split refusal must not miss.
+    fn security_revision(&self) -> c_int {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `document` is live and the API is documented to accept it.
+        unsafe { (self.api.security_revision)(self.document) }
     }
 
     fn rotations(&self) -> Result<Vec<u32>> {
@@ -1085,7 +1785,12 @@ impl RawDocument {
         Ok(())
     }
 
-    fn import_pages(&self, source: &RawDocument, pages: &[u32]) -> Result<()> {
+    /// Imports `pages` from `source`, inserting them so the first lands at `index`.
+    ///
+    /// The final `FPDF_ImportPagesByIndex` argument is an insertion index, not "append when 0":
+    /// a merge must pass the destination's current page count, or the imported pages land at the
+    /// front and every page (and outline destination) shifts.
+    fn import_pages(&self, source: &RawDocument, pages: &[u32], index: u32) -> Result<()> {
         let indices: Vec<c_int> = pages.iter().map(|page| *page as c_int).collect();
         let _guard = PDFIUM_LOCK
             .lock()
@@ -1097,7 +1802,7 @@ impl RawDocument {
                 source.document,
                 indices.as_ptr(),
                 indices.len() as c_ulong,
-                0,
+                index as c_int,
             )
         };
         if imported == 0 {
@@ -1882,6 +2587,471 @@ mod tests {
                 &sizes
             )
             .is_err()
+        );
+    }
+
+    fn copy_named(directory: &Path, source: &str, destination: &str) -> PathBuf {
+        crate::test_support::copy_fixture(directory, source, destination)
+    }
+
+    /// An eleven-page document built only from committed fixtures, so the "every five pages"
+    /// split can be asserted as 5 + 5 + 1 without adding a fixture to the repository.
+    fn eleven_page_document(directory: &Path) -> PathBuf {
+        let multipage = copy_fixture(directory, "multipage.pdf");
+        let second = copy_named(directory, "multipage.pdf", "multipage-2.pdf");
+        let third = copy_named(directory, "multipage.pdf", "multipage-3.pdf");
+        let last_two = directory.join("last-two.pdf");
+        extract_pages(&multipage, &last_two, &[0, 1], None).expect("extract two pages");
+        let eleven = directory.join("eleven-pages.pdf");
+        merge_documents(&multipage, &[second, third, last_two], &eleven, None)
+            .expect("build the eleven-page source");
+        assert_eq!(texts(&eleven).len(), 11);
+        eleven
+    }
+
+    fn split_plan(directory: &Path, chunks: &[&[u32]]) -> Vec<SplitPart> {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, pages)| SplitPart {
+                destination: directory.join(format!("part-{}.pdf", index + 1)),
+                pages: pages.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_appends_pages_annotations_and_keeps_the_first_outline() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("merge");
+        let first = copy_fixture(&directory, "outlined.pdf");
+        let second = copy_fixture(&directory, "annotated.pdf");
+        let third = copy_named(&directory, "outlined.pdf", "outlined-again.pdf");
+        let first_bytes = fs::read(&first).expect("first bytes");
+        let second_bytes = fs::read(&second).expect("second bytes");
+        let third_bytes = fs::read(&third).expect("third bytes");
+        let first_texts = texts(&first);
+        let second_texts = texts(&second);
+        let third_texts = texts(&third);
+        let first_outline = outline_signature(&first).expect("first outline");
+        let third_outline = outline_signature(&third).expect("third outline");
+        assert!(
+            !first_outline.is_empty(),
+            "the first fixture has an outline"
+        );
+        assert!(
+            !third_outline.is_empty(),
+            "the appended fixture has an outline"
+        );
+        let second_annotations = annotations(&second);
+        let merged = directory.join("merged.pdf");
+
+        let report = merge_documents(&first, &[second.clone(), third.clone()], &merged, None)
+            .expect("merge three documents");
+
+        assert_eq!(report.page_count, 8);
+        assert_eq!(report.first_page_count, 3);
+        assert_eq!(report.appended_page_counts, vec![2, 3]);
+        assert_eq!(
+            report.appended_annotation_counts,
+            vec![second_annotations.iter().map(Vec::len).sum::<usize>(), 0]
+        );
+        assert_eq!(report.first_outline_entries, first_outline.len());
+        assert_eq!(report.dropped_outline_entries, third_outline.len());
+        assert_eq!(
+            report.rotations,
+            rotations(&merged),
+            "the report lists the output's rotations"
+        );
+
+        // Content identity, including the two boundary pages.
+        let expected_texts: Vec<String> = first_texts
+            .iter()
+            .chain(second_texts.iter())
+            .chain(third_texts.iter())
+            .cloned()
+            .collect();
+        assert_eq!(texts(&merged), expected_texts);
+        assert!(texts(&merged)[2].contains("Chapter Three"));
+        assert!(texts(&merged)[3].contains("Annotated page 1"));
+        assert!(texts(&merged)[4].contains("Annotated page 2"));
+        assert!(texts(&merged)[5].contains("Chapter One"));
+
+        // File-owned annotations travel with their appended pages.
+        let merged_annotations = annotations(&merged);
+        assert!(!second_annotations[0].is_empty());
+        assert_eq!(
+            on_page(merged_annotations[3].clone(), 0),
+            on_page(second_annotations[0].clone(), 0),
+            "the first appended page keeps its annotations"
+        );
+        assert_eq!(
+            on_page(merged_annotations[4].clone(), 0),
+            on_page(second_annotations[1].clone(), 0),
+            "the second appended page keeps its annotations"
+        );
+        assert!(merged_annotations[5].is_empty() && merged_annotations[7].is_empty());
+
+        // The first document's outline survives unchanged; the appended outline was not imported.
+        assert_eq!(
+            outline_signature(&merged).expect("merged outline"),
+            first_outline
+        );
+
+        // Every input is byte-identical.
+        assert_eq!(fs::read(&first).expect("first after"), first_bytes);
+        assert_eq!(fs::read(&second).expect("second after"), second_bytes);
+        assert_eq!(fs::read(&third).expect("third after"), third_bytes);
+    }
+
+    #[test]
+    fn merge_keeps_appended_rotations_and_page_sizes() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("merge-rotations");
+        let first = copy_fixture(&directory, "multipage.pdf");
+        let rotated = copy_fixture(&directory, "rotated.pdf");
+        let expected_rotations: Vec<u32> = rotations(&first)
+            .into_iter()
+            .chain(rotations(&rotated))
+            .collect();
+        let expected_sizes: Vec<(f64, f64)> =
+            sizes(&first).into_iter().chain(sizes(&rotated)).collect();
+        let merged = directory.join("merged-rotations.pdf");
+        let report = merge_documents(&first, std::slice::from_ref(&rotated), &merged, None)
+            .expect("merge a rotated document");
+        assert_eq!(report.page_count, 5);
+        assert_eq!(report.rotations, expected_rotations);
+        assert_eq!(report.page_sizes.len(), expected_sizes.len());
+        for (reported, expected) in report.page_sizes.iter().zip(&expected_sizes) {
+            assert!((reported.0 - expected.0).abs() < 0.001);
+            assert!((reported.1 - expected.1).abs() < 0.001);
+        }
+        assert_eq!(rotations(&merged), expected_rotations);
+        let merged_sizes = sizes(&merged);
+        for (actual, expected) in merged_sizes.iter().zip(&expected_sizes) {
+            assert!((actual.0 - expected.0).abs() < 0.001);
+            assert!((actual.1 - expected.1).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn merge_refuses_self_encrypted_and_overwriting_inputs_and_writes_nothing() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("merge-refuse");
+        let first = copy_fixture(&directory, "multipage.pdf");
+        let second = copy_fixture(&directory, "text-page.pdf");
+        let encrypted = copy_fixture(&directory, "form-fields-encrypted.pdf");
+        let first_bytes = fs::read(&first).expect("first bytes");
+        let destination = directory.join("refused.pdf");
+
+        let self_merge = merge_documents(&first, std::slice::from_ref(&first), &destination, None)
+            .expect_err("merging a document into itself is refused");
+        assert!(
+            self_merge.to_string().contains("into itself"),
+            "{self_merge}"
+        );
+        assert!(!destination.exists());
+
+        let duplicate = merge_documents(
+            &first,
+            &[second.clone(), second.clone()],
+            &destination,
+            None,
+        )
+        .expect_err("the same file twice is refused");
+        assert!(duplicate.to_string().contains("twice"), "{duplicate}");
+        assert!(!destination.exists());
+
+        let overwrite = merge_documents(&first, std::slice::from_ref(&second), &first, None)
+            .expect_err("the output cannot be an input");
+        assert!(overwrite.to_string().contains("overwrite"), "{overwrite}");
+
+        let encrypted_other =
+            merge_documents(&first, std::slice::from_ref(&encrypted), &destination, None)
+                .expect_err("an encrypted appended document is refused");
+        assert!(
+            encrypted_other.to_string().contains("password-protected"),
+            "{encrypted_other}"
+        );
+        assert!(!destination.exists(), "a refused merge writes no output");
+
+        let encrypted_primary = merge_documents(
+            &encrypted,
+            std::slice::from_ref(&second),
+            &destination,
+            None,
+        )
+        .expect_err("an encrypted primary document is refused");
+        assert!(
+            encrypted_primary.to_string().contains("password-protected"),
+            "{encrypted_primary}"
+        );
+        assert!(!destination.exists(), "a refused merge writes no output");
+        assert_eq!(fs::read(&first).expect("first after"), first_bytes);
+        assert!(
+            crate::writeback::interrupted_save_temporaries(&destination).is_empty(),
+            "a refused merge leaves no temporary behind"
+        );
+    }
+
+    #[test]
+    fn split_by_ranges_matches_every_selected_page() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("split-ranges");
+        let source = eleven_page_document(&directory);
+        let source_bytes = fs::read(&source).expect("source bytes");
+        let source_texts = texts(&source);
+        let source_rotations = rotations(&source);
+        let source_sizes = sizes(&source);
+
+        let plan = split_plan(&directory, &[&[0, 1, 2, 3, 4], &[5, 6, 7, 8, 9]]);
+        let report = split_pages(&source, &plan, None).expect("split into two ranges");
+        assert_eq!(report.source_page_count, 11);
+        assert_eq!(report.parts.len(), 2);
+        for (part, (start, end)) in report.parts.iter().zip([(0usize, 5usize), (5, 10)]) {
+            assert_eq!(part.page_count, 5);
+            assert_eq!(
+                part.source_pages,
+                (start..end).map(|page| page as u32).collect::<Vec<_>>()
+            );
+            let output_texts = texts(&part.destination);
+            assert_eq!(output_texts, source_texts[start..end]);
+            assert_eq!(part.rotations, source_rotations[start..end]);
+            assert_eq!(part.page_sizes, source_sizes[start..end]);
+        }
+        // Page 11 was not selected by either range; it is not written anywhere.
+        assert!(!plan[0].destination.with_file_name("part-3.pdf").exists());
+        assert_eq!(fs::read(&source).expect("source after"), source_bytes);
+    }
+
+    #[test]
+    fn split_every_five_pages_on_eleven_pages_is_five_five_one() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("split-every-five");
+        let source = eleven_page_document(&directory);
+        let source_bytes = fs::read(&source).expect("source bytes");
+        let source_texts = texts(&source);
+        let all: Vec<u32> = (0..11).collect();
+        let chunks: Vec<&[u32]> = all.chunks(5).collect();
+        let plan = split_plan(&directory, &chunks);
+        let report = split_pages(&source, &plan, None).expect("split every five");
+        assert_eq!(
+            report
+                .parts
+                .iter()
+                .map(|part| part.page_count)
+                .collect::<Vec<_>>(),
+            vec![5, 5, 1]
+        );
+        let mut start = 0;
+        for part in &report.parts {
+            let end = start + part.page_count as usize;
+            assert_eq!(texts(&part.destination), source_texts[start..end]);
+            start = end;
+        }
+        assert_eq!(start, 11);
+        assert_eq!(fs::read(&source).expect("source after"), source_bytes);
+    }
+
+    #[test]
+    fn split_refuses_bad_plans_and_encrypted_documents_and_writes_nothing() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("split-refuse");
+        let source = copy_fixture(&directory, "multipage.pdf");
+        let source_bytes = fs::read(&source).expect("source bytes");
+        let encrypted = copy_fixture(&directory, "form-fields-encrypted.pdf");
+
+        let empty_part = split_pages(
+            &source,
+            &[SplitPart {
+                destination: directory.join("empty.pdf"),
+                pages: vec![],
+            }],
+            None,
+        )
+        .expect_err("an empty part is refused");
+        assert!(empty_part.to_string().contains("no pages"), "{empty_part}");
+        assert!(!directory.join("empty.pdf").exists());
+
+        let duplicate_page = split_pages(
+            &source,
+            &[SplitPart {
+                destination: directory.join("dup.pdf"),
+                pages: vec![0, 0],
+            }],
+            None,
+        )
+        .expect_err("a page named twice inside a part is refused");
+        assert!(
+            duplicate_page.to_string().contains("twice"),
+            "{duplicate_page}"
+        );
+        assert!(!directory.join("dup.pdf").exists());
+
+        let overlapping = split_pages(
+            &source,
+            &[
+                SplitPart {
+                    destination: directory.join("a.pdf"),
+                    pages: vec![0, 1],
+                },
+                SplitPart {
+                    destination: directory.join("b.pdf"),
+                    pages: vec![1, 2],
+                },
+            ],
+            None,
+        )
+        .expect_err("a page in two outputs is refused");
+        assert!(
+            overlapping
+                .to_string()
+                .contains("more than one split output"),
+            "{overlapping}"
+        );
+        assert!(!directory.join("a.pdf").exists() && !directory.join("b.pdf").exists());
+
+        let overlapping_destination = split_pages(
+            &source,
+            &[
+                SplitPart {
+                    destination: directory.join("same.pdf"),
+                    pages: vec![0],
+                },
+                SplitPart {
+                    destination: directory.join("same.pdf"),
+                    pages: vec![1],
+                },
+            ],
+            None,
+        )
+        .expect_err("two outputs at the same path are refused");
+        assert!(
+            overlapping_destination.to_string().contains("same file"),
+            "{overlapping_destination}"
+        );
+
+        let source_output = split_pages(
+            &source,
+            &[SplitPart {
+                destination: source.clone(),
+                pages: vec![0],
+            }],
+            None,
+        )
+        .expect_err("a split cannot overwrite its source");
+        assert!(
+            source_output.to_string().contains("overwrite"),
+            "{source_output}"
+        );
+
+        let encrypted_split = split_pages(
+            &encrypted,
+            &[SplitPart {
+                destination: directory.join("encrypted-part.pdf"),
+                pages: vec![0],
+            }],
+            None,
+        )
+        .expect_err("splitting an encrypted document is refused");
+        assert!(
+            encrypted_split.to_string().contains("password-protected"),
+            "{encrypted_split}"
+        );
+        assert!(!directory.join("encrypted-part.pdf").exists());
+        assert_eq!(fs::read(&source).expect("source after"), source_bytes);
+    }
+
+    #[test]
+    fn a_later_split_failure_keeps_earlier_outputs_valid_and_the_source_untouched() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("split-late-failure");
+        let source = eleven_page_document(&directory);
+        let source_bytes = fs::read(&source).expect("source bytes");
+        let source_texts = texts(&source);
+        let blocked = directory.join("blocked-third-output.pdf");
+        fs::create_dir(&blocked).expect("a directory where the third output should go");
+        let plan = vec![
+            SplitPart {
+                destination: directory.join("first.pdf"),
+                pages: (0..5).collect(),
+            },
+            SplitPart {
+                destination: directory.join("second.pdf"),
+                pages: (5..10).collect(),
+            },
+            SplitPart {
+                destination: blocked.clone(),
+                pages: vec![10],
+            },
+        ];
+
+        let error =
+            split_pages(&source, &plan, None).expect_err("the third output cannot be renamed");
+        let message = error.to_string();
+        assert!(message.contains("split output 3 of 3"), "{message}");
+        assert!(
+            message.contains("2 earlier output(s) are complete"),
+            "{message}"
+        );
+        assert!(message.contains("source is unchanged"), "{message}");
+
+        // The first two outputs are complete, verified and carry exactly their pages.
+        assert_eq!(texts(&plan[0].destination), source_texts[0..5]);
+        assert_eq!(texts(&plan[1].destination), source_texts[5..10]);
+        assert!(blocked.is_dir(), "the failed destination was not replaced");
+        assert_eq!(fs::read(&source).expect("source after"), source_bytes);
+        assert!(
+            crate::writeback::interrupted_save_temporaries(&blocked).is_empty(),
+            "the failed output cleaned its temporary"
+        );
+    }
+
+    #[test]
+    fn split_carries_a_pages_file_owned_annotations() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("split-annotations");
+        let source = copy_fixture(&directory, "annotated.pdf");
+        let source_annotations = annotations(&source);
+        assert!(!source_annotations[1].is_empty());
+        let destination = directory.join("page-two.pdf");
+        let report = split_pages(
+            &source,
+            &[SplitPart {
+                destination: destination.clone(),
+                pages: vec![1],
+            }],
+            None,
+        )
+        .expect("split an annotated page");
+        assert_eq!(report.parts[0].page_count, 1);
+        assert_eq!(
+            on_page(annotations(&destination)[0].clone(), 0),
+            on_page(source_annotations[1].clone(), 0)
         );
     }
 }

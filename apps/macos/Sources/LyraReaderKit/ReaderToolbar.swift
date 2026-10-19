@@ -193,6 +193,9 @@ struct ReaderToolbar: View {
                 .separator("page-operations"),
                 LyraReaderMenuItem("Insert Blank Page After", icon: "doc.badge.plus", enabled: state.canPageEdit) { state.insertBlankPage(before: false) },
                 LyraReaderMenuItem("Extract Selected Pages…", icon: "doc.on.doc", enabled: state.document != nil) { state.presentExtractPagesPanel() },
+                .separator("merge-split"),
+                LyraReaderMenuItem("Append Pages from PDFs…", icon: "doc.badge.plus", enabled: state.document != nil) { state.presentMergeDocumentsPanel() },
+                LyraReaderMenuItem("Split Pages…", icon: "scissors", enabled: state.document != nil) { state.presentSplitPagesPanel() },
             ]) { menuLabel("doc.on.doc") }
             LyraReaderMenu(title: "Export and save", items: [
                 LyraReaderMenuItem("Save Annotated Copy…", icon: "square.and.arrow.up", shortcut: "⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentSaveAnnotatedCopyPanel() },
