@@ -5350,15 +5350,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// erasure counts even when it removed the last annotation: the copy must still be
     /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
-        document != nil && (!annotations.isEmpty || hasPendingInkErasure)
+        document != nil
+            && (!annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
+                || hasPendingInkErasure)
             && !annotationSaveInProgress
     }
 
-    /// Replacing the original has something to write only when an annotation remains. A copy is
-    /// still offered after the eraser removed the last one (it is the source bytes), but
-    /// replacing a file with an identical copy would be a destructive no-op with a backup.
+    /// Whether the open document's outline already contains the reader's marked bookmark
+    /// subtree. Deleting the last bookmark still has something to save: the save removes that
+    /// subtree, so the command must not become disabled at exactly that moment.
+    public var hasEmbeddedBookmarkSubtree: Bool {
+        outline.contains { $0.isBookmarkSubtree }
+    }
+
+    /// Replacing the original has something to write when an annotation or bookmark remains, or
+    /// when the file already carries the reader's bookmark subtree (deleting the last bookmark
+    /// still has work to do: removing it). A copy is still offered after the eraser removed the
+    /// last annotation (it is the source bytes), but replacing a file with an identical copy
+    /// would be a destructive no-op with a backup.
     public var canReplaceOriginalWithAnnotations: Bool {
-        canSaveAnnotationsToPDF && !annotations.isEmpty
+        canSaveAnnotationsToPDF && (!annotations.isEmpty || !bookmarks.isEmpty
+            || hasEmbeddedBookmarkSubtree)
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -5374,8 +5386,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
         panel.message =
-            "Every highlight, ink mark, note and text box in the reader's list is written into a new PDF. "
-            + "The original file is not modified."
+            "Every highlight, ink mark, note, text box and bookmark in the reader's list is written "
+            + "into a new PDF. The original file is not modified."
         panel.nameFieldStringValue = suggestion.lastPathComponent
         panel.directoryURL = suggestion.deletingLastPathComponent()
         panel.allowedContentTypes = [.pdf]
@@ -5392,7 +5404,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard canReplaceOriginalWithAnnotations, let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Replace “\(url.lastPathComponent)” with the annotated version?"
+        alert.messageText =
+            "Replace “\(url.lastPathComponent)” with the reader's annotations and bookmarks?"
         alert.informativeText =
             "This changes the file on disk. A byte-identical backup is written first; "
             + "if the backup cannot be written, nothing is replaced."
@@ -5418,8 +5431,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before saving annotations"
             return false
         }
-        guard !annotations.isEmpty || hasPendingInkErasure else {
-            statusMessage = "There are no annotations to save"
+        guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
+                || hasPendingInkErasure else {
+            statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
         if Self.resolvesToSameFile(destination, documentURL) {
@@ -5447,9 +5461,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let requests = try await pendingAnnotationWrites()
-            if requests.isEmpty {
-                // The eraser removed the last annotation: there is nothing to append, and the
-                // engine deliberately refuses an empty annotation list. The honest copy is the
+            let bookmarkRequests = bookmarkWriteRequests()
+            if requests.isEmpty && bookmarkRequests.isEmpty {
+                // The eraser removed the last annotation and there is no bookmark to write:
+                // the engine deliberately refuses an empty request. The honest copy is the
                 // source bytes. It still matters: the pending banner offers "Save Copy…" and
                 // that action must work precisely in this case.
                 let source = try Data(contentsOf: documentURL, options: .mappedIfSafe)
@@ -5457,6 +5472,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 lastAnnotationWriteReport = AnnotationWriteReport(
                     destinationPath: destination.path,
                     writtenIDs: [],
+                    writtenBookmarkIDs: [],
+                    bookmarkOutlineTitle: nil,
+                    preexistingOutlineEntryCount: 0,
                     appendedBytes: 0,
                     backupPath: nil,
                     preexistingAnnotationCount: documentAnnotations.count,
@@ -5475,6 +5493,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let report = try await engine.saveAnnotatedCopy(
                 to: destination,
                 annotations: requests,
+                bookmarks: bookmarkRequests,
                 zoom: zoomFactor
             )
             lastAnnotationWriteReport = report
@@ -5482,11 +5501,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // nothing left to warn about. The open document and its sidecar are unchanged.
             erasedInkStrokeIDs.removeAll()
             let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
+            let written = Self.markCount(
+                annotations: report.writtenIDs.count,
+                bookmarks: report.writtenBookmarkIDs.count
+            )
             statusMessage =
-                "Saved \(report.writtenIDs.count) annotation(s) to \(destination.lastPathComponent)"
+                "Saved \(written) to \(destination.lastPathComponent)"
                 + " · \(report.appendedBytes) bytes appended · the original is unchanged\(backup)"
             FileHandle.standardError.write(Data((
-                "lyra-reader-annotate: saved \(report.writtenIDs.count) annotation(s) to \(destination.path)"
+                "lyra-reader-annotate: saved \(written) to \(destination.path)"
                 + " (append \(report.appendedBytes) bytes)\(backup)\n"
             ).utf8))
             return true
@@ -5500,11 +5523,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Replaces the open document with one carrying the reader's annotations.
+    /// Replaces the open document with one carrying the reader's annotations and bookmarks.
     ///
     /// The engine writes a verified backup first and replaces the original by an atomic rename
     /// of a verified temporary file. Only after that succeeds are exactly the saved sidecar
-    /// entries removed; the document is reopened so its annotations now come from the PDF.
+    /// entries removed; the document is reopened so its annotations and bookmark subtree now
+    /// come from the PDF.
     /// Returns `false` when nothing was replaced.
     @discardableResult
     public func replaceOriginalWithSavedAnnotations() async -> Bool {
@@ -5513,8 +5537,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before saving annotations"
             return false
         }
-        guard !annotations.isEmpty else {
-            statusMessage = "There are no annotations to save"
+        guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree else {
+            statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
 
@@ -5528,13 +5552,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let requests = try await pendingAnnotationWrites()
-            let report = try await engine.replaceWithAnnotations(requests, zoom: zoomFactor)
+            let bookmarkRequests = bookmarkWriteRequests()
+            let report = try await engine.replaceWithAnnotations(
+                requests,
+                bookmarks: bookmarkRequests,
+                zoom: zoomFactor
+            )
 
             // The PDF is now the source of truth. Remove exactly the written ids from the
             // sidecar so reopening the file does not show each annotation twice.
-            let cleanedSidecar = forgetAnnotationsSavedToPDF(
+            let cleanedAnnotations = forgetAnnotationsSavedToPDF(
                 ids: Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
             )
+            let cleanedBookmarks = forgetBookmarksSavedToPDF(
+                ids: Set(report.writtenBookmarkIDs.compactMap { UUID(uuidString: $0) })
+            )
+            let cleanedSidecar = cleanedAnnotations && cleanedBookmarks
 
             // The engine marks the old handle stale; reopen the file in place, keeping the
             // reading position and zoom.
@@ -5552,6 +5585,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if cleanedSidecar {
                 loadAnnotations(for: url)
             }
+            // The file now carries the bookmark subtree; reload the outline so the sidebar can
+            // show it (and adopt the file's bookmarks instead of a duplicate sidecar list).
+            outline = []
+            outlineLoadCompleted = false
+            loadOutline()
             loadDocumentAnnotations()
             reloadVisiblePages()
 
@@ -5565,14 +5603,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             let backup = report.backupPath
                 .map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
+            let written = Self.markCount(
+                annotations: report.writtenIDs.count,
+                bookmarks: report.writtenBookmarkIDs.count
+            )
             statusMessage =
-                "Saved \(report.writtenIDs.count) annotation(s) into \(url.lastPathComponent)"
+                "Saved \(written) into \(url.lastPathComponent)"
                 + " · backup: \(backup)"
             if !cleanedSidecar {
                 statusMessage += " · the sidecar could not be updated and will be reconciled on open"
             }
             FileHandle.standardError.write(Data((
-                "lyra-reader-annotate: replaced \(url.path) with \(report.writtenIDs.count) annotation(s)"
+                "lyra-reader-annotate: replaced \(url.path) with \(written)"
                 + ", backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
             ).utf8))
             return true
@@ -5583,6 +5625,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-annotate: replace failed: \(error)\n".utf8)
             )
             return false
+        }
+    }
+
+    /// The current bookmarks as writer requests, in the order the sidebar shows them.
+    private func bookmarkWriteRequests() -> [BookmarkWriteRequest] {
+        bookmarks.map { bookmark in
+            BookmarkWriteRequest(
+                id: bookmark.id,
+                page: bookmark.page,
+                title: bookmark.title,
+                yPt: bookmark.yPt
+            )
+        }
+    }
+
+    /// A count for the status line that names both kinds only when both were written.
+    private static func markCount(annotations: Int, bookmarks: Int) -> String {
+        switch (annotations, bookmarks) {
+        case (0, 0): return "0 marks"
+        case (0, let bookmarks): return "\(bookmarks) bookmark(s)"
+        case (let annotations, 0): return "\(annotations) annotation(s)"
+        case (let annotations, let bookmarks):
+            return "\(annotations) annotation(s) and \(bookmarks) bookmark(s)"
         }
     }
 
@@ -5835,6 +5900,72 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             "lyra-reader-annotate: the PDF was saved but the sidecar could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
         ))
         return false
+    }
+
+    /// Removes exactly the bookmark entries a replacement wrote into the outline.
+    ///
+    /// Mirrors [`forgetAnnotationsSavedToPDF`]: the PDF now owns them, so the sidecar must not
+    /// keep a second copy. Returns `false` when the sidecar write failed; the in-memory list is
+    /// still trimmed, and the next open adopts the file's copy instead of showing both.
+    @discardableResult
+    private func forgetBookmarksSavedToPDF(ids: Set<UUID>) -> Bool {
+        guard !ids.isEmpty else { return true }
+        let remaining = bookmarks.filter { !ids.contains($0.id) }
+        let slots = annotationSidecarSlots.filter { slot in
+            if case .bookmark(let id) = slot { return !ids.contains(id) }
+            return true
+        }
+        undoStack.removeAll()
+        redoStack.removeAll()
+        if writeSidecar(
+            annotations: annotations,
+            bookmarks: remaining,
+            slots: slots,
+            trigger: "bookmarks-saved-to-pdf"
+        ) {
+            return true
+        }
+        bookmarks = remaining
+        annotationSidecarSlots = slots
+        FileHandle.standardError.write(Data(
+            ("lyra-reader-annotate: the PDF carries the bookmarks but the sidecar could not be "
+                + "updated; the saved entries are hidden in memory and the outline supplies them "
+                + "on the next open\n").utf8
+        ))
+        return false
+    }
+
+    /// The open-time half of duplicate avoidance for bookmarks.
+    ///
+    /// A saved file carries its bookmarks in the outline, with the sidecar's UUID in a private
+    /// key. Adopting them gives the sidebar back the reader's own list — identities, titles and
+    /// page positions — without a sidecar and without showing a second copy. This runs once per
+    /// open, after [`loadOutline`]; it never writes a sidecar on its own.
+    private func adoptEmbeddedBookmarks(from entries: [OutlineEntry]) {
+        guard let document else { return }
+        var known = Set(bookmarks.map(\.id))
+        var adopted: [Bookmark] = []
+        for entry in entries {
+            guard let text = entry.bookmarkID,
+                  let id = UUID(uuidString: text),
+                  !known.contains(id),
+                  let page = entry.page,
+                  page >= 0,
+                  page < document.pageCount else { continue }
+            known.insert(id)
+            adopted.append(
+                Bookmark(
+                    id: id,
+                    page: page,
+                    title: entry.title,
+                    yPt: CGFloat(entry.yPt ?? 0)
+                )
+            )
+        }
+        guard !adopted.isEmpty else { return }
+        bookmarks.append(contentsOf: adopted)
+        let line = "lyra-reader-annotate: adopted \(adopted.count) bookmark(s) from the document outline\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// The open-time half of duplicate avoidance.
@@ -9035,6 +9166,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let found = (try? await self.engine.outline()) ?? []
             guard epoch == self.documentEpoch else { return }
             self.outline = found
+            self.adoptEmbeddedBookmarks(from: found)
         }
     }
 
@@ -9200,6 +9332,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
         reloadVisiblePages()
         schedulePositionSave()
+    }
+
+    /// Follows an outline row. The reader's own bookmark subtree carries a page-local Y, so the
+    /// click lands on the bookmarked paragraph; a document node without one goes to the page top.
+    public func gotoOutlineEntry(_ entry: OutlineEntry) {
+        guard document != nil, let page = entry.page else { return }
+        guard let y = entry.yPt, y.isFinite, y > 0 else {
+            gotoPage(page)
+            return
+        }
+        cancelScrollGlide()
+        let top = engine.pageTopPt(max(0, page), gapPt: pageGapPt, layout: layoutMode)
+        scrollYPt = clampedScrollOffset(top + CGFloat(y))
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = "Jumped to “\(entry.title)”"
     }
 
     // MARK: - Reading layout (T2.10)

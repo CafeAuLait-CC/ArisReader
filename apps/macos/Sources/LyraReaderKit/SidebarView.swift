@@ -401,9 +401,7 @@ public struct SidebarView: View {
                 let rows = OutlineNumbering.rows(for: state.outline)
                 List(rows) { row in
                     Button {
-                        if let page = row.entry.page {
-                            state.gotoPage(page)
-                        }
+                        state.gotoOutlineEntry(row.entry)
                     } label: {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text(row.number)

@@ -84,7 +84,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// section's list. A version-2 sidecar has only the document-wide list, so using it would make
 /// an appendix citation resolve into the main list again. Every version-2 cache is therefore
 /// re-derived once; the replacement carries the lists.
-pub(crate) const FORMAT_VERSION: u32 = 3;
+///
+/// # 4
+///
+/// Outline entries gained the reader's bookmark identity (`bookmark_id`) and its page-local Y
+/// (`y_pt`). A version-3 cache cannot supply either, so it is re-derived instead of being
+/// returned without the data that makes a saved bookmark clickable at its position.
+pub(crate) const FORMAT_VERSION: u32 = 4;
 
 /// Tag that identifies our sidecar (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";

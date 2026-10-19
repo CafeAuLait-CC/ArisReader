@@ -29,8 +29,9 @@ use lyra_reader_core::{
 };
 use lyra_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use lyra_reader_pdfium::{
-    PageOperation, PdfiumBackend, RedactionArea, RedactionMode, SaveMode, WriteAnnotation,
-    WriteAnnotationKind, backend_description, preview_redactions, redact_pdf,
+    DEFAULT_BOOKMARK_TITLE, EmbeddedBookmarks, PageOperation, PdfiumBackend, RedactionArea,
+    RedactionMode, SaveMode, WriteAnnotation, WriteAnnotationKind, WriteBookmark,
+    backend_description, preview_redactions, read_embedded_bookmarks, redact_pdf,
     suggested_redaction_copy_path,
 };
 use lyra_reader_session::{DocumentLayout, LayoutMode};
@@ -1352,6 +1353,19 @@ impl LyraReaderDocument {
         let started = Instant::now();
         let mut entries = Vec::new();
         flatten_outline(&self.backend.outline()?, 0, &mut entries);
+        // Our own bookmark subtree is written into the outline. Adopt its identities and
+        // page-local positions so a click lands where the bookmark was set and the bookmarks tab
+        // can show the file's copy rather than a duplicate sidecar entry. The lopdf parse is only
+        // attempted when the title we would have written is present, which keeps ordinary
+        // documents from paying for a whole-file parse on open.
+        if entries
+            .iter()
+            .any(|entry| entry.depth == 0 && entry.title.starts_with(DEFAULT_BOOKMARK_TITLE))
+            && let Ok(Some(embedded)) =
+                read_embedded_bookmarks(Path::new(&self.path), self.password.as_deref())
+        {
+            merge_embedded_bookmarks(&mut entries, &embedded);
+        }
         if let Ok(mut cache) = self.outline.lock() {
             *cache = Some(entries.clone());
         }
@@ -1750,11 +1764,13 @@ impl LyraReaderDocument {
         &self,
         destination: String,
         annotations: Vec<WriteAnnotationRecord>,
+        bookmarks: Vec<WriteBookmarkRecord>,
         zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(destination),
             annotations,
+            bookmarks,
             zoom,
             SaveMode::Copy,
         )
@@ -1769,11 +1785,13 @@ impl LyraReaderDocument {
     pub fn replace_with_annotations(
         &self,
         annotations: Vec<WriteAnnotationRecord>,
+        bookmarks: Vec<WriteBookmarkRecord>,
         zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(&self.path),
             annotations,
+            bookmarks,
             zoom,
             SaveMode::ReplaceOriginal,
         )
@@ -2490,6 +2508,7 @@ impl LyraReaderDocument {
         &self,
         destination: std::path::PathBuf,
         annotations: Vec<WriteAnnotationRecord>,
+        bookmarks: Vec<WriteBookmarkRecord>,
         zoom: f64,
         mode: SaveMode,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
@@ -2502,7 +2521,7 @@ impl LyraReaderDocument {
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
                 message:
-                    "this document is encrypted; saving annotations into it is not supported yet"
+                    "this document is encrypted; saving annotations or bookmarks into it is not supported yet"
                         .to_string(),
             });
         }
@@ -2514,6 +2533,24 @@ impl LyraReaderDocument {
         let page_count = self.backend.page_count();
         let mut geometries: std::collections::HashMap<u32, PageGeometry> =
             std::collections::HashMap::new();
+        let mut bookmark_specs = Vec::with_capacity(bookmarks.len());
+        for record in bookmarks {
+            if record.page >= page_count {
+                return Err(LyraReaderFfiError::InvalidArgument {
+                    message: format!(
+                        "bookmark {:?} names page {}, but the document has {page_count} page(s)",
+                        record.id,
+                        record.page + 1
+                    ),
+                });
+            }
+            bookmark_specs.push(WriteBookmark {
+                id: record.id,
+                page: PageIndex(record.page),
+                title: record.title,
+                y_pt: record.y_pt,
+            });
+        }
         let mut specs = Vec::with_capacity(annotations.len());
         for record in annotations {
             if record.page >= page_count {
@@ -2749,6 +2786,7 @@ impl LyraReaderDocument {
             Path::new(&self.path),
             &destination,
             &specs,
+            &bookmark_specs,
             self.password.as_deref(),
             mode,
         )?;
@@ -2770,6 +2808,10 @@ impl LyraReaderDocument {
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
             preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
+                .unwrap_or(u32::MAX),
+            written_bookmark_ids: report.written_bookmark_ids,
+            bookmark_outline_title: report.bookmark_outline_title,
+            preexisting_outline_entry_count: u32::try_from(report.preexisting_outline_entry_count)
                 .unwrap_or(u32::MAX),
             cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
             source_bytes_preserved: report.source_bytes_preserved,
@@ -3454,6 +3496,20 @@ pub enum AnnotationWriteKind {
     Line,
 }
 
+/// One bookmark the shell asks the writer to put into the document's `/Outlines`.
+///
+/// `y_pt` is page-local view space (0 at the page top), the same value the sidecar stores, so a
+/// bookmark survives a zoom change, a resize and a layout switch.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WriteBookmarkRecord {
+    /// The sidecar bookmark's UUID string, written as the private `/LyraReaderID` key so a
+    /// reopened document can adopt the file's bookmarks with their identities intact.
+    pub id: String,
+    pub page: u32,
+    pub title: String,
+    pub y_pt: f64,
+}
+
 /// One annotation the shell asks the writer to put into a PDF.
 ///
 /// Geometry is **view space at `zoom`** (points, top-left origin), exactly the space the canvas
@@ -3509,6 +3565,14 @@ pub struct AnnotationSaveReport {
     pub backup_path: Option<String>,
     /// Content annotations the source already had; all were verified unchanged.
     pub preexisting_annotation_count: u32,
+    /// Bookmark identities written into the outline, so the shell removes exactly those sidecar
+    /// entries after a replacement.
+    pub written_bookmark_ids: Vec<String>,
+    /// Title of the rewritten bookmark subtree; `None` when the bookmark list was empty.
+    pub bookmark_outline_title: Option<String>,
+    /// Outline nodes the document already had outside the reader's subtree; all were verified
+    /// unchanged.
+    pub preexisting_outline_entry_count: u32,
     /// Stale `.lyra-reader-save-*.tmp` files removed before this save.
     pub cleaned_temporary_files: u32,
     /// True when the written file's prefix equals the source byte-for-byte.
@@ -3622,7 +3686,7 @@ pub struct PageEditReport {
 }
 
 /// One outline entry.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutlineEntry {
     pub title: String,
@@ -3630,6 +3694,15 @@ pub struct OutlineEntry {
     pub page: Option<u32>,
     /// Nesting level; 0 is a top-level entry.
     pub depth: u32,
+    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// `None` for every node the document's author wrote.
+    pub bookmark_id: Option<String>,
+    /// Page-local Y (points, 0 at the page top) when the destination names a position. This is
+    /// what lets a click land on the bookmarked paragraph, not merely on the page.
+    pub y_pt: Option<f64>,
+    /// True for the top-level `My bookmarks` node the reader wrote. Its children carry
+    /// `bookmark_id`; a document author's node with a similar title is not this.
+    pub is_bookmark_subtree: bool,
 }
 
 /// Flattens an outline tree into sidebar rows.
@@ -3643,8 +3716,54 @@ fn flatten_outline(
             title: node.title.clone(),
             page: node.page.map(|page| page.get()),
             depth,
+            bookmark_id: None,
+            y_pt: None,
+            is_bookmark_subtree: false,
         });
         flatten_outline(&node.children, depth + 1, out);
+    }
+}
+
+/// Attaches the reader's own bookmark identities to the flattened outline.
+///
+/// The PDFium outline supplies the tree; the marked subtree supplies `/LyraReaderID` and the
+/// page-local Y that PDFium's bookmark API does not expose. The subtree is located by its
+/// top-level title and its child count/titles, which the writer made unique among top-level
+/// nodes. A foreign node with the same title is not ours and does not match both conditions.
+fn merge_embedded_bookmarks(entries: &mut [OutlineEntry], embedded: &EmbeddedBookmarks) {
+    let mut matched: Option<(usize, Vec<usize>)> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.depth != 0 || entry.title != embedded.title {
+            continue;
+        }
+        let children: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .take_while(|(_, entry)| entry.depth > 0)
+            .map(|(index, _)| index)
+            .collect();
+        if children.len() != embedded.bookmarks.len() {
+            continue;
+        }
+        let titles_match = children
+            .iter()
+            .zip(&embedded.bookmarks)
+            .all(|(index, bookmark)| {
+                entries[*index].title == bookmark.title && entries[*index].page == bookmark.page
+            });
+        if titles_match {
+            matched = Some((index, children));
+            break;
+        }
+    }
+    let Some((root, children)) = matched else {
+        return;
+    };
+    entries[root].is_bookmark_subtree = true;
+    for (index, bookmark) in children.into_iter().zip(&embedded.bookmarks) {
+        entries[index].bookmark_id = (!bookmark.id.is_empty()).then(|| bookmark.id.clone());
+        entries[index].y_pt = bookmark.y_pt;
     }
 }
 
@@ -5632,6 +5751,7 @@ mod tests {
             .save_annotations_copy(
                 at_100.display().to_string(),
                 vec![zoom_annotation(1.0)],
+                Vec::new(),
                 1.0,
             )
             .expect("save at 100%");
@@ -5639,6 +5759,7 @@ mod tests {
             .save_annotations_copy(
                 at_300.display().to_string(),
                 vec![zoom_annotation(3.0)],
+                Vec::new(),
                 3.0,
             )
             .expect("save at 300%");
@@ -5706,6 +5827,7 @@ mod tests {
         let bad_zoom = document.save_annotations_copy(
             directory.join("bad.pdf").display().to_string(),
             vec![zoom_annotation(1.0)],
+            Vec::new(),
             0.0,
         );
         assert!(bad_zoom.is_err(), "a zero zoom is refused before any write");
@@ -5726,10 +5848,20 @@ mod tests {
         let at_100 = directory.join("stroke-100.pdf");
         let at_300 = directory.join("stroke-300.pdf");
         document
-            .save_annotations_copy(at_100.display().to_string(), vec![zoom_stroke(1.0)], 1.0)
+            .save_annotations_copy(
+                at_100.display().to_string(),
+                vec![zoom_stroke(1.0)],
+                Vec::new(),
+                1.0,
+            )
             .expect("save stroke at 100%");
         document
-            .save_annotations_copy(at_300.display().to_string(), vec![zoom_stroke(3.0)], 3.0)
+            .save_annotations_copy(
+                at_300.display().to_string(),
+                vec![zoom_stroke(3.0)],
+                Vec::new(),
+                3.0,
+            )
             .expect("save stroke at 300%");
 
         let page_space = |path: &std::path::Path| {
@@ -5790,7 +5922,7 @@ mod tests {
         assert!(document.interrupted_save_note().is_none());
 
         let report = document
-            .replace_with_annotations(vec![zoom_annotation(1.0)], 1.0)
+            .replace_with_annotations(vec![zoom_annotation(1.0)], Vec::new(), 1.0)
             .expect("replace original");
         let backup = report.backup_path.expect("backup path");
         let backup_bytes = std::fs::read(&backup).expect("backup readable");
@@ -5828,5 +5960,148 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    // ── Bookmark outline write-back ────────────────────────────────────────────────────
+
+    fn bookmark_record(id: &str, page: u32, title: &str, y_pt: f64) -> WriteBookmarkRecord {
+        WriteBookmarkRecord {
+            id: id.to_string(),
+            page,
+            title: title.to_string(),
+            y_pt,
+        }
+    }
+
+    #[test]
+    fn bookmarks_are_written_as_an_outline_subtree_and_read_back_with_identity_and_position() {
+        if !lyra_reader_pdfium::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("bookmark-outline");
+        let source = directory.join("outlined.pdf");
+        std::fs::copy(fixture("outlined.pdf"), &source).expect("copy outlined fixture");
+        let source_bytes = std::fs::read(&source).expect("source readable");
+
+        let engine = LyraReaderEngine::new();
+        let document = engine
+            .open_document(source.display().to_string(), None)
+            .expect("open outlined fixture");
+        assert_eq!(
+            document.outline().expect("outline").len(),
+            8,
+            "the fixture's own outline"
+        );
+
+        let bookmarks = vec![
+            bookmark_record("11111111-1111-1111-1111-111111111101", 0, "Alpha", 120.0),
+            bookmark_record("11111111-1111-1111-1111-111111111102", 1, "Beta", 340.0),
+            bookmark_record("11111111-1111-1111-1111-111111111103", 2, "Gamma", 50.0),
+        ];
+        let saved = directory.join("saved.pdf");
+        let report = document
+            .save_annotations_copy(
+                saved.display().to_string(),
+                Vec::new(),
+                bookmarks.clone(),
+                1.0,
+            )
+            .expect("a document with only bookmarks can still be saved");
+        assert_eq!(
+            report.written_bookmark_ids,
+            bookmarks.iter().map(|b| b.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(report.preexisting_outline_entry_count, 8);
+        assert_eq!(
+            report.bookmark_outline_title.as_deref(),
+            Some("My bookmarks")
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("source readable"),
+            source_bytes,
+            "a copy save leaves the open document untouched"
+        );
+
+        let reopened = engine
+            .open_document(saved.display().to_string(), None)
+            .expect("reopen saved copy");
+        let entries = reopened.outline().expect("outline after saving");
+        assert_eq!(entries.len(), 12, "eight of the document's, four of ours");
+        assert_eq!(
+            &entries[..8],
+            &document.outline().expect("original outline")[..]
+        );
+        assert_eq!(entries[8].title, "My bookmarks");
+        assert_eq!(entries[8].depth, 0);
+        assert_eq!(
+            entries[9..]
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "Beta", "Gamma"]
+        );
+        assert!(entries[9..].iter().all(|entry| entry.depth == 1));
+        assert_eq!(
+            entries[9..]
+                .iter()
+                .map(|entry| entry.page)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(
+            entries[9..]
+                .iter()
+                .map(|entry| entry.bookmark_id.clone())
+                .collect::<Vec<_>>(),
+            bookmarks
+                .iter()
+                .map(|bookmark| Some(bookmark.id.clone()))
+                .collect::<Vec<_>>(),
+            "the reader adopts the file's bookmark identities"
+        );
+        for (entry, expected) in entries[9..].iter().zip(&bookmarks) {
+            let y = entry.y_pt.expect("page-local position");
+            assert!(
+                (y - expected.y_pt).abs() <= 0.01,
+                "{} lands at its page-local Y, got {y}",
+                expected.id
+            );
+        }
+
+        // Saving the reopened copy again rewrites the same subtree; it cannot accumulate.
+        let again = directory.join("saved-again.pdf");
+        let reopened_bookmarks: Vec<WriteBookmarkRecord> = entries[9..]
+            .iter()
+            .map(|entry| {
+                bookmark_record(
+                    entry.bookmark_id.as_deref().expect("bookmark id"),
+                    entry.page.expect("page"),
+                    &entry.title,
+                    entry.y_pt.unwrap_or(0.0),
+                )
+            })
+            .collect();
+        reopened
+            .save_annotations_copy(
+                again.display().to_string(),
+                Vec::new(),
+                reopened_bookmarks,
+                1.0,
+            )
+            .expect("second save");
+        let second = engine
+            .open_document(again.display().to_string(), None)
+            .expect("reopen second save");
+        let second_entries = second.outline().expect("outline of second save");
+        assert_eq!(second_entries.len(), 12);
+        assert_eq!(
+            second_entries
+                .iter()
+                .filter(|entry| entry.title == "My bookmarks")
+                .count(),
+            1,
+            "one subtree, not two"
+        );
     }
 }

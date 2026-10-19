@@ -809,6 +809,24 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     }
 }
 
+/// One bookmark the shell asks the engine to write into the document's outline.
+///
+/// `yPt` is page-local view space (0 at the page top), the same value the sidecar stores, so the
+/// written destination survives a zoom change, a resize and a layout switch.
+public struct BookmarkWriteRequest: Sendable, Equatable {
+    public let id: UUID
+    public let page: Int
+    public let title: String
+    public let yPt: CGFloat
+
+    public init(id: UUID, page: Int, title: String, yPt: CGFloat) {
+        self.id = id
+        self.page = page
+        self.title = title
+        self.yPt = yPt
+    }
+}
+
 /// What a successful PDF write did.
 
 /// One rectangle the reader marked for redaction, in page-local view space (points, top-left
@@ -867,6 +885,13 @@ public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
     /// The `/NM` values written, so the sidecar can remove exactly those entries.
     public let writtenIDs: [String]
+    /// The bookmark identities written into the outline, so the sidecar can remove exactly
+    /// those entries after a replacement.
+    public let writtenBookmarkIDs: [String]
+    /// Title of the bookmark subtree written into the outline; `nil` when the list was empty.
+    public let bookmarkOutlineTitle: String?
+    /// The document's own outline nodes outside the reader's subtree (verified unchanged).
+    public let preexistingOutlineEntryCount: Int
     public let appendedBytes: UInt64
     /// Present only for a replacement; the backup is verified byte-identical.
     public let backupPath: String?
@@ -1217,12 +1242,29 @@ public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
     public let page: Int?
     public let depth: Int
+    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// `nil` for every node the document's author wrote.
+    public let bookmarkID: String?
+    /// Page-local Y (points, 0 at the page top) when the destination names a position.
+    public let yPt: Double?
+    /// The top-level `My bookmarks` node the reader wrote. Its children carry `bookmarkID`.
+    public let isBookmarkSubtree: Bool
     public var id: String { "\(depth):\(page ?? -1):\(title)" }
 
-    public init(title: String, page: Int?, depth: Int) {
+    public init(
+        title: String,
+        page: Int?,
+        depth: Int,
+        bookmarkID: String? = nil,
+        yPt: Double? = nil,
+        isBookmarkSubtree: Bool = false
+    ) {
         self.title = title
         self.page = page
         self.depth = depth
+        self.bookmarkID = bookmarkID
+        self.yPt = yPt
+        self.isBookmarkSubtree = isBookmarkSubtree
     }
 }
 
@@ -1401,12 +1443,15 @@ public protocol PDFEngine: AnyObject {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
-    /// Replaces the open document with one carrying `annotations`; the engine writes and verifies
-    /// a backup first and refuses the replacement if the backup cannot be written.
+    /// Replaces the open document with one carrying `annotations` and `bookmarks`; the engine
+    /// writes and verifies a backup first and refuses the replacement if the backup cannot be
+    /// written.
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
     /// The document's AcroForm fields, read from the widget dictionaries and reported in view
@@ -1566,6 +1611,7 @@ public extension PDFEngine {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         throw NSError(
@@ -1577,6 +1623,7 @@ public extension PDFEngine {
 
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         throw NSError(
@@ -2206,6 +2253,7 @@ public final class RustEngine: PDFEngine {
     public func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         guard let document else {
@@ -2216,6 +2264,7 @@ public final class RustEngine: PDFEngine {
             )
         }
         let records = Self.writeRecords(from: annotations)
+        let bookmarkRecords = Self.writeBookmarkRecords(from: bookmarks)
         let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
             // Off the main thread: PDFium writes and reopens the whole document, and the UI must
             // not wait for it. `rasterQueue` is also what keeps this engine's PDFium calls
@@ -2225,6 +2274,7 @@ public final class RustEngine: PDFEngine {
                     continuation.resume(returning: try document.saveAnnotationsCopy(
                         destination: url.path,
                         annotations: records,
+                        bookmarks: bookmarkRecords,
                         zoom: Double(zoom)
                     ))
                 } catch {
@@ -2241,6 +2291,7 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
+        bookmarks: [BookmarkWriteRequest],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         guard let document else {
@@ -2251,11 +2302,13 @@ public final class RustEngine: PDFEngine {
             )
         }
         let records = Self.writeRecords(from: annotations)
+        let bookmarkRecords = Self.writeBookmarkRecords(from: bookmarks)
         let report: AnnotationSaveReport = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
                     continuation.resume(returning: try document.replaceWithAnnotations(
                         annotations: records,
+                        bookmarks: bookmarkRecords,
                         zoom: Double(zoom)
                     ))
                 } catch {
@@ -2819,10 +2872,26 @@ public final class RustEngine: PDFEngine {
         }
     }
 
+    private static func writeBookmarkRecords(
+        from requests: [BookmarkWriteRequest]
+    ) -> [WriteBookmarkRecord] {
+        requests.map { request in
+            WriteBookmarkRecord(
+                id: request.id.uuidString,
+                page: UInt32(request.page),
+                title: request.title,
+                yPt: Double(request.yPt)
+            )
+        }
+    }
+
     private static func writeReport(from report: AnnotationSaveReport) -> AnnotationWriteReport {
         AnnotationWriteReport(
             destinationPath: report.destinationPath,
             writtenIDs: report.writtenIds,
+            writtenBookmarkIDs: report.writtenBookmarkIds,
+            bookmarkOutlineTitle: report.bookmarkOutlineTitle,
+            preexistingOutlineEntryCount: Int(report.preexistingOutlineEntryCount),
             appendedBytes: report.appendedBytes,
             backupPath: report.backupPath,
             preexistingAnnotationCount: Int(report.preexistingAnnotationCount),
@@ -3001,7 +3070,10 @@ public final class RustEngine: PDFEngine {
                             OutlineEntry(
                                 title: entry.title,
                                 page: entry.page.map { Int($0) },
-                                depth: Int(entry.depth)
+                                depth: Int(entry.depth),
+                                bookmarkID: entry.bookmarkId,
+                                yPt: entry.yPt,
+                                isBookmarkSubtree: entry.isBookmarkSubtree
                             )
                         }
                     )

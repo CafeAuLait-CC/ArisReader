@@ -55,6 +55,8 @@ mod forms;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
 #[cfg(feature = "pdfium")]
+mod outline_write;
+#[cfg(feature = "pdfium")]
 mod page_ops;
 #[cfg(feature = "pdfium")]
 mod redaction;
@@ -83,6 +85,11 @@ pub use document_properties::{
 pub use forms::{
     FormDocument, FormField, FormFieldKind, FormOption, FormSaveReport, FormValueUpdate,
     FormWidget, read_form_document, save_form_pdf, suggested_filled_copy_path,
+};
+#[cfg(feature = "pdfium")]
+pub use outline_write::{
+    DEFAULT_BOOKMARK_TITLE, EmbeddedBookmark, EmbeddedBookmarks, WriteBookmark,
+    read_embedded_bookmarks,
 };
 #[cfg(feature = "pdfium")]
 pub use page_ops::{

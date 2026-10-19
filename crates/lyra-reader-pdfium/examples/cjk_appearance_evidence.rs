@@ -82,7 +82,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let report = save_annotated_pdf(&source, &destination, &annotations, None, SaveMode::Copy)?;
+    let report = save_annotated_pdf(
+        &source,
+        &destination,
+        &annotations,
+        &[],
+        None,
+        SaveMode::Copy,
+    )?;
     println!("wrote {}", report.destination.display());
     println!("appended bytes: {}", report.appended_bytes);
     println!("written ids: {:?}", report.written_ids);

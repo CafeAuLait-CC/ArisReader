@@ -134,6 +134,12 @@ extension ReaderChecks {
         if let report = copyState.lastAnnotationWriteReport {
             require(report.backupPath == nil, "a copy save writes no backup")
             require(report.writtenIDs.count == 2, "the report names the two written annotations")
+            require(report.writtenBookmarkIDs == [bookmark.id.uuidString],
+                    "the report names the written bookmark")
+            require(report.bookmarkOutlineTitle == "My bookmarks",
+                    "the bookmark subtree has the fixed title")
+            require(report.preexistingOutlineEntryCount == 0,
+                    "the one-page fixture had no outline before the write")
             require(report.preexistingAnnotationCount == 0,
                     "the one-page fixture had no annotations before the write")
             require(report.appendedBytes > 0 && report.sourceBytesPreserved,
@@ -153,6 +159,13 @@ extension ReaderChecks {
         try await eventually("reopening the copy reads its PDF annotations", {
             copyReopen.documentAnnotations.count == 2
         })
+        try await eventually("reopening the copy adopts its outline bookmarks", {
+            copyReopen.bookmarks.map(\.id) == [bookmark.id]
+        })
+        require(copyReopen.bookmarks.first?.yPt == bookmark.yPt,
+                "the adopted bookmark keeps its page-local position")
+        require(copyReopen.outline.contains { $0.isBookmarkSubtree },
+                "the copy's sidebar lists the bookmark subtree in its outline")
 
         let identities = Set(copyReopen.documentAnnotations.map(\.id))
         require(identities.contains("nm:\(firstID.uuidString)"),
@@ -228,6 +241,7 @@ extension ReaderChecks {
         let noteReport = try await probe.saveAnnotatedCopy(
             to: noteURL,
             annotations: [noteRequest],
+            bookmarks: [],
             zoom: 1.0
         )
         require(noteReport.writtenIDs == [noteRequest.id], "the note is written once")
@@ -283,10 +297,13 @@ extension ReaderChecks {
                 "exactly the saved entries are removed from the sidecar")
         require(sidecarText.contains(foreignEntry),
                 "a foreign entry is preserved verbatim through the replace")
-        require(sidecarText.contains(bookmark.id.uuidString),
-                "the bookmark sharing the sidecar is preserved")
+        require(!sidecarText.contains(bookmark.id.uuidString),
+                "the bookmark is saved into the PDF and removed from the sidecar")
         try await eventually("the replaced document reopens with its PDF annotations", {
             replaceState.documentAnnotations.count == 2
+        })
+        try await eventually("the replaced document adopts its saved bookmark", {
+            replaceState.bookmarks.map(\.id) == [bookmark.id]
         })
         require(replaceState.annotations.isEmpty,
                 "the saved entries are gone from the sidecar model")
