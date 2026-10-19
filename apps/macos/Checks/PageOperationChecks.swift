@@ -292,5 +292,292 @@ extension ReaderChecks {
 
         // ── The page count still comes from the engine, not a stale cache ───────────
         require(editedCopy.pathExtension == "pdf", "the edited copy is a PDF")
+
+        // ── Merge: page count, boundary text, annotations, outline, sidecar marks ───
+        //
+        // The first document has an outline and reader marks; the appended annotated.pdf
+        // carries another viewer's annotations; the third document has an outline of its own,
+        // which a merge must NOT import. Every input is copied into the scratch directory, so
+        // the committed fixtures are never written.
+        let mergeFirst = try copyFixture("outlined.pdf", to: "merge-first.pdf")
+        let mergeAnnotated = try copyFixture("annotated.pdf", to: "merge-annotated.pdf")
+        let mergeThird = try copyFixture("outlined.pdf", to: "merge-third.pdf")
+        let mergeMark = AppState.Annotation(
+            id: UUID(), kind: .highlight, page: 0, start: 0, end: 5,
+            color: AppState.highlightPalette[0].color, note: "merge mark", createdAt: Date()
+        )
+        let mergeBookmark = Bookmark(page: 1, title: "merge bookmark", yPt: 10)
+        try writeSidecar([mergeMark], [mergeBookmark], to: mergeFirst)
+        let mergeSidecar = mergeFirst.appendingPathExtension("lyra-reader-annotations.json")
+        let mergeFirstBytes = try Data(contentsOf: mergeFirst)
+        let mergeSidecarBytes = try Data(contentsOf: mergeSidecar)
+        let mergeState = AppState(engine: try RustEngine())
+        require(mergeState.open(url: mergeFirst), "merge fixture opens")
+        let merged = scratch.appendingPathComponent("merged.pdf")
+        let mergedOK = await mergeState.mergeDocuments(
+            [mergeAnnotated, mergeThird],
+            to: merged
+        )
+        require(mergedOK, "merge writes a new file")
+        require(mergeState.document?.url?.standardizedFileURL.path
+                    == mergeFirst.standardizedFileURL.path,
+                "merge leaves the open document alone (immediate-to-a-new-file, like extract)")
+        require(!mergeState.pageEditSessionActive, "merge does not start a page-edit session")
+        let mergeFirstAfter = try Data(contentsOf: mergeFirst)
+        let mergeSidecarAfter = try Data(contentsOf: mergeSidecar)
+        require(mergeFirstAfter == mergeFirstBytes,
+                "merge leaves the first document byte-identical")
+        require(mergeSidecarAfter == mergeSidecarBytes,
+                "merge leaves the first document's sidecar byte-identical")
+        require(mergeState.statusMessage.contains("did not import 8 outline entries"),
+                "the merge message says what happened to the appended outlines")
+        require(mergeState.statusMessage.contains("start without LyraReader marks"),
+                "the merge message says what happens to marks on appended pages")
+
+        let mergedState = AppState(engine: try RustEngine())
+        require(mergedState.open(url: merged), "the merged file opens")
+        require(mergedState.document?.pageCount == 8,
+                "the merged file has the sum of the three documents' pages")
+        let mergedMarks = Dictionary(
+            uniqueKeysWithValues: mergedState.annotations.map { ($0.note, $0.page) }
+        )
+        require(mergedMarks["merge mark"] == 0,
+                "our annotation keeps its page after a merge")
+        require(mergedState.bookmarks.count == 1 && mergedState.bookmarks[0].page == 1,
+                "our bookmark keeps its page after a merge")
+        require(mergedState.annotations.count == 1,
+                "the appended pages start with no LyraReader sidecar marks")
+        try await eventually("the merged outline loads", {
+            mergedState.outline.count == 8
+        })
+        require(mergedState.outline.filter { $0.depth == 0 }.map(\.title)
+                    == ["Chapter One", "Chapter Two", "Chapter Three"],
+                "the first document's outline survives the merge")
+        let mergedProbe = try RustEngine()
+        _ = try mergedProbe.openDocument(at: merged)
+        let lastFirstText = try await mergedProbe.textPage(2).text
+        let firstAppendedText = try await mergedProbe.textPage(3).text
+        let secondAppendedText = try await mergedProbe.textPage(4).text
+        require(lastFirstText.contains("Chapter Three"),
+                "the last page of the first document still belongs to the first document")
+        require(firstAppendedText.contains("Annotated page 1"),
+                "the first appended page belongs to the appended document")
+        require(secondAppendedText.contains("Annotated page 2"),
+                "the second appended page belongs to the appended document")
+        try await eventually("the merged file's embedded annotations load", {
+            !mergedState.documentAnnotations.isEmpty
+        })
+        require(mergedState.documentAnnotations.contains { $0.page == 3 },
+                "the appended pages' file-owned annotations are present in the merged file")
+
+        // Self-merge and an encrypted appended document are refused and write nothing.
+        let refusedMerge = scratch.appendingPathComponent("refused-merge.pdf")
+        let selfMergeOK = await mergeState.mergeDocuments([mergeFirst], to: refusedMerge)
+        require(!selfMergeOK, "merging a document into itself is refused")
+        require(!fileManager.fileExists(atPath: refusedMerge.path),
+                "a refused self-merge writes no output")
+        let encryptedMerge = try copyFixture(
+            "form-fields-encrypted.pdf",
+            to: "merge-encrypted.pdf"
+        )
+        let encryptedMergeOK = await mergeState.mergeDocuments([encryptedMerge], to: refusedMerge)
+        require(!encryptedMergeOK, "merging an encrypted document is refused")
+        require(!fileManager.fileExists(atPath: refusedMerge.path),
+                "a refused encrypted merge writes no output")
+        require(mergeState.lastError?.lowercased().contains("password-protected") == true,
+                "the encrypted-merge refusal gives a readable reason")
+
+        // ── Split: plan parsing/naming, ranges, every-five, sidecar remap, failure ───
+        let everyFive = try PageSplitPlan.chunks(pageCount: 11, every: 5)
+        require(everyFive.map(\.count) == [5, 5, 1],
+                "an eleven-page document splits every five pages as 5 + 5 + 1")
+        let parsedRanges = try PageSplitPlan.ranges("1-5, 6-10, 11", pageCount: 11)
+        require(parsedRanges.map(\.count) == [5, 5, 1],
+                "explicit ranges become the three expected page lists")
+        do {
+            _ = try PageSplitPlan.ranges("1-6, 5-10", pageCount: 11)
+            require(false, "overlapping ranges are refused by the plan")
+        } catch {
+            require(error.localizedDescription.contains("overlaps"),
+                    "the overlap refusal names the problem")
+        }
+        do {
+            _ = try PageSplitPlan.ranges("0-2", pageCount: 11)
+            require(false, "page zero is refused by the plan")
+        } catch {}
+        do {
+            _ = try PageSplitPlan.chunks(pageCount: 11, every: 0)
+            require(false, "splitting every zero pages is refused")
+        } catch {}
+        let splitNames = PageSplitPlan.outputURLs(
+            base: URL(fileURLWithPath: "/tmp/Paper.pdf"),
+            ranges: parsedRanges
+        ).map(\.lastPathComponent)
+        require(splitNames == [
+            "Paper (pages 1-5).pdf",
+            "Paper (pages 6-10).pdf",
+            "Paper (page 11).pdf",
+        ], "split output names say which pages each file contains")
+
+        // Build an eleven-page document from committed fixtures through the engine itself.
+        let elevenSource = try copyFixture("multipage.pdf", to: "eleven-source.pdf")
+        let elevenExtraOne = try copyFixture("multipage.pdf", to: "eleven-extra-1.pdf")
+        let elevenExtraTwo = try copyFixture("multipage.pdf", to: "eleven-extra-2.pdf")
+        let elevenTwoPages = scratch.appendingPathComponent("eleven-two-pages.pdf")
+        let extractState = AppState(engine: try RustEngine())
+        require(extractState.open(url: elevenSource), "the eleven-page base opens")
+        let twoPageExcerptOK = await extractState.extractPages([0, 1], to: elevenTwoPages)
+        require(twoPageExcerptOK,
+                "the two-page excerpt for the eleven-page document is written")
+        let eleven = scratch.appendingPathComponent("eleven.pdf")
+        let builder = AppState(engine: try RustEngine())
+        require(builder.open(url: elevenSource), "the eleven-page builder opens")
+        let assembledOK = await builder.mergeDocuments(
+            [elevenExtraOne, elevenExtraTwo, elevenTwoPages],
+            to: eleven
+        )
+        require(assembledOK, "the eleven-page document is assembled by merging")
+        let elevenProbe = try RustEngine()
+        let elevenLoaded = try elevenProbe.openDocument(at: eleven)
+        require(elevenLoaded.pageCount == 11, "the assembled document has eleven pages")
+
+        let splitMark = AppState.Annotation(
+            id: UUID(), kind: .underline, page: 10, start: 0, end: 4,
+            color: AppState.highlightPalette[1].color, note: "last page mark", createdAt: Date()
+        )
+        let splitBookmark = Bookmark(page: 5, title: "middle bookmark", yPt: 20)
+        try writeSidecar([splitMark], [splitBookmark], to: eleven)
+        let elevenSidecar = eleven.appendingPathExtension("lyra-reader-annotations.json")
+        let elevenBytes = try Data(contentsOf: eleven)
+        let elevenSidecarBytes = try Data(contentsOf: elevenSidecar)
+        let splitState = AppState(engine: try RustEngine())
+        require(splitState.open(url: eleven), "the eleven-page split source opens")
+        require(splitState.annotations.count == 1 && splitState.bookmarks.count == 1,
+                "the split source's marks are loaded")
+
+        let rangeOutputs = [
+            scratch.appendingPathComponent("range-1-5.pdf"),
+            scratch.appendingPathComponent("range-6-10.pdf"),
+            scratch.appendingPathComponent("range-11.pdf"),
+        ]
+        let rangeSplitOK = await splitState.splitPages(parsedRanges, to: rangeOutputs)
+        require(rangeSplitOK, "splitting into explicit ranges writes every file")
+        for (index, expectedPages) in [5, 5, 1].enumerated() {
+            let probe = try RustEngine()
+            let loaded = try probe.openDocument(at: rangeOutputs[index])
+            require(loaded.pageCount == expectedPages,
+                    "range output \(index + 1) has exactly \(expectedPages) page(s)")
+        }
+        let rangeFirst = try RustEngine()
+        _ = try rangeFirst.openDocument(at: rangeOutputs[0])
+        let firstStartText = try await rangeFirst.textPage(0).text
+        let firstEndText = try await rangeFirst.textPage(4).text
+        require(firstStartText.contains("Page 1 of 3"),
+                "the first range starts on the source's first page")
+        require(firstEndText.contains("Page 2 of 3"),
+                "the first range ends on the source's fifth page")
+        let rangeSecond = try RustEngine()
+        _ = try rangeSecond.openDocument(at: rangeOutputs[1])
+        let secondStartText = try await rangeSecond.textPage(0).text
+        let secondEndText = try await rangeSecond.textPage(4).text
+        require(secondStartText.contains("Page 3 of 3"),
+                "the second range starts on the source's sixth page")
+        require(secondEndText.contains("Page 1 of 3"),
+                "the second range ends on the source's tenth page")
+        let rangeThird = try RustEngine()
+        _ = try rangeThird.openDocument(at: rangeOutputs[2])
+        let thirdStartText = try await rangeThird.textPage(0).text
+        require(thirdStartText.contains("Page 2 of 3"),
+                "the last range is the source's eleventh page")
+        let elevenAfterRanges = try Data(contentsOf: eleven)
+        require(elevenAfterRanges == elevenBytes,
+                "splitting into ranges leaves the source byte-identical")
+
+        // The reader's marks follow their pages into the outputs that contain them.
+        let rangeSecondState = AppState(engine: try RustEngine())
+        require(rangeSecondState.open(url: rangeOutputs[1]),
+                "the second range output opens")
+        require(rangeSecondState.bookmarks.count == 1
+                    && rangeSecondState.bookmarks[0].page == 0
+                    && rangeSecondState.bookmarks[0].title == "middle bookmark",
+                "a bookmark is renumbered into the output that contains its page")
+        require(rangeSecondState.annotations.isEmpty,
+                "the second output carries no mark from another page")
+        let rangeThirdState = AppState(engine: try RustEngine())
+        require(rangeThirdState.open(url: rangeOutputs[2]), "the last range output opens")
+        require(rangeThirdState.annotations.count == 1
+                    && rangeThirdState.annotations[0].note == "last page mark"
+                    && rangeThirdState.annotations[0].page == 0,
+                "an annotation on the last page is renumbered into the last output")
+        require(rangeThirdState.bookmarks.isEmpty,
+                "the last output carries no bookmark from another page")
+        let elevenSidecarAfter = try Data(contentsOf: elevenSidecar)
+        require(elevenSidecarAfter == elevenSidecarBytes,
+                "splitting leaves the source sidecar byte-identical")
+
+        // Every five pages: 5 + 5 + 1 on the same eleven-page document.
+        let everyFiveOutputs = [
+            scratch.appendingPathComponent("five-1.pdf"),
+            scratch.appendingPathComponent("five-2.pdf"),
+            scratch.appendingPathComponent("five-3.pdf"),
+        ]
+        let everyFiveOK = await splitState.splitPages(everyFive, to: everyFiveOutputs)
+        require(everyFiveOK, "splitting every five pages writes three files")
+        for (index, expectedPages) in [5, 5, 1].enumerated() {
+            let probe = try RustEngine()
+            let loaded = try probe.openDocument(at: everyFiveOutputs[index])
+            require(loaded.pageCount == expectedPages,
+                    "every-five output \(index + 1) has \(expectedPages) page(s)")
+        }
+
+        // A failure on the third output leaves the first two complete and the source untouched.
+        // The third destination's parent is a regular file, so the engine fails only when it
+        // reaches that part (all outputs passed the shell's preflight, which checks names only).
+        let blocker = scratch.appendingPathComponent("split-blocker.pdf")
+        try Data("not a directory".utf8).write(to: blocker)
+        let lateFailureOutputs = [
+            scratch.appendingPathComponent("late-1.pdf"),
+            scratch.appendingPathComponent("late-2.pdf"),
+            blocker.appendingPathComponent("late-3.pdf"),
+        ]
+        let lateFailureOK = await splitState.splitPages(
+            [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10]],
+            to: lateFailureOutputs
+        )
+        require(!lateFailureOK, "a failure on the third output fails the split")
+        let lateFirstProbe = try RustEngine()
+        let lateFirstLoaded = try lateFirstProbe.openDocument(at: lateFailureOutputs[0])
+        require(lateFirstLoaded.pageCount == 5,
+                "the first output is complete after a later failure")
+        let lateSecondProbe = try RustEngine()
+        let lateSecondLoaded = try lateSecondProbe.openDocument(at: lateFailureOutputs[1])
+        require(lateSecondLoaded.pageCount == 5,
+                "the second output is complete after a later failure")
+        require(!fileManager.fileExists(atPath: lateFailureOutputs[2].path),
+                "the failed third output does not exist")
+        let elevenAfterFailure = try Data(contentsOf: eleven)
+        require(elevenAfterFailure == elevenBytes,
+                "a failed split leaves the source byte-identical")
+        require(splitState.lastError?.contains("2 complete output(s)") == true,
+                "the failure says how many outputs are complete")
+
+        // Splitting an encrypted document is refused before anything is written.
+        let encryptedSplitSource = try copyFixture(
+            "form-fields-encrypted.pdf",
+            to: "split-encrypted.pdf"
+        )
+        let encryptedSplitState = AppState(engine: try RustEngine())
+        require(encryptedSplitState.open(url: encryptedSplitSource),
+                "the encrypted split fixture opens (empty user password)")
+        let encryptedSplitOutput = scratch.appendingPathComponent("encrypted-part.pdf")
+        let encryptedSplitOK = await encryptedSplitState.splitPages(
+            [[0]],
+            to: [encryptedSplitOutput]
+        )
+        require(!encryptedSplitOK, "splitting an encrypted document is refused")
+        require(!fileManager.fileExists(atPath: encryptedSplitOutput.path),
+                "a refused encrypted split writes nothing")
+        require(encryptedSplitState.lastError?.lowercased().contains("password-protected") == true,
+                "the encrypted-split refusal gives a readable reason")
     }
 }

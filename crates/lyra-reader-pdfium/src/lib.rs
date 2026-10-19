@@ -99,8 +99,9 @@ pub use outline_write::{
 };
 #[cfg(feature = "pdfium")]
 pub use page_ops::{
-    PageOperation, PageOperationReport, apply_page_operation, extract_pages, publish_edited_copy,
-    replace_original_with_edit,
+    MergeReport, PageOperation, PageOperationReport, SplitPart, SplitPartReport, SplitReport,
+    apply_page_operation, extract_pages, merge_documents, publish_edited_copy,
+    replace_original_with_edit, split_pages,
 };
 #[cfg(feature = "pdfium")]
 pub use redaction::{

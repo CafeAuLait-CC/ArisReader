@@ -24,7 +24,9 @@ press would remove is haloed first, one gesture is one undo step, and a saved co
 erased strokes. Pages can be rotated,
 deleted, reordered, inserted and extracted through a staged session whose undo covers the whole
 session; the file on disk stays untouched until the reader applies the changes, and applying writes
-a verified backup before replacing anything. An optional AI assistant speaks the OpenAI-compatible
+a verified backup before replacing anything. Documents can also be merged and split into new files
+without touching the source; the first document's outline survives a merge, and the reader's own
+sidecar marks are remapped so they keep pointing at their pages. An optional AI assistant speaks the OpenAI-compatible
 chat API, so a hosted service or a local Ollama works with nothing but a base URL, a model and a
 key: it summarises a page or a long document, answers about a selection and translates one, previews
 exactly what will be sent before anything leaves the machine, streams, cancels and retries, and keeps
@@ -50,7 +52,7 @@ Capabilities, each backed by a check rather than a claim: selection and click-pr
 tabs that switch without reloading and independent windows, outline with section numbers and levels, page
 and annotation sidebars with reply threads, highlight/underline/strikethrough/ink/shape/sticky-note/text-box
 creation with a colour and blend, and every one of those kinds written back into the PDF through a verified
-incremental save; staged page editing; facing pages, page gap and bookmarks; a redaction that removes the
+incremental save; staged page editing; merge and split into new files; facing pages, page gap and bookmarks; a redaction that removes the
 covered characters rather than covering them, and printing at print resolution; form filling bound to the
 Fill & Sign slot and editable document properties; citation/figure/table/algorithm previews with draggable,
 pinnable panels, open-in-a-second-window, a per-window Back for preview jumps, citation BibTeX copy,
@@ -156,6 +158,57 @@ cargo run -p lyra-reader-cli -- annotations tests/fixtures/annotated-appearance.
 # 8) Recognise title/authors/venue/year/DOI/arXiv and print each field with its source
 cargo run -p lyra-reader-cli -- metadata tests/fixtures/metadata-text-layer.pdf
 ```
+
+## Page editing, merge and split
+
+Rotate, delete, reorder, insert-blank and extract run through a staged session: every operation
+is applied by the Rust engine to an in-memory copy, written to a temporary file, reopened and
+verified (page count, per-page rotation, per-page size, and — for extraction — the selected
+pages' text), then renamed into place. The file on disk changes only through **Save Edited Copy**
+or **Replace Original**; replacing writes a verified byte-identical backup first. Undo/redo is a
+stack of complete revisions, so deleting a page and undoing it restores the page's content rather
+than approximating it.
+
+**Merge** (`Pages > Append Pages from PDFs…`) and **Split** (`Pages > Split Pages…`) are
+*immediate-to-a-new-file* commands, exactly like **Extract Selected Pages**: they read the file
+that is open now (the working revision during a page-edit session), never end or alter the
+session, are not undoable, and write new files only. Every output goes through the same
+temporary-file / flush / reopen-and-verify / atomic-rename path; a source is never an output.
+
+- **Outline rule.** A merge keeps the first document's outline exactly as it was (appending does
+  not move its pages). It does **not** import the appended documents' outlines: PDFium's
+  `FPDF_ImportPagesByIndex` copies page dictionaries, not a document-level bookmark tree, so the
+  shell says "kept the first document's outline (N entries) and did not import M outline entries
+  from the appended documents". A split writes no outline into its outputs, because the source
+  outline's destinations can belong to different outputs; the reader's own bookmarks are
+  remapped per output instead.
+- **Marks rule.** The reader's annotations and bookmarks live in a sidecar keyed by page index.
+  Merge appends at the end, so every page of the first document keeps its index and the existing
+  marks keep pointing at it; the merged file gets a sidecar copy of exactly those marks. The
+  appended pages are new indices and start with **no LyraReader sidecar marks**, because this app
+  has no sidecar for the other documents (their file-owned annotations inside the PDF do travel
+  with their pages and are counted in the confirmation). Split renumbers pages per output, so
+  each output's sidecar holds the marks whose pages that file contains, at their new indices.
+- **Refusals.** Merging a document into itself, selecting the same file twice, merging an
+  encrypted PDF (including one that opens with an empty user password; the security-handler
+  revision is checked), splitting an encrypted PDF, and any output that would overwrite an input
+  are refused with a readable reason before anything is written. The self-merge and encrypted
+  cases leave no PDF, sidecar or temporary behind.
+- **Split failure model.** The whole plan (page indices, overlap between outputs, destination
+  names) is validated before the first file is built. Outputs then go one at a time, each with
+  its own verified atomic rename. If output *k* fails, outputs 1…*k*−1 are complete, valid files
+  and stay in place; output *k* is not renamed (its temporary is removed); later outputs are not
+  attempted; the source is untouched. The error and the alert say how many outputs are complete.
+  The split is a sequence of atomic steps, not one transaction across files.
+- **File names.** Merge offers `<name> (merged).pdf`. Split writes `<name> (pages 1-5).pdf`,
+  `<name> (pages 6-10).pdf`, `<name> (page 11).pdf` (or the same shape from "every N pages"). The
+  split dialog refuses to overwrite an existing file or sidecar before it starts. These dialogs
+  and the generated names are the part that needs a human eye.
+
+Evidence: `cargo test -p lyra-reader-pdfium page_ops` covers the engine round trips (boundary
+text, appended annotations, outline kept/dropped, 5+5+1, refusals, and a failed third output);
+`LyraReaderChecks --check-page-operations .` covers the shell's staged-session behaviour, the
+sidecar remapping and the refusal/atomicity contracts end to end.
 
 ## Annotation write-back
 
@@ -946,7 +999,7 @@ resolve locally.
 | M0 | Skeleton, FFI path, GPU interop spike (a PDF page texture on screen) | ✅ Complete |
 | M1 | Minimum readable loop | Core implemented; performance, memory/leak budgets and scheduling exit criteria remain unverified. PDFium lifecycle locking review: resolved in PR #6 |
 | M2 | Reading experience | Core implemented; normal-open initialization, tab/cache isolation and stale search handling repaired. Named, reorderable user bookmarks (sidecar-persisted) and facing pages with a configurable page gap are implemented. Cross-page selection, incremental search, navigation history, split view and full session restoration remain. |
-| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/strikeouts/notes with undo/redo, sticky markup tools, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines, strikeouts and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight/underline/strikeout appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink and shape annotations are drawn in a vector overlay, stored as versioned page-space sidecar entries and written back as `/Ink`, `/Square`, `/Circle` and `/Line` (with `/L`, `/LE`, `/BS` and a real `/AP` appearance stream); they can be selected by their stroke, moved and deleted, with undo/redo covering all three. Free text is written as a `/FreeText` annotation whose appearance uses a per-document subset of the bundled Noto Sans SC (renamed LyraReader Sans SC, SIL OFL 1.1) embedded as Type0/Identity-H with `FontFile2`, `CIDToGIDMap`, `/W` and `/ToUnicode`; Chinese, Japanese, Greek and maths characters render in the appearance, and a character outside the subset paints as `.notdef` while `/Contents` and extraction stay exact. Page operations and AcroForm forms remain; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
+| M3 | Annotation and editing | Partial: durable sidecar highlights/underlines/strikeouts/notes with undo/redo, sticky markup tools, and PDF write-back (Save Annotated Copy / Save and Replace Original) for highlights, underlines, strikeouts and `/Text` notes with verified atomic writes, a byte-identical backup on replace, append-only saves and sidecar deduplication. Highlight/underline/strikeout appearance streams are not written because PDFium's C ABI cannot express the multiply blend (see the write-back section; PDFKit synthesizes the mark correctly). A sidecar that cannot be read still refuses every write, but the reader can back it up and start fresh from the alert (the original file is moved, never overwritten). Note edits coalesce their disk writes and flush on commit, document switch, tab close and quit. Annotations are exported as Markdown or CSV, labelled with their source and threaded by reply. Ink and shape annotations are drawn in a vector overlay, stored as versioned page-space sidecar entries and written back as `/Ink`, `/Square`, `/Circle` and `/Line` (with `/L`, `/LE`, `/BS` and a real `/AP` appearance stream); they can be selected by their stroke, moved and deleted, with undo/redo covering all three. Free text is written as a `/FreeText` annotation whose appearance uses a per-document subset of the bundled Noto Sans SC (renamed LyraReader Sans SC, SIL OFL 1.1) embedded as Type0/Identity-H with `FontFile2`, `CIDToGIDMap`, `/W` and `/ToUnicode`; Chinese, Japanese, Greek and maths characters render in the appearance, and a character outside the subset paints as `.notdef` while `/Contents` and extraction stay exact. Page operations (rotate, delete, reorder, insert blank, extract, merge and split, all through the verified write path) and AcroForm forms are implemented; the sidecar still lacks document-fingerprint validation and cross-process conflict detection. |
 | M4 | Advanced reading | Partial: resizable, scrollable previews; complete resolved citation text with entry switching; Algorithm detection; full-page fallback for uncertain table/vector regions. A `Table` reference previews the grid its border lines form — 20 of the 40 table captions in the twelve sample papers, the rest falling back to the page. Captions and per-page citation spans are indexed for the whole document, not the first 120 pages, so a reference to a figure or a citation near the end of a 900-page book resolves like one on page 8. A grouped citation resolves to **every** work it names (`[1,11,19]` lists three entries), and bibliography entries are modelled as fragments (page and glyph range each), so a cross-page continuation is no longer a truncated rectangle. A document that prints more than one reference list (a main bibliography and an appendix's own, or a per-chapter thesis list) attributes each citation to the list its section cites — in the app's citation click as well as in the `cite` CLI, which prints the list and the reason, reports when a number exists only in an appendix list, and records an ambiguous choice instead of silently preferring the nearer list. On the **twenty-paper arXiv corpus**, 94.4% of 1826 detected citation spans resolve — the evaluation set is links only, no PDF is committed. Alphanumeric labels and groups (`[HR18]`, `[MCCD13, PSM14]`, `[VSP+ 17]`) now resolve: GPT-3 has 203 spans and 144 bibliography entries. Superscripts on papers that bracket their citations remain unsupported. Bare parenthesised numerals - (12), (3-5), (7, 9) - are detected when the document proves its bibliography is numeric and its body does not already bracket those citations, with equation numbers, function calls, years, enumerations, figure sub-labels and out-of-range labels rejected by position and context; a Science paper in the evaluation set went from no spans to twenty resolved ones while every other row stayed identical. A column gutter is now detected from the character runs inside each line (52 of the corpus's 298 pages, all in its seven two-column papers; the five single-column papers acquire none). Unlinked equations, vector-figure segmentation and index persistence remain. Preview pinning freezes the panel against document clicks; **Open in New Window** reopens the same page and region in a second independent reader window; a citation preview copies the document's generated BibTeX and is disabled when there is none. Document metadata (title, authors, venue, year, DOI, arXiv id) is recognised from XMP, `/Info` and page one, shown with per-field provenance in Document Information, editable, and exported as BibTeX with an offline generator. |
 | M5 | AI assistant: summarization, translation, document chat, region-based discussion, RAG, local models | Partial: OpenAI-compatible streaming page/document summaries, selection Q&A and translation, local/remote visibility, request preview, Keychain, cancel/retry, usage and `[p.N]` page links. Document chat, vision/region discussion, summary merging and cross-platform credential stores remain. |
 | M6 | Cross-platform: Windows / Linux shell and packaging | ⬜ |

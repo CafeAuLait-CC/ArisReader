@@ -339,6 +339,19 @@ struct ReaderCommands: Commands {
 
             Divider()
 
+            // Merge and split are immediate-to-a-new-file, like Extract: they never end the
+            // staged page-edit session and are not undoable, because the source is only read.
+            Button("Append Pages from PDFs…") {
+                session?.state.presentMergeDocumentsPanel()
+            }
+            .disabled(focusedState?.document == nil)
+            Button("Split Pages…") {
+                session?.state.presentSplitPagesPanel()
+            }
+            .disabled(focusedState?.document == nil)
+
+            Divider()
+
             Button("Undo Page Change") { session?.state.undoPageEdit() }
                 .disabled(session?.state.canUndoPageEdit != true)
             Button("Redo Page Change") { session?.state.redoPageEdit() }

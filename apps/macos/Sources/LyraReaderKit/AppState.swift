@@ -7856,6 +7856,384 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: - Merge and split (T3.9)
+    //
+    // Merge and split are **immediate-to-a-new-file**, exactly like Extract: they work on the
+    // file that is open now (the working revision during a page-edit session), never end the
+    // session and are not undoable. The source is only read. The outputs are files the reader
+    // asked for by name, each written through the engine's verified temporary-file path.
+    //
+    // Sidecar rules: a merge appends, so existing pages keep their indices and the reader's
+    // marks are copied unchanged to the merged file's sidecar. The appended pages start with no
+    // LyraReader marks because this app has no sidecar for the other documents (their file-owned
+    // annotations travel inside the PDF). A split renumbers pages per output, so each output's
+    // sidecar holds exactly the marks whose pages that output contains, at their new indices.
+
+    public func presentMergeDocumentsPanel() {
+        guard let source = pageEditDisplayURL else { return }
+        let open = NSOpenPanel()
+        open.title = "Append PDFs"
+        open.message =
+            "Choose one or more PDFs whose pages will be appended to “"
+            + source.lastPathComponent + "” in the order they are selected. "
+            + "The open document and the chosen PDFs are not modified. "
+            + "Encrypted PDFs and the open document itself are refused."
+        open.allowedContentTypes = [.pdf]
+        open.allowsMultipleSelection = true
+        open.canChooseDirectories = false
+        open.directoryURL = source.deletingLastPathComponent()
+        guard open.runModal() == .OK else { return }
+        let others = open.urls
+        guard !others.isEmpty else { return }
+
+        let panel = NSSavePanel()
+        panel.title = "Merge PDFs"
+        panel.message =
+            "Writes the current document followed by the chosen PDFs' pages to a new file. "
+            + "The first document's outline is kept; the appended documents' outlines are not "
+            + "imported. Annotations stored inside the PDFs travel with their pages. Your "
+            + "LyraReader marks keep their pages; appended pages carry none."
+        panel.nameFieldStringValue =
+            "\(source.deletingPathExtension().lastPathComponent) (merged).pdf"
+        panel.directoryURL = source.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.mergeDocuments(others, to: destination)
+        }
+    }
+
+    /// Appends `others` to the open document and writes a new file at `destination`.
+    ///
+    /// The open document (and any staged page-edit session) is left exactly as it is: this is
+    /// the same immediate-to-a-new-file shape as ``extractPages(_:to:)``. The destination's
+    /// sidecar receives the current marks unchanged, because appending does not move a page.
+    @discardableResult
+    public func mergeDocuments(_ others: [URL], to destination: URL) async -> Bool {
+        guard let source = document?.url else { return false }
+        guard !others.isEmpty else {
+            lastError = "Choose at least one PDF to append."
+            return false
+        }
+        guard !pageEditBusy && !annotationSaveInProgress else { return false }
+        if let reason = annotationWritesBlockedReason {
+            lastError =
+                "This document's annotation sidecar could not be read (\(reason)), so the merge "
+                + "was not started: it could not tell which marks the merged file should carry."
+            return false
+        }
+        if Self.resolvesToSameFile(destination, source)
+            || others.contains(where: { Self.resolvesToSameFile($0, source) }) {
+            lastError = "A document cannot be merged into itself; choose another file."
+            return false
+        }
+        if let original = pageEditSession?.originalURL,
+           Self.resolvesToSameFile(destination, original) {
+            lastError =
+                "The merged file cannot replace the document the page-edit session started from. "
+                + "Choose another name; the original is unchanged until Replace Original is used."
+            return false
+        }
+        let destinationSidecar = Self.sidecarURL(for: destination)
+        if Self.sidecarFileExists(for: destination) {
+            lastError =
+                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
+                + "Choose another name so the merged pages cannot show two sets of marks."
+            return false
+        }
+        let sidecarData: Data?
+        do {
+            sidecarData = try pageEditSidecarData()
+        } catch {
+            lastError = "Could not prepare the reader's annotations for the merge: \(error.localizedDescription)"
+            return false
+        }
+        if let sidecarData {
+            do {
+                try sidecarData.write(to: destinationSidecar, options: .atomic)
+            } catch {
+                lastError = "Could not write the merged file's annotation sidecar: \(error.localizedDescription)"
+                return false
+            }
+        }
+
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let report = try await engine.mergeDocuments(others: others, to: destination)
+            let appendedNotes = report.appendedAnnotationCounts.reduce(0, +)
+            let outlineNote = report.droppedOutlineEntries == 0
+                ? "kept the first document's outline (\(report.firstOutlineEntries) entries); "
+                    + "the appended documents had no outline"
+                : "kept the first document's outline (\(report.firstOutlineEntries) entries) and "
+                    + "did not import \(report.droppedOutlineEntries) outline "
+                    + "entr\(report.droppedOutlineEntries == 1 ? "y" : "ies") from the appended documents"
+            let marksNote: String
+            if annotations.isEmpty && bookmarks.isEmpty {
+                marksNote = "there were no LyraReader marks to carry"
+            } else {
+                marksNote =
+                    "your \(annotations.count) annotation(s) and \(bookmarks.count) bookmark(s) "
+                    + "stay on pages 1–\(report.firstPageCount); the \(report.pageCount - report.firstPageCount) "
+                    + "appended page(s) start without LyraReader marks"
+            }
+            statusMessage =
+                "Merged into \(destination.lastPathComponent) · \(report.pageCount) pages · "
+                + "\(outlineNote) · \(appendedNotes) embedded annotation(s) traveled · "
+                + "\(marksNote) · the open document is unchanged"
+            FileHandle.standardError.write(Data((
+                "lyra-reader-pages: merged \(others.count) document(s) into \(destination.path) "
+                + "· \(report.pageCount) page(s), first \(report.firstPageCount) · "
+                + "dropped \(report.droppedOutlineEntries) outline entries · "
+                + "\(report.outputBytes) bytes\n"
+            ).utf8))
+            return true
+        } catch {
+            if sidecarData != nil {
+                try? FileManager.default.removeItem(at: destinationSidecar)
+            }
+            lastError = "Could not merge the documents; nothing was written: \(error.localizedDescription)"
+            statusMessage = "Could not merge the documents"
+            FileHandle.standardError.write(Data("lyra-reader-pages: merge failed: \(error)\n".utf8))
+            return false
+        }
+    }
+
+    public func presentSplitPagesPanel() {
+        guard let source = pageEditDisplayURL, let pageCount = document?.pageCount, pageCount > 0 else {
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Split “\(source.lastPathComponent)”"
+        alert.informativeText =
+            "Each part is written as its own verified file; the source is not modified. "
+            + "Choose page ranges (for example 1-5, 6-10) or a fixed page count. "
+            + "The reader's marks are copied to the output that contains their page."
+
+        let mode = NSPopUpButton(frame: NSRect(x: 0, y: 72, width: 320, height: 26), pullsDown: false)
+        mode.addItems(withTitles: ["Page ranges", "Every N pages"])
+        let field = NSTextField(frame: NSRect(x: 0, y: 40, width: 320, height: 26))
+        field.stringValue = pageCount > 5 ? "1-5" : "1-\(pageCount)"
+        field.placeholderString = "1-5, 6-10"
+        let hint = NSTextField(labelWithString:
+            "Ranges are 1-based and must not overlap. Every N pages: type just the number, "
+            + "for example 5.")
+        hint.frame = NSRect(x: 0, y: 0, width: 320, height: 32)
+        hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byWordWrapping
+        hint.maximumNumberOfLines = 2
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 100))
+        accessory.addSubview(mode)
+        accessory.addSubview(field)
+        accessory.addSubview(hint)
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "Choose Folder…")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let ranges: [[Int]]
+        do {
+            if mode.indexOfSelectedItem == 0 {
+                ranges = try PageSplitPlan.ranges(field.stringValue, pageCount: pageCount)
+            } else {
+                guard let every = Int(field.stringValue.trimmingCharacters(in: .whitespaces)),
+                      every >= 1 else {
+                    throw PageSplitPlanError.invalid("Type a whole number of pages, for example 5.")
+                }
+                ranges = try PageSplitPlan.chunks(pageCount: pageCount, every: every)
+            }
+        } catch {
+            lastError = "Could not use that split: \(error.localizedDescription)"
+            statusMessage = "Split not started"
+            return
+        }
+
+        let folderPanel = NSOpenPanel()
+        folderPanel.title = "Choose a Folder for the Split"
+        folderPanel.message =
+            "\(ranges.count) file(s) will be written here, named like "
+            + "“\(source.deletingPathExtension().lastPathComponent) (pages 1-5).pdf”. "
+            + "Nothing is overwritten: an existing file or sidecar stops the split before it starts."
+        folderPanel.prompt = "Choose Folder"
+        folderPanel.canChooseFiles = false
+        folderPanel.canChooseDirectories = true
+        folderPanel.canCreateDirectories = true
+        folderPanel.allowsMultipleSelection = false
+        folderPanel.directoryURL = source.deletingLastPathComponent()
+        guard folderPanel.runModal() == .OK, let folder = folderPanel.url else { return }
+        let base = folder.appendingPathComponent(source.lastPathComponent)
+        let destinations = PageSplitPlan.outputURLs(base: base, ranges: ranges)
+        Task { @MainActor [weak self] in
+            await self?.splitPages(ranges, to: destinations)
+        }
+    }
+
+    /// Splits the open document into `ranges` written at `destinations` (same order).
+    ///
+    /// Like ``extractPages(_:to:)`` this is immediate: it does not start or end a page-edit
+    /// session. Every output is verified by the engine. If a later output fails, earlier outputs
+    /// are complete and stay in place; each one that exists gets its remapped sidecar, so a
+    /// partial split still leaves usable files with the right marks.
+    @discardableResult
+    public func splitPages(_ ranges: [[Int]], to destinations: [URL]) async -> Bool {
+        guard let source = document?.url else { return false }
+        guard !ranges.isEmpty, ranges.count == destinations.count else {
+            lastError = "A split needs one destination for every page range."
+            return false
+        }
+        guard !pageEditBusy && !annotationSaveInProgress else { return false }
+        if let reason = annotationWritesBlockedReason {
+            lastError =
+                "This document's annotation sidecar could not be read (\(reason)), so the split "
+                + "was not started: it could not tell which marks each output should carry."
+            return false
+        }
+        guard preservedAnnotationEntryCount == 0 else {
+            lastError =
+                "This document's annotation sidecar contains entries written by a newer LyraReader. "
+                + "Their pages cannot be remapped into the split outputs safely, so the split was "
+                + "not started."
+            return false
+        }
+        for (range, destination) in zip(ranges, destinations) {
+            guard !range.isEmpty else {
+                lastError = "A split range is empty; nothing was written."
+                return false
+            }
+            if Self.resolvesToSameFile(destination, source)
+                || pageEditSession.map({ Self.resolvesToSameFile(destination, $0.originalURL) }) == true {
+                lastError = "A split output cannot overwrite the document being split."
+                return false
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                lastError =
+                    "“\(destination.lastPathComponent)” already exists. Nothing was written; choose "
+                    + "another folder or remove the file."
+                return false
+            }
+            if Self.sidecarFileExists(for: destination) {
+                lastError =
+                    "“\(destination.lastPathComponent)” already has LyraReader annotations beside it. "
+                    + "Nothing was written; choose another folder."
+                return false
+            }
+        }
+
+        let ordered = ranges.map { $0.sorted() }
+        let partSidecarData: [Data?]
+        do {
+            partSidecarData = try ordered.map { try sidecarData(for: $0) }
+        } catch {
+            lastError = "Could not prepare the split outputs' annotations: \(error.localizedDescription)"
+            return false
+        }
+
+        pageEditBusy = true
+        defer { pageEditBusy = false }
+        do {
+            let parts = zip(ordered, destinations).map { pair in
+                PageSplitPart(pages: pair.0, destination: pair.1)
+            }
+            let report = try await engine.splitPages(parts)
+            var sidecarFailures = 0
+            for (index, part) in report.parts.enumerated() {
+                guard index < partSidecarData.count, let data = partSidecarData[index] else { continue }
+                do {
+                    try data.write(
+                        to: Self.sidecarURL(for: part.destination),
+                        options: .atomic
+                    )
+                } catch {
+                    sidecarFailures += 1
+                }
+            }
+            let counts = report.parts.map(\.pageCount).map(String.init).joined(separator: " + ")
+            let sidecarNote = sidecarFailures == 0
+                ? "the reader's marks were copied to the output that contains each page"
+                : "\(sidecarFailures) output sidecar(s) could not be written"
+            statusMessage =
+                "Split into \(report.parts.count) file(s) · \(counts) pages · each verified · "
+                + "the source is unchanged · \(sidecarNote)"
+            if sidecarFailures > 0 {
+                lastError = "The split PDFs are valid, but \(sidecarFailures) annotation sidecar(s) could not be written."
+            }
+            FileHandle.standardError.write(Data((
+                "lyra-reader-pages: split \(source.lastPathComponent) into \(report.parts.count) "
+                + "file(s) (\(counts) pages) · source unchanged\n"
+            ).utf8))
+            return true
+        } catch {
+            // An output is renamed only after its verification, so any destination that now
+            // exists is a complete earlier part. Give those parts their sidecars.
+            var completed = 0
+            for (index, destination) in destinations.enumerated() {
+                guard FileManager.default.fileExists(atPath: destination.path) else { continue }
+                completed += 1
+                if index < partSidecarData.count, let data = partSidecarData[index] {
+                    try? data.write(to: Self.sidecarURL(for: destination), options: .atomic)
+                }
+            }
+            lastError =
+                "Could not split the document; \(completed) complete output(s) are on disk and "
+                + "the source is unchanged: \(error.localizedDescription)"
+            statusMessage = completed == 0
+                ? "Split failed; nothing was written"
+                : "Split stopped after \(completed) complete output(s)"
+            FileHandle.standardError.write(Data("lyra-reader-pages: split failed: \(error)\n".utf8))
+            return false
+        }
+    }
+
+    /// True when either naming convention of the reader's sidecar exists beside `document`.
+    private static func sidecarFileExists(for document: URL) -> Bool {
+        let fileManager = FileManager.default
+        let current = document.appendingPathExtension("lyra-reader-annotations.json")
+        let legacy = document.appendingPathExtension("aris-annotations.json")
+        return fileManager.fileExists(atPath: current.path)
+            || fileManager.fileExists(atPath: legacy.path)
+    }
+
+    /// The reader's marks on exactly `pages`, renumbered to their position in that output.
+    ///
+    /// Opaque entries (a newer LyraReader's schema) cannot be placed and are refused before a
+    /// split starts, so this filter never silently drops one.
+    private func sidecarData(for pages: [Int]) throws -> Data? {
+        let positions = Dictionary(uniqueKeysWithValues: pages.enumerated().map { ($0.element, $0.offset) })
+        var mappedAnnotations: [Annotation] = []
+        for annotation in annotations {
+            guard let page = positions[annotation.page] else { continue }
+            var copy = annotation
+            copy.page = page
+            mappedAnnotations.append(copy)
+        }
+        var mappedBookmarks: [Bookmark] = []
+        for bookmark in bookmarks {
+            guard let page = positions[bookmark.page] else { continue }
+            var copy = bookmark
+            copy.page = page
+            mappedBookmarks.append(copy)
+        }
+        let annotationIDs = Set(mappedAnnotations.map(\.id))
+        let bookmarkIDs = Set(mappedBookmarks.map(\.id))
+        let mappedSlots = annotationSidecarSlots.filter { slot in
+            switch slot {
+            case .annotation(let id): return annotationIDs.contains(id)
+            case .bookmark(let id): return bookmarkIDs.contains(id)
+            case .opaque: return false
+            }
+        }
+        if mappedAnnotations.isEmpty && mappedBookmarks.isEmpty && mappedSlots.isEmpty {
+            return nil
+        }
+        return try AnnotationSidecar.encode(
+            annotations: mappedAnnotations,
+            bookmarks: mappedBookmarks,
+            slots: mappedSlots
+        )
+    }
+
     public func presentSavePageEditsCopyPanel() {
         guard let source = pageEditDisplayURL, pageEditSession != nil else { return }
         let panel = NSSavePanel()

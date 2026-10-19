@@ -1256,6 +1256,57 @@ public struct PageOperationReport: Sendable, Equatable {
     }
 }
 
+/// One output the shell asks a split to write.
+public struct PageSplitPart: Sendable, Equatable {
+    /// 0-based source pages this output carries.
+    public let pages: [Int]
+    public let destination: URL
+
+    public init(pages: [Int], destination: URL) {
+        self.pages = pages
+        self.destination = destination
+    }
+}
+
+/// What a split wrote for one part.
+public struct PageSplitOutput: Sendable, Equatable {
+    public let destination: URL
+    public let pageCount: Int
+    /// 0-based source pages this output carries, in output order.
+    public let sourcePages: [Int]
+    public let rotations: [Int]
+    public let outputBytes: UInt64
+}
+
+/// What a split wrote.
+///
+/// Each part is an independent verified atomic write. On a later failure the engine throws, and
+/// the earlier outputs are already complete and stay on disk; the shell checks which destinations
+/// exist to write their sidecars.
+public struct PageSplitReport: Sendable, Equatable {
+    public let parts: [PageSplitOutput]
+    public let sourcePageCount: Int
+    public let cleanedTemporaryFiles: Int
+}
+
+/// What a merge wrote.
+///
+/// The first document's outline is kept; the appended documents' outlines are not imported, and
+/// `droppedOutlineEntries` counts what was left out. The appended pages' file-owned annotations
+/// travel with them. The first document's pages keep their indices.
+public struct PageMergeReport: Sendable, Equatable {
+    public let destination: URL
+    public let pageCount: Int
+    public let firstPageCount: Int
+    public let appendedPageCounts: [Int]
+    public let appendedAnnotationCounts: [Int]
+    public let rotations: [Int]
+    public let firstOutlineEntries: Int
+    public let droppedOutlineEntries: Int
+    public let outputBytes: UInt64
+    public let cleanedTemporaryFiles: Int
+}
+
 /// A `Figure 3` / `Table 2` reference in a page's body text, boxed in view space.
 public struct CaptionMention: Sendable {
     public let page: Int
@@ -1541,6 +1592,11 @@ public protocol PDFEngine: AnyObject {
     func applyPageOperation(_ operation: PageEditOperation, to destination: URL) async throws -> PageOperationReport
     /// Extracts `pages` (0-based) from the open document into a new PDF.
     func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport
+    /// Appends `others` to the open document and writes a **new** file; the open document is
+    /// untouched. The first document's outline is kept, the appended outlines are not imported.
+    func mergeDocuments(others: [URL], to destination: URL) async throws -> PageMergeReport
+    /// Splits the open document into `parts`, each an independently verified atomic write.
+    func splitPages(_ parts: [PageSplitPart]) async throws -> PageSplitReport
     /// Publishes the current page-edit revision as a new file; the open document is untouched.
     func saveEditedCopy(to destination: URL) async throws -> PageOperationReport
     /// Replaces `original` with the current page-edit revision. Backup first, atomic rename.
@@ -1810,6 +1866,22 @@ public extension PDFEngine {
             domain: "LyraReader",
             code: 2,
             userInfo: [NSLocalizedDescriptionKey: "This engine cannot extract pages"]
+        )
+    }
+
+    func mergeDocuments(others: [URL], to destination: URL) async throws -> PageMergeReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot merge documents"]
+        )
+    }
+
+    func splitPages(_ parts: [PageSplitPart]) async throws -> PageSplitReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot split documents"]
         )
     }
 
@@ -2748,6 +2820,86 @@ public final class RustEngine: PDFEngine {
         }
         invalidateCachedCopy(at: destination)
         return Self.pageEditReport(report, destination: destination)
+    }
+
+    public func mergeDocuments(others: [URL], to destination: URL) async throws -> PageMergeReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let paths = others.map(\.path)
+        let report: MergeReportRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.mergeDocuments(
+                            others: paths,
+                            destination: destination.path
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        // The whole engine is main-actor isolated; convert the UniFFI record here.
+        invalidateCachedCopy(at: destination)
+        return PageMergeReport(
+            destination: URL(fileURLWithPath: report.destinationPath),
+            pageCount: Int(report.pageCount),
+            firstPageCount: Int(report.firstPageCount),
+            appendedPageCounts: report.appendedPageCounts.map(Int.init),
+            appendedAnnotationCounts: report.appendedAnnotationCounts.map(Int.init),
+            rotations: report.rotations.map(Int.init),
+            firstOutlineEntries: Int(report.firstOutlineEntries),
+            droppedOutlineEntries: Int(report.droppedOutlineEntries),
+            outputBytes: report.outputBytes,
+            cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles)
+        )
+    }
+
+    public func splitPages(_ parts: [PageSplitPart]) async throws -> PageSplitReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let records = parts.map { part in
+            SplitPartRecord(
+                destinationPath: part.destination.path,
+                pages: part.pages.map { UInt32(max(0, $0)) }
+            )
+        }
+        let report: SplitReportRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.splitPages(parts: records))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        for part in report.parts {
+            invalidateCachedCopy(at: URL(fileURLWithPath: part.destinationPath))
+        }
+        return PageSplitReport(
+            parts: report.parts.map { part in
+                PageSplitOutput(
+                    destination: URL(fileURLWithPath: part.destinationPath),
+                    pageCount: Int(part.pageCount),
+                    sourcePages: part.sourcePages.map(Int.init),
+                    rotations: part.rotations.map(Int.init),
+                    outputBytes: part.outputBytes
+                )
+            },
+            sourcePageCount: Int(report.sourcePageCount),
+            cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles)
+        )
     }
 
     public func saveEditedCopy(to destination: URL) async throws -> PageOperationReport {
