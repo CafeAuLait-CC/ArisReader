@@ -364,6 +364,100 @@ extension ReaderChecks {
             require(false, "PDFKit could not open the properties copy")
         }
 
+        // The reader's metadata panel must prefer the values the save wrote, not a stale XMP
+        // packet. `form-fields.pdf` had no packet: the save creates one, so the title now comes
+        // from XMP with the same text as /Info.
+        let propertiesMetadataState = AppState(engine: try RustEngine())
+        propertiesMetadataState.setViewportSize(CGSize(width: 900, height: 650))
+        propertiesMetadataState.newTab(url: propertiesCopy)
+        try await eventually("the saved properties copy's metadata loads", {
+            propertiesMetadataState.document?.url == propertiesCopy
+                && !propertiesMetadataState.metadataLoading
+                && propertiesMetadataState.metadata != nil
+        })
+        require(propertiesMetadataState.metadata?.title.first == "Edited & 100% Title",
+                "the metadata panel shows the edited title after saving")
+        require(propertiesMetadataState.metadata?.title.source == .xmp,
+                "the edited title comes from the created XMP packet")
+        require(propertiesMetadataState.metadata?.authors.values == ["Ada Lovelace", "Alan Turing"],
+                "the metadata panel reads the created creator sequence")
+        require(propertiesMetadataState.metadata?.authors.source == .xmp,
+                "the created packet's authors are preferred over /Info")
+        if let pdf = PDFDocument(url: propertiesCopy) {
+            let author = pdf.documentAttributes?[PDFDocumentAttribute.authorAttribute] as? String
+            print("lyra-reader-properties: PDFKit attributes (created packet): \(pdf.documentAttributes ?? [:])")
+            require(author?.contains("Ada Lovelace") == true && author?.contains("Alan Turing") == true,
+                    "PDFKit reads the created packet's author list")
+        } else {
+            require(false, "PDFKit could not open the properties copy after the metadata checks")
+        }
+
+        // A document that already has a packet: editing two properties must update both sources,
+        // and the packet's other properties (venue, DOI, year) must survive and stay recognised.
+        let embeddedSource = scratch.appendingPathComponent("metadata-embedded.pdf")
+        try FileManager.default.copyItem(
+            at: root.appendingPathComponent("tests/fixtures/metadata-embedded.pdf"),
+            to: embeddedSource
+        )
+        let embeddedState = AppState(engine: try RustEngine())
+        embeddedState.setViewportSize(CGSize(width: 900, height: 650))
+        embeddedState.newTab(url: embeddedSource)
+        embeddedState.loadDocumentInfo()
+        try await eventually("the embedded-metadata document's properties load", {
+            embeddedState.documentInfo != nil && !embeddedState.documentInfoLoading
+        })
+        embeddedState.updateDocumentProperty(.title, text: "Edited Embedded Title")
+        embeddedState.updateDocumentProperty(.author, text: "Ada Lovelace; Alan Turing; Grace Hopper")
+        embeddedState.updateDocumentProperty(.subject, text: "A corrected subject")
+        embeddedState.updateDocumentProperty(.keywords, text: "one, two")
+        let embeddedCopy = scratch.appendingPathComponent("metadata-embedded-edited.pdf")
+        let didSaveEmbedded = await embeddedState.saveDocumentProperties(to: embeddedCopy)
+        require(didSaveEmbedded, "saving properties on a packet document writes a copy")
+
+        let embeddedProbe = try RustEngine()
+        _ = try embeddedProbe.openDocument(at: embeddedCopy)
+        let embeddedInfo = try await embeddedProbe.documentInfo()
+        require(embeddedInfo.title == "Edited Embedded Title", "the edited title reads back from /Info")
+        require(embeddedInfo.author == "Ada Lovelace; Alan Turing; Grace Hopper",
+                "the edited author reads back from /Info")
+        require(embeddedInfo.subject == "A corrected subject", "the edited subject reads back")
+        require(embeddedInfo.keywords == "one, two", "the edited keywords read back")
+
+        let embeddedMetadataState = AppState(engine: try RustEngine())
+        embeddedMetadataState.setViewportSize(CGSize(width: 900, height: 650))
+        embeddedMetadataState.newTab(url: embeddedCopy)
+        try await eventually("the edited packet document's metadata loads", {
+            embeddedMetadataState.document?.url == embeddedCopy
+                && !embeddedMetadataState.metadataLoading
+                && embeddedMetadataState.metadata != nil
+        })
+        require(embeddedMetadataState.metadata?.title.first == "Edited Embedded Title",
+                "the metadata panel shows the edited XMP title, not the old one")
+        require(embeddedMetadataState.metadata?.title.source == .xmp,
+                "the edited title still reports XMP as its source")
+        require(embeddedMetadataState.metadata?.authors.values
+                    == ["Ada Lovelace", "Alan Turing", "Grace Hopper"],
+                "the creator sequence round-trips three authors")
+        require(embeddedMetadataState.metadata?.venue.first == "Journal of Embedded Testing",
+                "an unedited XMP property (venue) survives the save")
+        require(embeddedMetadataState.metadata?.doi.first == "10.1234/embedded.2024.001",
+                "an unedited XMP property (DOI) survives the save")
+        require(embeddedMetadataState.metadata?.year.first == "2024",
+                "an unedited XMP property (year) survives the save")
+        if let pdf = PDFDocument(url: embeddedCopy) {
+            print("lyra-reader-properties: PDFKit attributes (edited packet): \(pdf.documentAttributes ?? [:])")
+            let title = pdf.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String
+            require(title == "Edited Embedded Title",
+                    "PDFKit reads the edited title from the packet-backed document")
+            let author = pdf.documentAttributes?[PDFDocumentAttribute.authorAttribute] as? String
+            require(author?.contains("Ada Lovelace") == true
+                        && author?.contains("Alan Turing") == true
+                        && author?.contains("Grace Hopper") == true,
+                    "PDFKit reads all three authors")
+        } else {
+            require(false, "PDFKit could not open the edited packet-backed document")
+        }
+
         // The properties replace path: backup, write, reopen, and the new value in the file.
         let propertiesReplaceSource = scratch.appendingPathComponent("replace-properties.pdf")
         try FileManager.default.copyItem(at: fixture, to: propertiesReplaceSource)
@@ -385,6 +479,10 @@ extension ReaderChecks {
             .filter { $0.contains(".lyra-reader-backup-") && $0.hasSuffix(".pdf") }
         require(propertiesBackups.count >= backups.count + 1,
                 "the properties replace wrote another verified backup")
+        try await eventually("the reopened metadata panel shows the replaced title from XMP", {
+            replacePropertiesState.metadata?.title.first == "Replaced title"
+                && replacePropertiesState.metadata?.title.source == .xmp
+        })
 
         // ── Encrypted documents are refused ──────────────────────────────────────────
         let encryptedProbe = try RustEngine()

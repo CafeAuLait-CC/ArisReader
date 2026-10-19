@@ -17,8 +17,8 @@
 
 use lyra_reader_core::{DocumentBackend, PageIndex};
 use lyra_reader_metadata::{MetadataSource, RecognizedMetadata, recognize};
-use lyra_reader_pdfium::PdfiumBackend;
-use std::path::PathBuf;
+use lyra_reader_pdfium::{DocumentProperties, PdfiumBackend, SaveMode, save_document_properties};
+use std::path::{Path, PathBuf};
 
 mod common;
 
@@ -28,6 +28,17 @@ fn fixture(name: &str) -> Option<PathBuf> {
         return None;
     }
     Some(common::fixture(name))
+}
+
+fn recognize_path(path: &Path) -> RecognizedMetadata {
+    let backend = PdfiumBackend::open(path, None).expect("open metadata fixture");
+    let embedded = backend.embedded_metadata().expect("read embedded metadata");
+    let first_page = backend.raw_text_page(PageIndex(0)).ok();
+    let page_height = backend
+        .page_info(PageIndex(0))
+        .map(|info| info.geometry.crop_box.size.height)
+        .unwrap_or(842.0);
+    recognize(&embedded, first_page.as_ref(), page_height)
 }
 
 fn recognize_fixture(name: &str) -> Option<RecognizedMetadata> {
@@ -153,6 +164,93 @@ fn an_arxiv_only_paper_is_misc_and_its_year_is_derived_from_the_id() {
         bibtex.contains("howpublished = {arXiv preprint arXiv:2303.08774v2}"),
         "{bibtex}"
     );
+}
+
+#[test]
+fn saving_properties_updates_info_and_xmp_together() {
+    if !lyra_reader_pdfium::is_available() {
+        eprintln!("skipping the properties save: PDFium is unavailable");
+        return;
+    }
+    let scratch = std::env::temp_dir().join(format!(
+        "lyra-reader-xmp-properties-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch directory");
+    let source = fixture("metadata-embedded.pdf").expect("metadata fixture");
+    let destination = scratch.join("edited.pdf");
+    let properties = DocumentProperties {
+        title: "Edited in LyraReader".to_string(),
+        author: "Ada Lovelace; Alan Turing; Grace Hopper".to_string(),
+        subject: "A corrected subject".to_string(),
+        keywords: "one, two".to_string(),
+    };
+    let report = save_document_properties(&source, &destination, &properties, None, SaveMode::Copy)
+        .expect("save properties");
+    assert!(report.xmp_updated);
+    assert!(!report.xmp_created);
+    let metadata = recognize_path(&destination);
+    assert_eq!(metadata.title.value(), Some("Edited in LyraReader"));
+    assert_eq!(metadata.title.source, Some(MetadataSource::Xmp));
+    assert_eq!(
+        metadata.authors.values,
+        ["Ada Lovelace", "Alan Turing", "Grace Hopper"]
+    );
+    assert_eq!(metadata.authors.source, Some(MetadataSource::Xmp));
+    // Properties the save does not own stay in the packet and are still recognised.
+    assert_eq!(metadata.venue.value(), Some("Journal of Embedded Testing"));
+    assert_eq!(metadata.venue.source, Some(MetadataSource::Xmp));
+    assert_eq!(metadata.doi.value(), Some("10.1234/embedded.2024.001"));
+    assert_eq!(metadata.year.value(), Some("2024"));
+    // The same document read from /Info says exactly the same four values.
+    let info = lyra_reader_pdfium::read_document_info(&destination, None).unwrap();
+    assert_eq!(info.properties, properties);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn saving_properties_on_a_document_without_a_packet_creates_one_the_reader_uses() {
+    if !lyra_reader_pdfium::is_available() {
+        eprintln!("skipping the created-packet save: PDFium is unavailable");
+        return;
+    }
+    let scratch = std::env::temp_dir().join(format!(
+        "lyra-reader-xmp-created-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch directory");
+    let source = fixture("form-fields.pdf").expect("form fixture");
+    let destination = scratch.join("created.pdf");
+    let properties = DocumentProperties {
+        title: "A New XMP Title".to_string(),
+        author: "Ada Lovelace; Alan Turing".to_string(),
+        subject: "A new subject".to_string(),
+        keywords: "new, keywords".to_string(),
+    };
+    let report = save_document_properties(&source, &destination, &properties, None, SaveMode::Copy)
+        .expect("save properties");
+    assert!(report.xmp_created);
+    assert!(report.xmp_updated);
+    let metadata = recognize_path(&destination);
+    assert_eq!(metadata.title.value(), Some("A New XMP Title"));
+    assert_eq!(
+        metadata.title.source,
+        Some(MetadataSource::Xmp),
+        "the created packet is preferred, not the dictionary"
+    );
+    assert_eq!(metadata.authors.values, ["Ada Lovelace", "Alan Turing"]);
+    assert_eq!(metadata.authors.source, Some(MetadataSource::Xmp));
+    let info = lyra_reader_pdfium::read_document_info(&destination, None).unwrap();
+    assert_eq!(info.properties, properties);
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
