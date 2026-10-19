@@ -18,6 +18,7 @@
 //! lyra-reader-cli figures <file.pdf> [--pages N]
 //! lyra-reader-cli tables <file.pdf>... [--pages N] [--all]
 //! lyra-reader-cli metadata <file.pdf> [--bibtex]
+//! lyra-reader-cli eval [--body-pages N] [--save-baseline FILE] [--compare FILE]
 //! ```
 
 use lyra_reader_core::Rect;
@@ -31,6 +32,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod bench;
+mod eval;
 
 const USAGE: &str = "\
 lyra-reader-cli — LyraReader headless tool
@@ -53,6 +55,11 @@ Usage:
                  [--bibtex]                      DOI, arXiv id) with the source of every field, and
                                                  the BibTeX entry those values generate; --bibtex
                                                  prints only the entry
+  lyra-reader-cli eval                           per-document and aggregate index-quality report
+                 [--body-pages N]                over the local PDF corpora (LYRA_READER_PDF_SAMPLES
+                 [--save-baseline FILE]          and/or LYRA_READER_EVAL_PAPERS): citations detected
+                 [--compare FILE]                vs resolved, captions that do not close, and table
+                                                 grid regions; writes versioned JSON baselines
   lyra-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   lyra-reader-cli render <file.pdf>              render one page to PNG
@@ -145,6 +152,7 @@ fn main() -> ExitCode {
         Some("region") => cmd_region(rest(&args)),
         Some("tables") => cmd_tables(rest(&args)),
         Some("metadata") => cmd_metadata(rest(&args)),
+        Some("eval") => eval::run(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");

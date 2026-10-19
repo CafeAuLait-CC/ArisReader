@@ -25,3 +25,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # `bench` reports peak RSS through `getrusage(RUSAGE_SELF)`: the kernel's own high-water
 # mark, which a sampler can miss and a profiler is not always available for.
 libc = "0.2"
+# `eval` writes and reads a versioned JSON baseline. Both crates are already in the tree
+# (the FFI and AI crates depend on them); this only adds the CLI as a consumer.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
