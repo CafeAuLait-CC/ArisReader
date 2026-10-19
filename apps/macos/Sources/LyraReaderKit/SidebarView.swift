@@ -647,6 +647,11 @@ public struct SidebarView: View {
     /// orphan says why it is not under a parent instead of disappearing into a silent gap.
     private func documentAnnotationRow(_ row: AnnotationPanelRow) -> some View {
         Button {
+            // An editable annotation is adopted and selected, so its note, colour and geometry
+            // can be edited here; a reply or an unsupported kind still jumps to the page.
+            if state.selectDocumentAnnotation(row.annotation.id) {
+                return
+            }
             state.jump(toDocumentAnnotation: row.annotation)
         } label: {
             HStack(alignment: .top, spacing: 8) {
@@ -716,6 +721,19 @@ public struct SidebarView: View {
         // A note clicked on the page opens its paper overlay and still marks this row (both go
         // through `selectedDocumentAnnotationID`); a click here jumps to the annotation's page.
         .background(state.selectedDocumentAnnotationID == row.annotation.id ? LyraReaderTheme.selectedBg : .clear)
+        .contextMenu {
+            if !row.annotation.isReply {
+                Button("Delete Annotation", role: .destructive) {
+                    _ = state.deleteDocumentAnnotation(row.annotation.id)
+                }
+                ForEach(Array(AppState.highlightPalette.enumerated()), id: \.offset) { _, entry in
+                    Button(entry.name) {
+                        _ = state.setDocumentAnnotationColor(
+                            row.annotation.id, to: entry.color)
+                    }
+                }
+            }
+        }
     }
 
     private func replyBody(_ annotation: DocumentAnnotation) -> String {
@@ -765,23 +783,35 @@ public struct SidebarView: View {
             }
             .buttonStyle(.plain)
             .help("Delete annotation")
-        }.padding(12)
+        }
+        .padding(12)
+        .contextMenu {
+            ForEach(Array(AppState.highlightPalette.enumerated()), id: \.offset) { _, entry in
+                Button(entry.name) {
+                    _ = state.setAnnotationColor(annotation.id, to: entry.color)
+                }
+            }
+        }
     }
 
     /// The one line under a sidecar annotation's note field.
     private func ownAnnotationSubtitle(_ annotation: AppState.Annotation) -> String {
         let kind = annotation.kind.rawValue
+        let source = annotation.isFileOwned ? "PDF annotation · " : ""
         if annotation.kind.isPlacedText {
             let characters = annotation.note.count
             let detail = annotation.kind == .textBox
                 ? "\(String(format: "%.0f", annotation.fontSize)) pt"
                 : "icon"
-            return "Page \(annotation.page + 1) · placed \(kind) · \(detail) · "
+            return "\(source)Page \(annotation.page + 1) · placed \(kind) · \(detail) · "
                 + "\(characters) character\(characters == 1 ? "" : "s")"
         }
         if annotation.kind.isGeometry {
             let width = String(format: "%.1f pt", annotation.strokeWidth)
-            return "Page \(annotation.page + 1) · \(kind) · \(width) stroke"
+            return "\(source)Page \(annotation.page + 1) · \(kind) · \(width) stroke"
+        }
+        if annotation.isFileOwned {
+            return "\(source)Page \(annotation.page + 1) · \(kind)"
         }
         return "Page \(annotation.page + 1) · \(kind) · "
             + "\(annotation.end - annotation.start + 1) characters"

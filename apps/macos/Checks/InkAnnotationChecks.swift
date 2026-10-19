@@ -447,8 +447,8 @@ extension ReaderChecks {
                 "an external /LE [/None /None] is a plain line")
         require(external.canvasAnnotationMarks.count == 5,
                 "all five external marks reach the canvas overlay")
-        require(external.canvasAnnotationMarks.allSatisfy { !$0.isEditable },
-                "a PDF's own ink is drawn but not offered as editable")
+        require(external.canvasAnnotationMarks.allSatisfy { $0.isEditable },
+                "a PDF's own ink is drawn and offered as editable through the one policy")
         require(!external.canvasPages.contains { page in
             page.placement.index == PlacementIndex.documentAnnotation(0, box: 0)
         }, "a geometry annotation is not also drawn as a quad")

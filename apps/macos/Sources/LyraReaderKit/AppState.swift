@@ -759,10 +759,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The font size a text box is drawn and written at, in page points. Zero for every other
     /// kind. This is `/DA`'s size on the way into the PDF.
     public var fontSize: CGFloat = 0
+    /// The PDF's own identity for an annotation this entry **edits**, or `nil` for an entry this
+    /// reader created.
+    ///
+    /// The value is exactly `DocumentAnnotation.id` (`nm:<NM>`, or `fp:<fingerprint>` when the
+    /// file carries no `/NM`). It is what the writer resolves at save time, so the annotation's
+    /// `/NM`, author, flags, popup, parent and reply links stay the file's own. Sidecar entries
+    /// with an identity are hidden from the PDF-annotation list while they are open, so a mark
+    /// is never drawn twice.
+    public var fileIdentity: String?
+    /// The page-space boxes of a text mark the PDF already carries.
+    ///
+    /// A text mark this reader creates is a character range, but a foreign highlight's characters
+    /// are in somebody else's text layer. These are the file's own boxes, so the adopted mark is
+    /// drawn exactly where it was and can be selected without re-deriving a range. The writer
+    /// never rewrites a text mark's `/QuadPoints`: its geometry belongs to the text, not to this
+    /// editor.
+    public var fileQuads: [StoredRect]?
+    /// `/Q` of an adopted `/FreeText` annotation: `left`, `center` or `right`.
+    ///
+    /// Kept so a text box written by another producer keeps the alignment it was saved with
+    /// when its text or box is edited. `nil` for every entry except an adopted text box.
+    public var textAlignment: String?
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, page, start, end, color, colorIndex, note, createdAt
         case version, paths, rect, lineStart, lineEnd, strokeWidth, fontSize
+        case fileIdentity, quads, textAlignment
     }
 
     public init(
@@ -779,7 +802,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         lineStart: CGPoint? = nil,
         lineEnd: CGPoint? = nil,
         strokeWidth: CGFloat = 0,
-        fontSize: CGFloat = 0
+        fontSize: CGFloat = 0,
+        fileIdentity: String? = nil,
+        fileQuads: [StoredRect]? = nil,
+        textAlignment: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -795,7 +821,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         self.lineEnd = lineEnd
         self.strokeWidth = strokeWidth
         self.fontSize = fontSize
+        self.fileIdentity = fileIdentity
+        self.fileQuads = fileQuads
+        self.textAlignment = textAlignment
     }
+
+    /// True when this entry edits an annotation the PDF already carries.
+    public var isFileOwned: Bool { fileIdentity != nil }
 
     /// Whether the annotation's geometry is complete and finite.
     ///
@@ -887,6 +919,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
+        fileIdentity = try values.decodeIfPresent(String.self, forKey: .fileIdentity)
+        fileQuads = try values.decodeIfPresent([StoredRect].self, forKey: .quads)
+        textAlignment = try values.decodeIfPresent(String.self, forKey: .textAlignment)
         kind = try values.decodeIfPresent(Kind.self, forKey: .kind) ?? .highlight
         page = try values.decode(Int.self, forKey: .page)
         if kind.isGeometry {
@@ -1016,6 +1051,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         try values.encode(note, forKey: .note)
         try values.encode(createdAt, forKey: .createdAt)
+        if let fileIdentity { try values.encode(fileIdentity, forKey: .fileIdentity) }
+        if let fileQuads { try values.encode(fileQuads, forKey: .quads) }
+        if let textAlignment { try values.encode(textAlignment, forKey: .textAlignment) }
     }
 }
 
@@ -1425,6 +1463,187 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var documentAnnotationsError: String?
     private var documentAnnotationsLoadCompleted = false
 
+    /// One annotation the reader removed from the PDF's annotation list but has not written to a
+    /// file yet.
+    ///
+    /// The deletion is a pending change, like an unsaved highlight: the PDF on disk still has
+    /// the annotation until "Save Copy" or "Save and Replace Original". The identity is what the
+    /// writer resolves; the page is kept for the sidebar and for the report.
+    public struct FileAnnotationDeletion: Identifiable, Equatable, Sendable {
+        public let identity: String
+        public let page: Int
+        public var id: String { identity }
+
+        public init(identity: String, page: Int) {
+            self.identity = identity
+            self.page = page
+        }
+    }
+
+    /// Annotations deleted in this session, waiting for the next explicit save.
+    @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = []
+
+    /// True when at least one annotation the PDF carries is marked for deletion.
+    public var hasPendingFileDeletions: Bool { !pendingFileDeletions.isEmpty }
+
+    /// The identities of adopted file annotations, for hiding their PDF copies exactly once.
+    public var adoptedFileAnnotationIDs: Set<String> {
+        Set(annotations.compactMap(\.fileIdentity))
+    }
+
+    /// What this reader can do with an annotation the PDF carries.
+    ///
+    /// One policy for every surface: click selection, the eraser, the sidebar and the save
+    /// writer all ask this, so a kind cannot be refused on the page and silently accepted in the
+    /// list. A reply is editable only through its thread (editing it directly would still be
+    /// safe, but deleting a parent would then have to delete the user's adopted entry too, which
+    /// this version does not model).
+    public enum DocumentAnnotationEditability: Equatable, Sendable {
+        case editable
+        case unsupported(reason: String)
+    }
+
+    /// Why an annotation the PDF carries cannot be edited here, stated once.
+    public static func documentAnnotationUnsupportedReason(_ annotation: DocumentAnnotation) -> String? {
+        switch documentAnnotationEditability(annotation) {
+        case .editable:
+            return nil
+        case .unsupported(let reason):
+            return reason
+        }
+    }
+
+    /// The one editability decision. Called by the canvas, the eraser, the sidebar and the
+    /// writer; nothing re-derives it.
+    public static func documentAnnotationEditability(
+        _ annotation: DocumentAnnotation
+    ) -> DocumentAnnotationEditability {
+        if annotation.isReply {
+            return .unsupported(
+                reason: "This is a reply. Edit or delete the annotation at the top of the thread; "
+                    + "the replies stay attached to it.")
+        }
+        guard annotation.visible else {
+            return .unsupported(reason: "This annotation is hidden by the file (/F).")
+        }
+        switch annotation.kind {
+        case "highlight", "underline", "strikeout", "text", "freeText",
+             "ink", "square", "circle", "line":
+            break
+        case "squiggly":
+            return .unsupported(
+                reason: "LyraReader has no editable model for /Squiggly; editing it would have to "
+                    + "change the mark's subtype.")
+        default:
+            return .unsupported(
+                reason: "LyraReader has no editable model for a /\(annotation.kind) annotation yet.")
+        }
+        if annotation.kind == "ink" && annotation.inkPaths.isEmpty {
+            return .unsupported(reason: "This ink annotation carries no /InkList to move or draw.")
+        }
+        if annotation.kind == "line" && (annotation.lineStart == nil || annotation.lineEnd == nil) {
+            return .unsupported(reason: "This line annotation carries no /L endpoints.")
+        }
+        if annotation.drawing == .skipped {
+            return .unsupported(reason: "This annotation is not drawn by the reader.")
+        }
+        return .editable
+    }
+
+    /// A copy of a file annotation in the editable model, or `nil` when the kind cannot be
+    /// represented.
+    ///
+    /// Text marks keep the file's fixed page-space quads; they have no character range in this
+    /// reader's text layer. Every other kind maps to the reader's own geometry, with the same
+    /// coordinate convention (page space, top-left origin) `DocumentAnnotation` already uses.
+    public static func adoptedAnnotation(
+        from document: DocumentAnnotation,
+        id: UUID = UUID(),
+        now: Date = Date()
+    ) -> Annotation? {
+        guard documentAnnotationEditability(document) == .editable else { return nil }
+        let kind: Annotation.Kind
+        switch document.kind {
+        case "highlight": kind = .highlight
+        case "underline": kind = .underline
+        case "strikeout": kind = .strikeout
+        case "text": kind = .stickyNote
+        case "freeText": kind = .textBox
+        case "ink": kind = .ink
+        case "square": kind = .square
+        case "circle": kind = .circle
+        case "line": kind = document.lineArrow ? .arrow : .line
+        default: return nil
+        }
+        let opacity = min(max(document.opacity ?? 1.0, 0.0), 1.0)
+        let alpha = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
+        let box = CGRect(x: document.xPt, y: document.yPt,
+                         width: document.widthPt, height: document.heightPt)
+        let width = min(max(document.borderWidthPt ?? 1.0, 0.1), 200.0)
+        let colour: AnnotationColor
+        if let fileColour = document.color {
+            colour = AnnotationColor(red: fileColour.red, green: fileColour.green,
+                                     blue: fileColour.blue, alpha: alpha)
+        } else if kind == .stickyNote {
+            colour = AnnotationColor(red: AnnotationColor.defaultNote.red,
+                                     green: AnnotationColor.defaultNote.green,
+                                     blue: AnnotationColor.defaultNote.blue, alpha: alpha)
+        } else {
+            let grey = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
+            colour = AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: grey)
+        }
+
+        switch kind {
+        case .highlight, .underline, .strikeout:
+            let quads = document.boxes.map {
+                Annotation.StoredRect(x: Double($0.xPt), y: Double($0.yPt),
+                                      width: Double($0.widthPt),
+                                      height: Double($0.heightPt))
+            }
+            guard !quads.isEmpty else { return nil }
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                fileIdentity: document.id, fileQuads: quads)
+        case .stickyNote:
+            guard box.width > 0, box.height > 0 else { return nil }
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                shapeRect: box, fileIdentity: document.id)
+        case .textBox:
+            guard box.width >= 1, box.height >= 1 else { return nil }
+            let size = min(max(document.fontSizePt ?? Annotation.defaultTextBoxFontSize, 1), 400)
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                shapeRect: box, fontSize: size, fileIdentity: document.id,
+                textAlignment: document.alignment)
+        case .ink:
+            guard !document.inkPaths.isEmpty else { return nil }
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                inkPaths: document.inkPaths, strokeWidth: width, fileIdentity: document.id)
+        case .square, .circle:
+            guard box.width > 0, box.height > 0 else { return nil }
+            // The sidecar stores the stroke's centre line; a PDF `/Rect` is its outer edge.
+            let inset = box.insetBy(dx: width / 2, dy: width / 2)
+            guard inset.width > 0, inset.height > 0 else { return nil }
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                shapeRect: inset, strokeWidth: width, fileIdentity: document.id)
+        case .line, .arrow:
+            guard let start = document.lineStart, let end = document.lineEnd else { return nil }
+            return Annotation(
+                id: id, kind: kind, page: document.page, start: 0, end: 0,
+                color: colour, note: document.contents ?? "", createdAt: now,
+                lineStart: start, lineEnd: end, strokeWidth: width,
+                fileIdentity: document.id)
+        }
+    }
+
     /// The note the reader last clicked on the page, highlighted in the sidebar so its text is
     /// where the click put it. `nil` until a note is clicked or a document is opened.
     @Published public private(set) var selectedDocumentAnnotationID: String?
@@ -1511,7 +1730,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = []
     /// Why the eraser refused its last gesture. A PDF's own ink cannot be removed by this
     /// version's append-only writer, so the refusal is stated rather than silently ignored.
-    @Published public private(set) var eraserRefusalNotice: String?
     /// Why a plain click last refused to select a mark the PDF itself carries.
     ///
     /// The same policy as the eraser's: a file-owned mark can be read but not removed by this
@@ -1569,6 +1787,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Both are `nil`/empty when no gesture is in flight.
     private var eraserGestureBase: [Annotation]?
     private var eraserGestureRemoved: [Int: Annotation] = [:]
+    /// File-owned ink strokes one eraser drag has removed, keyed by their index in the
+    /// `documentAnnotations` array the gesture started with, so cancel/undo restore the order.
+    private var eraserGestureRemovedDocuments: [Int: DocumentAnnotation] = [:]
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
     /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
@@ -1825,6 +2046,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var documentInfo: DocumentInfo?
         var documentInfoLoading: Bool
         var documentAnnotations: [DocumentAnnotation]
+        var pendingFileDeletions: [FileAnnotationDeletion]
         var documentAnnotationsError: String?
         var documentAnnotationsLoadCompleted: Bool
         var outline: [OutlineEntry]
@@ -2542,6 +2764,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentInfoError = nil
         propertiesSaveInProgress = false
         documentAnnotations = []
+        pendingFileDeletions = []
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
         annotationSaveInProgress = false
@@ -2580,10 +2803,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         bookmarks = []
         erasedInkStrokeIDs = []
         eraserHoverMarkID = nil
-        eraserRefusalNotice = nil
         markSelectionRefusalNotice = nil
         eraserGestureBase = nil
         eraserGestureRemoved = [:]
+        eraserGestureRemovedDocuments = [:]
         pageSelection = []
         pageSelectionAnchor = nil
         annotationsURL = nil
@@ -3074,7 +3297,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func toggleEraserTool() {
         guard canUseEraserTool else { return }
         annotationTool = annotationTool == .eraser ? .select : .eraser
-        eraserRefusalNotice = nil
     }
 
     /// Escape and the Select button leave every mode that has no finished draft to keep.
@@ -3714,6 +3936,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             beginEditingAnnotation(annotation.id)
             return true
         }
+        // A note or text box the PDF carries is adopted on the double-click that asks to edit
+        // it, then edited through the same editor as the reader's own.
+        for document in documentAnnotations.reversed()
+        where document.kind == "freeText" || document.kind == "text" {
+            guard document.page == pageHit.page,
+                  let box = document.boxes.first,
+                  CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
+                    .contains(pageHit.point) else { continue }
+            guard Self.documentAnnotationEditability(document) == .editable,
+                  let id = adoptDocumentAnnotation(document.id),
+                  let adopted = annotations.first(where: { $0.id == id }) else { return false }
+            selectedAnnotationID = adopted.id
+            beginEditingAnnotation(adopted.id)
+            return true
+        }
         return false
     }
 
@@ -3859,7 +4096,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 color: color,
                 strokeWidth: width,
                 isSelected: false,
-                isEditable: false
+                isEraseTarget: eraserHoverMarkID == "pdf:" + annotation.id,
+                isEditable: true
             ))
         }
         return marks
@@ -3875,8 +4113,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// rather than falling back to a bounding box, which would claim text the mark does not
     /// cover.
     public func textQuads(for annotation: Annotation) -> [CGRect] {
-        guard annotation.kind.isTextMarkup,
-              let textPage = textPages[annotation.page] else { return [] }
+        guard annotation.kind.isTextMarkup else { return [] }
+        // A mark the PDF itself carried keeps the file's own boxes: its characters are in
+        // somebody else's text layer, so re-deriving a range here would move the mark.
+        if let fixed = annotation.fileQuads, !fixed.isEmpty {
+            return fixed.map {
+                CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
+        }
+        guard let textPage = textPages[annotation.page] else { return [] }
         let lower = min(annotation.start, annotation.end)
         let upper = max(annotation.start, annotation.end)
         guard lower >= 0, upper >= lower else { return [] }
@@ -3908,8 +4153,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// A text mark the PDF itself carries under a content point.
     ///
-    /// Used only to explain the refusal: the file's markup is not selectable here because this
-    /// version's writer cannot remove it, the same reason the eraser refuses file-owned ink.
+    /// The click turns it into an adopted, selected mark (or states the one unsupported reason
+    /// when its kind has no editable model), so there is no separate refusal path.
     public func fileOwnedMarkupHit(atContentPoint point: CGPoint) -> DocumentAnnotation? {
         guard let hit = pagePoint(atContentPoint: point) else { return nil }
         let slack = Self.noteClickSlackPt
@@ -3924,6 +4169,53 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
         return nil
+    }
+
+    /// A geometric annotation the PDF carries (ink, a shape or a line) under a content point.
+    public func documentGeometryHit(
+        atContentPoint point: CGPoint,
+        toleranceViewPt: CGFloat = AnnotationGeometry.hitTolerancePt
+    ) -> (annotation: DocumentAnnotation, page: Int, point: CGPoint)? {
+        guard let hit = pagePoint(atContentPoint: point) else { return nil }
+        let tolerance = toleranceViewPt / max(zoomFactor, 0.01)
+        for annotation in documentAnnotations.reversed()
+        where annotation.visible && annotation.isGeometry && annotation.page == hit.page {
+            guard Self.documentAnnotationEditability(annotation) == .editable else { continue }
+            if AnnotationGeometry.hitTest(documentMark(annotation), at: hit.point,
+                                          tolerance: tolerance) {
+                return (annotation, hit.page, hit.point)
+            }
+        }
+        return nil
+    }
+
+    /// A file annotation as the canvas overlay draws it, for hit testing.
+    private func documentMark(_ annotation: DocumentAnnotation) -> CanvasAnnotationMark {
+        let kind = Annotation.Kind(rawValue: annotation.kind) ?? .ink
+        let width = annotation.borderWidthPt ?? 1
+        let alpha = UInt8(min(max(((annotation.opacity ?? 1.0) * 255.0).rounded(), 0), 255))
+        let color = annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80,
+                                                       alpha: alpha)
+        let shapeRect: CGRect? = if kind == .square || kind == .circle {
+            CGRect(x: annotation.xPt, y: annotation.yPt,
+                   width: annotation.widthPt, height: annotation.heightPt)
+                .insetBy(dx: width / 2, dy: width / 2)
+        } else {
+            nil
+        }
+        return CanvasAnnotationMark(
+            id: "pdf:" + annotation.id,
+            page: annotation.page,
+            kind: kind,
+            inkPaths: annotation.inkPaths,
+            shapeRect: shapeRect,
+            lineStart: annotation.lineStart,
+            lineEnd: annotation.lineEnd,
+            color: color,
+            strokeWidth: width,
+            isSelected: false,
+            isEditable: true
+        )
     }
 
     /// The sidecar annotation whose stroke is within `tolerance` points of `point` (page space).
@@ -3981,11 +4273,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
 
-        /// True when the target is in LyraReader's annotation list and can be removed.
-        public var isEditable: Bool {
-            if case .sidecar = self { return true }
-            return false
-        }
+        /// True when the eraser can remove the target. Both halves of the model are removable
+        /// now: an adopted file annotation lives in the annotation list, and an ink annotation
+        /// the file carries is deleted through the same incremental writer.
+        public var isEditable: Bool { true }
     }
 
     /// The ink stroke an armed eraser would remove at a content point, or the file-owned stroke
@@ -4034,7 +4325,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         let id: String? = switch target {
         case .sidecar(let id, _): id.uuidString
-        case .document: nil
+        case .document(let id, _): "pdf:" + id
         }
         if eraserHoverMarkID != id { eraserHoverMarkID = id }
     }
@@ -4046,7 +4337,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         cancelEraserGesture()
         eraserGestureBase = annotations
         eraserGestureRemoved = [:]
-        eraserRefusalNotice = nil
+        eraserGestureRemovedDocuments = [:]
         eraseInk(alongContentSegment: point, to: point)
     }
 
@@ -4068,39 +4359,69 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func endEraserGesture() -> Int {
         guard let base = eraserGestureBase else { return 0 }
         let removed = erasedGestureStrokes()
+        let removedDocuments = eraserGestureRemovedDocuments
+            .keys.sorted()
+            .compactMap { index in
+                eraserGestureRemovedDocuments[index].map {
+                    ErasedFileAnnotation(document: $0, index: index)
+                }
+            }
         eraserGestureBase = nil
         eraserGestureRemoved = [:]
-        guard !removed.isEmpty else { return 0 }
+        eraserGestureRemovedDocuments = [:]
+        guard !removed.isEmpty || !removedDocuments.isEmpty else { return 0 }
 
         let removedIDs = Set(removed.map(\.annotation.id))
         if let selected = selectedAnnotationID, removedIDs.contains(selected) {
             selectedAnnotationID = nil
         }
         let candidate = base.filter { !removedIDs.contains($0.id) }
-        guard saveAnnotations(candidate, trigger: "erase-ink") else {
-            // The candidate never reached disk: put the page back exactly as it was, with no
-            // undo step that would claim an erasure the sidecar does not have.
-            annotations = base
-            refreshSelectionOverlay()
-            return 0
+        if !removed.isEmpty {
+            guard saveAnnotations(candidate, trigger: "erase-ink") else {
+                // The candidate never reached disk: put the page back exactly as it was, with no
+                // undo step that would claim an erasure the sidecar does not have.
+                annotations = base
+                for erased in removedDocuments {
+                    documentAnnotations.insert(
+                        erased.document,
+                        at: min(erased.index, documentAnnotations.count))
+                }
+                refreshSelectionOverlay()
+                return 0
+            }
         }
-        undoStack.append(.erased(removed))
+        for erased in removedDocuments {
+            if !pendingFileDeletions.contains(where: { $0.identity == erased.document.id }) {
+                pendingFileDeletions.append(
+                    FileAnnotationDeletion(identity: erased.document.id,
+                                           page: erased.document.page))
+            }
+        }
+        undoStack.append(.erased(strokes: removed, documents: removedDocuments))
         redoStack.removeAll()
         erasedInkStrokeIDs.formUnion(removedIDs)
         reloadVisiblePages()
-        statusMessage = removed.count == 1
+        let count = removed.count + removedDocuments.count
+        statusMessage = count == 1
             ? "Erased 1 ink stroke · the PDF on disk is unchanged"
-            : "Erased \(removed.count) ink strokes · the PDF on disk is unchanged"
-        return removed.count
+            : "Erased \(count) ink strokes · the PDF on disk is unchanged"
+        return count
     }
 
     /// Abandons a gesture in flight (Escape, or a tool switch): nothing was written yet, so the
     /// page simply returns to its pre-gesture state.
     public func cancelEraserGesture() {
         guard let base = eraserGestureBase else { return }
+        let removedDocuments = eraserGestureRemovedDocuments
         eraserGestureBase = nil
         eraserGestureRemoved = [:]
+        eraserGestureRemovedDocuments = [:]
         annotations = base
+        for (index, annotation) in removedDocuments.sorted(by: { $0.key < $1.key }) {
+            if !documentAnnotations.contains(where: { $0.id == annotation.id }) {
+                documentAnnotations.insert(annotation, at: min(index, documentAnnotations.count))
+            }
+        }
         refreshSelectionOverlay()
     }
 
@@ -4110,31 +4431,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The number of erased strokes whose absence has not reached a PDF yet.
     public var hasPendingInkErasure: Bool { !erasedInkStrokeIDs.isEmpty }
 
-    /// The eraser banner's second line, in the same language as the page-edit and form banners.
+    /// The eraser/annotation-deletion banner's second line, in the same language as the
+    /// page-edit and form banners.
     public var eraserPendingSummary: String? {
-        guard !erasedInkStrokeIDs.isEmpty else { return nil }
-        let count = erasedInkStrokeIDs.count
-        let noun = count == 1 ? "1 ink stroke erased" : "\(count) ink strokes erased"
-        return "\(noun) · the PDF on disk is unchanged until you save a copy"
+        var parts: [String] = []
+        if !erasedInkStrokeIDs.isEmpty {
+            let count = erasedInkStrokeIDs.count
+            parts.append(count == 1 ? "1 ink stroke erased" : "\(count) ink strokes erased")
+        }
+        if !pendingFileDeletions.isEmpty {
+            let count = pendingFileDeletions.count
+            parts.append(count == 1 ? "1 file annotation deleted"
+                                    : "\(count) file annotations deleted")
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
+            + " · the PDF on disk is unchanged until you save"
     }
-
-    /// Why a file-owned stroke cannot be erased, stated once and reused by the banner and checks.
-    public static let eraserFileOwnedMessage =
-        "This ink belongs to the PDF file, not to LyraReader's annotations. "
-        + "The eraser can only remove strokes from LyraReader's annotation list; ink the file itself "
-        + "carries cannot be deleted without rewriting the PDF."
-
-    /// The refusal banner's Dismiss button (the refusal is a statement, not an unsaved change).
-    public func dismissEraserRefusal() {
-        eraserRefusalNotice = nil
-    }
-
-    /// Why file-owned text markup cannot be selected for deletion, in the same language as the
-    /// eraser's file-owned refusal. Stated once and reused by the banner and the checks.
-    public static let markSelectionFileOwnedMessage =
-        "This markup belongs to the PDF file, not to LyraReader's annotations. "
-        + "Select can only select marks in LyraReader's annotation list; markup the file itself "
-        + "carries cannot be deleted without rewriting the PDF."
 
     /// The selection refusal banner's Dismiss button.
     public func dismissMarkSelectionRefusal() {
@@ -4158,6 +4471,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let base = eraserGestureBase else { return }
         let zoom = max(zoomFactor, 0.01)
         var removedAny = false
+        var removedDocumentIDs = Set<String>()
         for placement in visiblePagePlacements {
             let rect = CGRect(x: placement.leftPt, y: placement.topPt,
                               width: placement.widthPt, height: placement.heightPt)
@@ -4181,44 +4495,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     removedAny = true
                 }
             }
+            for (index, annotation) in documentAnnotations.enumerated() {
+                guard annotation.visible, annotation.kind == "ink",
+                      annotation.page == placement.index,
+                      eraserGestureRemovedDocuments[index] == nil,
+                      Self.documentAnnotationEditability(annotation) == .editable
+                else { continue }
+                let mark = documentInkMark(annotation)
+                let reach = AnnotationGeometry.eraserReach(strokeWidth: mark.strokeWidth,
+                                                           zoom: zoom)
+                let hit = mark.inkPaths.contains { path in
+                    AnnotationGeometry.distance(fromSegment: localStart, to: localEnd,
+                                                andPolyline: path) <= reach
+                }
+                if hit {
+                    eraserGestureRemovedDocuments[index] = annotation
+                    removedDocumentIDs.insert(annotation.id)
+                    removedAny = true
+                }
+            }
         }
         if removedAny {
             let removedIDs = Set(eraserGestureRemoved.values.map(\.id))
             annotations = base.filter { !removedIDs.contains($0.id) }
+            documentAnnotations.removeAll { removedDocumentIDs.contains($0.id) }
         }
-        if fileOwnedInkIsNear(from: start, to: end) {
-            eraserRefusalNotice = Self.eraserFileOwnedMessage
-        }
-    }
-
-    /// Whether the pointer segment passes within eraser reach of an ink stroke the PDF carries.
-    private func fileOwnedInkIsNear(from start: CGPoint, to end: CGPoint) -> Bool {
-        guard !documentAnnotations.isEmpty else { return false }
-        let zoom = max(zoomFactor, 0.01)
-        for placement in visiblePagePlacements {
-            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
-                              width: placement.widthPt, height: placement.heightPt)
-            guard let clipped = AnnotationGeometry.clippedSegment(from: start, to: end, in: rect)
-            else { continue }
-            let localStart = CGPoint(x: clipped.start.x - placement.leftPt,
-                                     y: clipped.start.y - placement.topPt)
-            let localEnd = CGPoint(x: clipped.end.x - placement.leftPt,
-                                   y: clipped.end.y - placement.topPt)
-            for annotation in documentAnnotations
-                where annotation.visible && annotation.kind == "ink"
-                    && annotation.page == placement.index {
-                let mark = documentInkMark(annotation)
-                let reach = AnnotationGeometry.eraserReach(strokeWidth: mark.strokeWidth,
-                                                           zoom: zoom)
-                if mark.inkPaths.contains(where: {
-                    AnnotationGeometry.distance(fromSegment: localStart, to: localEnd,
-                                                andPolyline: $0) <= reach
-                }) {
-                    return true
-                }
-            }
-        }
-        return false
     }
 
     /// A PDF-owned ink stroke as the canvas draws it, for hit testing and eraser refusal.
@@ -4262,7 +4563,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard delta.x != 0 || delta.y != 0,
               let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
         let before = annotations[index]
-        guard before.kind.isGeometry else { return false }
+        guard before.kind.isGeometry || before.kind.isPlacedText else { return false }
         let after = before.translated(by: delta.x, dy: delta.y)
         guard after.hasValidGeometry else { return false }
         var updated = annotations
@@ -4274,6 +4575,155 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
         statusMessage = "Moved \(after.kind.rawValue) annotation"
         return true
+    }
+
+    // MARK: - Adopting and deleting annotations the PDF carries
+
+    /// Moves one annotation the PDF carries into the editable model.
+    ///
+    /// The file's identity (`/NM`, or the stable fingerprint when there is none) travels with the
+    /// sidecar entry; the PDF's copy is removed from `documentAnnotations` so the page shows the
+    /// adopted mark exactly once. Nothing about the file changes until an explicit save. Returns
+    /// the new entry's id, or `nil` when the kind has no editable model.
+    @discardableResult
+    public func adoptDocumentAnnotation(_ documentID: String) -> UUID? {
+        guard let index = documentAnnotations.firstIndex(where: { $0.id == documentID }) else {
+            return nil
+        }
+        let document = documentAnnotations[index]
+        if let reason = Self.documentAnnotationUnsupportedReason(document) {
+            lastError = reason
+            statusMessage = reason
+            return nil
+        }
+        guard let adopted = Self.adoptedAnnotation(from: document) else {
+            let reason = "This annotation has no geometry the reader can edit."
+            lastError = reason
+            statusMessage = reason
+            return nil
+        }
+        var updated = annotations
+        updated.append(adopted)
+        guard saveAnnotations(updated, trigger: "adopt-file-annotation") else { return nil }
+        if index < documentAnnotations.count, documentAnnotations[index].id == documentID {
+            documentAnnotations.remove(at: index)
+        } else {
+            documentAnnotations.removeAll { $0.id == documentID }
+        }
+        selectedDocumentAnnotationID = nil
+        openDocumentNoteID = nil
+        selectedAnnotationID = adopted.id
+        undoStack.append(.adoptedFile(annotation: adopted, document: document, index: index))
+        redoStack.removeAll()
+        refreshSelectionOverlay()
+        statusMessage = annotationStatus(adopted)
+        return adopted.id
+    }
+
+    /// Selects an annotation the PDF carries, adopting it first when it is editable.
+    ///
+    /// This is the click-selection replacement for the old refusal: a file-owned highlight,
+    /// underline, strikeout or text box becomes a normal selected mark, and a sticky note opens
+    /// its editor. A kind with no editable model still states the one reason, from
+    /// `documentAnnotationEditability`.
+    @discardableResult
+    public func selectDocumentAnnotation(_ documentID: String) -> Bool {
+        if let existing = annotations.first(where: { $0.fileIdentity == documentID }) {
+            selectedAnnotationID = existing.id
+            selectedDocumentAnnotationID = nil
+            refreshSelectionOverlay()
+            statusMessage = annotationStatus(existing)
+            return true
+        }
+        guard let index = documentAnnotations.firstIndex(where: { $0.id == documentID }) else {
+            return false
+        }
+        let document = documentAnnotations[index]
+        if let reason = Self.documentAnnotationUnsupportedReason(document) {
+            selectedDocumentAnnotationID = documentID
+            markSelectionRefusalNotice = reason
+            statusMessage = reason
+            return false
+        }
+        guard let id = adoptDocumentAnnotation(documentID) else { return false }
+        if document.kind == "text", let adopted = annotations.first(where: { $0.id == id }) {
+            beginEditingAnnotation(adopted.id)
+        }
+        return true
+    }
+
+    /// Deletes an annotation the PDF carries. The removal is pending until the next save, and
+    /// one undo step restores it before it reaches any file.
+    ///
+    /// Deletion works for every content annotation, whether or not this reader can edit its
+    /// fields: the writer only needs the identity, and it takes the annotation's `/IRT` reply
+    /// thread and `/Popup` window with it so no reply is left pointing at nothing.
+    @discardableResult
+    public func deleteDocumentAnnotation(_ documentID: String) -> Bool {
+        guard let index = documentAnnotations.firstIndex(where: { $0.id == documentID }) else {
+            return false
+        }
+        let document = documentAnnotations[index]
+        if pendingFileDeletions.contains(where: { $0.identity == documentID }) {
+            return true
+        }
+        documentAnnotations.remove(at: index)
+        pendingFileDeletions.append(FileAnnotationDeletion(identity: document.id,
+                                                           page: document.page))
+        if selectedDocumentAnnotationID == documentID { selectedDocumentAnnotationID = nil }
+        if openDocumentNoteID == documentID { openDocumentNoteID = nil }
+        selectedAnnotationID = nil
+        undoStack.append(.deletedFile(document: document, index: index))
+        redoStack.removeAll()
+        reloadVisiblePages()
+        let replyCount = documentAnnotations.filter { $0.isReply && $0.parentID == documentID }.count
+        statusMessage = replyCount > 0
+            ? "Deleted a file annotation and its \(replyCount) repl\(replyCount == 1 ? "y" : "ies")"
+                + " · the PDF is unchanged until you save"
+            : "Deleted a file annotation · the PDF is unchanged until you save"
+        return true
+    }
+
+    /// Changes a colour on the reader's own or an adopted annotation as one undo step.
+    @discardableResult
+    public func setAnnotationColor(_ id: UUID, to color: AnnotationColor) -> Bool {
+        guard let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
+        let before = annotations[index]
+        guard before.color != color else { return true }
+        var after = before
+        after.color = color
+        var updated = annotations
+        updated[index] = after
+        guard saveAnnotations(updated, trigger: "recolor-\(after.kind.rawValue)") else { return false }
+        undoStack.append(.replaced(before: before, after: after))
+        redoStack.removeAll()
+        selectedAnnotationID = id
+        refreshSelectionOverlay()
+        reloadVisiblePages()
+        statusMessage = "Changed the annotation colour"
+        return true
+    }
+
+    /// Adopts a file annotation and changes its colour in one step.
+    @discardableResult
+    public func setDocumentAnnotationColor(_ documentID: String, to color: AnnotationColor) -> Bool {
+        let id: UUID
+        if let existing = annotations.first(where: { $0.fileIdentity == documentID }) {
+            id = existing.id
+        } else {
+            guard let adopted = adoptDocumentAnnotation(documentID) else { return false }
+            id = adopted
+        }
+        return setAnnotationColor(id, to: color)
+    }
+
+    /// One line describing a selected mark, shared by the page status and the sidebar.
+    private func annotationStatus(_ annotation: Annotation) -> String {
+        let noun = annotation.kind == .textBox ? "text box" : annotation.kind.rawValue
+        if annotation.isFileOwned {
+            return "Selected a \(noun) from the PDF · edit it here, or Delete removes it"
+        }
+        return "Selected a \(noun) · Delete removes it"
     }
 
     public func removeAnnotation(_ id: UUID) {
@@ -4292,10 +4742,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var updated = annotations
         updated.remove(at: index)
         guard saveAnnotations(updated, trigger: "remove") else { return }
+        if let identity = removed.fileIdentity,
+           !pendingFileDeletions.contains(where: { $0.identity == identity }) {
+            pendingFileDeletions.append(
+                FileAnnotationDeletion(identity: identity, page: removed.page))
+        }
         undoStack.append(.removed(removed))
         redoStack.removeAll()
         reloadVisiblePages()
-        statusMessage = "Deleted annotation"
+        statusMessage = removed.isFileOwned
+            ? "Deleted a file annotation · the PDF is unchanged until you save"
+            : "Deleted annotation"
     }
 
     // MARK: - Bookmarks (T2.13)
@@ -4437,6 +4894,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One ink stroke removed by an eraser gesture, with the array position it had before the
     /// gesture. Undo reinserts it there so the drawing order (and the sidecar's slot order) is
     /// exactly what it was.
+    /// One file-owned ink annotation an eraser gesture removed, with its position in the
+    /// `documentAnnotations` array so undo restores the order the page drew it in.
+    public struct ErasedFileAnnotation: Equatable, Sendable {
+        public let document: DocumentAnnotation
+        public let index: Int
+
+        public init(document: DocumentAnnotation, index: Int) {
+            self.document = document
+            self.index = index
+        }
+    }
+
     public struct ErasedInkStroke: Equatable, Sendable {
         public let annotation: Annotation
         public let index: Int
@@ -4459,7 +4928,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// Everything one eraser drag removed. A drag is one gesture and therefore **one undo
         /// step**, even when it crosses three strokes: one ⌘Z restores the whole sweep, because
         /// the reader made one motion and undoing it stroke by stroke would be a surprise.
-        case erased([ErasedInkStroke])
+        case erased(strokes: [ErasedInkStroke], documents: [ErasedFileAnnotation])
+        /// A file annotation was adopted into the editable model. Undo puts it back in the PDF's
+        /// list and removes the sidecar entry, exactly as if it had never been touched.
+        case adoptedFile(annotation: Annotation, document: DocumentAnnotation, index: Int)
+        /// A file annotation was deleted in this session. Undo restores it (and cancels the
+        /// pending deletion) until a save makes the removal real.
+        case deletedFile(document: DocumentAnnotation, index: Int)
     }
 
     @Published public private(set) var undoStack: [UndoableAction] = []
@@ -4472,12 +4947,51 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
+        // A direct deletion never touched the sidecar, so undo is a pure in-memory restoration
+        // (and the pending deletion goes away with it).
+        if case .deletedFile(let document, let index) = action {
+            pendingFileDeletions.removeAll { $0.identity == document.id }
+            if !documentAnnotations.contains(where: { $0.id == document.id }) {
+                documentAnnotations.insert(document, at: min(index, documentAnnotations.count))
+            }
+            undoStack.removeLast()
+            redoStack.append(action)
+            selectedDocumentAnnotationID = document.id
+            reloadVisiblePages()
+            statusMessage = "Undo"
+            return
+        }
         let updated = annotations(applying: action, undoing: true)
         guard saveAnnotations(updated, trigger: "undo") else { return }
         undoStack.removeLast()
         redoStack.append(action)
-        if case .erased(let strokes) = action {
+        switch action {
+        case .adoptedFile(_, let document, let index):
+            if !documentAnnotations.contains(where: { $0.id == document.id }) {
+                documentAnnotations.insert(document, at: min(index, documentAnnotations.count))
+            }
+            pendingFileDeletions.removeAll { $0.identity == document.id }
+        case .removed(let annotation):
+            if let identity = annotation.fileIdentity {
+                pendingFileDeletions.removeAll { $0.identity == identity }
+            }
+        case .erased(let strokes, let documents):
             erasedInkStrokeIDs.subtract(strokes.map(\.annotation.id))
+            for stroke in strokes {
+                if let identity = stroke.annotation.fileIdentity {
+                    pendingFileDeletions.removeAll { $0.identity == identity }
+                }
+            }
+            for erased in documents.sorted(by: { $0.index < $1.index }) {
+                pendingFileDeletions.removeAll { $0.identity == erased.document.id }
+                if !documentAnnotations.contains(where: { $0.id == erased.document.id }) {
+                    documentAnnotations.insert(
+                        erased.document,
+                        at: min(erased.index, documentAnnotations.count))
+                }
+            }
+        case .added, .replaced, .noteChanged, .deletedFile:
+            break
         }
         reloadVisiblePages()
         statusMessage = "Undo"
@@ -4487,12 +5001,53 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
+        if case .deletedFile(let document, let index) = action {
+            documentAnnotations.removeAll { $0.id == document.id }
+            if !pendingFileDeletions.contains(where: { $0.identity == document.id }) {
+                pendingFileDeletions.append(
+                    FileAnnotationDeletion(identity: document.id, page: document.page))
+            }
+            _ = index
+            redoStack.removeLast()
+            undoStack.append(action)
+            selectedDocumentAnnotationID = nil
+            reloadVisiblePages()
+            statusMessage = "Redo"
+            return
+        }
         let updated = annotations(applying: action, undoing: false)
         guard saveAnnotations(updated, trigger: "redo") else { return }
         redoStack.removeLast()
         undoStack.append(action)
-        if case .erased(let strokes) = action {
+        switch action {
+        case .adoptedFile(_, let document, _):
+            documentAnnotations.removeAll { $0.id == document.id }
+            pendingFileDeletions.removeAll { $0.identity == document.id }
+        case .removed(let annotation):
+            if let identity = annotation.fileIdentity,
+               !pendingFileDeletions.contains(where: { $0.identity == identity }) {
+                pendingFileDeletions.append(
+                    FileAnnotationDeletion(identity: identity, page: annotation.page))
+            }
+        case .erased(let strokes, let documents):
             erasedInkStrokeIDs.formUnion(strokes.map(\.annotation.id))
+            for stroke in strokes {
+                if let identity = stroke.annotation.fileIdentity,
+                   !pendingFileDeletions.contains(where: { $0.identity == identity }) {
+                    pendingFileDeletions.append(
+                        FileAnnotationDeletion(identity: identity, page: stroke.annotation.page))
+                }
+            }
+            let removedDocumentIDs = Set(documents.map(\.document.id))
+            documentAnnotations.removeAll { removedDocumentIDs.contains($0.id) }
+            for erased in documents
+            where !pendingFileDeletions.contains(where: { $0.identity == erased.document.id }) {
+                pendingFileDeletions.append(
+                    FileAnnotationDeletion(identity: erased.document.id,
+                                           page: erased.document.page))
+            }
+        case .added, .replaced, .noteChanged, .deletedFile:
+            break
         }
         reloadVisiblePages()
         statusMessage = "Redo"
@@ -4513,6 +5068,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } else {
                 updated.removeAll { $0.id == annotation.id }
             }
+        case .adoptedFile(let annotation, _, _):
+            if undoing {
+                updated.removeAll { $0.id == annotation.id }
+            } else if !updated.contains(where: { $0.id == annotation.id }) {
+                updated.append(annotation)
+            }
+        case .deletedFile:
+            break
         case .replaced(let before, let after):
             let target = undoing ? before : after
             if let index = updated.firstIndex(where: { $0.id == target.id }) {
@@ -4524,7 +5087,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let index = updated.firstIndex(where: { $0.id == id }) {
                 updated[index].note = undoing ? oldNote : newNote
             }
-        case .erased(let strokes):
+        case .erased(let strokes, _):
             if undoing {
                 // The actions after this one have already been undone, so the array is the same
                 // arrangement minus these strokes; inserting at their original indices restores
@@ -5352,7 +5915,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canSaveAnnotationsToPDF: Bool {
         document != nil
             && (!annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure)
+                || hasPendingInkErasure || hasPendingFileDeletions)
             && !annotationSaveInProgress
     }
 
@@ -5370,7 +5933,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// would be a destructive no-op with a backup.
     public var canReplaceOriginalWithAnnotations: Bool {
         canSaveAnnotationsToPDF && (!annotations.isEmpty || !bookmarks.isEmpty
-            || hasEmbeddedBookmarkSubtree)
+            || hasEmbeddedBookmarkSubtree || hasPendingFileDeletions)
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -5432,7 +5995,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure else {
+                || hasPendingInkErasure || hasPendingFileDeletions else {
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -5460,9 +6023,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
-            let requests = try await pendingAnnotationWrites()
+            let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarkWriteRequests()
-            if requests.isEmpty && bookmarkRequests.isEmpty {
+            if changes.isEmpty && bookmarkRequests.isEmpty {
                 // The eraser removed the last annotation and there is no bookmark to write:
                 // the engine deliberately refuses an empty request. The honest copy is the
                 // source bytes. It still matters: the pending banner offers "Save Copy…" and
@@ -5490,26 +6053,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 ).utf8))
                 return true
             }
-            let report = try await engine.saveAnnotatedCopy(
+            let report = try await engine.saveAnnotationChanges(
                 to: destination,
-                annotations: requests,
+                additions: changes.additions,
                 bookmarks: bookmarkRequests,
+                updates: changes.updates,
+                deletions: changes.deletions,
                 zoom: zoomFactor
             )
             lastAnnotationWriteReport = report
             // The erasure now exists in a PDF (the copy), so the pending-erasure banner has
-            // nothing left to warn about. The open document and its sidecar are unchanged.
+            // nothing left to warn about. The open document and its sidecar are unchanged; a
+            // pending *file deletion* stays pending because the open file still has the mark.
             erasedInkStrokeIDs.removeAll()
             let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
             let written = Self.markCount(
                 annotations: report.writtenIDs.count,
                 bookmarks: report.writtenBookmarkIDs.count
             )
+            let deleted = changes.deletions.count
             statusMessage =
                 "Saved \(written) to \(destination.lastPathComponent)"
+                + (deleted > 0 ? " · \(deleted) annotation(s) deleted" : "")
                 + " · \(report.appendedBytes) bytes appended · the original is unchanged\(backup)"
             FileHandle.standardError.write(Data((
-                "lyra-reader-annotate: saved \(written) to \(destination.path)"
+                "lyra-reader-annotate: saved \(written), \(deleted) annotation deletion(s) to \(destination.path)"
                 + " (append \(report.appendedBytes) bytes)\(backup)\n"
             ).utf8))
             return true
@@ -5537,7 +6105,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before saving annotations"
             return false
         }
-        guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree else {
+        guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
+                || hasPendingFileDeletions else {
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -5551,23 +6120,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
-            let requests = try await pendingAnnotationWrites()
+            let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarkWriteRequests()
-            let report = try await engine.replaceWithAnnotations(
-                requests,
+            let report = try await engine.replaceWithAnnotationChanges(
+                changes.additions,
                 bookmarks: bookmarkRequests,
+                updates: changes.updates,
+                deletions: changes.deletions,
                 zoom: zoomFactor
             )
 
-            // The PDF is now the source of truth. Remove exactly the written ids from the
-            // sidecar so reopening the file does not show each annotation twice.
-            let cleanedAnnotations = forgetAnnotationsSavedToPDF(
-                ids: Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
-            )
+            // The PDF is now the source of truth. Remove exactly the written entries and the
+            // adopted entries whose annotation was deleted (including a thread's cascaded
+            // replies) from the sidecar, so reopening shows each annotation once.
+            let deletedFileIDs = Set(report.deletedFileIDs)
+            let writtenEntries = Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
+            let deletedAdopted = Set(annotations.compactMap { annotation -> UUID? in
+                guard let identity = annotation.fileIdentity,
+                      deletedFileIDs.contains(identity) else { return nil }
+                return annotation.id
+            })
+            let cleanedAnnotations = forgetAnnotationsSavedToPDF(ids: writtenEntries.union(deletedAdopted))
             let cleanedBookmarks = forgetBookmarksSavedToPDF(
                 ids: Set(report.writtenBookmarkIDs.compactMap { UUID(uuidString: $0) })
             )
             let cleanedSidecar = cleanedAnnotations && cleanedBookmarks
+            pendingFileDeletions.removeAll()
 
             // The engine marks the old handle stale; reopen the file in place, keeping the
             // reading position and zoom.
@@ -5607,15 +6185,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 annotations: report.writtenIDs.count,
                 bookmarks: report.writtenBookmarkIDs.count
             )
+            let deletedCount = report.deletedFileIDs.count
             statusMessage =
                 "Saved \(written) into \(url.lastPathComponent)"
+                + (deletedCount > 0 ? " · \(deletedCount) annotation(s) deleted" : "")
                 + " · backup: \(backup)"
+            if report.deletedReplyCount > 0 {
+                statusMessage += " · \(report.deletedReplyCount) repl\(report.deletedReplyCount == 1 ? "y" : "ies") removed with their thread"
+            }
             if !cleanedSidecar {
                 statusMessage += " · the sidecar could not be updated and will be reconciled on open"
             }
             FileHandle.standardError.write(Data((
-                "lyra-reader-annotate: replaced \(url.path) with \(written)"
-                + ", backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
+                "lyra-reader-annotate: replaced \(url.path) with \(written),"
+                + " \(deletedCount) annotation deletion(s), backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
             ).utf8))
             return true
         } catch {
@@ -5657,12 +6240,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// reader is at now. They are **view-space** on purpose: the engine inverts that scale with
     /// the page geometry, so the stored PDF coordinates do not depend on the zoom this happened
     /// to be called at.
-    private func pendingAnnotationWrites() async throws -> [AnnotationWriteRequest] {
-        guard let document else { return [] }
+    private func pendingAnnotationChanges() async throws -> PendingAnnotationChanges {
+        guard let document else { return PendingAnnotationChanges() }
         let zoom = zoomFactor
-        let savedAt = Date()
-        let modified = Self.pdfDate(savedAt)
-        var requests: [AnnotationWriteRequest] = []
+        let modified = Self.pdfDate(Date())
+        var changes = PendingAnnotationChanges()
+        func record(_ request: AnnotationWriteRequest, for annotation: Annotation) {
+            if let identity = annotation.fileIdentity {
+                let assigned = identity.hasPrefix("fp:") ? annotation.id.uuidString : nil
+                changes.updates.append(AnnotationUpdateRequest(
+                    target: identity, annotation: request, assignedName: assigned))
+            } else {
+                changes.additions.append(request)
+            }
+        }
         for annotation in annotations {
             guard annotation.page >= 0, annotation.page < document.pageCount else {
                 throw NSError(
@@ -5673,48 +6264,61 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
             }
             if annotation.kind.isPlacedText {
-                requests.append(try placedTextWriteRequest(annotation, zoom: zoom, modified: modified))
+                record(try placedTextWriteRequest(annotation, zoom: zoom, modified: modified),
+                       for: annotation)
                 continue
             }
             if annotation.kind.isGeometry {
-                requests.append(try geometryWriteRequest(annotation, zoom: zoom, modified: modified))
+                record(try geometryWriteRequest(annotation, zoom: zoom, modified: modified),
+                       for: annotation)
                 continue
             }
-            let text: TextPage
-            if let cached = textPages[annotation.page] {
-                text = cached
+
+            // A text mark this reader created is a character range; a mark the PDF carried keeps
+            // the file's own boxes, because its characters are in somebody else's text layer.
+            let quads: [CGRect]
+            if let fixed = annotation.fileQuads, !fixed.isEmpty {
+                quads = fixed.map { box in
+                    CGRect(x: box.x * zoom, y: box.y * zoom,
+                           width: box.width * zoom, height: box.height * zoom)
+                }
             } else {
-                text = try await engine.textPage(annotation.page)
-                textPages[annotation.page] = text
-            }
-            guard annotation.start >= 0,
-                  annotation.end >= annotation.start,
-                  annotation.end < text.chars.count
-            else {
-                throw NSError(
-                    domain: "LyraReader",
-                    code: 3,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "Annotation \(annotation.id.uuidString) covers characters \(annotation.start)…\(annotation.end), "
-                        + "but page \(annotation.page + 1) has \(text.chars.count) characters"]
-                )
-            }
-            let rects = text.selectionRects(in: annotation.start...annotation.end)
-            guard !rects.isEmpty else {
-                throw NSError(
-                    domain: "LyraReader",
-                    code: 3,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "Annotation \(annotation.id.uuidString) covers no visible text and cannot be written"]
-                )
-            }
-            let quads = rects.map { rect in
-                CGRect(
-                    x: rect.origin.x * zoom,
-                    y: rect.origin.y * zoom,
-                    width: rect.width * zoom,
-                    height: rect.height * zoom
-                )
+                let text: TextPage
+                if let cached = textPages[annotation.page] {
+                    text = cached
+                } else {
+                    text = try await engine.textPage(annotation.page)
+                    textPages[annotation.page] = text
+                }
+                guard annotation.start >= 0,
+                      annotation.end >= annotation.start,
+                      annotation.end < text.chars.count
+                else {
+                    throw NSError(
+                        domain: "LyraReader",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Annotation \(annotation.id.uuidString) covers characters \(annotation.start)…\(annotation.end), "
+                            + "but page \(annotation.page + 1) has \(text.chars.count) characters"]
+                    )
+                }
+                let rects = text.selectionRects(in: annotation.start...annotation.end)
+                guard !rects.isEmpty else {
+                    throw NSError(
+                        domain: "LyraReader",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Annotation \(annotation.id.uuidString) covers no visible text and cannot be written"]
+                    )
+                }
+                quads = rects.map { rect in
+                    CGRect(
+                        x: rect.origin.x * zoom,
+                        y: rect.origin.y * zoom,
+                        width: rect.width * zoom,
+                        height: rect.height * zoom
+                    )
+                }
             }
             let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
             let writeKind: AnnotationWriteRequest.Kind = switch annotation.kind {
@@ -5723,7 +6327,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             case .strikeout: .strikeout
             default: .highlight
             }
-            requests.append(AnnotationWriteRequest(
+            record(AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
                 kind: writeKind,
@@ -5734,9 +6338,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 contents: annotation.note,
                 author: Self.annotationAuthor,
                 modified: modified
-            ))
+            ), for: annotation)
         }
-        return requests
+        changes.deletions = pendingFileDeletions.map {
+            AnnotationDeleteRequest(target: $0.identity, page: $0.page)
+        }
+        return changes
+    }
+
+    /// Everything one explicit save writes: additions, edits of annotations the PDF carries, and
+    /// deletions of those annotations.
+    private struct PendingAnnotationChanges {
+        var additions: [AnnotationWriteRequest] = []
+        var updates: [AnnotationUpdateRequest] = []
+        var deletions: [AnnotationDeleteRequest] = []
+
+        var isEmpty: Bool { additions.isEmpty && updates.isEmpty && deletions.isEmpty }
     }
 
     /// One placed-text annotation as a write request: a `/Text` sticky note for an icon, a
@@ -5780,7 +6397,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             author: Self.annotationAuthor,
             modified: modified,
             fontSizePt: annotation.kind == .textBox ? annotation.fontSize : 0,
-            textAlignment: "left"
+            textAlignment: annotation.textAlignment ?? "left"
         )
     }
 
@@ -6045,8 +6662,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationWriteCount = 0
         hasPendingAnnotationWrite = false
         erasedInkStrokeIDs = []
+        pendingFileDeletions = []
         eraserHoverMarkID = nil
-        eraserRefusalNotice = nil
 
         do {
             _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
@@ -7887,13 +8504,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             || openFigureMention(at: point)
             || openDocumentNote(at: point)
         // Nothing above claimed the click, and it landed on markup the file itself carries.
-        // Report the same refusal the eraser states for file-owned ink instead of no-opping.
-        // Only the Select tool owns mark selection; the armed markup tools keep their old
-        // click behaviour.
+        // Adopt it into the editable model and select it; a kind with no editable model states
+        // its one reason instead. Only the Select tool owns mark selection; the armed markup
+        // tools keep their old click behaviour.
         if annotationTool == .select, !resolved,
-           fileOwnedMarkupHit(atContentPoint: point) != nil {
-            markSelectionRefusalNotice = Self.markSelectionFileOwnedMessage
-            statusMessage = Self.markSelectionFileOwnedMessage
+           let document = fileOwnedMarkupHit(atContentPoint: point) {
+            _ = selectDocumentAnnotation(document.id)
         }
     }
 
@@ -7979,7 +8595,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
             let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
             guard marker.rect.contains(local) else { continue }
-            showDocumentNote(documentAnnotations[marker.annotationIndex])
+            let annotation = documentAnnotations[marker.annotationIndex]
+            showDocumentNote(annotation)
             return true
         }
         return false
@@ -8011,6 +8628,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     .insetBy(dx: -Self.noteClickSlackPt, dy: -Self.noteClickSlackPt)
                 guard hit.contains(local) else { continue }
 
+                // A single click opens the file's own note paper, exactly as before: reading
+                // somebody's note must not silently rewrite it. A double-click (see
+                // `beginEditingTextBox`) or the sidebar adopts it for editing.
                 showDocumentNote(annotation)
                 FileHandle.standardError.write(
                     Data("lyra-reader-annot: opened note \(annotation.id) (\(annotation.drawing.rawValue)) on page \(annotation.page + 1)\n".utf8)
@@ -8087,7 +8707,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             do {
                 let found = try await self.engine.annotations()
                 guard epoch == self.documentEpoch else { return }
-                self.documentAnnotations = found
+                // An adopted entry is drawn from the editable model, and a pending deletion is
+                // drawn nowhere: hiding both here is what keeps a mark from appearing twice (or
+                // after the reader deleted it) until the save makes the change real.
+                let hidden = self.adoptedFileAnnotationIDs
+                    .union(self.pendingFileDeletions.map(\.identity))
+                self.documentAnnotations = found.filter { !hidden.contains($0.id) }
                 self.reconcileAnnotationsAlreadySaved(found)
                 self.reloadVisiblePages()
                 FileHandle.standardError.write(
@@ -8954,6 +9579,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             documentInfo: documentInfo,
             documentInfoLoading: documentInfoLoading,
             documentAnnotations: documentAnnotations,
+            pendingFileDeletions: pendingFileDeletions,
             documentAnnotationsError: documentAnnotationsError,
             documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
             outline: outline,
@@ -9063,6 +9689,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentInfoError = nil
         propertiesSaveInProgress = false
         documentAnnotations = state.documentAnnotations
+        pendingFileDeletions = state.pendingFileDeletions
         documentAnnotationsError = state.documentAnnotationsError
         documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted
         outline = state.outline
@@ -9071,9 +9698,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotations = state.annotations
         erasedInkStrokeIDs = state.erasedInkStrokeIDs
         eraserHoverMarkID = nil
-        eraserRefusalNotice = nil
         eraserGestureBase = nil
         eraserGestureRemoved = [:]
+        eraserGestureRemovedDocuments = [:]
         bookmarks = state.bookmarks
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount
@@ -10013,20 +10640,38 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // its own glyph below; neither is a tinted text box.
             guard !annotation.kind.isGeometry, !annotation.kind.isPlacedText else { continue }
             let bar = Self.textMarkupBar(for: annotation.kind)
-            appendHighlight(
-                page: annotation.page,
-                range: annotation.start...max(annotation.start, annotation.end),
-                // Multiply preserves black glyphs while tinting the paper, just like PDF markup.
-                image: annotationTexture(for: annotation.color, opacity: 1.0, blend: .multiply),
-                // Its own index block, one slot per line: the index is the key the canvas caches
-                // this quad's texture under, so it must not collide with a page raster or with a
-                // loaded annotation (see `PlacementIndex`).
-                idBase: PlacementIndex.ownAnnotation(annotationIndex),
-                verticalScale: bar.scale,
-                verticalOffset: bar.offset,
-                blend: .multiply,
-                to: &pages
-            )
+            let image = annotationTexture(for: annotation.color, opacity: 1.0, blend: .multiply)
+            let idBase = PlacementIndex.ownAnnotation(annotationIndex)
+            if let fixed = annotation.fileQuads, !fixed.isEmpty {
+                appendHighlight(
+                    quads: fixed.map {
+                        CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                    },
+                    page: annotation.page,
+                    image: image,
+                    idBase: idBase,
+                    verticalScale: bar.scale,
+                    verticalOffset: bar.offset,
+                    blend: .multiply,
+                    to: &pages
+                )
+            } else {
+                appendHighlight(
+                    page: annotation.page,
+                    range: annotation.start...max(annotation.start, annotation.end),
+                    // Multiply preserves black glyphs while tinting the paper, just like PDF
+                    // markup.
+                    image: image,
+                    // Its own index block, one slot per line: the index is the key the canvas
+                    // caches this quad's texture under, so it must not collide with a page raster
+                    // or with a loaded annotation (see `PlacementIndex`).
+                    idBase: idBase,
+                    verticalScale: bar.scale,
+                    verticalOffset: bar.offset,
+                    blend: .multiply,
+                    to: &pages
+                )
+            }
         }
 
         // Sticky notes and text boxes are glyphs, not tinted text boxes: an icon and a laid-out
@@ -10371,6 +11016,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return image
     }
 
+    /// Appends one tinted box per fixed page-space quad, for a mark the PDF carried.
+    private func appendHighlight(
+        quads: [CGRect],
+        page: Int,
+        image: PageImage,
+        idBase: Int,
+        verticalScale: CGFloat = 1.0,
+        verticalOffset: CGFloat = 0.0,
+        blend: QuadBlend = .normal,
+        to pages: inout [CanvasPage]
+    ) {
+        guard let placement = visiblePagePlacements.first(where: { $0.index == page }) else { return }
+        for (index, rect) in quads.enumerated() {
+            pages.append(CanvasPage(
+                placement: PagePlacement(
+                    index: idBase + index,
+                    topPt: placement.topPt + rect.minY + rect.height * verticalOffset,
+                    leftPt: placement.leftPt + rect.minX,
+                    widthPt: rect.width,
+                    heightPt: max(rect.height * verticalScale, 1)
+                ),
+                image: image,
+                blend: blend
+            ))
+        }
+    }
+
     private func appendHighlight(
         page: Int,
         range: ClosedRange<Int>,
@@ -10486,6 +11158,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let hit = geometryAnnotationHit(atContentPoint: point),
                let annotation = annotations.first(where: { $0.id == hit.id }) {
                 selectedAnnotationID = hit.id
+                moveOriginalAnnotation = annotation
+                moveStartPagePoint = hit.point
+                resizeOriginalAnnotation = nil
+                resizeStartPagePoint = nil
+                resizeHandle = nil
+                selection = nil
+                selectionAnchor = nil
+                refreshSelectionOverlay()
+                return
+            }
+            if let hit = documentGeometryHit(atContentPoint: point),
+               let id = adoptDocumentAnnotation(hit.annotation.id),
+               let annotation = annotations.first(where: { $0.id == id }) {
+                selectedAnnotationID = id
                 moveOriginalAnnotation = annotation
                 moveStartPagePoint = hit.point
                 resizeOriginalAnnotation = nil

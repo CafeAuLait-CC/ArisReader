@@ -398,7 +398,7 @@ extension ReaderChecks {
         require(reopenedInkIDs.contains("nm:\(strokeB.id.uuidString)"),
                 "reopening the copy finds the kept stroke's annotation")
 
-        // ── 11. A PDF's own ink is refused, with an explanation ───────────────────────
+        // ── 11. A PDF's own ink is erased through the incremental writer ───────────────
         let external = try makeState(try copy(strokes, "external-ink.pdf"))
         try await eventually("the external ink fixture is read", {
             external.documentAnnotations.count == 5 || external.documentAnnotationsError != nil
@@ -418,8 +418,8 @@ extension ReaderChecks {
         requireTargetIsDocument(hoverTarget,
                                 "the eraser recognizes a stroke that belongs to the PDF")
         external.updateEraserHover(atContentPoint: externalContent)
-        require(external.eraserHoverMarkID == nil,
-                "a file-owned stroke gets no erase halo because it cannot be erased")
+        require(external.eraserHoverMarkID == "pdf:" + externalInk.id,
+                "a file-owned stroke gets the erase halo: it is erasable now")
         let externalCanvas = makeCanvas(external)
         let externalUndo = external.undoStack.count
         let externalWrites = external.annotationWriteCount
@@ -427,22 +427,23 @@ extension ReaderChecks {
              from: content(external, page: externalInk.page, externalPath[0]),
              through: [content(external, page: externalInk.page, externalPath[0])],
              to: content(external, page: externalInk.page, externalPath[externalPath.count - 1]))
-        require(external.eraserRefusalNotice == AppState.eraserFileOwnedMessage,
-                "erasing a PDF-owned stroke is refused, not silently ignored")
-        require(external.eraserRefusalNotice?.contains("belongs to the PDF") == true,
-                "the refusal says the ink belongs to the PDF")
-        require(external.annotations.isEmpty,
-                "the refused gesture did not change the reader's annotation list")
-        require(external.documentAnnotations.count == 5,
-                "the PDF's own annotation is still there after the refused gesture")
-        require(external.canvasAnnotationMarks.contains(where: { $0.id == "pdf:" + externalInk.id }),
-                "the refused file-owned stroke is still drawn on the canvas")
-        require(external.undoStack.count == externalUndo,
-                "a refused erasure adds no undo step")
+        require(!external.documentAnnotations.contains(where: { $0.id == externalInk.id }),
+                "the file-owned stroke is gone from the page")
+        require(external.pendingFileDeletions.contains(where: { $0.identity == externalInk.id }),
+                "the removal is pending, not written")
+        require(external.undoStack.count == externalUndo + 1,
+                "the eraser gesture is one undo step")
         require(external.annotationWriteCount == externalWrites,
-                "a refused erasure writes no sidecar")
-        external.dismissEraserRefusal()
-        require(external.eraserRefusalNotice == nil, "the refusal banner can be dismissed")
+                "erasing file-owned ink writes no sidecar entry")
+
+        // Undo before saving restores it exactly once.
+        external.undo()
+        require(external.documentAnnotations.contains(where: { $0.id == externalInk.id }),
+                "undo restores the deleted file annotation before it is saved")
+        require(!external.pendingFileDeletions.contains(where: { $0.identity == externalInk.id }),
+                "undo cancels the pending deletion")
+        require(!external.annotations.contains(where: { $0.fileIdentity == externalInk.id }),
+                "undo does not leave an adopted copy behind")
 
         // ── 12. Erasing did not disturb the geometry the select tool relies on ─────────
         // (The full suite's selection, click and form checks run on a state that never armed

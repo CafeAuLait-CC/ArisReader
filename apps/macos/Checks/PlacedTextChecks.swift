@@ -480,15 +480,21 @@ extension ReaderChecks {
         require(replacer.canvasAnnotationMarks.isEmpty,
                 "a PDF's own placed text is not offered as an editable sidecar mark")
 
-        // ── 7. Another producer's notes and free text are read, drawn and clearly not editable
+        // ── 7. Another producer's notes and free text are read, and a double-click edits them
+        let externalCopy = try copy(external, "external-notes.pdf")
         let externalState = AppState(engine: try RustEngine())
         externalState.setViewportSize(CGSize(width: 700, height: 500))
-        externalState.newTab(url: external)
+        externalState.newTab(url: externalCopy)
         try await eventually("the external notes fixture is read", {
-            externalState.documentAnnotations.count == 7 || externalState.documentAnnotationsError != nil
+            !externalState.documentAnnotations.isEmpty
+                || externalState.documentAnnotationsError != nil
         })
         require(externalState.documentAnnotationsError == nil,
                 "reading another writer's notes does not fail")
+        require(externalState.documentAnnotations.count == 7,
+                "the external notes fixture reports its seven annotations, got "
+                    + "\(externalState.documentAnnotations.count): "
+                    + "\(externalState.documentAnnotations.map { "\($0.kind):\($0.id)" })")
         let externalKinds = externalState.documentAnnotations.map(\.drawing)
         require(externalKinds.filter { $0 == .noteIcon }.count == 2,
                 "the external /Text notes are classified as note icons")
@@ -502,14 +508,28 @@ extension ReaderChecks {
                                      point: CGPoint(x: box.xPt + box.widthPt / 2,
                                                     y: box.yPt + box.heightPt / 2))
             externalState.beginSelection(at: point)
-            require(externalState.selectedAnnotationID == nil,
-                    "another writer's note is not offered as an editable sidecar annotation")
             require(externalState.openDocumentNote(at: point),
-                    "clicking another writer's note opens the read-only note paper")
-            require(externalState.openDocumentNoteID != nil &&
+                    "a single click still opens another writer's note paper")
+            require(externalState.openDocumentNoteID == externalNote.id &&
                         externalState.editingAnnotationID == nil,
-                    "the external note is read-only and clearly not an editable placed note")
+                    "a single click reads the note without adopting or rewriting it")
             externalState.closeDocumentNote()
+            require(externalState.beginEditingTextBox(atContentPoint: point),
+                    "a double-click opens the same note in the editable editor")
+            guard let adoptedID = externalState.selectedAnnotationID,
+                  let adopted = externalState.annotations.first(where: { $0.id == adoptedID })
+            else {
+                require(false, "another writer's note becomes an editable placed note")
+                return
+            }
+            require(adopted.fileIdentity == externalNote.id,
+                    "the editable note carries the file's own identity")
+            require(externalState.editingAnnotationID == adoptedID,
+                    "the double-click opens the editable paper")
+            require(!externalState.documentAnnotations.contains(where: {
+                $0.id == externalNote.id
+            }), "the PDF copy is hidden while the adopted note is open")
+            externalState.cancelTextEditing()
         }
 
         // ── 8. A newer placed-text entry is preserved, not half-read ─────────────────────

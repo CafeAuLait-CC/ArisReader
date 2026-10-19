@@ -255,18 +255,19 @@ public struct ReaderWindow: View {
             }
 
             if state.pageEditSessionActive || state.formHasPendingChanges
-                || state.hasPendingInkErasure || state.eraserRefusalNotice != nil
+                || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil {
                 VStack(spacing: 8) {
                     if !state.pendingRedactions.isEmpty { redactionBanner }
                     if state.pageEditSessionActive { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
-                    if state.eraserRefusalNotice != nil
-                        || state.markSelectionRefusalNotice != nil {
+                    if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner
                     }
-                    if state.hasPendingInkErasure { eraserPendingBanner }
+                    if state.hasPendingInkErasure || state.hasPendingFileDeletions {
+                        eraserPendingBanner
+                    }
                     Spacer()
                 }
                 .padding(.top, 12)
@@ -469,7 +470,7 @@ public struct ReaderWindow: View {
             Image(systemName: "eraser")
                 .foregroundStyle(LyraReaderTheme.warningFg)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Ink changes pending")
+                Text("Annotation changes pending")
                     .font(.callout.weight(.semibold))
                 Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save a copy.")
                     .font(.caption)
@@ -492,21 +493,17 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Ink erasures pending. The PDF on disk is unchanged until you save a copy."
+            "Annotation deletions pending. The PDF on disk is unchanged until you save a copy."
         )
     }
 
-    /// The eraser's or the selection's refusal: the mark under the pointer belongs to the PDF
-    /// itself, so this version's writer cannot remove it. Stated explicitly instead of leaving a
-    /// press that looks broken.
-    ///
-    /// Both refusals share one banner because they are one policy; only the subject changes.
+    /// The single remaining refusal: a file annotation whose kind has no editable model (a
+    /// reply, `/Squiggly`, `/Stamp`, …). It comes from the same policy the canvas, sidebar and
+    /// writer use, so the message cannot disagree with what a click actually does.
     private var annotationRefusalBanner: some View {
-        let isSelection = state.markSelectionRefusalNotice != nil
-        let title = isSelection ? "This markup belongs to the PDF" : "This ink belongs to the PDF"
-        let message = isSelection
-            ? (state.markSelectionRefusalNotice ?? AppState.markSelectionFileOwnedMessage)
-            : (state.eraserRefusalNotice ?? AppState.eraserFileOwnedMessage)
+        let title = "This annotation cannot be edited here"
+        let message = state.markSelectionRefusalNotice
+            ?? "LyraReader has no editable model for this annotation's kind."
         return HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(LyraReaderTheme.warningFg)
@@ -519,10 +516,7 @@ public struct ReaderWindow: View {
                     .frame(maxWidth: 520, alignment: .leading)
             }
             Divider().frame(height: 24)
-            Button("Dismiss") {
-                if isSelection { state.dismissMarkSelectionRefusal() }
-                else { state.dismissEraserRefusal() }
-            }
+            Button("Dismiss") { state.dismissMarkSelectionRefusal() }
         }
         .controlSize(.small)
         .padding(.horizontal, 14)

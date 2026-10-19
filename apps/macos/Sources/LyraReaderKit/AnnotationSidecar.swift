@@ -87,6 +87,9 @@ enum AnnotationSidecar {
         // Placed text (`stickyNote`, `textBox`) carries its box, its font size (text box only)
         // and the same versioning rule.
         "fontSize",
+        // An entry that edits an annotation already in the PDF: its file identity, the fixed
+        // quads of a foreign text mark, and a free text box's `/Q`.
+        "fileIdentity", "quads", "textAlignment",
     ]
 
     /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
