@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Alex
+Copyright (c) 2026 Alex Xu
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,16 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-party components (see docs/adr/0005-licensing.md):
-
-- PDFium — BSD-3-Clause (including its bundled freetype/harfbuzz/icu/lcms/
-  libjpeg-turbo/openjpeg/libpng/zlib/agg/abseil, all permissively licensed).
-  Distributions must ship the license texts found in vendor/pdfium/licenses/.
-- wgpu / naga — MIT OR Apache-2.0
-- pdfium-render — MIT OR Apache-2.0
-- UniFFI / cbindgen — MPL-2.0 (build-time tooling only; their sources are not modified)
-
-This project contains no AGPL/GPL components (MuPDF and friends are explicitly excluded).
