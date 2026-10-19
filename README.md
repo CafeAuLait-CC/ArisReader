@@ -45,13 +45,19 @@ fixes, validation evidence and outstanding work. PDFium remains serialized withi
 background execution does not imply parallel PDFium rendering.
 
 Capabilities, each backed by a check rather than a claim: selection and click-precise text, search,
-tabs and independent windows, outline with section numbers and levels, page and annotation sidebars
-with reply threads, highlight/underline/strikethrough/note/ink/shape creation with a colour and blend, saved
-annotations inside the PDF, staged page editing, facing pages and bookmarks,
-citation/figure/table/algorithm previews with draggable panels, paper metadata and BibTeX export,
-AcroForm filling and editable document properties, and the AI assistant described above. Known gaps
-are listed in the project's design notes: standalone sticky notes and text boxes, redaction and
-printing, and the Linux and Windows shells.
+tabs that switch without reloading and independent windows, outline with section numbers and levels, page
+and annotation sidebars with reply threads, highlight/underline/strikethrough/ink/shape/sticky-note/text-box
+creation with a colour and blend, and every one of those kinds written back into the PDF through a verified
+incremental save; staged page editing; facing pages, page gap and bookmarks; a redaction that removes the
+covered characters rather than covering them, and printing at print resolution; form filling bound to the
+Fill & Sign slot and editable document properties; citation/figure/table/algorithm previews with draggable
+panels, a per-window Back for preview jumps, transparent figure crops and text-only previews for section
+references; paper metadata with BibTeX export; annotation export as Markdown or CSV; a persistent index
+cache keyed by the document's bytes; and the AI assistant described above.
+Known gaps are listed in the project's design notes: bookmarks are stored beside the PDF but not written into
+its outline; annotations the PDF itself carries cannot be deleted, because the writer only appends; partial
+stroke erasing, stamps and signature images, in-place text editing, AI document chat and region questions,
+and the Linux and Windows shells remain.
 
 ---
 
