@@ -199,6 +199,14 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // Bookmark outline write-back on its own (`LyraReaderChecks --check-bookmark-writeback .`).
+        if CommandLine.arguments.contains("--check-bookmark-writeback") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await bookmarkWritebackChecks(root: root)
+            print("Bookmark write-back checks passed")
+            return
+        }
         // The eraser on its own (`LyraReaderChecks --check-eraser .`).
         if CommandLine.arguments.contains("--check-eraser") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -519,6 +527,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await bookmarkWritebackChecks(root: root)
         try await inkAnnotationChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),

@@ -389,6 +389,7 @@ fn free_text_appearance_is_a_shared_type0_subset_with_tounicode() {
         &source,
         &destination,
         &[chinese, japanese],
+        &[],
         None,
         SaveMode::Copy,
     )
@@ -417,8 +418,15 @@ fn a_character_outside_the_font_uses_notdef_and_keeps_extraction_exact() {
     let source = fixture();
     let text = "中😀文";
     let annotation = annotation("cjk-fallback", text, 420.0);
-    save_annotated_pdf(&source, &destination, &[annotation], None, SaveMode::Copy)
-        .expect("write the fallback text box");
+    save_annotated_pdf(
+        &source,
+        &destination,
+        &[annotation],
+        &[],
+        None,
+        SaveMode::Copy,
+    )
+    .expect("write the fallback text box");
 
     let document = Document::load(&destination).expect("reopen");
     let dictionary = find_annotation(&document, "cjk-fallback");
