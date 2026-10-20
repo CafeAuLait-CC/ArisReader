@@ -69,6 +69,8 @@ mod signature;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 #[cfg(feature = "pdfium")]
+mod text_edit;
+#[cfg(feature = "pdfium")]
 mod writeback;
 #[cfg(feature = "pdfium")]
 mod xmp;
@@ -121,6 +123,12 @@ pub use rewrite::{SignatureStripReport, strip_signature_from_copy};
 pub use signature::{SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature};
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
+#[cfg(feature = "pdfium")]
+pub use text_edit::{
+    TextEditAnalysis, TextEditFontInfo, TextEditFontSubtype, TextEditOperator,
+    TextEditPageAnalysis, TextEditPolicy, TextEditRefusalReason, TextEditRefusalStats, TextEditRun,
+    TextEditTotals, TextEditWidthSource, analyze_text_edit, analyze_text_edit_with_policy,
+};
 #[cfg(feature = "pdfium")]
 pub use writeback::{
     SaveMode, SaveReport, cleanup_interrupted_save_temporaries, interrupted_save_note,

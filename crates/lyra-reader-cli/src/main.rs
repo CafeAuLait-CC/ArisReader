@@ -24,8 +24,9 @@
 use lyra_reader_core::Rect;
 use lyra_reader_core::{DocumentBackend, EngineConfig, PageIndex, RasterRequest};
 use lyra_reader_pdfium::{
-    PdfiumBackend, RedactionArea, RedactionMode, backend_description, preview_redactions,
-    redact_pdf, suggested_redaction_copy_path,
+    PdfiumBackend, RedactionArea, RedactionMode, TextEditAnalysis, TextEditPageAnalysis,
+    TextEditPolicy, TextEditRefusalReason, TextEditRun, analyze_text_edit_with_policy,
+    backend_description, preview_redactions, redact_pdf, suggested_redaction_copy_path,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -66,6 +67,11 @@ Usage:
                  [--page N] [--dpi D] [-o out.png]
   lyra-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
                  [--max-mae F]                   exit non-zero when MAE exceeds F
+  lyra-reader-cli text-edit analyze <file.pdf>  read-only: list the runs that could be edited in
+                 [--page N] [--json] [--all]     place, and the reason every other run is refused
+                 [--limit N]                     (no PDF is written); the default policy refuses
+                 [--include-tj-adjustments]      TJ strings whose array carries kerning numbers;
+                                                 this flag widens the *analysis* only
   lyra-reader-cli redact <file.pdf>              remove the content under rectangles from a copy
                  --rect X,Y,W,H [--rect ...]     (PDF user space, origin bottom-left); --replace
                  [--replace] [-o out.pdf]        rewrites the file after a verified backup;
@@ -141,6 +147,7 @@ fn main() -> ExitCode {
         Some("render") => cmd_render(rest(&args)),
         Some("compare") => cmd_compare(rest(&args)),
         Some("text") => cmd_text(rest(&args)),
+        Some("text-edit") => cmd_text_edit(rest(&args)),
         Some("redact") => cmd_redact(rest(&args)),
         Some("annotations") => cmd_annotations(rest(&args)),
         Some("bench") => cmd_bench(rest(&args)),
@@ -185,6 +192,9 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--bibtex"
                 | "--replace"
                 | "--preview"
+                | "--json"
+                | "--all"
+                | "--include-tj-adjustments"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;
@@ -1107,6 +1117,359 @@ fn cmd_redact(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_text_edit(args: &[String]) -> ExitCode {
+    let (positional, options) = parse(args);
+    let Some(command) = positional.first() else {
+        eprintln!(
+            "usage: lyra-reader-cli text-edit analyze <file.pdf> [--page N] [--json] [--all] [--limit N] [--include-tj-adjustments]"
+        );
+        return ExitCode::from(64);
+    };
+    if command != "analyze" {
+        eprintln!("unknown text-edit command: {command}");
+        eprintln!(
+            "usage: lyra-reader-cli text-edit analyze <file.pdf> [--page N] [--json] [--all] [--limit N] [--include-tj-adjustments]"
+        );
+        return ExitCode::from(64);
+    }
+    let Some(path) = positional.get(1) else {
+        eprintln!(
+            "usage: lyra-reader-cli text-edit analyze <file.pdf> [--page N] [--json] [--all] [--limit N] [--include-tj-adjustments]"
+        );
+        return ExitCode::from(64);
+    };
+    let json = options.iter().any(|(key, _)| key == "--json");
+    let show_all = options.iter().any(|(key, _)| key == "--all");
+    let limit = opt_usize(&options, &["--limit"], 10).max(1);
+    let only_page = opt(&options, &["--page"]).and_then(|value| value.parse::<u32>().ok());
+    let policy = if options
+        .iter()
+        .any(|(key, _)| key == "--include-tj-adjustments")
+    {
+        TextEditPolicy::AllowTjKerning
+    } else {
+        TextEditPolicy::Conservative
+    };
+
+    let analysis = match analyze_text_edit_with_policy(Path::new(path), None, policy) {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            eprintln!("cannot analyse {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&text_edit_json(&analysis))
+                .unwrap_or_else(|_| "{}".into())
+        );
+        return ExitCode::SUCCESS;
+    }
+    print_text_edit_report(&analysis, only_page, limit, show_all);
+    ExitCode::SUCCESS
+}
+
+fn print_text_edit_report(
+    analysis: &TextEditAnalysis,
+    only_page: Option<u32>,
+    limit: usize,
+    show_all: bool,
+) {
+    println!(
+        "{}: {} page(s), {} text character(s), {} glyph(s), encrypted={}, signed={}",
+        analysis.path.display(),
+        analysis.page_count,
+        analysis.totals.text_characters,
+        analysis.totals.glyphs,
+        analysis.encrypted,
+        analysis.signed
+    );
+    println!(
+        "policy: {} — {}",
+        analysis.policy.code(),
+        match analysis.policy {
+            TextEditPolicy::Conservative =>
+                "TJ strings whose array carries numeric adjustments are refused",
+            TextEditPolicy::AllowTjKerning =>
+                "analysis only: TJ strings with numeric adjustments are reported as addressable; no writer is proposed",
+        }
+    );
+    println!("read-only: no PDF is written by this command");
+    if let Some(refusal) = analysis.document_refusal {
+        println!(
+            "document refused: {} — {}",
+            refusal.code(),
+            refusal.sentence()
+        );
+    }
+    if let Some(note) = &analysis.doc_note {
+        println!("  {note}");
+    }
+    let totals = &analysis.totals;
+    let run_share = percentage(totals.editable_runs, totals.runs);
+    let char_share = percentage(totals.editable_characters, totals.text_characters);
+    println!(
+        "totals: {} of {} run(s) editable ({run_share}), {} of {} character(s) ({char_share}), \
+         {} of {} page(s) with a usable run, {} TJ boundary/boundaries",
+        totals.editable_runs,
+        totals.runs,
+        totals.editable_characters,
+        totals.text_characters,
+        totals.pages_with_editable_runs,
+        totals.pages,
+        totals.tj_boundaries
+    );
+    if !totals.refusals.is_empty() {
+        println!("refusals:");
+        for (reason, stats) in &totals.refusals {
+            println!(
+                "  {:28} {:6} run(s) {:8} character(s)  {}",
+                reason.code(),
+                stats.runs,
+                stats.characters,
+                reason.sentence()
+            );
+        }
+    }
+
+    for page in &analysis.pages {
+        if only_page.is_some_and(|selected| selected != page.page) {
+            continue;
+        }
+        if page.runs.is_empty() && page.page_refusal.is_none() {
+            continue;
+        }
+        println!();
+        println!(
+            "page {}: {} editable of {} run(s), {}/{} character(s), {} TJ boundary/boundaries, crop {:.1}x{:.1} at ({:.1},{:.1})",
+            page.page,
+            page.editable_runs,
+            page.runs.len(),
+            page.editable_characters,
+            page.text_characters,
+            page.tj_boundaries,
+            page.crop.size.width,
+            page.crop.size.height,
+            page.crop.origin.x,
+            page.crop.origin.y
+        );
+        if let Some(reason) = page.page_refusal {
+            println!(
+                "  page refused: {} — {}{}",
+                reason.code(),
+                reason.sentence(),
+                page.note
+                    .as_ref()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default()
+            );
+            continue;
+        }
+        let mut editable = 0usize;
+        let mut refused = 0usize;
+        for run in &page.runs {
+            if run.is_editable() {
+                if show_all || editable < limit {
+                    print_text_edit_run("editable", run);
+                }
+                editable += 1;
+            } else if show_all || refused < limit {
+                print_text_edit_run("refused", run);
+                refused += 1;
+            }
+        }
+        if !show_all {
+            let hidden_editable = editable.saturating_sub(limit);
+            let hidden_refused = page
+                .runs
+                .iter()
+                .filter(|run| !run.is_editable())
+                .count()
+                .saturating_sub(limit);
+            if hidden_editable > 0 || hidden_refused > 0 {
+                println!(
+                    "  … {hidden_editable} more editable and {hidden_refused} more refused run(s); use --all or --limit"
+                );
+            }
+        }
+        if !page.refusals.is_empty() {
+            println!("  refusal summary:");
+            for (reason, stats) in &page.refusals {
+                println!(
+                    "    {:28} {:5} run(s) {:8} character(s)",
+                    reason.code(),
+                    stats.runs,
+                    stats.characters
+                );
+            }
+        }
+    }
+}
+
+fn print_text_edit_run(state: &str, run: &TextEditRun) {
+    let text = truncate(&run.text.replace('\n', " "), 48);
+    println!(
+        "  [{state:8}] {text:?}  font={} ({}, {}, widths={}, toUnicode={})  size={:.1}  op={}  \
+         run={:.2}pt room={:.2}pt{}",
+        run.font.base_font,
+        run.font.subtype.code(),
+        if run.font.subset {
+            "subset"
+        } else {
+            "complete"
+        },
+        run.font.width_source.code(),
+        if run.font.to_unicode { "yes" } else { "no" },
+        run.font_size,
+        run.operator.code(),
+        run.original_advance,
+        run.available_advance,
+        if run.at_line_end { " lineEnd" } else { "" }
+    );
+    if run.tj_adjusted {
+        println!(
+            "             inside a TJ array that carries kerning adjustments; a conservative policy refuses this run"
+        );
+    }
+    if let Some(reason) = run.refusal {
+        println!(
+            "             refused: {} — {}{}",
+            reason.code(),
+            reason.sentence(),
+            run.detail
+                .as_ref()
+                .map(|detail| format!(" [{detail}]"))
+                .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "             replacement alphabet: {} character(s) {:?}{}",
+            run.replacement_char_count,
+            truncate(&run.replacement_sample, 40),
+            if run.deletion_safe {
+                "; deletion leaves no visible gap"
+            } else {
+                "; shorter text must be padded"
+            }
+        );
+    }
+}
+
+fn percentage(part: usize, whole: usize) -> String {
+    if whole == 0 {
+        "0.0%".into()
+    } else {
+        format!("{:.1}%", part as f64 * 100.0 / whole as f64)
+    }
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(limit).collect::<String>())
+    }
+}
+
+fn text_edit_json(analysis: &TextEditAnalysis) -> serde_json::Value {
+    serde_json::json!({
+        "path": analysis.path,
+        "policy": if analysis.policy == TextEditPolicy::Conservative { "conservative" } else { "allowTjKerning" },
+        "pageCount": analysis.page_count,
+        "encrypted": analysis.encrypted,
+        "signed": analysis.signed,
+        "signatureSummary": analysis.signature_summary,
+        "documentRefusal": analysis.document_refusal.map(TextEditRefusalReason::code),
+        "note": analysis.doc_note,
+        "totals": text_edit_totals_json(analysis),
+        "pages": analysis.pages.iter().map(text_edit_page_json).collect::<Vec<_>>(),
+    })
+}
+
+fn text_edit_totals_json(analysis: &TextEditAnalysis) -> serde_json::Value {
+    let totals = &analysis.totals;
+    serde_json::json!({
+        "pages": totals.pages,
+        "pagesWithEditableRuns": totals.pages_with_editable_runs,
+        "runs": totals.runs,
+        "editableRuns": totals.editable_runs,
+        "refusedRuns": totals.refused_runs,
+        "glyphs": totals.glyphs,
+        "textCharacters": totals.text_characters,
+        "editableCharacters": totals.editable_characters,
+        "refusedCharacters": totals.refused_characters,
+        "tjBoundaries": totals.tj_boundaries,
+        "refusals": totals.refusals.iter().map(|(reason, stats)| {
+            (reason.code().to_string(), serde_json::json!({
+                "runs": stats.runs,
+                "characters": stats.characters,
+            }))
+        }).collect::<serde_json::Map<String, serde_json::Value>>(),
+    })
+}
+
+fn text_edit_page_json(page: &TextEditPageAnalysis) -> serde_json::Value {
+    serde_json::json!({
+        "page": page.page,
+        "crop": {
+            "x": page.crop.origin.x,
+            "y": page.crop.origin.y,
+            "width": page.crop.size.width,
+            "height": page.crop.size.height,
+        },
+        "textCharacters": page.text_characters,
+        "glyphs": page.glyphs,
+        "editableRuns": page.editable_runs,
+        "editableCharacters": page.editable_characters,
+        "refusedCharacters": page.refused_characters,
+        "tjBoundaries": page.tj_boundaries,
+        "pageRefusal": page.page_refusal.map(TextEditRefusalReason::code),
+        "note": page.note,
+        "runs": page.runs.iter().map(text_edit_run_json).collect::<Vec<_>>(),
+        "refusals": page.refusals.iter().map(|(reason, stats)| {
+            (reason.code().to_string(), serde_json::json!({
+                "runs": stats.runs,
+                "characters": stats.characters,
+            }))
+        }).collect::<serde_json::Map<String, serde_json::Value>>(),
+    })
+}
+
+fn text_edit_run_json(run: &TextEditRun) -> serde_json::Value {
+    serde_json::json!({
+        "text": run.text,
+        "rect": {
+            "x": run.rect.origin.x,
+            "y": run.rect.origin.y,
+            "width": run.rect.size.width,
+            "height": run.rect.size.height,
+        },
+        "font": {
+            "baseFont": run.font.base_font,
+            "subtype": run.font.subtype.code(),
+            "embedded": run.font.embedded,
+            "subset": run.font.subset,
+            "vertical": run.font.vertical,
+            "toUnicode": run.font.to_unicode,
+            "encoding": run.font.encoding,
+            "widthSource": run.font.width_source.code(),
+        },
+        "fontSize": run.font_size,
+        "operator": run.operator.code(),
+        "tjAdjusted": run.tj_adjusted,
+        "operatorIndex": run.operator_index,
+        "originalAdvance": run.original_advance,
+        "availableAdvance": run.available_advance,
+        "atLineEnd": run.at_line_end,
+        "deletionSafe": run.deletion_safe,
+        "replacementCharacters": run.replacement_char_count,
+        "replacementSample": run.replacement_sample,
+        "refusal": run.refusal.map(TextEditRefusalReason::code),
+        "detail": run.detail,
+    })
 }
 
 fn cmd_text(args: &[String]) -> ExitCode {
