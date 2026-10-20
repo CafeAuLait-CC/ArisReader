@@ -92,7 +92,11 @@ jobs:
       - name: Prove PDFium loads before running the write regressions
         run: cargo run --quiet -p lyra-reader-cli -- info tests/fixtures/signed-signature.pdf
 
+      - name: PDFium serial diagnostics
+        run: cargo test -p lyra-reader-pdfium --lib -- --test-threads=1
+
       - name: cargo test --workspace
+        if: success() || failure()
         run: cargo test --workspace
 
       # No Metal device here, and the workspace compiles only wgpu's Metal backend
