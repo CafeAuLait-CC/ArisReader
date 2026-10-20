@@ -2,6 +2,7 @@ import LyraReaderFFI
 import Combine
 import AppKit
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 
 /// Sidebar tabs (see `docs/04-ui-ux.md` §2.2).
@@ -617,7 +618,81 @@ public final class AppState: ObservableObject {
     /// Page placements from the last layout pass (hit-testing needs them).
     private var visiblePagePlacements: [PagePlacement] = []
 
-    /// A highlight the reader added.
+    /// The small, honest set of stamps a reader actually uses.
+///
+/// The words and colours are the stamp's whole design, so they live in one place: the toolbar
+/// menu, the canvas badge, the sidebar row and the PDF appearance all read them from here. A
+/// date stamp freezes today's date into `note` when it is placed, so moving or resaving it never
+/// changes what the stamp says.
+public enum StampStyle: String, CaseIterable, Codable, Sendable, Identifiable {
+    case approved
+    case reviewed
+    case draft
+    case confidential
+    /// A dated mark: its words are the local date at placement time (`YYYY-MM-DD`).
+    case date
+
+    public var id: String { rawValue }
+
+    /// The menu label, in the reader's words.
+    public var title: String {
+        switch self {
+        case .approved: return "Approved"
+        case .reviewed: return "Reviewed"
+        case .draft: return "Draft"
+        case .confidential: return "Confidential"
+        case .date: return "Date"
+        }
+    }
+
+    /// The words on the stamp. A date stamp is computed when it is placed; every other style is
+    /// a fixed phrase.
+    public func text(on day: Date = Date()) -> String {
+        switch self {
+        case .approved: return "APPROVED"
+        case .reviewed: return "REVIEWED"
+        case .draft: return "DRAFT"
+        case .confidential: return "CONFIDENTIAL"
+        case .date:
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = .current
+            formatter.dateFormat = "yyyy-MM-dd"
+            return formatter.string(from: day)
+        }
+    }
+
+    /// The ink and border colour. Deliberately a small palette with a meaning, not a free
+    /// colour: a green "APPROVED" and a red "CONFIDENTIAL" are read before the words are.
+    public var color: AnnotationColor {
+        switch self {
+        case .approved:
+            return AnnotationColor(red: 0x1B, green: 0x7F, blue: 0x3B, alpha: 255)
+        case .reviewed:
+            return AnnotationColor(red: 0x1F, green: 0x5F, blue: 0xA8, alpha: 255)
+        case .draft:
+            return AnnotationColor(red: 0x6B, green: 0x72, blue: 0x80, alpha: 255)
+        case .confidential:
+            return AnnotationColor(red: 0xB3, green: 0x26, blue: 0x1E, alpha: 255)
+        case .date:
+            return AnnotationColor(red: 0x33, green: 0x41, blue: 0x55, alpha: 255)
+        }
+    }
+
+    /// The style a file's private key or standard `/Name` maps to.
+    public init?(fileStyle: String) {
+        switch fileStyle.lowercased() {
+        case "approved": self = .approved
+        case "reviewed": self = .reviewed
+        case "draft": self = .draft
+        case "confidential": self = .confidential
+        case "date": self = .date
+        default: return nil
+        }
+    }
+}
+
+/// A highlight the reader added.
 ///
 /// Stored in a sidecar JSON next to the document rather than inside the PDF itself: writing
 /// PDF annotations means round-tripping the file through PDFium (`FPDF_Annot_*` +
@@ -646,13 +721,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case stickyNote
         /// A placeable text box laid out in `shapeRect`, with its text in `note`.
         case textBox
+        /// A rubber stamp: `note` is its wording, `stampStyle` its style, `shapeRect` its box.
+        /// Written into the PDF as `/Stamp` with an appearance stream that draws the border and
+        /// the words in the bundled font, which is the same font the canvas draws.
+        case stamp
+        /// An image signature: `imageData` is the picture the reader chose, `shapeRect` its box.
+        /// Written into the PDF as a `/Stamp` whose appearance stream paints the image.
+        case signature
 
         /// Whether this kind is stored as geometry rather than as a character range.
         public var isGeometry: Bool {
             switch self {
             case .highlight, .underline, .strikeout: return false
             case .ink, .square, .circle, .line, .arrow: return true
-            case .stickyNote, .textBox: return false
+            case .stickyNote, .textBox, .stamp, .signature: return false
             }
         }
 
@@ -667,10 +749,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         public var isPlacedText: Bool {
             switch self {
             case .stickyNote, .textBox: return true
-            case .highlight, .underline, .strikeout, .ink, .square, .circle, .line, .arrow:
+            case .highlight, .underline, .strikeout, .ink, .square, .circle, .line, .arrow,
+                 .stamp, .signature:
                 return false
             }
         }
+
+        /// Whether this kind is an image or a stamp badge whose box is placed, moved and
+        /// resized like a note's but whose content is not text to be edited in a text view.
+        public var isStampArtwork: Bool {
+            self == .stamp || self == .signature
+        }
+
+        /// Whether this kind occupies a page box that the select tool can move and resize.
+        ///
+        /// This is the union the canvas needs, not a statement about how the content is drawn:
+        /// ink and shapes move by their geometry, placed text by its box, and a stamp by the box
+        /// its appearance fills.
+        public var isPlacement: Bool { isGeometry || isPlacedText || isStampArtwork }
     }
 
     /// One point of a stored ink stroke or line, as the sidecar writes it.
@@ -717,11 +813,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// half-understood. `AnnotationSidecar` preserves any version it does not know.
     public static let placedTextVersion = 1
 
+    /// The sidecar schema version of a text stamp entry.
+    public static let stampVersion = 1
+
+    /// The sidecar schema version of an image-signature entry.
+    public static let signatureVersion = 1
+
     /// The size a newly placed sticky note icon occupies on the page, in points.
     public static let stickyNoteSize = CGSize(width: 22, height: 22)
 
     /// The default font size of a new text box, in points.
     public static let defaultTextBoxFontSize: CGFloat = 14
+
+    /// The size a newly placed stamp occupies, in page points. Wide enough for `CONFIDENTIAL`
+    /// at a readable size; the reader can move and resize it afterwards.
+    public static let defaultStampSize = CGSize(width: 150, height: 50)
+
+    /// The height a newly placed image signature occupies, in page points. Its width follows the
+    /// picture's aspect ratio, so a tall signature is not stretched on the way in.
+    public static let defaultSignatureHeight: CGFloat = 64
 
     /// The smallest text box the reader may create or resize to, in points.
     ///
@@ -781,11 +891,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Kept so a text box written by another producer keeps the alignment it was saved with
     /// when its text or box is edited. `nil` for every entry except an adopted text box.
     public var textAlignment: String?
+    /// The style of a `.stamp` entry: `approved`, `reviewed`, `draft`, `confidential` or
+    /// `date`. `nil` for every other kind.
+    public var stampStyle: String?
+    /// The picture of a `.signature` entry, exactly the bytes the reader chose (PNG or JPEG).
+    /// Stored base64 in the sidecar, and re-encoded into the PDF as an image XObject on save.
+    public var imageData: Data?
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, page, start, end, color, colorIndex, note, createdAt
         case version, paths, rect, lineStart, lineEnd, strokeWidth, fontSize
         case fileIdentity, quads, textAlignment
+        case stampStyle, image
     }
 
     public init(
@@ -805,7 +922,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         fontSize: CGFloat = 0,
         fileIdentity: String? = nil,
         fileQuads: [StoredRect]? = nil,
-        textAlignment: String? = nil
+        textAlignment: String? = nil,
+        stampStyle: String? = nil,
+        imageData: Data? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -824,6 +943,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         self.fileIdentity = fileIdentity
         self.fileQuads = fileQuads
         self.textAlignment = textAlignment
+        self.stampStyle = stampStyle
+        self.imageData = imageData
     }
 
     /// True when this entry edits an annotation the PDF already carries.
@@ -855,6 +976,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return rect.minX.isFinite && rect.minY.isFinite
                 && rect.width.isFinite && rect.height.isFinite
                 && rect.width >= 1 && rect.height >= 1
+        case .stamp:
+            guard let rect = shapeRect else { return false }
+            return rect.minX.isFinite && rect.minY.isFinite
+                && rect.width.isFinite && rect.height.isFinite
+                && rect.width >= 12 && rect.height >= 8
+                && !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .signature:
+            guard let rect = shapeRect else { return false }
+            return rect.minX.isFinite && rect.minY.isFinite
+                && rect.width.isFinite && rect.height.isFinite
+                && rect.width >= 6 && rect.height >= 6
+                && !(imageData?.isEmpty ?? true)
         case .textBox:
             guard let rect = shapeRect else { return false }
             return rect.minX.isFinite && rect.minY.isFinite
@@ -887,7 +1020,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
                           width: max(abs(end.x - start.x), 0.01),
                           height: max(abs(end.y - start.y), 0.01))
-        case .stickyNote, .textBox:
+        case .stickyNote, .textBox, .stamp, .signature:
             return shapeRect
         case .highlight, .underline, .strikeout:
             return nil
@@ -896,7 +1029,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// A copy moved by `dx`/`dy` in page points.
     public func translated(by dx: CGFloat, dy: CGFloat) -> Annotation {
-        guard kind.isGeometry || kind.isPlacedText else { return self }
+        guard kind.isPlacement else { return self }
         var copy = self
         copy.inkPaths = inkPaths.map { path in
             path.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }
@@ -966,6 +1099,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let rect = try values.decodeIfPresent(StoredRect.self, forKey: .rect) {
                 shapeRect = CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
             }
+        } else if kind.isStampArtwork {
+            let expected = kind == .stamp ? Self.stampVersion : Self.signatureVersion
+            let version = try values.decodeIfPresent(Int.self, forKey: .version)
+            guard version == expected else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .version,
+                    in: values,
+                    debugDescription: "stamp annotation schema \(version.map(String.init) ?? "missing") is not supported"
+                )
+            }
+            start = 0
+            end = 0
+            note = try values.decodeIfPresent(String.self, forKey: .note) ?? ""
+            stampStyle = try values.decodeIfPresent(String.self, forKey: .stampStyle)
+            imageData = try values.decodeIfPresent(Data.self, forKey: .image)
+            if let rect = try values.decodeIfPresent(StoredRect.self, forKey: .rect) {
+                shapeRect = CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+            }
         } else {
             start = try values.decode(Int.self, forKey: .start)
             end = try values.decode(Int.self, forKey: .end)
@@ -985,7 +1136,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             color = AppState.highlightPalette[index].color
         }
         createdAt = try values.decode(Date.self, forKey: .createdAt)
-        if (kind.isGeometry || kind.isPlacedText), !hasValidGeometry {
+        if (kind.isPlacement), !hasValidGeometry {
             throw DecodingError.dataCorruptedError(
                 forKey: .kind,
                 in: values,
@@ -1029,7 +1180,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     try values.encode(StoredPoint(x: Double(end.x), y: Double(end.y)),
                                       forKey: .lineEnd)
                 }
-            case .stickyNote, .textBox, .highlight, .underline, .strikeout:
+            case .stickyNote, .textBox, .stamp, .signature,
+                 .highlight, .underline, .strikeout:
                 break
             }
         } else if kind.isPlacedText {
@@ -1040,6 +1192,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                   forKey: .rect)
             }
             try values.encode(Double(fontSize), forKey: .fontSize)
+        } else if kind.isStampArtwork {
+            try values.encode(
+                kind == .stamp ? Self.stampVersion : Self.signatureVersion,
+                forKey: .version)
+            if let rect = shapeRect {
+                try values.encode(StoredRect(x: Double(rect.minX), y: Double(rect.minY),
+                                             width: Double(rect.width), height: Double(rect.height)),
+                                  forKey: .rect)
+            }
+            if let stampStyle { try values.encode(stampStyle, forKey: .stampStyle) }
+            if let imageData { try values.encode(imageData, forKey: .image) }
         } else {
             try values.encode(start, forKey: .start)
             try values.encode(end, forKey: .end)
@@ -1642,7 +1805,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         switch annotation.kind {
         case "highlight", "underline", "strikeout", "text", "freeText",
-             "ink", "square", "circle", "line":
+             "ink", "square", "circle", "line", "stamp":
             break
         case "squiggly":
             return .unsupported(
@@ -1657,6 +1820,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if annotation.kind == "line" && (annotation.lineStart == nil || annotation.lineEnd == nil) {
             return .unsupported(reason: "This line annotation carries no /L endpoints.")
+        }
+        if annotation.kind == "stamp",
+           annotation.stampImageData == nil,
+           (annotation.stampText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let reason = annotation.stampImageError {
+            return .unsupported(
+                reason: "This stamp's picture could not be decoded (\(reason)), so it can be "
+                    + "deleted here but not moved, resized or edited.")
         }
         if annotation.drawing == .skipped {
             return .unsupported(reason: "This annotation is not drawn by the reader.")
@@ -1687,6 +1858,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case "square": kind = .square
         case "circle": kind = .circle
         case "line": kind = document.lineArrow ? .arrow : .line
+        case "stamp":
+            if !(document.stampText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                kind = .stamp
+            } else if document.stampImageData != nil {
+                kind = .signature
+            } else {
+                return nil
+            }
         default: return nil
         }
         let opacity = min(max(document.opacity ?? 1.0, 0.0), 1.0)
@@ -1702,6 +1881,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             colour = AnnotationColor(red: AnnotationColor.defaultNote.red,
                                      green: AnnotationColor.defaultNote.green,
                                      blue: AnnotationColor.defaultNote.blue, alpha: alpha)
+        } else if kind == .stamp {
+            let style = StampStyle(fileStyle: document.stampStyle)?.color
+                ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: 255)
+            colour = AnnotationColor(red: style.red, green: style.green, blue: style.blue,
+                                     alpha: alpha)
         } else {
             let grey = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
             colour = AnnotationColor(red: 0x80, green: 0x80, blue: 0x80, alpha: grey)
@@ -1755,6 +1939,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 color: colour, note: document.contents ?? "", createdAt: now,
                 lineStart: start, lineEnd: end, strokeWidth: width,
                 fileIdentity: document.id)
+        case .stamp:
+            let text = document.stampText ?? document.contents ?? ""
+            guard box.width >= 12, box.height >= 8,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return Annotation(
+                id: id, kind: .stamp, page: document.page, start: 0, end: 0,
+                color: colour, note: text, createdAt: now, shapeRect: box,
+                fileIdentity: document.id,
+                stampStyle: StampStyle(fileStyle: document.stampStyle)?.rawValue ?? "custom")
+        case .signature:
+            guard box.width >= 6, box.height >= 6,
+                  let data = document.stampImageData, !data.isEmpty else { return nil }
+            return Annotation(
+                id: id, kind: .signature, page: document.page, start: 0, end: 0,
+                color: colour, note: "", createdAt: now, shapeRect: box,
+                fileIdentity: document.id, stampStyle: "signature", imageData: data)
         }
     }
 
@@ -1803,6 +2003,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var annotations: [Annotation] = [] {
         didSet { rebuildAnnotationPassages() }
     }
+    /// The stamp style the armed stamp tool will place, or `nil` when no style is armed.
+    @Published public var pendingStampStyle: StampStyle?
+    /// The picture the armed signature tool will place, or `nil` when it is not armed.
+    @Published public var pendingSignatureImageData: Data?
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The eraser removes ink on a drag. The
     /// modes cannot both be active.
@@ -1822,6 +2026,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     eraserHoverMarkID = nil
                     cancelEraserGesture()
                 }
+                // A placed stamp or signature picture belongs to its own tool; leaving that tool
+                // disarms it so a later click cannot place the wrong picture.
+                if annotationTool != .stamp { pendingStampStyle = nil }
+                if annotationTool != .signature { pendingSignatureImageData = nil }
                 // Selection is the Select tool's business: arming a pen, shape, markup or the
                 // eraser drops the halo instead of leaving a mark that Delete would still act on.
                 cancelPendingMarkSelection()
@@ -1991,6 +2199,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Textures for the sidecar's sticky notes and text boxes: the icon and the laid-out text,
     /// keyed by every input that changes a pixel.
     private var placedGlyphTextures: [PlacedGlyphKey: PageImage] = [:]
+    /// Stamp badges and signature images, keyed by every input that changes a pixel.
+    private var stampGlyphTextures: [StampGlyphKey: PageImage] = [:]
 
     /// Whether to print the annotations handed to the canvas (`LYRA_READER_CANVAS_DUMP=1`).
     ///
@@ -3439,6 +3649,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if hadMarkSelection { clearAnnotationSelection() }
             return true
         }
+        if annotationTool == .stamp || annotationTool == .signature {
+            pendingStampStyle = nil
+            pendingSignatureImageData = nil
+            annotationTool = .select
+            statusMessage = "Stamp tool off"
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
         guard hadMarkSelection else { return false }
         clearAnnotationSelection()
         return true
@@ -3602,7 +3820,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .line, .arrow:
             guard let start = lineStart, let end = lineEnd,
                   hypot(end.x - start.x, end.y - start.y) >= 1 else { return false }
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             return false
         }
 
@@ -3669,9 +3887,280 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .ink:
             return addInkAnnotation(page: page, points: [start, end], color: color,
                                     strokeWidth: strokeWidth)
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             return false
         }
+    }
+
+    // MARK: - Stamps and image signatures
+
+    /// Arms the stamp tool with one style. The next click on a page places it.
+    public func armStampTool(_ style: StampStyle) {
+        pendingStampStyle = style
+        pendingSignatureImageData = nil
+        annotationTool = .stamp
+        statusMessage = "Click on the page to place a \(style.title) stamp"
+    }
+
+    /// Arms the signature tool with the image the reader chose. The next click places it.
+    ///
+    /// A hand-drawn signature is the pen, not a second signature tool: the pen writes an `/Ink`
+    /// annotation, which every viewer can read, while this places a picture.
+    public func armSignatureTool(imageData: Data) {
+        guard !imageData.isEmpty else {
+            lastError = "That image file is empty."
+            return
+        }
+        pendingSignatureImageData = imageData
+        pendingStampStyle = nil
+        annotationTool = .signature
+        statusMessage = "Click on the page to place the signature image"
+    }
+
+    /// Places the armed stamp centred on a content point. Returns whether it was added.
+    @discardableResult
+    public func placeStamp(atContentPoint point: CGPoint) -> Bool {
+        guard let style = pendingStampStyle,
+              let hit = pagePoint(atContentPoint: point) else { return false }
+        let placed = addStampAnnotation(page: hit.page, style: style, center: hit.point)
+        if placed { pendingStampStyle = nil; annotationTool = .select }
+        return placed
+    }
+
+    /// Places the armed signature image centred on a content point.
+    @discardableResult
+    public func placeSignature(atContentPoint point: CGPoint) -> Bool {
+        guard let data = pendingSignatureImageData,
+              let hit = pagePoint(atContentPoint: point) else { return false }
+        let placed = addSignatureAnnotation(page: hit.page, imageData: data, center: hit.point)
+        if placed { pendingSignatureImageData = nil; annotationTool = .select }
+        return placed
+    }
+
+    /// Adds a text stamp centred at `center` in page space. Exposed for the checks and the
+    /// toolbar; the click path is [`placeStamp`].
+    @discardableResult
+    public func addStampAnnotation(page: Int, style: StampStyle, center: CGPoint) -> Bool {
+        guard let document, page >= 0, page < document.pageCount,
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+        guard annotationWritesBlockedReason == nil else {
+            lastError = annotationWritesBlockedReason
+            return false
+        }
+        let text = style.text()
+        guard let box = placementBox(page: page, size: Annotation.defaultStampSize,
+                                     center: center) else { return false }
+        let annotation = Annotation(
+            id: UUID(),
+            kind: .stamp,
+            page: page,
+            start: 0,
+            end: 0,
+            color: style.color,
+            note: text,
+            createdAt: Date(),
+            shapeRect: box,
+            strokeWidth: 0,
+            stampStyle: style.rawValue
+        )
+        return appendPlacedArtwork(annotation)
+    }
+
+    /// Adds an image signature centred at `center` in page space. The picture's aspect ratio
+    /// decides the initial width, so a tall signature is not stretched on the way in.
+    @discardableResult
+    public func addSignatureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
+        guard let document, page >= 0, page < document.pageCount,
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+        guard annotationWritesBlockedReason == nil else {
+            lastError = annotationWritesBlockedReason
+            return false
+        }
+        guard let size = Self.signatureBoxSize(imageData) else {
+            lastError = "That file is not an image the reader can place."
+            return false
+        }
+        guard let box = placementBox(page: page, size: size, center: center) else { return false }
+        let annotation = Annotation(
+            id: UUID(),
+            kind: .signature,
+            page: page,
+            start: 0,
+            end: 0,
+            color: AnnotationColor(red: 0, green: 0, blue: 0, alpha: 255),
+            note: "",
+            createdAt: Date(),
+            shapeRect: box,
+            strokeWidth: 0,
+            stampStyle: "signature",
+            imageData: imageData
+        )
+        return appendPlacedArtwork(annotation)
+    }
+
+    /// The one commit path for a placed stamp or signature: sidecar first, then one undo step.
+    private func appendPlacedArtwork(_ annotation: Annotation) -> Bool {
+        guard annotation.hasValidGeometry else { return false }
+        var updated = annotations
+        updated.append(annotation)
+        guard saveAnnotations(updated, trigger: "add-\(annotation.kind.rawValue)") else {
+            return false
+        }
+        undoStack.append(.added(annotation))
+        redoStack.removeAll()
+        selectedAnnotationID = annotation.id
+        refreshSelectionOverlay()
+        reloadVisiblePages()
+        statusMessage = "Placed a \(annotation.kind == .stamp ? "stamp" : "signature image")"
+        return true
+    }
+
+    /// A page-space box of `size` centred at `center`, clamped inside the page.
+    private func placementBox(page: Int, size: CGSize, center: CGPoint) -> CGRect? {
+        let pageSize: CGSize
+        if let placement = visiblePagePlacements.first(where: { $0.index == page }) {
+            pageSize = CGSize(width: placement.widthPt, height: placement.heightPt)
+        } else if page == 0 {
+            pageSize = document?.firstPageSize ?? .zero
+        } else {
+            return nil
+        }
+        guard pageSize.width > 1, pageSize.height > 1 else { return nil }
+        let width = min(size.width, pageSize.width)
+        let height = min(size.height, pageSize.height)
+        let x = min(max(0, center.x - width / 2), max(0, pageSize.width - width))
+        let y = min(max(0, center.y - height / 2), max(0, pageSize.height - height))
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// The initial page-space size of an image signature, from the picture's pixel aspect ratio.
+    private static func signatureBoxSize(_ data: Data) -> CGSize? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width > 0, height > 0 else { return nil }
+        let aspect = width / height
+        let clamped = min(max(aspect, 0.2), 8.0)
+        return CGSize(width: Annotation.defaultSignatureHeight * clamped,
+                      height: Annotation.defaultSignatureHeight)
+    }
+
+    /// Decodes an image signature into the straight RGBA the PDF writer stores.
+    ///
+    /// The picture is capped at 2048 px on its longest side: a signature is displayed at tens of
+    /// points, and an 8000 px scan would add megabytes to every save without adding detail a
+    /// reader can see. The alpha channel is un-premultiplied because that is what the writer's
+    /// `/SMask` expects.
+    static func signaturePixels(_ data: Data) -> (width: Int, height: Int, rgba: [UInt8])? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        let longest = max(image.width, image.height)
+        let scale = longest > 2048 ? 2048.0 / Double(longest) : 1.0
+        let width = max(1, Int((Double(image.width) * scale).rounded()))
+        let height = max(1, Int((Double(image.height) * scale).rounded()))
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let success = rgba.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue
+            ) else { return false }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard success else { return nil }
+        for pixel in stride(from: 0, to: rgba.count - 3, by: 4) {
+            let alpha = Int(rgba[pixel + 3])
+            if alpha == 255 || alpha == 0 { continue }
+            for channel in 0..<3 {
+                let value = (Int(rgba[pixel + channel]) * 255 + alpha / 2) / alpha
+                rgba[pixel + channel] = UInt8(min(value, 255))
+            }
+        }
+        return (width, height, rgba)
+    }
+
+    /// One stamp or signature as a write request: a `/Stamp` with text or an image.
+    private func stampWriteRequest(
+        _ annotation: Annotation,
+        zoom: CGFloat,
+        modified: String
+    ) throws -> AnnotationWriteRequest {
+        guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
+            )
+        }
+        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
+                          width: box.width * zoom, height: box.height * zoom)
+        guard rect.width > 0.5, rect.height > 0.5 else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has a box too small to write"]
+            )
+        }
+        if annotation.kind == .stamp {
+            guard !annotation.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw NSError(
+                    domain: "LyraReader",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Stamp \(annotation.id.uuidString) has no text to write"]
+                )
+            }
+            return AnnotationWriteRequest(
+                id: annotation.id.uuidString,
+                page: annotation.page,
+                kind: .stamp,
+                rect: rect,
+                quads: [],
+                color: annotation.color,
+                opacity: Double(annotation.color.alpha) / 255.0,
+                contents: annotation.note,
+                author: Self.annotationAuthor,
+                modified: modified,
+                stampStyle: annotation.stampStyle ?? "custom"
+            )
+        }
+        guard let data = annotation.imageData,
+              let pixels = Self.signaturePixels(data) else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Signature \(annotation.id.uuidString) has no image the writer can read"]
+            )
+        }
+        return AnnotationWriteRequest(
+            id: annotation.id.uuidString,
+            page: annotation.page,
+            kind: .signature,
+            rect: rect,
+            quads: [],
+            color: annotation.color,
+            opacity: 1.0,
+            contents: "",
+            author: Self.annotationAuthor,
+            modified: modified,
+            signatureWidth: pixels.width,
+            signatureHeight: pixels.height,
+            signatureRGBA: pixels.rgba
+        )
     }
 
     // MARK: - Placeable notes and text boxes
@@ -3698,7 +4187,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ) -> PlacedTextHit? {
         guard let pageHit = pagePoint(atContentPoint: point) else { return nil }
         let tolerance = toleranceViewPt / max(zoomFactor, 0.01)
-        for annotation in annotations.reversed() where annotation.kind.isPlacedText {
+        for annotation in annotations.reversed() where annotation.kind.isPlacement {
             guard annotation.page == pageHit.page, let rect = annotation.shapeRect else { continue }
             let local = pageHit.point
             switch annotation.kind {
@@ -3706,7 +4195,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard rect.insetBy(dx: -tolerance, dy: -tolerance).contains(local) else { continue }
                 return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                      handle: nil)
-            case .textBox:
+            case .textBox, .stamp, .signature:
                 let selected = annotation.id == selectedAnnotationID
                 if selected,
                    let handle = textBoxHandle(at: local, in: rect, tolerance: tolerance) {
@@ -3721,7 +4210,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                          handle: nil)
                 }
-            default:
+            case .ink, .square, .circle, .line, .arrow, .highlight, .underline, .strikeout:
                 continue
             }
         }
@@ -4083,7 +4572,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if handle.movesRight { maxX += delta.x }
         if handle.movesTop { minY += delta.y }
         if handle.movesBottom { maxY += delta.y }
-        let minimum = Annotation.minimumTextBoxSize
+        let minimum = Self.minimumPlacementSize(for: original.kind)
         if maxX - minX < minimum.width {
             if handle.movesLeft { minX = maxX - minimum.width } else { maxX = minX + minimum.width }
         }
@@ -4095,6 +4584,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         minY = max(0, min(minY, placement.heightPt - minimum.height))
         maxY = max(minY + minimum.height, min(maxY, placement.heightPt))
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// The smallest page-space box a placed mark may be resized to.
+    ///
+    /// A text box keeps room for one line at its smallest font; a stamp keeps its border and one
+    /// short word legible; a signature keeps enough pixels to be recognisable.
+    static func minimumPlacementSize(for kind: Annotation.Kind) -> CGSize {
+        switch kind {
+        case .textBox: return Annotation.minimumTextBoxSize
+        case .stamp: return CGSize(width: 60, height: 20)
+        case .signature: return CGSize(width: 24, height: 12)
+        case .stickyNote: return CGSize(width: 8, height: 8)
+        default: return CGSize(width: 8, height: 8)
+        }
     }
 
     /// Commits a resize on mouse-up: one sidecar write and one undo step for the whole drag.
@@ -4138,7 +4641,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         redoStack.removeAll()
         selectedAnnotationID = original.id
         refreshSelectionOverlay()
-        statusMessage = "Resized the text box"
+        statusMessage = "Resized the \(original.kind == .textBox ? "text box" : original.kind.rawValue)"
     }
 
     /// The page under a **content point** and the point in that page's own space (top-left,
@@ -4164,8 +4667,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// overlay hit-tests and what its dashed selection halo follows.
     public var canvasAnnotationMarks: [CanvasAnnotationMark] {
         var marks: [CanvasAnnotationMark] = annotations.compactMap { annotation in
-            guard annotation.kind.isGeometry || annotation.kind.isPlacedText
-                    || annotation.kind.isTextMarkup else { return nil }
+            guard annotation.kind.isPlacement || annotation.kind.isTextMarkup else { return nil }
             return CanvasAnnotationMark(
                 id: annotation.id.uuidString,
                 page: annotation.page,
@@ -4214,7 +4716,47 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 isEditable: true
             ))
         }
+        // A stamp the PDF carries is drawn by the canvas' texture pass, but its box is on the
+        // overlay so the select tool can hit-test and the adoption path can take it over. The
+        // overlay's `layers(for:)` deliberately draws nothing for a stamp: one picture, one owner.
+        for annotation in documentAnnotations
+        where annotation.visible && annotation.drawing == .stamp {
+            let color = annotation.color ?? AnnotationColor(
+                red: 0x80, green: 0x80, blue: 0x80, alpha: 255)
+            marks.append(CanvasAnnotationMark(
+                id: "pdf:" + annotation.id,
+                page: annotation.page,
+                kind: .stamp,
+                shapeRect: CGRect(x: annotation.xPt, y: annotation.yPt,
+                                  width: annotation.widthPt, height: annotation.heightPt),
+                color: color,
+                strokeWidth: 0,
+                isSelected: false,
+                isEditable: true
+            ))
+        }
         return marks
+    }
+
+    /// A stamp the PDF carries under a content point.
+    ///
+    /// Unlike [`documentGeometryHit`] this returns a stamp the reader cannot edit as well: the
+    /// click has to reach the one sentence that says why (it can still be deleted), rather than
+    /// falling through to the text underneath and looking like the stamp was not there.
+    public func documentStampHit(atContentPoint point: CGPoint)
+        -> (annotation: DocumentAnnotation, page: Int, point: CGPoint)? {
+        guard let hit = pagePoint(atContentPoint: point) else { return nil }
+        for annotation in documentAnnotations.reversed()
+        where annotation.visible && annotation.drawing == .stamp
+            && annotation.page == hit.page {
+            let rect = CGRect(x: annotation.xPt, y: annotation.yPt,
+                              width: annotation.widthPt, height: annotation.heightPt)
+            let slack = Self.noteClickSlackPt / max(zoomFactor, 0.01)
+            if rect.insetBy(dx: -slack, dy: -slack).contains(hit.point) {
+                return (annotation, hit.page, hit.point)
+            }
+        }
+        return nil
     }
 
     /// The page frames the canvas needs to map page-local marks into the view.
@@ -4677,7 +5219,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard delta.x != 0 || delta.y != 0,
               let index = annotations.firstIndex(where: { $0.id == id }) else { return false }
         let before = annotations[index]
-        guard before.kind.isGeometry || before.kind.isPlacedText else { return false }
+        guard before.kind.isPlacement else { return false }
         let after = before.translated(by: delta.x, dy: delta.y)
         guard after.hasValidGeometry else { return false }
         var updated = annotations
@@ -4689,6 +5231,55 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
         statusMessage = "Moved \(after.kind.rawValue) annotation"
         return true
+    }
+
+    /// Resizes a placed mark to `rect` in page space, as one undo step.
+    ///
+    /// The drag path calls this through `resizedTextBox`; the checks use it to exercise a
+    /// resize without synthesising pointer events. A box below the kind's minimum is refused
+    /// rather than silently clamped, so a caller cannot turn a stamp into an invisible mark.
+    @discardableResult
+    public func resizeAnnotation(_ id: UUID, to rect: CGRect) -> Bool {
+        guard let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].kind.isPlacement else { return false }
+        let before = annotations[index]
+        let minimum = Self.minimumPlacementSize(for: before.kind)
+        guard rect.width >= minimum.width, rect.height >= minimum.height,
+              rect.minX.isFinite, rect.minY.isFinite else { return false }
+        var after = before
+        after.shapeRect = rect
+        guard after.hasValidGeometry else { return false }
+        var updated = annotations
+        updated[index] = after
+        guard saveAnnotations(updated, trigger: "resize-\(after.kind.rawValue)") else { return false }
+        undoStack.append(.replaced(before: before, after: after))
+        redoStack.removeAll()
+        selectedAnnotationID = id
+        refreshSelectionOverlay()
+        reloadVisiblePages()
+        statusMessage = "Resized the \(after.kind.rawValue)"
+        return true
+    }
+
+    /// The canvas bitmap the reader draws for one stamp the PDF carries.
+    ///
+    /// Only the checks call this, to prove the same routine the canvas uses produced a picture
+    /// from a foreign producer's stamp. It is package-internal for that reason.
+    package func documentStampBitmapForCheck(_ documentID: String) -> PageImage? {
+        guard let index = documentAnnotations.firstIndex(where: { $0.id == documentID }) else {
+            return nil
+        }
+        let annotation = documentAnnotations[index]
+        guard let box = annotation.boxes.first else { return nil }
+        return stampGlyphTexture(
+            kind: annotation.stampText?.isEmpty == false ? .stamp : .signature,
+            text: annotation.stampText ?? "",
+            style: annotation.stampStyle,
+            color: annotation.color ?? AnnotationColor(red: 0x80, green: 0x80, blue: 0x80,
+                                                       alpha: 255),
+            imageData: annotation.stampImageData,
+            boxPt: CGSize(width: box.widthPt, height: box.heightPt),
+            cacheKey: "doc-check:\(index)")
     }
 
     // MARK: - Adopting and deleting annotations the PDF carries
@@ -6471,6 +7062,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                        for: annotation)
                 continue
             }
+            if annotation.kind.isStampArtwork {
+                record(try stampWriteRequest(annotation, zoom: zoom, modified: modified),
+                       for: annotation)
+                continue
+            }
             if annotation.kind.isGeometry {
                 record(try geometryWriteRequest(annotation, zoom: zoom, modified: modified),
                        for: annotation)
@@ -6640,7 +7236,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .arrow:
             let head = max(width * 5, 8)
             outer = outer.insetBy(dx: -(width / 2 + head), dy: -(width / 2 + head))
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             break
         }
         guard outer.width > 0.5, outer.height > 0.5 else {
@@ -6667,12 +7263,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .highlight: kind = .highlight
         case .underline: kind = .underline
         case .strikeout: kind = .strikeout
-        case .stickyNote, .textBox:
+        case .stickyNote, .textBox, .stamp, .signature:
             throw NSError(
                 domain: "LyraReader",
                 code: 3,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "Placed text is written by its own request builder"])
+                    "Placed text and stamp artwork are written by their own request builders"])
         }
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
@@ -11358,6 +11954,34 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ))
         }
 
+        // Stamps and image signatures are pictures, like a note icon: the canvas' textured-quad
+        // path draws them, and the overlay only draws the selection halo and the resize handles.
+        for (annotationIndex, annotation) in annotations.enumerated()
+        where annotation.kind.isStampArtwork {
+            guard let placement = visiblePagePlacements.first(where: { $0.index == annotation.page }),
+                  let box = annotation.shapeRect,
+                  let image = stampGlyphTexture(
+                    kind: annotation.kind,
+                    text: annotation.note,
+                    style: annotation.stampStyle ?? "",
+                    color: annotation.color,
+                    imageData: annotation.imageData,
+                    boxPt: box.size,
+                    cacheKey: "own:\(annotationIndex)")
+            else { continue }
+            pages.append(CanvasPage(
+                placement: PagePlacement(
+                    index: PlacementIndex.ownNote(annotationIndex),
+                    topPt: placement.topPt + box.minY,
+                    leftPt: placement.leftPt + box.minX,
+                    widthPt: box.width,
+                    heightPt: box.height
+                ),
+                image: image,
+                blend: .normal
+            ))
+        }
+
         for marker in ownInlineNoteMarkers {
             let annotation = annotations[marker.annotationIndex]
             guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }),
@@ -11423,6 +12047,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                           color: annotation.color ?? .defaultNote,
                           boxPt: CGSize(width: box.widthPt, height: box.heightPt)
                       )
+                else { continue }
+                appendNoteGlyph(
+                    image,
+                    index: PlacementIndex.documentNote(annotationIndex),
+                    box: box,
+                    placement: placement,
+                    annotation: annotation,
+                    to: &pages
+                )
+
+            case .stamp:
+                guard let box = annotation.boxes.first,
+                      let image = stampGlyphTexture(
+                        kind: annotation.stampText?.isEmpty == false ? .stamp : .signature,
+                        text: annotation.stampText ?? "",
+                        style: annotation.stampStyle,
+                        color: annotation.color ?? neutralColor,
+                        imageData: annotation.stampImageData,
+                        boxPt: CGSize(width: box.widthPt, height: box.heightPt),
+                        cacheKey: "doc:\(annotationIndex)")
                 else { continue }
                 appendNoteGlyph(
                     image,
@@ -11595,7 +12239,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         case .markup:
             NoteGlyph.inlineComment(color: color, boxPt: boxPt, scale: scale, generation: generation)
-        case .geometry, .skipped:
+        case .geometry, .stamp, .skipped:
             nil
         }
         if let image { noteGlyphTextures[key] = image }
@@ -11638,6 +12282,67 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if let image { placedGlyphTextures[key] = image }
         return image
+    }
+
+    /// The bitmap for one stamp badge or image signature, from the cache or freshly rendered.
+    ///
+    /// A text stamp is drawn with the same bundled font, border insets and fitted size the PDF
+    /// writer uses, so the badge on screen and the `/AP` stream in the file say the same thing.
+    /// An image signature is drawn from the picture's own pixels; a file-owned one arrives
+    /// already decoded (`png`/`jpeg`) from the Rust reader.
+    private func stampGlyphTexture(
+        kind: AppState.Annotation.Kind,
+        text: String,
+        style: String,
+        color: AnnotationColor,
+        imageData: Data?,
+        boxPt: CGSize,
+        cacheKey: String
+    ) -> PageImage? {
+        guard boxPt.width > 0, boxPt.height > 0 else { return nil }
+        let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let key = StampGlyphKey(
+            cacheKey: cacheKey,
+            kind: kind,
+            text: text,
+            style: style,
+            color: color,
+            imageData: imageData,
+            boxPt: boxPt,
+            scale: scale
+        )
+        if let cached = stampGlyphTextures[key] { return cached }
+
+        nextAnnotationTextureGeneration += 1
+        let generation = nextAnnotationTextureGeneration
+        let image: PageImage?
+        switch kind {
+        case .signature:
+            image = imageData
+                .flatMap { CGImageSourceCreateWithData($0 as CFData, nil) }
+                .flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+                .flatMap { NoteGlyph.signatureImage($0, boxPt: boxPt, scale: scale,
+                                                    generation: generation) }
+        case .stamp:
+            image = NoteGlyph.stamp(text, color: color, boxPt: boxPt, scale: scale,
+                                    generation: generation)
+        default:
+            image = nil
+        }
+        if let image { stampGlyphTextures[key] = image }
+        return image
+    }
+
+    /// Identity of one stamp badge or signature image: every input that changes a pixel.
+    private struct StampGlyphKey: Hashable {
+        let cacheKey: String
+        let kind: AppState.Annotation.Kind
+        let text: String
+        let style: String
+        let color: AnnotationColor
+        let imageData: Data?
+        let boxPt: CGSize
+        let scale: CGFloat
     }
 
     /// Identity of one placed-text glyph: every input that changes a pixel of it.
@@ -11826,6 +12531,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 selection = nil
                 selectionAnchor = nil
                 refreshSelectionOverlay()
+                return
+            }
+            if let hit = documentStampHit(atContentPoint: point) {
+                if Self.documentAnnotationEditability(hit.annotation) == .editable,
+                   let id = adoptDocumentAnnotation(hit.annotation.id),
+                   let annotation = annotations.first(where: { $0.id == id }) {
+                    selectedAnnotationID = id
+                    moveOriginalAnnotation = annotation
+                    moveStartPagePoint = hit.point
+                    resizeOriginalAnnotation = nil
+                    resizeStartPagePoint = nil
+                    resizeHandle = nil
+                    selection = nil
+                    selectionAnchor = nil
+                    refreshSelectionOverlay()
+                    return
+                }
+                _ = selectDocumentAnnotation(hit.annotation.id)
                 return
             }
             if let hit = documentGeometryHit(atContentPoint: point),

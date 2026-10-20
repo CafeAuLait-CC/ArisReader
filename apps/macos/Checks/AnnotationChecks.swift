@@ -887,6 +887,7 @@ extension ReaderChecks {
         var drawnText = 0
         var drawnMarkup = 0
         var drawnGeometry = 0
+        var drawnStamps = 0
         var skipReasons: [String] = []
         for annotation in state.documentAnnotations {
             switch annotation.drawing {
@@ -898,14 +899,16 @@ extension ReaderChecks {
                 drawnText += 1
             case .geometry:
                 drawnGeometry += 1
+            case .stamp:
+                drawnStamps += 1
             case .skipped:
                 require(annotation.skipReason != nil,
                         "a skipped annotation says why (\(annotation.kind))")
                 skipReasons.append(annotation.skipReason?.rawValue ?? "?")
             }
         }
-        require(drawnMarkup + drawnNotes + drawnText + drawnGeometry + skipReasons.count
-                    == state.documentAnnotations.count,
+        require(drawnMarkup + drawnNotes + drawnText + drawnGeometry + drawnStamps
+                    + skipReasons.count == state.documentAnnotations.count,
                 "every content annotation is accounted for exactly once")
         require(drawnMarkup == 0, "this fixture carries no text markup at all")
         require(drawnNotes == 2, "both sticky notes are classified as drawn")

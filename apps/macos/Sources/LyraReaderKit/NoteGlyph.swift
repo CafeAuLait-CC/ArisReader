@@ -201,6 +201,87 @@ enum NoteGlyph {
         )
     }
 
+    /// A text stamp's badge: a double border and one line of words in the bundled font.
+    ///
+    /// The numbers are the same ones the PDF writer uses (`stamp_appearance` in
+    /// `geometry_write.rs`): a border stroke width of 3.5% of the height, an outer inset of half
+    /// that, a 4.5 pt inner rule, a text box inset 6 pt horizontally, a size of at most 42% of the
+    /// height fitted to the width, and a baseline 35% of the size below the centre. Keeping the
+    /// two in step is what "the reader and the file show the same stamp" means in practice.
+    @MainActor static func stamp(
+        _ text: String,
+        color: AnnotationColor,
+        boxPt: CGSize,
+        scale: CGFloat,
+        generation: UInt64
+    ) -> PageImage? {
+        guard let (width, height) = pixelSize(boxPt, scale: scale),
+              let context = context(width: width, height: height) else { return nil }
+        let w = CGFloat(width), h = CGFloat(height)
+        let effective = min(w / max(boxPt.width, 0.01), h / max(boxPt.height, 0.01))
+        let nsColor = nsColor(color)
+
+        let borderPt = stampBorderWidth(boxPt)
+        let border = borderPt * effective
+        let outerInset = border / 2
+        let innerInset = 4.5 * effective
+        context.setStrokeColor(nsColor.cgColor)
+        context.setLineWidth(max(border, 0.5))
+        context.stroke(CGRect(x: outerInset, y: outerInset,
+                              width: w - 2 * outerInset, height: h - 2 * outerInset))
+        context.setLineWidth(max(border * 0.75, 0.4))
+        context.stroke(CGRect(x: innerInset, y: innerInset,
+                              width: w - 2 * innerInset, height: h - 2 * innerInset))
+
+        let words = collapsedStampText(text)
+        guard !words.isEmpty else {
+            return finish(context, width: width, height: height, pointSize: boxPt,
+                          generation: generation)
+        }
+        let sizePt = AnnotationTextFont.stampFontSize(words, width: boxPt.width,
+                                                      height: boxPt.height)
+        let size = sizePt * effective
+        let font = AnnotationTextFont.font(size: size)
+        let attributed = NSAttributedString(
+            string: words,
+            attributes: [.font: font, .kern: 0, .foregroundColor: nsColor]
+        )
+        let line = CTLineCreateWithAttributedString(attributed)
+        let textWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        context.textMatrix = .identity
+        context.textPosition = CGPoint(x: (w - textWidth) / 2, y: h / 2 - size * 0.35)
+        CTLineDraw(line, context)
+        return finish(context, width: width, height: height, pointSize: boxPt,
+                      generation: generation)
+    }
+
+    /// An image signature drawn into its page box. The picture is stretched to the box the
+    /// reader chose; the box starts at the picture's aspect ratio (see
+    /// `AppState.signatureBoxSize`) so it is only distorted by a deliberate resize.
+    @MainActor static func signatureImage(
+        _ image: CGImage,
+        boxPt: CGSize,
+        scale: CGFloat,
+        generation: UInt64
+    ) -> PageImage? {
+        guard let (width, height) = pixelSize(boxPt, scale: scale),
+              let context = context(width: width, height: height) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return finish(context, width: width, height: height, pointSize: boxPt,
+                      generation: generation)
+    }
+
+    /// The stamp border width in page points, shared with the PDF writer.
+    static func stampBorderWidth(_ boxPt: CGSize) -> CGFloat {
+        min(max(boxPt.height * 0.035, 0.75), 2.0)
+    }
+
+    /// One line: runs of whitespace collapse to a single space, as the written appearance does.
+    static func collapsedStampText(_ text: String) -> String {
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
     // MARK: - Drawing
 
     /// The icon itself, in a bottom-left-origin context: a filled page, a folded corner, three

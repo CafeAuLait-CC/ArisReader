@@ -197,7 +197,7 @@ final class AnnotationOverlayView: NSView {
             liveLayer.path = nil
             liveStart = content
             liveEnd = content
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             break
         }
         liveKind = kind
@@ -225,7 +225,7 @@ final class AnnotationOverlayView: NSView {
             let path = CGMutablePath()
             if kind == .square { path.addRect(rect) } else { path.addEllipse(in: rect) }
             liveLayer.path = path
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             break
         }
     }
@@ -257,7 +257,7 @@ final class AnnotationOverlayView: NSView {
                               width: abs(end.x - start.x), height: abs(end.y - start.y))
             guard rect.width >= 1, rect.height >= 1 else { return nil }
             return AnnotationDraft(kind: kind, page: page, shapeRect: rect)
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             return nil
         }
     }
@@ -297,7 +297,7 @@ final class AnnotationOverlayView: NSView {
                     NSNumber(value: 4 / max(zoom, 0.01)),
                     NSNumber(value: 3 / max(zoom, 0.01)),
                 ]
-                if mark.kind == .textBox {
+                if mark.kind == .textBox || mark.kind.isStampArtwork {
                     appendResizeHandles(for: mark, frame: frame)
                 }
             }
@@ -340,7 +340,9 @@ final class AnnotationOverlayView: NSView {
                                        width: mark.strokeWidth)
             paths.stroke = path
             if mark.kind == .arrow { paths.fill = path }
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox:
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
+            // Drawn by the canvas as a texture (a note icon, laid-out text, a stamp badge or a
+            // signature image); this layer only draws the selection halo and the handles.
             return []
         }
 

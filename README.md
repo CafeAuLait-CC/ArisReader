@@ -51,8 +51,9 @@ background execution does not imply parallel PDFium rendering.
 Capabilities, each backed by a check rather than a claim: selection and click-precise text, search,
 tabs that switch without reloading and independent windows, outline with section numbers and levels, page
 and annotation sidebars with reply threads, highlight/underline/strikethrough/ink/shape/sticky-note/text-box
-creation with a colour and blend, and every one of those kinds written back into the PDF through a verified
-incremental save; staged page editing; merge and split into new files; facing pages, page gap and bookmarks; a redaction that removes the
+creation with a colour and blend, a small set of text stamps (Approved, Reviewed, Draft,
+Confidential and a dated mark) and image signatures, and every one of those kinds written back into the
+PDF through a verified incremental save; staged page editing; merge and split into new files; facing pages, page gap and bookmarks; a redaction that removes the
 covered characters rather than covering them, and printing at print resolution; form filling bound to the
 Fill & Sign slot and editable document properties; citation/figure/table/algorithm previews with draggable,
 pinnable panels, open-in-a-second-window, a per-window Back for preview jumps, citation BibTeX copy,
@@ -60,10 +61,18 @@ transparent figure crops and text-only previews for section references; paper me
 annotation export as Markdown or CSV; a persistent index
 cache keyed by the document's bytes; and the AI assistant described above.
 Known gaps are listed in the project's design notes: bookmarks are stored beside the PDF but not written into
-its outline; text-markup geometry cannot be moved (it belongs to the text selection); `/Squiggly`, stamps
-and annotations of a kind this reader does not model can be deleted but not edited; partial stroke
-erasing, signature images, in-place text editing, AI document chat and region questions, and the Linux
-and Windows shells remain.
+its outline; text-markup geometry cannot be moved (it belongs to the text selection); `/Squiggly` and
+annotations of a kind this reader does not model can be deleted but not edited; an image stamp whose
+picture a foreign producer stored in an encoding this reader does not decode (JPEG is decoded, JPX is
+not) can be deleted but not moved or resized; partial stroke erasing, in-place text editing, AI document
+chat and region questions, and the Linux and Windows shells remain.
+
+Stamps are read in both directions. A `/Stamp` this reader writes carries a private `/LyraReaderStamp`
+key so its exact words and style survive a round trip; a `/Stamp` Preview, PDFKit, Acrobat or another
+producer writes is read from `/Contents`, `/Name` and the appearance stream's own text or image. A
+text stamp and an image stamp can both be adopted into the editable model, with the same move, resize,
+delete and undo rules as the other annotations. A hand-drawn signature remains the pen, not a second
+signature tool: the pen writes an `/Ink` annotation, while the signature command places a picture.
 
 ---
 
