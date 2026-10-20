@@ -1042,6 +1042,8 @@ mod tests {
                 ink_paths: Vec::new(),
                 line: None,
                 line_arrow: false,
+                stamp_style: None,
+                stamp_image: None,
                 border_width: 0.0,
                 font_size: 0.0,
                 alignment: lyra_reader_core::AnnotationAlignment::Left,

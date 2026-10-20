@@ -77,6 +77,7 @@
 // gains the exemption.
 #![allow(unsafe_code)]
 
+use crate::stamp_read::{StampCatalog, read_stamp_catalog};
 use libloading::Library;
 use lopdf::{Document, LoadOptions, Object};
 use lyra_reader_core::{
@@ -331,6 +332,13 @@ pub struct WriteAnnotation {
     pub border_width: f64,
     /// `/DA` font size, in points. Used by `/FreeText`; 0 for every other kind.
     pub font_size: f64,
+    /// The stamp's style (`approved`, `reviewed`, `draft`, `confidential`, `date`). Written as
+    /// the private `/LyraReaderStamp /Style` key and as the standard `/Name`; `None` for every
+    /// kind except [`WriteAnnotationKind::Stamp`].
+    pub stamp_style: Option<String>,
+    /// The signature image, for [`WriteAnnotationKind::Signature`]. The writer stores its
+    /// pixels as a FlateDecode image XObject plus an `/SMask`, inside the appearance stream.
+    pub stamp_image: Option<WriteStampImage>,
     /// `/Q` text alignment, used by `/FreeText`; the PDF default (left) for every other kind.
     pub alignment: AnnotationAlignment,
     pub color: [u8; 3],
@@ -341,6 +349,15 @@ pub struct WriteAnnotation {
     pub author: Option<String>,
     /// `/M`, already formatted as a PDF date (`D:YYYYMMDDHHmmSSOHH'mm'`).
     pub modified: Option<String>,
+}
+
+/// The pixels of one image-signature stamp, straight (non-premultiplied) RGBA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteStampImage {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` bytes, top row first.
+    pub rgba: Vec<u8>,
 }
 
 /// What a [`WriteAnnotation`] becomes in the PDF.
@@ -366,6 +383,13 @@ pub enum WriteAnnotationKind {
     Circle,
     /// `/Line`: a line from `/L`, optionally with an arrowhead (`/LE`, `line_arrow`).
     Line,
+    /// `/Stamp`: a text stamp. `/Contents` is the words, `stamp_style` the style, `/C` the
+    /// colour, and the appearance stream draws the border and text with the embedded font.
+    Stamp,
+    /// `/Stamp`: an image signature. `stamp_image` is drawn inside the appearance stream as an
+    /// image XObject; `/Contents` is empty. Both this and [`Self::Stamp`] are the same PDF
+    /// subtype, because a signature image is what PDF calls a stamp.
+    Signature,
 }
 
 impl WriteAnnotationKind {
@@ -380,6 +404,7 @@ impl WriteAnnotationKind {
             Self::Square => ANNOT_SQUARE,
             Self::Circle => ANNOT_CIRCLE,
             Self::Line => ANNOT_LINE,
+            Self::Stamp | Self::Signature => ANNOT_STAMP,
         }
     }
 
@@ -395,6 +420,7 @@ impl WriteAnnotationKind {
             Self::Square => "Square",
             Self::Circle => "Circle",
             Self::Line => "Line",
+            Self::Stamp | Self::Signature => "Stamp",
         }
     }
 
@@ -410,6 +436,8 @@ impl WriteAnnotationKind {
             Self::Square => "Square",
             Self::Circle => "Circle",
             Self::Line => "Line",
+            Self::Stamp => "Stamp",
+            Self::Signature => "Signature",
         }
     }
 
@@ -960,6 +988,10 @@ pub struct AnnotationReader {
     /// read. PDFium's `FPDFAnnot_GetBorder` reads `/Border` but not the `/BS` dictionary this
     /// writer uses, so the dictionary itself is the authority here.
     border_widths: OnceLock<HashMap<String, f64>>,
+    /// Every `/Stamp` annotation's text and picture, built on the first stamp read. PDFium's C
+    /// ABI exposes neither `/Contents`-as-drawn nor `/AP`, so the dictionary pass in
+    /// [`crate::stamp_read`] is where a stamp becomes drawable.
+    stamp_details: OnceLock<StampCatalog>,
 }
 
 // SAFETY: raw PDFium handles are not thread-safe, and these markers are only sound because every
@@ -1031,6 +1063,7 @@ impl AnnotationReader {
             password: source_password,
             line_endings: OnceLock::new(),
             border_widths: OnceLock::new(),
+            stamp_details: OnceLock::new(),
         })
     }
 
@@ -1170,6 +1203,21 @@ impl AnnotationReader {
             None
         };
 
+        let stamp = if kind == RawAnnotationKind::Stamp {
+            let name = id.strip_prefix("nm:");
+            let values = [rect.min_x(), rect.min_y(), rect.max_x(), rect.max_y()];
+            self.stamps()
+                .find(name, page.get(), values)
+                .map(|details| lyra_reader_core::RawStamp {
+                    text: details.text.clone(),
+                    style: details.style.clone(),
+                    image: details.image.clone(),
+                    image_error: details.image_error.clone(),
+                })
+        } else {
+            None
+        };
+
         Some(RawAnnotation {
             page,
             id,
@@ -1190,6 +1238,7 @@ impl AnnotationReader {
             modified,
             font_size_pt,
             alignment,
+            stamp,
             visible: !hidden,
         })
     }
@@ -1381,6 +1430,16 @@ impl AnnotationReader {
     fn line_endings(&self) -> &HashMap<String, bool> {
         self.line_endings.get_or_init(|| {
             read_line_endings(&self.path, self.password.as_deref()).unwrap_or_default()
+        })
+    }
+
+    /// Every `/Stamp`'s content for this document, read once.
+    ///
+    /// A failure to parse the file a second time is not an error: the stamp is still a stamp,
+    /// and reporting its `/Rect` with no words is better than dropping the annotation.
+    fn stamps(&self) -> &StampCatalog {
+        self.stamp_details.get_or_init(|| {
+            read_stamp_catalog(&self.path, self.password.as_deref()).unwrap_or_default()
         })
     }
 
@@ -1805,7 +1864,7 @@ fn subtype_kind(subtype: c_ulong) -> RawAnnotationKind {
         ANNOT_CIRCLE => RawAnnotationKind::Circle,
         ANNOT_POLYGON => RawAnnotationKind::Other("Polygon".to_string()),
         ANNOT_POLYLINE => RawAnnotationKind::Other("Polyline".to_string()),
-        ANNOT_STAMP => RawAnnotationKind::Other("Stamp".to_string()),
+        ANNOT_STAMP => RawAnnotationKind::Stamp,
         ANNOT_CARET => RawAnnotationKind::Other("Caret".to_string()),
         ANNOT_INK => RawAnnotationKind::Ink,
         ANNOT_POPUP => RawAnnotationKind::Other("Popup".to_string()),

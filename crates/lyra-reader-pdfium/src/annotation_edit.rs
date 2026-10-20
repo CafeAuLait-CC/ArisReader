@@ -58,7 +58,8 @@
 use crate::annotations::{WriteAnnotation, WriteAnnotationKind};
 use crate::geometry_write::{
     EmbeddedFreeTextFont, add_appearance_object, annots_array, build_free_text_font, colour_array,
-    deref, line_array, load_document, lopdf_error, name, number, quadding, rect_array, text_string,
+    deref, line_array, load_document, lopdf_error, name, number, quadding, rect_array,
+    stamp_icon_name, text_string,
 };
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId};
 use lyra_reader_core::{ErrorCode, LyraReaderError, Point, RawAnnotationLine, Rect, Result};
@@ -166,7 +167,12 @@ pub(crate) fn apply_changes(
         .additions
         .iter()
         .chain(changes.updates.iter().map(|update| &update.values))
-        .filter(|annotation| annotation.kind == WriteAnnotationKind::FreeText)
+        .filter(|annotation| {
+            matches!(
+                annotation.kind,
+                WriteAnnotationKind::FreeText | WriteAnnotationKind::Stamp
+            )
+        })
         .cloned()
         .collect();
     let font = build_free_text_font(&mut incremental.new_document, &free_text)?;
@@ -691,7 +697,9 @@ fn update_one(
     let kind = update.values.kind;
     let visual_changed = visual_change(&source, &update.values);
     let regenerate = match kind {
-        WriteAnnotationKind::FreeText => true,
+        WriteAnnotationKind::FreeText
+        | WriteAnnotationKind::Stamp
+        | WriteAnnotationKind::Signature => true,
         WriteAnnotationKind::Ink
         | WriteAnnotationKind::Square
         | WriteAnnotationKind::Circle
@@ -730,6 +738,14 @@ fn update_one(
     }
 
     match kind {
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => {
+            dictionary.set("Rect", rect_array(update.values.rect));
+            set_stamp_key(dictionary, &update.values);
+            dictionary.set("Name", name(stamp_icon_name(&update.values)));
+            if let Some(appearance) = appearance {
+                set_normal_appearance(dictionary, appearance);
+            }
+        }
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut => {
@@ -824,7 +840,9 @@ fn visual_change(source: &Dictionary, values: &WriteAnnotation) -> bool {
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
         | WriteAnnotationKind::Text => false,
-        WriteAnnotationKind::FreeText => true,
+        WriteAnnotationKind::FreeText
+        | WriteAnnotationKind::Stamp
+        | WriteAnnotationKind::Signature => true,
         WriteAnnotationKind::Ink => {
             let source_ink = source_ink(source);
             !ink_equal(&source_ink, &values.ink_paths)
@@ -1057,6 +1075,10 @@ fn owned_key(key: &[u8]) -> bool {
             | b"Q"
             | b"LE"
             | b"NM"
+            // A stamp edit owns its appearance's `/Name` and this writer's private stamp model.
+            // Both are namespaced to the stamp path: no other kind's edit sets them.
+            | b"Name"
+            | b"LyraReaderStamp"
     )
 }
 
@@ -1236,6 +1258,11 @@ fn verify_update(
     }
 
     match values.kind {
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => {
+            verify_rect(after, values.rect, &fail, &update.target)?;
+            verify_stamp_key_saved(saved_document, after, values, &fail, &update.target)?;
+            verify_appearance_policy(before, after, update, saved_document, &fail)?;
+        }
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut => {
@@ -1305,6 +1332,63 @@ fn verify_update(
     }
     // `/Popup`, `/Parent` and `/IRT` are not owned: the loop above already proved them equal.
     let _ = source_document;
+    Ok(())
+}
+
+/// Writes the private stamp model an edit keeps in step with the appearance.
+fn set_stamp_key(dictionary: &mut Dictionary, values: &WriteAnnotation) {
+    let mut key = Dictionary::new();
+    key.set(
+        "Text",
+        text_string(values.contents.as_deref().unwrap_or("")),
+    );
+    key.set(
+        "Style",
+        name(if values.kind == WriteAnnotationKind::Signature {
+            "signature"
+        } else {
+            values.stamp_style.as_deref().unwrap_or("custom")
+        }),
+    );
+    dictionary.set("LyraReaderStamp", Object::Dictionary(key));
+}
+
+/// Checks the private stamp model after an edit.
+fn verify_stamp_key_saved(
+    document: &Document,
+    dictionary: &Dictionary,
+    values: &WriteAnnotation,
+    fail: &impl Fn(String) -> LyraReaderError,
+    id: &str,
+) -> Result<()> {
+    let Some(key) = dictionary
+        .get(b"LyraReaderStamp")
+        .ok()
+        .and_then(|object| object.as_dict().ok())
+    else {
+        return Err(fail(format!("{id}: no /LyraReaderStamp after the edit")));
+    };
+    let text = key
+        .get(b"Text")
+        .ok()
+        .and_then(|object| pdf_text(document, object))
+        .unwrap_or_default();
+    if text != values.contents.clone().unwrap_or_default() {
+        return Err(fail(format!("{id}: stamp /Text")));
+    }
+    let expected = if values.kind == WriteAnnotationKind::Signature {
+        "signature"
+    } else {
+        values.stamp_style.as_deref().unwrap_or("custom")
+    };
+    let style = key
+        .get(b"Style")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        .map(String::from_utf8_lossy);
+    if style.as_deref() != Some(expected) {
+        return Err(fail(format!("{id}: stamp /Style")));
+    }
     Ok(())
 }
 
