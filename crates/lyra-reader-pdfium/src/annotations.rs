@@ -1202,6 +1202,10 @@ impl AnnotationReader {
         } else {
             None
         };
+        // `/Popup` is a reference to the annotation's popup window. The window itself is
+        // structural and never listed, but its presence is what tells a caller that removing
+        // this annotation would take review text with it.
+        let has_popup = self.has_key(handle, c"Popup");
 
         let stamp = if kind == RawAnnotationKind::Stamp {
             let name = id.strip_prefix("nm:");
@@ -1223,6 +1227,7 @@ impl AnnotationReader {
             id,
             parent_id,
             is_reply,
+            has_popup,
             kind,
             rect,
             quads,

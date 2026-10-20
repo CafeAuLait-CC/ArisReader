@@ -252,7 +252,9 @@ struct ReaderChecks {
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
             try await partialEraseChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
-                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+                inkReview: root.appendingPathComponent(
+                    "tests/fixtures/annotated-ink-review.pdf"))
             return
         }
         // Partial stroke erase on its own (`LyraReaderChecks --check-partial-erase .`).
@@ -261,7 +263,9 @@ struct ReaderChecks {
                 ?? FileManager.default.currentDirectoryPath)
             try await partialEraseChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
-                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+                inkReview: root.appendingPathComponent(
+                    "tests/fixtures/annotated-ink-review.pdf"))
             print("Partial erase checks passed")
             return
         }
@@ -590,7 +594,9 @@ struct ReaderChecks {
             strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
         try await partialEraseChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
-            signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
+            signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+            inkReview: root.appendingPathComponent(
+                "tests/fixtures/annotated-ink-review.pdf"))
         try await placedTextChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),

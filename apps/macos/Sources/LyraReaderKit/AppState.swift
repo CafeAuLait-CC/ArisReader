@@ -1759,6 +1759,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Annotations deleted in this session, waiting for the next explicit save.
     @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = []
+    /// `/Popup` presence for every annotation the file carries, keyed by identity. An adopted
+    /// entry is no longer in `documentAnnotations`, but the file still owns its popup, so the
+    /// eraser guard needs this to survive adoption.
+    private var documentPopupFlags: [String: Bool] = [:]
 
     /// True when at least one annotation the PDF carries is marked for deletion.
     public var hasPendingFileDeletions: Bool { !pendingFileDeletions.isEmpty }
@@ -2056,6 +2060,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// not know) states that one reason in a banner instead of acting as if the click were never
     /// made.
     @Published public private(set) var markSelectionRefusalNotice: String?
+    /// Why the eraser refused to cut a file-owned stroke: splitting it would delete review text
+    /// the PDF attaches to that stroke. Persists until dismissed or the next gesture starts.
+    @Published public private(set) var eraserRefusalNotice: String?
     /// The colour a newly created mark is stored in.
     ///
     /// The highlight palette's presets are translucent because a highlight sits over text. Pen
@@ -2111,6 +2118,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the original annotation is deleted by identity and its surviving pieces become new
     /// sidecar ink.
     private var eraserGestureDocumentSplits: [String: DocumentInkSplit] = [:]
+    /// File-owned strokes this drag found but must not touch: splitting one would orphan its
+    /// review thread. Cached so every pointer sample does not rebuild the same sentence.
+    private var eraserGestureRefusedDocumentIDs: Set<String> = []
+    /// Adopted sidecar entries that are file-owned and carry review text, refused for this drag.
+    private var eraserGestureRefusedSidecarIDs: Set<UUID> = []
     /// What the canvas should draw while a drag is cutting. `nil` while no gesture is in flight.
     /// Preview marks are not annotations: they carry stable, throwaway identities so a pointer
     /// sample cannot churn the model or the sidecar.
@@ -2373,6 +2385,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var documentInfo: DocumentInfo?
         var documentInfoLoading: Bool
         var documentAnnotations: [DocumentAnnotation]
+        var documentPopupFlags: [String: Bool]
         var pendingFileDeletions: [FileAnnotationDeletion]
         var documentAnnotationsError: String?
         var documentAnnotationsLoadCompleted: Bool
@@ -3092,6 +3105,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         propertiesSaveInProgress = false
         documentAnnotations = []
         pendingFileDeletions = []
+        documentPopupFlags = [:]
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
         annotationSaveInProgress = false
@@ -3131,9 +3145,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         erasedInkStrokeIDs = []
         eraserHoverMarkID = nil
         markSelectionRefusalNotice = nil
+        eraserRefusalNotice = nil
         eraserGestureBase = nil
         eraserGestureSidecarSplits = [:]
         eraserGestureDocumentSplits = [:]
+        eraserGestureRefusedDocumentIDs = []
+        eraserGestureRefusedSidecarIDs = []
         eraserPreviewMarks = nil
         pageSelection = []
         pageSelectionAnchor = nil
@@ -4969,7 +4986,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         let tolerance = AnnotationGeometry.eraserToleranceViewPt / max(zoomFactor, 0.01)
         for annotation in annotations.reversed()
-            where annotation.kind == .ink && annotation.page == hit.page {
+            where annotation.kind == .ink && annotation.page == hit.page
+                && inkAttachmentRefusal(for: annotation) == nil {
             let mark = CanvasAnnotationMark(
                 id: annotation.id.uuidString, page: hit.page, kind: .ink,
                 inkPaths: annotation.inkPaths, color: annotation.color,
@@ -4980,7 +4998,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         for annotation in documentAnnotations.reversed()
             where annotation.visible && annotation.kind == "ink" && annotation.page == hit.page
-                && Self.documentAnnotationEditability(annotation) == .editable {
+                && Self.documentAnnotationEditability(annotation) == .editable
+                && inkAttachmentRefusal(for: annotation) == nil {
             if AnnotationGeometry.hitTest(documentInkMark(annotation), at: hit.point,
                                           tolerance: tolerance) {
                 return .document(id: annotation.id, page: hit.page)
@@ -5017,6 +5036,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func beginEraserGesture(atContentPoint point: CGPoint) {
         guard annotationTool == .eraser, document != nil else { return }
         cancelEraserGesture()
+        eraserRefusalNotice = nil
         eraserGestureBase = annotations
         eraseInk(alongContentSegment: point, to: point)
     }
@@ -5048,7 +5068,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let documentSplits = eraserGestureDocumentSplits
         resetEraserGesture()
         guard !sidecarSplits.isEmpty || !documentSplits.isEmpty else {
-            statusMessage = "The eraser did not reach any ink"
+            // A refused file-owned stroke is not "nothing happened": the banner explains what
+            // would have been destroyed, and the page is untouched.
+            statusMessage = eraserRefusalNotice ?? "The eraser did not reach any ink"
             return 0
         }
 
@@ -5178,7 +5200,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         eraserGestureBase = nil
         eraserGestureSidecarSplits = [:]
         eraserGestureDocumentSplits = [:]
+        eraserGestureRefusedDocumentIDs = []
         eraserPreviewMarks = nil
+    }
+
+    /// The refusal banner's Dismiss button.
+    public func dismissEraserRefusal() {
+        eraserRefusalNotice = nil
     }
 
     /// Appends a deletion once, preserving the order the gesture found the strokes in.
@@ -5237,6 +5265,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var survivingPaths: [[CGPoint]]
     }
 
+    /// Why a file-owned ink stroke must not be split, or `nil` when it carries nothing a split
+    /// would orphan.
+    ///
+    /// Splitting a PDF-owned stroke is implemented as "delete the original annotation by
+    /// identity, append its surviving pieces as new sidecar ink". That is the cross-reader path
+    /// and it is safe for bare ink, but the original annotation can also own review data the
+    /// reader does not model as separate marks: its `/Contents`, a `/Popup` window, and the
+    /// `/IRT` replies that name it. Deleting it would destroy that conversation, so the eraser
+    /// leaves the stroke whole and says what is at stake. Sidecar ink has no such attachments.
+    private func inkAttachmentRefusal(for annotation: DocumentAnnotation) -> String? {
+        inkAttachmentRefusal(contents: annotation.contents,
+                             hasPopup: annotation.hasPopup,
+                             identity: annotation.id)
+    }
+
+    /// The adopted-entry form. It is still a file-owned stroke: the sidecar entry edits the PDF's
+    /// own annotation by identity, so the file's popup (remembered in `documentPopupFlags`), its
+    /// current comment (kept in the sidecar note), and the `/IRT` replies still in
+    /// `documentAnnotations` would all be deleted by a split.
+    private func inkAttachmentRefusal(for annotation: Annotation) -> String? {
+        guard let identity = annotation.fileIdentity else { return nil }
+        return inkAttachmentRefusal(contents: annotation.note,
+                                    hasPopup: documentPopupFlags[identity] ?? false,
+                                    identity: identity)
+    }
+
+    private func inkAttachmentRefusal(contents: String?, hasPopup: Bool,
+                                      identity: String) -> String? {
+        var losses: [String] = []
+        if let contents,
+           !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            losses.append("a comment")
+        }
+        if hasPopup {
+            losses.append("a popup")
+        }
+        let replyCount = documentAnnotations.filter {
+            $0.isReply && $0.parentID == identity
+        }.count
+        if replyCount == 1 {
+            losses.append("1 reply")
+        } else if replyCount > 1 {
+            losses.append("\(replyCount) replies")
+        }
+        guard !losses.isEmpty else { return nil }
+        let list: String = switch losses.count {
+        case 1: losses[0]
+        case 2: "\(losses[0]) and \(losses[1])"
+        default: losses.dropLast().joined(separator: ", ") + " and " + losses[losses.count - 1]
+        }
+        let pronoun = losses.count == 1 ? "it" : "them"
+        return "This stroke belongs to the PDF and carries \(list); splitting it would delete \(pronoun)."
+    }
+
     /// Tests one pointer segment against the ink that existed when the gesture began.
     ///
     /// Each page the segment touches is handled in that page's own space (the segment is clipped
@@ -5258,6 +5340,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                    y: clipped.end.y - placement.topPt)
             for annotation in base
             where annotation.kind == .ink && annotation.page == placement.index {
+                if eraserGestureRefusedSidecarIDs.contains(annotation.id) { continue }
+                if let reason = inkAttachmentRefusal(for: annotation) {
+                    eraserGestureRefusedSidecarIDs.insert(annotation.id)
+                    eraserRefusalNotice = reason
+                    statusMessage = reason
+                    continue
+                }
                 let reach = AnnotationGeometry.eraserReach(
                     strokeWidth: annotation.strokeWidth, zoom: zoom)
                 var split = eraserGestureSidecarSplits[annotation.id]
@@ -5282,6 +5371,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             where annotation.visible && annotation.kind == "ink"
                 && annotation.page == placement.index
                 && Self.documentAnnotationEditability(annotation) == .editable {
+                if eraserGestureRefusedDocumentIDs.contains(annotation.id) { continue }
+                if let reason = inkAttachmentRefusal(for: annotation) {
+                    // Refuse this stroke for the whole gesture: no cuts, no pending deletion,
+                    // no sidecar entry. Other strokes under the same drag still split.
+                    eraserGestureRefusedDocumentIDs.insert(annotation.id)
+                    eraserRefusalNotice = reason
+                    statusMessage = reason
+                    continue
+                }
                 let mark = documentInkMark(annotation)
                 let reach = AnnotationGeometry.eraserReach(
                     strokeWidth: mark.strokeWidth, zoom: zoom)
@@ -10116,6 +10214,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // after the reader deleted it) until the save makes the change real.
                 let hidden = self.adoptedFileAnnotationIDs
                     .union(self.pendingFileDeletions.map(\.identity))
+                var popupFlags: [String: Bool] = [:]
+                for annotation in found {
+                    popupFlags[annotation.id] = annotation.hasPopup
+                }
+                self.documentPopupFlags = popupFlags
                 self.documentAnnotations = found.filter { !hidden.contains($0.id) }
                 self.reconcileAnnotationsAlreadySaved(found)
                 self.reloadVisiblePages()
@@ -11045,6 +11148,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             documentInfo: documentInfo,
             documentInfoLoading: documentInfoLoading,
             documentAnnotations: documentAnnotations,
+            documentPopupFlags: documentPopupFlags,
             pendingFileDeletions: pendingFileDeletions,
             documentAnnotationsError: documentAnnotationsError,
             documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
@@ -11155,6 +11259,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentInfoError = nil
         propertiesSaveInProgress = false
         documentAnnotations = state.documentAnnotations
+        documentPopupFlags = state.documentPopupFlags
         pendingFileDeletions = state.pendingFileDeletions
         documentAnnotationsError = state.documentAnnotationsError
         documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted

@@ -12,7 +12,8 @@ import PDFKit
 /// `InkStrokeSplitter` directly so the tolerance and boundary numbers can be asserted without a
 /// document in the way.
 extension ReaderChecks {
-    @MainActor static func partialEraseChecks(drawing: URL, signed: URL) async throws {
+    @MainActor static func partialEraseChecks(drawing: URL, signed: URL,
+                                    inkReview: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
             .appendingPathComponent("lyra-reader-partial-erase-\(UUID())")
@@ -706,6 +707,65 @@ extension ReaderChecks {
                     .allSatisfy { !($0.x > 205 && $0.x < 221) },
                 "the reopened file-split copy has no point inside the erased gap")
 
+        // ── 9b. A bare file-owned stroke can still be erased as a whole ────────────────
+        // The no-attachment case keeps the old cross-reader contract: tracing the stroke stages
+        // the annotation's deletion, writes no sidecar ink (there are no pieces), and a saved
+        // copy prunes the original.
+        let fullEraseURL = try copy(singleCopyURL, "file-full-erase.pdf")
+        let fullErase = try makeState(fullEraseURL)
+        try await eventually("the whole-erase source's ink is read", {
+            fullErase.documentAnnotations.contains { $0.kind == "ink" }
+                || fullErase.documentAnnotationsError != nil
+        })
+        require(fullErase.documentAnnotationsError == nil,
+                "the whole-erase source's annotations read without error")
+        guard let fullInk = fullErase.documentAnnotations.first(where: { $0.kind == "ink" }),
+              let fullPath = fullInk.inkPaths.first, fullPath.count >= 2 else {
+            fatalError("FAIL: the whole-erase source carries a bare ink stroke")
+        }
+        let fullBytesBefore = try bytes(fullEraseURL)
+        let fullWrites = fullErase.annotationWriteCount
+        fullErase.toggleEraserTool()
+        let fullCanvas = makeCanvas(fullErase)
+        let fullContentPath = fullPath.map { content(fullErase, page: fullInk.page, $0) }
+        drag(fullCanvas, from: fullContentPath[0],
+             through: Array(fullContentPath.dropFirst().dropLast()),
+             to: fullContentPath[fullContentPath.count - 1])
+        require(!fullErase.documentAnnotations.contains(where: { $0.id == fullInk.id }),
+                "tracing a bare file-owned stroke removes the annotation as a whole")
+        require(fullErase.pendingFileDeletions.map { $0.identity } == [fullInk.id],
+                "the whole removal is staged as one file-annotation deletion")
+        require(fullErase.annotations.isEmpty,
+                "a fully erased file-owned stroke leaves no sidecar pieces")
+        require(fullErase.annotationWriteCount == fullWrites,
+                "a fully erased file-owned stroke writes no sidecar")
+        fullErase.undo()
+        require(fullErase.documentAnnotations.contains(where: { $0.id == fullInk.id }),
+                "undo restores the fully erased file-owned stroke")
+        require(fullErase.pendingFileDeletions.isEmpty,
+                "undo cancels the fully erased file-owned stroke's deletion")
+        fullErase.redo()
+        require(!fullErase.documentAnnotations.contains(where: { $0.id == fullInk.id })
+                    && fullErase.pendingFileDeletions.map { $0.identity } == [fullInk.id],
+                "redo removes the file-owned stroke and restages its deletion")
+        let fullEraseCopyURL = scratch.appendingPathComponent("file-full-erase-copy.pdf")
+        let fullEraseSaved = await fullErase.saveAnnotatedCopy(to: fullEraseCopyURL)
+        require(fullEraseSaved, "the fully erased file-owned stroke saves into a copy")
+        let fullReport = fullErase.lastAnnotationWriteReport
+        require(fullReport?.fullRewrite == true,
+                "the fully erased file-owned stroke prunes the copy")
+        require(fullReport?.deletedFileIDs == [fullInk.id],
+                "the whole-erase report names the deleted annotation")
+        require(fullReport?.writtenIDs.isEmpty == true,
+                "the whole erase appends no ink")
+        let fullCopyBytes = try bytes(fullEraseCopyURL)
+        require(!contains(fullCopyBytes, fullInk.id.hasPrefix("nm:")
+                    ? String(fullInk.id.dropFirst(3)) : fullInk.id),
+                "the whole-erase copy contains no /NM for the removed stroke")
+        let fullBytesAfter = try bytes(fullEraseURL)
+        require(fullBytesAfter == fullBytesBefore,
+                "the whole-erase source PDF is byte-identical")
+
         // ── 10. An adopted file-owned stroke: the original leaves the sidecar too ────────
         let adoptedURL = try copy(singleCopyURL, "adopted-source.pdf")
         let adopted = try makeState(adoptedURL)
@@ -821,6 +881,233 @@ extension ReaderChecks {
                 "the real gesture path also splits the long signature into two pieces")
         require(gestureMilliseconds < 250,
                 "the gesture including the sidecar write stays under 250 ms (measured \(gestureMilliseconds) ms)")
+
+        // ── 11b. A PDF-owned stroke with review text is refused, not orphaned ──────────
+        // Splitting a file-owned stroke deletes its annotation identity. When that annotation
+        // carries a comment, a popup or `/IRT` replies, deleting it would destroy somebody's
+        // review thread, so the eraser must leave it whole and say why. A bare file-owned
+        // stroke in the same drag may still split.
+        let reviewSource = try copy(inkReview, "ink-review.pdf")
+        let review = try makeState(reviewSource)
+        try await eventually("the review-ink fixture's annotations load", {
+            review.documentAnnotations.count >= 4 || review.documentAnnotationsError != nil
+        })
+        require(review.documentAnnotationsError == nil,
+                "the review-ink fixture reads without error")
+        guard let commented = review.documentAnnotations.first(where: {
+            $0.id == "nm:review-ink-commented"
+        }), let bare = review.documentAnnotations.first(where: {
+            $0.id == "nm:review-ink-bare"
+        }) else {
+            fatalError("FAIL: the review-ink fixture carries both ink strokes")
+        }
+        require(commented.hasPopup, "the commented stroke reports its /Popup")
+        let replyIDs = Set(review.documentAnnotations.filter {
+            $0.isReply && $0.parentID == commented.id
+        }.map(\.id))
+        require(replyIDs == Set(["nm:review-reply-one", "nm:review-reply-two"]),
+                "both /IRT replies name the commented stroke as their parent")
+        let commentedContents = commented.contents ?? ""
+        let firstReplyText = review.documentAnnotations
+            .first(where: { $0.id == "nm:review-reply-one" })?.contents ?? ""
+        let secondReplyText = review.documentAnnotations
+            .first(where: { $0.id == "nm:review-reply-two" })?.contents ?? ""
+        require(!commentedContents.isEmpty && !firstReplyText.isEmpty && !secondReplyText.isEmpty,
+                "the fixture carries a comment and two reply bodies")
+        review.toggleEraserTool()
+        let reviewCanvas = makeCanvas(review)
+        let commentedPoint = commented.inkPaths.first?.first(where: { $0.x == 300 })
+            ?? commented.inkPaths[0][0]
+        let barePoint = bare.inkPaths.first?.first(where: { $0.x == 300 })
+            ?? bare.inkPaths[0][0]
+        // 1) The commented stroke alone: no halo, no cut, no sidecar write, no undo step.
+        require(review.eraserTarget(atContentPoint: content(review, page: 0, commentedPoint))
+                    == nil,
+                "the eraser does not promise a cut on a stroke whose thread would be orphaned")
+        let refusedUndo = review.undoStack.count
+        let refusedWrites = review.annotationWriteCount
+        let refusedPending = review.pendingFileDeletions.count
+        let refusedAnnotations = review.annotations
+        drag(reviewCanvas,
+             from: content(review, page: 0,
+                           CGPoint(x: commentedPoint.x, y: commentedPoint.y - 30)),
+             through: [], to: content(review, page: 0,
+                                       CGPoint(x: commentedPoint.x, y: commentedPoint.y + 30)))
+        require(review.documentAnnotations.contains(where: { $0.id == commented.id }),
+                "the commented file-owned stroke is left intact")
+        require(review.pendingFileDeletions.count == refusedPending,
+                "a refused stroke stages no file deletion")
+        require(review.annotations == refusedAnnotations,
+                "a refused stroke writes no sidecar pieces")
+        require(review.undoStack.count == refusedUndo,
+                "a refused stroke adds no undo step")
+        require(review.annotationWriteCount == refusedWrites,
+                "a refused stroke writes no sidecar")
+        let refusal = review.eraserRefusalNotice ?? ""
+        require(refusal == "This stroke belongs to the PDF and carries a comment, a popup and "
+                    + "2 replies; splitting it would delete them.",
+                "the refusal names the comment, the popup and the two replies (got \"\(refusal)\")")
+        require(review.statusMessage == refusal,
+                "the status line repeats the same refusal sentence")
+        review.dismissEraserRefusal()
+        require(review.eraserRefusalNotice == nil, "the refusal banner can be dismissed")
+
+        // 2) The same drag also crosses the bare file-owned stroke, which must still split.
+        let reviewUndo = review.undoStack.count
+        drag(reviewCanvas,
+             from: content(review, page: 0,
+                           CGPoint(x: commentedPoint.x, y: commentedPoint.y - 60)),
+             through: [], to: content(review, page: 0,
+                                       CGPoint(x: barePoint.x, y: barePoint.y + 60)))
+        require(review.documentAnnotations.contains(where: { $0.id == commented.id }),
+                "the commented stroke survives a drag that also crosses bare ink")
+        require(review.documentAnnotations.contains(where: { $0.id == bare.id }) == false,
+                "the bare file-owned stroke is removed through the cross-reader path")
+        let pendingAfterReviewDrag = review.pendingFileDeletions.map { $0.identity }
+        require(pendingAfterReviewDrag == [bare.id],
+                "only the bare stroke is staged for deletion")
+        for replyID in replyIDs {
+            require(review.documentAnnotations.contains(where: { $0.id == replyID }),
+                    "reply \(replyID) still exists after the gesture")
+        }
+        let survivingComment = review.documentAnnotations
+            .first(where: { $0.id == commented.id })?.contents
+        require(survivingComment == commentedContents,
+                "the commented stroke's /Contents is untouched")
+        let survivingFirstReply = review.documentAnnotations
+            .first(where: { $0.id == "nm:review-reply-one" })?.contents
+        let survivingSecondReply = review.documentAnnotations
+            .first(where: { $0.id == "nm:review-reply-two" })?.contents
+        require(survivingFirstReply == firstReplyText && survivingSecondReply == secondReplyText,
+                "both reply bodies are untouched")
+        require(review.undoStack.count == reviewUndo + 1,
+                "the part of the drag that did apply is one undo step")
+        require(review.annotations.count == 2,
+                "the bare stroke splits into two sidecar pieces")
+        let reviewPieces = review.annotations
+        require(reviewPieces.allSatisfy { $0.fileIdentity == nil },
+                "the pieces are new ink, not edits of the bare annotation")
+        let reviewNotice = review.eraserRefusalNotice ?? ""
+        require(reviewNotice.contains("comment") && reviewNotice.contains("popup")
+                    && reviewNotice.contains("2 replies"),
+                "the refusal survives until dismissed and still names what would be lost")
+        // Undo the applied part; the refused stroke was never touched, so it stays as it was.
+        review.undo()
+        require(review.documentAnnotations.contains(where: { $0.id == bare.id }),
+                "undo restores the bare file-owned stroke")
+        require(review.pendingFileDeletions.isEmpty,
+                "undo cancels the bare stroke's pending deletion")
+        let survivingIDs = Set(review.documentAnnotations.map { $0.id })
+        require(survivingIDs.contains(commented.id) && replyIDs.isSubset(of: survivingIDs),
+                "undo leaves the commented stroke and its replies intact")
+        review.redo()
+        require(review.annotations == reviewPieces,
+                "redo re-applies the bare stroke's split pieces")
+        let pendingAfterRedo = review.pendingFileDeletions.map { $0.identity }
+        require(pendingAfterRedo == [bare.id],
+                "redo restages only the bare stroke's deletion")
+
+        // 3) Saving the copy keeps the whole thread and prunes only the bare stroke.
+        let reviewCopyURL = scratch.appendingPathComponent("ink-review-split-copy.pdf")
+        let reviewSaved = await review.saveAnnotatedCopy(to: reviewCopyURL)
+        require(reviewSaved, "the mixed refusal/split copy saves")
+        let reviewReport = review.lastAnnotationWriteReport
+        require(reviewReport?.fullRewrite == true,
+                "deleting the bare file-owned stroke prunes the copy")
+        require(reviewReport?.deletedFileIDs == [bare.id],
+                "only the bare stroke is named as deleted")
+        require(Set(reviewReport?.writtenIDs ?? []) == Set(reviewPieces.map(\.id.uuidString)),
+                "the saved copy writes the bare stroke's pieces")
+        let reviewCopyBytes = try bytes(reviewCopyURL)
+        require(contains(reviewCopyBytes, "review-ink-commented"),
+                "the saved copy keeps the commented stroke's /NM")
+        require(contains(reviewCopyBytes, commentedContents),
+                "the saved copy keeps the commented stroke's /Contents")
+        for replyID in replyIDs {
+            require(contains(reviewCopyBytes, String(replyID.dropFirst(3))),
+                    "the saved copy keeps reply \(replyID)")
+        }
+        require(contains(reviewCopyBytes, firstReplyText)
+                    && contains(reviewCopyBytes, secondReplyText),
+                "the saved copy keeps both reply bodies")
+        require(!contains(reviewCopyBytes, "review-ink-bare"),
+                "the saved copy has no /NM for the pruned bare stroke")
+        for piece in reviewPieces {
+            require(contains(reviewCopyBytes, piece.id.uuidString),
+                    "the saved copy carries the bare stroke's piece \(piece.id)")
+        }
+        let reviewReopened = try makeState(reviewCopyURL)
+        try await eventually("the mixed review copy reopens its annotations", {
+            reviewReopened.documentAnnotations.count >= 3
+                || reviewReopened.documentAnnotationsError != nil
+        })
+        require(reviewReopened.documentAnnotationsError == nil,
+                "the mixed review copy's annotations read without error")
+        let reopenedReviewIDs = Set(reviewReopened.documentAnnotations.map { $0.id })
+        let reviewThreadIDs = Set([
+            "nm:review-ink-commented", "nm:review-reply-one", "nm:review-reply-two",
+        ])
+        require(reviewThreadIDs.isSubset(of: reopenedReviewIDs),
+                "reopening the copy still finds the comment thread")
+        require(!reopenedReviewIDs.contains("nm:review-ink-bare"),
+                "reopening the copy finds no bare stroke")
+        let reopenedComment = reviewReopened.documentAnnotations
+            .first(where: { $0.id == "nm:review-ink-commented" })
+        require(reopenedComment?.hasPopup == true,
+                "the reopened copy still links the popup")
+
+        // ── 11c. The same rule holds after the stroke was adopted into the sidecar ──────
+        // Adoption moves the file-owned annotation into the editable model but it remains an
+        // edit of the PDF's annotation by identity. Its popup is no longer in
+        // `documentAnnotations`, so the guard remembers it from the file's annotation list.
+        let adoptedReviewURL = try copy(inkReview, "ink-review-adopted.pdf")
+        let adoptedReview = try makeState(adoptedReviewURL)
+        try await eventually("the adopted review stroke's annotations load", {
+            adoptedReview.documentAnnotations.count >= 4
+                || adoptedReview.documentAnnotationsError != nil
+        })
+        require(adoptedReview.documentAnnotationsError == nil,
+                "the adopted review stroke's annotations read")
+        guard let adoptedCommented = adoptedReview.documentAnnotations
+            .first(where: { $0.id == "nm:review-ink-commented" }),
+              let adoptedCommentedID = adoptedReview.adoptDocumentAnnotation(adoptedCommented.id),
+              let adoptedEntry = adoptedReview.annotations.first(where: {
+                  $0.id == adoptedCommentedID
+              })
+        else {
+            fatalError("FAIL: the commented file-owned stroke can be adopted")
+        }
+        require(adoptedEntry.fileIdentity == adoptedCommented.id,
+                "the adopted stroke edits the file's own annotation by identity")
+        require(!(adoptedEntry.note.isEmpty), "the adopted stroke keeps the file's comment")
+        let adoptedPoint = adoptedEntry.inkPaths.first?.first(where: { $0.x == 300 })
+            ?? adoptedEntry.inkPaths[0][0]
+        require(adoptedReview.eraserTarget(atContentPoint: content(adoptedReview, page: 0,
+                                                                  adoptedPoint)) == nil,
+                "the eraser refuses the adopted commented stroke before it is pressed")
+        let adoptedEntries = adoptedReview.annotations
+        let adoptedPending = adoptedReview.pendingFileDeletions
+        let adoptedUndo = adoptedReview.undoStack.count
+        let adoptedWrites = adoptedReview.annotationWriteCount
+        adoptedReview.toggleEraserTool()
+        let adoptedReviewCanvas = makeCanvas(adoptedReview)
+        drag(adoptedReviewCanvas,
+             from: content(adoptedReview, page: 0,
+                           CGPoint(x: adoptedPoint.x, y: adoptedPoint.y - 30)),
+             through: [], to: content(adoptedReview, page: 0,
+                                       CGPoint(x: adoptedPoint.x, y: adoptedPoint.y + 30)))
+        require(adoptedReview.annotations == adoptedEntries,
+                "an adopted commented stroke is not split")
+        require(adoptedReview.pendingFileDeletions == adoptedPending,
+                "an adopted commented stroke stages no deletion")
+        require(adoptedReview.undoStack.count == adoptedUndo,
+                "an adopted commented stroke adds no undo step")
+        require(adoptedReview.annotationWriteCount == adoptedWrites,
+                "an adopted commented stroke writes no sidecar")
+        let adoptedRefusal = adoptedReview.eraserRefusalNotice ?? ""
+        require(adoptedRefusal.contains("comment") && adoptedRefusal.contains("popup")
+                    && adoptedRefusal.contains("2 replies"),
+                "the adopted refusal still names the comment, popup and replies")
 
         // ── 12. Signed documents keep the existing read-only-in-place policy ─────────────
         // Sidecar ink can still be cut and a copy exported; replacing the signed original is

@@ -1154,6 +1154,79 @@ def annotated_strokes_fixture() -> tuple[dict[int, list[bytes]], list[bytes]]:
     return annotations, extras
 
 
+
+def annotated_ink_review_fixture() -> tuple[dict[int, list[bytes]], list[bytes]]:
+    """A PDF-owned ink stroke with review text attached, and a bare one beside it.
+
+    The first stroke carries a `/Contents` comment, a `/Popup` window and two hidden `/IRT`
+    replies; the second is bare ink. A partial erase must refuse the first and split the second
+    in the same drag. The popup is structural, so the reader sees four content annotations:
+    the commented ink, its two replies, and the bare ink.
+    """
+    # One page: objects 4 and 5 are the page and its content stream, so the first of the five
+    # annotations is object 6. `first_extra_object_id` would name the object *after* them.
+    base = 4 + 2
+    commented_box = (80, 620, 500, 710)
+    bare_box = (80, 470, 500, 590)
+    popup_box = (520, 620, 700, 760)
+    first_reply_box = (520, 690, 546, 716)
+    second_reply_box = (520, 650, 546, 676)
+    return {
+        0: [
+            annotation(
+                "Ink",
+                commented_box,
+                extra=(
+                    f"/C [0.80 0.20 0.10] /CA 1 /BS << /W 3 /S /S >> "
+                    f"/InkList [[100 650 200 700 300 650 400 700 500 650]] "
+                    f"/Popup {base + 1} 0 R"
+                ),
+                contents="A stroke comment that must survive a partial erase.",
+                author="Reviewer A",
+                modified="D:20240203040506Z",
+                name="review-ink-commented",
+            ),
+            annotation(
+                "Popup",
+                popup_box,
+                extra=f"/Parent {base} 0 R /Open false",
+                flags=0,
+            ),
+            annotation(
+                "Text",
+                first_reply_box,
+                extra=f"/IRT {base} 0 R",
+                contents="First reply on the stroke.",
+                author="Reviewer B",
+                modified="D:20240203041000Z",
+                flags=26,
+                name="review-reply-one",
+            ),
+            annotation(
+                "Text",
+                second_reply_box,
+                extra=f"/IRT {base} 0 R",
+                contents="Second reply on the stroke.",
+                author="Reviewer C",
+                modified="D:20240203042000Z",
+                flags=26,
+                name="review-reply-two",
+            ),
+            annotation(
+                "Ink",
+                bare_box,
+                extra=(
+                    "/C [0.10 0.40 0.80] /CA 1 /BS << /W 3 /S /S >> "
+                    "/InkList [[100 500 200 550 300 500 400 550 500 500]]"
+                ),
+                author="Reviewer A",
+                modified="D:20240203043000Z",
+                name="review-ink-bare",
+            ),
+        ]
+    }, []
+
+
 def annotated_appearance_fixture(pages: int) -> tuple[dict[int, list[bytes]], list[bytes]]:
     """Annotations that carry an `/AP`, the shape Preview and Acrobat actually write.
 
@@ -2371,6 +2444,23 @@ def main() -> int:
     path = out_dir / "annotated-strokes.pdf"
     path.write_bytes(build_pdf(stroke_pages, stroke_annotations, stroke_extras))
     print(f"  {path}  ({path.stat().st_size} bytes, {len(stroke_pages)} page(s))")
+
+    # A PDF-owned ink stroke with a comment, a popup and two replies, beside a bare ink stroke.
+    # Partial erase must refuse the first and may split the second in the same drag.
+    review_pages = [
+        (
+            text_page(
+                "Ink with review text",
+                "a commented stroke and a bare stroke from another producer",
+                [f"Line {number}: review ink and the text around it." for number in range(1, 9)],
+            ),
+            0,
+        ),
+    ]
+    review_annotations, review_extras = annotated_ink_review_fixture()
+    path = out_dir / "annotated-ink-review.pdf"
+    path.write_bytes(build_pdf(review_pages, review_annotations, review_extras))
+    print(f"  {path}  ({path.stat().st_size} bytes, {len(review_pages)} page(s))")
 
     # Navigation borders must render even when content annotations are drawn by the shell.
     link_borders = [
