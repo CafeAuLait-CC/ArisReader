@@ -167,6 +167,29 @@ struct ReaderCommands: Commands {
             Button("Document Information…") { focusedState?.showDocumentInformation = true }
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(focusedState?.document == nil)
+
+            Divider()
+
+            // The zoom presets. "Actual Size" is physical size on the current display: the
+            // screen's own logical density calibrates the percentage (see DisplayCalibration).
+            Button("Actual Size (100%)") { session?.state.zoomActual() }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(session == nil)
+            Button("Fit Width") { session?.state.zoomFitWidth() }
+                .keyboardShortcut("9", modifiers: .command)
+                .disabled(session == nil)
+            Button("Fit Page") { session?.state.zoomFitPage() }
+                .keyboardShortcut("9", modifiers: [.command, .shift])
+                .disabled(session == nil)
+
+            Divider()
+
+            Button("Zoom In") { session?.state.zoomIn() }
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(session == nil)
+            Button("Zoom Out") { session?.state.zoomOut() }
+                .keyboardShortcut("-", modifiers: .command)
+                .disabled(session == nil)
         }
 
         CommandMenu("Reading") {
@@ -234,18 +257,6 @@ struct ReaderCommands: Commands {
                 }
                 .disabled(session == nil)
             }
-
-            Divider()
-
-            Button("Zoom In") { session?.state.zoomIn() }
-                .keyboardShortcut("+", modifiers: .command)
-                .disabled(session == nil)
-            Button("Zoom Out") { session?.state.zoomOut() }
-                .keyboardShortcut("-", modifiers: .command)
-                .disabled(session == nil)
-            Button("Actual Size") { session?.state.zoomActual() }
-                .keyboardShortcut("0", modifiers: .command)
-                .disabled(session == nil)
 
             Divider()
 

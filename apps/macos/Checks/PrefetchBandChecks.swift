@@ -66,7 +66,7 @@ extension ReaderChecks {
         /// The transform `PDFCanvasView.renderFrame` applies: content is centred when the
         /// viewport is wider, so the visible window is its left edge when the page is wider.
         func visibleRect() -> CGRect {
-            let zoom = max(CGFloat(state.zoomPercent) / 100, 0.01)
+            let zoom = max(state.zoomFactor, 0.01)
             let centreOffset = max(0, (viewport.width - state.contentWidthPt * zoom) / 2)
             return CGRect(x: -centreOffset / zoom, y: state.scrollYPt,
                           width: viewport.width / zoom, height: viewport.height / zoom)

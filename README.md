@@ -608,6 +608,18 @@ annotation tools, page operations, export, AI, and search. **Annotate** expands 
 highlights, underlines, strikethrough, selection notes, and six LyraReader color presets. Existing indexed sidecar
 colors retain their original values. Tools that are not implemented yet are disabled in their
 reserved positions.
+**View > Actual Size (100%)** (⌘0) shows the page at its physical size on the current display, not
+at 72 dpi in logical points: the zoom factor is `percent/100 × calibration`, where
+`calibration = (screen logical width in points / screen physical width in inches) / 72`. On a
+5120×2880 panel that looks like 2560×1440 this calibrates 100% to about 150.7%, so a US Letter page
+is about 1845 physical pixels wide, matching Preview's Actual Size. **Fit Width** (⌘9) fits the
+current page — or the facing spread — to the viewport width, and **Fit Page** (⇧⌘9) fits one page
+row's height; both reserve an 8 pt inset per side. Fit Width keeps the reading position; Fit Page
+top-aligns the current page so the page indicator cannot drift.
+Because the percentage is the setting, moving the window to another screen or changing the display
+mode keeps 100% at 100% and recomputes the physical scale; the scroll offset is in content points,
+so it is preserved and only clamped at the document end. Opening a fresh window starts at 100%
+(actual size).
 **View > Paper Appearance** offers Original Colours, Warm Paper and Night Reading. Warm Paper
 uses cream paper and warm ink; Night Reading uses charcoal paper, subdued gray text and grayscale
 page content/annotations. These conversions happen only when drawing: cached source rasters,

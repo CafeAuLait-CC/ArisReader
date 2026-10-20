@@ -314,7 +314,12 @@ public final class AppState: ObservableObject {
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false
+    /// The reader's zoom setting. 100% means **actual physical size**, not 72 dpi on a logical
+    /// point: ``zoomFactor`` multiplies it by the current screen's calibration.
     @Published public var zoomPercent: Int = 100
+    /// The current screen's calibration. It starts uncalibrated (factor 1) until the canvas
+    /// attaches to a window and reports its screen; checks inject a known value instead.
+    @Published public private(set) var displayCalibration = DisplayCalibration.uncalibratedDefault
     @Published public var currentPage: Int = 1 {
         didSet {
             // A selected mark belongs to the page it is on. Turning to another page drops it,
@@ -3198,6 +3203,153 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public static let minimumZoomPercent = 25
     public static let maximumZoomPercent = 400
 
+    /// The inset the Fit Width and Fit Page presets leave between a page edge and the viewport
+    /// edge, measured on each side. 8 logical points is small enough that a fitted page still
+    /// reads as "fit" and large enough that it does not touch the window chrome.
+    public static let zoomPresetInsetPt: CGFloat = 8
+
+    /// The current page's row geometry in content points.
+    ///
+    /// In facing mode a "page" for fitting purposes is the whole row (both pages), and its
+    /// height is the taller of the two; in continuous mode it is just the page. The width to fit
+    /// is the page's own width in continuous mode and the spread's width in facing mode.
+    private struct PageFitGeometry {
+        let page: Int
+        let pageHeightPt: CGFloat
+        let widthToFitPt: CGFloat
+    }
+
+    private func pageFitGeometry() -> PageFitGeometry? {
+        guard let document, document.pageCount > 0 else { return nil }
+        let page = min(max(0, currentPage - 1), document.pageCount - 1)
+        let placement = visiblePagePlacements.first { $0.index == page }
+            ?? engine.visiblePages(
+                scrollYPt: scrollYPt,
+                viewportHeightPt: viewportHeightContentPt,
+                gapPt: pageGapPt,
+                marginPt: 0,
+                layout: layoutMode
+            ).first { $0.index == page }
+        let fallback = document.firstPageSize
+        let pageHeight = placement?.heightPt ?? fallback.height
+        guard pageHeight > 0, pageHeight.isFinite else { return nil }
+        let rowTop = placement?.topPt
+        let rowHeight: CGFloat
+        if let rowTop {
+            rowHeight = visiblePagePlacements
+                .filter { abs($0.topPt - rowTop) < 0.5 }
+                .map(\.heightPt)
+                .max() ?? pageHeight
+        } else {
+            rowHeight = pageHeight
+        }
+        let width: CGFloat
+        if layoutMode == .facing {
+            // The row, not always the full spread: a cover page is a one-page row centred in
+            // the spread's width, and fitting it to the viewport should fill with the cover.
+            let rowPages: [PagePlacement]
+            if let rowTop {
+                rowPages = visiblePagePlacements.filter { abs($0.topPt - rowTop) < 0.5 }
+            } else {
+                rowPages = []
+            }
+            if let minX = rowPages.map(\.leftPt).min(),
+               let maxX = rowPages.map({ $0.leftPt + $0.widthPt }).max(),
+               maxX > minX {
+                width = maxX - minX
+            } else {
+                width = contentWidthPt > 0 ? contentWidthPt : (placement?.widthPt ?? fallback.width)
+            }
+        } else {
+            width = placement?.widthPt ?? fallback.width
+        }
+        guard width > 0, width.isFinite else { return nil }
+        return PageFitGeometry(page: page, pageHeightPt: rowHeight, widthToFitPt: width)
+    }
+
+    /// The integer percentage that fits `contentPt` into `viewportPt` minus the preset inset.
+    ///
+    /// Flooring is deliberate: a fit that rounds up would leave a sliver of the page outside the
+    /// viewport (there is no horizontal scrolling to reach it, and the vertical one would show a
+    /// scrollbar for a page that was supposed to fit).
+    private func fitZoomPercent(fittingContentPt contentPt: CGFloat,
+                                intoViewportPt viewportPt: CGFloat) -> Int? {
+        let available = viewportPt - 2 * Self.zoomPresetInsetPt
+        guard contentPt.isFinite, contentPt > 0,
+              available.isFinite, available > 0,
+              displayCalibration.factor.isFinite, displayCalibration.factor > 0
+        else { return nil }
+        let percent = available / (contentPt * displayCalibration.factor) * 100
+        guard percent.isFinite else { return nil }
+        return min(Self.maximumZoomPercent,
+                   max(Self.minimumZoomPercent, Int(percent.rounded(.down))))
+    }
+
+    private enum ZoomPresetAnchor {
+        /// Keep the content point at the viewport top where it is (Fit Width).
+        ///
+        /// The offset is in content points, so the reader keeps looking at the same part of the
+        /// page; only the amount of content visible at the same window size changes.
+        case viewportTop
+        /// Put the current page's top at the viewport top (Fit Page).
+        ///
+        /// The fit already leaves `zoomPresetInsetPt` per side in the *scale*, so the page is
+        /// smaller than the viewport. It is top-aligned rather than centred because the current
+        /// page is defined by the content point at the viewport top: scrolling even into the gap
+        /// above a page would report the previous page while the fitted page fills the screen.
+        case pageTop(page: Int)
+    }
+
+    /// Applies a preset percentage through the ordinary zoom path and re-anchors the scroll.
+    ///
+    /// The percentage is an integer like every other zoom, so a preset and the toolbar show the
+    /// same number. `reloadVisiblePages` then rebuilds the band and the tile/raster choice for
+    /// the new effective scale, exactly as `zoomIn` does.
+    private func applyZoomPreset(_ percent: Int, anchoring anchor: ZoomPresetAnchor) {
+        guard document != nil else { return }
+        cancelScrollGlide()
+        pointerZoomRemainder = 0
+        zoomPercent = percent
+        switch anchor {
+        case .viewportTop:
+            scrollYPt = clampedScrollOffset(scrollYPt)
+        case .pageTop(let page):
+            scrollYPt = clampedScrollOffset(
+                engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode))
+        }
+        reloadVisiblePages()
+        schedulePositionSave()
+    }
+
+    /// Fits the current page — the current spread row in facing mode — to the viewport width,
+    /// leaving ``zoomPresetInsetPt`` on each side. Vertical scrolling stays available.
+    ///
+    /// Idempotent: the fit is computed from the page and viewport, not from the current zoom, and
+    /// the content point at the viewport top is kept.
+    public func zoomFitWidth() {
+        guard let geometry = pageFitGeometry(),
+              let target = fitZoomPercent(fittingContentPt: geometry.widthToFitPt,
+                                          intoViewportPt: viewportSizePt.width)
+        else { return }
+        applyZoomPreset(target, anchoring: .viewportTop)
+        statusMessage = "Fit width · \(zoomPercent)%"
+    }
+
+    /// Fits the current page — the current spread row in facing mode — to the viewport **height**,
+    /// leaving ``zoomPresetInsetPt`` on each side. Other pages remain reachable by scrolling;
+    /// width is the job of ``zoomFitWidth``.
+    ///
+    /// Idempotent for the same reason as ``zoomFitWidth``: the current page's top is the anchor,
+    /// and the target is recomputed from the page geometry and the viewport.
+    public func zoomFitPage() {
+        guard let geometry = pageFitGeometry(),
+              let target = fitZoomPercent(fittingContentPt: geometry.pageHeightPt,
+                                          intoViewportPt: viewportSizePt.height)
+        else { return }
+        applyZoomPreset(target, anchoring: .pageTop(page: geometry.page))
+        statusMessage = "Fit page · \(zoomPercent)%"
+    }
+
     /// How much zoom one screen point of a Ctrl/⌘+scroll asks for, in percent.
     ///
     /// `WheelMotion` reports a discrete wheel notch as 32 points and a precise trackpad delta as
@@ -3286,9 +3438,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         min(max(0, value), max(0, contentHeightPt - viewportHeightContentPt))
     }
 
+    /// Actual physical size: 100% of the calibrated scale (⌘0).
+    ///
+    /// The percentage is the reader's number; the calibration makes it physical. On a screen whose
+    /// logical density is 108.5 ppi the factor is ≈1.507, so a US Letter page is ≈922 logical
+    /// points wide, which is its real 8.5 inches on that panel.
     public func zoomActual() {
+        guard document != nil else { return }
+        cancelScrollGlide()
+        pointerZoomRemainder = 0
         zoomPercent = 100
+        scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
+        statusMessage = "Actual size · 100%"
     }
 
     public func nextPage() {
@@ -11609,12 +11771,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// A facing pair is wider than the single page the reader was looking at: an A4 spread is
     /// 1202 pt at 100%, while the default window leaves about 960 pt for the canvas. Without
     /// this the right-hand page would be clipped and there is no horizontal scrolling to reach
-    /// it. Only ever zooms **out**, and never below the normal minimum. The anchor is the
-    /// viewport centre, so the spread opens where the reader was looking rather than at a page
-    /// corner. The user's 100% zoom is still one ⌘+ away.
+    /// it. Only ever zooms **out**, and never below the normal minimum. The fit uses the same
+    /// calibration and inset as the Fit Width preset, and the anchor is the viewport centre, so
+    /// the spread opens where the reader was looking rather than at a page corner. The user's
+    /// 100% zoom is still one ⌘+ away.
     private func fitSpreadToViewportIfNeeded() {
         guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
-        let fitPercent = Int((viewportSizePt.width / contentWidthPt * 100).rounded(.down))
+        guard let fitPercent = fitZoomPercent(fittingContentPt: contentWidthPt,
+                                              intoViewportPt: viewportSizePt.width)
+        else { return }
         guard fitPercent < zoomPercent else { return }
         let target = max(Self.minimumZoomPercent, fitPercent)
         guard target < zoomPercent else { return }
@@ -11663,8 +11828,39 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         schedulePositionSave()
     }
 
+    /// The viewer scale: `zoomPercent/100 × displayCalibration.factor`.
+    ///
+    /// This is the **only** place display calibration enters the render path. The canvas draws a
+    /// page quad at `placement.widthPt × zoomFactor × backingScale` device pixels, so 100% is the
+    /// page's physical width and 150% is 1.5× paper. The percentage stays the reader's setting;
+    /// moving to another screen changes `displayCalibration.factor`, not `zoomPercent`.
     public var zoomFactor: CGFloat {
-        CGFloat(zoomPercent) / 100.0
+        CGFloat(zoomPercent) / 100.0 * displayCalibration.factor
+    }
+
+    /// Adopts the screen's calibration. The reader's percentage is kept: "100%" stays 100%, which
+    /// now means actual size on the new screen.
+    ///
+    /// **Scroll position.** `scrollYPt` is in content points, so it is left exactly where it was,
+    /// then clamped to the new scrollable range. Away from the document end the content point at
+    /// the viewport top therefore stays put and the current page does not change; at the end the
+    /// bottom-aligned view stays bottom-aligned, which can move the top to the previous page.
+    /// Only the physical size of the visible region changes (a denser screen shows fewer page
+    /// points at the same window size). An open document is re-laid out and its raster band
+    /// rebuilt for the new effective scale.
+    public func setDisplayCalibration(_ calibration: DisplayCalibration) {
+        guard calibration.factor.isFinite, calibration.factor > 0 else { return }
+        let factorChanged = abs(calibration.factor - displayCalibration.factor) > 1e-9
+        guard factorChanged || calibration != displayCalibration else { return }
+        displayCalibration = calibration
+        // A different screen with the same density changes nothing on screen; only adopt its
+        // description. A real factor change re-lays out the open document.
+        guard factorChanged, document != nil else { return }
+        cancelScrollGlide()
+        let previousScroll = scrollYPt
+        scrollYPt = clampedScrollOffset(scrollYPt)
+        reloadVisiblePages()
+        if abs(scrollYPt - previousScroll) > 0.01 { schedulePositionSave() }
     }
 
     /// Viewport height in content points (the canvas draws at zoom × backing scale).

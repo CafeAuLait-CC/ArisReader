@@ -201,11 +201,22 @@ extension ReaderChecks {
             require(false, "the hosted reader has the text box editor")
             return
         }
-        let fieldPadding = AnnotationTextFont.padding(
-            size: AppState.Annotation.defaultTextBoxFontSize) * state.zoomFactor
-        require(abs(field.bounds.height - (creationBox.height - 2 * fieldPadding)) <= 2,
+        // The overlay frame and its padding both track the live calibrated zoom. Read it through
+        // a function rather than capturing it once: a screen-calibration report can arrive while
+        // this check is running, and the check must follow the same factor the overlay uses.
+        func editorPadding() -> CGFloat {
+            AnnotationTextFont.padding(
+                size: AppState.Annotation.defaultTextBoxFontSize) * state.zoomFactor
+        }
+        guard let anchor = state.editingAnnotationAnchor else {
+            require(false, "the editing box has a view-space anchor")
+            return
+        }
+        // The overlay's frame is the box's view-space anchor, already scaled by the calibrated
+        // zoom, and the padding is scaled by the same factor. Compare in view points.
+        require(abs(field.bounds.height - (anchor.height - 2 * editorPadding())) <= 2,
                 "the transparent editor fills the box instead of hugging one line")
-        require(abs(field.bounds.width - (creationBox.width - 2 * fieldPadding)) <= 2,
+        require(abs(field.bounds.width - (anchor.width - 2 * editorPadding())) <= 2,
                 "the editor fills the box's width")
         try await eventually("the text box editor takes keyboard focus", {
             field.window?.firstResponder === field
@@ -227,13 +238,13 @@ extension ReaderChecks {
                 "the caret is at the start of the empty box")
         let canvasRect = host.convert(hostCanvas.bounds, from: hostCanvas)
         let fieldRect = host.convert(field.bounds, from: field)
-        guard let anchor = state.editingAnnotationAnchor else {
-            require(false, "the editing box has a view-space anchor")
+        guard let currentAnchor = state.editingAnnotationAnchor else {
+            require(false, "the editing box has a live view-space anchor")
             return
         }
-        require(abs(fieldRect.minY - (canvasRect.minY + anchor.minY + fieldPadding)) <= 3,
+        require(abs(fieldRect.minY - (canvasRect.minY + currentAnchor.minY + editorPadding())) <= 3,
                 "the editor's top edge is the box's top edge plus padding")
-        require(abs(fieldRect.minX - (canvasRect.minX + anchor.minX + fieldPadding)) <= 3,
+        require(abs(fieldRect.minX - (canvasRect.minX + currentAnchor.minX + editorPadding())) <= 3,
                 "the editor's left edge is the box's left edge plus padding")
 
         // Typing reaches `AppState` through the real text view delegate and the box grows.
@@ -255,7 +266,8 @@ extension ReaderChecks {
             host.layoutSubtreeIfNeeded()
             guard let current = findEditor(in: host),
                   let box = state.editingAnnotation?.shapeRect else { return false }
-            return abs(current.bounds.width - (box.width - 2 * fieldPadding)) <= 2
+            return abs(current.bounds.width
+                        - (box.width * state.zoomFactor - 2 * editorPadding())) <= 2
         })
         guard let grownField = findEditor(in: host),
               let grownLayout = grownField.layoutManager,
@@ -296,8 +308,11 @@ extension ReaderChecks {
                   let container = current.textContainer else { return false }
             manager.ensureLayout(for: container)
             let used = manager.usedRect(for: container)
-            return abs(current.bounds.height - (box.height - 2 * fieldPadding)) <= 2
-                && used.height <= current.bounds.height + 0.5
+            return abs(current.bounds.height
+                        - (box.height * state.zoomFactor - 2 * editorPadding())) <= 2
+                // TextKit rounds glyph line heights at fractional (scaled) font sizes; 1.5 pt is
+                // below one visible line and keeps this about clipping, not rounding.
+                && used.height <= current.bounds.height + 1.5
         })
         guard let tallField = findEditor(in: host),
               let tallLayout = tallField.layoutManager,
@@ -307,11 +322,11 @@ extension ReaderChecks {
         }
         tallLayout.ensureLayout(for: tallContainer)
         let tallUsed = tallLayout.usedRect(for: tallContainer)
-        require(tallUsed.height <= tallField.bounds.height + 0.5,
+        require(tallUsed.height <= tallField.bounds.height + 1.5,
                 "every line is visible, not clipped vertically")
         require(tallUsed.width <= tallField.bounds.width + 0.5,
                 "the longest line is visible after the height growth")
-        require(tallUsed.height >= 2 * lineHeight,
+        require(tallUsed.height >= 2 * lineHeight * state.zoomFactor,
                 "the editor is really laying out all three lines")
 
         // Command-Return is Done: the box stays, at the size its text produced.

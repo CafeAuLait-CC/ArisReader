@@ -173,6 +173,8 @@ struct ReaderToolbar: View {
                 tool("Zoom out (⌘−)", "minus") { state.zoomOut() }
                 LyraReaderMenu(title: "Zoom", items: [
                     LyraReaderMenuItem("Actual Size (100%)", icon: "1.magnifyingglass", shortcut: "⌘0") { state.zoomActual() },
+                    LyraReaderMenuItem("Fit Width", icon: "arrow.left.and.right", shortcut: "⌘9") { state.zoomFitWidth() },
+                    LyraReaderMenuItem("Fit Page", icon: "arrow.up.left.and.arrow.down.right", shortcut: "⇧⌘9") { state.zoomFitPage() },
                     LyraReaderMenuItem("Zoom In", icon: "plus.magnifyingglass", shortcut: "⌘+") { state.zoomIn() },
                     LyraReaderMenuItem("Zoom Out", icon: "minus.magnifyingglass", shortcut: "⌘−") { state.zoomOut() },
                 ]) {
