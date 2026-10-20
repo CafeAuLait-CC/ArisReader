@@ -90,6 +90,9 @@ enum AnnotationSidecar {
         // An entry that edits an annotation already in the PDF: its file identity, the fixed
         // quads of a foreign text mark, and a free text box's `/Q`.
         "fileIdentity", "quads", "textAlignment",
+        // A stamp's style and an image signature's picture. Both kinds carry a schema version
+        // of their own, so a newer build's change to either is preserved rather than guessed at.
+        "stampStyle", "image",
     ]
 
     /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
@@ -162,6 +165,10 @@ enum AnnotationSidecar {
                 (object["version"] as? Int) == AppState.Annotation.geometryVersion
             } else if let kind, kind.isPlacedText {
                 (object["version"] as? Int) == AppState.Annotation.placedTextVersion
+            } else if let kind, kind.isStampArtwork {
+                (object["version"] as? Int) == (kind == .stamp
+                    ? AppState.Annotation.stampVersion
+                    : AppState.Annotation.signatureVersion)
             } else {
                 object["version"] == nil
             }
@@ -180,7 +187,7 @@ enum AnnotationSidecar {
             guard annotation.page >= 0, annotation.page < pageCount else {
                 throw SidecarError.structure("page \(annotation.page + 1) is outside the document")
             }
-            if annotation.kind.isGeometry || annotation.kind.isPlacedText {
+            if annotation.kind.isPlacement {
                 guard annotation.hasValidGeometry else {
                     throw SidecarError.structure(
                         "an \(annotation.kind.rawValue) entry has incomplete or non-finite geometry")

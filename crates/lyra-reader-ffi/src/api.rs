@@ -1597,6 +1597,23 @@ impl LyraReaderDocument {
                     modified: annotation.modified,
                     font_size_pt: annotation.font_size_pt,
                     alignment: annotation.alignment.as_str().to_string(),
+                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
+                        text: stamp.text.clone(),
+                        style: stamp.style.clone(),
+                        image: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.data.clone())
+                            .unwrap_or_default(),
+                        image_encoding: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.encoding.as_str().to_string())
+                            .unwrap_or_default(),
+                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
+                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
+                        image_error: stamp.image_error.clone(),
+                    }),
                     drawing: drawing.as_str().to_string(),
                     skip_reason: match drawing {
                         AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
@@ -3099,7 +3116,94 @@ impl LyraReaderDocument {
                         AnnotationAlignment::Left,
                     )
                 }
+                AnnotationWriteKind::Stamp => {
+                    if record.contents.trim().is_empty() {
+                        return Err(LyraReaderFfiError::InvalidArgument {
+                            message: format!("stamp annotation {:?} has no text", record.id),
+                        });
+                    }
+                    if !matches!(
+                        record.stamp_style.as_str(),
+                        "approved" | "reviewed" | "draft" | "confidential" | "date" | "custom"
+                    ) {
+                        return Err(LyraReaderFfiError::InvalidArgument {
+                            message: format!(
+                                "stamp annotation {:?} has an unknown style {:?}",
+                                record.id, record.stamp_style
+                            ),
+                        });
+                    }
+                    (
+                        WriteAnnotationKind::Stamp,
+                        supplied_rect,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        0.0,
+                        0.0,
+                        AnnotationAlignment::Left,
+                    )
+                }
+                AnnotationWriteKind::Signature => {
+                    if !record.contents.is_empty() {
+                        return Err(LyraReaderFfiError::InvalidArgument {
+                            message: format!(
+                                "signature annotation {:?} must not carry text",
+                                record.id
+                            ),
+                        });
+                    }
+                    if record.signature_width == 0
+                        || record.signature_height == 0
+                        || record.signature_width > 8192
+                        || record.signature_height > 8192
+                    {
+                        return Err(LyraReaderFfiError::InvalidArgument {
+                            message: format!(
+                                "signature annotation {:?} has dimensions {}×{}; the limit is 8192 on a side",
+                                record.id, record.signature_width, record.signature_height
+                            ),
+                        });
+                    }
+                    let expected =
+                        record.signature_width as usize * record.signature_height as usize * 4;
+                    if record.signature_rgba.len() != expected {
+                        return Err(LyraReaderFfiError::InvalidArgument {
+                            message: format!(
+                                "signature annotation {:?} has {} RGBA byte(s); {}×{} needs {expected}",
+                                record.id,
+                                record.signature_rgba.len(),
+                                record.signature_width,
+                                record.signature_height
+                            ),
+                        });
+                    }
+                    (
+                        WriteAnnotationKind::Signature,
+                        supplied_rect,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        0.0,
+                        0.0,
+                        AnnotationAlignment::Left,
+                    )
+                }
             };
+        let (stamp_style, stamp_image) = match record.kind {
+            AnnotationWriteKind::Stamp => (Some(record.stamp_style.clone()), None),
+            AnnotationWriteKind::Signature => (
+                None,
+                Some(lyra_reader_pdfium::WriteStampImage {
+                    width: record.signature_width,
+                    height: record.signature_height,
+                    rgba: record.signature_rgba.clone(),
+                }),
+            ),
+            _ => (None, None),
+        };
         Ok(WriteAnnotation {
             id: record.id.clone(),
             page: PageIndex(record.page),
@@ -3112,6 +3216,8 @@ impl LyraReaderDocument {
             border_width,
             font_size,
             alignment,
+            stamp_style,
+            stamp_image,
             color: [record.color.red, record.color.green, record.color.blue],
             opacity: record.opacity,
             contents: text_or_none(&record.contents),
@@ -3667,6 +3773,26 @@ pub struct LinkRegion {
 /// as [`LinkRecord`] and [`ReferenceFragment`]; `/QuadPoints` is what markup annotations are
 /// really drawn from, so prefer `quads` and fall back to `x_pt`/`y_pt`/`width_pt`/`height_pt`
 /// when it is empty.
+/// One `/Stamp` annotation's content, as the reader found it.
+///
+/// `image` is encoded bytes ready for the shell's image decoder: `image_encoding` is `png` for a
+/// FlateDecode image this reader re-encoded (including this reader's own image signatures) and
+/// `jpeg` for a DCTDecode image passed through from another producer. `image_error` is set when
+/// the file carries an image this reader cannot decode; the stamp is then listed with the reason
+/// instead of drawn as an empty box.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StampRecord {
+    pub text: Option<String>,
+    /// `approved`, `reviewed`, `draft`, `confidential`, `date`, `signature` or `custom`.
+    pub style: String,
+    pub image: Vec<u8>,
+    /// `png`, `jpeg`, or empty when there is no image.
+    pub image_encoding: String,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub image_error: Option<String>,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AnnotationRecord {
     /// Page the annotation is on (0-based).
@@ -3733,6 +3859,10 @@ pub struct AnnotationRecord {
     /// rectangle. Always one of the three: the PDF's own default (left) stands in when the file
     /// says nothing, so the shell never has to decide what "no alignment" means.
     pub alignment: String,
+    /// The stamp's content, for a `/Stamp` annotation; `None` for every other kind. Both the
+    /// stamps this reader writes and the ones another producer writes carry their words and
+    /// picture here.
+    pub stamp: Option<StampRecord>,
     /// What to put on the page, and the reason when the answer is "nothing": `markup` (a tinted
     /// box per quad), `noteIcon` (a `/Text` sticky note), `freeText` (a `/FreeText` annotation's
     /// own text), or `skipped`.
@@ -3796,6 +3926,12 @@ pub enum AnnotationWriteKind {
     Circle,
     /// `/Line`: `line_start`/`line_end` are the endpoints; `line_arrow` adds a head.
     Line,
+    /// `/Stamp`: a text stamp. `contents` is the words and `stamp_style` is one of
+    /// `approved`, `reviewed`, `draft`, `confidential`, `date` or `custom`.
+    Stamp,
+    /// `/Stamp`: an image signature. `signature_width`, `signature_height` and
+    /// `signature_rgba` are the decoded picture; `contents` must be empty.
+    Signature,
 }
 
 /// One bookmark the shell asks the writer to put into the document's `/Outlines`.
@@ -3853,6 +3989,15 @@ pub struct WriteAnnotationRecord {
     /// `/Q` text alignment for [`AnnotationWriteKind::FreeText`]: `left`, `center` or `right`.
     /// Any other value is refused rather than silently becoming left.
     pub text_alignment: String,
+    /// The stamp's style, for [`AnnotationWriteKind::Stamp`]: `approved`, `reviewed`, `draft`,
+    /// `confidential`, `date` or `custom`. Ignored for every other kind.
+    pub stamp_style: String,
+    /// The image signature's width in pixels, for [`AnnotationWriteKind::Signature`].
+    pub signature_width: u32,
+    /// The image signature's height in pixels.
+    pub signature_height: u32,
+    /// Straight (non-premultiplied) RGBA, `width × height × 4` bytes, top row first.
+    pub signature_rgba: Vec<u8>,
 }
 
 /// One annotation the shell asks the writer to **edit** in place.
@@ -6076,6 +6221,10 @@ mod tests {
             modified: "D:20261016213000-07'00'".to_string(),
             font_size_pt: 0.0,
             text_alignment: "left".to_string(),
+            stamp_style: String::new(),
+            signature_width: 0,
+            signature_height: 0,
+            signature_rgba: Vec::new(),
         }
     }
 
@@ -6119,6 +6268,10 @@ mod tests {
             modified: "D:20261017120000-07'00'".to_string(),
             font_size_pt: 0.0,
             text_alignment: "left".to_string(),
+            stamp_style: String::new(),
+            signature_width: 0,
+            signature_height: 0,
+            signature_rgba: Vec::new(),
         }
     }
 

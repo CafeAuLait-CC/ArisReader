@@ -759,7 +759,10 @@ public struct SidebarView: View {
                 if annotation.kind.isPlacedText { state.beginEditingAnnotation(annotation.id) }
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
-                    if annotation.kind.isPlacedText {
+                    if annotation.kind == .signature {
+                        Text("Signature image")
+                            .font(.caption)
+                    } else if annotation.kind.isPlacedText {
                         Text(annotation.note.isEmpty ? (annotation.kind == .textBox ? "Text Box" : "Sticky Note") : annotation.note)
                             .font(.caption)
                     } else {
@@ -812,6 +815,12 @@ public struct SidebarView: View {
             let width = String(format: "%.1f pt", annotation.strokeWidth)
             return "\(source)Page \(annotation.page + 1) · \(kind) · \(width) stroke"
         }
+        if annotation.kind.isStampArtwork {
+            let detail = annotation.kind == .signature
+                ? "picture"
+                : "\(annotation.stampStyle ?? "custom") · \(annotation.note.count) character\(annotation.note.count == 1 ? "" : "s")"
+            return "\(source)Page \(annotation.page + 1) · \(kind) · \(detail)"
+        }
         if annotation.isFileOwned {
             return "\(source)Page \(annotation.page + 1) · \(kind)"
         }
@@ -829,6 +838,9 @@ public struct SidebarView: View {
         case "squiggly": return "Squiggly underline"
         case "text": return "Sticky note (no text)"
         case "freeText": return "Free text (no text)"
+        case "stamp":
+            if let text = annotation.stampText, !text.isEmpty { return text }
+            return "Stamp"
         default: return "\(annotation.kind) annotation"
         }
     }

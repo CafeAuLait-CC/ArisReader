@@ -135,7 +135,12 @@ pub(crate) fn build_free_text_font(
 ) -> Result<Option<EmbeddedFreeTextFont>> {
     let texts: Vec<&str> = annotations
         .iter()
-        .filter(|annotation| annotation.kind == WriteAnnotationKind::FreeText)
+        .filter(|annotation| {
+            matches!(
+                annotation.kind,
+                WriteAnnotationKind::FreeText | WriteAnnotationKind::Stamp
+            )
+        })
         .filter_map(|annotation| annotation.contents.as_deref())
         .collect();
     build_appearance_font(document, &texts)
@@ -459,6 +464,54 @@ pub(crate) fn verify_direct_annotations(
                 verify_appearance(&document, dictionary, expected)?;
                 verify_embedded_appearance_font(&document, dictionary, expected)?;
             }
+            WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => {
+                let subtype = dictionary
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|object| deref(&document, object))
+                    .and_then(|object| object.as_name().ok());
+                if subtype != Some(b"Stamp".as_slice()) {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "a written stamp does not have /Subtype /Stamp",
+                    )
+                    .with_detail(format!("{}: {subtype:?}", expected.id)));
+                }
+                verify_stamp_key(&document, dictionary, expected)?;
+                verify_stamp_name(&document, dictionary, expected)?;
+                verify_appearance(&document, dictionary, expected)?;
+                let Some(stream) = appearance_of(&document, dictionary) else {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "a written stamp has no appearance stream to check",
+                    )
+                    .with_detail(expected.id.clone()));
+                };
+                let content = String::from_utf8_lossy(&stream.content);
+                match expected.kind {
+                    WriteAnnotationKind::Stamp => {
+                        if !content.contains(" Tj") || !content.contains(" re S") {
+                            return Err(LyraReaderError::new(
+                                ErrorCode::Internal,
+                                "a written text stamp's appearance has no text or border",
+                            )
+                            .with_detail(expected.id.clone()));
+                        }
+                        verify_embedded_appearance_font(&document, dictionary, expected)?;
+                    }
+                    WriteAnnotationKind::Signature => {
+                        if !content.contains("/Im0 Do") {
+                            return Err(LyraReaderError::new(
+                                ErrorCode::Internal,
+                                "a written image signature's appearance does not paint its image",
+                            )
+                            .with_detail(expected.id.clone()));
+                        }
+                        verify_stamp_image(&document, stream, expected)?;
+                    }
+                    _ => unreachable!("this arm only handles stamps"),
+                }
+            }
             kind if kind.is_geometry() => {
                 let border = dictionary
                     .get(b"BS")
@@ -498,6 +551,186 @@ pub(crate) fn verify_direct_annotations(
                 .with_detail(format!("{}: {:?}", expected.id, expected.kind)));
             }
         }
+    }
+    Ok(())
+}
+
+/// The form XObject `/AP /N` points at, when it is a stream (our writer always writes one).
+fn appearance_of<'a>(document: &'a Document, dictionary: &'a Dictionary) -> Option<&'a Stream> {
+    match dictionary
+        .get(b"AP")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|ap| ap.get(b"N").ok())
+        .and_then(|object| deref(document, object))
+    {
+        Some(Object::Stream(stream)) => Some(stream),
+        _ => None,
+    }
+}
+
+/// The private `/LyraReaderStamp` dictionary: the exact words and style this reader wrote.
+fn verify_stamp_key(
+    document: &Document,
+    dictionary: &Dictionary,
+    expected: &WriteAnnotation,
+) -> Result<()> {
+    let key = dictionary
+        .get(b"LyraReaderStamp")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .ok_or_else(|| {
+            LyraReaderError::new(
+                ErrorCode::Internal,
+                "a written stamp has no /LyraReaderStamp key",
+            )
+            .with_detail(expected.id.clone())
+        })?;
+    let text = key
+        .get(b"Text")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_str().ok())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    let expected_text = expected.contents.clone().unwrap_or_default();
+    if text != expected_text {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written stamp's private text does not match the request",
+        )
+        .with_detail(format!("{}: {text:?} != {expected_text:?}", expected.id)));
+    }
+    let style = key
+        .get(b"Style")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_name().ok())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .unwrap_or_default();
+    let expected_style = if expected.kind == WriteAnnotationKind::Signature {
+        "signature".to_string()
+    } else {
+        expected
+            .stamp_style
+            .clone()
+            .unwrap_or_else(|| "custom".to_string())
+    };
+    if style != expected_style {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written stamp's private style does not match the request",
+        )
+        .with_detail(format!("{}: {style:?} != {expected_style:?}", expected.id)));
+    }
+    Ok(())
+}
+
+/// The standard `/Name` that makes a viewer without `/AP` draw the right icon.
+fn verify_stamp_name(
+    document: &Document,
+    dictionary: &Dictionary,
+    expected: &WriteAnnotation,
+) -> Result<()> {
+    let name = dictionary
+        .get(b"Name")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_name().ok())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .unwrap_or_default();
+    if name != stamp_icon_name(expected) {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written stamp's /Name does not match its style",
+        )
+        .with_detail(format!("{}: {name:?}", expected.id)));
+    }
+    Ok(())
+}
+
+/// The image XObject a signature's appearance points at: its dimensions, and the `/SMask` that
+/// carries the PNG's transparency.
+fn verify_stamp_image(
+    document: &Document,
+    appearance: &Stream,
+    expected: &WriteAnnotation,
+) -> Result<()> {
+    let Some(image) = &expected.stamp_image else {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written signature has no image in the request",
+        )
+        .with_detail(expected.id.clone()));
+    };
+    let xobject = appearance
+        .dict
+        .get(b"Resources")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|resources| resources.get(b"XObject").ok())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|xobjects| xobjects.get(b"Im0").ok())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_stream().ok());
+    let Some(xobject) = xobject else {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written signature's appearance has no /Im0 image XObject",
+        )
+        .with_detail(expected.id.clone()));
+    };
+    let width = xobject
+        .dict
+        .get(b"Width")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_i64().ok());
+    let height = xobject
+        .dict
+        .get(b"Height")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_i64().ok());
+    if width != Some(i64::from(image.width)) || height != Some(i64::from(image.height)) {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written signature's image dimensions do not match the request",
+        )
+        .with_detail(format!(
+            "{}: {width:?}×{height:?} != {}×{}",
+            expected.id, image.width, image.height
+        )));
+    }
+    let has_alpha = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[3] != 255);
+    let mask = xobject
+        .dict
+        .get(b"SMask")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_stream().ok());
+    if has_alpha && mask.is_none() {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written signature dropped the image's transparency (/SMask)",
+        )
+        .with_detail(expected.id.clone()));
+    }
+    if mask.is_some_and(|mask| mask.content.is_empty()) {
+        return Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written signature's /SMask is empty",
+        )
+        .with_detail(expected.id.clone()));
     }
     Ok(())
 }
@@ -723,6 +956,56 @@ impl WriteAnnotationKind {
     }
 }
 
+/// Appends an image XObject (FlateDecode RGB, plus an `/SMask` when the picture has any
+/// transparency) and returns its object id.
+///
+/// PDF has no PNG image filter. A signature is normally a PNG with an alpha channel, so the
+/// RGBA samples are split into a DeviceRGB Flate stream and a DeviceGray Flate `/SMask`; that
+/// is the standard way an image with transparency is stored in a PDF and every viewer draws it.
+fn add_stamp_image(
+    document: &mut Document,
+    image: &crate::annotations::WriteStampImage,
+) -> Option<ObjectId> {
+    if image.width == 0
+        || image.height == 0
+        || image.rgba.len() != image.width as usize * image.height as usize * 4
+    {
+        return None;
+    }
+    let mut rgb = Vec::with_capacity(image.width as usize * image.height as usize * 3);
+    let mut alpha = Vec::with_capacity(image.width as usize * image.height as usize);
+    let mut has_alpha = false;
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        rgb.extend_from_slice(&pixel[..3]);
+        alpha.push(pixel[3]);
+        has_alpha |= pixel[3] != 255;
+    }
+    let mask = if has_alpha {
+        let mut dictionary = Dictionary::new();
+        dictionary.set("Type", name("XObject"));
+        dictionary.set("Subtype", name("Image"));
+        dictionary.set("Width", Object::Integer(i64::from(image.width)));
+        dictionary.set("Height", Object::Integer(i64::from(image.height)));
+        dictionary.set("ColorSpace", name("DeviceGray"));
+        dictionary.set("BitsPerComponent", Object::Integer(8));
+        add_stream(document, dictionary, alpha, true).ok()
+    } else {
+        None
+    };
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", name("XObject"));
+    dictionary.set("Subtype", name("Image"));
+    dictionary.set("Width", Object::Integer(i64::from(image.width)));
+    dictionary.set("Height", Object::Integer(i64::from(image.height)));
+    dictionary.set("ColorSpace", name("DeviceRGB"));
+    dictionary.set("BitsPerComponent", Object::Integer(8));
+    if let Some(mask) = mask {
+        dictionary.set("SMask", Object::Reference(mask));
+    }
+    add_stream(document, dictionary, rgb, true).ok()
+}
+
 /// Appends the form XObject an annotation's `/AP /N` points at, and returns its object id.
 ///
 /// A `/Text` note has no appearance stream (its icon is drawn by the viewer from `/Name`); every
@@ -734,8 +1017,10 @@ pub(crate) fn add_appearance_object(
     free_text_font: Option<&EmbeddedFreeTextFont>,
 ) -> ObjectId {
     let mut resources = Dictionary::new();
-    if annotation.kind == WriteAnnotationKind::FreeText
-        && let Some(font) = free_text_font
+    if matches!(
+        annotation.kind,
+        WriteAnnotationKind::FreeText | WriteAnnotationKind::Stamp
+    ) && let Some(font) = free_text_font
     {
         // The appearance's own font: Type0/Identity-H, subset for this document. `/DA`
         // keeps Helvetica as the standard-14 fallback for a viewer that ignores `/AP`; the
@@ -743,6 +1028,14 @@ pub(crate) fn add_appearance_object(
         let mut fonts = Dictionary::new();
         fonts.set("F1", Object::Reference(font.type0));
         resources.set("Font", Object::Dictionary(fonts));
+    }
+    if annotation.kind == WriteAnnotationKind::Signature
+        && let Some(image) = &annotation.stamp_image
+        && let Some(object) = add_stamp_image(document, image)
+    {
+        let mut images = Dictionary::new();
+        images.set("Im0", Object::Reference(object));
+        resources.set("XObject", Object::Dictionary(images));
     }
     let mut stream_dictionary = Dictionary::new();
     stream_dictionary.set("Type", name("XObject"));
@@ -809,6 +1102,28 @@ pub(crate) fn append_one(
         dictionary.set("M", text_string(modified));
     }
     dictionary.set("Subj", name(annotation.kind.subject()));
+    if matches!(
+        annotation.kind,
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature
+    ) {
+        // The reader's own model of the stamp: the exact words and style, independent of what
+        // the appearance stream paints. A stamp written by another producer has no such key and
+        // is read from `/Contents`, `/Name` and `/AP` instead (see `stamp_read`).
+        let mut lyra = Dictionary::new();
+        lyra.set(
+            "Text",
+            text_string(annotation.contents.as_deref().unwrap_or("")),
+        );
+        lyra.set(
+            "Style",
+            name(match annotation.kind {
+                WriteAnnotationKind::Signature => "signature",
+                _ => annotation.stamp_style.as_deref().unwrap_or("custom"),
+            }),
+        );
+        dictionary.set("LyraReaderStamp", Object::Dictionary(lyra));
+        dictionary.set("Name", name(stamp_icon_name(annotation)));
+    }
     if let Some(appearance_id) = appearance_id {
         let mut ap = Dictionary::new();
         ap.set("N", Object::Reference(appearance_id));
@@ -873,6 +1188,7 @@ pub(crate) fn append_one(
             dictionary.set("LE", Object::Array(vec![name("None"), ending]));
         }
         WriteAnnotationKind::Square | WriteAnnotationKind::Circle => {}
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => {}
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut => {
@@ -990,6 +1306,12 @@ pub(crate) fn appearance_content(
     if annotation.kind == WriteAnnotationKind::FreeText {
         return free_text_appearance(annotation, free_text_font);
     }
+    if annotation.kind == WriteAnnotationKind::Stamp {
+        return stamp_appearance(annotation, free_text_font);
+    }
+    if annotation.kind == WriteAnnotationKind::Signature {
+        return signature_appearance(annotation);
+    }
     let [red, green, blue] = annotation.color;
     let width = annotation.border_width.max(0.1);
     let mut content = format!(
@@ -1045,7 +1367,11 @@ pub(crate) fn appearance_content(
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
         | WriteAnnotationKind::Text => {}
-        WriteAnnotationKind::FreeText => unreachable!("handled at the top of this function"),
+        WriteAnnotationKind::FreeText
+        | WriteAnnotationKind::Stamp
+        | WriteAnnotationKind::Signature => {
+            unreachable!("handled at the top of this function")
+        }
     }
     content.push_str("Q\n");
     content.into_bytes()
@@ -1120,6 +1446,148 @@ fn free_text_appearance(annotation: &WriteAnnotation, font: Option<&AppearanceSu
     }
     content.push_str("ET\nQ\n");
     content.into_bytes()
+}
+
+/// The standard `/Name` a stamp style maps to. A viewer that ignores `/AP` draws its own icon
+/// for these names; one that uses `/AP` draws the appearance, which says the same thing.
+pub(crate) fn stamp_icon_name(annotation: &WriteAnnotation) -> &'static str {
+    if annotation.kind == WriteAnnotationKind::Signature {
+        return "Signature";
+    }
+    match annotation.stamp_style.as_deref() {
+        Some("approved") => "Approved",
+        Some("reviewed") => "Reviewed",
+        Some("draft") => "Draft",
+        Some("confidential") => "Confidential",
+        Some("date") => "Date",
+        // Not a standard stamp name: the appearance says the words, and a viewer that ignores
+        // `/AP` shows its generic mark rather than a false "Approved".
+        Some("custom") => "Custom",
+        _ => "Approved",
+    }
+}
+
+/// The appearance of a text stamp: a double border in the stamp's colour and the stamp's own
+/// words, centred, in the same embedded font free text uses.
+///
+/// The layout is deliberately simple and stated in one place ([`stamp_layout`]) because the
+/// canvas draws the same stamp before it is saved: a border and one line of text cannot be laid
+/// out two different ways without the reader and the file disagreeing.
+fn stamp_appearance(annotation: &WriteAnnotation, font: Option<&AppearanceSubset>) -> Vec<u8> {
+    let [red, green, blue] = annotation.color;
+    let colour = (
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0,
+    );
+    let rect = annotation.rect;
+    let border = stamp_border_width(rect);
+    let outer_inset = border / 2.0;
+    let inner_inset = 4.5;
+    let mut content = format!(
+        "q {:.4} {:.4} {:.4} RG {:.3} w\n",
+        colour.0, colour.1, colour.2, border
+    );
+    content.push_str(&format!(
+        "{:.3} {:.3} {:.3} {:.3} re S\n",
+        rect.min_x() + outer_inset,
+        rect.min_y() + outer_inset,
+        (rect.size.width - 2.0 * outer_inset).max(0.01),
+        (rect.size.height - 2.0 * outer_inset).max(0.01)
+    ));
+    content.push_str(&format!(
+        "{:.3} {:.3} {:.3} {:.3} re S\n",
+        rect.min_x() + inner_inset,
+        rect.min_y() + inner_inset,
+        (rect.size.width - 2.0 * inner_inset).max(0.01),
+        (rect.size.height - 2.0 * inner_inset).max(0.01)
+    ));
+    if let Some(font) = font
+        && let Some(layout) = stamp_layout(annotation, font)
+    {
+        content.push_str(&format!(
+            "BT /F1 {:.4} Tf {:.4} {:.4} {:.4} rg 1 0 0 1 {:.3} {:.3} Tm {} Tj ET\n",
+            layout.size,
+            colour.0,
+            colour.1,
+            colour.2,
+            layout.x,
+            layout.baseline,
+            font.hex_string(&stamp_text(annotation))
+        ));
+    }
+    content.push_str("Q\n");
+    content.into_bytes()
+}
+
+/// One line of stamp text, with runs of whitespace collapsed. `/Contents` keeps the exact
+/// string; only the picture is a single line, which is what a stamp is.
+fn stamp_text(annotation: &WriteAnnotation) -> String {
+    annotation
+        .contents
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+struct StampLayout {
+    size: f64,
+    x: f64,
+    baseline: f64,
+}
+
+/// The font size, left edge and baseline of a text stamp's one line.
+///
+/// The size is the largest that fits the inner box at up to 42% of the stamp's height, so a
+/// resized stamp scales its words instead of clipping them. The baseline is 35% of the size
+/// below the centre, which centres capital letters and digits (a stamp is upper case) rather
+/// than centring the font's full ascent+descent. The canvas uses the same three numbers.
+fn stamp_layout(annotation: &WriteAnnotation, font: &AppearanceSubset) -> Option<StampLayout> {
+    let text = stamp_text(annotation);
+    if text.is_empty() {
+        return None;
+    }
+    let rect = annotation.rect;
+    let available = rect.size.width - 2.0 * 6.0;
+    if available <= 1.0 {
+        return None;
+    }
+    let mut size = (rect.size.height * 0.42).clamp(2.0, 200.0);
+    let width = font.text_width(&text, size);
+    if width > available {
+        size *= available / width;
+    }
+    if size < 2.0 {
+        return None;
+    }
+    let width = font.text_width(&text, size);
+    Some(StampLayout {
+        size,
+        x: rect.min_x() + (rect.size.width - width) / 2.0,
+        baseline: rect.min_y() + rect.size.height / 2.0 - size * 0.35,
+    })
+}
+
+fn stamp_border_width(rect: Rect) -> f64 {
+    (rect.size.height * 0.035).clamp(0.75, 2.0)
+}
+
+/// The appearance of an image signature: the image XObject filling the annotation's box.
+///
+/// The image is stored at its own pixel size and scaled by the appearance matrix; a signature
+/// therefore keeps its resolution when the box is enlarged, and the canvas draws the same
+/// pixels. The image's transparency travels in its `/SMask` (see [`add_stamp_image`]).
+fn signature_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
+    format!(
+        "q {:.3} 0 0 {:.3} {:.3} {:.3} cm /Im0 Do Q\n",
+        annotation.rect.size.width.max(0.01),
+        annotation.rect.size.height.max(0.01),
+        annotation.rect.min_x(),
+        annotation.rect.min_y()
+    )
+    .into_bytes()
 }
 
 /// Greedy line breaking with the embedded font's real advances.

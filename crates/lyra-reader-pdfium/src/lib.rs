@@ -66,6 +66,8 @@ mod redaction;
 mod rewrite;
 #[cfg(feature = "pdfium")]
 mod signature;
+#[cfg(feature = "pdfium")]
+mod stamp_read;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 #[cfg(feature = "pdfium")]
@@ -82,7 +84,9 @@ pub use annotation_edit::{
     AnnotationChanges, AnnotationDelete, AnnotationUpdate, AppliedChangesReport,
 };
 #[cfg(feature = "pdfium")]
-pub use annotations::{AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind};
+pub use annotations::{
+    AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind, WriteStampImage,
+};
 #[cfg(feature = "pdfium")]
 pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, missing_glyphs};
 #[cfg(feature = "pdfium")]

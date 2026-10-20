@@ -187,6 +187,8 @@ public struct ReaderWindow: View {
                 onPlaceTextBox: { point in
                     state.placeOrOpenTextBox(atContentPoint: point)
                 },
+                onPlaceStamp: { point in state.placeStamp(atContentPoint: point) },
+                onPlaceSignature: { point in state.placeSignature(atContentPoint: point) },
                 // Escape leaves the sticky markup mode or the eraser. It is consumed only when a
                 // mode was active; the canvas keeps its existing Escape handling for a live draft.
                 onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },

@@ -28,11 +28,16 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     case highlight
     case underline
     case strikeout
+    /// A click places the stamp chosen in the toolbar menu.
+    case stamp
+    /// A click places the image signature the reader chose; hand-drawn signatures use the pen.
+    case signature
 
     /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select, .eraser, .note, .textBox, .redact, .highlight, .underline, .strikeout:
+        case .select, .eraser, .note, .textBox, .redact, .highlight, .underline, .strikeout,
+             .stamp, .signature:
             return nil
         case .pen: return .ink
         case .line: return .line
@@ -52,7 +57,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .underline: return .underline
         case .strikeout: return .strikeout
         case .select, .pen, .eraser, .line, .arrow, .rectangle, .ellipse, .note, .textBox,
-             .redact:
+             .redact, .stamp, .signature:
             return nil
         }
     }
@@ -66,7 +71,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .highlight: self = .highlight
         case .underline: self = .underline
         case .strikeout: self = .strikeout
-        case .ink, .square, .circle, .line, .arrow, .stickyNote, .textBox: return nil
+        case .ink, .square, .circle, .line, .arrow, .stickyNote, .textBox, .stamp, .signature:
+            return nil
         }
     }
 
@@ -91,6 +97,12 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// comes from its text, not from a rectangle the reader hauls out first.
     public var placesTextBox: Bool { self == .textBox }
 
+    /// Whether this tool places a stamp on a click.
+    public var placesStamp: Bool { self == .stamp }
+
+    /// Whether this tool places an image signature on a click.
+    public var placesSignature: Bool { self == .signature }
+
     public var title: String {
         switch self {
         case .select: return "Select"
@@ -106,6 +118,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .highlight: return "Highlight"
         case .underline: return "Underline"
         case .strikeout: return "Strikethrough"
+        case .stamp: return "Stamp"
+        case .signature: return "Image Signature"
         }
     }
 
@@ -124,6 +138,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .highlight: return "highlighter"
         case .underline: return "underline"
         case .strikeout: return "strikethrough"
+        case .stamp: return "seal"
+        case .signature: return "signature"
         }
     }
 }
@@ -244,7 +260,7 @@ public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
             }
             return CGRect(x: minX, y: minY, width: max(maxX - minX, 0.01),
                           height: max(maxY - minY, 0.01))
-        case .square, .circle, .stickyNote, .textBox:
+        case .square, .circle, .stickyNote, .textBox, .stamp, .signature:
             return shapeRect
         case .line, .arrow:
             guard let start = lineStart, let end = lineEnd else { return nil }
@@ -365,9 +381,9 @@ public enum AnnotationGeometry {
             }
         case .highlight, .underline, .strikeout:
             break
-        case .stickyNote, .textBox:
-            // These are drawn from a bitmap (the note icon or the laid-out text), not a stroke;
-            // the overlay uses `bounds` for the selection halo. No vector path to return.
+        case .stickyNote, .textBox, .stamp, .signature:
+            // These are drawn from a bitmap (the note icon, the laid-out text, the stamp or the
+            // signature image), not a stroke; the overlay uses `bounds` for the selection halo.
             break
         }
         return path
@@ -411,6 +427,9 @@ public enum AnnotationGeometry {
             // selection; the canvas and `AppState` then use click-versus-drag to decide whether
             // it selects the box or selects the text underneath. Once the box is selected,
             // dragging its interior moves it.
+            return rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
+        case .stamp, .signature:
+            guard let rect = mark.shapeRect else { return false }
             return rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
         }
     }

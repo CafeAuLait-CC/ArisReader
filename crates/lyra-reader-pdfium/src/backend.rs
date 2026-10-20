@@ -1713,6 +1713,7 @@ mod tests {
         let mut drawn_text = 0;
         let mut drawn_markup = 0;
         let mut drawn_geometry = 0;
+        let mut drawn_stamps = 0;
         let mut skips: Vec<AnnotationSkipReason> = Vec::new();
         for annotation in &annotations {
             match annotation.drawing() {
@@ -1720,6 +1721,7 @@ mod tests {
                 AnnotationDrawing::NoteIcon => drawn_notes += 1,
                 AnnotationDrawing::FreeText => drawn_text += 1,
                 AnnotationDrawing::Geometry => drawn_geometry += 1,
+                AnnotationDrawing::Stamp => drawn_stamps += 1,
                 AnnotationDrawing::Skipped(reason) => skips.push(reason),
             }
         }
@@ -1727,6 +1729,7 @@ mod tests {
         assert_eq!(drawn_markup, 0, "this fixture carries no text markup");
         assert_eq!(drawn_notes, 2, "both of its sticky notes are drawn");
         assert_eq!(drawn_text, 2, "both of its readable free texts are drawn");
+        assert_eq!(drawn_stamps, 0, "the notes fixture carries no stamps");
         assert_eq!(
             drawn_geometry, 0,
             "the fixture's /InkList is the malformed flat form, so there is no stroke to draw"

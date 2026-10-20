@@ -1,5 +1,7 @@
 import AppKit
 import CoreGraphics
+import CoreText
+import ImageIO
 
 /// One mark the reader added, snapshotted for printing.
 ///
@@ -20,6 +22,8 @@ public struct PrintAnnotation: Sendable {
     public let lineEnd: CGPoint?
     public let strokeWidth: CGFloat
     public let fontSize: CGFloat
+    /// An image signature's picture; `nil` for every other kind.
+    public let imageData: Data?
 
     public init(
         kind: AppState.Annotation.Kind,
@@ -33,7 +37,8 @@ public struct PrintAnnotation: Sendable {
         lineStart: CGPoint? = nil,
         lineEnd: CGPoint? = nil,
         strokeWidth: CGFloat = 0,
-        fontSize: CGFloat = 0
+        fontSize: CGFloat = 0,
+        imageData: Data? = nil
     ) {
         self.kind = kind
         self.page = page
@@ -47,6 +52,7 @@ public struct PrintAnnotation: Sendable {
         self.lineEnd = lineEnd
         self.strokeWidth = strokeWidth
         self.fontSize = fontSize
+        self.imageData = imageData
     }
 
     public init(_ annotation: AppState.Annotation) {
@@ -62,7 +68,8 @@ public struct PrintAnnotation: Sendable {
             lineStart: annotation.lineStart,
             lineEnd: annotation.lineEnd,
             strokeWidth: annotation.strokeWidth,
-            fontSize: annotation.fontSize
+            fontSize: annotation.fontSize,
+            imageData: annotation.imageData
         )
     }
 }
@@ -389,7 +396,53 @@ public final class ReaderPrintView: NSView {
             context.restoreGState()
             drawNoteText(annotation.note, in: box.insetBy(dx: 3, dy: 3),
                          fontSize: max(annotation.fontSize, 6), color: .black, context: context)
+        case .stamp:
+            guard let box = annotation.shapeRect else { return }
+            drawStampBadge(annotation.note, in: box, color: color, context: context)
+        case .signature:
+            guard let box = annotation.shapeRect, let data = annotation.imageData,
+                  let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return }
+            context.saveGState()
+            // The print context is already flipped top-left; flip locally so the picture is not
+            // printed upside down.
+            context.translateBy(x: 0, y: box.maxY)
+            context.scaleBy(x: 1, y: -1)
+            context.draw(image, in: CGRect(x: box.minX, y: 0, width: box.width,
+                                           height: box.height))
+            context.restoreGState()
         }
+    }
+
+    /// A stamp as it prints: the same border insets and fitted text the canvas and PDF use.
+    private func drawStampBadge(_ text: String, in box: CGRect, color: NSColor,
+                                context: CGContext) {
+        let words = NoteGlyph.collapsedStampText(text)
+        let border = NoteGlyph.stampBorderWidth(box.size)
+        context.saveGState()
+        context.setStrokeColor(color.withAlphaComponent(1).cgColor)
+        context.setLineWidth(max(border, 0.5))
+        context.stroke(box.insetBy(dx: border / 2, dy: border / 2))
+        context.setLineWidth(max(border * 0.75, 0.4))
+        context.stroke(box.insetBy(dx: 4.5, dy: 4.5))
+        guard !words.isEmpty else {
+            context.restoreGState()
+            return
+        }
+        let size = AnnotationTextFont.stampFontSize(words, width: box.width, height: box.height)
+        let font = AnnotationTextFont.font(size: size)
+        let attributed = NSAttributedString(
+            string: words,
+            attributes: [.font: font, .kern: 0, .foregroundColor: color])
+        let line = CTLineCreateWithAttributedString(attributed)
+        let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        context.translateBy(x: 0, y: box.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.textMatrix = .identity
+        context.textPosition = CGPoint(x: box.midX - width / 2,
+                                       y: box.height / 2 - size * 0.35)
+        CTLineDraw(line, context)
+        context.restoreGState()
     }
 
     /// The sticky-note icon the canvas shows, drawn white inside the note's colour.

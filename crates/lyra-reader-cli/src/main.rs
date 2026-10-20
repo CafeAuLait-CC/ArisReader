@@ -506,6 +506,7 @@ struct DrawAccount {
     notes: usize,
     free_text: usize,
     geometry: usize,
+    stamps: usize,
     skipped: usize,
     /// How many skips each reason accounts for, in the order the reasons are first seen.
     reasons: Vec<(&'static str, usize)>,
@@ -518,6 +519,7 @@ impl DrawAccount {
             lyra_reader_core::AnnotationDrawing::NoteIcon => self.notes += 1,
             lyra_reader_core::AnnotationDrawing::FreeText => self.free_text += 1,
             lyra_reader_core::AnnotationDrawing::Geometry => self.geometry += 1,
+            lyra_reader_core::AnnotationDrawing::Stamp => self.stamps += 1,
             lyra_reader_core::AnnotationDrawing::Skipped(reason) => {
                 self.skipped += 1;
                 let name = reason.as_str();
@@ -532,12 +534,13 @@ impl DrawAccount {
     /// The file's accounting on one line: what is drawn, and every annotation that is not.
     fn summary(&self) -> String {
         let mut line = format!(
-            "{} content annotation(s): {} markup + {} note icon(s) + {} free text + {} ink/shape \
-             drawn, {} skipped",
+            "{} content annotation(s): {} markup + {} note icon(s) + {} free text + {} stamp(s) + \
+             {} ink/shape drawn, {} skipped",
             self.total(),
             self.markup,
             self.notes,
             self.free_text,
+            self.stamps,
             self.geometry,
             self.skipped
         );
@@ -554,7 +557,7 @@ impl DrawAccount {
     }
 
     fn total(&self) -> usize {
-        self.markup + self.notes + self.free_text + self.skipped
+        self.markup + self.notes + self.free_text + self.stamps + self.skipped
     }
 }
 
@@ -692,6 +695,9 @@ fn describe_draw(annotation: &lyra_reader_core::RawAnnotation) -> String {
                     "this build has no drawing rule for that /Subtype"
                 }
                 AnnotationSkipReason::EmptyGeometry => "it carries no /InkList or /L to draw",
+                AnnotationSkipReason::StampImageUnreadable => {
+                    "its only picture is an image this build cannot decode"
+                }
             };
             format!(
                 "skipped ({}: {because}) — the sidebar still lists it",
@@ -728,6 +734,36 @@ fn describe_draw(annotation: &lyra_reader_core::RawAnnotation) -> String {
                     (opacity * 255.0).round().clamp(0.0, 255.0) as u8
                 )
             )
+        }
+        AnnotationDrawing::Stamp => {
+            let style = annotation
+                .stamp
+                .as_ref()
+                .map(|stamp| stamp.style.as_str())
+                .unwrap_or("custom");
+            let text = annotation
+                .stamp
+                .as_ref()
+                .and_then(|stamp| stamp.text.as_deref())
+                .unwrap_or("");
+            let image = annotation
+                .stamp
+                .as_ref()
+                .and_then(|stamp| stamp.image.as_ref())
+                .map(|image| {
+                    format!(
+                        " + a {}×{} {} image",
+                        image.width,
+                        image.height,
+                        image.encoding.as_str()
+                    )
+                })
+                .unwrap_or_default();
+            if text.is_empty() {
+                format!("stamp ({style}){image}, filling /Rect")
+            } else {
+                format!("stamp ({style}, {text:?}){image}, filling /Rect")
+            }
         }
         AnnotationDrawing::Geometry => {
             let width = annotation.border_width.map_or_else(

@@ -228,6 +228,13 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // Stamps and image signatures on their own (`LyraReaderChecks --check-stamps .`).
+        if CommandLine.arguments.contains("--check-stamps") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await stampSignatureChecks(root: root)
+            return
+        }
         // Bookmark outline write-back on its own (`LyraReaderChecks --check-bookmark-writeback .`).
         if CommandLine.arguments.contains("--check-bookmark-writeback") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -556,6 +563,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await stampSignatureChecks(root: root)
         try await bookmarkWritebackChecks(root: root)
         try await crossReaderAnnotationChecks(
             replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),

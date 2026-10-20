@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Full-width document tabs sit above all commands, independently of the sidebar.
 ///
@@ -304,6 +305,24 @@ struct ReaderToolbar: View {
         Button {} label: { Image(systemName: icon) }
             .disabled(true).help("\(title) · Coming soon").accessibilityLabel("\(title), coming soon")
     }
+
+    /// Asks for the PNG (or JPEG) a reader signs with, then arms the signature tool.
+    ///
+    /// PNG with transparency is the normal case: the picture's alpha is carried into the PDF as
+    /// an image `/SMask`, so the page shows through around the strokes exactly as it does here.
+    @MainActor
+    fileprivate static func chooseSignatureImage(for state: AppState) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Signature Image"
+        panel.message = "Choose a PNG with a transparent background (or a JPEG). "
+            + "To draw a signature instead, use the pen."
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+        state.armSignatureTool(imageData: data)
+    }
 }
 
 /// The contextual second row, drawn **over** the canvas instead of above it.
@@ -438,8 +457,8 @@ struct ReaderSecondaryToolbar: View {
                 state.toggleRedactionTool()
             }.disabled(!state.canMarkRedactions)
 
-            pending("Stamps", "seal")
-            pending("Signature", "signature")
+            stampMenu
+            signatureMenu
             separator
             LyraReaderMenu(title: "Annotation color", items: AppState.annotationPalette.enumerated().map { _, item in
                 LyraReaderMenuItem(item.name, icon: "circle.fill", selected: state.annotationColor == item.color,
@@ -464,6 +483,57 @@ struct ReaderSecondaryToolbar: View {
 
     private var annotationColor: AnnotationColor { state.annotationColor }
 
+    /// Stamps: one small set of meaningful marks, not a text field pretending to be a stamp.
+    @ViewBuilder
+    private var stampMenu: some View {
+        LyraReaderMenu(title: "Stamps", items: stampMenuItems) {
+            Image(systemName: "seal")
+        }
+        .disabled(!state.canEditAnnotations)
+        .help(writeHelp("Stamps: Approved, Reviewed, Draft, Confidential or a dated mark; click the page to place it"))
+    }
+
+    private var stampMenuItems: [LyraReaderMenuItem] {
+        AppState.StampStyle.allCases.map { style in
+            LyraReaderMenuItem(
+                style.title, icon: "seal",
+                selected: state.annotationTool == .stamp && state.pendingStampStyle == style,
+                color: Color(red: Double(style.color.red) / 255,
+                             green: Double(style.color.green) / 255,
+                             blue: Double(style.color.blue) / 255),
+                action: { state.armStampTool(style) }
+            )
+        }
+    }
+
+    /// A signature image, plus the honest alternative: a hand-drawn signature *is* the pen.
+    @ViewBuilder
+    private var signatureMenu: some View {
+        LyraReaderMenu(title: "Signature", items: signatureMenuItems) {
+            Image(systemName: "signature")
+        }
+        .disabled(!state.canEditAnnotations)
+        .help(writeHelp("Signature: place a picture of a signature, or draw one with the pen"))
+    }
+
+    private var signatureMenuItems: [LyraReaderMenuItem] {
+        [
+            LyraReaderMenuItem("Place Image Signature…", icon: "photo",
+                               enabled: state.canEditAnnotations,
+                               selected: state.annotationTool == .signature,
+                               action: { Self.chooseSignatureImage(for: state) }),
+            .separator("signature-pen"),
+            LyraReaderMenuItem("Draw with the Pen", icon: "pencil.tip",
+                               enabled: state.canEditAnnotations,
+                               help: "A hand-drawn signature is a pen stroke, not a picture",
+                               selected: state.annotationTool == .pen,
+                               action: {
+                                   state.annotationTool =
+                                       state.annotationTool == .pen ? .select : .pen
+                               }),
+        ]
+    }
+
     private var separator: some View {
         LyraReaderTheme.separator.frame(width: 1, height: 22).padding(.horizontal, 4)
     }
@@ -477,9 +547,22 @@ struct ReaderSecondaryToolbar: View {
             .accessibilityValue(selected ? "Selected" : "")
     }
 
-    private func pending(_ title: String, _ icon: String) -> some View {
-        Button {} label: { Image(systemName: icon) }
-            .disabled(true).help("\(title) · Coming soon").accessibilityLabel("\(title), coming soon")
+    /// Asks for the PNG (or JPEG) a reader signs with, then arms the signature tool.
+    ///
+    /// PNG with transparency is the normal case: the picture's alpha is carried into the PDF as
+    /// an image `/SMask`, so the page shows through around the strokes exactly as it does here.
+    @MainActor
+    private static func chooseSignatureImage(for state: AppState) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Signature Image"
+        panel.message = "Choose a PNG with a transparent background (or a JPEG). "
+            + "To draw a signature instead, use the pen."
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+        state.armSignatureTool(imageData: data)
     }
 }
 

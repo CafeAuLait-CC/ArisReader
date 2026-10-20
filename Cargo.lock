@@ -971,6 +971,7 @@ dependencies = [
  "lopdf",
  "lyra-reader-core",
  "pdfium-render",
+ "png",
  "subsetter",
  "tiny-skia",
  "ttf-parser",

@@ -180,6 +180,10 @@ pub enum RawAnnotationKind {
     /// `/Line`: a line from [`RawAnnotation::line`]'s start to its end. An arrowhead is the
     /// file's `/LE` (or this writer's `/Subj`), reported as [`RawAnnotation::line_arrow`].
     Line,
+    /// `/Stamp`: a rubber stamp. Its text and/or image live in
+    /// [`RawAnnotation::stamp`]; both the ones this reader writes and the ones another
+    /// producer writes are reported the same way.
+    Stamp,
     /// A subtype this build does not model; the PDF's own `/Subtype` name is carried with it.
     Other(String),
 }
@@ -198,6 +202,7 @@ impl RawAnnotationKind {
             Self::Square => "square",
             Self::Circle => "circle",
             Self::Line => "line",
+            Self::Stamp => "stamp",
             Self::Other(name) => name,
         }
     }
@@ -260,6 +265,7 @@ impl RawAnnotationKind {
             | Self::Square
             | Self::Circle
             | Self::Line
+            | Self::Stamp
             | Self::Other(_) => AnnotationBlend::Normal,
         }
     }
@@ -351,6 +357,9 @@ pub enum AnnotationDrawing {
     /// page-space geometry (`ink_paths`, `line` or `rect`) in the annotation's colour and
     /// border width.
     Geometry,
+    /// `/Stamp`: a stamp badge drawn from [`RawAnnotation::stamp`] — its text, or its image,
+    /// in `/Rect`.
+    Stamp,
     /// Nothing is drawn, for the reason carried.
     Skipped(AnnotationSkipReason),
 }
@@ -363,6 +372,7 @@ impl AnnotationDrawing {
             Self::NoteIcon => "noteIcon",
             Self::FreeText => "freeText",
             Self::Geometry => "geometry",
+            Self::Stamp => "stamp",
             Self::Skipped(_) => "skipped",
         }
     }
@@ -392,6 +402,9 @@ pub enum AnnotationSkipReason {
     /// A stroked geometry annotation whose dictionary carries no path to draw: an `/Ink` with
     /// an empty or unreadable `/InkList`, or a `/Line` with no `/L`.
     EmptyGeometry,
+    /// A `/Stamp` whose only picture is an image in an encoding this build cannot read, and
+    /// which carries no text to draw in its place.
+    StampImageUnreadable,
 }
 
 impl AnnotationSkipReason {
@@ -403,6 +416,7 @@ impl AnnotationSkipReason {
             Self::EmptyContents => "no-text",
             Self::Unmodelled => "unmodelled",
             Self::EmptyGeometry => "empty-geometry",
+            Self::StampImageUnreadable => "stamp-image-unreadable",
         }
     }
 }
@@ -420,6 +434,58 @@ pub struct RawAnnotationColor {
 pub struct RawAnnotationLine {
     pub start: Point,
     pub end: Point,
+}
+
+/// One `/Stamp` annotation's own content, reduced to what the reader can draw.
+///
+/// A stamp is either text, an image, or (in a malformed file) neither. Both the stamps this
+/// reader writes and the ones another producer writes are reported the same way: `/Contents`,
+/// `/Name`, the private keys this writer adds, and the appearance stream's own text and image
+/// are read in that order, so a file written by Preview, PDFKit or Acrobat is still drawable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawStamp {
+    /// The words on the stamp, when the file states them or the appearance paints them.
+    pub text: Option<String>,
+    /// A stable style name: `approved`, `reviewed`, `draft`, `confidential`, `date`, or
+    /// `custom` when the file does not say. It decides the colour and `/Name` the reader
+    /// writes back, not what is drawn.
+    pub style: String,
+    /// The stamp's image, re-encoded as PNG or passed through as JPEG.
+    pub image: Option<RawStampImage>,
+    /// Why an image that is present could not be decoded; `None` when there is no image or it
+    /// was decoded. The shell states this rather than pretending the stamp is empty.
+    pub image_error: Option<String>,
+}
+
+/// One image carried by a `/Stamp` appearance stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawStampImage {
+    pub width: u32,
+    pub height: u32,
+    pub encoding: RawStampImageEncoding,
+    /// The encoded bytes (`encoding` names the codec), ready for the shell's image decoder.
+    pub data: Vec<u8>,
+}
+
+/// The codec of [`RawStampImage::data`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawStampImageEncoding {
+    /// A PNG this reader re-encoded from a FlateDecode image XObject (the usual case for a
+    /// signature, including the PNG-with-transparency a reader chooses).
+    Png,
+    /// The file's own DCTDecode (JPEG) bytes, passed through. The shell decodes them with the
+    /// same image library it uses for a chosen signature.
+    Jpeg,
+}
+
+impl RawStampImageEncoding {
+    /// Stable lower-case name across the FFI and the CLI dump.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
 }
 
 /// One annotation that already exists inside the PDF.
@@ -500,6 +566,8 @@ pub struct RawAnnotation {
     /// `/Q`, how the text of a `/FreeText` is aligned in `/Rect`; the PDF default (left) when the
     /// file states none.
     pub alignment: AnnotationAlignment,
+    /// The stamp's text and/or image. `Some` exactly for [`RawAnnotationKind::Stamp`].
+    pub stamp: Option<RawStamp>,
     /// False when the file marks the annotation `/Hidden`, `/Invisible` or `/NoView`, i.e. when
     /// drawing it would contradict the file.
     pub visible: bool,
@@ -550,6 +618,24 @@ impl RawAnnotation {
             | RawAnnotationKind::Square
             | RawAnnotationKind::Circle
             | RawAnnotationKind::Line => AnnotationDrawing::Geometry,
+            RawAnnotationKind::Stamp if !has_area => {
+                AnnotationDrawing::Skipped(AnnotationSkipReason::EmptyRect)
+            }
+            RawAnnotationKind::Stamp => match &self.stamp {
+                Some(stamp)
+                    if stamp.image.is_some()
+                        || stamp
+                            .text
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty()) =>
+                {
+                    AnnotationDrawing::Stamp
+                }
+                Some(stamp) if stamp.image_error.is_some() => {
+                    AnnotationDrawing::Skipped(AnnotationSkipReason::StampImageUnreadable)
+                }
+                _ => AnnotationDrawing::Skipped(AnnotationSkipReason::Unmodelled),
+            },
             RawAnnotationKind::Other(_) => {
                 AnnotationDrawing::Skipped(AnnotationSkipReason::Unmodelled)
             }

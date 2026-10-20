@@ -185,6 +185,10 @@ const MAX_INK_POINTS: usize = 100_000;
 const MAX_TEXT_BYTES: usize = 100_000;
 const MAX_AUTHOR_BYTES: usize = 1_024;
 const MAX_ID_BYTES: usize = 128;
+/// A stamp is a short mark, not a text box; a longer string is a request mistake.
+const MAX_STAMP_TEXT_BYTES: usize = 512;
+/// The largest image signature the writer will store, per side.
+const MAX_STAMP_IMAGE_SIDE: u32 = 8_192;
 
 /// Appends `annotations` to `source` and writes the result to `destination`.
 ///
@@ -1071,6 +1075,90 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                     validate_rect(quad, id, "quad")?;
                 }
             }
+            WriteAnnotationKind::Stamp => {
+                if !annotation.quads.is_empty() || !annotation.ink_paths.is_empty() {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("stamp annotation {id:?} must not carry quads or ink"),
+                    ));
+                }
+                let text = annotation.contents.as_deref().unwrap_or("");
+                if text.trim().is_empty() {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("stamp annotation {id:?} has no text"),
+                    ));
+                }
+                if text.len() > MAX_STAMP_TEXT_BYTES {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "stamp annotation {id:?} has more than {MAX_STAMP_TEXT_BYTES} bytes of text"
+                        ),
+                    ));
+                }
+                if !matches!(
+                    annotation.stamp_style.as_deref(),
+                    Some("approved" | "reviewed" | "draft" | "confidential" | "date" | "custom")
+                ) {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "stamp annotation {id:?} has an unknown style {:?}",
+                            annotation.stamp_style
+                        ),
+                    ));
+                }
+                if annotation.stamp_image.is_some() {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("text stamp annotation {id:?} must not carry an image"),
+                    ));
+                }
+            }
+            WriteAnnotationKind::Signature => {
+                if !annotation.quads.is_empty() || !annotation.ink_paths.is_empty() {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("signature annotation {id:?} must not carry quads or ink"),
+                    ));
+                }
+                let Some(image) = &annotation.stamp_image else {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("signature annotation {id:?} has no image"),
+                    ));
+                };
+                if image.width == 0
+                    || image.height == 0
+                    || image.width > MAX_STAMP_IMAGE_SIDE
+                    || image.height > MAX_STAMP_IMAGE_SIDE
+                {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "signature annotation {id:?} has dimensions {}×{}; the limit is {MAX_STAMP_IMAGE_SIDE} on a side",
+                            image.width, image.height
+                        ),
+                    ));
+                }
+                if image.rgba.len() != image.width as usize * image.height as usize * 4 {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("signature annotation {id:?} has a pixel buffer of the wrong size"),
+                    ));
+                }
+                if annotation
+                    .contents
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    return Err(LyraReaderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("signature annotation {id:?} must not carry text"),
+                    ));
+                }
+            }
             WriteAnnotationKind::Ink => {
                 validate_geometry_common(annotation, id)?;
                 if !annotation.quads.is_empty() {
@@ -1586,6 +1674,7 @@ fn verify_one(
         WriteAnnotationKind::Square => RawAnnotationKind::Square,
         WriteAnnotationKind::Circle => RawAnnotationKind::Circle,
         WriteAnnotationKind::Line => RawAnnotationKind::Line,
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => RawAnnotationKind::Stamp,
     };
     if record.kind != kind {
         return Err(mismatch(
@@ -1665,7 +1754,9 @@ fn verify_one(
             | WriteAnnotationKind::Ink
             | WriteAnnotationKind::Square
             | WriteAnnotationKind::Circle
-            | WriteAnnotationKind::Line => lyra_reader_core::AnnotationBlend::Normal,
+            | WriteAnnotationKind::Line
+            | WriteAnnotationKind::Stamp
+            | WriteAnnotationKind::Signature => lyra_reader_core::AnnotationBlend::Normal,
         },
         |original| original.blend.clone(),
     );
@@ -1720,6 +1811,72 @@ fn verify_one(
                     expected.alignment, record.alignment
                 ),
             ));
+        }
+    }
+    if matches!(
+        expected.kind,
+        WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature
+    ) {
+        let Some(stamp) = record.stamp.as_ref() else {
+            return Err(mismatch(
+                "stamp",
+                "the saved file reports no stamp content".into(),
+            ));
+        };
+        let expected_text = expected.contents.clone().unwrap_or_default();
+        let actual_text = stamp.text.clone().unwrap_or_default();
+        if actual_text != expected_text {
+            return Err(mismatch(
+                "stamp text",
+                format!("expected {expected_text:?}, got {actual_text:?}"),
+            ));
+        }
+        let expected_style = if expected.kind == WriteAnnotationKind::Signature {
+            "signature".to_string()
+        } else {
+            expected
+                .stamp_style
+                .clone()
+                .unwrap_or_else(|| "custom".to_string())
+        };
+        if stamp.style != expected_style {
+            return Err(mismatch(
+                "stamp style",
+                format!("expected {expected_style:?}, got {:?}", stamp.style),
+            ));
+        }
+        match (&expected.stamp_image, &stamp.image) {
+            (Some(image), Some(read)) => {
+                if read.width != image.width || read.height != image.height {
+                    return Err(mismatch(
+                        "stamp image",
+                        format!(
+                            "expected {}×{}, got {}×{}",
+                            image.width, image.height, read.width, read.height
+                        ),
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(mismatch(
+                    "stamp image",
+                    format!(
+                        "the image is missing{}",
+                        stamp
+                            .image_error
+                            .as_deref()
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    ),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(mismatch(
+                    "stamp image",
+                    "a text stamp came back with an image".into(),
+                ));
+            }
+            (None, None) => {}
         }
     }
     let expected_visible = original.is_none_or(|original| original.visible);
@@ -1797,7 +1954,9 @@ fn verify_geometry(
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
         | WriteAnnotationKind::Text
-        | WriteAnnotationKind::FreeText => {
+        | WriteAnnotationKind::FreeText
+        | WriteAnnotationKind::Stamp
+        | WriteAnnotationKind::Signature => {
             unreachable!("only called for a stroked kind")
         }
     }
@@ -2138,6 +2297,8 @@ mod tests {
             ink_paths: Vec::new(),
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 0.0,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -2159,6 +2320,8 @@ mod tests {
             ink_paths: Vec::new(),
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 0.0,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -2180,6 +2343,8 @@ mod tests {
             ink_paths: Vec::new(),
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 0.0,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -2201,6 +2366,8 @@ mod tests {
             ink_paths: Vec::new(),
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 0.0,
             font_size: 14.0,
             alignment: AnnotationAlignment::Center,
@@ -2227,6 +2394,8 @@ mod tests {
             ]],
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 2.5,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -2248,6 +2417,8 @@ mod tests {
             ink_paths: Vec::new(),
             line: None,
             line_arrow: false,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 3.0,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -2272,6 +2443,8 @@ mod tests {
                 end: Point::new(250.0, 520.0),
             }),
             line_arrow: true,
+            stamp_style: None,
+            stamp_image: None,
             border_width: 2.0,
             font_size: 0.0,
             alignment: AnnotationAlignment::Left,
@@ -3007,6 +3180,8 @@ mod tests {
                 ink_paths: record.ink_paths.clone(),
                 line: record.line,
                 line_arrow: record.line_arrow,
+                stamp_style: None,
+                stamp_image: None,
                 border_width: record.border_width.unwrap_or(1.0),
                 font_size: record.font_size_pt.unwrap_or(14.0),
                 alignment: record.alignment,
