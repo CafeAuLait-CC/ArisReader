@@ -231,3 +231,35 @@ fn sample_citations_resolve_to_bibliography_entries() {
         }
     }
 }
+
+/// Printed line 159 links only the year to a bibliography page. The text detector must
+/// include the preceding author so the shell can open the entry instead of that page image.
+#[test]
+#[ignore = "requires the private/local PDF samples and a PDFium shared library"]
+fn review_du_guo_narrative_citation_resolves_to_its_entry() {
+    let path = common::samples_dir().join("with_annotations/review_du_0923.pdf");
+    let backend = PdfiumBackend::open(&path, None).expect("review manuscript");
+    let pages: Vec<_> = (0..backend.page_count())
+        .map(|index| {
+            (
+                index,
+                backend.raw_text_page(PageIndex(index)).expect("text page"),
+            )
+        })
+        .collect();
+    let entries = find_references(pages.iter().map(|(index, raw)| (*index, raw)), 2000);
+    let style = CitationStyle::for_document(&pages, &entries);
+    let citation = find_citations_with(&pages[2].1, &style)
+        .into_iter()
+        .find(|citation| citation.text == "Guo et al. (2022)")
+        .expect("narrative citation around printed line 159");
+    assert_eq!(citation.labels, ["Guo 2022"]);
+    let entry = resolve_reference(&citation.labels, &entries).expect("Guo entry");
+    assert_eq!(entry.page, 10);
+    assert!(
+        entry
+            .text
+            .contains("Generating diverse and natural 3d human motions from text")
+    );
+    assert!(entry.text.starts_with("Chuan Guo, Shihao Zou"));
+}

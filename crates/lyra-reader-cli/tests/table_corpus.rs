@@ -15,6 +15,41 @@ use std::path::PathBuf;
 
 mod common;
 
+/// The reported manuscript: Table 1 must stop before prose and an equation, while the
+/// three-rule Table 6 must show its cells rather than falling back to the page.
+#[test]
+#[ignore = "requires the private/local PDF samples and a PDFium shared library"]
+fn review_du_table_boundaries() {
+    let path = common::samples_dir().join("with_annotations/review_du_0923.pdf");
+    let backend = PdfiumBackend::open(&path, None).expect("review manuscript");
+    for (index, label, expected) in [
+        (6, "1", (108.0, 475.0, 396.0, 137.0)),
+        (15, "6", (163.0, 276.0, 286.0, 91.0)),
+        (19, "11", (130.0, 152.0, 352.0, 110.0)),
+    ] {
+        let raw = backend.raw_text_page(PageIndex(index)).unwrap();
+        let lines = lines_from(&raw);
+        let rules = backend.page_line_segments(PageIndex(index)).unwrap();
+        let caption = find_captions(&raw)
+            .into_iter()
+            .find(|caption| caption.kind == "Table" && caption.label == label)
+            .expect("table caption");
+        let (outcome, grid) = table_outcome(&caption, &rules, &lines);
+        let grid = grid.expect("table gets a crop instead of the whole page");
+        assert_eq!(outcome.label(), "text-only");
+        assert_eq!(
+            (
+                grid.origin.x.round(),
+                grid.origin.y.round(),
+                grid.size.width.round(),
+                grid.size.height.round()
+            ),
+            expected,
+            "Table {label}: {grid:?}"
+        );
+    }
+}
+
 /// Every `Table` caption in the corpus, and how many of them got a grid region.
 #[test]
 #[ignore = "requires the private/local PDF samples and a PDFium shared library"]
