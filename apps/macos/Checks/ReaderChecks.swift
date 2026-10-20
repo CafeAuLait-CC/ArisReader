@@ -87,6 +87,10 @@ struct ReaderChecks {
                 notes: fastRoot.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             return
         }
+        if CommandLine.arguments.contains("--check-signatures") {
+            try await signatureWriteChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-forms") {
             try await formChecks(root: fastRoot)
             return
@@ -581,6 +585,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/outlined.pdf"))
         try await bookmarkChecks(url: a)
         try await metadataChecks(root: root)
+        try await signatureWriteChecks(root: root)
         try await formChecks(root: root)
         try await annotationEditingChecks(root: root)
         try await facingLayoutChecks(url: b)

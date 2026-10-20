@@ -401,6 +401,52 @@ field) are not page content and are left alone; their dictionaries are not cover
 extraction proof. Mixed crop boxes and non-identity page rotations have not been exercised by the
 native checks.
 
+## Digital signatures and read-only documents
+
+A document is treated as **digitally signed** when any of these is present, and the banner reports
+which evidence was found:
+
+* `/AcroForm /SigFlags` with the signatures-exist bit set;
+* `/Perms /DocMDP` in the catalog;
+* a signature field (`/FT /Sig`, inherited through `/Kids`) with a non-empty `/V`;
+* a `/DSS` long-term-validation store.
+
+PDFium's signature count is a fallback only when the dictionary read cannot parse the file (that
+count also includes unsigned signature fields, so it is not evidence on its own). Detection is one
+structural read at open; the result is inherited by raster workers.
+
+**The rule is "a signed document must not be modified", not "nothing may be derived from it".**
+The engine refuses every command that would rewrite the signed file itself:
+
+* `replace_with_annotations` / `replace_with_annotation_changes`
+* `replace_with_filled_form`
+* `replace_with_document_properties`
+* `replace_with_redactions`
+* `replace_with_edited_pages` (applying a staged page edit to the original)
+
+All of them fail with the same sentence:
+
+> This document is digitally signed (…); it opens read-only in place — edits can be saved to a
+> copy, and the signed original is never modified. A modified copy has its signature fields
+> removed, because the copy's bytes are no longer covered by the signature.
+
+Commands whose destination is a **different file** stay available and write through their normal
+verified path: extract pages, merge (the signed file is an input), split, save edited copy, save
+filled-form copy, save properties copy, redaction to a copy, and annotation/bookmark copy export.
+A byte-identical export (a copy with no edits) keeps the signature, because those bytes are still
+the signed bytes. Any **modified** derived copy is checked and, if it carries signature material,
+has the signature fields, their widgets, `/V` dictionaries, `/AcroForm /SigFlags`, `/Perms` and
+`/DSS` removed before it is renamed into place; page count, text, non-signature form fields,
+outline, metadata and embedded files are verified unchanged, and a copy that cannot be stripped
+safely is deleted and the command refused. The UI states this in the signed-document banner and in
+the disabled in-place controls' help text.
+
+Unsigned documents are unaffected. A save that deletes annotations (cross-reader editing or the
+eraser) still prunes the file, and before that rewrite is renamed it is compared with the source
+on page count, every page's text, form field count/values, outline count/titles, XMP presence, the
+four owned `/Info` properties plus the other entries, and embedded files. A mismatch refuses and
+names the feature.
+
 ## Printing
 
 **File ▸ Print… (⌘P)** runs a normal `NSPrintOperation` over `ReaderPrintView`. The print panel is

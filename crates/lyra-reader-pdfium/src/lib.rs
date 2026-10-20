@@ -62,6 +62,10 @@ mod outline_write;
 mod page_ops;
 #[cfg(feature = "pdfium")]
 mod redaction;
+#[cfg(feature = "pdfium")]
+mod rewrite;
+#[cfg(feature = "pdfium")]
+mod signature;
 #[cfg(not(feature = "pdfium"))]
 mod stub;
 #[cfg(feature = "pdfium")]
@@ -111,6 +115,10 @@ pub use redaction::{
     RedactionPreview, RedactionReport, preview_redactions, redact_pdf,
     suggested_redaction_copy_path,
 };
+#[cfg(feature = "pdfium")]
+pub use rewrite::{SignatureStripReport, strip_signature_from_copy};
+#[cfg(feature = "pdfium")]
+pub use signature::{SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature};
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
 #[cfg(feature = "pdfium")]

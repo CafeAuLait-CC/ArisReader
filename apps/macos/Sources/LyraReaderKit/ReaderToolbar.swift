@@ -69,9 +69,16 @@ public struct TabStrip: View {
         let active = index == state.activeTabIndex
         return ZStack(alignment: .trailing) {
             HStack(spacing: 4) {
-                Image(systemName: "doc.text")
+                Image(systemName: active && state.isReadOnlyDocument ? "lock.doc" : "doc.text")
                 Text(tab.title)
                     .lineLimit(1).truncationMode(.tail)
+                if active && state.isReadOnlyDocument {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(LyraReaderTheme.warningFg)
+                        .help(state.readOnlyReason ?? "Signed PDF · read-only")
+                        .accessibilityLabel("Signed PDF, read-only")
+                }
                 Spacer(minLength: 0)
             }
             .font(.system(size: 12, weight: active ? .medium : .regular))
@@ -192,21 +199,29 @@ struct ReaderToolbar: View {
                 LyraReaderMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },
                 .separator("page-operations"),
                 LyraReaderMenuItem("Insert Blank Page After", icon: "doc.badge.plus", enabled: state.canPageEdit) { state.insertBlankPage(before: false) },
-                LyraReaderMenuItem("Extract Selected Pages…", icon: "doc.on.doc", enabled: state.document != nil) { state.presentExtractPagesPanel() },
+                LyraReaderMenuItem("Extract Selected Pages…", icon: "doc.on.doc", enabled: state.canPageOperations,
+                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentExtractPagesPanel() },
                 .separator("merge-split"),
-                LyraReaderMenuItem("Append Pages from PDFs…", icon: "doc.badge.plus", enabled: state.document != nil) { state.presentMergeDocumentsPanel() },
-                LyraReaderMenuItem("Split Pages…", icon: "scissors", enabled: state.document != nil) { state.presentSplitPagesPanel() },
+                LyraReaderMenuItem("Append Pages from PDFs…", icon: "doc.badge.plus", enabled: state.canPageOperations,
+                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentMergeDocumentsPanel() },
+                LyraReaderMenuItem("Split Pages…", icon: "scissors", enabled: state.canPageOperations,
+                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentSplitPagesPanel() },
             ]) { menuLabel("doc.on.doc") }
             LyraReaderMenu(title: "Export and save", items: [
                 LyraReaderMenuItem("Save Annotated Copy…", icon: "square.and.arrow.up", shortcut: "⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentSaveAnnotatedCopyPanel() },
-                LyraReaderMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S", enabled: state.canReplaceOriginalWithAnnotations) { state.presentReplaceOriginalConfirmation() },
+                LyraReaderMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S",
+                                   enabled: state.canReplaceOriginalWithAnnotations,
+                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentReplaceOriginalConfirmation() },
                 .separator("export"),
-                LyraReaderMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canApplyPageEdits) { state.presentSavePageEditsCopyPanel() },
+                LyraReaderMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canSavePageEditsCopy,
+                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentSavePageEditsCopyPanel() },
                 .separator("forms"),
-                LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm) {
+                LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm,
+                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
                     state.presentSaveFilledFormPanel()
                 },
-                LyraReaderMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canSaveFilledForm) {
+                LyraReaderMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canReplaceOriginalWithFilledForm,
+                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
                     state.presentReplaceOriginalWithFilledFormConfirmation()
                 },
             ]) { menuLabel("square.and.arrow.up") }
@@ -214,9 +229,11 @@ struct ReaderToolbar: View {
                 state.toggleFormTool()
             }
             .disabled(state.document == nil)
-            .help(state.formToolActive
-                  ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
-                  : "Fill & Sign · fill this PDF's form fields")
+            .help(state.isReadOnlyDocument
+                  ? "Fill & Sign · fill this PDF's form fields · changes can be saved to a copy"
+                  : (state.formToolActive
+                     ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
+                     : "Fill & Sign · fill this PDF's form fields"))
             separator
             tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
                 state.pageOverviewVisible = false
@@ -224,7 +241,8 @@ struct ReaderToolbar: View {
             }
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
-                LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D", enabled: state.document != nil) { state.addBookmarkAtCurrentPage() },
+                LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",
+                                   enabled: state.document != nil) { state.addBookmarkAtCurrentPage() },
                 LyraReaderMenuItem("Previous Page", icon: "chevron.up", enabled: state.document != nil) { state.previousPage() },
                 LyraReaderMenuItem("Next Page", icon: "chevron.down", enabled: state.document != nil) { state.nextPage() },
                 .separator("more"),
@@ -317,6 +335,11 @@ struct ReaderSecondaryToolbar: View {
         .buttonStyle(LyraReaderToolStyle())
     }
 
+    /// Help for a tool that changes the document: a signed file says where the edit can go.
+    private func writeHelp(_ normal: String) -> String {
+        state.isReadOnlyDocument ? normal + " · edits are saved to a copy" : normal
+    }
+
     private var overviewRow: some View {
         HStack(spacing: 10) {
             Button { state.insertBlankPage(before: false) } label: {
@@ -327,7 +350,8 @@ struct ReaderSecondaryToolbar: View {
             }.disabled(!state.canPageEdit)
             Button { state.presentExtractPagesPanel() } label: {
                 Label("Extract", systemImage: "square.and.arrow.up")
-            }.disabled(state.document == nil)
+            }.disabled(!state.canPageOperations)
+             .help(writeHelp("Write the selected pages to a new PDF"))
             Button { state.confirmDeleteSelectedPages() } label: {
                 Label("Delete", systemImage: "trash")
             }.disabled(!state.canPageEdit || state.selectedPageIndices.count >= (state.document?.pageCount ?? 0))
@@ -348,28 +372,29 @@ struct ReaderSecondaryToolbar: View {
             // immediately, so the old select-then-click flow still takes one click.
             tool("Highlight", "highlighter",
                  selected: state.annotationTool == .highlight,
-                 help: "Highlight tool: new selections are highlighted until you turn it off") {
+                 help: writeHelp("Highlight tool: new selections are highlighted until you turn it off")) {
                 state.toggleTextMarkupTool(.highlight)
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             tool("Underline", "underline",
                  selected: state.annotationTool == .underline,
-                 help: "Underline tool: new selections are underlined until you turn it off") {
+                 help: writeHelp("Underline tool: new selections are underlined until you turn it off")) {
                 state.toggleTextMarkupTool(.underline)
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             tool("Strikethrough", "strikethrough",
                  selected: state.annotationTool == .strikeout,
-                 help: "Strikethrough tool: new selections are struck through until you turn it off") {
+                 help: writeHelp("Strikethrough tool: new selections are struck through until you turn it off")) {
                 state.toggleTextMarkupTool(.strikeout)
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             separator
             tool("Select a mark", "arrow.up.left",
                  selected: state.annotationTool == .select) {
                 state.selectTool()
             }.disabled(state.document == nil)
             tool("Draw with the pen", "pencil.tip",
-                 selected: state.annotationTool == .pen) {
+                 selected: state.annotationTool == .pen,
+                 help: writeHelp("Draw with the pen")) {
                 state.annotationTool = state.annotationTool == .pen ? .select : .pen
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             LyraReaderMenu(title: "Shapes", items: [
                 LyraReaderMenuItem("Line", icon: "line.diagonal",
                              selected: state.annotationTool == .line) {
@@ -389,24 +414,27 @@ struct ReaderSecondaryToolbar: View {
                 },
             ]) {
                 Image(systemName: "square.on.circle")
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
+             .help(writeHelp("Shapes: line, arrow, rectangle or ellipse"))
             tool("Eraser", "eraser",
                  selected: state.annotationTool == .eraser,
-                 help: "Eraser: drag over ink to remove whole strokes (Esc leaves the eraser)") {
+                 help: writeHelp("Eraser: drag over ink to remove whole strokes (Esc leaves the eraser)")) {
                 state.toggleEraserTool()
             }.disabled(!state.canUseEraserTool)
             tool("Place a sticky note", "text.bubble",
-                 selected: state.annotationTool == .note) {
+                 selected: state.annotationTool == .note,
+                 help: writeHelp("Place a sticky note")) {
                 state.annotationTool = state.annotationTool == .note ? .select : .note
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             tool("Place a text box (double-click)", "textbox",
-                 selected: state.annotationTool == .textBox) {
+                 selected: state.annotationTool == .textBox,
+                 help: writeHelp("Place a text box (double-click)")) {
                 state.annotationTool = state.annotationTool == .textBox ? .select : .textBox
-            }.disabled(state.document == nil)
+            }.disabled(!state.canEditAnnotations)
             separator
             tool("Redact", "rectangle.dashed",
                  selected: state.annotationTool == .redact,
-                 help: "Redact: drag over content to mark it (or mark the selected text); nothing is removed until you apply") {
+                 help: writeHelp("Redact: drag over content to mark it (or mark the selected text); nothing is removed until you apply")) {
                 state.toggleRedactionTool()
             }.disabled(!state.canMarkRedactions)
 

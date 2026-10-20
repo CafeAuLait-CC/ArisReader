@@ -2,6 +2,46 @@ import LyraReaderBindings
 import CoreGraphics
 import Foundation
 
+/// The digital-signature evidence the engine found when it opened a document.
+///
+/// A signed document is read-only: every command that would write into the file is refused with
+/// ``readOnlyReason``, and the shell disables those commands and shows the same sentence. Saving
+/// an annotated **copy** stays available because it writes a new file and never touches the
+/// signed original.
+public struct DocumentSignature: Equatable, Sendable {
+    public struct Evidence: Equatable, Sendable {
+        /// Stable machine name: `sigFlags`, `docMdp`, `signatureField`, `dss` or `pdfium`.
+        public let kind: String
+        /// The concrete dictionary fact, for the banner and logs.
+        public let detail: String
+
+        public init(kind: String, detail: String) {
+            self.kind = kind
+            self.detail = detail
+        }
+    }
+
+    public let signed: Bool
+    public let evidence: [Evidence]
+    /// The one explanation every write refusal uses; `nil` for an unsigned document.
+    public let readOnlyReason: String?
+
+    public init(signed: Bool, evidence: [Evidence], readOnlyReason: String?) {
+        self.signed = signed
+        self.evidence = evidence
+        self.readOnlyReason = readOnlyReason
+    }
+
+    public static let unsigned = DocumentSignature(
+        signed: false, evidence: [], readOnlyReason: nil)
+
+    init(_ record: SignatureStatusRecord) {
+        signed = record.signed
+        evidence = record.evidence.map { Evidence(kind: $0.kind, detail: $0.detail) }
+        readOnlyReason = record.readOnlyReason
+    }
+}
+
 /// Snapshot of a document the shell has opened.
 ///
 /// Deliberately *not* called `DocumentSummary`: the UniFFI-generated control plane
@@ -16,6 +56,8 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
     public var firstPageSize: CGSize
     /// Which PDF backend produced this snapshot (shown in diagnostics).
     public var backend: String
+    /// Signature evidence, read once at open. `.unsigned` when the document has none.
+    public var signature: DocumentSignature
 
     public init(
         id: UUID = UUID(),
@@ -23,7 +65,8 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
         pageCount: Int,
         url: URL? = nil,
         firstPageSize: CGSize = .zero,
-        backend: String = "unknown"
+        backend: String = "unknown",
+        signature: DocumentSignature = .unsigned
     ) {
         self.id = id
         self.title = title
@@ -31,6 +74,7 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
         self.url = url
         self.firstPageSize = firstPageSize
         self.backend = backend
+        self.signature = signature
     }
 }
 
@@ -907,6 +951,9 @@ public struct AnnotationWriteReport: Sendable, Equatable {
     public var assignedNames: [String] = []
     public let cleanedTemporaryFiles: Int
     public let sourceBytesPreserved: Bool
+    /// True when the output is a fresh, pruned document: a deletion was requested, so the
+    /// removed annotation objects and every other unreachable byte are gone from the file.
+    public var fullRewrite: Bool = false
 }
 
 /// One annotation the shell asks the engine to **edit** in a PDF that already carries it.
@@ -2023,7 +2070,8 @@ public final class RustEngine: PDFEngine {
                 width: firstPage?.widthPt ?? 0,
                 height: firstPage?.heightPt ?? 0
             ),
-            backend: engine.backend()
+            backend: engine.backend(),
+            signature: DocumentSignature(opened.signatureStatus())
         )
 
         openDocuments[key] = opened
@@ -3228,7 +3276,8 @@ public final class RustEngine: PDFEngine {
             deletedPopupCount: Int(report.deletedPopupCount),
             assignedNames: report.assignedNames,
             cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles),
-            sourceBytesPreserved: report.sourceBytesPreserved
+            sourceBytesPreserved: report.sourceBytesPreserved,
+            fullRewrite: report.fullRewrite
         )
     }
 

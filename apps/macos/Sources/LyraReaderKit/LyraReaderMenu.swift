@@ -9,15 +9,20 @@ struct LyraReaderMenuItem: Identifiable {
     var nativeImage: NSImage? = nil
     var shortcut: String? = nil
     var enabled = true
+    /// Why a disabled command is disabled. A signed document says so instead of showing a
+    /// grey row that explains nothing.
+    var help: String? = nil
     var selected = false
     var color: Color? = nil
     var action: () -> Void = {}
     var isSeparator = false
 
     init(_ title: String, icon: String, shortcut: String? = nil, enabled: Bool = true,
-         selected: Bool = false, color: Color? = nil, action: @escaping () -> Void) {
+         help: String? = nil, selected: Bool = false, color: Color? = nil,
+         action: @escaping () -> Void) {
         id = title; self.title = title; self.icon = icon; self.shortcut = shortcut
-        self.enabled = enabled; self.selected = selected; self.color = color; self.action = action
+        self.enabled = enabled; self.help = help; self.selected = selected
+        self.color = color; self.action = action
     }
 
     static func separator(_ id: String) -> Self {
@@ -100,6 +105,7 @@ private struct LyraReaderMenuContent: View {
                         .contentShape(RoundedRectangle(cornerRadius: 5))
                     }
                     .buttonStyle(.plain).disabled(!item.enabled).focusable(false)
+                    .help(item.help ?? item.title)
                     .onHover { hovered in if hovered && item.enabled { activeID = item.id } }
                     .accessibilityValue(item.selected ? "Selected" : "")
                 }

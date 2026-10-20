@@ -3401,7 +3401,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The button used to be a disabled `pending("Eraser")` placeholder. It is enabled exactly
     /// when a document is open, and arming it is the only way to enter the mode.
-    public var canUseEraserTool: Bool { document != nil }
+    public var canUseEraserTool: Bool { canEditAnnotations }
 
     /// The toolbar's eraser button: arms the mode, or leaves it when it is already active.
     public func toggleEraserTool() {
@@ -5546,12 +5546,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveFilledForm: Bool {
-        document != nil && formHasPendingChanges && !formSaveInProgress && !formInfo.encrypted
+        document != nil && formHasPendingChanges
+            && !formSaveInProgress && !formInfo.encrypted
+    }
+
+    /// Writing values into the signed file itself. The copy command above stays available.
+    public var canReplaceOriginalWithFilledForm: Bool {
+        canSaveFilledForm && !isReadOnlyDocument
     }
 
     /// Whether the Fill & Sign placeholder has something to offer.
     public var canUseFormTool: Bool {
-        document != nil && !formInfo.encrypted && formInfo.fields.contains(where: { $0.editable })
+        document != nil && !formInfo.encrypted
+            && formInfo.fields.contains(where: { $0.editable })
     }
 
     /// The toolbar button. Activating the form tool leaves the annotation tool in its normal
@@ -5759,7 +5766,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let report = try await engine.saveFilledForm(to: destination, values: values)
             statusMessage =
                 "Saved \(report.writtenFieldIDs.count) filled field(s) to "
-                + "\(destination.lastPathComponent) · \(report.appendedBytes) bytes appended"
+                + "\(destination.lastPathComponent)"
+                + (report.sourceBytesPreserved
+                   ? " · \(report.appendedBytes) bytes appended"
+                   : " · signature fields removed from the copy")
                 + " · the original is unchanged"
             FileHandle.standardError.write(Data((
                 "lyra-reader-forms: saved \(report.writtenFieldIDs.count) field(s) to "
@@ -5777,6 +5787,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithFilledFormConfirmation() {
+        guard guardWritable() else { return }
+        guard canReplaceOriginalWithFilledForm else { return }
         guard let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -5795,6 +5807,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithFilledForm() async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before filling its form"
             return false
@@ -5888,8 +5901,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveDocumentProperties: Bool {
-        document != nil && documentInfo != nil && documentPropertiesAreDirty
-            && !propertiesSaveInProgress && !(documentInfo?.isEncrypted ?? true)
+        document != nil && documentInfo != nil
+            && documentPropertiesAreDirty && !propertiesSaveInProgress
+            && !(documentInfo?.isEncrypted ?? true)
+    }
+
+    /// Writing properties into the signed file itself. The copy command above stays available.
+    public var canReplaceOriginalWithDocumentProperties: Bool {
+        canSaveDocumentProperties && !isReadOnlyDocument
     }
 
     /// Why the Save buttons are disabled, shown in the panel. Nil when they are available.
@@ -5948,7 +5967,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             statusMessage =
                 "Saved the document properties to \(destination.lastPathComponent)"
-                + " · \(report.appendedBytes) bytes appended · the original is unchanged"
+                + (report.sourceBytesPreserved
+                   ? " · \(report.appendedBytes) bytes appended"
+                   : " · signature fields removed from the copy")
+                + " · the original is unchanged"
             FileHandle.standardError.write(Data((
                 "lyra-reader-properties: saved \(report.writtenKeys.joined(separator: ",")) to "
                 + "\(destination.path)\n"
@@ -5965,6 +5987,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPropertiesConfirmation() {
+        guard guardWritable() else { return }
+        guard canReplaceOriginalWithDocumentProperties else { return }
         guard let url = document?.url else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -5982,6 +6006,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithProperties() async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before editing its properties"
             return false
@@ -6014,6 +6039,55 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    // MARK: - Signed documents (read-only)
+
+    /// The signature evidence for the open document, read by the engine once at open.
+    public var documentSignature: DocumentSignature { document?.signature ?? .unsigned }
+
+    /// True when the file carries a digital signature and every **in-place** write is refused.
+    ///
+    /// Edits are still allowed: they go to the sidecar and can be saved to a new file. The
+    /// decision lives in Rust; the shell mirrors it only to disable the in-place controls and
+    /// explain them. A direct engine call is still refused by the same gate, so a stale button
+    /// cannot rewrite a signed file.
+    public var isReadOnlyDocument: Bool { documentSignature.signed }
+
+    /// The one sentence every in-place write refuses with.
+    public var readOnlyReason: String? { documentSignature.readOnlyReason }
+
+    /// The banner's headline. The reason below it names the evidence.
+    public var readOnlyBannerTitle: String { "Signed PDF · read-only in place" }
+
+    /// The evidence, one line, for the banner's second line.
+    public var readOnlyBannerEvidence: String {
+        documentSignature.evidence.map(\.detail).joined(separator: " · ")
+    }
+
+    /// What a signed document can still do. Shown in the banner next to the reason.
+    public var readOnlyBannerNote: String {
+        "Saving a copy is allowed; the copy leaves the signature fields out."
+    }
+
+    /// True when annotation tools may create or remove marks. Sidecar edits are allowed for a
+    /// signed document too: they can be written to a copy, and the signed original is untouched.
+    public var canEditAnnotations: Bool { document != nil }
+
+    /// Refuses an in-place write and states the shared reason. Returns true when the file is
+    /// writable.
+    ///
+    /// Every public replace/original write entry point calls this before doing anything, so a
+    /// call that bypasses a disabled button still gets the same answer as the UI.
+    @discardableResult
+    private func guardWritable() -> Bool {
+        guard let reason = readOnlyReason else { return true }
+        lastError = reason
+        statusMessage = "Signed PDF · read-only"
+        FileHandle.standardError.write(Data(
+            "lyra-reader-signature: write refused · \(reason)\n".utf8
+        ))
+        return false
+    }
+
     // MARK: - Saving annotations into the PDF
 
     /// Whether the two PDF-writing commands can run.
@@ -6023,10 +6097,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// erasure counts even when it removed the last annotation: the copy must still be
     /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
-        document != nil
-            && (!annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure || hasPendingFileDeletions)
-            && !annotationSaveInProgress
+        guard document != nil, !annotationSaveInProgress else { return false }
+        // A signed document cannot be edited, but exporting a copy (with whatever sidecar
+        // annotations it already carries, or none) never touches the signed original.
+        if isReadOnlyDocument { return true }
+        return !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
+            || hasPendingInkErasure || hasPendingFileDeletions
     }
 
     /// Whether the open document's outline already contains the reader's marked bookmark
@@ -6042,8 +6118,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// last annotation (it is the source bytes), but replacing a file with an identical copy
     /// would be a destructive no-op with a backup.
     public var canReplaceOriginalWithAnnotations: Bool {
-        canSaveAnnotationsToPDF && (!annotations.isEmpty || !bookmarks.isEmpty
-            || hasEmbeddedBookmarkSubtree || hasPendingFileDeletions)
+        canSaveAnnotationsToPDF && !isReadOnlyDocument
+            && (!annotations.isEmpty || !bookmarks.isEmpty
+                || hasEmbeddedBookmarkSubtree || hasPendingFileDeletions)
     }
 
     /// The name an annotated copy is offered as: `<name> (annotated).pdf`.
@@ -6105,7 +6182,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-                || hasPendingInkErasure || hasPendingFileDeletions else {
+                || hasPendingInkErasure || hasPendingFileDeletions
+                || isReadOnlyDocument else {
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -6136,10 +6214,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarkWriteRequests()
             if changes.isEmpty && bookmarkRequests.isEmpty {
-                // The eraser removed the last annotation and there is no bookmark to write:
-                // the engine deliberately refuses an empty request. The honest copy is the
-                // source bytes. It still matters: the pending banner offers "Save Copy…" and
-                // that action must work precisely in this case.
+                // The eraser removed the last annotation and there is no bookmark to write, or
+                // the document is signed and has nothing the reader may add: the engine
+                // deliberately refuses an empty request. The honest copy is the source bytes.
+                // It still matters: the pending banner (or the signed banner's copy promise)
+                // offers "Save Copy…" and that action must work precisely in this case.
                 let source = try Data(contentsOf: documentURL, options: .mappedIfSafe)
                 try source.write(to: destination, options: .atomic)
                 lastAnnotationWriteReport = AnnotationWriteReport(
@@ -6155,11 +6234,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     sourceBytesPreserved: true
                 )
                 erasedInkStrokeIDs.removeAll()
-                statusMessage =
-                    "Saved a copy without annotations to \(destination.lastPathComponent)"
-                    + " · the original is unchanged"
+                statusMessage = isReadOnlyDocument
+                    ? "Saved a copy of the signed PDF to \(destination.lastPathComponent)"
+                        + " · the original is unchanged"
+                    : "Saved a copy without annotations to \(destination.lastPathComponent)"
+                        + " · the original is unchanged"
                 FileHandle.standardError.write(Data((
-                    "lyra-reader-annotate: saved a byte copy without annotations to \(destination.path)\n"
+                    "lyra-reader-annotate: saved a byte copy to \(destination.path)"
+                    + (isReadOnlyDocument ? " (signed, export only)\n" : " (without annotations)\n")
                 ).utf8))
                 return true
             }
@@ -6182,13 +6264,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 bookmarks: report.writtenBookmarkIDs.count
             )
             let deleted = changes.deletions.count
+            let outcome = report.fullRewrite
+                ? " · pruned the removed annotations out of the saved bytes"
+                : (report.sourceBytesPreserved
+                   ? " · \(report.appendedBytes) bytes appended"
+                   : " · signature fields removed from the copy")
             statusMessage =
                 "Saved \(written) to \(destination.lastPathComponent)"
                 + (deleted > 0 ? " · \(deleted) annotation(s) deleted" : "")
-                + " · \(report.appendedBytes) bytes appended · the original is unchanged\(backup)"
+                + "\(outcome) · the original is unchanged\(backup)"
             FileHandle.standardError.write(Data((
                 "lyra-reader-annotate: saved \(written), \(deleted) annotation deletion(s) to \(destination.path)"
-                + " (append \(report.appendedBytes) bytes)\(backup)\n"
+                + " (\(outcome))\(backup)\n"
             ).utf8))
             return true
         } catch {
@@ -6210,6 +6297,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Returns `false` when nothing was replaced.
     @discardableResult
     public func replaceOriginalWithSavedAnnotations() async -> Bool {
+        guard guardWritable() else { return false }
         guard !annotationSaveInProgress else { return false }
         guard let url = document?.url else {
             lastError = "Open a document before saving annotations"
@@ -6299,6 +6387,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage =
                 "Saved \(written) into \(url.lastPathComponent)"
                 + (deletedCount > 0 ? " · \(deletedCount) annotation(s) deleted" : "")
+                + (report.fullRewrite ? " · removed content pruned from the file" : "")
                 + " · backup: \(backup)"
             if report.deletedReplyCount > 0 {
                 statusMessage += " · \(report.deletedReplyCount) repl\(report.deletedReplyCount == 1 ? "y" : "ies") removed with their thread"
@@ -7161,6 +7250,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         canMarkRedactions && !pendingRedactions.isEmpty && !annotationSaveInProgress
     }
 
+    /// Replacing the signed file with the redacted version. "Apply to Copy" stays available.
+    public var canReplaceOriginalWithRedactions: Bool {
+        canApplyRedactions && !isReadOnlyDocument
+    }
+
     /// Arms the redaction tool, or leaves it when it is already armed.
     public func toggleRedactionTool() {
         guard canMarkRedactions else {
@@ -7335,7 +7429,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Presents the destructive confirmation for replacing the file on disk.
     public func presentReplaceRedactionsConfirmation() {
-        guard canApplyRedactions else {
+        guard guardWritable() else { return }
+        guard canReplaceOriginalWithRedactions else {
             lastError = pendingRedactions.isEmpty
                 ? "Mark at least one area before replacing the document."
                 : "Redactions cannot be applied while another write is in progress."
@@ -7395,6 +7490,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     private func redactReplacingOriginal(areas: [RedactionArea]) async -> Bool {
+        guard guardWritable() else { return false }
         guard let url = document?.url else { return false }
         redactionBusy = true
         defer { redactionBusy = false }
@@ -7537,18 +7633,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         document != nil && !annotationSaveInProgress && !pageEditBusy
     }
 
+    /// Page operations that write a new file (extract, merge, split).
+    public var canPageOperations: Bool { document != nil }
+
     public var pageEditSessionActive: Bool { pageEditSession != nil }
     public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
     public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
-    public var canApplyPageEdits: Bool {
+    public var canSavePageEditsCopy: Bool {
         pageEditSession != nil && !pageEditBusy && !annotationSaveInProgress
+    }
+
+    /// Applying the staged revision to the signed file itself. "Save Copy" stays available.
+    public var canReplaceOriginalWithPageEdits: Bool {
+        canSavePageEditsCopy && !isReadOnlyDocument
     }
 
     /// The entry point behind the menu commands, exposed separately so the headless checks can
     /// exercise the real session without driving AppKit menus or modal alerts.
     @discardableResult
     public func applyPageEditOperation(_ operation: PageEditOperation, label: String) async -> Bool {
-        await applyPageEdit(operation, label: label)
+        return await applyPageEdit(operation, label: label)
     }
 
     /// What the interface must say about the staged state. Nil when nothing is pending.
@@ -8305,7 +8409,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPageEditsConfirmation() {
-        guard let session = pageEditSession else { return }
+        guard guardWritable() else { return }
+        guard canReplaceOriginalWithPageEdits, let session = pageEditSession else { return }
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Replace “\(session.originalURL.lastPathComponent)” with the page-edited version?"

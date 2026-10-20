@@ -161,7 +161,8 @@ struct DocumentInformationContent: View {
                         .foregroundStyle(LyraReaderTheme.warningFg)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.vertical, 2)
-                } else {
+                }
+                if state.documentPropertiesRefusal == nil {
                     ForEach(DocumentPropertyKey.allCases, id: \.self) { key in
                         propertyRow(key)
                     }
@@ -177,7 +178,10 @@ struct DocumentInformationContent: View {
                         } label: {
                             Label("Write to This File…", systemImage: "doc.badge.arrow.up")
                         }
-                        .disabled(!state.canSaveDocumentProperties)
+                        .disabled(!state.canReplaceOriginalWithDocumentProperties)
+                        .help(state.isReadOnlyDocument
+                              ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                              : "Back up and replace the original file's information")
                         Spacer()
                         if state.documentPropertiesAreDirty {
                             Text("Unsaved")
@@ -187,14 +191,24 @@ struct DocumentInformationContent: View {
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    Text(
-                        "Save Copy writes the entries into a new PDF and leaves this file "
-                        + "untouched; Write to This File backs it up first and then replaces it. "
-                        + "Changing the recognized metadata above does not write anything."
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    if state.isReadOnlyDocument {
+                        Text(
+                            "Signed PDF: edits here can be saved to a copy. A modified copy "
+                            + "has its signature fields removed, so it does not look signed."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.warningFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(
+                            "Save Copy writes the entries into a new PDF and leaves this file "
+                            + "untouched; Write to This File backs it up first and then replaces it. "
+                            + "Changing the recognized metadata above does not write anything."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 if state.documentInfo?.hasInfoDictionary == false {
                     Text("This PDF has no information dictionary yet; a save adds one.")

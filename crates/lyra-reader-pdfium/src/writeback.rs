@@ -8,9 +8,13 @@
 //!
 //! 1. **A user choice, not a background write.** Nothing here runs unless the caller asks for
 //!    [`SaveMode::Copy`] or [`SaveMode::ReplaceOriginal`]. There is no autosave.
-//! 2. **Append-only.** The incremental save leaves every original byte at its original offset.
-//!    [`save_annotated_pdf`] verifies that the output's prefix *is* the source before it accepts
-//!    the result, so a PDFium regression that rewrote the file would be caught here.
+//! 2. **Append-only — unless something was removed.** An ordinary save leaves every original
+//!    byte at its original offset and verifies that the output's prefix *is* the source. When
+//!    the request deletes annotations, an incremental update cannot free their objects, so the
+//!    save finishes with a pruned full rewrite (`rewrite`): the removed dictionaries, their
+//!    replies and popups, and every other unreachable byte are gone. That path verifies the
+//!    rewritten document is equivalent to the source (pages, text, forms, outline, metadata,
+//!    attachments) before the rename; a feature it cannot preserve refuses the save.
 //! 3. **Atomic.** The bytes are written to a new temporary file in the destination's own
 //!    directory, flushed, `fsync`ed, reopened and verified, and only then renamed over the
 //!    target. A crash at any earlier point leaves the target untouched and at most one
@@ -73,6 +77,7 @@ use crate::geometry_write::{append_direct_annotations, verify_direct_annotations
 use crate::outline_write::{
     WriteBookmark, append_bookmarks, has_bookmark_subtree, validate_bookmarks, verify_outline,
 };
+use crate::rewrite::{RewriteFault, TextComparison, prune_rewrite, verify_document_equivalence};
 use lyra_reader_core::{
     ErrorCode, LyraReaderError, PageIndex, Point, RawAnnotation, RawAnnotationKind, Result,
 };
@@ -125,8 +130,13 @@ pub struct SaveReport {
     pub assigned_names: Vec<String>,
     /// Stale `*.lyra-reader-save-*.tmp` files removed from the destination directory before this save.
     pub cleaned_temporaries: usize,
-    /// True when the output's prefix equals the source byte-for-byte. Always true on `Ok`.
+    /// True when the output's prefix equals the source byte-for-byte. Always true on `Ok`
+    /// unless [`Self::full_rewrite`] is set.
     pub source_bytes_preserved: bool,
+    /// True when the save pruned the file: deletions were requested, so the output is a fresh
+    /// document that no longer contains the removed annotation objects (or any other
+    /// unreachable bytes). False for an ordinary append-only save.
+    pub full_rewrite: bool,
 }
 
 /// How a rewritten document (page edits, extraction) is allowed to land.
@@ -211,7 +221,9 @@ pub fn save_annotated_pdf(
 ///   then the original is still the old inode, because rename is the last step.
 /// * On `Ok`, `destination` has been reopened and verified to contain every requested
 ///   annotation exactly once, every annotation the save did not edit or delete unchanged, the
-///   deletions absent (with their replies and popups), and the source's bytes as a prefix.
+///   deletions absent (with their replies and popups), and — for an append-only save — the
+///   source's bytes as a prefix. A save with deletions is a full pruned rewrite instead; its
+///   equivalence with the source is verified before the rename.
 /// * Temporary files are removed on every error path on a best-effort basis; leftovers are
 ///   cleaned by the next save and reported by [`interrupted_save_note`].
 pub fn save_annotation_changes(
@@ -221,6 +233,50 @@ pub fn save_annotation_changes(
     bookmarks: &[WriteBookmark],
     password: Option<&str>,
     mode: SaveMode,
+) -> Result<SaveReport> {
+    save_annotation_changes_with(
+        source,
+        destination,
+        changes,
+        bookmarks,
+        password,
+        mode,
+        RewriteFault::None,
+    )
+}
+
+/// A save with a deliberately broken full rewrite, for the equivalence-refusal check.
+///
+/// The fault can only lose the embedded-file tree; everything else about the save is real. The
+/// test asserts the refusal names the attachment and that no output file exists afterwards.
+#[cfg(test)]
+pub(crate) fn save_annotation_changes_with_fault(
+    source: &Path,
+    destination: &Path,
+    changes: &AnnotationChanges,
+    bookmarks: &[WriteBookmark],
+    password: Option<&str>,
+    mode: SaveMode,
+) -> Result<SaveReport> {
+    save_annotation_changes_with(
+        source,
+        destination,
+        changes,
+        bookmarks,
+        password,
+        mode,
+        RewriteFault::DropEmbeddedFiles,
+    )
+}
+
+fn save_annotation_changes_with(
+    source: &Path,
+    destination: &Path,
+    changes: &AnnotationChanges,
+    bookmarks: &[WriteBookmark],
+    password: Option<&str>,
+    mode: SaveMode,
+    fault: RewriteFault,
 ) -> Result<SaveReport> {
     let annotations = &changes.additions;
     let (updates, deletions): (&[AnnotationUpdate], &[AnnotationDelete]) =
@@ -378,6 +434,11 @@ pub fn save_annotation_changes(
                 .len();
         }
 
+        // A deletion would otherwise leave the removed annotation dictionaries in the file as
+        // unreachable bytes. A full rewrite is the only way to remove them; an ordinary append
+        // or edit stays incremental.
+        let full_rewrite = !deletions.is_empty();
+
         // The document must not have moved under us while the update was being produced.
         let after = fs::metadata(&source)
             .map_err(|error| io_error("could not re-read the source metadata", &source, error))?;
@@ -388,7 +449,30 @@ pub fn save_annotation_changes(
             ));
         }
 
-        verify_prefix(&source, temp.path(), source_len)?;
+        if full_rewrite {
+            let pruned = prune_rewrite(temp.path(), &applied.removed_objects, fault)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(temp.path())
+                .map_err(|error| {
+                    io_error(
+                        "could not reopen the saved file for the rewrite",
+                        temp.path(),
+                        error,
+                    )
+                })?;
+            file.write_all(&pruned).map_err(|error| {
+                io_error("could not write the pruned document", temp.path(), error)
+            })?;
+            file.sync_all().map_err(|error| {
+                io_error("could not fsync the pruned document", temp.path(), error)
+            })?;
+            drop(file);
+            written_bytes = pruned.len() as u64;
+        } else {
+            verify_prefix(&source, temp.path(), source_len)?;
+        }
 
         let saved = read_annotations(temp.path(), password, page_count)?;
         verify_all(&preexisting, &saved, changes, &applied.deleted_ids)?;
@@ -402,7 +486,14 @@ pub fn save_annotation_changes(
             password,
         )?;
 
-        if written_bytes < source_len {
+        // A full rewrite re-serialises the whole document, so "the annotations are right" is
+        // not enough: every feature the reader promises to preserve must still be there before
+        // the temporary file can replace anything.
+        if full_rewrite {
+            verify_document_equivalence(&source, temp.path(), password, TextComparison::Exact)?;
+        }
+
+        if !full_rewrite && written_bytes < source_len {
             return Err(LyraReaderError::new(
                 ErrorCode::Internal,
                 "the incremental save produced fewer bytes than the original",
@@ -448,7 +539,8 @@ pub fn save_annotation_changes(
             deleted_popup_count: applied.deleted_popup_count,
             assigned_names: applied.assigned_names,
             cleaned_temporaries,
-            source_bytes_preserved: true,
+            source_bytes_preserved: !full_rewrite,
+            full_rewrite,
         })
     })();
 
