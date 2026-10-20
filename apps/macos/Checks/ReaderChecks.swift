@@ -250,6 +250,19 @@ struct ReaderChecks {
             try await eraserChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+            try await partialEraseChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
+            return
+        }
+        // Partial stroke erase on its own (`LyraReaderChecks --check-partial-erase .`).
+        if CommandLine.arguments.contains("--check-partial-erase") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await partialEraseChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
+            print("Partial erase checks passed")
             return
         }
         // Ink and shapes on their own (`LyraReaderChecks --check-ink-annotations .`).
@@ -575,6 +588,9 @@ struct ReaderChecks {
         try await eraserChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+        try await partialEraseChecks(
+            drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"))
         try await placedTextChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),

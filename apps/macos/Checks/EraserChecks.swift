@@ -3,7 +3,9 @@ import LyraReaderKit
 import Foundation
 import PDFKit
 
-/// The eraser: a mode that removes **ink strokes**, not annotations.
+/// The eraser: a mode that cuts **ink**, not annotations. This suite covers the whole-stroke
+/// behaviour it started with (a drag along a stroke removes it); `PartialEraseChecks` covers the
+/// split, identity, undo and save rules for a drag that cuts only part of a stroke.
 ///
 /// Every check runs through the real `AppState`, the real `MetalCanvasView` event path and the
 /// real engine, on scratch copies of the committed fixtures. The canvas is wired exactly as
@@ -132,9 +134,10 @@ extension ReaderChecks {
         require(!noDocument.canUseEraserTool,
                 "the eraser button has nothing to act on without a document")
 
-        // ── 2. Eraser geometry: whole strokes, a stated tolerance, no partial erase ──────
+        // ── 2. Eraser geometry: a stated reach; tracing a stroke removes the whole stroke ──
         // Reach = half the stroke's width + 8 view points at the current zoom. At 100% a 2 pt
-        // stroke is therefore removed within 9 page points of its centreline.
+        // stroke is therefore removed within 9 page points of its centreline. Partial erase uses
+        // the same number; see `PartialEraseChecks` for the cut geometry.
         let red = AnnotationColor(red: 200, green: 30, blue: 40, alpha: 255)
         let twoPointReach = AnnotationGeometry.eraserReach(strokeWidth: 2, zoom: 1)
         require(abs(twoPointReach - 9) < 0.001,
@@ -247,9 +250,10 @@ extension ReaderChecks {
         let undoBeforeSweep = state.undoStack.count
         require(state.annotationTool == .eraser, "the eraser is still armed after the first drag")
         state.updateEraserHover(atContentPoint: nil)
-        drag(canvas, from: content(state, page: 0, CGPoint(x: 200, y: 230)),
-             through: [content(state, page: 0, CGPoint(x: 200, y: 290))],
-             to: content(state, page: 0, CGPoint(x: 200, y: 350)))
+        drag(canvas, from: content(state, page: 0, CGPoint(x: 90, y: 240)),
+             through: [content(state, page: 0, CGPoint(x: 310, y: 240)),
+                       content(state, page: 0, CGPoint(x: 310, y: 340))],
+             to: content(state, page: 0, CGPoint(x: 90, y: 340)))
         require(!state.annotations.contains(where: { $0.id == strokeB.id }),
                 "the sweep crossed and removed stroke B")
         require(!state.annotations.contains(where: { $0.id == strokeC.id }),
@@ -423,10 +427,15 @@ extension ReaderChecks {
         let externalCanvas = makeCanvas(external)
         let externalUndo = external.undoStack.count
         let externalWrites = external.annotationWriteCount
-        drag(externalCanvas,
-             from: content(external, page: externalInk.page, externalPath[0]),
-             through: [content(external, page: externalInk.page, externalPath[0])],
-             to: content(external, page: externalInk.page, externalPath[externalPath.count - 1]))
+        // The eraser now removes only what its pointer path reaches, so erasing a whole stroke
+        // means tracing the whole stroke. A chord from the first /InkList point to the last
+        // would leave the two bends as pieces (and correctly so).
+        let externalStrokeContent = externalPath.map {
+            content(external, page: externalInk.page, $0)
+        }
+        drag(externalCanvas, from: externalStrokeContent[0],
+             through: Array(externalStrokeContent.dropFirst().dropLast()),
+             to: externalStrokeContent[externalStrokeContent.count - 1])
         require(!external.documentAnnotations.contains(where: { $0.id == externalInk.id }),
                 "the file-owned stroke is gone from the page")
         require(external.pendingFileDeletions.contains(where: { $0.identity == externalInk.id }),

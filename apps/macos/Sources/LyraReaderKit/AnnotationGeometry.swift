@@ -11,8 +11,9 @@ import CoreGraphics
 public enum AnnotationTool: String, CaseIterable, Sendable {
     case select
     case pen
-    /// A mode rather than a drawing tool: dragging removes whole ink strokes instead of
-    /// creating anything. It is in the same enum so exactly one tool can own the canvas.
+    /// A mode rather than a drawing tool: dragging removes the ink under its pointer path
+    /// instead of creating anything. It is in the same enum so exactly one tool can own the
+    /// canvas.
     case eraser
     case line
     case arrow

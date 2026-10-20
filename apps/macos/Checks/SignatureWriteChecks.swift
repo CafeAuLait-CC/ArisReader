@@ -437,9 +437,14 @@ extension ReaderChecks {
         }
         let eraseBytes = try bytes(eraseURL)
         eraseState.toggleEraserTool()
+        // A partial eraser removes only the ink under its pointer path; trace the whole stroke to
+        // remove the annotation as a whole.
         eraseState.beginEraserGesture(atContentPoint: content(path[0]))
-        eraseState.extendEraserGesture(
-            fromContentPoint: content(path[0]), toContentPoint: content(path[path.count - 1]))
+        for index in 1..<path.count {
+            eraseState.extendEraserGesture(
+                fromContentPoint: content(path[index - 1]),
+                toContentPoint: content(path[index]))
+        }
         eraseState.endEraserGesture()
         require(!eraseState.documentAnnotations.contains(where: { $0.id == ink.id }),
                 "the eraser removed the file-owned ink stroke")

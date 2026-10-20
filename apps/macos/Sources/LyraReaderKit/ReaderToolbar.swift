@@ -437,7 +437,7 @@ struct ReaderSecondaryToolbar: View {
              .help(writeHelp("Shapes: line, arrow, rectangle or ellipse"))
             tool("Eraser", "eraser",
                  selected: state.annotationTool == .eraser,
-                 help: writeHelp("Eraser: drag over ink to remove whole strokes (Esc leaves the eraser)")) {
+                 help: writeHelp("Eraser: drag over ink to cut it where you pass (Esc leaves the eraser)")) {
                 state.toggleEraserTool()
             }.disabled(!state.canUseEraserTool)
             tool("Place a sticky note", "text.bubble",
