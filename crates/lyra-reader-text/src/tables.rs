@@ -72,13 +72,18 @@
 //! row), three small tables that share full-width rules as their borders (`Zhang`, pages 7–8),
 //! and pages where the caption is narrower than its table by more than half again.
 //!
+//! On 2026-10-20, counting distinct text rows instead of rule intervals finds **31 of 40**
+//! captions in the same corpus (previously 20). The review manuscript `review_du_0923.pdf`
+//! yields **12 of 12**, including its three-rule Tables 6 and 11. Growth also requires a
+//! separator to cover half of the anchored span: a narrow equation fraction bar below Table 1
+//! must not extend its bottom border through the following paragraph.
+//!
 //! # Honest limits
 //!
 //! * **Tables with no vertical rules.** `booktabs`-style tables have three horizontal rules and
 //!   no verticals at all; on this corpus that is the largest single group, and 8 of the 13 in
-//!   `manuscript_0925.pdf` are found through the text tier. The other five have rules that do not
-//!   stack into rows at all (two-rule tables), and no rule-based method can see a table that is
-//!   not drawn.
+//!   `manuscript_0925.pdf` were originally found through the text tier. Counting visual text rows
+//!   instead of rule intervals now finds all 13; three borders need not mean only two text rows.
 //! * **A caption much narrower than its table.** The border rule is required to be no wider than
 //!   the caption plus half again, which is what stops a full-width rule from being taken for a
 //!   small table's border. A one-line centred caption under a wide table is therefore lost.
@@ -131,14 +136,15 @@ pub const MAX_ROW_PITCH_PT: f64 = 100.0;
 /// Two body lines: a table row taller than this is holding something other than one line of type.
 pub const WIDE_GAP_PT: f64 = 30.0;
 
-/// Share of the narrower rule that two horizontal rules must overlap to be rows of one table.
+/// Share of the narrower rule that consecutive rules must overlap, and minimum share
+/// of the anchored span a separator must cover to extend the table.
 pub const ROW_OVERLAP_SHARE: f64 = 0.5;
 
 /// How far a rule may stick out of the extent found so far and still join the same table
 /// (points). This is the tolerance for stroke ends and rounding, not for a wider table.
 pub const CONTAIN_TOLERANCE_PT: f64 = 10.0;
 
-/// A grid needs three horizontal rules: two rows is the smallest thing anyone calls a table.
+/// A grid needs three horizontal rules: typically top, header separator and bottom.
 pub const MIN_HORIZONTAL_LEVELS: usize = 3;
 
 /// The strong tier needs two vertical rules: the borders of one column of cells.
@@ -188,11 +194,12 @@ pub const CAPTION_OVERLAP_SHARE: f64 = 0.3;
 /// Fewest text lines inside a grid for it to be a table rather than a frame.
 pub const MIN_CELL_LINES: usize = 3;
 
-/// Row bands that must hold text before a grid without vertical rules is believed.
+/// Distinct text rows needed before a grid without vertical rules is believed.
 ///
 /// A ruled frame around a diagram holds one or two labels; a table holds a line of data per row.
-/// Three is the smallest count that is a pattern rather than a coincidence.
-pub const MIN_OCCUPIED_ROWS_WITHOUT_VERTICALS: usize = 3;
+/// Three is the smallest count that is a pattern rather than a coincidence. These are text
+/// rows, not spaces between rules: a booktabs table often has only top, header and bottom rules.
+pub const MIN_TEXT_ROWS_WITHOUT_VERTICALS: usize = 3;
 
 /// Columns of text that must appear when the grid has no vertical rules to show them.
 pub const MIN_TEXT_COLUMNS_WITHOUT_VERTICALS: usize = 2;
@@ -604,6 +611,10 @@ fn grow_once(
             })
             .filter(|rule| rule.start >= span.0 - CONTAIN_TOLERANCE_PT)
             .filter(|rule| rule.end <= span.1 + CONTAIN_TOLERANCE_PT)
+            // Underlined values and equation fraction bars are also horizontal paths. They
+            // cannot extend the table's outer boundary just because they fit inside its width.
+            // Require the next separator to cover at least half of the anchored table span.
+            .filter(|rule| rule.length() >= ROW_OVERLAP_SHARE * (span.1 - span.0))
             .filter(|rule| {
                 let overlap = rule.overlaps(edge);
                 overlap > 0.0 && overlap >= ROW_OVERLAP_SHARE * rule.length().min(edge.length())
@@ -734,7 +745,8 @@ fn grid_from_band(
     // No vertical rules to show the columns, so the text itself has to: several rows, and more
     // than one column of them. This is the `booktabs` case and the strictest test in the module,
     // because nothing else distinguishes it from a framed diagram.
-    if occupied < MIN_OCCUPIED_ROWS_WITHOUT_VERTICALS
+    if occupied < 2
+        || text_rows(&inside) < MIN_TEXT_ROWS_WITHOUT_VERTICALS
         || text_columns(&inside) < MIN_TEXT_COLUMNS_WITHOUT_VERTICALS
     {
         return Err(GridOutcome::NoTextInCells);
@@ -868,6 +880,28 @@ fn occupied_rows(inside: &[&TextLine], band: &[Rule]) -> usize {
             })
         })
         .count()
+}
+
+/// Count visual text rows, joining fragments on a common baseline. Superscripts and split
+/// glyph runs must not turn a single row into three: use the median text height as tolerance.
+fn text_rows(inside: &[&TextLine]) -> usize {
+    if inside.is_empty() {
+        return 0;
+    }
+    let mut heights: Vec<f64> = inside.iter().map(|line| line.rect.size.height).collect();
+    heights.sort_by(f64::total_cmp);
+    let tolerance = (heights[heights.len() / 2] * 0.75).max(MIN_LEVEL_GAP_PT);
+    let mut centres: Vec<f64> = inside.iter().map(|line| line.rect.center().y).collect();
+    centres.sort_by(f64::total_cmp);
+    let mut rows = 0;
+    let mut previous = f64::NEG_INFINITY;
+    for centre in centres {
+        if centre - previous > tolerance {
+            rows += 1;
+            previous = centre;
+        }
+    }
+    rows
 }
 
 /// How many columns the text's own left edges form.
@@ -1358,6 +1392,46 @@ mod table_tests {
             .map(|row| text_line(206.0, 108.0 + row as f64 * 16.0, 140.0, "one line of prose"))
             .collect();
         assert_eq!(table_region(&caption, &segments, &prose, page()), None);
+    }
+
+    #[test]
+    fn three_rule_booktabs_tables_count_text_rows_between_separators() {
+        let segments = vec![
+            horizontal(100.0, 200.0, 350.0),
+            horizontal(165.0, 200.0, 350.0),
+            horizontal(185.0, 200.0, 350.0),
+        ];
+        let caption = caption_at(200.0, 195.0, 150.0);
+        let mut lines = Vec::new();
+        for y in [106.0, 126.0, 146.0, 170.0] {
+            lines.push(text_line(206.0, y, 40.0, "method"));
+            lines.push(text_line(300.0, y, 30.0, "1.0"));
+        }
+        assert_eq!(
+            table_region(&caption, &segments, &lines, page()),
+            Some(Rect::new(200.0, 100.0, 150.0, 105.0)),
+            "a header separator need not be repeated between every data row"
+        );
+        // A header and one data row alone do not establish a text-only table.
+        lines.retain(|line| line.rect.origin.y >= 146.0);
+        assert_eq!(table_region(&caption, &segments, &lines, page()), None);
+    }
+
+    #[test]
+    fn fraction_bars_beyond_the_table_do_not_extend_its_bottom_boundary() {
+        let mut segments = clean_grid();
+        // A following paragraph ends with an equation; its fraction bar is inside the table's
+        // horizontal span and less than one permitted row pitch below the bottom border.
+        segments.push(horizontal(20.0, 245.0, 290.0));
+        let mut lines = clean_grid_text();
+        lines.push(text_line(200.0, 65.0, 150.0, "paragraph below the table"));
+        lines.push(text_line(245.0, 30.0, 45.0, "numerator"));
+        let caption = caption_at(200.0, 190.0, 150.0);
+        assert_eq!(
+            table_region(&caption, &segments, &lines, page()),
+            Some(Rect::new(200.0, 100.0, 150.0, 100.0)),
+            "the preview stops at the bottom border before the following paragraph"
+        );
     }
 
     #[test]

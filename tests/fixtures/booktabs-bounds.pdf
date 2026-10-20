@@ -1,0 +1,128 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [10 0 R 11 0 R 12 0 R] >>
+endobj
+5 0 obj
+<< /Length 791 >>
+stream
+BT /F1 28 Tf 72 760 Td (Table previews) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (bounds come from rules and text rows) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(See Table 1 for synthetic results.) Tj T*
+(See Table 6 for synthetic settings.) Tj T*
+(See the overview for more context.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 728 >>
+stream
+0 G 0 g 0.7 w
+BT /F1 11 Tf 72 710 Td (Table 1: Quantitative comparison of synthetic baseline methods and results.) Tj ET
+72 690 m 523 690 l S
+72 670 m 523 670 l S
+72 610 m 523 610 l S
+BT /F1 11 Tf 77 677 Td (Method) Tj ET
+BT /F1 11 Tf 473 677 Td (1.0) Tj ET
+BT /F1 11 Tf 77 653 Td (Alpha) Tj ET
+BT /F1 11 Tf 473 653 Td (1.0) Tj ET
+BT /F1 11 Tf 77 635 Td (Beta) Tj ET
+BT /F1 11 Tf 473 635 Td (1.0) Tj ET
+BT /F1 11 Tf 77 617 Td (Gamma) Tj ET
+BT /F1 11 Tf 473 617 Td (1.0) Tj ET
+BT /F1 11 Tf 72 575 Td (This paragraph belongs below the table.) Tj ET
+BT /F1 11 Tf 72 559 Td (The preview must stop before these lines.) Tj ET
+BT /F1 11 Tf 157 540 Td (numerator) Tj ET
+147 530 m 237 530 l S
+BT /F1 11 Tf 157 515 Td (denominator) Tj ET
+
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 609 >>
+stream
+0 G 0 g 0.7 w
+BT /F1 11 Tf 160 710 Td (Table 6: Main optimization settings for all baselines.) Tj ET
+160 690 m 440 690 l S
+160 670 m 440 670 l S
+160 610 m 440 610 l S
+BT /F1 11 Tf 165 677 Td (Method) Tj ET
+BT /F1 11 Tf 390 677 Td (1.0) Tj ET
+BT /F1 11 Tf 165 653 Td (Alpha) Tj ET
+BT /F1 11 Tf 390 653 Td (1.0) Tj ET
+BT /F1 11 Tf 165 635 Td (Beta) Tj ET
+BT /F1 11 Tf 390 635 Td (1.0) Tj ET
+BT /F1 11 Tf 165 617 Td (Gamma) Tj ET
+BT /F1 11 Tf 390 617 Td (1.0) Tj ET
+BT /F1 11 Tf 160 575 Td (This paragraph belongs below the table.) Tj ET
+BT /F1 11 Tf 160 559 Td (The preview must stop before these lines.) Tj ET
+
+endstream
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 686 200 701] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 671 200 686] /Border [0 0 0] /Dest [8 0 R /Fit] /F 4 >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 656 200 671] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000133 00000 n 
+0000000230 00000 n 
+0000000387 00000 n 
+0000001229 00000 n 
+0000001355 00000 n 
+0000002134 00000 n 
+0000002260 00000 n 
+0000002920 00000 n 
+0000003033 00000 n 
+0000003146 00000 n 
+trailer
+<< /Size 13 /Root 1 0 R >>
+startxref
+3259
+%%EOF

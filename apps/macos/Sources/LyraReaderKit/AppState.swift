@@ -1186,6 +1186,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var referencePreviewWidthPt: CGFloat = 480
     private var referencePreviewHeightPt: CGFloat = 380
     private var previewEpoch: UInt64 = 0
+    /// Click/content identity, independent of raster requests caused by panel resizing.
+    private var previewLookupEpoch: UInt64 = 0
     @Published public private(set) var referencePreviewScrollYPt: CGFloat = 0
     @Published public private(set) var referencePreviewError: String?
     @Published public private(set) var referencePreviewLoading = false
@@ -1279,6 +1281,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage = "Preview pinned — unpin it to preview a new reference"
             return false
         }
+        if requested != referencePreview { previewLookupEpoch &+= 1 }
         previewEpoch &+= 1
         let request = previewEpoch
         referencePreviewPages = []
@@ -1363,6 +1366,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func closeReferencePreview() {
+        previewLookupEpoch &+= 1
         previewEpoch &+= 1
         referencePreviewPinned = false
         referencePreviewLoading = false
@@ -9087,6 +9091,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         clearSelection()
         clearAnnotationSelection()
         closeDocumentNote()
+        previewLookupEpoch &+= 1
         previewEpoch &+= 1
 
         // A visible inline-comment label wins over text underneath it. Elsewhere, preserve
@@ -9580,7 +9585,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
         let epoch = documentEpoch
-        let request = previewEpoch
+        let request = previewLookupEpoch
         // Read the anchor before the await: resolution can take a moment, and the reader
         // may have scrolled by the time it lands, but the panel belongs where they clicked.
         let anchor = viewRect(
@@ -9589,12 +9594,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             on: placement
         )
         Task { @MainActor [weak self] in
-            guard let self, epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard let self, epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
             let resolved = (try? await self.engine.resolveCitations(
                 labels: labels,
                 page: placement.index
             )) ?? []
-            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
             guard let first = resolved.first else {
                 self.statusMessage = "Citation \"\(written)\" has no matching entry"
                 return
@@ -9639,7 +9644,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func resolveCitation(on placement: PagePlacement, at local: CGPoint) {
         let page = placement.index
         let epoch = documentEpoch
-        let request = previewEpoch
+        let request = previewLookupEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
             let citations: [Citation]
@@ -9648,7 +9653,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } else {
                 citations = await self.startCitationLoad(page: page).value ?? []
             }
-            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
             guard let citation = self.citation(at: local, in: citations) else { return }
             // The placement is the one the reader clicked in even if the view has scrolled since:
             // the panel belongs where they clicked, the same rule `previewCitation` follows.
@@ -9690,6 +9695,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 return false
             }
             guard let mention = mention(at: local, in: mentions) else { continue }
+            if figures.isEmpty {
+                resolveFigureMention(on: placement.index, at: local)
+                return false
+            }
             return openFigure(mention, from: placement.index,
                               anchor: anchor(of: mention, on: placement))
         }
@@ -9768,7 +9777,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// which is cheaper than keeping a second copy of the in-flight state.
     private func resolveFigureMention(on page: Int, at local: CGPoint) {
         let epoch = documentEpoch
-        let request = previewEpoch
+        let request = previewLookupEpoch
         Task { @MainActor [weak self] in
             guard let self else { return }
             let index = self.figures.isEmpty
@@ -9782,7 +9791,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
 
             // A newer click or document switch supersedes this lookup.
-            guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
             self.figures = index
             self.captionMentionsByPage[page] = mentions
 
@@ -9864,7 +9873,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
         if let page = link.page {
-            if openCitation(at: point) || openFigureMention(at: point) { return true }
+            // Reserve this click before starting asynchronous resolution. A temporary page
+            // preview must not cancel its own lookup; panel resizing has a separate raster epoch.
+            previewLookupEpoch &+= 1
+            previewEpoch &+= 1
+            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            if let citations = citationsByPage[placement.index],
+               let citation = citation(at: local, in: citations) {
+                previewCitation(citation, on: placement)
+                return true
+            }
+            if let mentions = captionMentionsByPage[placement.index],
+               let mention = mention(at: local, in: mentions),
+               openFigure(mention, from: placement.index, anchor: anchor(of: mention, on: placement)) {
+                return true
+            }
             // A section link is a reference to a *heading*, not to a picture: the clicked line
             // says so (`Sec. 2`, `Chapter IV`, `Appendix A`). A `/FitR` link already means a
             // figure or table region, so only a plain destination is considered.
@@ -9889,10 +9912,50 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 anchor: viewRect(local: box, on: placement),
                 region: link.region
             )
-            if opened { statusMessage = "Previewing page \(page + 1)" }
+            if opened {
+                statusMessage = "Previewing page \(page + 1)"
+                resolveLinkedPreview(on: placement, at: local)
+            }
             return true
         }
         return false
+    }
+
+    /// Classify a linked cold click after its temporary page preview has opened. Keep one
+    /// request identity through citation, mention and caption loads, and preserve the fallback
+    /// when none of them names an indexed entry. A later click, close or document switch wins.
+    private func resolveLinkedPreview(on placement: PagePlacement, at local: CGPoint) {
+        let epoch = documentEpoch
+        let request = previewLookupEpoch
+        Task { @MainActor [weak self] in
+            guard let self, epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
+            let citations: [Citation]
+            if let cached = self.citationsByPage[placement.index] {
+                citations = cached
+            } else {
+                citations = await self.startCitationLoad(page: placement.index).value ?? []
+            }
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
+            if let citation = self.citation(at: local, in: citations) {
+                self.previewCitation(citation, on: placement)
+                return
+            }
+            let mentions: [CaptionMention]
+            if let cached = self.captionMentionsByPage[placement.index] {
+                mentions = cached
+            } else {
+                mentions = (try? await self.engine.captionMentions(page: placement.index)) ?? []
+            }
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
+            self.captionMentionsByPage[placement.index] = mentions
+            guard let mention = self.mention(at: local, in: mentions) else { return }
+            let index = self.figures.isEmpty
+                ? ((try? await self.engine.figures()) ?? []) : self.figures
+            guard epoch == self.documentEpoch, request == self.previewLookupEpoch else { return }
+            self.figures = index
+            self.openFigure(mention, from: placement.index,
+                            anchor: self.anchor(of: mention, on: placement))
+        }
     }
 
     /// The section reference printed around a link box, if the link is one.

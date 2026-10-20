@@ -90,7 +90,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Outline entries gained the reader's bookmark identity (`bookmark_id`) and its page-local Y
 /// (`y_pt`). A version-3 cache cannot supply either, so it is re-derived instead of being
 /// returned without the data that makes a saved bookmark clickable at its position.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+///
+/// # 5
+///
+/// Citation detection gained narrative parenthesized years (`Guo et al. (2022)`). Version-4
+/// indexes persisted the old, incomplete spans and table regions. Three-rule booktabs tables
+/// and short equation bars also change the derived crops, so old indexes are rebuilt on open.
+pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// Tag that identifies our sidecar (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";

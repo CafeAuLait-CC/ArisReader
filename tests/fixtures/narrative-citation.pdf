@@ -1,0 +1,112 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R] >>
+endobj
+5 0 obj
+<< /Length 785 >>
+stream
+BT /F1 28 Tf 72 760 Td (Narrative citations) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (author names outside the year parentheses) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Guo et al. \(2022\) describe a synthetic motion baseline.) Tj T*
+(See the overview page for more context.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 1025 >>
+stream
+BT /F1 28 Tf 72 760 Td (REFERENCES) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (Synthetic bibliography) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Yun Bai. 2020. An example baseline.) Tj T*
+(Yiyi Cai. 2021. A second example.) Tj T*
+(Yuming Du. 2023. A third example.) Tj T*
+(Chuan Guo, Shihao Zou, and Li Cheng. Synthetic motion baseline. 2022.) Tj T*
+(Haonan Han. 2025. Another example.) Tj T*
+(Heng Li. 2024. An example model.) Tj T*
+(Guy Tevet. 2023. A synthetic comparison.) Tj T*
+(Tao Wang. 2025. The final example.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Link /Rect [130 687 158 701] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 671 260 686] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000372 00000 n 
+0000001208 00000 n 
+0000001334 00000 n 
+0000002411 00000 n 
+0000002524 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+2636
+%%EOF

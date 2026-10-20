@@ -137,6 +137,76 @@ fn open(
 }
 
 #[test]
+fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
+    if !lyra_reader_pdfium::is_available() {
+        eprintln!("skipping: PDFium unavailable");
+        return;
+    }
+    for name in ["narrative-citation.pdf", "booktabs-bounds.pdf"] {
+        let (_directory, path) = copy_named_fixture("preview-upgrade", name);
+        let (engine, first) = open(&path);
+        let fresh = snapshot(&first);
+        if name == "narrative-citation.pdf" {
+            let citation = fresh.citations[&0]
+                .iter()
+                .find(|citation| citation.labels == ["Guo 2022"])
+                .expect("narrative citation spans author and year");
+            assert_eq!(citation.text, "Guo et al. (2022)");
+            let entries = first
+                .resolve_citations_on(0, citation.labels.clone())
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].reference.page, 1);
+            assert!(
+                entries[0]
+                    .reference
+                    .text
+                    .contains("Synthetic motion baseline")
+            );
+        } else {
+            assert_eq!(fresh.figures.len(), 2);
+            for table in &fresh.figures {
+                assert_eq!(table.kind, "Table");
+                assert!(table.height_pt < 130.0, "{table:?}");
+                // PDF y=610 is the bottom border. The preview's margin must stay clear of
+                // the following paragraph at y=575 (view y=267 on an 842 pt page).
+                assert!(table.y_pt + table.height_pt < 260.0, "{table:?}");
+            }
+        }
+        drop(first);
+
+        // Simulate an index from the previous detector: no narrative spans and stale crops.
+        let sidecar = cache_path(&path);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        old["format_version"] = 4.into();
+        old["citations"] = serde_json::json!({"0": []});
+        old["figures"] = serde_json::json!([]);
+        fs::write(&sidecar, serde_json::to_vec(&old).unwrap()).unwrap();
+        let rebuilt = engine
+            .open_document(path.display().to_string(), None)
+            .unwrap();
+        assert_eq!(
+            rebuilt.index_cache_report().outcome,
+            IndexCacheOutcome::Corrupt
+        );
+        assert_eq!(
+            snapshot(&rebuilt),
+            fresh,
+            "{name}: old preview values were reused"
+        );
+        drop(rebuilt);
+
+        let warm = engine
+            .open_document(path.display().to_string(), None)
+            .unwrap();
+        assert_eq!(warm.index_cache_report().outcome, IndexCacheOutcome::Hit);
+        assert_eq!(snapshot(&warm), fresh, "{name}: repaired cache differs");
+        assert_eq!(warm.index_cache_report().derived_parts, 0);
+    }
+}
+
+#[test]
 fn a_second_open_uses_the_cache_and_returns_the_same_index_field_by_field() {
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");

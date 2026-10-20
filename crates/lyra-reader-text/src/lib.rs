@@ -2207,6 +2207,7 @@ pub struct Citation {
 ///
 /// * numeric — `[12]`, `[12,13]`, `[12-14]`
 /// * author-year — `(He et al. 2024)`, `(Kim and Lee, 2023)`, `(A, 2024; B, 2022)`
+///   and narrative forms such as `Guo et al. (2022)` or `Wang et al. [2006]`.
 ///
 /// A third style — superscript numerals, `winds5,6,23-26` — needs the bibliography to
 /// corroborate a run, so it is only found by [`find_citations_with`]. The same is true of the
@@ -2271,6 +2272,20 @@ fn find_bracketed_citations(text: &RawTextPage) -> Vec<Citation> {
                 .copied()
                 .filter(|c| !c.is_control() || c.is_whitespace())
                 .collect();
+            if close < chars.len()
+                && chars[close] == ')'
+                && let Some((start, label)) = narrative_author_year(&chars, index, &inner)
+            {
+                found.push(Citation {
+                    text: chars[start..=close].iter().collect(),
+                    labels: vec![label],
+                    rect: union_boxes(&text.chars[start..=close]),
+                    start,
+                    end: close + 1,
+                });
+                index = close + 1;
+                continue;
+            }
             let letters = inner
                 .chars()
                 .filter(|character| character.is_alphabetic())
@@ -2322,12 +2337,7 @@ fn find_bracketed_citations(text: &RawTextPage) -> Vec<Citation> {
             let inner: String = chars[index + 1..end].iter().collect();
             // ACM also uses narrative citations: `Lasseter [1987]` and
             // `Wang et al. [2006]`. A four-digit year is not an ordinal.
-            let narrative = first_year(&inner)
-                .filter(|year| year == &inner)
-                .and_then(|year| {
-                    preceding_author(&chars, index)
-                        .map(|(start, author)| (start, format!("{author} {year}")))
-                });
+            let narrative = narrative_author_year(&chars, index, &inner);
             let start = narrative.as_ref().map(|(start, _)| *start).unwrap_or(index);
             found.push(Citation {
                 text: chars[start..=end].iter().collect(),
@@ -2380,6 +2390,21 @@ fn citation_surname(text: &str) -> Option<String> {
     } else {
         Some(surname)
     }
+}
+
+/// A year-only group borrows its author from the preceding text. Including that author in
+/// the span makes both the name and a PDF link covering only the year open the same entry.
+fn narrative_author_year(chars: &[char], bracket: usize, inner: &str) -> Option<(usize, String)> {
+    let inner = inner.trim();
+    let year = first_year(inner).filter(|year| year == inner)?;
+    let (start, author) = preceding_author(chars, bracket)?;
+    if matches!(
+        author.as_str(),
+        "In" | "Since" | "Until" | "During" | "From" | "Between"
+    ) {
+        return None;
+    }
+    Some((start, format!("{author} {year}")))
 }
 
 fn preceding_author(chars: &[char], bracket: usize) -> Option<(usize, String)> {
@@ -2521,6 +2546,51 @@ mod citation_tests {
         let found = find_citations(&page("Prior work (He et al. 2024) agrees"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].labels, vec!["He 2024"]);
+    }
+
+    #[test]
+    fn narrative_parenthesized_years_include_the_author_in_the_click_target() {
+        for written in [
+            "Guo et al. (2022)",
+            "Guo and Li (2022)",
+            "Guo (2022)",
+            "Guo et al.\n(2022)",
+            "Guo (2022a)",
+        ] {
+            let raw = page(&format!("Following {written}, we compare results."));
+            let found = find_citations(&raw);
+            assert_eq!(found.len(), 1, "{written}");
+            let citation = &found[0];
+            assert_eq!(citation.text, written);
+            assert_eq!(
+                citation.labels,
+                [if written.ends_with("2022a)") {
+                    "Guo 2022a"
+                } else {
+                    "Guo 2022"
+                }]
+            );
+            assert_eq!(citation.start, "Following ".chars().count());
+            assert_eq!(citation.end - citation.start, written.chars().count());
+            assert_eq!(
+                citation.rect,
+                union_boxes(&raw.chars[citation.start..citation.end])
+            );
+        }
+    }
+
+    #[test]
+    fn bare_years_dates_and_equations_do_not_become_narrative_citations() {
+        for prose in [
+            "In (2022) we measured",
+            "January (2022)",
+            "the dataset (2022)",
+            "x (2022)",
+            "Guo (2022.5)",
+            "Guo (2022-2023)",
+        ] {
+            assert!(find_citations(&page(prose)).is_empty(), "{prose}");
+        }
     }
 
     #[test]

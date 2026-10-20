@@ -146,6 +146,12 @@ struct ReaderChecks {
             print("Section preview checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-linked-preview") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await linkedPreviewChecks(root: root)
+            return
+        }
         if CommandLine.arguments.contains("--check-preview-actions") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
@@ -596,6 +602,7 @@ struct ReaderChecks {
         try await previewHistoryChecks(url: b)
         try await previewTransparencyChecks(root: root)
         try await previewSectionChecks(root: root)
+        try await linkedPreviewChecks(root: root)
         try await previewActionChecks(root: root)
         try await pointerZoomChecks(url: b)
         try previewPanelChecks()

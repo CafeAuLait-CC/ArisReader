@@ -1936,6 +1936,67 @@ def long_document(page_count: int) -> list[tuple[str, int]]:
     ]
 
 
+def narrative_citation_pdf() -> bytes:
+    """A year-only internal link must open the complete author-year entry as text."""
+    body = text_page("Narrative citations", "author names outside the year parentheses", [
+        "Guo et al. (2022) describe a synthetic motion baseline.",
+        "See the overview page for more context.",
+    ])
+    references = text_page("REFERENCES", "Synthetic bibliography", [
+        "Yun Bai. 2020. An example baseline.",
+        "Yiyi Cai. 2021. A second example.",
+        "Yuming Du. 2023. A third example.",
+        "Chuan Guo, Shihao Zou, and Li Cheng. Synthetic motion baseline. 2022.",
+        "Haonan Han. 2025. Another example.",
+        "Heng Li. 2024. An example model.",
+        "Guy Tevet. 2023. A synthetic comparison.",
+        "Tao Wang. 2025. The final example.",
+    ])
+    return build_pdf([(body, 0), (references, 0)], annotations={0: [
+        annotation("Link", (130, 687, 158, 701), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", body_line_box(1, 260), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+    ]})
+
+
+def booktabs_bounds_pdf() -> bytes:
+    """Top captions, three-rule tables, and a fraction bar after the first table."""
+    body = text_page("Table previews", "bounds come from rules and text rows", [
+        "See Table 1 for synthetic results.",
+        "See Table 6 for synthetic settings.",
+        "See the overview for more context.",
+    ])
+
+    def table_page(label: int, left: float, right: float) -> str:
+        commands = ["0 G 0 g 0.7 w"]
+
+        def text(x: float, y: float, value: str) -> None:
+            commands.append(f"BT /F1 11 Tf {x} {y} Td ({escape_pdf_string(value)}) Tj ET")
+
+        caption = ("Table 1: Quantitative comparison of synthetic baseline methods and results."
+                   if label == 1 else "Table 6: Main optimization settings for all baselines.")
+        text(left, 710, caption)
+        # Only two spaces between rules, but four distinct rows of cells.
+        for y in [690, 670, 610]:
+            commands.append(f"{left} {y} m {right} {y} l S")
+        for y, name in [(677, "Method"), (653, "Alpha"), (635, "Beta"), (617, "Gamma")]:
+            text(left + 5, y, name)
+            text(right - 50, y, "1.0")
+        text(left, 575, "This paragraph belongs below the table.")
+        text(left, 559, "The preview must stop before these lines.")
+        if label == 1:
+            text(left + 85, 540, "numerator")
+            commands.append(f"{left + 75} 530 m {left + 165} 530 l S")
+            text(left + 85, 515, "denominator")
+        return "\n".join(commands) + "\n"
+
+    return build_pdf([(body, 0), (table_page(1, 72, 523), 0),
+                      (table_page(6, 160, 440), 0)], annotations={0: [
+        annotation("Link", body_line_box(0, 200), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", body_line_box(1, 200), extra="/Border [0 0 0] /Dest [8 0 R /Fit]"),
+        annotation("Link", body_line_box(2, 200), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+    ]})
+
+
 def main() -> int:
     args = sys.argv[1:]
     out_dir = Path("tests/fixtures")
@@ -2096,6 +2157,11 @@ def main() -> int:
         path = out_dir / name
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
+
+    path = out_dir / "narrative-citation.pdf"
+    path.write_bytes(narrative_citation_pdf())
+    (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
+    print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at
     #     "Appendix A"; the destination of the first is in the outline (so the preview title comes
