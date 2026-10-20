@@ -47,7 +47,10 @@ public struct ReaderWindow: View {
                     // A sliding drawer, not a conditional: the panel keeps its content width
                     // while the frame around it closes, so the canvas gets the freed width frame
                     // by frame and the document's vertical position never changes.
-                    ReaderSidebarTransition(isVisible: state.sidebarVisible && state.document != nil) {
+                    ReaderSidebarTransition(
+                        isVisible: state.sidebarVisible && state.document != nil,
+                        progressOverride: state.transitionProgressOverride?.sidebar
+                    ) {
                         SidebarView(state: state, opener: opener)
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
@@ -260,7 +263,8 @@ public struct ReaderWindow: View {
                 || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
-                || state.markSelectionRefusalNotice != nil {
+                || state.markSelectionRefusalNotice != nil
+                || state.eraserRefusalNotice != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
@@ -268,6 +272,9 @@ public struct ReaderWindow: View {
                     if state.formHasPendingChanges { formBanner }
                     if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner
+                    }
+                    if state.eraserRefusalNotice != nil {
+                        eraserRefusalBanner
                     }
                     if state.hasPendingInkErasure || state.hasPendingFileDeletions {
                         eraserPendingBanner
@@ -319,7 +326,10 @@ public struct ReaderWindow: View {
                     .frame(width: inset, height: ReaderChrome.secondaryToolbarHeightPt)
                     .allowsHitTesting(false)
             }
-            ReaderSecondaryToolbarTransition(isVisible: secondaryToolbarVisible) {
+            ReaderSecondaryToolbarTransition(
+                isVisible: secondaryToolbarVisible,
+                progressOverride: state.transitionProgressOverride?.row
+            ) {
                 ReaderSecondaryToolbar(state: state)
             }
         }
@@ -331,11 +341,13 @@ public struct ReaderWindow: View {
     /// A toggle made while the window edge is being dragged changes layout without animating:
     /// animating against the pointer would make the layout chase two sizes at once.
     private var sidebarAnimation: Animation? {
-        isLiveResizing ? nil : ReaderMotion.sidebarAnimation
+        if state.transitionProgressOverride != nil { return nil }
+        return isLiveResizing ? nil : ReaderMotion.sidebarAnimation
     }
 
     private var secondaryRowAnimation: Animation? {
-        isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
+        if state.transitionProgressOverride != nil { return nil }
+        return isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
     }
 
     /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
@@ -575,6 +587,39 @@ public struct ReaderWindow: View {
             }
             Divider().frame(height: 24)
             Button("Dismiss") { state.dismissMarkSelectionRefusal() }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.warningFg.opacity(0.5), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
+    }
+
+    /// The eraser's refusal when cutting a PDF-owned stroke would delete its review thread.
+    /// The sentence comes from `AppState.inkAttachmentRefusal`, so the check and the banner
+    /// cannot disagree about what would be lost.
+    private var eraserRefusalBanner: some View {
+        let message = state.eraserRefusalNotice
+            ?? "This stroke belongs to the PDF and carries review text; splitting it would delete it."
+        return HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("This stroke cannot be split here")
+                    .font(.callout.weight(.semibold))
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 520, alignment: .leading)
+            }
+            Divider().frame(height: 24)
+            Button("Dismiss") { state.dismissEraserRefusal() }
         }
         .controlSize(.small)
         .padding(.horizontal, 14)

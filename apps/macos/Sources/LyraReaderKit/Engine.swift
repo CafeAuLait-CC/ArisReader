@@ -665,6 +665,11 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     /// Whether the file carries an `/IRT` entry. True even when `parentID` is nil because the
     /// parent could not be read; that is the orphan case, not "not a reply".
     public let isReply: Bool
+    /// Whether the file links a `/Popup` window to this annotation.
+    ///
+    /// The window is structural and is not listed as an editable mark, but its text belongs to
+    /// this annotation's review thread: deleting the annotation deletes it too.
+    public let hasPopup: Bool
     /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype
     /// name for anything this build does not model (`Ink`, `Stamp`, …).
     public let kind: String
@@ -3360,6 +3365,7 @@ public final class RustEngine: PDFEngine {
             id: record.id,
             parentID: record.parentId,
             isReply: record.isReply,
+            hasPopup: record.hasPopup,
             kind: record.kind,
             page: Int(record.page),
             xPt: CGFloat(record.xPt),

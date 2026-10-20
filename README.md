@@ -18,12 +18,15 @@ another application wrote (Preview, Acrobat, anything) are editable and deletabl
 identified by `/NM` or a stable fallback, adopted into the same model, and written back without
 losing their identity, popup, parent, reply links or flags.
 Replacing the original also removes exactly the sidecar entries it saved, so nothing appears twice;
-a saved copy carries no sidecar and shows each annotation once, from the file. An eraser removes
-whole ink strokes only: a drag removes every stroke its path passes within reach of, the stroke a
-press would remove is haloed first, one gesture is one undo step, and a saved copy simply omits the
-erased strokes. Pages can be rotated,
-deleted, reordered, inserted and extracted through a staged session whose undo covers the whole
-session; the file on disk stays untouched until the reader applies the changes, and applying writes
+a saved copy carries no sidecar and shows each annotation once, from the file. An eraser cuts ink
+where its pointer path passes within reach: the surviving pieces become ink annotations in their
+own right, the stroke a press would cut is haloed first, one gesture is one undo step (even when it
+splits several strokes into many pieces), and a saved copy carries the pieces but none of the
+removed geometry. A stroke the PDF itself carries follows the cross-reader path: its pieces are
+new sidecar ink and the original annotation is deleted by identity when a copy is saved. If such a
+stroke carries a comment, a popup or replies, splitting it would orphan that review thread, so the
+eraser leaves it whole and states what would be lost. Pages can be rotated, deleted, reordered,
+inserted and extracted through a staged session whose undo covers the whole session; the file on disk stays untouched until the reader applies the changes, and applying writes
 a verified backup before replacing anything. Documents can also be merged and split into new files
 without touching the source; the first document's outline survives a merge, and the reader's own
 sidecar marks are remapped so they keep pointing at their pages. An optional AI assistant speaks the OpenAI-compatible

@@ -13,6 +13,25 @@ public enum ReaderChrome {
     public static let secondaryToolbarHeightPt: CGFloat = 46
 }
 
+/// A deterministic progress override for the two transitions, used only by the native checks.
+///
+/// SwiftUI's animation is driven by the display link: a check that samples a real animation on a
+/// wall clock can miss every intermediate frame on a loaded runner, which is exactly how the
+/// sidebar close check once failed in CI. The app never sets this; the checks pin a progress and
+/// step it, so "the panel is partly open" is an observed layout at a known value instead of a
+/// race with the display link.
+public struct ReaderTransitionProgress: Equatable, Sendable {
+    /// 0 is closed, 1 is fully open. `nil` means "use `isVisible` and animate normally".
+    public var sidebar: Double?
+    /// 0 is collapsed, 1 is the full 46 pt row.
+    public var row: Double?
+
+    public init(sidebar: Double? = nil, row: Double? = nil) {
+        self.sidebar = sidebar
+        self.row = row
+    }
+}
+
 /// Timings and the system motion preference for the reader's two show/hide transitions.
 ///
 /// Both transitions use a cubic ease-out and stay inside the requested 0.18-0.25 s:
@@ -71,11 +90,23 @@ public enum ReaderMotion {
 /// remove the animation at that call site.
 struct ReaderSidebarTransition<Content: View>: View {
     let isVisible: Bool
+    private let progressOverride: Double?
     private let content: Content
 
-    init(isVisible: Bool, @ViewBuilder content: () -> Content) {
+    init(isVisible: Bool, progressOverride: Double? = nil,
+         @ViewBuilder content: () -> Content) {
         self.isVisible = isVisible
+        self.progressOverride = progressOverride
         self.content = content()
+    }
+
+    /// The width the drawer should occupy. A test override wins over the boolean so the checks
+    /// can lay out and measure a known intermediate state without waiting for a display link.
+    private var progress: CGFloat {
+        if let progressOverride {
+            return CGFloat(min(max(progressOverride, 0), 1))
+        }
+        return isVisible ? 1 : 0
     }
 
     var body: some View {
@@ -89,11 +120,11 @@ struct ReaderSidebarTransition<Content: View>: View {
         .frame(width: ReaderChrome.sidebarTotalWidthPt)
         // Trailing alignment makes the panel slide behind the window's leading edge as the
         // frame closes, instead of being squeezed or re-laid out.
-        .frame(width: isVisible ? ReaderChrome.sidebarTotalWidthPt : 0, alignment: .trailing)
+        .frame(width: ReaderChrome.sidebarTotalWidthPt * progress, alignment: .trailing)
         .clipped()
         // A closing panel must not keep the pointer: the width already disables its area, but
         // its content is still in the hierarchy until the animation ends.
-        .allowsHitTesting(isVisible)
+        .allowsHitTesting(isVisible || progressOverride != nil)
         .accessibilityHidden(!isVisible)
     }
 }
@@ -110,21 +141,31 @@ struct ReaderSidebarTransition<Content: View>: View {
 /// the canvas still receives the click.
 struct ReaderSecondaryToolbarTransition<Content: View>: View {
     let isVisible: Bool
+    private let progressOverride: Double?
     private let content: Content
 
-    init(isVisible: Bool, @ViewBuilder content: () -> Content) {
+    init(isVisible: Bool, progressOverride: Double? = nil,
+         @ViewBuilder content: () -> Content) {
         self.isVisible = isVisible
+        self.progressOverride = progressOverride
         self.content = content()
+    }
+
+    private var progress: CGFloat {
+        if let progressOverride {
+            return CGFloat(min(max(progressOverride, 0), 1))
+        }
+        return isVisible ? 1 : 0
     }
 
     var body: some View {
         content
             .frame(height: ReaderChrome.secondaryToolbarHeightPt)
             .frame(maxWidth: .infinity)
-            .frame(height: isVisible ? ReaderChrome.secondaryToolbarHeightPt : 0, alignment: .top)
+            .frame(height: ReaderChrome.secondaryToolbarHeightPt * progress, alignment: .top)
             .clipped()
             .contentShape(Rectangle())
-            .allowsHitTesting(isVisible)
+            .allowsHitTesting(isVisible || progressOverride != nil)
             // A collapsed row is still in the hierarchy at zero height; keep its controls out of
             // the accessibility tree for the same reason its hit area is off.
             .accessibilityHidden(!isVisible)

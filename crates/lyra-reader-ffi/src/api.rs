@@ -1574,6 +1574,7 @@ impl LyraReaderDocument {
                     id: annotation.id,
                     parent_id: annotation.parent_id,
                     is_reply: annotation.is_reply,
+                    has_popup: annotation.has_popup,
                     kind,
                     x_pt: view.origin.x,
                     y_pt: view.origin.y,
@@ -3809,6 +3810,11 @@ pub struct AnnotationRecord {
     /// The parent may be on another page, hidden from the page, or skipped from the reader's
     /// annotation list. Those are the shell's cases to resolve, not reasons to drop the reply.
     pub is_reply: bool,
+    /// Whether the file links a `/Popup` window to this annotation.
+    ///
+    /// The popup is structural and is not listed separately, but its text belongs to this
+    /// annotation's review thread and is deleted with it.
+    pub has_popup: bool,
     /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype.
     pub kind: String,
     pub x_pt: f64,

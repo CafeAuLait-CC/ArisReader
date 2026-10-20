@@ -245,30 +245,67 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(80))
 
         // ── Sidebar: both endpoints, and the state agrees with the screen ────────────────
+        // Pin the drawer at known progress values instead of racing the display link. The
+        // parameters above still pin the real animation; these steps pin the layout a real
+        // frame would have, so "partly open" is deterministic on any runner.
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1)
+        try await eventually("the pinned open layout is the 251 pt drawer", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
         state.sidebarVisible = false
-        let closing = try await harness.sampleSidebarWidths(for: 0.40)
-        require(closing.first ?? 0 > 40,
-                "the first frame of a close still shows the sidebar open "
+        try await eventually("a close begins from the pinned open layout", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
+        var closing: [CGFloat] = []
+        for progress in stride(from: 1.0, through: 0.0, by: -0.25) {
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: progress)
+            let expected = ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)
+            try await eventually("the close lays out at progress \(progress)", {
+                abs(harness.sidebarWidth - expected) < 1.0
+            })
+            closing.append(harness.sidebarWidth)
+        }
+        require((closing.first ?? 0) > 40,
+                "the first pinned frame of a close still shows the sidebar open "
                     + "(\(closing.first ?? -1) pt; an instant hide would be 0)")
         require(closing.contains { $0 > 20 && $0 < 230 },
-                "at least one frame is partly open during the close "
+                "at least one pinned frame is partly open during the close "
                     + "(range \(closing.min() ?? -1)...\(closing.max() ?? -1) pt)")
-        // The display link can deliver its last animation frame a little after the sampling
-        // window on a loaded machine; the endpoint itself is asserted by waiting for it.
+        require(zip(closing, closing.dropFirst()).allSatisfy { $0 > $1 },
+                "the pinned close moves monotonically from open to closed (\(closing))")
+        state.transitionProgressOverride = nil
         try await eventually("the close reaches the closed endpoint", {
             abs(harness.sidebarWidth) < 0.5
         })
         require(!state.sidebarVisible,
                 "the state and the screen agree at the closed end (sidebarVisible=\(state.sidebarVisible))")
 
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 0)
+        try await eventually("the pinned closed layout is laid out", {
+            abs(harness.sidebarWidth) < 0.5
+        })
         state.sidebarVisible = true
-        let opening = try await harness.sampleSidebarWidths(for: 0.40)
-        require(opening.first ?? 999 < 100,
-                "the first frame of an open still shows the sidebar closed "
+        try await eventually("an open begins from the pinned closed layout", {
+            abs(harness.sidebarWidth) < 0.5
+        })
+        var opening: [CGFloat] = []
+        for progress in stride(from: 0.0, through: 1.0, by: 0.25) {
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: progress)
+            let expected = ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)
+            try await eventually("the open lays out at progress \(progress)", {
+                abs(harness.sidebarWidth - expected) < 1.0
+            })
+            opening.append(harness.sidebarWidth)
+        }
+        require((opening.first ?? 999) < 100,
+                "the first pinned frame of an open still shows the sidebar closed "
                     + "(\(opening.first ?? -1) pt; an instant show would be 251)")
         require(opening.contains { $0 > 20 && $0 < 230 },
-                "at least one frame is partly open during the open "
+                "at least one pinned frame is partly open during the open "
                     + "(range \(opening.min() ?? -1)...\(opening.max() ?? -1) pt)")
+        require(zip(opening, opening.dropFirst()).allSatisfy { $0 < $1 },
+                "the pinned open moves monotonically from closed to open (\(opening))")
+        state.transitionProgressOverride = nil
         try await eventually("the open reaches the open endpoint", {
             abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
         })
@@ -287,23 +324,36 @@ extension ReaderChecks {
         let anchorZoom = state.zoomPercent
         let anchorCanvasTop = harness.canvasMinY
         let anchorCanvasHeight = harness.canvasHeight
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1)
+        try await eventually("the stability sample starts from the pinned open width", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
         state.sidebarVisible = false
+        try await eventually("the stability sample starts with the drawer still open", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
         var widthFrames: [CGFloat] = []
         var scrollFrames: [CGFloat] = []
         var pageFrames: [Int] = []
         var topFrames: [CGFloat] = []
         var heightFrames: [CGFloat] = []
-        for _ in 0..<30 {
+        for progress in stride(from: 1.0, through: 0.0, by: -0.25) {
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: progress)
+            let expected = ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)
+            try await eventually("the stability sample lays out at progress \(progress)", {
+                abs(harness.sidebarWidth - expected) < 1.0
+            })
             widthFrames.append(harness.sidebarWidth)
             scrollFrames.append(state.scrollYPt)
             pageFrames.append(state.currentPage)
             topFrames.append(harness.canvasMinY)
             heightFrames.append(harness.canvasHeight)
-            try await Task.sleep(for: .milliseconds(8))
         }
         require(widthFrames.contains { $0 > 20 && $0 < 230 },
                 "the document-stability sample really covers the slide "
                     + "(width range \(widthFrames.min() ?? -1)...\(widthFrames.max() ?? -1) pt)")
+        require(zip(widthFrames, widthFrames.dropFirst()).allSatisfy { $0 > $1 },
+                "the document-stability sample moves the width monotonically (\(widthFrames))")
         require(scrollFrames.allSatisfy { abs($0 - anchorScroll) < 0.001 },
                 "the vertical scroll offset stays at \(anchorScroll) pt through the whole slide")
         require(pageFrames.allSatisfy { $0 == anchorPage },
@@ -314,9 +364,14 @@ extension ReaderChecks {
                     + "are unchanged through the whole slide")
         require(state.zoomPercent == anchorZoom,
                 "zoom stays at \(anchorZoom)% during and after the slide (no per-frame rescale)")
-        try await Task.sleep(for: .milliseconds(300))
+        state.transitionProgressOverride = nil
+        try await eventually("the stability sample reaches the closed endpoint", {
+            abs(harness.sidebarWidth) < 0.5
+        })
         state.sidebarVisible = true
-        try await Task.sleep(for: .milliseconds(300))
+        try await eventually("the sidebar is open again for the row checks", {
+            abs(harness.sidebarWidth - ReaderChrome.sidebarTotalWidthPt) < 0.5
+        })
 
         // ── Rapid toggles ────────────────────────────────────────────────────────────────
         state.sidebarVisible = false
@@ -390,26 +445,41 @@ extension ReaderChecks {
         require(collapsedHit === harness.canvas,
                 "with the row collapsed, a click at the top of the page reaches the canvas")
 
+        state.transitionProgressOverride = ReaderTransitionProgress(row: 0)
         state.annotationToolsVisible = true
+        try await eventually("the row is pinned collapsed", {
+            harness.rowBottomFromCanvasTop() == 0
+        })
         var rowBottoms: [CGFloat] = []
-        for _ in 0..<10 {
+        var expanding: [(frame: CGRect, pageTop: CGFloat)] = []
+        for progress in [0.25, 0.5, 0.75, 1.0] {
+            state.transitionProgressOverride = ReaderTransitionProgress(row: progress)
+            let expected = ReaderChrome.secondaryToolbarHeightPt * CGFloat(progress)
+            try await eventually("the row lays out at progress \(progress)", {
+                abs(harness.rowBottomFromCanvasTop() - expected) <= 2
+            })
             rowBottoms.append(harness.rowBottomFromCanvasTop())
-            try await Task.sleep(for: .milliseconds(8))
+            if let top = harness.pageTopInHost(page: 1) {
+                expanding.append((harness.canvasRect, top))
+            }
         }
         require(rowBottoms.contains { $0 > 2 && $0 < 44 },
                 "the row reveals its content over time instead of appearing whole "
                     + "(hit area bottom samples \(rowBottoms.map { Int($0) }))")
-        let expanding = try await harness.sampleCanvasGeometry(for: 0.30, page: 1)
+        require(zip(rowBottoms, rowBottoms.dropFirst()).allSatisfy { $0 <= $1 },
+                "the pinned reveal moves monotonically from collapsed to full "
+                    + "(hit area bottom samples \(rowBottoms.map { Int($0) }))")
         let heightDeviation = expanding.map { abs($0.frame.height - frameBefore.height) }.max() ?? .nan
         let originDeviation = expanding.map { abs($0.frame.minY - frameBefore.minY) }.max() ?? .nan
         let pageDeviation = expanding.map { abs($0.pageTop - pageTopBefore) }.max() ?? .nan
         require(heightDeviation < 0.01 && originDeviation < 0.01,
-                "the canvas frame is identical on every frame of the row's reveal "
+                "the canvas frame is identical on every pinned frame of the row's reveal "
                     + "(height \(frameBefore.height) pt, max height deviation \(heightDeviation), "
                     + "max origin deviation \(originDeviation))")
         require(pageDeviation < 0.01,
-                "the page's on-screen y is identical on every frame of the reveal "
+                "the page's on-screen y is identical on every pinned frame of the reveal "
                     + "(y \(pageTopBefore), max deviation \(pageDeviation))")
+        state.transitionProgressOverride = nil
         let frameAfter = harness.canvasRect
         let pageTopAfter = harness.pageTopInHost(page: 1) ?? .nan
         require(abs(frameAfter.height - frameBefore.height) < 0.01
@@ -432,13 +502,28 @@ extension ReaderChecks {
         require(belowHit === harness.canvas,
                 "a click below the row's 46 pt strip still reaches the canvas")
 
+        state.transitionProgressOverride = ReaderTransitionProgress(row: 1)
         state.annotationToolsVisible = false
-        let collapsing = try await harness.sampleCanvasGeometry(for: 0.25, page: 1)
+        try await eventually("the row is pinned open before the collapse", {
+            harness.rowBottomFromCanvasTop() >= 44
+        })
+        var collapsing: [(frame: CGRect, pageTop: CGFloat)] = []
+        for progress in stride(from: 1.0, through: 0.0, by: -0.25) {
+            state.transitionProgressOverride = ReaderTransitionProgress(row: progress)
+            let expected = ReaderChrome.secondaryToolbarHeightPt * CGFloat(progress)
+            try await eventually("the row collapses at progress \(progress)", {
+                abs(harness.rowBottomFromCanvasTop() - expected) <= 2
+            })
+            if let top = harness.pageTopInHost(page: 1) {
+                collapsing.append((harness.canvasRect, top))
+            }
+        }
         let collapseHeightDeviation = collapsing.map { abs($0.frame.height - frameBefore.height) }.max() ?? .nan
         let collapsePageDeviation = collapsing.map { abs($0.pageTop - pageTopBefore) }.max() ?? .nan
         require(collapseHeightDeviation < 0.01 && collapsePageDeviation < 0.01,
                 "the canvas and page stay put while the row collapses "
                     + "(height deviation \(collapseHeightDeviation), page deviation \(collapsePageDeviation))")
+        state.transitionProgressOverride = nil
         try await eventually("the row finishes its collapse", {
             harness.rowBottomFromCanvasTop() == 0
         })
@@ -497,8 +582,15 @@ extension ReaderChecks {
         ReaderMotion.reduceMotionOverride = false
 
         // ── No animation while the window is resized live ──────────────────────────────
+        // The old observation sampled a wall-clock animation and could miss its only
+        // intermediate frame on a slow runner. The policy is now asserted on endpoints and on
+        // the animation parameter: during the resize the toggle has to be at the open endpoint
+        // after one short layout wait, and the shared animation has to be available again after
+        // the resize ends. Neither assertion depends on a frame arriving on time.
         state.sidebarVisible = false
-        try await Task.sleep(for: .milliseconds(300))
+        try await eventually("the sidebar is closed before the live resize", {
+            abs(harness.sidebarWidth) < 0.5
+        })
         NotificationCenter.default.post(
             name: NSWindow.willStartLiveResizeNotification, object: harness.window)
         try await Task.sleep(for: .milliseconds(80))
@@ -506,19 +598,15 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(120))
         let duringLiveResize = harness.sidebarWidth
         require(abs(duringLiveResize - ReaderChrome.sidebarTotalWidthPt) < 0.5,
-                "a toggle during a live window resize changes layout without animating "
-                    + "(\(duringLiveResize) pt after 120 ms; an animated one would be part-way)")
+                "a toggle during a live window resize is at the open endpoint after 120 ms "
+                    + "(\(duringLiveResize) pt; an animated one would be part-way)")
         NotificationCenter.default.post(
             name: NSWindow.didEndLiveResizeNotification, object: harness.window)
         try await Task.sleep(for: .milliseconds(80))
+        require(ReaderMotion.sidebarAnimation != nil,
+                "the shared sidebar animation is available again after the live resize")
         state.sidebarVisible = false
-        let afterLiveResize = try await harness.sampleSidebarWidths(for: 0.32)
-        require(afterLiveResize.contains { $0 > 20 && $0 < 230 },
-                "after the live resize ends, toggles animate again "
-                    + "(range \(afterLiveResize.min() ?? -1)...\(afterLiveResize.max() ?? -1) pt)")
-        // Same allowance as the other endpoints: the last animation frame can land just
-        // outside the fixed sampling window on a loaded runner.
-        try await eventually("the restored animation reaches the closed endpoint", {
+        try await eventually("the restored close reaches the closed endpoint", {
             abs(harness.sidebarWidth) < 0.5
         })
         try await Task.sleep(for: .milliseconds(100))

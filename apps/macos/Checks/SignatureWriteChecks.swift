@@ -414,7 +414,10 @@ extension ReaderChecks {
         require(deleteSourceAfter == deletionBytes,
                 "the deletion's source PDF was not modified")
 
-        // ── 5. The eraser on a file-owned ink stroke also prunes ────────────────────────
+        // ── 5. A commented file-owned ink stroke is refused, not pruned ─────────────────
+        // The fixture's ink carries `/Contents`. Deleting its annotation would delete the
+        // comment, so the eraser must leave it whole and stage nothing. Pruning a bare
+        // file-owned stroke is covered in PartialEraseChecks.
         let eraseURL = try copy("annotated-strokes.pdf", "erase-source.pdf")
         let eraseState = AppState(engine: try engine())
         eraseState.setViewportSize(CGSize(width: 700, height: 500))
@@ -438,25 +441,22 @@ extension ReaderChecks {
         let eraseBytes = try bytes(eraseURL)
         eraseState.toggleEraserTool()
         eraseState.beginEraserGesture(atContentPoint: content(path[0]))
-        eraseState.extendEraserGesture(
-            fromContentPoint: content(path[0]), toContentPoint: content(path[path.count - 1]))
+        for index in 1..<path.count {
+            eraseState.extendEraserGesture(
+                fromContentPoint: content(path[index - 1]),
+                toContentPoint: content(path[index]))
+        }
         eraseState.endEraserGesture()
-        require(!eraseState.documentAnnotations.contains(where: { $0.id == ink.id }),
-                "the eraser removed the file-owned ink stroke")
-        require(eraseState.pendingFileDeletions.contains(where: { $0.identity == ink.id }),
-                "the erasure is pending a PDF write")
-        let erasedCopy = scratch.appendingPathComponent("erased-ink.pdf")
-        let erased = await eraseState.saveAnnotatedCopy(to: erasedCopy)
-        require(erased, "the erasure saves into a copy")
-        let erasedBytes = try bytes(erasedCopy)
-        require(!contains(erasedBytes, "external-ink"),
-                "the saved copy contains no /NM for the erased stroke")
-        require(!contains(erasedBytes, "Ink written by another producer."),
-                "the saved copy contains none of the erased stroke's contents")
-        require(contains(erasedBytes, "external-square"),
-                "the other file-owned annotations survive the erasure")
-        require(eraseState.lastAnnotationWriteReport?.fullRewrite == true,
-                "the eraser's save pruned the file")
+        require(eraseState.documentAnnotations.contains(where: { $0.id == ink.id }),
+                "the commented file-owned ink stroke is left intact")
+        require(eraseState.pendingFileDeletions.isEmpty,
+                "a refused file-owned stroke stages no deletion")
+        require(eraseState.annotations.isEmpty,
+                "a refused file-owned stroke writes no sidecar ink")
+        require(eraseState.undoStack.isEmpty,
+                "a refused file-owned stroke adds no undo step")
+        require(eraseState.eraserRefusalNotice?.contains("comment") == true,
+                "the refusal names the comment that would be lost")
         let eraseSourceAfter = try bytes(eraseURL)
         require(eraseSourceAfter == eraseBytes,
                 "the eraser's source PDF was not modified")

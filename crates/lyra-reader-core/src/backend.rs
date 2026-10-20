@@ -517,6 +517,12 @@ pub struct RawAnnotation {
     /// (hidden annotations are still read). The shell is responsible for noticing when the
     /// parent is absent from the list it is rendering.
     pub is_reply: bool,
+    /// Whether the file links a `/Popup` window to this annotation.
+    ///
+    /// A popup is a structural annotation and is not listed as an editable mark, but its text
+    /// belongs to the annotation's review thread. Deleting the annotation deletes the window
+    /// with it, so a caller that only *edits* geometry has to know it is there.
+    pub has_popup: bool,
     pub kind: RawAnnotationKind,
     /// The annotation's `/Rect` — the icon box for a sticky note, the text box for free text.
     pub rect: Rect,
