@@ -35,6 +35,9 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std"], op
 # XMP metadata streams are usually FlateDecode-compressed (see `src/xmp.rs`). PDFium's C
 # ABI has no XMP accessor, so the backend inflates the packet itself.
 flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
 
 # Re-encoding a stamp appearance's image XObject as a PNG the shell can decode. A signature
 # is a PNG with transparency in the normal case; PDF has no PNG image filter, so the writer

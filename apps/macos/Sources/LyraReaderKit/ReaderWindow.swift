@@ -240,6 +240,14 @@ public struct ReaderWindow: View {
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
             HStack { Spacer(); ScrollIndicator(state: state) }
 
+            if state.contentEditEnabled {
+                PDFContentEditor(state:state)
+                    .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)") {
+                        await state.reloadContentObjects()
+                    }
+                HStack { Spacer(); ContentEditInspector(state:state) }
+            }
+
             if state.document == nil {
                 LyraReaderTheme.emptyBg
                 emptyState

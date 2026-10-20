@@ -348,6 +348,17 @@ public final class AppState: ObservableObject {
     /// The staged session. Nil means the file on disk is the document on screen.
     private var pageEditSession: PageEditSession?
 
+    @Published public var contentEditEnabled = false
+    @Published public var contentEditTool = "select"
+    @Published public var contentEditPage: PDFContentPage?
+    @Published public var contentEditSelection: String?
+    @Published public var contentEditLoading = false
+    @Published public var contentLinkDraft: CGRect?
+    @Published public var contentTextEditing = false
+    var commitContentText: (() -> Void)?
+    private var contentEditTask: Task<Bool,Never>?
+    private var contentLoadToken = UUID()
+
     /// Pages the canvas should draw right now (usually one or two while scrolling).
     @Published public private(set) var canvasPages: [CanvasPage] = []
     private var canvasTiles: [CanvasPage] = []
@@ -3064,6 +3075,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        contentLoadToken = UUID()
+        contentEditPage = nil
+        contentEditSelection = nil
+        contentLinkDraft = nil
+        contentEditLoading = false
         // Pending writes describe the document being replaced or closed, so they have to land
         // before the state that carries them (sidecar URL, scroll offset) is cleared.
         flushPendingWrites()
@@ -6141,10 +6157,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var undoStack: [UndoableAction] = []
     @Published public private(set) var redoStack: [UndoableAction] = []
 
-    public var canUndo: Bool { !undoStack.isEmpty }
-    public var canRedo: Bool { !redoStack.isEmpty }
+    public var canUndo: Bool { contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty }
+    public var canRedo: Bool { contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty }
 
     public func undo() {
+        if contentEditEnabled { undoPageEdit(); return }
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -6195,6 +6212,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func redo() {
+        if contentEditEnabled { redoPageEdit(); return }
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -7202,6 +7220,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
     /// document on screen (and its sidecar) stays exactly where it is.
     public func presentSaveAnnotatedCopyPanel() {
+        if contentEditEnabled {presentSavePageEditsCopyPanel();return}
         guard let suggestion = suggestedAnnotatedCopyURL else { return }
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
@@ -8715,7 +8734,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
     public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
     public var canSavePageEditsCopy: Bool {
-        pageEditSession != nil && !pageEditBusy && !annotationSaveInProgress
+        (pageEditSession != nil || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
     }
 
     /// Applying the staged revision to the signed file itself. "Save Copy" stays available.
@@ -9414,7 +9433,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSavePageEditsCopyPanel() {
-        guard let source = pageEditDisplayURL, pageEditSession != nil else { return }
+        guard let source = pageEditDisplayURL, pageEditSession != nil || contentTextEditing else { return }
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
         panel.message =
@@ -9433,6 +9452,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func savePageEditsCopy(to destination: URL) async -> Bool {
+        commitContentText?()
+        if let task=contentEditTask {
+            let succeeded=await task.value
+            contentEditTask=nil
+            if !succeeded {return false}
+        }
         guard let session = pageEditSession, !pageEditBusy else { return false }
         if Self.resolvesToSameFile(destination, session.originalURL) {
             lastError = "The edited copy would be the original. Use “Replace Original with Page Changes” for that."
@@ -9484,6 +9509,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPageEditsConfirmation() {
+        if contentTextEditing {
+            commitContentText?()
+            Task { @MainActor [weak self] in
+                guard let self, let task=contentEditTask, await task.value else{return}
+                contentEditTask=nil
+                presentReplaceOriginalWithPageEditsConfirmation()
+            }
+            return
+        }
         guard guardWritable() else { return }
         guard canReplaceOriginalWithPageEdits, let session = pageEditSession else { return }
         let alert = NSAlert()
@@ -9503,6 +9537,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithPageEdits() async -> Bool {
+        commitContentText?()
+        if let task=contentEditTask {
+            let succeeded=await task.value
+            contentEditTask=nil
+            if !succeeded {return false}
+        }
         guard let session = pageEditSession, !pageEditBusy else { return false }
         let sidecarData: Data?
         do {
@@ -13526,5 +13566,168 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard tileCache.usedBytes + pageRasterCacheUsedBytes > tileCache.budgetBytes else { return }
         tileCache.evictToFit(pinned: wantedTiles.union(tilesInFlight), currentLod: rasterLod,
                             reservedBytes: pageRasterCacheUsedBytes)
+    }
+}
+
+extension AppState {
+    public var selectedContentItem: PDFContentItem? {
+        contentEditPage?.items.first { $0.id == contentEditSelection }
+    }
+
+    public func toggleContentEditing() {
+        contentEditEnabled.toggle()
+        annotationTool = .select
+        annotationToolsVisible = false
+        contentEditSelection = nil
+    }
+
+    public func reloadContentObjects() async {
+        guard contentEditEnabled, let url = document?.url else { return }
+        let token = UUID()
+        contentLoadToken = token
+        contentEditLoading = true
+        contentEditPage = nil
+        contentEditSelection = nil
+        let page = currentPage - 1
+        do {
+            let snapshot = try await engine.contentObjects(page: page)
+            guard token == contentLoadToken, document?.url == url, currentPage - 1 == page else { return }
+            contentEditPage = snapshot
+            contentEditLoading = false
+        } catch {
+            guard token == contentLoadToken else { return }
+            lastError = "Could not inspect page content: \(error.localizedDescription)"
+            contentEditLoading = false
+        }
+    }
+
+    public func transformContent(_ item: PDFContentItem, to rect: CGRect, rotation: Double = 0) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "transform", revision: page.revision)
+        command.target = item.id; command.bounds = PDFContentBox(rect); command.rotation = rotation
+        stageContentEdit(command, page: page.page, label: "Move or resize \(item.kind)")
+    }
+
+    public func replaceContentText(_ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil, colour: [UInt8]? = nil, alignment: Int = 0) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "replaceText", revision: page.revision)
+        command.target = item.id; command.bounds = item.bounds; command.text = text
+        command.font = font; command.size = size ?? item.size
+        command.colour = colour ?? item.colour; command.alignment = alignment
+        stageContentEdit(command, page: page.page, label: "Edit page text")
+    }
+
+    public func insertContentText(at rect: CGRect) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "insertText", revision: page.revision)
+        command.bounds = PDFContentBox(rect); command.text = "New text"; command.font = "Helvetica"
+        command.size = 12; command.colour = [0,0,0,255]; command.alignment = 0
+        stageContentEdit(command, page: page.page, label: "Insert page text")
+    }
+
+    public func deleteContent(_ item: PDFContentItem) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "delete", revision: page.revision)
+        command.target = item.id
+        stageContentEdit(command, page: page.page, label: "Delete \(item.kind)")
+    }
+
+    public func redactContent(in rect:CGRect,blackout:Bool) {
+        guard let page=contentEditPage else{return}
+        var command=PDFContentCommand(action:"redact",revision:page.revision)
+        command.bounds=PDFContentBox(rect);command.blackout=blackout
+        stageContentEdit(command,page:page.page,label:blackout ? "Blackout page content" : "Erase page content")
+    }
+
+    public func setContentLink(_ item:PDFContentItem?,page:Int?,uri:String?) {
+        guard let snapshot=contentEditPage,let bounds=item?.bounds.rect ?? contentLinkDraft else{return}
+        if let page,page<0 || page >= (document?.pageCount ?? 0) {lastError="Choose a page inside this document.";return}
+        var command=PDFContentCommand(action:"setLink",revision:snapshot.revision)
+        command.target=item?.id;command.bounds=PDFContentBox(bounds);command.page=page;command.uri=uri
+        contentLinkDraft=nil
+        stageContentEdit(command,page:snapshot.page,label:item == nil ? "Insert link" : "Edit link")
+    }
+
+    public func chooseContentImage(at rect:CGRect? = nil, replacing item:PDFContentItem? = nil) {
+        guard let page=contentEditPage else{return}
+        let panel=NSOpenPanel();panel.allowedContentTypes=[.image];panel.allowsMultipleSelection=false
+        guard panel.runModal() == .OK,let url=panel.url,let image=NSImage(contentsOf:url),
+              let cg=image.cgImage(forProposedRect:nil,context:nil,hints:nil),
+              let png=NSBitmapImageRep(cgImage:cg).representation(using:.png,properties:[:]) else{return}
+        let path=FileManager.default.temporaryDirectory.appendingPathComponent("LyraContentImage-\(UUID().uuidString).png")
+        do{try png.write(to:path,options:.atomic)}catch{lastError=error.localizedDescription;return}
+        var command=PDFContentCommand(action:item == nil ? "insertImage" : "replaceImage",revision:page.revision)
+        command.target=item?.id;command.image_path=path.path
+        if let rect {command.bounds=PDFContentBox(CGRect(x:rect.minX,y:rect.minY,width:180,height:180*Double(cg.height)/Double(cg.width)))}
+        stageContentEdit(command,page:page.page,label:item == nil ? "Insert image" : "Replace image")
+    }
+
+    public func cropContentImage(_ item:PDFContentItem,to crop:CGRect) {
+        guard let page=contentEditPage else{return}
+        var command=PDFContentCommand(action:"cropImage",revision:page.revision)
+        command.target=item.id;command.crop=PDFContentBox(crop)
+        stageContentEdit(command,page:page.page,label:"Crop image")
+    }
+
+    public func contentImageData(_ item:PDFContentItem) async throws -> Data {
+        guard let page=contentEditPage else{throw NSError(domain:"LyraReader",code:1)}
+        if item.kind == "image" {return try await engine.contentImagePNG(page:page.page,target:item.id,revision:page.revision)}
+        let r=item.bounds.rect
+        let image=try await engine.rasterizeRegion(page:page.page,scale:2,xPt:r.minX,yPt:r.minY,widthPt:r.width,heightPt:r.height,transparentBackground:false)
+        guard let data=image.contentPNGData() else{throw NSError(domain:"LyraReader",code:2)}
+        return data
+    }
+
+    public func exportContentImage(_ item:PDFContentItem) {
+        Task { @MainActor [weak self] in
+            guard let self else{return}
+            do {
+                let data=try await contentImageData(item)
+                let panel=NSSavePanel();panel.allowedContentTypes=[.png];panel.nameFieldStringValue="image.png"
+                guard panel.runModal() == .OK,let url=panel.url else{return}
+                try data.write(to:url,options:.atomic)
+                statusMessage="Image exported"
+            }catch{lastError="Image export failed: \(error.localizedDescription)"}
+        }
+    }
+
+    private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
+        contentEditTask = Task { @MainActor [weak self] in
+            defer {
+                if let path=command.image_path,URL(fileURLWithPath:path).lastPathComponent.hasPrefix("LyraContentImage-") {try? FileManager.default.removeItem(atPath:path)}
+            }
+            guard let self, !pageEditBusy, !contentEditLoading else { return false }
+            // Sidecar ranges address the PDFium text stream. A content rewrite can reorder it;
+            // refuse until range remapping is available rather than silently moving marks.
+            guard !annotations.contains(where:{$0.page == page}), !bookmarks.contains(where:{$0.page == page}) else {
+                lastError = "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content."
+                return false
+            }
+            guard await ensurePageEditSession(), var session = pageEditSession,
+                  let snapshot = pageEditSnapshot(label: label) else { return false }
+            pageEditBusy = true
+            defer { pageEditBusy = false }
+            let next = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+            do {
+                try await engine.applyContentEdit(page:page,command:command,to:next)
+                try loadPageEditRevision(at:next,title:session.title,sidecarURL:session.sidecarURL,
+                    annotations:annotations,bookmarks:bookmarks,slots:annotationSidecarSlots,
+                    currentPage:currentPage,selection:pageSelection)
+                session.revisionURL = next
+                session.revisionNumber += 1
+                session.operations.append(label)
+                session.undo.append(snapshot); session.redo.removeAll()
+                pageEditSession = session
+                pageEditPendingOperations = session.operations
+                pageEditIsApplied = false
+                statusMessage = "\(label) · staged in working copy; Save Edited Copy to publish"
+                await reloadContentObjects()
+                return true
+            } catch {
+                lastError = "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)"
+                try? FileManager.default.removeItem(at:next)
+                return false
+            }
+        }
     }
 }

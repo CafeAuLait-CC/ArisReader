@@ -1646,6 +1646,99 @@ impl LyraReaderDocument {
         Ok(rotations)
     }
 
+    /// Actual page objects in top-left view points. Identity is bound to the file's SHA-256.
+    pub fn content_objects(&self, page: u32) -> Result<String, LyraReaderFfiError> {
+        let mut snapshot =
+            lyra_reader_pdfium::content_edit::inspect_content(Path::new(&self.path), page)?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .page_to_view(1.0);
+        for item in &mut snapshot.items {
+            item.bounds = transform
+                .apply_rect(lyra_reader_core::Rect::new(
+                    item.bounds.x,
+                    item.bounds.y,
+                    item.bounds.width,
+                    item.bounds.height,
+                ))
+                .into();
+        }
+        serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            message: e.to_string(),
+        })
+    }
+
+    pub fn content_image_png(
+        &self,
+        page: u32,
+        target: String,
+        revision: String,
+    ) -> Result<Vec<u8>, LyraReaderFfiError> {
+        Ok(lyra_reader_pdfium::content_edit::content_image(
+            Path::new(&self.path),
+            page,
+            &target,
+            &revision,
+        )?)
+    }
+
+    /// Stages a content edit in a separate working revision; publication uses the existing
+    /// signature-aware page-edit save transaction.
+    pub fn apply_content_edit(
+        &self,
+        page: u32,
+        command: String,
+        destination: String,
+    ) -> Result<(), LyraReaderFfiError> {
+        use lyra_reader_pdfium::content_edit::ContentCommand;
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.is_encrypted() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: "Reopen an unencrypted document before editing its contents.".into(),
+            });
+        }
+        let mut command: ContentCommand =
+            serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
+                message: e.to_string(),
+            })?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .view_to_page(1.0)
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                message: "Singular page geometry".into(),
+            })?;
+        match &mut command {
+            ContentCommand::Transform { bounds, .. }
+            | ContentCommand::ReplaceText { bounds, .. }
+            | ContentCommand::InsertText { bounds, .. }
+            | ContentCommand::Redact { bounds, .. }
+            | ContentCommand::InsertImage { bounds, .. }
+            | ContentCommand::SetLink { bounds, .. } => {
+                *bounds = transform
+                    .apply_rect(lyra_reader_core::Rect::new(
+                        bounds.x,
+                        bounds.y,
+                        bounds.width,
+                        bounds.height,
+                    ))
+                    .into();
+            }
+            ContentCommand::Delete { .. }
+            | ContentCommand::ReplaceImage { .. }
+            | ContentCommand::CropImage { .. } => {}
+        }
+        lyra_reader_pdfium::content_edit::edit_content(
+            Path::new(&self.path),
+            Path::new(&destination),
+            page,
+            &command,
+        )?;
+        Ok(())
+    }
+
     /// Applies a page operation to a **copy** of this document and writes it to `destination`.
     ///
     /// This object's file is never modified. The written file is verified to have the requested
