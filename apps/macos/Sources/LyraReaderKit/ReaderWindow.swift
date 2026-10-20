@@ -198,6 +198,11 @@ public struct ReaderWindow: View {
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
+                // The screen's physical density: 100% means actual size on it, so moving the
+                // window to another display keeps the percentage and changes the factor.
+                onDisplayCalibration: { calibration in
+                    state.setDisplayCalibration(calibration)
+                },
                 onViewportSize: { size in state.setViewportSize(size) },
                 // Precise input preserves system deltas; wheel input applies its accelerated
                 // distance immediately, with no queued motion after the wheel stops.

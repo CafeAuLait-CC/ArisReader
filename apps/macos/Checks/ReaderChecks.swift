@@ -166,6 +166,14 @@ struct ReaderChecks {
             try await transitionChecks(root: root)
             return
         }
+        // The calibrated zoom and its presets on their own
+        // (`LyraReaderChecks --check-zoom .`).
+        if CommandLine.arguments.contains("--check-zoom") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await zoomChecks(root: root)
+            return
+        }
         if CommandLine.arguments.contains("--measure-page-navigation") {
             try await measurePageNavigation()
             return
@@ -635,6 +643,7 @@ struct ReaderChecks {
         try await linkedPreviewChecks(root: root)
         try await previewActionChecks(root: root)
         try await pointerZoomChecks(url: b)
+        try await zoomChecks(root: root)
         try previewPanelChecks()
         try await previewPanelSessionChecks(url: b)
         try referenceEntryTextChecks()

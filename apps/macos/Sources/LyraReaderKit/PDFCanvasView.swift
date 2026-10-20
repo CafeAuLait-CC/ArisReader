@@ -72,6 +72,10 @@ public final class MetalCanvasView: NSView {
     public var onFailure: ((String) -> Void)?
     /// Reports the backing scale so the engine can rasterize at device resolution.
     public var onDeviceScale: ((CGFloat) -> Void)?
+    /// Reports the screen's zoom calibration when the view attaches to a window, the window
+    /// moves to another screen, or the display mode changes. The shell keeps the reader's
+    /// percentage and only changes the physical scale (`AppState.setDisplayCalibration`).
+    public var onDisplayCalibration: ((DisplayCalibration) -> Void)?
 
     /// Pages to draw; new bitmaps are uploaded as textures and old ones released.
     public var pages: [CanvasPage] = [] {
@@ -295,7 +299,10 @@ public final class MetalCanvasView: NSView {
         }
     }
 
-    /// Zoom factor (1.0 = 100%: one PDF point per point on screen).
+    /// Zoom factor as the canvas draws with it: `percent/100 × display calibration`.
+    ///
+    /// 1.0 is therefore not "100%" in general — it means 72 physical dpi. At 100% on a display
+    /// whose logical density is 108.5 ppi this is ≈1.507 (see ``DisplayCalibration``).
     public var zoom: CGFloat = 1.0 {
         didSet {
             guard zoom != oldValue else { return }
@@ -344,6 +351,12 @@ public final class MetalCanvasView: NSView {
     }
     private var configuredSize: CGSize = .zero
     private var reportedDeviceScale: CGFloat = 0
+    /// The last calibration sent to the shell, so a redundant screen notification does not
+    /// rebuild the band. Factor equality is what matters; the reason only changes on fallback.
+    private var reportedDisplayCalibration: DisplayCalibration?
+    /// Observers for the window's screen and for display-mode changes. Removed and re-added when
+    /// the view changes window (`viewDidMoveToWindow` runs more than once for one window).
+    private var screenObservers: [NSObjectProtocol] = []
     private var needsRender = true
     private var framesRendered: UInt64 = 0
     /// Native regression checks observe successful submissions without the HUD's throttle.
@@ -406,16 +419,45 @@ public final class MetalCanvasView: NSView {
 
     isolated deinit {
         pendingFrame?.cancel()
+        removeScreenObservers()
     }
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        removeScreenObservers()
         if window == nil {
             detachSurface()
         } else {
             if annotationTool == .eraser { window?.acceptsMouseMovedEvents = true }
+            installScreenObservers()
             attachSurfaceIfNeeded()
+            // `attachSurfaceIfNeeded` reports it too, but a view added to an already-attached
+            // surface skips that path; one call here keeps the first report unconditional.
+            reportDisplayCalibration()
         }
+    }
+
+    /// The window can move between displays and the display mode can change (a different
+    /// "looks like" resolution on the same panel), and both change the calibration while the
+    /// reader's zoom percentage stays put.
+    private func installScreenObservers() {
+        guard let window else { return }
+        let center = NotificationCenter.default
+        screenObservers.append(center.addObserver(
+            forName: NSWindow.didChangeScreenNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reportDisplayCalibration() }
+        })
+        screenObservers.append(center.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reportDisplayCalibration() }
+        })
+    }
+
+    private func removeScreenObservers() {
+        for observer in screenObservers { NotificationCenter.default.removeObserver(observer) }
+        screenObservers.removeAll()
     }
 
     // MARK: - Pointer hover (eraser indication)
@@ -625,18 +667,24 @@ public final class MetalCanvasView: NSView {
     // MARK: - Pointer
 
     /// Converts an event location into content points (origin at the first page's top-left,
-    /// one unit per PDF point at 100% zoom), which is the space the shell thinks in.
+    /// one unit per PDF point, independent of the zoom), which is the space the shell thinks in.
     private func contentPoint(for event: NSEvent) -> CGPoint {
         contentPoint(forViewPoint: convert(event.locationInWindow, from: nil))
     }
 
     /// The same conversion for a point already in view coordinates (bottom-left origin), which is
     /// what the press location is stored as.
+    ///
+    /// `zoom` is `AppState.zoomFactor`, calibration included, so the inverse keeps the page
+    /// coordinate under the pointer the same at every display density.
     private func contentPoint(forViewPoint point: CGPoint) -> CGPoint {
         let fromTop = CGPoint(x: point.x, y: bounds.height - point.y)
-        return CGPoint(
-            x: (fromTop.x - contentOffsetX) / max(zoom, 0.01),
-            y: fromTop.y / max(zoom, 0.01) + scrollYPt
+        return CanvasGeometry.contentPoint(
+            viewX: fromTop.x,
+            viewYTop: fromTop.y,
+            scrollYPt: scrollYPt,
+            zoom: zoom,
+            contentOffsetX: contentOffsetX
         )
     }
 
@@ -948,6 +996,9 @@ public final class MetalCanvasView: NSView {
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         reportDeviceScale()
+        // A display-mode change can keep the same backing scale but alter the logical width;
+        // the calibration is part of that change too.
+        reportDisplayCalibration()
         resizeSurfaceIfNeeded()
         markNeedsRender()
     }
@@ -987,6 +1038,7 @@ public final class MetalCanvasView: NSView {
         surfaceId = newSurfaceId
         configuredSize = bounds.size
         reportDeviceScale()
+        reportDisplayCalibration()
         onViewportSize?(bounds.size)
 
         syncTextures()
@@ -1140,10 +1192,23 @@ public final class MetalCanvasView: NSView {
         var submitted: [String] = []
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
-            let x = offsetX + page.placement.leftPt * zoom * scale
-            let y = (page.placement.topPt - scrollYPt) * zoom * scale
-            let width = page.placement.widthPt * zoom * scale
-            let height = page.placement.heightPt * zoom * scale
+            // `zoom` already includes the display calibration; `scale` is the backing scale.
+            // This shared helper is the only place the two are multiplied for a page quad, so
+            // calibration cannot be applied a second time here.
+            let quad = CanvasGeometry.pageRectInDevicePixels(
+                pageTopPt: page.placement.topPt,
+                pageLeftPt: page.placement.leftPt,
+                widthPt: page.placement.widthPt,
+                heightPt: page.placement.heightPt,
+                scrollYPt: scrollYPt,
+                zoom: zoom,
+                backingScale: scale,
+                contentOffsetXPx: offsetX
+            )
+            let x = quad.minX
+            let y = quad.minY
+            let width = quad.width
+            let height = quad.height
             textureIds.append(texture.id)
             rects.append(Float(x))
             rects.append(Float(y))
@@ -1284,6 +1349,21 @@ public final class MetalCanvasView: NSView {
         onDeviceScale?(scale)
     }
 
+    /// Reports the display's calibration once per distinct value.
+    ///
+    /// Called from `viewDidMoveToWindow` (first attach), `viewDidChangeBackingProperties`
+    /// (backing-store changes, including a move to a display with another scale), the window's
+    /// `didChangeScreen` notification and the application's screen-parameters notification
+    /// (display mode changes). The closure is also the only place that knows the shell exists;
+    /// this view never computes a zoom itself.
+    private func reportDisplayCalibration() {
+        let calibration = DisplayCalibration.forScreen(window?.screen)
+        guard calibration != reportedDisplayCalibration else { return }
+        reportedDisplayCalibration = calibration
+        FileHandle.standardError.write(Data(calibration.diagnosticLine.utf8))
+        onDisplayCalibration?(calibration)
+    }
+
     private func pixelSize() -> (Int, Int) {
         let scale = backingScale()
         return (
@@ -1340,6 +1420,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onFrame: (LyraReaderFrameStats) -> Void
     private let onFailure: (String) -> Void
     private let onDeviceScale: (CGFloat) -> Void
+    private let onDisplayCalibration: (DisplayCalibration) -> Void
     private let onViewportSize: (CGSize) -> Void
     private let onScroll: (CGFloat) -> Void
     private let onScrollStep: (CGFloat) -> Void
@@ -1388,6 +1469,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onFrame: @escaping (LyraReaderFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
+        onDisplayCalibration: @escaping (DisplayCalibration) -> Void = { _ in },
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
         onScroll: @escaping (CGFloat) -> Void = { _ in },
         onScrollStep: @escaping (CGFloat) -> Void = { _ in },
@@ -1432,6 +1514,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onFrame = onFrame
         self.onFailure = onFailure
         self.onDeviceScale = onDeviceScale
+        self.onDisplayCalibration = onDisplayCalibration
         self.onViewportSize = onViewportSize
         self.onScroll = onScroll
         self.onScrollStep = onScrollStep
@@ -1464,6 +1547,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onFrame = onFrame
         view.onFailure = onFailure
         view.onDeviceScale = onDeviceScale
+        view.onDisplayCalibration = onDisplayCalibration
         view.onViewportSize = onViewportSize
         view.onScroll = onScroll
         view.onScrollStep = onScrollStep

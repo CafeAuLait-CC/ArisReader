@@ -11,6 +11,10 @@ import CoreGraphics
 /// * **content space** — PDF points with the origin at the top-left of the first page, Y growing
 ///   downwards. `PagePlacement` and `AppState.scrollYPt` live here.
 ///
+/// The `zoom` every function takes is `AppState.zoomFactor`, not the bare percentage: it already
+/// includes the display calibration, so at 100% one PDF point occupies `calibration × backing`
+/// device pixels (see ``DisplayCalibration``).
+///
 /// The scroll path, the pointer-anchored zoom and the native checks all go through these
 /// functions, so the anchoring arithmetic cannot drift from what the canvas draws.
 public enum CanvasGeometry {
@@ -22,6 +26,29 @@ public enum CanvasGeometry {
     /// View-space Y of a content Y (the inverse of `contentY`).
     public static func viewY(contentY: CGFloat, scrollYPt: CGFloat, zoom: CGFloat) -> CGFloat {
         (contentY - scrollYPt) * zoom
+    }
+
+    /// Content point under a view-space point (top-left origin).
+    ///
+    /// This is the inverse of ``viewRect(pageTopPt:pageLeftPt:region:scrollYPt:zoom:contentOffsetX:)``
+    /// for a single point, and the conversion the canvas applies at its event boundary before
+    /// any annotation, selection or redaction geometry sees it. Both directions live here so the
+    /// pointer path cannot drift from the drawing path.
+    ///
+    /// `zoom` is the calibrated factor (`zoomFactor`), so a view point maps to the same page
+    /// coordinate at 100%, 150% or any other percentage the reader chose.
+    public static func contentPoint(
+        viewX: CGFloat,
+        viewYTop: CGFloat,
+        scrollYPt: CGFloat,
+        zoom: CGFloat,
+        contentOffsetX: CGFloat
+    ) -> CGPoint {
+        let scale = max(zoom, 0.01)
+        return CGPoint(
+            x: (viewX - contentOffsetX) / scale,
+            y: viewYTop / scale + scrollYPt
+        )
     }
 
     /// The scroll offset that puts `contentY` back under `viewY` at a new zoom.
@@ -65,6 +92,30 @@ public enum CanvasGeometry {
             y: (pageTopPt + region.minY - scrollYPt) * zoom,
             width: region.width * zoom,
             height: region.height * zoom
+        )
+    }
+
+    /// A page's full quad in **device pixels**, exactly as the Metal surface receives it.
+    ///
+    /// `zoom` is `AppState.zoomFactor`, which already contains the display calibration; the only
+    /// other factor here is the drawing surface's backing scale. Calibration therefore appears
+    /// **once** in `pageWidthPt × zoom × backingScale` — the renderer must not multiply it in
+    /// again, and this shared function is what the renderer and the native zoom checks call.
+    public static func pageRectInDevicePixels(
+        pageTopPt: CGFloat,
+        pageLeftPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat,
+        scrollYPt: CGFloat,
+        zoom: CGFloat,
+        backingScale: CGFloat,
+        contentOffsetXPx: CGFloat
+    ) -> CGRect {
+        CGRect(
+            x: contentOffsetXPx + pageLeftPt * zoom * backingScale,
+            y: (pageTopPt - scrollYPt) * zoom * backingScale,
+            width: widthPt * zoom * backingScale,
+            height: heightPt * zoom * backingScale
         )
     }
 }
