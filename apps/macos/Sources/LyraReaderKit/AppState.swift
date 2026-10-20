@@ -282,6 +282,10 @@ public final class AppState: ObservableObject {
     @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails
     @Published public var sidebarVisible: Bool = true
+    /// Test-only transition progress. The app never sets it; `TransitionChecks` pins a value and
+    /// steps it so a "partly open" frame is a deterministic layout, not a race with the display
+    /// link on a loaded runner.
+    @Published public var transitionProgressOverride: ReaderTransitionProgress?
     @Published public var searchSidebarVisible = false
     @Published public var showDocumentInformation = false
     // ── Form filling and document properties ───────────────────────────────────
@@ -3140,6 +3144,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingOriginalText = ""
         editingUndoDepth = 0
         annotationTool = .select
+        transitionProgressOverride = nil
         annotations = []
         bookmarks = []
         erasedInkStrokeIDs = []

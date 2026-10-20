@@ -47,7 +47,10 @@ public struct ReaderWindow: View {
                     // A sliding drawer, not a conditional: the panel keeps its content width
                     // while the frame around it closes, so the canvas gets the freed width frame
                     // by frame and the document's vertical position never changes.
-                    ReaderSidebarTransition(isVisible: state.sidebarVisible && state.document != nil) {
+                    ReaderSidebarTransition(
+                        isVisible: state.sidebarVisible && state.document != nil,
+                        progressOverride: state.transitionProgressOverride?.sidebar
+                    ) {
                         SidebarView(state: state, opener: opener)
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
@@ -323,7 +326,10 @@ public struct ReaderWindow: View {
                     .frame(width: inset, height: ReaderChrome.secondaryToolbarHeightPt)
                     .allowsHitTesting(false)
             }
-            ReaderSecondaryToolbarTransition(isVisible: secondaryToolbarVisible) {
+            ReaderSecondaryToolbarTransition(
+                isVisible: secondaryToolbarVisible,
+                progressOverride: state.transitionProgressOverride?.row
+            ) {
                 ReaderSecondaryToolbar(state: state)
             }
         }
@@ -335,11 +341,13 @@ public struct ReaderWindow: View {
     /// A toggle made while the window edge is being dragged changes layout without animating:
     /// animating against the pointer would make the layout chase two sizes at once.
     private var sidebarAnimation: Animation? {
-        isLiveResizing ? nil : ReaderMotion.sidebarAnimation
+        if state.transitionProgressOverride != nil { return nil }
+        return isLiveResizing ? nil : ReaderMotion.sidebarAnimation
     }
 
     private var secondaryRowAnimation: Animation? {
-        isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
+        if state.transitionProgressOverride != nil { return nil }
+        return isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
     }
 
     /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
