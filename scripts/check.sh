@@ -123,7 +123,7 @@ if cargo clippy --version >/dev/null 2>&1; then
   if cargo clippy --workspace --all-targets --quiet -- -D warnings >"$ROOT/build/clippy.log" 2>&1; then
     ok "cargo clippy -D warnings"
   else
-    warn "cargo clippy reported warnings (see build/clippy.log)"
+    bad "cargo clippy reported warnings (see build/clippy.log)"
   fi
 else
   warn "clippy not installed: rustup component add clippy"
@@ -133,7 +133,7 @@ if cargo fmt --version >/dev/null 2>&1; then
   if cargo fmt --all --check >/dev/null 2>&1; then
     ok "cargo fmt --check"
   else
-    warn "formatting differs: run cargo fmt"
+    bad "formatting differs: run cargo fmt"
   fi
 fi
 

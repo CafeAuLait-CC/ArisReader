@@ -151,6 +151,9 @@ pub struct SaveReport {
 pub(crate) enum OutputMode {
     /// Write a new file. Refuses to name the source.
     Copy,
+    /// Internal page-edit revision. Retain signature evidence so the shell keeps the original
+    /// protected throughout an edit session; exporting the revision still uses `Copy`.
+    WorkingRevision,
     /// Replace the destination with the rewritten source after a verified backup.
     ReplaceDestination,
 }
@@ -291,6 +294,9 @@ fn save_annotation_changes_with(
         .with_detail(source.display().to_string()));
     }
     let destination = canonical_destination(destination)?;
+    if mode == SaveMode::ReplaceOriginal {
+        crate::signature::ensure_unsigned_for_replacement(&source)?;
+    }
     match mode {
         SaveMode::Copy if destination == source => {
             return Err(LyraReaderError::new(
@@ -501,6 +507,10 @@ fn save_annotation_changes_with(
             .with_detail(format!("{written_bytes} < {source_len}")));
         }
 
+        let stripped =
+            mode == SaveMode::Copy && crate::strip_signature_from_copy(temp.path())?.is_some();
+        let full_rewrite = full_rewrite || stripped;
+
         // Keep the source's mode (a 0600 document must not become world-readable). The backup
         // already has it too.
         fs::set_permissions(temp.path(), source_bytes.permissions()).map_err(|error| {
@@ -528,7 +538,11 @@ fn save_annotation_changes_with(
                 .map(|annotation| annotation.id.clone())
                 .chain(updates.iter().map(|update| update.values.id.clone()))
                 .collect(),
-            appended_bytes: written_bytes.saturating_sub(source_len),
+            appended_bytes: if full_rewrite {
+                0
+            } else {
+                written_bytes.saturating_sub(source_len)
+            },
             backup_path: backup_path.clone(),
             preexisting_annotation_count,
             written_bookmark_ids: outline.written_ids,
@@ -602,6 +616,9 @@ where
         .with_detail(source.display().to_string()));
     }
     let destination = canonical_destination(destination)?;
+    if mode == SaveMode::ReplaceOriginal {
+        crate::signature::ensure_unsigned_for_replacement(&source)?;
+    }
     match mode {
         SaveMode::Copy if destination == source => {
             return Err(LyraReaderError::new(
@@ -669,6 +686,8 @@ where
 
         verify_prefix(&source, temp.path(), source_len)?;
         verify(temp.path())?;
+        let stripped =
+            mode == SaveMode::Copy && crate::strip_signature_from_copy(temp.path())?.is_some();
 
         fs::set_permissions(temp.path(), source_metadata.permissions()).map_err(|error| {
             io_error(
@@ -690,10 +709,14 @@ where
 
         Ok(IncrementalSaveReport {
             destination: destination.clone(),
-            appended_bytes: written_bytes.saturating_sub(source_len),
+            appended_bytes: if stripped {
+                0
+            } else {
+                written_bytes.saturating_sub(source_len)
+            },
             backup_path: backup_path.clone(),
             cleaned_temporaries,
-            source_bytes_preserved: true,
+            source_bytes_preserved: !stripped,
         })
     })()
 }
@@ -740,7 +763,7 @@ where
         .with_detail(source.display().to_string()));
     }
     let destination = canonical_destination(destination)?;
-    if mode == OutputMode::Copy && destination == source {
+    if mode != OutputMode::ReplaceDestination && destination == source {
         return Err(LyraReaderError::new(
             ErrorCode::InvalidArgument,
             "an edited copy cannot overwrite the document it was made from",
@@ -762,6 +785,9 @@ where
         .with_detail(destination.display().to_string()));
     }
 
+    if mode == OutputMode::ReplaceDestination {
+        crate::signature::ensure_unsigned_for_replacement(&destination)?;
+    }
     let source_before = fs::metadata(&source)
         .map_err(|error| io_error("could not read the source metadata", &source, error))?;
     let destination_before = if mode == OutputMode::ReplaceDestination {
@@ -785,7 +811,7 @@ where
     // byte-identical copy of what was about to be replaced.
     let backup_path = match mode {
         OutputMode::ReplaceDestination => Some(write_backup(&destination)?),
-        OutputMode::Copy => None,
+        OutputMode::Copy | OutputMode::WorkingRevision => None,
     };
 
     let (temp, mut file) = TempFile::create(&destination)?;
@@ -827,6 +853,9 @@ where
         }
 
         verify(temp.path())?;
+        if mode != OutputMode::WorkingRevision {
+            crate::strip_signature_from_copy(temp.path())?;
+        }
         let output_bytes = fs::metadata(temp.path())
             .map_err(|error| {
                 io_error(
@@ -1351,7 +1380,7 @@ fn read_annotations(
         let _guard = crate::backend::PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        AnnotationReader::open(path, password)?
+        AnnotationReader::open_locked(path, password)?
     };
     let mut pages = Vec::with_capacity(page_count as usize);
     for page in 0..page_count {
@@ -1359,7 +1388,7 @@ fn read_annotations(
             let _guard = crate::backend::PDFIUM_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reader.page(PageIndex(page))?
+            reader.page_locked(PageIndex(page))?
         };
         pages.push(annotations);
     }
@@ -2004,13 +2033,13 @@ fn canonical_destination(destination: &Path) -> Result<PathBuf> {
 ///
 /// Same directory is what makes the final rename atomic: a cross-device rename would be a copy
 /// followed by a delete, with a window where neither file is complete.
-struct TempFile {
+pub(crate) struct TempFile {
     path: PathBuf,
     armed: bool,
 }
 
 impl TempFile {
-    fn create(destination: &Path) -> Result<(Self, File)> {
+    pub(crate) fn create(destination: &Path) -> Result<(Self, File)> {
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -2046,11 +2075,11 @@ impl TempFile {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.armed = false;
     }
 }
@@ -2072,7 +2101,7 @@ fn nonce() -> u64 {
     nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(17)
 }
 
-fn sync_directory(directory: Option<&Path>) {
+pub(crate) fn sync_directory(directory: Option<&Path>) {
     // Best effort: the rename is already atomic, and `fsync` on a directory is about durability
     // across a power loss rather than about the file being readable. A platform that refuses to
     // open a directory for sync must not turn a successful save into an error.

@@ -945,8 +945,8 @@ fn set_string(
 ///
 /// Owns its own `FPDF_DOCUMENT`: PDFium has no way to hand out the handle behind the
 /// `pdfium-render` facade, and re-opening the same file is how this workspace already gives each
-/// worker its own handle ([`crate::backend::PdfiumBackend::reopen`]). The caller must hold
-/// `PDFIUM_LOCK` for every method here.
+/// worker its own handle ([`crate::backend::PdfiumBackend::reopen`]). The public methods serialize on
+/// `PDFIUM_LOCK`; the `_locked` helpers are only for callers already holding it.
 pub struct AnnotationReader {
     api: &'static Api,
     document: FpdfDocument,
@@ -963,7 +963,7 @@ pub struct AnnotationReader {
 }
 
 // SAFETY: raw PDFium handles are not thread-safe, and these markers are only sound because every
-// call site in this crate serialises on the process-wide `PDFIUM_LOCK` (see the module docs).
+// public method serialises on `PDFIUM_LOCK`, including opening and destruction.
 unsafe impl Send for AnnotationReader {}
 unsafe impl Sync for AnnotationReader {}
 
@@ -974,6 +974,15 @@ impl AnnotationReader {
     /// cannot be opened a second time — both are reported to the caller rather than silently
     /// turning into "this document has no annotations".
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
+        crate::backend::pdfium_instance()?;
+        let _guard = crate::backend::PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::open_locked(path, password)
+    }
+
+    /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
+    pub(crate) fn open_locked(path: &Path, password: Option<&str>) -> Result<Self> {
         let Some(api) = api() else {
             return Err(LyraReaderError::new(
                 ErrorCode::BackendUnavailable,
@@ -1034,6 +1043,14 @@ impl AnnotationReader {
     /// skipped rather than failing the whole page: a reader must not refuse to show the other
     /// twenty highlights because the twenty-first is broken.
     pub fn page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        let _guard = crate::backend::PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.page_locked(page)
+    }
+
+    /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
+    pub(crate) fn page_locked(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
         let index = c_int::try_from(page.get()).map_err(|_| {
             LyraReaderError::new(
                 ErrorCode::InvalidArgument,

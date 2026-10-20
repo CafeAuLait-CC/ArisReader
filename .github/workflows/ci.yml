@@ -1,7 +1,7 @@
 # Continuous integration for LyraReader (LyraReader).
 #
 # Two jobs:
-#   * rust-core   — the fast Rust signal (fmt, clippy, workspace tests) on ubuntu-latest.
+#   * rust-core   — the fast Rust signal (fmt, clippy, workspace tests with pinned PDFium) on ubuntu-latest.
 #                   The platform is part of the point, not an accident: this is the only job that
 #                   compiles the workspace for a non-Apple target, which is how it caught
 #                   `lyra-reader-gpu` using an Apple-only wgpu surface target and failing to build
@@ -17,8 +17,8 @@
 # no explicit `ref:`, no `github.event.pull_request.head.sha`, no "merge commit" toggle.
 #
 # What this workflow cannot cover, said out loud instead of hidden (see the annotated steps):
-#   * PDFium is a downloaded dynamic library and is not committed. If the download fails, the
-#     macOS gate fails: skipped native coverage cannot satisfy a required check.
+#   * PDFium is a downloaded dynamic library and is not committed. If the download fails, both
+#     gates fail: skipped PDF write coverage cannot satisfy a required check.
 #   * `pdf-samples/` — the twelve-paper corpus, withheld for copyright — is not in the
 #     repository, so the corpus regressions (reference_corpus, table_corpus and the 226/227
 #     sampled citation spans) never run here, on either runner.
@@ -60,6 +60,9 @@ jobs:
     name: rust-core (fmt · clippy · tests on ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.so
+      LYRA_READER_REQUIRE_PDFIUM: "1"
     steps:
       - name: Check out the merge result
         uses: actions/checkout@v5
@@ -82,6 +85,12 @@ jobs:
 
       - name: Native measurement summary regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_native_scroll_measurement.py'
+
+      - name: Fetch pinned Linux PDFium
+        run: ./scripts/fetch-pdfium.sh
+
+      - name: Prove PDFium loads before running the write regressions
+        run: cargo run --quiet -p lyra-reader-cli -- info tests/fixtures/signed-signature.pdf
 
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -115,6 +124,7 @@ jobs:
     env:
       # How the Rust engine finds the library at run time (crates/lyra-reader-pdfium/src/lib.rs).
       LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+      LYRA_READER_REQUIRE_PDFIUM: "1"
     steps:
       - name: Check out the merge result
         uses: actions/checkout@v5
