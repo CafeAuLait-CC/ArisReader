@@ -164,6 +164,24 @@ pub fn detect_signature(
     status
 }
 
+/// Recheck the file that will actually be replaced, before backups or temporary writes.
+/// A parse failure refuses the write rather than treating an unreadable structure as unsigned.
+pub(crate) fn ensure_unsigned_for_replacement(
+    path: &std::path::Path,
+) -> lyra_reader_core::Result<()> {
+    let document = load_document(path, None)?;
+    crate::rewrite::validate_signature_tree(&document)?;
+    let mut status = SignatureStatus::default();
+    read_evidence(&document, &mut status);
+    match status.read_only_reason() {
+        Some(reason) => Err(lyra_reader_core::LyraReaderError::new(
+            lyra_reader_core::ErrorCode::ReadOnly,
+            reason,
+        )),
+        None => Ok(()),
+    }
+}
+
 fn read_evidence(document: &Document, status: &mut SignatureStatus) {
     let Some(catalog) = catalog(document) else {
         return;
@@ -209,8 +227,20 @@ fn read_evidence(document: &Document, status: &mut SignatureStatus) {
 
     if let Some(form) = acro_form(document) {
         let mut signed_fields = Vec::new();
-        if let Ok(fields) = form.get(b"Fields").and_then(|object| object.as_array()) {
-            collect_signature_fields(document, fields, None, &mut signed_fields, 0);
+        if let Some(fields) = form
+            .get(b"Fields")
+            .ok()
+            .and_then(|object| resolve(document, object))
+            .and_then(|object| object.as_array().ok())
+        {
+            collect_signature_fields(
+                document,
+                fields,
+                None,
+                &mut signed_fields,
+                0,
+                &mut std::collections::BTreeSet::new(),
+            );
         }
         if !signed_fields.is_empty() {
             let names = signed_fields
@@ -253,11 +283,17 @@ fn collect_signature_fields(
     inherited_type: Option<&[u8]>,
     signed: &mut Vec<String>,
     depth: usize,
+    visited: &mut std::collections::BTreeSet<lopdf::ObjectId>,
 ) {
     if depth > MAX_SIGNATURE_FIELD_DEPTH {
         return;
     }
     for field in fields {
+        if let Ok(id) = field.as_reference()
+            && !visited.insert(id)
+        {
+            continue;
+        }
         let Some(dictionary) = resolve(document, field).and_then(|object| object.as_dict().ok())
         else {
             continue;
@@ -288,8 +324,13 @@ fn collect_signature_fields(
             // The children of a signature field are its widgets; they cannot add evidence.
             continue;
         }
-        if let Ok(kids) = dictionary.get(b"Kids").and_then(|object| object.as_array()) {
-            collect_signature_fields(document, kids, field_type, signed, depth + 1);
+        if let Some(kids) = dictionary
+            .get(b"Kids")
+            .ok()
+            .and_then(|object| resolve(document, object))
+            .and_then(|object| object.as_array().ok())
+        {
+            collect_signature_fields(document, kids, field_type, signed, depth + 1, visited);
         }
     }
 }

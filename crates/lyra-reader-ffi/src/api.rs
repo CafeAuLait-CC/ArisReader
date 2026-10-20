@@ -1655,7 +1655,7 @@ impl LyraReaderDocument {
         // be edited in the staged session (the final copy is sanitised by `save_edited_copy`,
         // and applying the revision to the original is refused by `replace_with_edited_pages`).
         let operation = page_operation(operation);
-        let report = lyra_reader_pdfium::apply_page_operation(
+        let report = lyra_reader_pdfium::stage_page_operation(
             Path::new(&self.path),
             Path::new(&destination),
             &operation,
@@ -1683,7 +1683,6 @@ impl LyraReaderDocument {
             &pages,
             self.password.as_deref(),
         )?;
-        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(page_edit_report(report))
     }
 
@@ -1715,9 +1714,6 @@ impl LyraReaderDocument {
             Path::new(&destination),
             self.password.as_deref(),
         )?;
-        // Any input may be signed; the output is a new document whose bytes are not covered by
-        // that signature, so it must not carry signature fields.
-        self.sanitize_derived_copy(&report.destination, true)?;
         Ok(merge_report(report))
     }
 
@@ -1745,9 +1741,6 @@ impl LyraReaderDocument {
             })
             .collect();
         let report = split_pages(Path::new(&self.path), &parts, self.password.as_deref())?;
-        for part in &report.parts {
-            self.sanitize_derived_copy(&part.destination, false)?;
-        }
         Ok(split_report(report))
     }
 
@@ -1761,7 +1754,6 @@ impl LyraReaderDocument {
             Path::new(&destination),
             self.backend.page_count(),
         )?;
-        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(page_edit_report(report))
     }
 
@@ -1854,7 +1846,6 @@ impl LyraReaderDocument {
             self.password.as_deref(),
             RedactionMode::Copy,
         )?;
-        self.sanitize_derived_copy(&report.destination, false)?;
         Ok(redaction_report(report))
     }
 
@@ -2631,37 +2622,6 @@ impl LyraReaderDocument {
         }
     }
 
-    /// Makes a modified derived copy signature-free, and reports whether it did.
-    ///
-    /// A copy whose bytes no longer match a signature field's `/V` must not look signed. The
-    /// stripper removes the signature fields, their widgets and signature dictionaries, clears
-    /// `/SigFlags`, and drops `/Perms` and `/DSS`; it verifies pages, text, non-signature form
-    /// fields, outline, metadata and embedded files before atomically replacing the copy. A
-    /// byte-identical export is not touched (the signature still covers those bytes).
-    ///
-    /// `force` is for merge, where any *input* may be signed even when the open document is not.
-    fn sanitize_derived_copy(
-        &self,
-        destination: &Path,
-        force: bool,
-    ) -> Result<bool, LyraReaderFfiError> {
-        if !force && !self.signature.is_signed() {
-            return Ok(false);
-        }
-        match lyra_reader_pdfium::strip_signature_from_copy(destination)? {
-            Some(report) => {
-                eprintln!(
-                    "lyra-reader-signature: removed {} signature field(s)/{} object(s) from derived copy {} (its bytes are no longer covered by the signature)",
-                    report.signature_fields,
-                    report.removed_objects,
-                    destination.display()
-                );
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
     /// Plain text and character boxes for one page, extracted once and kept for the
     /// document's lifetime. The boxes and the text come from the same `raw.chars` sequence, so
     /// the context builder's gutter rule and the canvas's selection indices agree.
@@ -2685,17 +2645,13 @@ impl LyraReaderDocument {
                 selected: value.selected,
             })
             .collect();
-        let mut report = lyra_reader_pdfium::save_form_pdf(
+        let report = lyra_reader_pdfium::save_form_pdf(
             Path::new(&self.path),
             &destination,
             &updates,
             self.password.as_deref(),
             mode,
         )?;
-        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
-            report.appended_bytes = 0;
-            report.source_bytes_preserved = false;
-        }
         if mode == SaveMode::ReplaceOriginal {
             self.replaced
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -2733,17 +2689,13 @@ impl LyraReaderDocument {
             subject,
             keywords,
         };
-        let mut report = lyra_reader_pdfium::save_document_properties(
+        let report = lyra_reader_pdfium::save_document_properties(
             Path::new(&self.path),
             &destination,
             &properties,
             self.password.as_deref(),
             mode,
         )?;
-        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
-            report.appended_bytes = 0;
-            report.source_bytes_preserved = false;
-        }
         if mode == SaveMode::ReplaceOriginal {
             self.replaced
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -2890,7 +2842,7 @@ impl LyraReaderDocument {
                 target: deletion.target.clone(),
             })
             .collect::<Vec<_>>();
-        let mut report = lyra_reader_pdfium::save_annotation_changes(
+        let report = lyra_reader_pdfium::save_annotation_changes(
             Path::new(&self.path),
             &destination,
             &lyra_reader_pdfium::AnnotationChanges {
@@ -2902,10 +2854,6 @@ impl LyraReaderDocument {
             self.password.as_deref(),
             mode,
         )?;
-        if mode == SaveMode::Copy && self.sanitize_derived_copy(&report.destination, false)? {
-            report.appended_bytes = 0;
-            report.source_bytes_preserved = false;
-        }
         if mode == SaveMode::ReplaceOriginal {
             // The open backend still holds the pre-replacement in-memory document; the shell
             // reopens it after a replace, and every read before that reopen is refused rather

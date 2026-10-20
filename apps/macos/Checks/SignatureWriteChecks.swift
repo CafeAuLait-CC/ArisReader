@@ -121,6 +121,18 @@ extension ReaderChecks {
         await expectRefusal("replaceOriginalWithPageEdits") {
             _ = try await gateEngine.replaceOriginalWithPageEdits(original: signedURL)
         }
+        // The policy must use the current file, even if it gained a signature after open.
+        let staleURL = try copy("text-page.pdf", "signed-after-open.pdf")
+        let staleEngine = try engine()
+        _ = try staleEngine.openDocument(at: staleURL)
+        try originalBytes.write(to: staleURL)
+        await expectRefusal("properties replacement after external signing") {
+            _ = try await staleEngine.replaceWithDocumentProperties(
+                DocumentProperties(title: "must not write", author: "", subject: "", keywords: ""))
+        }
+        let externallySignedBytes = try bytes(staleURL)
+        require(externallySignedBytes == originalBytes,
+                "a signature added after open is protected by the save transaction")
         let afterRefusals = try bytes(signedURL)
         require(afterRefusals == originalBytes,
                 "every refused in-place command left the signed original byte-identical")
@@ -196,6 +208,8 @@ extension ReaderChecks {
                 "the annotated copy keeps the new annotation")
         require(annotationReport.sourceBytesPreserved == false,
                 "a signature-stripped copy does not claim the source prefix")
+        require(annotationReport.fullRewrite && annotationReport.appendedBytes == 0,
+                "a signature-stripped annotation copy reports a full rewrite")
 
         // The signature field is gone, the non-signature form field survives, and the page text
         // is unchanged.

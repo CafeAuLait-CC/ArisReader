@@ -231,6 +231,34 @@ pub fn apply_page_operation(
     operation: &PageOperation,
     password: Option<&str>,
 ) -> Result<PageOperationReport> {
+    apply_page_operation_with_mode(source, destination, operation, password, OutputMode::Copy)
+}
+
+/// Creates an internal page-edit revision, retaining the original's signature evidence for the
+/// session's read-only policy. This is not a user export: publish it with `publish_edited_copy`
+/// to remove invalid signature material before the file becomes a deliverable.
+pub fn stage_page_operation(
+    source: &Path,
+    destination: &Path,
+    operation: &PageOperation,
+    password: Option<&str>,
+) -> Result<PageOperationReport> {
+    apply_page_operation_with_mode(
+        source,
+        destination,
+        operation,
+        password,
+        OutputMode::WorkingRevision,
+    )
+}
+
+fn apply_page_operation_with_mode(
+    source: &Path,
+    destination: &Path,
+    operation: &PageOperation,
+    password: Option<&str>,
+    mode: OutputMode,
+) -> Result<PageOperationReport> {
     reject_password(password)?;
     let api = api()?;
     let document = open_editable(api, source, "the document being edited")?;
@@ -262,7 +290,7 @@ pub fn apply_page_operation(
     let rewritten = write_rewritten_pdf(
         source,
         destination,
-        OutputMode::Copy,
+        mode,
         |file| document.save(file),
         |path| {
             verify_output(

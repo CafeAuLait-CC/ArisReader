@@ -107,7 +107,7 @@ pub use outline_write::{
 pub use page_ops::{
     MergeReport, PageOperation, PageOperationReport, SplitPart, SplitPartReport, SplitReport,
     apply_page_operation, extract_pages, merge_documents, publish_edited_copy,
-    replace_original_with_edit, split_pages,
+    replace_original_with_edit, split_pages, stage_page_operation,
 };
 #[cfg(feature = "pdfium")]
 pub use redaction::{
@@ -166,3 +166,6 @@ mod test_support;
 
 #[cfg(feature = "pdfium")]
 mod link_borders;
+
+#[cfg(all(test, feature = "pdfium"))]
+mod write_policy_tests;
