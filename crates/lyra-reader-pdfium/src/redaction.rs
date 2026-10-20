@@ -1808,13 +1808,8 @@ struct RedactApi {
     get_page_width: unsafe extern "C" fn(FpdfPage) -> f32,
     get_page_height: unsafe extern "C" fn(FpdfPage) -> f32,
     get_rotation: unsafe extern "C" fn(FpdfPage) -> std::ffi::c_int,
-    get_crop_box: unsafe extern "C" fn(
-        FpdfPage,
-        *mut FsRectF,
-        *mut FsRectF,
-        *mut FsRectF,
-        *mut FsRectF,
-    ) -> std::ffi::c_int,
+    get_crop_box:
+        unsafe extern "C" fn(FpdfPage, *mut f32, *mut f32, *mut f32, *mut f32) -> std::ffi::c_int,
     count_objects: unsafe extern "C" fn(FpdfPage) -> std::ffi::c_int,
     get_object: unsafe extern "C" fn(FpdfPage, std::ffi::c_int) -> FpdfPageObject,
     get_object_type: unsafe extern "C" fn(FpdfPageObject) -> std::ffi::c_int,
@@ -2265,16 +2260,13 @@ fn render_page_locked(
     let width_pt = f64::from(unsafe { (api.get_page_width)(page_handle) }).max(1.0);
     let height_pt = f64::from(unsafe { (api.get_page_height)(page_handle) }).max(1.0);
     let mut crop = FsRectF::default();
-    let mut media = FsRectF::default();
-    let mut bleed = FsRectF::default();
-    let mut trim = FsRectF::default();
     let has_crop = unsafe {
         (api.get_crop_box)(
             page_handle,
-            std::ptr::addr_of_mut!(crop),
-            std::ptr::addr_of_mut!(media),
-            std::ptr::addr_of_mut!(bleed),
-            std::ptr::addr_of_mut!(trim),
+            std::ptr::addr_of_mut!(crop.left),
+            std::ptr::addr_of_mut!(crop.bottom),
+            std::ptr::addr_of_mut!(crop.right),
+            std::ptr::addr_of_mut!(crop.top),
         )
     } != 0;
     let bounds = if has_crop {
@@ -2404,6 +2396,38 @@ mod tests {
     use super::*;
     use crate::redaction::RedactDocument;
     use crate::test_support::{copy_fixture, scratch};
+
+    #[test]
+    fn raster_redaction_respects_nonzero_crop_box_coordinates() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let scratch = scratch("redaction-crop-box");
+        let source = copy_fixture(&scratch, "text-page.pdf", "cropped.pdf");
+        let mut document = lopdf::Document::load(&source).unwrap();
+        let page = *document.get_pages().values().next().unwrap();
+        document
+            .get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "CropBox",
+                vec![
+                    Object::Integer(10),
+                    Object::Integer(20),
+                    Object::Integer(200),
+                    Object::Integer(300),
+                ],
+            );
+        document.save(&source).unwrap();
+        let document =
+            RedactDocument::load(redact_api().unwrap(), fs::read(&source).unwrap(), None).unwrap();
+        let raster = document.render_page(0, 1.0).unwrap();
+        assert_eq!(raster.bounds, Rect::new(10.0, 20.0, 190.0, 280.0));
+        assert_eq!((raster.width, raster.height), (190, 280));
+    }
 
     fn text_of(path: &Path, page: u32) -> String {
         let api = redact_api().expect("api");

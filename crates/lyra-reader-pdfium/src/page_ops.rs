@@ -1183,7 +1183,7 @@ fn page_annotations(path: &Path) -> Result<Vec<Vec<RawAnnotation>>> {
             let _guard = PDFIUM_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reader.page(PageIndex(page))?
+            reader.page_locked(PageIndex(page))?
         };
         pages.push(records);
     }
@@ -1996,7 +1996,9 @@ mod tests {
                 let _guard = PDFIUM_LOCK
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                reader.page(PageIndex(page)).expect("annotation page")
+                reader
+                    .page_locked(PageIndex(page))
+                    .expect("annotation page")
             };
             pages.push(records);
         }

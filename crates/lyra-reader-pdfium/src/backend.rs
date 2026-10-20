@@ -544,12 +544,12 @@ impl PdfiumBackend {
         }
 
         let reader = self.annotation_reader.get_or_init(|| {
-            AnnotationReader::open(&self.path, self.password.as_deref())
+            AnnotationReader::open_locked(&self.path, self.password.as_deref())
                 .map_err(|error| format!("{error:?}"))
         });
 
         match reader {
-            Ok(reader) => reader.page(page),
+            Ok(reader) => reader.page_locked(page),
             Err(detail) => Err(LyraReaderError::new(
                 ErrorCode::BackendUnavailable,
                 "could not read the document's annotations",

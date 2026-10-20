@@ -367,3 +367,49 @@ fn staged_signed_edits_keep_the_original_guard_but_exports_are_unsigned() {
     .unwrap();
     assert!(!crate::detect_signature(&direct_copy, None, 0).is_signed());
 }
+
+#[test]
+fn annotation_opens_and_page_writes_share_the_pdfium_transaction_lock() {
+    if !crate::is_available() {
+        eprintln!("skipping: PDFium unavailable");
+        return;
+    }
+    let scratch = ScratchDir::new("concurrent-annotation-writes");
+    let source = fixture("multipage.pdf");
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let source = &source;
+            let directory = scratch.join(format!("worker-{worker}"));
+            fs::create_dir(&directory).unwrap();
+            scope.spawn(move || {
+                for _ in 0..8 {
+                    let reader = crate::AnnotationReader::open(source, None).unwrap();
+                    reader.page(lyra_reader_core::PageIndex(0)).unwrap();
+                    crate::split_pages(
+                        source,
+                        &[
+                            crate::SplitPart {
+                                destination: directory.join("a.pdf"),
+                                pages: vec![0],
+                            },
+                            crate::SplitPart {
+                                destination: directory.join("b.pdf"),
+                                pages: vec![1],
+                            },
+                        ],
+                        None,
+                    )
+                    .unwrap();
+                    crate::preview_redactions(
+                        source,
+                        &[crate::RedactionArea::new(
+                            0,
+                            lyra_reader_core::Rect::new(72.0, 700.0, 100.0, 40.0),
+                        )],
+                    )
+                    .unwrap();
+                }
+            });
+        }
+    });
+}

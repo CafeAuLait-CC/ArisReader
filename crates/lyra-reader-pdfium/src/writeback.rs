@@ -1380,7 +1380,7 @@ fn read_annotations(
         let _guard = crate::backend::PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        AnnotationReader::open(path, password)?
+        AnnotationReader::open_locked(path, password)?
     };
     let mut pages = Vec::with_capacity(page_count as usize);
     for page in 0..page_count {
@@ -1388,7 +1388,7 @@ fn read_annotations(
             let _guard = crate::backend::PDFIUM_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reader.page(PageIndex(page))?
+            reader.page_locked(PageIndex(page))?
         };
         pages.push(annotations);
     }
