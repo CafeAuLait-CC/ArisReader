@@ -162,15 +162,14 @@ public struct TileCache {
         newest = nil
     }
 
-    /// Clears the lifetime counters without touching the cached tiles.
+    /// Clears the lifetime counters without touching the cached tiles or the peak.
     ///
-    /// `removeAll` deliberately preserves `peakBytes` and the counters so the HUD can report
-    /// what a run reached. The in-app performance panel is per document, so a document change
-    /// resets the counters; the peak restarts from what is still resident rather than claiming
-    /// a high-water mark from a document that is no longer open.
+    /// `removeAll` and this method deliberately preserve `peakBytes`, because the existing
+    /// `LYRA_READER_RENDER_STATS` line documents it as a high-water mark since the cache was
+    /// created. The in-app panel wants a per-document peak instead and subtracts a baseline it
+    /// saves when a document opens; that keeps the old diagnostic's meaning intact.
     public mutating func resetStats() {
         stats = TileCacheStats()
-        peakBytes = usedBytes
     }
 
     // MARK: - Private

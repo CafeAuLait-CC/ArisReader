@@ -495,7 +495,7 @@ public struct PerformancePanelView: View {
     private var memorySection: some View {
         section("MEMORY") {
             row("Tiles", "\(bytes(snapshot?.cacheUsedBytes)) / \(bytes(snapshot?.cacheBudgetBytes))")
-            row("Tile peak", bytes(snapshot?.cachePeakBytes))
+            row("Tile peak (doc)", bytes(snapshot?.cachePeakBytes))
             row("Page rasters", "\(bytes(snapshot?.pageRasterBytes)) · \(count(snapshot?.pageRastersResident))")
             row("Thumbnails", "\(bytes(snapshot?.thumbnailBytes)) · \(count(snapshot?.thumbnailCount))")
         }
@@ -671,7 +671,7 @@ extension AppState {
             tileRasterMilliseconds: tileRasterCount == 0 ? nil : tileRasterMilliseconds,
             cacheUsedBytes: tileCacheUsedBytes,
             cacheBudgetBytes: tileCacheBudgetBytes,
-            cachePeakBytes: tileCachePeakBytes,
+            cachePeakBytes: tileCacheDocumentPeakBytes,
             pageRasterBytes: pageRasterCacheUsedBytes,
             pageRastersResident: pageRasterCacheCount,
             thumbnailBytes: thumbnailCacheBytes,

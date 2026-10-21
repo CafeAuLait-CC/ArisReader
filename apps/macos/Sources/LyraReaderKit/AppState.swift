@@ -2756,6 +2756,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var searchHits: [SearchHit]
         var currentHitIndex: Int?
         var tileCache: TileCache
+        /// Where the lifetime cache peak stood when this document opened; the panel's peak is
+        /// measured from here, and it travels with the tab like the counters below.
+        var tileCachePeakBaseline: Int
         /// The performance panel's per-document counters, so switching back to a retained tab
         /// reports that tab's requests and raster times instead of the previous tab's.
         var tileRequestCount: Int
@@ -2957,6 +2960,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var tileCachePeakBytes: Int { tileCache.peakBytes }
     public var tileCacheEvictions: Int { tileCache.stats.evictions }
     public var tileCacheTileCount: Int { tileCache.count }
+    /// The cache peak when the current document opened. `tileCachePeakBytes` is a lifetime
+    /// high-water mark for `LYRA_READER_RENDER_STATS`, so the panel subtracts this baseline to
+    /// report a per-document peak without changing that existing diagnostic's meaning.
+    private var tileCachePeakBaseline = 0
+    public var tileCacheDocumentPeakBytes: Int {
+        max(0, tileCache.peakBytes - tileCachePeakBaseline)
+    }
     /// A copy of the cache's counters for the performance panel. `TileCacheStats` is a value
     /// type, so the panel cannot mutate the cache through the snapshot.
     public var tileCacheSnapshot: TileCacheStats { tileCache.stats }
@@ -3576,6 +3586,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // while tabs are swapped, but the counters should not carry one paper's raster history
         // into another's report.
         tileCache.resetStats()
+        // The lifetime peak is intentionally not reset (`LYRA_READER_RENDER_STATS` documents it
+        // as "since the cache was created"); the panel measures from this document's baseline.
+        tileCachePeakBaseline = tileCachePeakBytes
         tileRequestCount = 0
         tileRasterCount = 0
         tileRasterMilliseconds = 0
@@ -12255,6 +12268,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             searchHits: searchHits,
             currentHitIndex: currentHitIndex,
             tileCache: tileCache,
+            tileCachePeakBaseline: tileCachePeakBaseline,
             tileRequestCount: tileRequestCount,
             tileRasterCount: tileRasterCount,
             tileRasterMilliseconds: tileRasterMilliseconds,
@@ -12371,6 +12385,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         searchHits = state.searchHits
         currentHitIndex = state.currentHitIndex
         tileCache = state.tileCache
+        tileCachePeakBaseline = state.tileCachePeakBaseline
         tileRequestCount = state.tileRequestCount
         tileRasterCount = state.tileRasterCount
         tileRasterMilliseconds = state.tileRasterMilliseconds
