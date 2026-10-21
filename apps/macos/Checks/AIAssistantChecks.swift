@@ -374,7 +374,7 @@ extension ReaderChecks {
         }
 
         var profiles: [(AIAssistantAction, String)] = []
-        for action in AIAssistantAction.allCases where !action.isDocumentChat {
+        for action in AIAssistantAction.allCases where !action.isDocumentChat && action != .regionQuestion {
             let context = action.requiresSelection ? selectionContext : pageContext
             let service = ScriptedAIChatService(
                 engine: engine,
@@ -421,7 +421,7 @@ extension ReaderChecks {
                     "\(action.rawValue) feeds the same answer accumulator")
             model.discard()
         }
-        require(profiles.count == AIAssistantAction.allCases.filter { !$0.isDocumentChat }.count,
+        require(profiles.count == AIAssistantAction.allCases.filter { !$0.isDocumentChat && $0 != .regionQuestion }.count,
                 "all four single-shot action paths were profiled")
         for (action, body) in profiles {
             require(body.contains("\"thinking\":{\"type\":\"disabled\"}"),
@@ -586,6 +586,7 @@ extension ReaderChecks {
                 question: nil,
                 language: "English",
                 history: [],
+                region: nil,
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -616,6 +617,7 @@ extension ReaderChecks {
                 question: nil,
                 language: "English",
                 history: [],
+                region: nil,
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -647,6 +649,7 @@ extension ReaderChecks {
                     question: nil,
                     language: nil,
                     history: [],
+                    region: nil,
                     baseUrl: "http://127.0.0.1:11434/v1",
                     model: "mock-model",
                     temperature: 0.2,
@@ -1731,7 +1734,10 @@ extension ReaderChecks {
             model.selectedTab = tab
             try await Task.sleep(for: .milliseconds(100))
             host.layoutSubtreeIfNeeded()
-            if tab != .chat {
+            if tab == .regions {
+                require(findView(AIDocumentChatMarkerView.self, in: host) == nil,
+                        "Regions has its own workspace without a stacked chat")
+            } else if tab != .chat {
                 require(findView(AIDocumentChatMarkerView.self, in: host) == nil,
                         "\(tab.title) has its own workspace without a stacked chat")
                 require(findView(AIAssistantPanelMarkerView.self, in: host) != nil,
