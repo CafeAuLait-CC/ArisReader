@@ -152,6 +152,7 @@ extension ReaderChecks {
         try await aiMergeChecks()
         try await aiDocumentChatChecks(root: root)
         try await aiDocumentChatLayoutChecks(root: root)
+        try await aiLayeredSummaryChecks(root: root)
     }
 
     @MainActor
