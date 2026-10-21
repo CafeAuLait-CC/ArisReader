@@ -12040,18 +12040,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func fadeAISourceHighlight(id: UUID) {
         aiSourceHighlightTask?.cancel()
+        let clock = ContinuousClock()
+        let started = clock.now
         aiSourceHighlightTask = Task { @MainActor [weak self] in
+            // Absolute deadlines avoid extending every later phase when raster work delays
+            // one main-actor resumption on a busy window or CI runner.
             for (phase, delay) in [
                 (AISourceHighlight.Phase.soft, Duration.milliseconds(450)),
-                (.faint, .milliseconds(450)),
+                (.faint, .milliseconds(900)),
             ] {
-                try? await Task.sleep(for: delay)
+                try? await clock.sleep(until: started.advanced(by: delay))
                 guard !Task.isCancelled, let self,
                       self.aiSourceHighlight?.id == id else { return }
                 self.aiSourceHighlight?.phase = phase
                 self.refreshSelectionOverlay()
             }
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await clock.sleep(until: started.advanced(by: .milliseconds(1_400)))
             guard !Task.isCancelled, let self,
                   self.aiSourceHighlight?.id == id else { return }
             self.aiSourceHighlight = nil

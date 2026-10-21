@@ -1268,9 +1268,9 @@ extension ReaderChecks {
                 "following a citation creates no annotation")
         require(!FileManager.default.fileExists(atPath: sidecar.path),
                 "following a citation writes no sidecar annotation")
-        try await Task.sleep(for: .milliseconds(1_700))
-        require(state.aiSourceHighlight == nil,
-                "the source highlight disappears after the fade")
+        try await eventually("the source highlight disappears after the fade") {
+            state.aiSourceHighlight == nil
+        }
         require(!state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
                 "the transient quads are removed with the highlight")
         require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: sidecar.path),
