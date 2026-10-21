@@ -167,6 +167,17 @@ struct ReaderCommands: Commands {
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(focusedState?.document == nil)
 
+            // Developer-facing, off by default. ⌥⌘P is free: the native menu's P chord is ⌘P
+            // (Print) and the Rust keymap's P binding is ⇧⌘P (PreviewCitation); neither is ⌥⌘P.
+            // See PerformancePanelShortcut for the full collision list.
+            Button((focusedState?.performancePanelVisible == true ? "Hide " : "Show ")
+                   + PerformancePanelShortcut.label) {
+                focusedState?.togglePerformancePanel()
+            }
+            .keyboardShortcut(PerformancePanelShortcut.key,
+                              modifiers: PerformancePanelShortcut.modifiers)
+            .disabled(focusedState?.document == nil)
+
             Divider()
 
             // The zoom presets. "Actual Size" is physical size on the current display: the

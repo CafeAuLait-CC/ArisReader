@@ -336,6 +336,23 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// The 6 pt resize handle and 1 pt separator are added by ``ReaderSidePanelMetrics``.
     @Published public private(set) var rightPanelWidthPt =
         ReaderSidePanelMetrics.defaultContentWidthPt
+    /// Whether the developer-facing performance panel is open. Off by default, deliberately not
+    /// persisted (a diagnostic that survives a relaunch is chrome the reader did not ask for),
+    /// and only one right-hand drawer can be open at a time.
+    @Published public private(set) var performancePanelVisible = false {
+        didSet {
+            guard oldValue != performancePanelVisible else { return }
+            // Opening starts the 4 Hz sampling task; closing cancels it. The controller also
+            // clears the snapshot, so closed means no timer and no retained sample.
+            performancePanel.setRunning(performancePanelVisible, state: self)
+        }
+    }
+    /// The window's frame-sampling seam. Always allocated (one tiny object), but it does no
+    /// work until the panel's controller starts sampling or a document-open measurement is
+    /// pending; the canvas checks one bool per frame.
+    public let performanceProbe = CanvasPerformanceProbe()
+    /// The performance panel's sampler and last snapshot.
+    public let performancePanel = PerformancePanelController()
     /// Test-only transition progress. The app never sets it; `TransitionChecks` pins a value and
     /// steps it so a "partly open" frame is a deterministic layout, not a race with the display
     /// link on a loaded runner.
@@ -420,6 +437,7 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
         didSet {
             if contentEditEnabled {
                 rightPanelVisible = false
+                performancePanelVisible = false
                 cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
             }
         }
@@ -2738,6 +2756,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var searchHits: [SearchHit]
         var currentHitIndex: Int?
         var tileCache: TileCache
+        /// Where the lifetime cache peak stood when this document opened; the panel's peak is
+        /// measured from here, and it travels with the tab like the counters below.
+        var tileCachePeakBaseline: Int
+        /// The performance panel's per-document counters, so switching back to a retained tab
+        /// reports that tab's requests and raster times instead of the previous tab's.
+        var tileRequestCount: Int
+        var tileRasterCount: Int
+        var tileRasterMilliseconds: Double
+        var pageRasterCount: Int
+        var pageRasterMilliseconds: Double
         var pagePreviews: [Int: PageImage]
         var pagePreviewScales: [Int: CGFloat]
         var desiredPreviewScale: CGFloat
@@ -2932,6 +2960,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var tileCachePeakBytes: Int { tileCache.peakBytes }
     public var tileCacheEvictions: Int { tileCache.stats.evictions }
     public var tileCacheTileCount: Int { tileCache.count }
+    /// The cache peak when the current document opened. `tileCachePeakBytes` is a lifetime
+    /// high-water mark for `LYRA_READER_RENDER_STATS`, so the panel subtracts this baseline to
+    /// report a per-document peak without changing that existing diagnostic's meaning.
+    private var tileCachePeakBaseline = 0
+    public var tileCacheDocumentPeakBytes: Int {
+        max(0, tileCache.peakBytes - tileCachePeakBaseline)
+    }
+    /// A copy of the cache's counters for the performance panel. `TileCacheStats` is a value
+    /// type, so the panel cannot mutate the cache through the snapshot.
+    public var tileCacheSnapshot: TileCacheStats { tileCache.stats }
+    /// The LOD of the visible band's tile pyramid. Read-only: the panel reports it, the canvas
+    /// and the scheduler are the only writers.
+    public var currentRasterLOD: UInt8 { rasterLod }
+    /// Tiles the scheduler actually queued for rasterization since the document opened. This is
+    /// a request, not a cache lookup: a tile already cached is a hit and never queued.
+    public private(set) var tileRequestCount = 0
+    /// Tiles the engine finished rasterizing since the document opened (successful insertions).
+    public private(set) var tileRasterCount = 0
+    /// Wall-clock milliseconds spent in those tile raster calls, as self-reported by the shell
+    /// around `PDFEngine.rasterizeTile`. This is CPU/wall time, not GPU upload or draw time.
+    public private(set) var tileRasterMilliseconds: Double = 0
+    /// Whole-page rasters the engine finished since the document opened.
+    public private(set) var pageRasterCount = 0
+    /// Wall-clock milliseconds spent waiting for those page raster calls. Same caveat as the
+    /// tile figure: an engine self-report, not a GPU or presentation measurement.
+    public private(set) var pageRasterMilliseconds: Double = 0
+    public var thumbnailCacheBytes: Int {
+        thumbnails.values.reduce(0) { $0 + $1.bgra.count }
+    }
+    public var thumbnailCacheCount: Int { thumbnails.count }
 
     /// Whether one tile is cached. The budget checks use it to prove that a visible tile
     /// survived an eviction pass that a stale tile did not.
@@ -3433,6 +3491,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             endPageEditSession(deleteFiles: true)
         }
         do {
+            // One-shot, not a timer: stamps the request now; the first *presented* frame clears
+            // the flag. It is retained even when the panel is closed, so opening the panel later
+            // still reports the open latency instead of "not measured".
+            performanceProbe.beginOpenToFirstFrameMeasurement()
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
             // A tab switch already put the old document's page-edit session in its retained
@@ -3520,6 +3582,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // be able to scroll the next document to an offset it never had.
         clearNavigationHistory()
         invalidateTiles()
+        // The performance panel's counters are per document. The cache keeps its retained tiles
+        // while tabs are swapped, but the counters should not carry one paper's raster history
+        // into another's report.
+        tileCache.resetStats()
+        // The lifetime peak is intentionally not reset (`LYRA_READER_RENDER_STATS` documents it
+        // as "since the cache was created"); the panel measures from this document's baseline.
+        tileCachePeakBaseline = tileCachePeakBytes
+        tileRequestCount = 0
+        tileRasterCount = 0
+        tileRasterMilliseconds = 0
+        pageRasterCount = 0
+        pageRasterMilliseconds = 0
         canvasPages = []
         canvasTiles = []
         visiblePagePlacements = []
@@ -3978,8 +4052,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             rightPanelVisible = false
         } else {
             pageOverviewVisible = false
+            // Both live in the same right-hand slot, so opening one closes the other rather
+            // than drawing two drawers on top of each other.
+            performancePanelVisible = false
             rightPanelVisible = true
         }
+    }
+
+    /// Opens or closes the developer-facing performance panel.
+    ///
+    /// Off by default and not persisted: it is a diagnostic surface, not reader chrome. It uses
+    /// the same right-hand drawer host and visual language as the assistant, so it needs no new
+    /// chrome of its own. The menu command and ⌥⌘P are the only ways in.
+    public func togglePerformancePanel() {
+        guard document != nil else { return }
+        if performancePanelVisible {
+            performancePanelVisible = false
+            return
+        }
+        pageOverviewVisible = false
+        rightPanelVisible = false
+        performancePanelVisible = true
     }
 
     /// Sets the panel width and remembers it at once (one discrete change, not a gesture). A live
@@ -12091,6 +12184,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         resetDocumentState()
         endPageEditSession(deleteFiles: true)
         document = nil
+        // The panel is document chrome: no document means no numbers and no sampling task.
+        performancePanelVisible = false
         isRestoringDocument = false
         if let closingDocumentURL { releaseEngineDocumentIfUnused(closingDocumentURL) }
         guard !tabs.isEmpty else { return }
@@ -12173,6 +12268,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             searchHits: searchHits,
             currentHitIndex: currentHitIndex,
             tileCache: tileCache,
+            tileCachePeakBaseline: tileCachePeakBaseline,
+            tileRequestCount: tileRequestCount,
+            tileRasterCount: tileRasterCount,
+            tileRasterMilliseconds: tileRasterMilliseconds,
+            pageRasterCount: pageRasterCount,
+            pageRasterMilliseconds: pageRasterMilliseconds,
             pagePreviews: pagePreviews,
             pagePreviewScales: pagePreviewScales,
             desiredPreviewScale: desiredPreviewScale,
@@ -12284,6 +12385,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         searchHits = state.searchHits
         currentHitIndex = state.currentHitIndex
         tileCache = state.tileCache
+        tileCachePeakBaseline = state.tileCachePeakBaseline
+        tileRequestCount = state.tileRequestCount
+        tileRasterCount = state.tileRasterCount
+        tileRasterMilliseconds = state.tileRasterMilliseconds
+        pageRasterCount = state.pageRasterCount
+        pageRasterMilliseconds = state.pageRasterMilliseconds
         pagePreviews = state.pagePreviews
         pagePreviewScales = state.pagePreviewScales
         desiredPreviewScale = state.desiredPreviewScale
@@ -14283,6 +14390,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func scheduleTile(_ key: TileKey, placement: PagePlacement) {
         guard !tilesInFlight.contains(key), !failedTiles.contains(key) else { return }
         pendingTiles.append((key, placement))
+        // One request per queued raster. Repeated viewport updates re-append the tile only after
+        // `pendingTiles` is rebuilt, so this counts real scheduler requests, not cache lookups.
+        tileRequestCount += 1
     }
 
     private func pumpTiles() {
@@ -14297,6 +14407,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         let epoch = renderEpoch
         let tileSize = tileSizePx
+        let started = DispatchTime.now().uptimeNanoseconds
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
 
@@ -14310,6 +14421,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
+                // Self-reported wall time of the engine call: it includes PDFium rasterization
+                // and the FFI copy, not the GPU upload (which happens on the next canvas update).
+                self.tileRasterCount += 1
+                self.tileRasterMilliseconds += Double(
+                    DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
 
                 let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
                 self.tileCache.insert(image, for: key)
@@ -14489,6 +14605,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pagePreviewInFlight = page
         let scale = desiredPreviewScale
         let epoch = renderEpoch
+        let started = DispatchTime.now().uptimeNanoseconds
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
             do {
@@ -14497,6 +14614,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if self.desiredPreviewPages.contains(page), scale >= (self.pagePreviewScales[page] ?? 0) {
                     self.pagePreviews[page] = image
                     self.pagePreviewScales[page] = scale
+                    // Self-report around the engine call, same caveat as the tile figure.
+                    self.pageRasterCount += 1
+                    self.pageRasterMilliseconds += Double(
+                        DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
                 }
             } catch {
                 guard epoch == self.renderEpoch else { return }

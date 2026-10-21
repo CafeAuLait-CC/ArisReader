@@ -65,6 +65,15 @@ public struct ReaderWindow: View {
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
                         .overlay(alignment: .trailing) { assistantDrawer }
+                        .overlay(alignment: .trailing) {
+                            // Conditional on purpose: the panel is off by default, and a closed
+                            // panel should not leave a zero-width drawer or its sampling task in
+                            // the hierarchy. The AI drawer keeps its always-present drawer so an
+                            // answer survives closing; the performance panel has no such state.
+                            if state.performancePanelVisible {
+                                performanceDrawer
+                            }
+                        }
                     // The scroll indicator is a real lane, not an overlay: the canvas viewport
                     // and the page column end before it, and the right panel starts after it.
                     if state.document != nil {
@@ -198,6 +207,27 @@ public struct ReaderWindow: View {
         .animation(panelAnimation, value: state.rightPanelVisible)
     }
 
+    /// The developer-facing performance panel, in the same right-hand drawer host as the
+    /// assistant. It shares the persisted right-panel width, so the two tenants cannot end up
+    /// with different geometry and the resize handle keeps working. Only one is open at a time
+    /// (`AppState.togglePerformancePanel`).
+    private var performanceDrawer: some View {
+        ReaderSidePanel(
+            isVisible: state.performancePanelVisible && state.document != nil,
+            contentWidth: state.rightPanelWidthPt,
+            progressOverride: state.transitionProgressOverride?.panel,
+            accessibilityLabel: "Performance panel",
+            resizeAccessibilityLabel: "Resize performance panel",
+            onResizeBegan: { state.beginRightPanelResize() },
+            onResize: { state.resizeRightPanel(to: $0) },
+            onResizeEnded: { state.endRightPanelResize(); state.commitRightPanelWidth() }
+        ) {
+            PerformancePanelView(controller: state.performancePanel) {
+                state.togglePerformancePanel()
+            }
+        }
+    }
+
     // MARK: - Canvas
 
     private var canvas: some View {
@@ -268,6 +298,7 @@ public struct ReaderWindow: View {
                 onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
+                performanceProbe: state.performanceProbe,
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
                 // The screen's physical density: 100% means actual size on it, so moving the
                 // window to another display keeps the percentage and changes the factor.

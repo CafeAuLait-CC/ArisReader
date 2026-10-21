@@ -112,6 +112,9 @@ public struct ReaderSidePanel<Content: View>: View {
     private let contentWidth: CGFloat
     private let progressOverride: Double?
     private let accessibilityLabel: String
+    /// The resize handle is part of the same host, so its spoken label names the tenant that is
+    /// actually open (the assistant by default; the performance panel overrides it).
+    private let resizeAccessibilityLabel: String
     private let onResizeBegan: () -> Void
     private let onResize: (CGFloat) -> Void
     private let onResizeEnded: () -> Void
@@ -125,6 +128,7 @@ public struct ReaderSidePanel<Content: View>: View {
         contentWidth: CGFloat,
         progressOverride: Double? = nil,
         accessibilityLabel: String = "Side panel",
+        resizeAccessibilityLabel: String = "Resize assistant panel",
         onResizeBegan: @escaping () -> Void = {},
         onResize: @escaping (CGFloat) -> Void,
         onResizeEnded: @escaping () -> Void = {},
@@ -134,6 +138,7 @@ public struct ReaderSidePanel<Content: View>: View {
         self.contentWidth = ReaderSidePanelMetrics.clampedContentWidth(contentWidth)
         self.progressOverride = progressOverride
         self.accessibilityLabel = accessibilityLabel
+        self.resizeAccessibilityLabel = resizeAccessibilityLabel
         self.onResizeBegan = onResizeBegan
         self.onResize = onResize
         self.onResizeEnded = onResizeEnded
@@ -209,7 +214,7 @@ public struct ReaderSidePanel<Content: View>: View {
                     }
             )
             .accessibilityElement()
-            .accessibilityLabel("Resize assistant panel")
+            .accessibilityLabel(resizeAccessibilityLabel)
             .accessibilityValue("\(Int(contentWidth.rounded())) points")
             .accessibilityAdjustableAction { direction in
                 onResizeBegan()

@@ -217,6 +217,13 @@ struct ReaderChecks {
             try await rightPanelChecks(root: root)
             return
         }
+        // The developer performance panel on its own
+        // (`LyraReaderChecks --check-performance-panel .`).
+        if CommandLine.arguments.contains("--check-performance-panel") {
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
+            try await performancePanelChecks(root: root)
+            return
+        }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`LyraReaderChecks --check-transitions .`).
         if CommandLine.arguments.contains("--check-transitions") {
@@ -673,6 +680,7 @@ struct ReaderChecks {
         try await hostedPreviewChecks(root: root)
         try await transitionChecks(root: root)
         try await rightPanelChecks(root: root)
+        try await performancePanelChecks(root: root)
         try await previewChecks(url: b)
         try await previewHistoryChecks(url: b)
         try await previewTransparencyChecks(root: root)
