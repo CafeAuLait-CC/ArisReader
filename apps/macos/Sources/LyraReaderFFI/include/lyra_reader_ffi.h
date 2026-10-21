@@ -163,6 +163,18 @@ int32_t lyra_reader_surface_draw_pages_with_appearance(uint64_t surface_id,
                                        double red, double green, double blue,
                                        uint8_t appearance, LyraReaderFrameStats *stats);
 
+/* Same contract, plus a normalized source rectangle per quad: uvs is count*4 floats of
+ * [u0, v0, u1, v1] with origin top-left. A torn page draws its two display segments from one
+ * uploaded page texture this way, so the page is rasterized once and the GPU clips it. */
+int32_t lyra_reader_surface_draw_pages_with_appearance_uv(uint64_t surface_id,
+                                       const uint64_t *texture_ids,
+                                       const float *rects,
+                                       const float *uvs,
+                                       const uint8_t *blend_modes,
+                                       size_t count,
+                                       double red, double green, double blue,
+                                       uint8_t appearance, LyraReaderFrameStats *stats);
+
 /* Releases the device and every surface. */
 int32_t lyra_reader_gpu_shutdown(void);
 

@@ -140,13 +140,43 @@ public struct PagePlacement: Equatable, Sendable {
     public let leftPt: CGFloat
     public let widthPt: CGFloat
     public let heightPt: CGFloat
+    /// Page-local Y (PDF points from the paper's top) this placement's top shows.
+    ///
+    /// A whole page has `sourceTopPt == 0` and `sourceHeightPt == heightPt`. A display segment
+    /// of a torn page carries the part of the page it shows: the bottom segment of a tear has
+    /// `sourceTopPt == tear.splitPt`, and its `heightPt` is only the segment's height. Every
+    /// page-local conversion (hit testing, annotations, the marquee) uses this offset instead
+    /// of assuming the placement's top is the page's top.
+    public let sourceTopPt: CGFloat
+    /// Page-local height this placement shows. Equal to `heightPt` for an untorn page.
+    public let sourceHeightPt: CGFloat
 
-    public init(index: Int, topPt: CGFloat, leftPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat) {
+    public init(
+        index: Int,
+        topPt: CGFloat,
+        leftPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat,
+        sourceTopPt: CGFloat = 0,
+        sourceHeightPt: CGFloat? = nil
+    ) {
         self.index = index
         self.topPt = topPt
         self.leftPt = leftPt
         self.widthPt = widthPt
         self.heightPt = heightPt
+        self.sourceTopPt = sourceTopPt
+        self.sourceHeightPt = sourceHeightPt ?? heightPt
+    }
+
+    /// The page-local Y range this placement shows.
+    public var sourceRangePt: Range<CGFloat> {
+        sourceTopPt..<(sourceTopPt + sourceHeightPt)
+    }
+
+    /// The placement's content-space rect.
+    public var contentRect: CGRect {
+        CGRect(x: leftPt, y: topPt, width: widthPt, height: heightPt)
     }
 }
 
@@ -603,6 +633,26 @@ public struct Figure: Sendable {
     public let yPt: CGFloat
     public let widthPt: CGFloat
     public let heightPt: CGFloat
+
+    public init(
+        kind: String,
+        label: String,
+        page: Int,
+        captionText: String,
+        xPt: CGFloat,
+        yPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat
+    ) {
+        self.kind = kind
+        self.label = label
+        self.page = page
+        self.captionText = captionText
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+    }
 
     /// `"Figure 3"` — how the caption is named in the text and in the panel's title bar.
     public var title: String { "\(kind) \(label)" }
@@ -1542,11 +1592,23 @@ public struct CanvasPage: Sendable {
     public let image: PageImage
     /// How this quad composites with what is already in the frame.
     public let blend: QuadBlend
+    /// Which part of `image` this quad shows, normalized (`0…1`, origin top-left).
+    ///
+    /// The whole texture by default. A torn page hands the canvas two quads with complementary
+    /// source rectangles over the **same** `PageImage` generation, so the bitmap is uploaded
+    /// once and the GPU clips it; there is no second rasteriser call and no copied bitmap.
+    public let source: CGRect
 
-    public init(placement: PagePlacement, image: PageImage, blend: QuadBlend = .normal) {
+    public init(
+        placement: PagePlacement,
+        image: PageImage,
+        blend: QuadBlend = .normal,
+        source: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    ) {
         self.placement = placement
         self.image = image
         self.blend = blend
+        self.source = source
     }
 }
 

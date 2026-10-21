@@ -738,6 +738,9 @@ public final class AppState: ObservableObject {
     @Published package private(set) var annotationPassages: [AnnotationPassage] = []
     @Published package private(set) var annotationSidebarPages: [AnnotationSidebarPage] = []
     private var textPagesInFlight: Set<Int> = []
+
+    /// A page's already-loaded text layer, for paths that plan page geometry synchronously.
+    func cachedTextPage(_ page: Int) -> TextPage? { textPages[page] }
     /// Page placements from the last layout pass (hit-testing needs them).
     var visiblePagePlacements: [PagePlacement] = []
 
@@ -1789,9 +1792,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         cancelScrollGlide()
-        let top = displayPageTop(page)
+        guard let target = contentY(forPageLocalY: region.minY, onPage: page) else { gotoPage(page); return }
         let margin: CGFloat = 24
-        scrollYPt = clampedScrollOffset(top + region.minY - margin)
+        scrollYPt = clampedScrollOffset(target - margin)
         reloadVisiblePages()
         schedulePositionSave()
         statusMessage = "Opened page \(page + 1) at the referenced position"
@@ -2465,6 +2468,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var captionMentionsInFlight: Set<Int> = []
     @Published public private(set) var figures: [Figure] = []
     private var figuresLoadCompleted = false
+
+    /// The in-flight caption-index load, so a region tear can wait (briefly) for the boxes it
+    /// must not cut through.
+    private var figuresLoadTask: Task<Void, Never>?
     /// Recognised document metadata, with the source of every field.
     @Published public private(set) var metadata: DocumentMetadata?
     /// The editable values and the BibTeX generated from them. This is the panel's single
@@ -3348,6 +3355,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         outlineLoadCompleted = false
         referencesLoadCompleted = false
         figuresLoadCompleted = false
+        figuresLoadTask = nil
         metadataLoadCompleted = false
         documentAnnotationsLoadCompleted = false
         isRestoringDocument = false
@@ -5134,9 +5142,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             resizeStartPagePoint = nil
             resizeHandle = nil
         }
-        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        guard let hit = pagePoint(atContentPoint: point), hit.page == original.page
         else { return }
-        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        let current = hit.point
         guard let finalRect = resizedTextBox(
             original, handle: handle,
             delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
@@ -5170,13 +5178,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The canvas converts a view point to content points once, at the event boundary, the same
     /// way text selection does; this subtraction is therefore zoom-independent by construction.
+    ///
+    /// A torn page is two display segments, so the subtraction is piecewise: a point above the
+    /// split maps to the page's own Y, a point in the bottom segment subtracts the card's gap as
+    /// well, and a point in the gap belongs to no page.
     public func pagePoint(atContentPoint point: CGPoint) -> (page: Int, point: CGPoint)? {
-        for placement in visiblePagePlacements {
-            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
-                              width: placement.widthPt, height: placement.heightPt)
+        for segment in canvasPageSegments {
+            let rect = CGRect(x: segment.leftPt, y: segment.topPt,
+                              width: segment.widthPt, height: segment.heightPt)
             guard rect.contains(point) else { continue }
-            return (placement.index, CGPoint(x: point.x - placement.leftPt,
-                                             y: point.y - placement.topPt))
+            return (
+                segment.index,
+                CGPoint(x: point.x - segment.leftPt,
+                        y: point.y - segment.topPt + segment.sourceTopPt)
+            )
         }
         return nil
     }
@@ -5829,15 +5844,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let base = eraserGestureBase else { return }
         let zoom = max(zoomFactor, 0.01)
         var changed = false
-        for placement in visiblePagePlacements {
+        for placement in canvasPageSegments {
             let rect = CGRect(x: placement.leftPt, y: placement.topPt,
                               width: placement.widthPt, height: placement.heightPt)
             guard let clipped = AnnotationGeometry.clippedSegment(from: start, to: end, in: rect)
             else { continue }
+            // A torn page erases in page-local space, not content space: the pointer segment is
+            // clipped to each display segment (so it never crosses the card) and shifted back by
+            // the segment's own page-local offset.
             let localStart = CGPoint(x: clipped.start.x - placement.leftPt,
-                                     y: clipped.start.y - placement.topPt)
+                                     y: clipped.start.y - placement.topPt + placement.sourceTopPt)
             let localEnd = CGPoint(x: clipped.end.x - placement.leftPt,
-                                   y: clipped.end.y - placement.topPt)
+                                   y: clipped.end.y - placement.topPt + placement.sourceTopPt)
             for annotation in base
             where annotation.kind == .ink && annotation.page == placement.index {
                 if eraserGestureRefusedRecordIDs.contains(annotation.id) { continue }
@@ -6308,8 +6326,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         let page = min(max(currentPage - 1, 0), document.pageCount - 1)
-        let top = displayPageTop(page)
-        let yPt = max(0, scrollYPt - top)
+        // A bookmark stores page-local Y. In a tear's gap the viewport top names the tear, so
+        // the bookmark lands at the split rather than jumping a card-height away.
+        let yPt = pageLocalY(forContentY: scrollYPt, onPage: page)
+            ?? pageTear(forPage: page)?.splitPt
+            ?? max(0, scrollYPt - displayPageTop(page))
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
 
@@ -6384,8 +6405,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func jump(to bookmark: Bookmark) {
         guard let document, bookmark.page >= 0, bookmark.page < document.pageCount else { return }
         cancelScrollGlide()
-        let top = displayPageTop(bookmark.page)
-        scrollYPt = clampedScrollOffset(top + bookmark.yPt)
+        guard let target = contentY(forPageLocalY: bookmark.yPt, onPage: bookmark.page) else { return }
+        scrollYPt = clampedScrollOffset(target)
         reloadVisiblePages()
         schedulePositionSave()
         statusMessage = "Jumped to “\(bookmark.title)”"
@@ -6790,11 +6811,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // sidebar highlights the row it was asked to show, and a click on the annotation's own
         // glyph on the page comes here too.
         selectedDocumentAnnotationID = annotation.id
-        let top = displayPageTop(annotation.page)
         let box = annotation.boxes.first
         // Put the annotation a third of the way down the viewport rather than at its very top:
         // a highlight is easier to recognise with the text above it visible.
-        let target = top + (box?.yPt ?? 0) - viewportHeightContentPt / 3
+        let target = (contentY(forPageLocalY: box?.yPt ?? 0, onPage: annotation.page) ?? 0)
+            - viewportHeightContentPt / 3
         scrollYPt = max(0, min(target, max(0, contentHeightPt - viewportHeightContentPt)))
 
         selection = nil
@@ -9049,6 +9070,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// File > Print: a print operation over a view that renders one page at print resolution
     /// when the print system asks for it.
     ///
+    /// The view the print operation paginates, built from the document's own pages.
+    ///
+    /// Printing is independent of the display layout on purpose: a torn page's gap, its two
+    /// segments and its card are display-only, so the printer is handed one page per document
+    /// page at the page's paper size. This accessor exists so the checks can render the exact
+    /// view `Print` would and compare it with a torn state's output.
+    package func makePrintView(texts: [Int: TextPage]? = nil) -> ReaderPrintView? {
+        guard let document, document.pageCount > 0 else { return nil }
+        let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
+            ? document.firstPageSize
+            : CGSize(width: 612, height: 792)
+        let engine = self.engine
+        let layers = texts ?? textPages
+        return ReaderPrintView(
+            pageCount: document.pageCount,
+            pageSizePt: pageSize,
+            annotations: annotations.map(PrintAnnotation.init),
+            pageImage: { page, scale in
+                engine.renderPageForPrint(page, scale: scale)
+            },
+            textPage: { layers[$0] }
+        )
+    }
+
     /// The page range and the copy count are the print panel's own, because the panel is the
     /// system's; the view supplies the page count through `knowsPageRange`. Only the pages the
     /// panel selected are rendered, one at a time, by [`ReaderPrintView`].
@@ -9057,7 +9102,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before printing."
             return
         }
-        let pageCount = document.pageCount
         let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
             ? document.firstPageSize
             : CGSize(width: 612, height: 792)
@@ -9074,15 +9118,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
             guard let self else { return }
-            let view = ReaderPrintView(
-                pageCount: pageCount,
-                pageSizePt: pageSize,
-                annotations: snapshot,
-                pageImage: { page, scale in
-                    engine.renderPageForPrint(page, scale: scale)
-                },
-                textPage: { texts[$0] }
-            )
+            guard let view = self.makePrintView(texts: texts) else {
+                self.lastError = "The document could not be prepared for printing."
+                return
+            }
             let info = NSPrintInfo.shared.copy() as! NSPrintInfo
             info.paperSize = pageSize
             info.topMargin = 0
@@ -10750,9 +10789,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             moveOriginalAnnotation = nil
             moveStartPagePoint = nil
         }
-        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        guard let hit = pagePoint(atContentPoint: point), hit.page == original.page
         else { return }
-        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        let current = hit.point
         let dx = current.x - start.x
         let dy = current.y - start.y
         if wasClick || hypot(dx, dy) < 0.5 {
@@ -10794,17 +10833,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func openInlineNote(at point: CGPoint) -> Bool {
-        for marker in ownInlineNoteMarkers.reversed() {
-            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard marker.rect.contains(local), annotations.indices.contains(marker.annotationIndex) else { continue }
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        for marker in ownInlineNoteMarkers.reversed() where marker.page == hit.page {
+            guard marker.rect.contains(hit.point),
+                  annotations.indices.contains(marker.annotationIndex) else { continue }
             beginEditingAnnotation(annotations[marker.annotationIndex].id)
             return true
         }
-        for marker in inlineNoteMarkers.reversed() {
-            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard marker.rect.contains(local) else { continue }
+        for marker in inlineNoteMarkers.reversed() where marker.page == hit.page {
+            guard marker.rect.contains(hit.point) else { continue }
             let annotation = documentAnnotations[marker.annotationIndex]
             showDocumentNote(annotation)
             return true
@@ -10815,19 +10852,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Expands a fixed-size paper beside the clicked glyph without moving the document.
     @discardableResult
     public func openDocumentNote(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-
+        if let hit = pagePoint(atContentPoint: point) {
+            let local = hit.point
             // Backwards, so the note drawn last — the one the reader can see on top — wins.
             for annotation in documentAnnotations.reversed()
-            where annotation.page == placement.index && annotation.visible {
+            where annotation.page == hit.page && annotation.visible {
                 guard annotation.drawing == .noteIcon || annotation.drawing == .freeText,
                       let box = annotation.boxes.first
                 else { continue }
@@ -10886,16 +10915,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !figuresLoadCompleted else { return }
         figuresLoadCompleted = true
         let epoch = documentEpoch
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch else { return }
             let found = (try? await self.engine.figures()) ?? []
             guard epoch == self.documentEpoch else { return }
             self.figures = found
+            self.figuresLoadTask = nil
             FileHandle.standardError.write(
                 Data("lyra-reader-figures: \(self.figures.count) caption(s)\n".utf8)
             )
         }
+        figuresLoadTask = task
+    }
+
+    /// Waits for the caption index a tear must consult.
+    ///
+    /// The index starts loading when the document opens and is cached by the engine, so this is
+    /// normally already done by the time a reader selects a region and returns immediately. If
+    /// the selection beats it, the card waits for the one scan instead of cutting through a
+    /// figure because the answer had not arrived. The scan always completes (a failure yields an
+    /// empty list), so this cannot hang on a broken document.
+    func awaitFiguresForPlacement() async {
+        await figuresLoadTask?.value
     }
 
     /// Loads the annotations the document itself carries (once per open document).
@@ -11150,31 +11192,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// not on a citation, or when the citation names nothing we can resolve.
     @discardableResult
     public func openCitation(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard let citations = citationsByPage[placement.index] else {
-                // The page's citations are still being fetched — their first read runs the
-                // document-wide reference scan, queued behind this page's rasters and text layer,
-                // so a click can easily beat them. The pointer has already said which page it
-                // meant: resolve when the data lands instead of dropping the click. Nothing is
-                // known synchronously, so report "not handled" and let the panel appear a moment
-                // later, exactly as the figure-mention path does.
-                resolveCitation(on: placement, at: local)
-                return false
-            }
-            guard let citation = citation(at: local, in: citations) else { continue }
-            previewCitation(citation, on: placement)
-            return true
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        let placement = visiblePagePlacements.first { $0.index == hit.page }
+            ?? PagePlacement(index: hit.page, topPt: displayPageTop(hit.page), leftPt: 0,
+                             widthPt: 0, heightPt: 0)
+        let local = hit.point
+        guard let citations = citationsByPage[placement.index] else {
+            // The page's citations are still being fetched — their first read runs the
+            // document-wide reference scan, queued behind this page's rasters and text layer,
+            // so a click can easily beat them. The pointer has already said which page it
+            // meant: resolve when the data lands instead of dropping the click. Nothing is
+            // known synchronously, so report "not handled" and let the panel appear a moment
+            // later, exactly as the figure-mention path does.
+            resolveCitation(on: placement, at: local)
+            return false
         }
-        return false
+        guard let citation = citation(at: local, in: citations) else { return false }
+        previewCitation(citation, on: placement)
+        return true
     }
 
     /// The citation whose box contains a page-local point, if any.
@@ -11292,34 +11327,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// moment later even though this call could not know it yet.
     @discardableResult
     public func openFigureMention(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard let mentions = captionMentionsByPage[placement.index] else {
-                // The page's mentions are still being fetched — their first read is queued
-                // behind the document-wide scans, so a click can beat them. The pointer has
-                // already said which page it meant: resolve when the data lands instead of
-                // dropping the click. Nothing is known synchronously, so report "not handled"
-                // and let the panel appear a moment later.
-                resolveFigureMention(on: placement.index, at: local)
-                return false
-            }
-            guard let mention = mention(at: local, in: mentions) else { continue }
-            if figures.isEmpty {
-                resolveFigureMention(on: placement.index, at: local)
-                return false
-            }
-            return openFigure(mention, from: placement.index,
-                              anchor: anchor(of: mention, on: placement))
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        let placement = visiblePagePlacements.first { $0.index == hit.page }
+            ?? PagePlacement(index: hit.page, topPt: displayPageTop(hit.page), leftPt: 0,
+                             widthPt: 0, heightPt: 0)
+        let local = hit.point
+        guard let mentions = captionMentionsByPage[placement.index] else {
+            // The page's mentions are still being fetched — their first read is queued
+            // behind the document-wide scans, so a click can beat them. The pointer has
+            // already said which page it meant: resolve when the data lands instead of
+            // dropping the click. Nothing is known synchronously, so report "not handled"
+            // and let the panel appear a moment later.
+            resolveFigureMention(on: placement.index, at: local)
+            return false
         }
-        return false
+        guard let mention = mention(at: local, in: mentions) else { return false }
+        if figures.isEmpty {
+            resolveFigureMention(on: placement.index, at: local)
+            return false
+        }
+        return openFigure(mention, from: placement.index,
+                          anchor: anchor(of: mention, on: placement))
     }
 
     /// A caption mention's box in canvas view space, which is what the panel opens next to.
@@ -11425,7 +11453,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// have arrived, a right-click on that page has no link to offer. That is the same latency
     /// a click already has, rather than a second source of truth.
     private func linkHit(at point: CGPoint) -> (link: DocumentLink, placement: PagePlacement)? {
-        for placement in visiblePagePlacements {
+        for placement in canvasPageSegments {
             let pageRect = CGRect(
                 x: placement.leftPt,
                 y: placement.topPt,
@@ -11436,7 +11464,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 continue
             }
 
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            let local = CGPoint(
+                x: point.x - placement.leftPt,
+                y: point.y - placement.topPt + placement.sourceTopPt
+            )
             for link in links {
                 let box = CGRect(x: link.xPt, y: link.yPt, width: link.widthPt, height: link.heightPt)
                 guard box.contains(local) else { continue }
@@ -11461,14 +11492,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// reader's right-click has already said which one they mean. Gaps between pages answer `nil`,
     /// so a right-click in the gap offers no page operation at all.
     public func pageIndex(at point: CGPoint) -> Int? {
-        visiblePagePlacements.first { placement in
-            CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            ).contains(point)
-        }?.index
+        pagePoint(atContentPoint: point)?.page
     }
 
     /// Follows the link under a content-space point, if there is one.
@@ -11494,7 +11518,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // preview must not cancel its own lookup; panel resizing has a separate raster epoch.
             previewLookupEpoch &+= 1
             previewEpoch &+= 1
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            let local = CGPoint(
+                x: point.x - placement.leftPt,
+                y: point.y - placement.topPt + placement.sourceTopPt
+            )
             if let citations = citationsByPage[placement.index],
                let citation = citation(at: local, in: citations) {
                 previewCitation(citation, on: placement)
@@ -12325,8 +12352,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         cancelScrollGlide()
-        let top = displayPageTop(max(0, page))
-        scrollYPt = clampedScrollOffset(top + CGFloat(y))
+        guard let target = contentY(forPageLocalY: CGFloat(y), onPage: max(0, page)) else {
+            gotoPage(page)
+            return
+        }
+        scrollYPt = clampedScrollOffset(target)
         reloadVisiblePages()
         schedulePositionSave()
         statusMessage = "Jumped to “\(entry.title)”"
@@ -12686,6 +12716,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         loadCitations()
         wantedTiles = wanted
         evictTiles()
+        // One place, on the final list: every page raster, tile, selection tint, annotation quad
+        // and note glyph on a torn page is clipped into its two display segments here. No
+        // rasteriser call and no bitmap copy is added — the same textures are drawn twice with
+        // complementary source rectangles.
+        pages = applyPageTears(to: pages)
         canvasPages = pages
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
         currentPage = regionCurrentPage(at: scrollYPt) + 1
@@ -12776,7 +12811,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// rectangle; exposing the decision makes the facing-layout hit test checkable directly
     /// (a point in the right-hand page must name that page's index, not its partner's).
     public func pagePlacement(at point: CGPoint) -> PagePlacement? {
-        visiblePagePlacements.first { placement in
+        canvasPageSegments.first { placement in
             CGRect(
                 x: placement.leftPt,
                 y: placement.topPt,
@@ -12791,7 +12826,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The click paths use this to hand the floating panel the rectangle the reader actually
     /// clicked, transformed exactly the way the canvas transforms it while drawing.
     public func viewRect(local region: CGRect, on placement: PagePlacement) -> CGRect {
-        CanvasGeometry.viewRect(
+        // A torn page needs the piecewise map. The placement may be the page or one of its
+        // segments; the page index is the stable thing, so ask for the page's segments.
+        if pageTear(forPage: placement.index) != nil {
+            return viewRect(local: region, onPage: placement.index)
+                ?? CanvasGeometry.viewRect(
+                    pageTopPt: placement.topPt, pageLeftPt: placement.leftPt, region: region,
+                    scrollYPt: scrollYPt, zoom: zoomFactor,
+                    contentOffsetX: CanvasGeometry.contentOffsetX(
+                        viewportWidthPt: viewportSizePt.width,
+                        contentWidthPt: contentWidthPt,
+                        zoom: zoomFactor
+                    )
+                )
+        }
+        return CanvasGeometry.viewRect(
             pageTopPt: placement.topPt,
             pageLeftPt: placement.leftPt,
             region: region,
@@ -12892,8 +12941,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         return pages.compactMap { placement in
             let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
-            let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
-            let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
+            // A torn page's display extends past its paper by the gap, and its paper is split:
+            // convert the wanted content band back to page-local Y before choosing rows. Without
+            // this, a viewport scrolled into the bottom segment (which sits below the paper's
+            // nominal bottom) would name row indices past the page and schedule nothing.
+            guard let localBounds = pageLocalBand(top: top, bottom: bottom, for: placement)
+            else { return nil }
+            let firstRow = max(0, Int(floor(localBounds.lowerBound / tilePt)))
+            let lastRow = min(rows - 1, Int(floor((localBounds.upperBound - 0.001) / tilePt)))
             guard firstRow <= lastRow else { return nil }
 
             let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
@@ -12986,7 +13041,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func refreshSelectionOverlay() {
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
-        canvasPages = pages
+        canvasPages = applyPageTears(to: pages)
     }
 
     /// Adds continuous line rectangles for selection and annotations.
@@ -13791,8 +13846,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if let original = resizeOriginalAnnotation, let handle = resizeHandle,
            let start = resizeStartPagePoint,
-           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
-            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+           let hit = pagePoint(atContentPoint: point), hit.page == original.page {
+            let current = hit.point
             guard let rect = resizedTextBox(
                 original, handle: handle,
                 delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
@@ -13807,8 +13862,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if let original = moveOriginalAnnotation,
            let start = moveStartPagePoint,
-           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
-            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+           let hit = pagePoint(atContentPoint: point), hit.page == original.page {
+            let current = hit.point
             let moved = original.translated(by: current.x - start.x, dy: current.y - start.y)
             guard moved.hasValidGeometry,
                   let index = annotations.firstIndex(where: { $0.id == original.id }) else { return }
@@ -13848,11 +13903,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether a content point is inside the page a text selection belongs to.
     private func isOnSelectionPage(_ point: CGPoint, page: Int) -> Bool {
-        visiblePagePlacements.contains { placement in
-            placement.index == page
-                && CGRect(x: placement.leftPt, y: placement.topPt,
-                          width: placement.widthPt, height: placement.heightPt).contains(point)
-        }
+        pagePoint(atContentPoint: point)?.page == page
     }
 
     /// Drops a text selection that a markup drag is still extending, without committing it.
@@ -13898,27 +13949,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Hit-test the nearest visual line, including inferred whitespace, before its characters.
     private func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> (page: Int, index: Int)? {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point), let textPage = textPages[placement.index] else {
-                continue
-            }
-
-            let local = CGPoint(
-                x: point.x - placement.leftPt,
-                y: point.y - placement.topPt
-            )
-            if let index = textPage.characterIndex(at: local, extendingSelection: extendingSelection) {
-                return (placement.index, index)
-            }
-            return nil
-        }
-        return nil
+        guard let hit = pagePoint(atContentPoint: point),
+              let textPage = textPages[hit.page] else { return nil }
+        guard let index = textPage.characterIndex(
+            at: hit.point, extendingSelection: extendingSelection
+        ) else { return nil }
+        return (hit.page, index)
     }
 
     /// Rasterizes one tile in the background and folds it into the cache.

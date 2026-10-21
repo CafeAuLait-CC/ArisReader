@@ -39,11 +39,24 @@ public final class AIRegionMarqueeOverlayView: NSView {
 
     public func show(rect: CGRect?) {
         guard let rect, rect.width > 0.5, rect.height > 0.5 else {
+            show(rects: [])
+            return
+        }
+        show(rects: [rect])
+    }
+
+    /// Draws one marquee per display segment. A drag across a torn page is still one page-local
+    /// rectangle; it is drawn as the top piece and the bottom piece, with the card's gap between
+    /// them, rather than as one band over the card.
+    public func show(rects: [CGRect]) {
+        let visible = rects.filter { $0.width > 0.5 && $0.height > 0.5 }
+        guard !visible.isEmpty else {
             fill.path = nil
             shape.path = nil
             return
         }
-        let path = CGPath(rect: rect, transform: nil)
+        let path = CGMutablePath()
+        for rect in visible { path.addRect(rect) }
         fill.path = path
         shape.path = path
     }
@@ -51,5 +64,9 @@ public final class AIRegionMarqueeOverlayView: NSView {
     /// A separate call so the outline can be redrawn without touching the fill during a drag.
     public func update(_ rect: CGRect?) {
         show(rect: rect)
+    }
+
+    public func update(rects: [CGRect]) {
+        show(rects: rects)
     }
 }

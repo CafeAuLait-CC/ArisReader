@@ -295,6 +295,11 @@ enum AIRegionDates {
 /// content points.
 @MainActor
 public final class AIRegionCard: ObservableObject, Identifiable {
+    /// The height estimate a new card starts with, in view points. The placement rule uses it to
+    /// decide whether a tear can hold the card before the real height is measured; the measured
+    /// height then drives the gap exactly.
+    public static let initialHeightViewPt: CGFloat = 240
+
     public let id: UUID
     public let documentKey: String
     public let attachment: AIRegionAttachment
@@ -305,14 +310,24 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     @Published public var question: String = ""
     /// Measured height of the whole card in view points. It starts at a small estimate and is
     /// corrected after the first layout pass; the gap follows it exactly.
-    @Published public private(set) var heightViewPt: CGFloat = 240
+    @Published public private(set) var heightViewPt: CGFloat = AIRegionCard.initialHeightViewPt
+    /// Page-local Y of the tear this card opened, or nil when it sits after the page's row.
+    ///
+    /// The tear belongs to the card: when the card closes, the split disappears with the gap.
+    /// It is fixed at creation (and can fall back to the page foot if the measured card turns out
+    /// to be taller than the space below the selection), never re-chosen on a scroll or a zoom.
+    public internal(set) var tearSplitPt: CGFloat?
+    /// Why the inside-page tear was refused, when it was. The card's status line reports it.
+    public internal(set) var tearFallbackReason: String?
 
     public init(
         id: UUID = UUID(),
         documentKey: String,
         attachment: AIRegionAttachment,
         assistant: AIAssistantModel,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        tearSplitPt: CGFloat? = nil,
+        tearFallbackReason: String? = nil
     ) {
         self.id = id
         self.documentKey = documentKey
@@ -320,6 +335,8 @@ public final class AIRegionCard: ObservableObject, Identifiable {
         self.assistant = assistant
         self.createdAt = createdAt
         self.question = ""
+        self.tearSplitPt = tearSplitPt
+        self.tearFallbackReason = tearFallbackReason
     }
 
     /// The question the current answer belongs to.

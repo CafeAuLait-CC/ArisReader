@@ -12,33 +12,30 @@ import QuartzCore
 ///
 /// * A stroke is a vector path. Rasterising one into a page-sized bitmap would be re-done on
 ///   every zoom step and would show the same staircase at every scale; a `CAShapeLayer` draws
-///   its path once in content coordinates and the compositor scales it.
+///   its path once in page-local coordinates and the segment containers clip it.
 /// * The live pen has to be updated from inside the pointer event. Calling AppState for every
 ///   sample and waiting for a SwiftUI pass adds a run-loop turn between the pointer and the ink;
-///   the drag here goes straight into `liveLayer.path` and the display composites it on the next
+///   the drag here goes straight into the layer tree and the display composites it on the next
 ///   frame, with no model write until mouse-up.
 ///
-/// Coordinates: every path this view stores is in **content points** (page placement offset
-/// applied, not zoomed). The container layer's affine transform converts content points to the
-/// canvas' view points, so scrolling and zooming move the existing paths instead of rebuilding
-/// them.
+/// Coordinates: every path this view stores is in **page-local points**; a segment container
+/// translates it to content points and clips it to the display segment it belongs to. A torn
+/// page therefore draws a stroke that crosses the tear as two clipped pieces, one above the card
+/// and one below it, without changing the mark's page geometry.
 final class AnnotationOverlayView: NSView {
     private let container = CALayer()
     private let marksLayer = CALayer()
     private let redactionsLayer = CALayer()
-    private let selectionLayer = CAShapeLayer()
-    /// The same halo language as `selectionLayer`, drawn for the ink stroke an armed eraser is
-    /// over. A separate layer so a selected mark and the eraser's target can both be visible.
-    private let eraserTargetLayer = CAShapeLayer()
-    private let liveLayer = CAShapeLayer()
+    private let liveLayer = CALayer()
+    /// Every layer this view added below the three content layers, so a rebuild removes exactly
+    /// its own output and nothing else.
     private var markLayers: [CALayer] = []
 
-    /// Content points → page placement offset; the canvas supplies these with each model update.
-    private var frames: [Int: PagePlacement] = [:]
+    /// The page's display segments. An untorn page has one; a torn page has two, each with the
+    /// page-local range it shows (`sourceTopPt`/`sourceHeightPt`).
     private var framesList: [PagePlacement] = []
     private var marks: [CanvasAnnotationMark] = []
     private var redactionMarks: [CanvasRedactionMark] = []
-    private var redactionFrames: [Int: PagePlacement] = [:]
     private var zoom: CGFloat = 1
     private var scrollYPt: CGFloat = 0
     private var contentWidthPt: CGFloat = 0
@@ -61,21 +58,10 @@ final class AnnotationOverlayView: NSView {
         layer?.addSublayer(container)
         container.addSublayer(marksLayer)
         container.addSublayer(redactionsLayer)
-        container.addSublayer(selectionLayer)
-        container.addSublayer(eraserTargetLayer)
         container.addSublayer(liveLayer)
         container.anchorPoint = CGPoint(x: 0, y: 0)
         container.position = .zero
         container.bounds = CGRect(origin: .zero, size: frameRect.size)
-        selectionLayer.fillColor = nil
-        selectionLayer.lineDashPattern = [NSNumber(value: 4), NSNumber(value: 3)]
-        selectionLayer.lineCap = .butt
-        eraserTargetLayer.fillColor = nil
-        eraserTargetLayer.lineDashPattern = [NSNumber(value: 4), NSNumber(value: 3)]
-        eraserTargetLayer.lineCap = .butt
-        liveLayer.fillColor = nil
-        liveLayer.lineJoin = .round
-        liveLayer.lineCap = .round
     }
 
     @available(*, unavailable)
@@ -105,7 +91,6 @@ final class AnnotationOverlayView: NSView {
     ) {
         let framesChanged = frames != framesList
         self.framesList = frames
-        self.frames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
         self.zoom = zoom
         self.scrollYPt = scrollYPt
         self.contentWidthPt = contentWidthPt
@@ -117,9 +102,9 @@ final class AnnotationOverlayView: NSView {
         if marks != self.marks || framesChanged || appearanceChanged {
             self.marks = marks
             rebuildMarkLayers()
+            renderLive()
         }
         if framesChanged {
-            self.redactionFrames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
             rebuildRedactionLayers()
         }
         updateTransform()
@@ -132,33 +117,110 @@ final class AnnotationOverlayView: NSView {
     /// mistaken for the finished black mark.
     func updateRedactions(_ marks: [CanvasRedactionMark], frames: [PagePlacement]) {
         let framesChanged = frames != framesList
-        self.redactionFrames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
+        self.framesList = frames
         guard marks != redactionMarks || framesChanged else { return }
         self.redactionMarks = marks
         rebuildRedactionLayers()
     }
 
-    private func rebuildRedactionLayers() {
-        for layer in redactionsLayer.sublayers ?? [] {
-            layer.removeFromSuperlayer()
-        }
-        for mark in redactionMarks {
-            guard let frame = redactionFrames[mark.page] else { continue }
-            let content = CGRect(
-                x: frame.leftPt + mark.rect.minX,
-                y: frame.topPt + mark.rect.minY,
-                width: mark.rect.width,
-                height: mark.rect.height
+    // MARK: - Page-local ↔ content
+
+    private func segments(for page: Int) -> [PagePlacement] {
+        framesList.filter { $0.index == page }
+    }
+
+    /// The page-local point under a content point, or nil when the point is in a tear's gap.
+    private func pageLocalPoint(atContent point: CGPoint, page: Int) -> CGPoint? {
+        for frame in segments(for: page) {
+            let rect = CGRect(x: frame.leftPt, y: frame.topPt,
+                              width: frame.widthPt, height: frame.heightPt)
+            guard rect.contains(point) else { continue }
+            return CGPoint(
+                x: point.x - frame.leftPt,
+                y: point.y - frame.topPt + frame.sourceTopPt
             )
-            let fill = CAShapeLayer()
-            fill.path = CGPath(rect: content, transform: nil)
-            fill.fillColor = NSColor(calibratedWhite: 0.08, alpha: 0.55).cgColor
-            fill.strokeColor = NSColor.systemRed.withAlphaComponent(0.9).cgColor
-            fill.lineWidth = 1.2 / max(zoom, 0.01)
-            fill.lineDashPattern = [4, 3]
-            redactionsLayer.addSublayer(fill)
+        }
+        return nil
+    }
+
+    /// A page-local point in content space; nil only when the page-local Y is outside the
+    /// page's displayed range.
+    private func contentPoint(forPageLocal local: CGPoint, page: Int) -> CGPoint? {
+        for frame in segments(for: page)
+        where local.y >= frame.sourceTopPt - 0.001
+            && local.y <= frame.sourceTopPt + frame.sourceHeightPt + 0.001 {
+            return CGPoint(x: frame.leftPt + local.x,
+                           y: frame.topPt + local.y - frame.sourceTopPt)
+        }
+        return nil
+    }
+
+    /// One clipping container per display segment, each holding a shape built from the same
+    /// page-local path. The container's bounds are the segment's content rect, so the paper cut
+    /// is exactly where the card's gap is.
+    private func clippedContentLayers(
+        for localPath: CGPath,
+        page: Int,
+        stroke: NSColor?,
+        fill: NSColor?,
+        lineWidth: CGFloat,
+        dashed: Bool = false
+    ) -> [CALayer] {
+        var result: [CALayer] = []
+        for frame in segments(for: page) {
+            let rect = CGRect(x: frame.leftPt, y: frame.topPt,
+                              width: frame.widthPt, height: frame.heightPt)
+            guard rect.width > 0.1, rect.height > 0.1 else { continue }
+            let clip = CALayer()
+            clip.frame = rect
+            clip.masksToBounds = true
+            clip.isGeometryFlipped = true
+            clip.contentsScale = window?.backingScaleFactor ?? 2
+            let shape = CAShapeLayer()
+            shape.frame = CGRect(origin: .zero, size: rect.size)
+            var translate = CGAffineTransform(translationX: 0, y: -frame.sourceTopPt)
+            shape.path = localPath.copy(using: &translate)
+            shape.strokeColor = stroke?.cgColor
+            shape.fillColor = fill?.cgColor
+            shape.lineWidth = lineWidth
+            shape.lineJoin = .round
+            shape.lineCap = .round
+            if dashed {
+                let unit = 1 / max(zoom, 0.01)
+                shape.lineDashPattern = [NSNumber(value: 4 * unit), NSNumber(value: 3 * unit)]
+            }
+            shape.contentsScale = window?.backingScaleFactor ?? 2
+            clip.addSublayer(shape)
+            result.append(clip)
+        }
+        return result
+    }
+
+    // MARK: - Redactions
+
+    private func rebuildRedactionLayers() {
+        redactionsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        for mark in redactionMarks {
+            let rect = CGRect(x: mark.rect.minX, y: mark.rect.minY,
+                              width: mark.rect.width, height: mark.rect.height)
+            let path = CGPath(rect: rect, transform: nil)
+            let layers = clippedContentLayers(
+                for: path,
+                page: mark.page,
+                stroke: NSColor.systemRed.withAlphaComponent(0.9),
+                fill: NSColor(calibratedWhite: 0.08, alpha: 0.55),
+                lineWidth: 1.2 / max(zoom, 0.01)
+            )
+            for layer in layers {
+                if let shape = layer.sublayers?.first as? CAShapeLayer {
+                    shape.lineDashPattern = [4, 3]
+                }
+                redactionsLayer.addSublayer(layer)
+            }
         }
     }
+
+    // MARK: - Hit testing
 
     /// The page-local points of the mark under a content point, or `nil`.
     ///
@@ -168,91 +230,68 @@ final class AnnotationOverlayView: NSView {
     func hitTestMark(atContentPoint point: CGPoint, toleranceViewPt: CGFloat) -> CanvasAnnotationMark? {
         let tolerance = toleranceViewPt / max(zoom, 0.01)
         for mark in marks.reversed() where mark.isEditable {
-            guard let frame = frames[mark.page] else { continue }
-            let local = CGPoint(x: point.x - frame.leftPt, y: point.y - frame.topPt)
+            guard let local = pageLocalPoint(atContent: point, page: mark.page) else { continue }
             if AnnotationGeometry.hitTest(mark, at: local, tolerance: tolerance) { return mark }
         }
         return nil
     }
 
-    /// Starts a live preview for a gesture in `page`.
+    // MARK: - Live gesture
+
     func beginLiveStroke(kind: AppState.Annotation.Kind, page: Int, at point: CGPoint) {
-        guard let frame = frames[page] else { return }
-        let content = CGPoint(x: frame.leftPt + point.x, y: frame.topPt + point.y)
-        liveLayer.lineWidth = max(strokeWidth, 0.1)
-        liveLayer.strokeColor = strokeColor.cgColor
-        liveLayer.fillColor = kind == .arrow ? strokeColor.cgColor : nil
-        liveLayer.lineJoin = .round
-        liveLayer.lineCap = .round
-        liveLayer.isHidden = false
-        switch kind {
-        case .line, .arrow:
-            liveLayer.path = nil
-            liveStart = content
-            liveEnd = content
-        case .ink:
-            liveLayer.path = AnnotationGeometry.strokePath([content])
-            livePoints = [content]
-        case .square, .circle:
-            liveLayer.path = nil
-            liveStart = content
-            liveEnd = content
-        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
-            break
-        }
+        guard !segments(for: page).isEmpty else { return }
         liveKind = kind
         livePage = page
+        liveStart = point
+        liveEnd = point
+        livePoints = kind == .ink ? [point] : []
+        renderLive()
     }
 
+    /// Extends the preview with a content point. The point is converted to page-local space
+    /// first, so a drag across a tear keeps describing one page mark; the pointer is in the
+    /// card's gap for a moment, and that sample is ignored rather than folded into the path.
     func extendLiveStroke(atContentPoint content: CGPoint) {
-        guard let kind = liveKind, let page = livePage, frames[page] != nil else { return }
+        guard let kind = liveKind, let page = livePage,
+              let local = pageLocalPoint(atContent: content, page: page) else { return }
         switch kind {
         case .ink:
-            if let last = livePoints.last, hypot(content.x - last.x, content.y - last.y) < 0.4 {
+            if let last = livePoints.last, hypot(local.x - last.x, local.y - last.y) < 0.4 {
                 return
             }
-            livePoints.append(content)
-            liveLayer.path = AnnotationGeometry.strokePath(livePoints)
+            livePoints.append(local)
         case .line, .arrow:
-            liveEnd = content
-            liveLayer.path = lineOrArrowPath(kind: kind, start: liveStart, end: liveEnd,
-                                             width: strokeWidth)
+            liveEnd = local
         case .square, .circle:
-            liveEnd = content
-            let rect = CGRect(x: min(liveStart.x, liveEnd.x), y: min(liveStart.y, liveEnd.y),
-                              width: abs(liveEnd.x - liveStart.x),
-                              height: abs(liveEnd.y - liveStart.y))
-            let path = CGMutablePath()
-            if kind == .square { path.addRect(rect) } else { path.addEllipse(in: rect) }
-            liveLayer.path = path
+            liveEnd = local
         case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             break
         }
+        renderLive()
     }
 
     /// Ends the preview. Returns the page-local draft only when the gesture described a mark.
     func finishLiveStroke(in frames: [PagePlacement]) -> AnnotationDraft? {
+        _ = frames
         defer {
             liveKind = nil
             livePage = nil
-            liveLayer.path = nil
             livePoints = []
+            liveLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         }
-        guard let kind = liveKind, let page = livePage,
-              let frame = frames.first(where: { $0.index == page }) else { return nil }
+        guard let kind = liveKind, let page = livePage else { return nil }
         switch kind {
         case .ink:
             guard livePoints.count >= 2 else { return nil }
-            let pagePoints = livePoints.map { CGPoint(x: $0.x - frame.leftPt, y: $0.y - frame.topPt) }
-            return AnnotationDraft(kind: .ink, page: page, inkPaths: [pagePoints])
+            return AnnotationDraft(kind: .ink, page: page, inkPaths: [livePoints])
         case .line, .arrow:
-            let start = CGPoint(x: liveStart.x - frame.leftPt, y: liveStart.y - frame.topPt)
-            let end = CGPoint(x: liveEnd.x - frame.leftPt, y: liveEnd.y - frame.topPt)
+            let start = liveStart
+            let end = liveEnd
             guard hypot(end.x - start.x, end.y - start.y) >= 1 else { return nil }
             return AnnotationDraft(kind: kind, page: page, lineStart: start, lineEnd: end)
         case .square, .circle:
-            let start = CGPoint(x: liveStart.x - frame.leftPt, y: liveStart.y - frame.topPt)
-            let end = CGPoint(x: liveEnd.x - frame.leftPt, y: liveEnd.y - frame.topPt)
+            let start = liveStart
+            let end = liveEnd
             let rect = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
                               width: abs(end.x - start.x), height: abs(end.y - start.y))
             guard rect.width >= 1, rect.height >= 1 else { return nil }
@@ -265,8 +304,8 @@ final class AnnotationOverlayView: NSView {
     func cancelLiveStroke() {
         liveKind = nil
         livePage = nil
-        liveLayer.path = nil
         livePoints = []
+        liveLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
     }
 
     // MARK: - Live gesture state
@@ -277,102 +316,121 @@ final class AnnotationOverlayView: NSView {
     private var liveStart: CGPoint = .zero
     private var liveEnd: CGPoint = .zero
 
+    private func renderLive() {
+        liveLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let kind = liveKind, let page = livePage else { return }
+        let strokePath = CGMutablePath()
+        switch kind {
+        case .ink:
+            guard !livePoints.isEmpty else { return }
+            strokePath.addPath(AnnotationGeometry.strokePath(livePoints))
+        case .line, .arrow:
+            guard hypot(liveEnd.x - liveStart.x, liveEnd.y - liveStart.y) > 0.1 else { return }
+            strokePath.addPath(lineOrArrowPath(kind: kind, start: liveStart, end: liveEnd,
+                                               width: strokeWidth))
+        case .square, .circle:
+            let rect = CGRect(x: min(liveStart.x, liveEnd.x), y: min(liveStart.y, liveEnd.y),
+                              width: abs(liveEnd.x - liveStart.x),
+                              height: abs(liveEnd.y - liveStart.y))
+            guard rect.width > 0.1, rect.height > 0.1 else { return }
+            if kind == .square { strokePath.addRect(rect) } else { strokePath.addEllipse(in: rect) }
+        case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
+            return
+        }
+        let layers = clippedContentLayers(
+            for: strokePath,
+            page: page,
+            stroke: strokeColor,
+            fill: nil,
+            lineWidth: max(strokeWidth, 0.1)
+        )
+        for layer in layers { liveLayer.addSublayer(layer) }
+    }
+
     // MARK: - Committed marks
 
     private func rebuildMarkLayers() {
-        for layer in markLayers { layer.removeFromSuperlayer() }
+        marksLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         markLayers = []
-        selectionLayer.path = nil
-        eraserTargetLayer.path = nil
-        for mark in marks {
-            guard let frame = frames[mark.page] else { continue }
-            let layers = layers(for: mark, frame: frame)
-            for layer in layers { marksLayer.addSublayer(layer) }
-            markLayers.append(contentsOf: layers)
+        for mark in marks where !segments(for: mark.page).isEmpty {
+            for layer in layers(for: mark) {
+                marksLayer.addSublayer(layer)
+                markLayers.append(layer)
+            }
             if mark.isSelected {
-                selectionLayer.path = haloPath(for: mark, frame: frame)
-                selectionLayer.strokeColor = themeColor.withAlphaComponent(0.85).cgColor
-                selectionLayer.lineWidth = 1 / max(zoom, 0.01)
-                selectionLayer.lineDashPattern = [
-                    NSNumber(value: 4 / max(zoom, 0.01)),
-                    NSNumber(value: 3 / max(zoom, 0.01)),
-                ]
+                let halo = AnnotationGeometry.haloPath(for: mark)
+                for layer in clippedContentLayers(
+                    for: halo, page: mark.page,
+                    stroke: themeColor.withAlphaComponent(0.85), fill: nil,
+                    lineWidth: 1 / max(zoom, 0.01), dashed: true
+                ) {
+                    marksLayer.addSublayer(layer)
+                    markLayers.append(layer)
+                }
                 if mark.kind == .textBox || mark.kind.isStampArtwork {
-                    appendResizeHandles(for: mark, frame: frame)
+                    appendResizeHandles(for: mark)
                 }
             }
             if mark.isEraseTarget {
-                // Exactly the select tool's halo: the eraser is showing what a press will
-                // remove, not inventing a second visual language for "about to change".
-                eraserTargetLayer.path = haloPath(for: mark, frame: frame)
-                eraserTargetLayer.strokeColor = themeColor.withAlphaComponent(0.85).cgColor
-                eraserTargetLayer.lineWidth = 1 / max(zoom, 0.01)
-                eraserTargetLayer.lineDashPattern = [
-                    NSNumber(value: 4 / max(zoom, 0.01)),
-                    NSNumber(value: 3 / max(zoom, 0.01)),
-                ]
+                let halo = AnnotationGeometry.haloPath(for: mark)
+                for layer in clippedContentLayers(
+                    for: halo, page: mark.page,
+                    stroke: themeColor.withAlphaComponent(0.85), fill: nil,
+                    lineWidth: 1 / max(zoom, 0.01), dashed: true
+                ) {
+                    marksLayer.addSublayer(layer)
+                    markLayers.append(layer)
+                }
             }
         }
     }
 
-    private func layers(for mark: CanvasAnnotationMark, frame: PagePlacement) -> [CALayer] {
-        let offset = CGPoint(x: frame.leftPt, y: frame.topPt)
-        var paths: (stroke: CGPath, fill: CGPath?) = (CGMutablePath(), nil)
+    private func layers(for mark: CanvasAnnotationMark) -> [CALayer] {
+        let strokePath = CGMutablePath()
         switch mark.kind {
         case .ink:
-            let path = CGMutablePath()
             for stroke in mark.inkPaths where !stroke.isEmpty {
-                path.addPath(AnnotationGeometry.strokePath(stroke.map {
-                    CGPoint(x: $0.x + offset.x, y: $0.y + offset.y)
-                }))
+                strokePath.addPath(AnnotationGeometry.strokePath(stroke))
             }
-            paths.stroke = path
         case .square, .circle:
-            let rect = (mark.shapeRect ?? .zero).offsetBy(dx: offset.x, dy: offset.y)
-            let path = CGMutablePath()
-            if mark.kind == .square { path.addRect(rect) } else { path.addEllipse(in: rect) }
-            paths.stroke = path
+            guard let rect = mark.shapeRect else { return [] }
+            if mark.kind == .square { strokePath.addRect(rect) } else { strokePath.addEllipse(in: rect) }
         case .line, .arrow:
             guard let start = mark.lineStart, let end = mark.lineEnd else { return [] }
-            let contentStart = CGPoint(x: start.x + offset.x, y: start.y + offset.y)
-            let contentEnd = CGPoint(x: end.x + offset.x, y: end.y + offset.y)
-            let path = lineOrArrowPath(kind: mark.kind, start: contentStart, end: contentEnd,
-                                       width: mark.strokeWidth)
-            paths.stroke = path
-            if mark.kind == .arrow { paths.fill = path }
+            strokePath.addPath(lineOrArrowPath(kind: mark.kind, start: start, end: end,
+                                               width: mark.strokeWidth))
         case .highlight, .underline, .strikeout, .stickyNote, .textBox, .stamp, .signature:
             // Drawn by the canvas as a texture (a note icon, laid-out text, a stamp badge or a
             // signature image); this layer only draws the selection halo and the handles.
             return []
         }
-
-        let layer = CAShapeLayer()
-        layer.path = paths.stroke
-        layer.strokeColor = paperAppearance.displayColor(mark.color.nsColor).cgColor
-        layer.fillColor = mark.kind == .arrow ? paperAppearance.displayColor(mark.color.nsColor).cgColor : nil
-        layer.lineWidth = mark.strokeWidth
-        layer.lineJoin = .round
-        layer.lineCap = .round
-        layer.contentsScale = window?.backingScaleFactor ?? 2
-        return [layer]
+        let color = paperAppearance.displayColor(mark.color.nsColor)
+        return clippedContentLayers(
+            for: strokePath,
+            page: mark.page,
+            stroke: color,
+            fill: mark.kind == .arrow ? color : nil,
+            lineWidth: mark.strokeWidth
+        )
     }
 
     /// The eight grab handles on a selected text box: four corners and four edge midpoints.
     ///
     /// They are plain layers rather than part of the dashed halo so the pointer can see a target
     /// to grab; the hit test that decides which one the pointer is over lives in `AppState`, in
-    /// page space, where the resize maths also lives.
-    private func appendResizeHandles(for mark: CanvasAnnotationMark, frame: PagePlacement) {
+    /// page space, where the resize maths also lives. A torn page maps each handle's page point
+    /// through the same piecewise conversion as a click.
+    private func appendResizeHandles(for mark: CanvasAnnotationMark) {
         guard let box = mark.shapeRect else { return }
-        let rect = box.offsetBy(dx: frame.leftPt, dy: frame.topPt)
-        let points = [
-            CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY),
-            CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.midY),
-            CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY),
-            CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.minX, y: rect.midY),
-        ]
         let side = 7 / max(zoom, 0.01)
-        for point in points {
+        let points = [
+            CGPoint(x: box.minX, y: box.minY), CGPoint(x: box.midX, y: box.minY),
+            CGPoint(x: box.maxX, y: box.minY), CGPoint(x: box.maxX, y: box.midY),
+            CGPoint(x: box.maxX, y: box.maxY), CGPoint(x: box.midX, y: box.maxY),
+            CGPoint(x: box.minX, y: box.maxY), CGPoint(x: box.minX, y: box.midY),
+        ]
+        for local in points {
+            guard let point = contentPoint(forPageLocal: local, page: mark.page) else { continue }
             let handle = CALayer()
             handle.frame = CGRect(x: point.x - side / 2, y: point.y - side / 2,
                                   width: side, height: side)
@@ -393,18 +451,6 @@ final class AnnotationOverlayView: NSView {
             color: AnnotationColor(red: 0, green: 0, blue: 0, alpha: 255),
             strokeWidth: width, isSelected: false, isEditable: false)
         return AnnotationGeometry.path(for: mark)
-    }
-
-    /// The page-local halo path moved into content space.
-    ///
-    /// The shape is built by `AnnotationGeometry` so the checks can assert it against a text
-    /// mark's quads; this method only applies the page's placement.
-    private func haloPath(for mark: CanvasAnnotationMark, frame: PagePlacement) -> CGPath {
-        let path = CGMutablePath()
-        path.addPath(AnnotationGeometry.haloPath(for: mark),
-                     transform: CGAffineTransform(translationX: frame.leftPt,
-                                                  y: frame.topPt))
-        return path
     }
 
     private func updateTransform() {
