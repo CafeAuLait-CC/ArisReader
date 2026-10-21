@@ -60,8 +60,14 @@ public final class CanvasPerformanceProbe {
 
     /// Present frame times, oldest first. Bounded so a long session cannot grow it.
     private var presentedMillis: [Double] = []
+    /// Wall-clock intervals between *consecutive presented* samples, oldest first. A skipped
+    /// sample clears the anchor, so an occlusion gap is not reported as one enormous interval.
+    private var intervalMillis: [Double] = []
+    private var lastPresentedAt: TimeInterval?
     /// The engine's CPU time for the last presented frame.
     public private(set) var lastPresentedMilliseconds: Double?
+    /// Wall-clock time between the last two consecutive presented frames.
+    public private(set) var lastIntervalMilliseconds: Double?
     public private(set) var lastPresentedTileQuads: Int?
     public private(set) var lastPresentedQuadCount: Int?
     public private(set) var lastPresentedSurfaceFrameIndex: UInt64?
@@ -120,8 +126,25 @@ public final class CanvasPerformanceProbe {
             if presentedMillis.count > Self.frameWindowCapacity {
                 presentedMillis.removeFirst(presentedMillis.count - Self.frameWindowCapacity)
             }
+            // Wall-clock interval between consecutive presented frames. This is the number a
+            // pacing regression shows up in; the engine's elapsed_us above is CPU submit time.
+            let now = ProcessInfo.processInfo.systemUptime
+            if let lastPresentedAt {
+                let interval = max(0, (now - lastPresentedAt) * 1000)
+                lastIntervalMilliseconds = interval
+                intervalMillis.append(interval)
+                if intervalMillis.count > Self.frameWindowCapacity {
+                    intervalMillis.removeFirst(intervalMillis.count - Self.frameWindowCapacity)
+                }
+            } else {
+                lastIntervalMilliseconds = nil
+            }
+            self.lastPresentedAt = now
         } else {
             skippedSamples += 1
+            // A gap that includes a skipped attempt is not one frame interval.
+            lastPresentedAt = nil
+            lastIntervalMilliseconds = nil
         }
 
         recordNanoseconds &+= DispatchTime.now().uptimeNanoseconds - started
@@ -131,7 +154,10 @@ public final class CanvasPerformanceProbe {
     /// Resets the sampling window. Called when the panel opens, so two opens do not mix.
     public func beginSamplingWindow() {
         presentedMillis.removeAll(keepingCapacity: true)
+        intervalMillis.removeAll(keepingCapacity: true)
+        lastPresentedAt = nil
         lastPresentedMilliseconds = nil
+        lastIntervalMilliseconds = nil
         lastPresentedTileQuads = nil
         lastPresentedQuadCount = nil
         lastPresentedSurfaceFrameIndex = nil
@@ -146,6 +172,7 @@ public final class CanvasPerformanceProbe {
     /// which the panel shows as absent rather than as zero.
     public var frameMetrics: FrameMetrics {
         let sorted = presentedMillis.sorted()
+        let sortedIntervals = intervalMillis.sorted()
         return FrameMetrics(
             lastMillis: lastPresentedMilliseconds,
             p50Millis: FrameMetrics.percentile(0.50, of: sorted),
@@ -157,6 +184,10 @@ public final class CanvasPerformanceProbe {
             lastTileQuadCount: lastPresentedTileQuads,
             lastQuadCount: lastPresentedQuadCount,
             surfaceFrameIndex: lastPresentedSurfaceFrameIndex,
+            lastIntervalMillis: lastIntervalMilliseconds,
+            intervalP50Millis: FrameMetrics.percentile(0.50, of: sortedIntervals),
+            intervalP95Millis: FrameMetrics.percentile(0.95, of: sortedIntervals),
+            intervalSampleCount: intervalMillis.isEmpty ? nil : intervalMillis.count,
             meanRecordMicroseconds: recordCalls == 0
                 ? nil
                 : Double(recordNanoseconds) / Double(recordCalls) / 1000
@@ -176,6 +207,11 @@ public struct FrameMetrics: Sendable, Equatable {
     public var lastTileQuadCount: Int?
     public var lastQuadCount: Int?
     public var surfaceFrameIndex: UInt64?
+    /// Wall-clock gap between consecutive presented frames, and its nearest-rank percentiles.
+    public var lastIntervalMillis: Double?
+    public var intervalP50Millis: Double?
+    public var intervalP95Millis: Double?
+    public var intervalSampleCount: Int?
     public var meanRecordMicroseconds: Double?
 
     /// Nearest-rank percentile. This is deliberately *not* a moving average: the value is the
@@ -203,6 +239,11 @@ public struct PerformanceSnapshot: Sendable, Equatable {
     public var lastFramePresented: Bool?
     public var lastFrameTileQuads: Int?
     public var lastFrameQuads: Int?
+    /// Wall-clock intervals between consecutive presented frames (what pacing regressions show).
+    public var frameIntervalLastMs: Double?
+    public var frameIntervalP50Ms: Double?
+    public var frameIntervalP95Ms: Double?
+    public var frameIntervalSampleCount: Int?
     /// Engine's own counter for this surface, since it was attached. Unlike the sampled counts
     /// above, this one does not reset when the panel opens.
     public var surfaceFrameIndex: UInt64?
@@ -400,8 +441,10 @@ public struct PerformancePanelView: View {
 
     private var framesSection: some View {
         section("FRAMES") {
-            row("Last frame", milliseconds(snapshot?.frameLastMs))
-            row("p50 / p95", "\(milliseconds(snapshot?.frameP50Ms)) / \(milliseconds(snapshot?.frameP95Ms))")
+            row("Frame interval", milliseconds(snapshot?.frameIntervalLastMs))
+            row("Interval p50/p95", "\(milliseconds(snapshot?.frameIntervalP50Ms)) / \(milliseconds(snapshot?.frameIntervalP95Ms))")
+            row("Engine CPU", milliseconds(snapshot?.frameLastMs))
+            row("CPU p50/p95", "\(milliseconds(snapshot?.frameP50Ms)) / \(milliseconds(snapshot?.frameP95Ms))")
             row("Window", snapshot?.frameSampleCount.map { "\($0) presented" } ?? absent)
             row("Presented", snapshot?.framesPresented.map(String.init) ?? absent)
             row("Surface frames", snapshot?.surfaceFrameIndex.map(String.init) ?? absent)
@@ -409,7 +452,7 @@ public struct PerformancePanelView: View {
             row("State", frameState, tint: frameStateTint)
             row("Tiles/frame", snapshot?.lastFrameTileQuads.map(String.init) ?? absent)
             row("All quads", snapshot?.lastFrameQuads.map(String.init) ?? absent)
-            Text("Engine CPU self-report per frame; p50/p95 use presented frames only; tiles/frame is the tile quads in the last presented frame.")
+            Text("CPU = engine self-report; interval = wall-clock between presented frames (idle time between on-demand frames counts). p50/p95 are nearest-rank percentiles.")
                 .font(.system(size: 10))
                 .foregroundStyle(LyraReaderTheme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -442,7 +485,7 @@ public struct PerformancePanelView: View {
                 count: snapshot?.pageRasterCount, milliseconds: snapshot?.pageRasterMilliseconds))
             row("Tile rasters", rasterSummary(
                 count: snapshot?.tileRasterCount, milliseconds: snapshot?.tileRasterMilliseconds))
-            Text("Engine self-reports: count · total wall-clock around the engine raster call, not GPU time.")
+            Text("Engine self-reports: count · total wall time, not GPU time.")
                 .font(.system(size: 10))
                 .foregroundStyle(LyraReaderTheme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -608,6 +651,10 @@ extension AppState {
             lastFramePresented: metrics.lastSamplePresented,
             lastFrameTileQuads: metrics.lastTileQuadCount,
             lastFrameQuads: metrics.lastQuadCount,
+            frameIntervalLastMs: metrics.lastIntervalMillis,
+            frameIntervalP50Ms: metrics.intervalP50Millis,
+            frameIntervalP95Ms: metrics.intervalP95Millis,
+            frameIntervalSampleCount: metrics.intervalSampleCount,
             surfaceFrameIndex: metrics.surfaceFrameIndex,
             usingScreenPageRasters: screenPagePathSummary == "pending" ? nil : usesScreenPageRasters,
             pagePathSummary: screenPagePathSummary,

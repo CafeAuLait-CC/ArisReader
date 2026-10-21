@@ -135,6 +135,8 @@ extension ReaderChecks {
         let empty = state.makePerformanceSnapshot()
         require(empty.frameP95Ms == nil, "no frame window means p95 is absent, not 0")
         require(empty.framesPresented == nil, "no frames sampled means the count is absent, not 0")
+        require(empty.frameIntervalP95Ms == nil,
+                "no presented-frame interval means the interval p95 is absent")
         require(empty.openToFirstFrameMilliseconds == nil,
                 "no open has been measured, so open-to-first-frame is absent")
         require(empty.pageRasterMilliseconds == nil && empty.tileRasterMilliseconds == nil,
@@ -217,12 +219,29 @@ extension ReaderChecks {
         try await eventually("the open panel reports presented frames", {
             (state.performancePanel.snapshot?.framesPresented ?? 0) > 0
         })
+        // A few separated updates produce consecutive presented frames, which is what the
+        // wall-clock interval percentile needs.
+        for _ in 0..<3 {
+            try await Task.sleep(for: .milliseconds(120))
+            state.scroll(byScreenPoints: 3)
+        }
+        try await eventually("the panel reports presented-frame intervals", {
+            (state.performancePanel.snapshot?.frameIntervalSampleCount ?? 0) > 0
+        })
         let live = try requireSnapshot(state, "first live snapshot")
-        require(live.frameLastMs != nil, "the panel reports the last frame time")
+        require(live.frameLastMs != nil, "the panel reports the last engine CPU frame time")
         require(live.frameP50Ms != nil && live.frameP95Ms != nil,
-                "the panel reports p50 and p95 over the frame window")
+                "the panel reports CPU p50 and p95 over the frame window")
         if let p50 = live.frameP50Ms, let p95 = live.frameP95Ms {
-            require(p50 <= p95, "p50 cannot exceed p95")
+            require(p50 <= p95, "CPU p50 cannot exceed p95")
+        }
+        require(live.frameIntervalLastMs != nil,
+                "the panel reports the last wall-clock interval between presented frames")
+        require(live.frameIntervalP50Ms != nil && live.frameIntervalP95Ms != nil,
+                "the panel reports presented-frame interval p50 and p95")
+        if let p50 = live.frameIntervalP50Ms, let p95 = live.frameIntervalP95Ms {
+            require(p50 > 0 && p50 <= p95,
+                    "presented-frame interval percentiles are positive and ordered")
         }
         require(live.lastFramePresented == true,
                 "a visible window presents, and the panel says so")
@@ -259,7 +278,9 @@ extension ReaderChecks {
                 "the stated sampling interval is 250 ms (4 Hz)")
 
         // Sampling itself must not schedule frames or viewport rebuilds. An idle document with
-        // the panel open runs only the 4 Hz snapshot read; the canvas counters stay put.
+        // the panel open runs only the 4 Hz snapshot read; the canvas counters stay put. Let the
+        // frames from the scrolls above land first, then compare two idle windows.
+        try await Task.sleep(for: .milliseconds(600))
         let idleOpen = harness.existingCounters()
         try await Task.sleep(for: .milliseconds(800))
         require(harness.existingCounters() == idleOpen,
