@@ -49,8 +49,23 @@ public final class AIAssistantModel: ObservableObject {
     @Published public private(set) var documentKey: String?
     /// The question for "Ask selection"; the view binds it.
     @Published public var question = ""
+    /// The composer for document chat; the view binds it.
+    @Published public var chatQuestion = ""
     /// The target language for "Translate selection"; the view binds it.
     @Published public var targetLanguage = "English"
+
+    /// The conversation for the document currently attached. Turns are kept newest-last and
+    /// the list is bounded by `chatTurnLimit`.
+    @Published public private(set) var chatTurns: [AIChatTurn] = []
+    /// The exact question the current chat preview/send belongs to. Captured when Ask is
+    /// pressed, so editing the composer afterwards cannot change what Send will do.
+    @Published public private(set) var pendingChatQuestion: String?
+
+    /// Most recent exchanges kept per document, in the panel and in the request. The Rust
+    /// builder applies the same bound again.
+    public static let chatTurnLimit = 6
+    public static let chatLimitDescription =
+        "Keeps the most recent \(chatTurnLimit) questions and answers per document; older turns are dropped."
 
     public let settings: AISettingsStore
     private var service: (any AIChatServicing)?
@@ -60,6 +75,11 @@ public final class AIAssistantModel: ObservableObject {
     private var merging = false
     private var preparedConnection: AIConnectionMode = .apiKey
     private var preparedAccountID: UUID?
+    /// Per-document conversations. The model is per window (the side panel owns it), so a
+    /// document keeps its chat while it is open in this window and loses it when the window closes.
+    private var conversations: [String: [AIChatTurn]] = [:]
+    private var streamingChatTurnID: UUID?
+    private var retryingChatTurnID: UUID?
 
     public init(settings: AISettingsStore = .shared) {
         self.settings = settings
@@ -74,6 +94,18 @@ public final class AIAssistantModel: ObservableObject {
     public var isMerging: Bool { merging }
     public var canSendMerge: Bool { mergePlan != nil && phase == .mergePreview }
     public var canCancel: Bool { phase == .streaming }
+
+    /// The current plan is a document-chat question (as opposed to one of the four single-shot
+    /// actions). The chat section stays visible alongside the action UI either way.
+    public var isDocumentChatPlan: Bool { plan?.isDocumentChat == true }
+    public var canAskDocument: Bool {
+        !chatQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isPreparing && !isSending
+    }
+    public var canSendChatPreview: Bool { isDocumentChatPlan && phase == .preview }
+    public var isChatStreaming: Bool { streamingChatTurnID != nil }
+    public var hasChatConversation: Bool { !chatTurns.isEmpty }
+    public var chatHistoryLimitDescription: String { Self.chatLimitDescription }
 
     /// The merged instrumentation for this plan. Counts only; never content.
     public var streamDiagnostics: AIStreamDiagnostics? {
@@ -106,15 +138,18 @@ public final class AIAssistantModel: ObservableObject {
     /// How many requests Send will make. The preview lists each one.
     public var requestCount: Int { plan?.parts.count ?? 0 }
 
-    /// Attach the current window's service and document. Switching documents cancels an in-flight
-    /// request and clears the old answer: an answer about another paper must never look current.
+    /// Attach the current window's service and document. Switching documents cancels an
+    /// in-flight request and swaps to that document's own conversation: a chat about another
+    /// paper must never look current, and switching back must restore what was said.
     public func attach(service: (any AIChatServicing)?, context: AIReaderContext?) {
         self.service = service
         let key = context?.documentKey
         if documentKey != key {
             cancelWork()
+            saveCurrentConversation()
             documentKey = key
-            clearConversation()
+            chatTurns = key.flatMap { conversations[$0] } ?? []
+            clearChatTransientState()
             phase = .idle
             statusNote = nil
         }
@@ -123,9 +158,7 @@ public final class AIAssistantModel: ObservableObject {
     /// Prepare a request preview. This reads document text locally and does not read the key.
     public func prepare(action: AIAssistantAction, context: AIReaderContext) async {
         if documentKey != context.documentKey {
-            cancelWork()
-            documentKey = context.documentKey
-            clearConversation()
+            attach(service: service, context: context)
         }
         guard let service else {
             phase = .failed
@@ -190,6 +223,96 @@ public final class AIAssistantModel: ObservableObject {
         }
     }
 
+    /// Build the preview for a document-chat question. Retrieval runs locally over the whole
+    /// document; nothing is sent until the reader presses Send.
+    ///
+    /// An empty retrieval is not a provider error: no plan is built, the question is kept as a
+    /// local exchange with the "nothing relevant" answer, and no request is started.
+    public func prepareDocumentChat(context: AIReaderContext) async {
+        if documentKey != context.documentKey {
+            attach(service: service, context: context)
+        }
+        let question = chatQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else {
+            statusNote = "Type a question about the document first; nothing was sent."
+            return
+        }
+        guard let service else {
+            phase = .failed
+            errorMessage = Self.noEngineMessage
+            statusNote = Self.noEngineMessage
+            return
+        }
+        guard settings.canUseAI else {
+            phase = .failed
+            errorMessage = settings.connectionMode == .chatGPT
+                ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
+            statusNote = errorMessage
+            return
+        }
+        let providerSettings: AIProviderSettings
+        do {
+            providerSettings = try settings.providerSettings()
+        } catch {
+            phase = .failed
+            errorMessage = AIReadableError.message(error)
+            statusNote = errorMessage
+            return
+        }
+
+        cancelWork()
+        preparedConnection = settings.connectionMode
+        preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
+        phase = .preparing
+        plan = nil
+        resetMergeState()
+        resetStreamOutput()
+        errorMessage = nil
+        retryingChatTurnID = nil
+        pendingChatQuestion = question
+        statusNote = "Finding relevant passages in the whole document. Nothing has been sent."
+
+        let request = AIMakePlanRequest(
+            action: .documentChat,
+            currentPage: context.currentPage,
+            selection: nil,
+            question: question,
+            language: nil,
+            history: chatHistoryForRequest(),
+            settings: providerSettings
+        )
+        do {
+            let source = try await service.prepare(request)
+            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
+            guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
+            self.plan = plan
+            phase = .preview
+            statusNote = "Nothing has been sent yet. The preview lists the pages and characters that will go out; press Send to ask."
+        } catch {
+            guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
+            let message = AIReadableError.message(error)
+            if message.contains("Nothing in this document is relevant") {
+                // Honest local answer: the provider is not called with an empty context.
+                appendChatTurn(AIChatTurn(
+                    question: question,
+                    answer: message,
+                    pageCount: Int(context.pageCount),
+                    state: .nothingRelevant
+                ))
+                chatQuestion = ""
+                plan = nil
+                pendingChatQuestion = nil
+                phase = .idle
+                errorMessage = nil
+                statusNote = "Nothing relevant was found. No request was sent."
+            } else {
+                phase = .failed
+                errorMessage = message
+                statusNote = message
+            }
+        }
+    }
+
     /// Send the previewed plan. The key is read here, handed to the worker, and not retained.
     public func send() {
         guard let plan, let service else {
@@ -198,6 +321,10 @@ public final class AIAssistantModel: ObservableObject {
             return
         }
         guard !isSending else { return }
+        if plan.isDocumentChat {
+            sendDocumentChat(plan, service: service)
+            return
+        }
         let handle: any AIChatHandle
         do { handle = try startPrepared(plan, service: service) }
         catch {
@@ -216,6 +343,55 @@ public final class AIAssistantModel: ObservableObject {
         startPolling(handle)
     }
 
+    /// Start the already-previewed chat request. The question is recorded as a turn before the
+    /// first token so Cancel, a provider error and a stream that dies all keep it on screen.
+    private func sendDocumentChat(_ plan: AiPlanRecord, service: any AIChatServicing) {
+        guard let question = pendingChatQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty else {
+            phase = .failed
+            errorMessage = "There is no chat question to send."
+            statusNote = errorMessage
+            return
+        }
+        let handle: any AIChatHandle
+        do { handle = try startPrepared(plan, service: service) }
+        catch {
+            phase = .failed
+            errorMessage = AIReadableError.message(error)
+            statusNote = errorMessage
+            return
+        }
+        let turnID: UUID
+        if let retrying = retryingChatTurnID,
+           let index = chatTurns.firstIndex(where: { $0.id == retrying }) {
+            chatTurns[index].answer = ""
+            chatTurns[index].reasoning = ""
+            chatTurns[index].error = nil
+            chatTurns[index].usage = nil
+            chatTurns[index].state = .streaming
+            turnID = chatTurns[index].id
+        } else {
+            let turn = AIChatTurn(
+                question: question,
+                sources: plan.chatSources,
+                pageCount: Int(plan.pageCount)
+            )
+            appendChatTurn(turn)
+            turnID = turn.id
+        }
+        retryingChatTurnID = nil
+        streamingChatTurnID = turnID
+        chatQuestion = ""
+        pollTask?.cancel()
+        self.handle = handle
+        resetMergeState()
+        resetStreamOutput()
+        errorMessage = nil
+        phase = .streaming
+        statusNote = "Asking the document…"
+        startPolling(handle)
+    }
+
     /// Ask the worker to stop. The partial answer stays on screen and Retry can send the same
     /// already-previewed request again.
     public func cancel() {
@@ -230,12 +406,16 @@ public final class AIAssistantModel: ObservableObject {
             // closes its stream, do not leave the panel stuck in "Cancelling" forever.
             self.handle?.cancel()
             if self.handle === currentHandle {
-                self.phase = .cancelled
-                self.statusNote = self.answer.isEmpty
-                    ? "Cancelled before the first token."
-                    : "Cancelled after \(self.answer.count) characters."
-                self.handle = nil
-                self.pollTask?.cancel()
+                if self.streamingChatTurnID != nil {
+                    self.finishChatTurn(.cancelled)
+                } else {
+                    self.phase = .cancelled
+                    self.statusNote = self.answer.isEmpty
+                        ? "Cancelled before the first token."
+                        : "Cancelled after \(self.answer.count) characters."
+                    self.handle = nil
+                    self.pollTask?.cancel()
+                }
             }
         }
     }
@@ -243,19 +423,60 @@ public final class AIAssistantModel: ObservableObject {
     /// Re-send the plan that was already shown and approved. This is not a hidden extra request:
     /// the reader is pressing Retry on the same preview.
     public func retry() {
-        guard canRetry, plan != nil else { return }
+        guard canRetry, let plan else { return }
+        if plan.isDocumentChat {
+            guard let last = chatTurns.last,
+                  last.question == pendingChatQuestion,
+                  last.state == .cancelled || last.state == .failed else { return }
+            retryingChatTurnID = last.id
+        }
         send()
     }
 
-    /// Throw the preview or answer away and return to the action list.
+    /// Throw the preview or answer away and return to the action list. For a chat preview this
+    /// keeps the conversation; `clearChat()` is the explicit way to delete it.
     public func discard() {
+        let wasChat = plan?.isDocumentChat == true || pendingChatQuestion != nil
         cancelWork()
         plan = nil
         resetMergeState()
         resetStreamOutput()
         errorMessage = nil
-        statusNote = nil
+        if wasChat {
+            pendingChatQuestion = nil
+            retryingChatTurnID = nil
+            statusNote = "Chat preview discarded. Nothing was sent; the conversation is kept."
+        } else {
+            statusNote = nil
+        }
         phase = .idle
+    }
+
+    /// Drop the current document's conversation and any pending chat preview. Nothing is sent
+    /// and no annotation or sidecar entry is touched. Conversations for other documents remain.
+    public func clearChat() {
+        let chatPlan = plan?.isDocumentChat == true
+        let hadChat = !chatTurns.isEmpty || chatPlan
+            || pendingChatQuestion != nil || streamingChatTurnID != nil
+        if streamingChatTurnID != nil {
+            cancelWork()
+        }
+        chatTurns = []
+        chatQuestion = ""
+        if let key = documentKey { conversations[key] = [] }
+        if chatPlan {
+            plan = nil
+        }
+        pendingChatQuestion = nil
+        retryingChatTurnID = nil
+        if chatPlan {
+            resetStreamOutput()
+            errorMessage = nil
+            phase = .idle
+        }
+        statusNote = hadChat
+            ? "Chat cleared for this document. No request was sent and nothing was annotated."
+            : "There is no chat to clear for this document."
     }
 
     /// Send the separately previewed consolidation request. The part summaries stay available;
@@ -324,6 +545,10 @@ public final class AIAssistantModel: ObservableObject {
     }
 
     private func apply(_ events: [AIStreamEvent]) {
+        if streamingChatTurnID != nil {
+            applyChat(events)
+            return
+        }
         for event in events {
             switch event {
             case .partStarted(let index, let total, let label):
@@ -393,7 +618,151 @@ public final class AIAssistantModel: ObservableObject {
         }
     }
 
+    /// Events for the one chat turn that is streaming. The previous turns are untouched, so a
+    /// provider error can never erase the conversation.
+    private func applyChat(_ events: [AIStreamEvent]) {
+        for event in events {
+            switch event {
+            case .partStarted(let index, let total, let label):
+                currentPartIndex = index
+                guard total > 1 else {
+                    statusNote = "Asking the document…"
+                    continue
+                }
+                statusNote = "Answering part \(index + 1) of \(total) — \(label)."
+            case .delta(let text):
+                contentDeltaCount += 1
+                updateStreamingChatTurn { turn in
+                    turn.answer += text
+                    turn.state = .streaming
+                }
+                statusNote = "Streaming the answer… \(streamingChatCharacterCount) characters received."
+            case .reasoningDelta(let text):
+                reasoningDeltaCount += 1
+                reasoning += text
+                updateStreamingChatTurn { $0.reasoning += text }
+                if streamingChatTurnAnswerIsEmpty {
+                    statusNote = "The provider is sending reasoning (not the answer)…"
+                }
+            case .usage(let reported):
+                usageUpdateCount += 1
+                if let existing = usage {
+                    usage = existing.merged(with: reported)
+                } else {
+                    usage = reported
+                }
+                updateStreamingChatTurn { $0.usage = usage }
+            case .diagnostics(let reported):
+                diagnostics.append(reported)
+            case .done:
+                finishChatTurn(.finished)
+            case .error(let message, let cancelled):
+                if cancelled {
+                    finishChatTurn(.cancelled)
+                } else {
+                    failChatTurn(message)
+                }
+            }
+        }
+    }
+
+    private var streamingChatCharacterCount: Int {
+        guard let id = streamingChatTurnID,
+              let turn = chatTurns.first(where: { $0.id == id }) else { return 0 }
+        return turn.answer.count
+    }
+
+    private var streamingChatTurnAnswerIsEmpty: Bool {
+        guard let id = streamingChatTurnID,
+              let turn = chatTurns.first(where: { $0.id == id }) else { return true }
+        return turn.answer.isEmpty
+    }
+
+    private func updateStreamingChatTurn(_ body: (inout AIChatTurn) -> Void) {
+        guard let id = streamingChatTurnID,
+              let index = chatTurns.firstIndex(where: { $0.id == id }) else { return }
+        body(&chatTurns[index])
+    }
+
+    private func finishChatTurn(_ state: AIChatTurn.State) {
+        guard let id = streamingChatTurnID else { return }
+        streamingChatTurnID = nil
+        if let index = chatTurns.firstIndex(where: { $0.id == id }) {
+            chatTurns[index].state = state
+            chatTurns[index].usage = usage
+            if state == .finished, !chatTurns[index].answer.isEmpty {
+                chatTurns[index].error = nil
+            }
+        }
+        let final = chatTurns.first(where: { $0.id == id })
+        switch state {
+        case .finished:
+            phase = .finished
+            if let final, final.answer.isEmpty {
+                errorMessage = nil
+                statusNote = emptyChatAnswerMessage(for: final)
+            } else if let final, !final.backlinks(pageCount: final.pageCount).unverified.isEmpty {
+                let count = final.backlinks(pageCount: final.pageCount).unverified.count
+                statusNote = "Finished. \(count) citation(s) could not be verified; the answer says which pages were not sent."
+            } else {
+                statusNote = "Finished. The answer is complete."
+            }
+        case .cancelled:
+            phase = .cancelled
+            let count = final?.answer.count ?? 0
+            statusNote = count == 0
+                ? "Cancelled before the first token. The question is kept."
+                : "Cancelled after \(count) characters. The partial answer and the question are kept."
+        case .failed:
+            phase = .failed
+            statusNote = errorMessage ?? "The request failed. The conversation is kept; the next question can still be asked."
+        case .nothingRelevant:
+            phase = .idle
+        case .streaming:
+            break
+        }
+        handle = nil
+        pollTask?.cancel()
+        saveCurrentConversation()
+    }
+
+    private func failChatTurn(_ message: String) {
+        guard let id = streamingChatTurnID else {
+            phase = .failed
+            errorMessage = message
+            statusNote = message
+            return
+        }
+        streamingChatTurnID = nil
+        if let index = chatTurns.firstIndex(where: { $0.id == id }) {
+            chatTurns[index].state = .failed
+            chatTurns[index].error = message
+            chatTurns[index].usage = usage
+        }
+        handle = nil
+        pollTask?.cancel()
+        errorMessage = message
+        phase = .failed
+        statusNote = message + " The conversation is kept; the next question can still be asked."
+        saveCurrentConversation()
+    }
+
+    private func emptyChatAnswerMessage(for turn: AIChatTurn) -> String {
+        var text = "The provider returned no answer text. The question is kept; you can retry or ask another."
+        if !turn.reasoning.isEmpty {
+            text = "The provider sent reasoning but no answer. The question is kept; you can retry or ask another."
+        }
+        if finishReason == "length" {
+            text = "The provider stopped at its token limit before answering. The question is kept; you can retry or ask another."
+        }
+        return text
+    }
+
     private func handleDone() {
+        if streamingChatTurnID != nil {
+            finishChatTurn(.finished)
+            return
+        }
         if merging {
             finishAnswer()
             return
@@ -545,6 +914,10 @@ public final class AIAssistantModel: ObservableObject {
             }
         }
         guard phase == .streaming else { return }
+        if streamingChatTurnID != nil {
+            failChatTurn("The request ended without a final result. The conversation is kept.")
+            return
+        }
         phase = .failed
         errorMessage = "The request ended without a final result. Nothing else was sent."
         statusNote = errorMessage
@@ -552,14 +925,55 @@ public final class AIAssistantModel: ObservableObject {
     }
 
     private func cancelWork() {
+        if streamingChatTurnID != nil {
+            finishChatTurn(.cancelled)
+        }
         handle?.cancel()
         handle = nil
         pollTask?.cancel()
         pollTask = nil
     }
 
-    private func clearConversation() {
+    /// Persist the current turns under the document they belong to. The dictionary is what makes
+    /// switching documents restore a chat instead of silently carrying another paper's answers.
+    private func saveCurrentConversation() {
+        guard let key = documentKey else { return }
+        trimChatTurns()
+        conversations[key] = chatTurns
+    }
+
+    private func appendChatTurn(_ turn: AIChatTurn) {
+        chatTurns.append(turn)
+        trimChatTurns()
+        saveCurrentConversation()
+    }
+
+    /// Bound the visible conversation to the most recent exchanges. The Rust planner applies the
+    /// same bound to the request, so the preview cannot include something the panel dropped.
+    private func trimChatTurns() {
+        if chatTurns.count > Self.chatTurnLimit {
+            chatTurns.removeFirst(chatTurns.count - Self.chatTurnLimit)
+        }
+    }
+
+    /// The previous turns that go to the model: finished answers and cancelled partials, newest
+    /// last, at most the bound. Failed and "nothing relevant" turns stay visible but are not fed
+    /// back as if they were model answers.
+    private func chatHistoryForRequest() -> [AIConversationTurn] {
+        chatTurns
+            .filter {
+                ($0.state == .finished || $0.state == .cancelled)
+                    && !$0.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            .suffix(Self.chatTurnLimit)
+            .map { AIConversationTurn(question: $0.question, answer: $0.answer) }
+    }
+
+    private func clearChatTransientState() {
         plan = nil
+        pendingChatQuestion = nil
+        retryingChatTurnID = nil
+        streamingChatTurnID = nil
         resetMergeState()
         resetStreamOutput()
         errorMessage = nil

@@ -174,6 +174,16 @@ public enum PlacementIndex {
         index >= -7 * block && index < -6 * block
     }
 
+    /// The AI chat's transient source highlight: one box per line of the passage a citation
+    /// chip points at, upwards from `-8·block`. Capacity: 2^28 boxes. It gets its own block so
+    /// it can coexist with a selection without sharing a texture cache slot.
+    public static func aiSource(_ index: Int) -> Int { -8 * block + index }
+
+    /// Whether `index` names one box of the transient AI source highlight.
+    public static func isAISource(_ index: Int) -> Bool {
+        index >= -8 * block && index < -7 * block
+    }
+
     /// A note glyph loaded from the PDF — a sticky icon, free text or inline-comment label:
     /// one per annotation, upwards from `-6·block`. Capacity: 2^28 notes.
     ///

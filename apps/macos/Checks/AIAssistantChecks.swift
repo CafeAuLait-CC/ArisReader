@@ -1,6 +1,8 @@
 import AppKit
+import CoreText
 import LyraReaderBindings
 import LyraReaderKit
+import SwiftUI
 import Darwin
 import Foundation
 
@@ -148,6 +150,8 @@ extension ReaderChecks {
         try await aiSelectionChecks(root: root)
         try await aiPanelChecks(root: root)
         try await aiMergeChecks()
+        try await aiDocumentChatChecks(root: root)
+        try await aiDocumentChatLayoutChecks(root: root)
     }
 
     @MainActor
@@ -310,6 +314,10 @@ extension ReaderChecks {
             return nil
         }
         require(pages == [2], "spaced, zero and range forms are not linkified")
+        require(AIAnswerMarkdown.allCitedPages(in: "One [p.7], again [p.2], duplicate [p.2], zero [p.0].") == [7, 2, 0],
+                "the chat verification scan sees every strict citation, including out-of-range pages")
+        require(AIAnswerMarkdown.allCitedPages(in: "[p. 3] [pp.1-2] [12]").isEmpty,
+                "the verification scan does not invent citations from other forms")
         require(AIAnswerMarkdown.parse("", pageCount: 3).blocks.isEmpty, "an empty answer has no blocks")
     }
 
@@ -366,7 +374,7 @@ extension ReaderChecks {
         }
 
         var profiles: [(AIAssistantAction, String)] = []
-        for action in AIAssistantAction.allCases {
+        for action in AIAssistantAction.allCases where !action.isDocumentChat {
             let context = action.requiresSelection ? selectionContext : pageContext
             let service = ScriptedAIChatService(
                 engine: engine,
@@ -413,8 +421,8 @@ extension ReaderChecks {
                     "\(action.rawValue) feeds the same answer accumulator")
             model.discard()
         }
-        require(profiles.count == AIAssistantAction.allCases.count,
-                "all four action paths were profiled")
+        require(profiles.count == AIAssistantAction.allCases.filter { !$0.isDocumentChat }.count,
+                "all four single-shot action paths were profiled")
         for (action, body) in profiles {
             require(body.contains("\"thinking\":{\"type\":\"disabled\"}"),
                     "\(action.rawValue) carries exactly thinking:disabled")
@@ -577,6 +585,7 @@ extension ReaderChecks {
                 ),
                 question: nil,
                 language: "English",
+                history: [],
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -606,6 +615,7 @@ extension ReaderChecks {
                 selection: nil,
                 question: nil,
                 language: "English",
+                history: [],
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -636,6 +646,7 @@ extension ReaderChecks {
                     selection: nil,
                     question: nil,
                     language: nil,
+                    history: [],
                     baseUrl: "http://127.0.0.1:11434/v1",
                     model: "mock-model",
                     temperature: 0.2,
@@ -721,6 +732,8 @@ extension ReaderChecks {
             ],
             sourcePages: [1, 2, 3],
             note: "split into 2 parts",
+            sources: [],
+            historyTurns: 0,
             previewHeaders: [],
             estimatedTokens: 400
         )
@@ -1079,6 +1092,653 @@ extension ReaderChecks {
 }
 
 // MARK: - Test helpers
+
+// MARK: - Document chat (T5.6)
+
+extension ReaderChecks {
+    /// A deterministic eight-page PDF generated at check time. The repository carries no such
+    /// sample: the text is chosen so pages 2, 4 and 6 answer the question and the other five are
+    /// plausible decoys. The engine reads it through the same PDFium path as any opened paper.
+    private static func writeDocumentChatFixture(to url: URL) throws {
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        guard let consumer = CGDataConsumer(url: url as CFURL),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw NSError(
+                domain: "LyraReaderChecks",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "could not create the document-chat fixture"]
+            )
+        }
+        let pages: [[String]] = [
+            ["Introduction. This paper studies reading interfaces and their long term use."],
+            ["The spectral absorbance experiment measured light across every sample."],
+            ["Administrative scheduling details describe the team calendar and room booking."],
+            ["The retrieval baseline improved recall on each evaluation query by a wide margin."],
+            ["Appendix notes cover typography, margins and page layout conventions."],
+            ["The evaluation query set was replayed against the retrieval baseline for comparison."],
+            ["Acknowledgements thank the library staff for their patient help."],
+            ["References point to prior work on reading interfaces and typography."],
+        ]
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont(name: "Helvetica", size: 12) ?? NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.black,
+        ]
+        for lines in pages {
+            context.beginPDFPage(nil)
+            context.setFillColor(NSColor.white.cgColor)
+            context.fill(mediaBox)
+            context.setFillColor(NSColor.black.cgColor)
+            for (index, line) in lines.enumerated() {
+                let attributed = NSAttributedString(string: line, attributes: attributes)
+                let ctLine = CTLineCreateWithAttributedString(attributed)
+                context.textPosition = CGPoint(x: 72, y: 720 - CGFloat(index) * 18)
+                CTLineDraw(ctLine, context)
+            }
+            context.endPDFPage()
+        }
+        context.closePDF()
+    }
+
+    @MainActor
+    private static func aiDocumentChatChecks(root: URL) async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lyra-reader-docchat-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let url = scratch.appendingPathComponent("long-paper.pdf")
+        try writeDocumentChatFixture(to: url)
+
+        let engine = try RustEngine()
+        let document = try engine.openDocument(at: url)
+        guard document.pageCount == 8 else {
+            fatalError("the document-chat fixture did not produce 8 pages (got \(document.pageCount))")
+        }
+        let context = AIReaderContext(
+            documentKey: url.standardizedFileURL.path,
+            documentTitle: document.title,
+            pageCount: document.pageCount,
+            currentPage: 1,
+            selection: nil
+        )
+        let baseURL = "http://127.0.0.1:11434/v1"
+        let fakeKey = "sk-docchat-not-real-\(UUID().uuidString)"
+        let fixture = makeSettings(key: fakeKey)
+        defer { fixture.cleanup() }
+        require(fixture.store.save(
+            baseURL: baseURL,
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: fakeKey
+        ), "the document-chat fixture saves its provider")
+
+        let recording = RecordingAIService(
+            base: RustAIChatService(engine: engine, useMockProvider: true)
+        )
+        let model = AIAssistantModel(settings: fixture.store)
+        model.attach(service: recording, context: context)
+        let question = "How did the spectral absorbance experiment and the retrieval baseline change the evaluation query results?"
+        model.chatQuestion = question
+        await model.prepareDocumentChat(context: context)
+        try await eventually("the document-chat preview is built locally", {
+            model.phase == .preview && model.plan != nil
+        })
+        require(recording.startedPlans.isEmpty,
+                "document chat sends nothing while the preview is built")
+        guard let preview = model.plan else { fatalError("expected a chat preview") }
+        require(preview.action == .documentChat, "the preview is the document-chat action")
+        require(preview.historyTurns == 0, "the first question has no earlier turns")
+        let sentPages = Set(preview.parts[0].pages.map(Int.init))
+        require(sentPages.count >= 2,
+                "retrieval selected several pages from the whole document: \(sentPages)")
+        require(sentPages.count < 8,
+                "retrieval did not send the whole document: \(sentPages)")
+        require(preview.parts.count == 1, "a chat question is one request")
+        let body = preview.parts[0].wireBody
+        for page in sentPages.sorted() {
+            require(body.contains("[Page \(page)]"),
+                    "the exact request body carries the page \(page) label")
+        }
+        for page in Set(1...8).subtracting(sentPages) {
+            require(!body.contains("[Page \(page)]"),
+                    "a page that retrieval did not select is not in the request: page \(page)")
+        }
+        require(body.contains("[Retrieved context]"), "retrieved passages are labelled in the body")
+        require(preview.parts[0].pageCharacters > 0
+                    && preview.parts[0].pageCharacters < 8_000,
+                "the preview reports the retrieved character count, not the whole document")
+        require(preview.parts[0].requestCharacters > preview.parts[0].pageCharacters,
+                "the preview reports the request size separately")
+        require(preview.sources.count == sentPages.count,
+                "every sent page has a snippet source")
+        for source in preview.sources {
+            require(sentPages.contains(Int(source.page)),
+                    "source page \(source.page) was sent")
+            require(!source.snippet.isEmpty, "the source has a snippet")
+            require(!source.rects.isEmpty,
+                    "the source carries page geometry for the transient highlight")
+        }
+
+        // 1. Send the exact previewed body and build backlinks from the answer.
+        model.send()
+        try await eventually("the chat answer streams to completion", {
+            model.phase == .finished && model.chatTurns.last?.state == .finished
+        })
+        require(recording.startedPlans.count == 1,
+                "pressing Send starts exactly one chat request")
+        guard let sent = recording.startedPlans.last else { fatalError("expected a sent chat plan") }
+        require(sent.parts.map(\.wireBody) == preview.parts.map(\.wireBody),
+                "the request that ran has the exact previewed body")
+        guard let firstTurn = model.chatTurns.last else { fatalError("expected a chat turn") }
+        require(firstTurn.question == question, "the question is kept with the answer")
+        require(firstTurn.answer.contains("Sources:"),
+                "the mock answer cites the sent pages: \(firstTurn.answer)")
+        let links = firstTurn.backlinks(pageCount: 8)
+        require(links.chips.count == sentPages.count,
+                "every sent page the answer cites has a chip: \(links.chips.map(\.page))")
+        require(links.unverified.isEmpty,
+                "the mock provider cites only pages that were sent")
+        require(links.chips.allSatisfy { !$0.snippet.isEmpty },
+                "each chip carries a snippet of the passage that was sent")
+        require(links.chips.allSatisfy { !$0.rects.isEmpty },
+                "each chip carries the source geometry")
+
+        // 2. Clicking a chip jumps to the page and flashes the source; nothing is saved.
+        let chip = links.chips[0]
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        state.open(url: url)
+        require(state.currentPage == 1, "the reader starts on page 1")
+        let annotationsBefore = state.annotations
+        let sidecar = url.appendingPathExtension("lyra-reader-annotations.json")
+        try? FileManager.default.removeItem(at: sidecar)
+        chip.follow(in: state)
+        require(state.currentPage == chip.page,
+                "the chip jumped to page \(chip.page) (current \(state.currentPage))")
+        guard let highlight = state.aiSourceHighlight else {
+            fatalError("clicking a chip did not set the transient source highlight")
+        }
+        require(highlight.page == chip.page - 1, "the highlight is on the cited page")
+        require(!highlight.rects.isEmpty, "the highlight has the passage's line boxes")
+        require(state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
+                "the source boxes are drawn as transient canvas quads")
+        require(state.annotations == annotationsBefore,
+                "following a citation creates no annotation")
+        require(!FileManager.default.fileExists(atPath: sidecar.path),
+                "following a citation writes no sidecar annotation")
+        try await Task.sleep(for: .milliseconds(1_700))
+        require(state.aiSourceHighlight == nil,
+                "the source highlight disappears after the fade")
+        require(!state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
+                "the transient quads are removed with the highlight")
+        require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: sidecar.path),
+                "the fade leaves no annotation or sidecar behind")
+
+        // 3. A second question carries the first exchange and its own retrieval.
+        model.chatQuestion = "Which evaluation query set was replayed against the retrieval baseline?"
+        await model.prepareDocumentChat(context: context)
+        try await eventually("the second chat preview is built", {
+            model.phase == .preview && model.plan?.historyTurns == 1
+        })
+        guard let secondPlan = model.plan else { fatalError("expected a second chat plan") }
+        require(secondPlan.historyTurns == 1, "the second question includes one earlier turn")
+        require(secondPlan.parts[0].userPrompt.contains(question),
+                "the first question is in the second request's history")
+        require(secondPlan.parts[0].userPrompt.contains(firstTurn.answer),
+                "the first answer is in the second request's history")
+        require(secondPlan.parts[0].userPrompt.contains("[Earlier conversation]"),
+                "the preview labels the earlier conversation")
+        let secondBodyObject = try JSONSerialization.jsonObject(
+            with: Data(secondPlan.parts[0].wireBody.utf8)
+        ) as? [String: Any]
+        let secondMessages = secondBodyObject?["messages"] as? [[String: Any]]
+        let secondUserContent = secondMessages?.last?["content"] as? String
+        require(secondUserContent?.contains(firstTurn.answer) == true,
+                "the exact body carries the earlier answer")
+        model.send()
+        try await eventually("the second chat answer finishes", {
+            model.chatTurns.count == 2 && model.chatTurns.last?.state == .finished
+        })
+        require(model.chatTurns.first?.answer == firstTurn.answer,
+                "the first answer stays visible after the second turn")
+
+        // 4. A citation to a page that was not sent gets no chip and a stated reason.
+        let unverifiedService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Retrieved passages"),
+                .delta("This is supported by [p.2] but also by [p.7]."),
+                .done,
+            ]
+        )
+        let unverifiedModel = AIAssistantModel(settings: fixture.store)
+        unverifiedModel.attach(service: unverifiedService, context: context)
+        unverifiedModel.chatQuestion = question
+        await unverifiedModel.prepareDocumentChat(context: context)
+        try await eventually("the unverified-citation preview is built", {
+            unverifiedModel.phase == .preview && unverifiedModel.plan != nil
+        })
+        unverifiedModel.send()
+        try await eventually("the unverified-citation answer finishes", {
+            unverifiedModel.phase == .finished && unverifiedModel.chatTurns.last?.state == .finished
+        })
+        guard let unverifiedTurn = unverifiedModel.chatTurns.last,
+              let unverifiedPlan = unverifiedModel.plan else {
+            fatalError("expected the unverified-citation turn")
+        }
+        let unverifiedLinks = unverifiedTurn.backlinks(pageCount: 8)
+        require(!unverifiedLinks.chips.contains(where: { $0.page == 7 }),
+                "a citation to a page that was not sent produces no chip")
+        require(unverifiedLinks.unverified.contains(where: {
+            $0.page == 7 && $0.reason.contains("was not sent")
+        }), "the panel states why [p.7] could not be verified: \(unverifiedLinks.unverified)")
+        let renderedUnverified = AIAnswerMarkdown.parse(
+            unverifiedTurn.answer,
+            pageCount: 8,
+            verifiedPages: unverifiedTurn.sentPages
+        )
+        require(!renderedUnverified.citedPages.contains(7),
+                "an unverified citation is not linkified to a plausible page")
+        require(renderedUnverified.citedPages.contains(2),
+                "the verified citation in the same answer remains clickable")
+        require(Set(unverifiedPlan.parts[0].pages.map(Int.init)).contains(2),
+                "page 2 was actually sent")
+
+        // 5. Empty retrieval answers honestly without building or starting a request.
+        let requestsBeforeEmpty = recording.startedPlans.count
+        let emptyModel = AIAssistantModel(settings: fixture.store)
+        emptyModel.attach(service: recording, context: context)
+        emptyModel.chatQuestion = "zzzz-quasar-xylophone"
+        await emptyModel.prepareDocumentChat(context: context)
+        try await eventually("the empty retrieval settles without a plan", {
+            emptyModel.phase == .idle && emptyModel.chatTurns.count == 1
+        })
+        guard let emptyTurn = emptyModel.chatTurns.last else { fatalError("expected an empty-retrieval turn") }
+        require(emptyTurn.state == .nothingRelevant, "the empty retrieval is a local answer")
+        require(emptyTurn.answer.contains("Nothing in this document is relevant"),
+                "the panel says nothing relevant was found: \(emptyTurn.answer)")
+        require(emptyTurn.sources.isEmpty, "no passages were sent for the empty retrieval")
+        require(emptyModel.plan == nil, "no request plan was built for the empty retrieval")
+        require(recording.startedPlans.count == requestsBeforeEmpty,
+                "the provider was not called for the empty retrieval")
+        require((emptyModel.statusNote ?? "").contains("No request was sent"),
+                "the status says no request was sent")
+
+        // 6. Cancel keeps the partial answer and the question; Retry works on the same preview.
+        let cancelModel = AIAssistantModel(settings: fixture.store)
+        cancelModel.attach(service: recording, context: context)
+        cancelModel.chatQuestion = question
+        await cancelModel.prepareDocumentChat(context: context)
+        try await eventually("the cancel fixture has a chat preview", {
+            cancelModel.phase == .preview && cancelModel.plan != nil
+        })
+        cancelModel.send()
+        try await eventually("the chat answer has started", {
+            cancelModel.phase == .streaming
+                && (cancelModel.chatTurns.last?.answer.isEmpty == false)
+        })
+        cancelModel.cancel()
+        try await eventually("cancel settles the chat turn", {
+            cancelModel.phase == .cancelled
+                && cancelModel.chatTurns.last?.state == .cancelled
+        })
+        let partial = cancelModel.chatTurns.last?.answer ?? ""
+        require(!partial.isEmpty, "cancel keeps the partial answer")
+        require(cancelModel.chatTurns.last?.question == question,
+                "cancel keeps the question with the partial answer")
+        let startsBeforeRetry = recording.startedPlans.count
+        cancelModel.retry()
+        try await eventually("retry completes the cancelled chat answer", {
+            cancelModel.phase == .finished
+                && cancelModel.chatTurns.last?.state == .finished
+                && (cancelModel.chatTurns.last?.answer.isEmpty == false)
+        })
+        require(recording.startedPlans.count == startsBeforeRetry + 1,
+                "retry starts one more request for the same question")
+        require(cancelModel.chatTurns.count == 1,
+                "retry reuses the cancelled turn instead of duplicating the question")
+
+        // 7. A provider error keeps the conversation readable and the next question works.
+        let errorService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Retrieved passages"),
+                .delta("A partial answer [p.2]. "),
+                .error(message: "The provider dropped the connection.", cancelled: false),
+            ]
+        )
+        let errorModel = AIAssistantModel(settings: fixture.store)
+        errorModel.attach(service: errorService, context: context)
+        errorModel.chatQuestion = "What did the introduction say?"
+        await errorModel.prepareDocumentChat(context: context)
+        try await eventually("the error fixture has a preview", {
+            errorModel.phase == .preview && errorModel.plan != nil
+        })
+        errorModel.send()
+        try await eventually("the provider error settles the turn", {
+            errorModel.phase == .failed && errorModel.chatTurns.last?.state == .failed
+        })
+        guard let failedTurn = errorModel.chatTurns.last else { fatalError("expected the failed turn") }
+        require(failedTurn.question == "What did the introduction say?",
+                "the failed turn keeps its question")
+        require(failedTurn.answer.contains("A partial answer"),
+                "the failed turn keeps its partial answer")
+        require((failedTurn.error ?? "").contains("dropped the connection"),
+                "the failed turn states the provider error")
+        let failedTurnCount = errorModel.chatTurns.count
+        let recovery = RecordingAIService(
+            base: RustAIChatService(engine: engine, useMockProvider: true)
+        )
+        errorModel.attach(service: recovery, context: context)
+        errorModel.chatQuestion = question
+        await errorModel.prepareDocumentChat(context: context)
+        try await eventually("the next question after an error has a preview", {
+            errorModel.phase == .preview && errorModel.plan != nil
+        })
+        errorModel.send()
+        try await eventually("the next question after an error finishes", {
+            errorModel.chatTurns.count == failedTurnCount + 1
+                && errorModel.chatTurns.last?.state == .finished
+        })
+        require(errorModel.chatTurns.first?.state == .failed,
+                "the failed turn is still readable after the next answer")
+        require(recovery.startedPlans.count == 1,
+                "the next question after an error makes one request")
+
+        // 8. The visible history is bounded, and switching documents swaps conversations.
+        let boundedService = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Retrieved passages"),
+                .delta("A short answer [p.2]."),
+                .done,
+            ]
+        )
+        let boundedModel = AIAssistantModel(settings: fixture.store)
+        boundedModel.attach(service: boundedService, context: context)
+        for index in 1...7 {
+            boundedModel.chatQuestion = "\(question) vari\(index)"
+            await boundedModel.prepareDocumentChat(context: context)
+            try await eventually("bounded-history preview \(index)", {
+                boundedModel.phase == .preview && boundedModel.plan != nil
+            })
+            boundedModel.send()
+            try await eventually("bounded-history answer \(index)", {
+                boundedModel.chatTurns.last?.state == .finished
+            })
+        }
+        require(boundedModel.chatTurns.count == AIAssistantModel.chatTurnLimit,
+                "the visible chat keeps exactly \(AIAssistantModel.chatTurnLimit) turns")
+        require(boundedModel.chatTurns.first?.question.contains("vari2") == true,
+                "the oldest turn was dropped")
+        require(boundedModel.chatTurns.last?.question.contains("vari7") == true,
+                "the newest turn is present")
+        let otherContext = AIReaderContext(
+            documentKey: "another-document-key",
+            documentTitle: "Another paper",
+            pageCount: 3,
+            currentPage: 1,
+            selection: nil
+        )
+        boundedModel.attach(service: boundedService, context: otherContext)
+        require(boundedModel.chatTurns.isEmpty,
+                "switching documents shows the other document's (empty) conversation")
+        boundedModel.attach(service: boundedService, context: context)
+        require(boundedModel.chatTurns.count == AIAssistantModel.chatTurnLimit,
+                "switching back restores the first document's bounded conversation")
+
+        print("AI-DOCCHAT pages=\(sentPages.sorted()) document_chars=\(preview.parts[0].pageCharacters) request_chars=\(preview.parts[0].requestCharacters) chips=\(links.chips.map(\.page))")
+    }
+}
+
+// MARK: - Document chat layout at the panel's width limits
+
+private struct DocumentChatPanelMeasurements {
+    let hostBounds: CGRect
+    let chat: CGRect
+    let composer: CGRect
+    let actions: CGRect
+    let composerField: CGRect?
+    let askButton: CGRect?
+    let historyContentHeight: CGFloat
+    let historyViewportHeight: CGFloat
+    /// Page → chip frame, sorted top-to-bottom; the first occurrence of each page is kept.
+    let chipFrames: [(page: Int, frame: CGRect)]
+}
+
+extension ReaderChecks {
+    /// Host the real right-panel content at the panel's minimum and maximum content widths and
+    /// measure the chat's AppKit frames. This is the narrow/wide acceptance evidence: the chat
+    /// fills the remaining height, the composer stays usable, chips wrap (their height grows at
+    /// 240 pt rather than their width clipping), and the history remains a scroll view whose
+    /// content is taller than its viewport.
+    @MainActor
+    private static func aiDocumentChatLayoutChecks(root: URL) async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lyra-reader-docchat-layout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let url = scratch.appendingPathComponent("long-paper.pdf")
+        try writeDocumentChatFixture(to: url)
+
+        let engine = try RustEngine()
+        _ = try engine.openDocument(at: url)
+        let context = AIReaderContext(
+            documentKey: url.standardizedFileURL.path,
+            documentTitle: "Long paper",
+            pageCount: 8,
+            currentPage: 1,
+            selection: nil
+        )
+        let fixture = makeSettings(key: "sk-docchat-layout")
+        defer { fixture.cleanup() }
+        require(fixture.store.save(
+            baseURL: "http://127.0.0.1:11434/v1",
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: "sk-docchat-layout"
+        ), "the layout fixture saves its provider")
+
+        // Long answers with several short citations give the history enough content to scroll
+        // and the chips a snippet that must wrap at 240 pt but not at 520 pt.
+        let answer = "The spectral absorbance experiment measured every sample, and the retrieval "
+            + "baseline improved recall on the evaluation query. "
+            + String(repeating: "The result was checked against the baseline. ", count: 6)
+            + " [p.2] [p.4] [p.6]"
+        let service = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Retrieved passages"),
+                .delta(answer),
+                .done,
+            ]
+        )
+        let model = AIAssistantModel(settings: fixture.store)
+        model.attach(service: service, context: context)
+        for index in 1...6 {
+            model.chatQuestion = "How did the spectral absorbance experiment and the retrieval baseline change the evaluation query results? (\(index))"
+            await model.prepareDocumentChat(context: context)
+            try await eventually("layout chat preview \(index)", {
+                model.phase == .preview && model.plan != nil
+            })
+            model.send()
+            try await eventually("layout chat answer \(index)", {
+                model.chatTurns.last?.state == .finished
+            })
+        }
+        require(model.chatTurns.count == 6, "the layout fixture has six chat turns")
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        require(state.open(url: url), "the layout fixture opens in the reader state")
+
+        let narrow = try await measureDocumentChatPanel(
+            state: state, model: model, width: ReaderSidePanelMetrics.minimumContentWidthPt
+        )
+        let wide = try await measureDocumentChatPanel(
+            state: state, model: model, width: ReaderSidePanelMetrics.maximumContentWidthPt
+        )
+
+        for (label, measurement, expectedWidth) in [
+            ("240 pt", narrow, ReaderSidePanelMetrics.minimumContentWidthPt),
+            ("520 pt", wide, ReaderSidePanelMetrics.maximumContentWidthPt),
+        ] {
+            require(abs(measurement.chat.width - expectedWidth) < 1,
+                    "\(label): the chat fills the panel width (\(measurement.chat.width) pt)")
+            require(measurement.chat.height > 250,
+                    "\(label): the chat gets the panel height below the actions (\(measurement.chat.height) pt)")
+            require(measurement.actions.height >= 170 && measurement.actions.height <= 280,
+                    "\(label): the single-shot actions keep a bounded scrollable area (\(measurement.actions.height) pt)")
+            require(measurement.chat.minX >= -0.5
+                        && measurement.chat.maxX <= measurement.hostBounds.maxX + 0.5,
+                    "\(label): the chat is not clipped horizontally")
+            require(measurement.composer.width > 180 && measurement.composer.width <= expectedWidth + 0.5,
+                    "\(label): the composer keeps a usable width (\(measurement.composer.width) pt)")
+            require(measurement.composerField != nil,
+                    "\(label): the composer has an editable text field")
+            if let field = measurement.composerField {
+                require(field.width > 120 && field.height > 0,
+                        "\(label): the question field is usable (\(field.width)×\(field.height) pt)")
+            }
+            require(measurement.askButton != nil,
+                    "\(label): the Ask button is present")
+            require(measurement.historyViewportHeight > 0,
+                    "\(label): the history has a scroll viewport")
+            require(measurement.historyContentHeight > measurement.historyViewportHeight + 40,
+                    "\(label): the history is scrollable when it overflows "
+                        + "(\(measurement.historyContentHeight) content vs "
+                        + "\(measurement.historyViewportHeight) viewport)")
+            require(measurement.chipFrames.count >= 3,
+                    "\(label): the answer shows citation chips")
+            for (page, frame) in measurement.chipFrames {
+                require(frame.width > 0 && frame.height > 0,
+                        "\(label): chip p.\(page) has a laid-out frame")
+                require(frame.maxX <= measurement.chat.maxX + 0.5,
+                        "\(label): chip p.\(page) wraps inside the panel rather than crossing its edge "
+                            + "(maxX \(frame.maxX) vs \(measurement.chat.maxX))")
+            }
+            let sorted = measurement.chipFrames.sorted { $0.frame.minY < $1.frame.minY }
+            for pair in zip(sorted, sorted.dropFirst()) {
+                require(pair.1.frame.minY >= pair.0.frame.maxY - 0.5,
+                        "\(label): citation chips stack without clipping each other")
+            }
+        }
+
+        let narrowChips = Dictionary(
+            narrow.chipFrames.map { ($0.page, $0.frame.height) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let wideChips = Dictionary(
+            wide.chipFrames.map { ($0.page, $0.frame.height) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for page in narrowChips.keys.sorted() {
+            guard let narrowHeight = narrowChips[page], let wideHeight = wideChips[page] else { continue }
+            require(narrowHeight >= wideHeight - 0.5,
+                    "chip p.\(page) gets taller at 240 pt (\(narrowHeight)) than at 520 pt (\(wideHeight)) "
+                        + "because its snippet wraps")
+        }
+        require(narrowChips.values.max() ?? 0 > (wideChips.values.max() ?? 0) + 4,
+                "at least one snippet visibly wraps to more lines at 240 pt")
+
+        print("AI-DOCCHAT-LAYOUT narrow=240 chat=\(narrow.chat.size) composer=\(narrow.composer.size) "
+            + "chips=\(narrow.chipFrames.map { "\($0.page):\($0.frame.height)" }) "
+            + "history=\(narrow.historyContentHeight)/\(narrow.historyViewportHeight) "
+            + "wide=520 chat=\(wide.chat.size) composer=\(wide.composer.size) "
+            + "chips=\(wide.chipFrames.map { "\($0.page):\($0.frame.height)" }) "
+            + "history=\(wide.historyContentHeight)/\(wide.historyViewportHeight)")
+    }
+
+    @MainActor
+    private static func measureDocumentChatPanel(
+        state: AppState,
+        model: AIAssistantModel,
+        width: CGFloat
+    ) async throws -> DocumentChatPanelMeasurements {
+        let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
+        let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
+        host.frame = container.bounds
+        host.autoresizingMask = [.width, .height]
+        container.addSubview(host)
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: width, height: 800),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = container
+        window.setContentSize(NSSize(width: width, height: 800))
+        window.orderFrontRegardless()
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+        try await Task.sleep(for: .milliseconds(120))
+        host.layoutSubtreeIfNeeded()
+        require(abs(host.bounds.height - 800) < 1,
+                "the layout host keeps the requested 800 pt height (got \(host.bounds.height))")
+
+        guard let chatMarker = findView(AIDocumentChatMarkerView.self, in: host),
+              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host),
+              let actionsMarker = findView(AIAssistantPanelMarkerView.self, in: host) else {
+            fatalError("FAIL: the hosted right panel is missing a chat, composer or actions marker")
+        }
+        let chat = host.convert(chatMarker.bounds, from: chatMarker)
+        let composer = host.convert(composerMarker.bounds, from: composerMarker)
+        let actions = host.convert(actionsMarker.bounds, from: actionsMarker)
+        let composerFrame = host.convert(composerMarker.bounds, from: composerMarker)
+        let fields = findViews(NSTextField.self, in: host)
+            .filter {
+                !$0.isHidden && $0.frame.width > 1
+                    && host.convert($0.bounds, from: $0).intersects(composerFrame)
+            }
+        let buttons = findViews(NSButton.self, in: host)
+            .filter {
+                !$0.isHidden && host.convert($0.bounds, from: $0).intersects(composerFrame)
+            }
+        let history = findViews(NSScrollView.self, in: host)
+            .filter { host.convert($0.bounds, from: $0).intersects(chat.insetBy(dx: -1, dy: -1)) }
+            .max { lhs, rhs in
+                host.convert(lhs.bounds, from: lhs).height
+                    < host.convert(rhs.bounds, from: rhs).height
+            }
+        let chipMarkers = findViews(AIDocumentChatChipMarkerView.self, in: host)
+            .map { ($0.page, host.convert($0.bounds, from: $0)) }
+            .filter { $0.1.intersects(chat.insetBy(dx: -1, dy: -1)) }
+            .sorted { $0.1.minY < $1.1.minY }
+        var seenPages: Set<Int> = []
+        let firstChipPerPage = chipMarkers.filter { seenPages.insert($0.0).inserted }
+        return DocumentChatPanelMeasurements(
+            hostBounds: host.bounds,
+            chat: chat,
+            composer: composer,
+            actions: actions,
+            composerField: fields.first.map { host.convert($0.bounds, from: $0) },
+            askButton: buttons.first.map { host.convert($0.bounds, from: $0) },
+            historyContentHeight: history?.documentView?.frame.height ?? 0,
+            historyViewportHeight: history?.contentView.bounds.height ?? 0,
+            chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
+        )
+    }
+
+    @MainActor
+    private static func findView<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+        if let found = view as? T { return found }
+        for subview in view.subviews {
+            if let found = findView(type, in: subview) { return found }
+        }
+        return nil
+    }
+
+    @MainActor
+    private static func findViews<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+        var found: [T] = []
+        if let value = view as? T { found.append(value) }
+        for subview in view.subviews {
+            found.append(contentsOf: findViews(type, in: subview))
+        }
+        return found
+    }
+}
 
 /// Runs `body` with stdout and stderr captured, then returns everything written. Used to prove the
 /// key is not logged. The body must not call `require` (its PASS line would be captured too).

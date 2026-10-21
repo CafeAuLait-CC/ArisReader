@@ -29,7 +29,11 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
         self.blocks = blocks
     }
 
-    public static func parse(_ text: String, pageCount: Int) -> AIAnswerMarkdown {
+    public static func parse(
+        _ text: String,
+        pageCount: Int,
+        verifiedPages: Set<Int>? = nil
+    ) -> AIAnswerMarkdown {
         var blocks: [AIAnswerBlock] = []
         var paragraphLines: [String] = []
 
@@ -37,7 +41,7 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
             guard !paragraphLines.isEmpty else { return }
             let joined = paragraphLines.joined(separator: " ")
             paragraphLines.removeAll()
-            let runs = inlineRuns(joined, pageCount: pageCount)
+            let runs = inlineRuns(joined, pageCount: pageCount, verifiedPages: verifiedPages)
             if !runs.isEmpty {
                 blocks.append(.paragraph(runs))
             }
@@ -53,20 +57,24 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
                 flushParagraph()
                 blocks.append(.heading(
                     level: heading.level,
-                    runs: inlineRuns(heading.text, pageCount: pageCount)
+                    runs: inlineRuns(heading.text, pageCount: pageCount, verifiedPages: verifiedPages)
                 ))
                 continue
             }
             if let bullet = bulletLine(line) {
                 flushParagraph()
-                blocks.append(.bullet(inlineRuns(bullet, pageCount: pageCount)))
+                blocks.append(.bullet(inlineRuns(
+                    bullet, pageCount: pageCount, verifiedPages: verifiedPages
+                )))
                 continue
             }
             if let numbered = numberedLine(line) {
                 flushParagraph()
                 blocks.append(.numbered(
                     number: numbered.number,
-                    runs: inlineRuns(numbered.text, pageCount: pageCount)
+                    runs: inlineRuns(
+                        numbered.text, pageCount: pageCount, verifiedPages: verifiedPages
+                    )
                 ))
                 continue
             }
@@ -77,7 +85,11 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
     }
 
     /// Split one line into plain text and strict `[p.N]` citations.
-    public static func inlineRuns(_ text: String, pageCount: Int) -> [AIInlineRun] {
+    public static func inlineRuns(
+        _ text: String,
+        pageCount: Int,
+        verifiedPages: Set<Int>? = nil
+    ) -> [AIInlineRun] {
         guard !text.isEmpty else { return [] }
         var runs: [AIInlineRun] = []
         var plain = ""
@@ -95,7 +107,8 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
                     cursor += 1
                 }
                 if !digits.isEmpty, cursor < characters.count, characters[cursor] == "]",
-                   let page = Int(digits), page >= 1, page <= pageCount {
+                   let page = Int(digits), page >= 1, page <= pageCount,
+                   verifiedPages?.contains(page) ?? true {
                     if !plain.isEmpty {
                         runs.append(.text(plain))
                         plain = ""
@@ -112,6 +125,36 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
             runs.append(.text(plain))
         }
         return runs
+    }
+
+    /// Every strict `[p.N]` marker in the answer, whether or not the page is in this document
+    /// or was sent. The chat panel compares this with the pages that went out to decide which
+    /// citations are verified and which need a stated reason.
+    public static func allCitedPages(in text: String) -> [Int] {
+        var pages: [Int] = []
+        let characters = Array(text)
+        var index = 0
+        while index < characters.count {
+            guard characters[index] == "[",
+                  index + 2 < characters.count,
+                  characters[index + 1] == "p",
+                  characters[index + 2] == "." else {
+                index += 1
+                continue
+            }
+            var cursor = index + 3
+            var digits = ""
+            while cursor < characters.count, characters[cursor].isNumber {
+                digits.append(characters[cursor])
+                cursor += 1
+            }
+            if !digits.isEmpty, cursor < characters.count, characters[cursor] == "]",
+               let page = Int(digits), !pages.contains(page) {
+                pages.append(page)
+            }
+            index = max(index + 1, cursor)
+        }
+        return pages
     }
 
     /// Every page number the answer would link to, for checks and for the panel's footer.
