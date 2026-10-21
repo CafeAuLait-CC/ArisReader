@@ -670,6 +670,9 @@ extension ReaderChecks {
         for index in 0..<4_096 {
             claim(PlacementIndex.ownNote(index), "sidecar placed-text glyph \(index)")
         }
+        for index in 0..<4_096 {
+            claim(PlacementIndex.aiSource(index), "AI source-highlight box \(index)")
+        }
 
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
@@ -683,10 +686,11 @@ extension ReaderChecks {
               "the last loaded annotation's last box")
         claim(PlacementIndex.documentNote(PlacementIndex.block - 1), "the last note glyph")
         claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last sidecar placed-text glyph")
+        claim(PlacementIndex.aiSource(PlacementIndex.block - 1), "the last AI source-highlight box")
 
-        require(owner.count == 4_096 * 5 + 4_096 * 64 + 6,
+        require(owner.count == 4_096 * 6 + 4_096 * 64 + 7,
                 "page rasters, the selection, this reader's annotations, loaded annotations, "
-                    + "sidecar placed-text glyphs and note glyphs never share a placement index (\(owner.count) distinct indices, "
+                    + "sidecar placed-text glyphs, note glyphs and the AI source highlight never share a placement index (\(owner.count) distinct indices, "
                     + "including the ends of each block)")
     }
 

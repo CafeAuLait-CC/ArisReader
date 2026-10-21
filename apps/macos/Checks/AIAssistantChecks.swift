@@ -312,7 +312,7 @@ extension ReaderChecks {
             return nil
         }
         require(pages == [2], "spaced, zero and range forms are not linkified")
-        require(AIAnswerMarkdown.allCitedPages(in: "One [p.7], again [p.2], duplicate [p.2], zero [p.0].") == [7, 2],
+        require(AIAnswerMarkdown.allCitedPages(in: "One [p.7], again [p.2], duplicate [p.2], zero [p.0].") == [7, 2, 0],
                 "the chat verification scan sees every strict citation, including out-of-range pages")
         require(AIAnswerMarkdown.allCitedPages(in: "[p. 3] [pp.1-2] [12]").isEmpty,
                 "the verification scan does not invent citations from other forms")

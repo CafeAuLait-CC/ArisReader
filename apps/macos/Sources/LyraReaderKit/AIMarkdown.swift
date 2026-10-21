@@ -149,7 +149,7 @@ public struct AIAnswerMarkdown: Equatable, Sendable {
                 cursor += 1
             }
             if !digits.isEmpty, cursor < characters.count, characters[cursor] == "]",
-               let page = Int(digits), page >= 1, !pages.contains(page) {
+               let page = Int(digits), !pages.contains(page) {
                 pages.append(page)
             }
             index = max(index + 1, cursor)
