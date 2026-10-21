@@ -106,7 +106,17 @@ public struct ReaderWindow: View {
             Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
             Button("Cancel",role:.cancel) {state.cancelContentClose()}
         } message: {Text(state.isReadOnlyDocument ? "Save an unsigned copy to keep these changes." : "Save these changes to the original PDF before closing.")}
-        .onAppear { state.installTerminationHandling() }
+        .onAppear {
+            state.installTerminationHandling()
+            // The in-place action uses the same provider settings and target language as the
+            // assistant panel; there is exactly one AI configuration in a window.
+            state.inPlaceTranslationSettingsOverride = aiAssistant.settings
+            state.inPlaceTranslationAuditOverride = aiAssistant.audit
+            state.inPlaceTranslationTargetLanguage = aiAssistant.targetLanguage
+        }
+        .onChange(of: aiAssistant.targetLanguage) { _, language in
+            state.inPlaceTranslationTargetLanguage = language
+        }
         // Tell the state whether this toggle is a real animation. The state holds the width-only
         // viewport updates (and releases one rebuild) for the slide, because a loaded machine can
         // take longer per frame than the ordinary coalescing window.
@@ -200,6 +210,8 @@ public struct ReaderWindow: View {
                 paperAppearance: appearance.mode,
                 annotationMarks: state.canvasAnnotationMarks,
                 annotationPageFrames: state.canvasPageSegments,
+                translationOverlays: state.translationOverlays,
+                translationPaperColors: state.translationPaperColors,
                 redactionMarks: state.pendingRedactionMarks,
                 annotationTool: state.annotationTool,
                 regionSelectionArmed: state.regionSelectionArmed,
@@ -294,7 +306,9 @@ public struct ReaderWindow: View {
                 // the reader's state (`CanvasContextMenu`), so no item is shown dead.
                 onContextMenu: { point in
                     CanvasContextMenu.menu(state: state, at: point)
-                }
+                },
+                onTranslationToggle: { id in state.toggleTranslation(id: id) },
+                onTranslationCancel: { id in state.cancelTranslation(id: id) }
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
 
@@ -357,7 +371,8 @@ public struct ReaderWindow: View {
                 || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil
                 || state.eraserRefusalNotice != nil
-                || state.regionRefusalMessage != nil {
+                || state.regionRefusalMessage != nil
+                || state.translationNotice != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
@@ -371,6 +386,9 @@ public struct ReaderWindow: View {
                     }
                     if state.regionRefusalMessage != nil {
                         regionRefusalBanner
+                    }
+                    if state.translationNotice != nil {
+                        translationBanner
                     }
                     if state.hasPendingInkErasure || state.hasPendingFileDeletions {
                         eraserPendingBanner
@@ -479,6 +497,40 @@ public struct ReaderWindow: View {
             rightPanelVisible: state.rightPanelVisible,
             rightPanelContentWidth: state.rightPanelWidthPt
         )
+    }
+
+    /// What the in-place translation layer just did, including why an overlay disappeared after
+    /// a page edit. It is a status sentence, not a warning about the file: the PDF is untouched.
+    private var translationBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "character.bubble")
+                .foregroundStyle(LyraReaderTheme.accent)
+            Text(state.translationNotice ?? "")
+                .font(.callout)
+                .frame(maxWidth: 640, alignment: .leading)
+            Spacer(minLength: 0)
+            Button {
+                state.dismissTranslationNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss translation message")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.accent.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.translationNotice ?? "Translation status")
     }
 
     /// The read-only explanation for a digitally signed document.

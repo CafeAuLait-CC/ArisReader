@@ -27,6 +27,13 @@ import Foundation
         directory(for: document).appendingPathComponent("annotations.json")
     }
 
+    /// In-place translations live in the document's edit-cache directory, beside the annotations
+    /// and revisions. They are never written next to the PDF: a translation is reader state, not
+    /// document content, and it must not travel with a shared file.
+    public static func translationsURL(for document: URL) -> URL {
+        directory(for: document).appendingPathComponent("translations.json")
+    }
+
     static func legacyURLs(for document: URL) -> [URL] {
         [document.appendingPathExtension("lyra-reader-annotations.json"),
          document.appendingPathExtension("aris-annotations.json")]

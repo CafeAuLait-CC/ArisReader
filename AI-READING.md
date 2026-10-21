@@ -29,3 +29,32 @@ its embedded files, the file path, annotations, reading history and other docume
 a whole-document summary does send every page's extracted text. A Rust guard
 (`crates/lyra-reader-ai/tests/network_guard.rs`) fails if the AI layer gains an unlisted network
 call or an analytics identifier without an explicit opt-in gate.
+
+## In-place translation
+
+Selecting a paragraph (or a free range) and choosing **Translate** draws the translation over the source block
+instead of opening a panel. The source stays untouched underneath; **Show original** removes the cover exactly and
+**Translate** brings the cached result back, both without a request. The control chip is fixed-size so it stays
+readable at any zoom and is hidden when its block is off screen.
+
+The cover uses the page's sampled paper colour. Text starts at the block's source size and shrinks to a **7 pt**
+minimum; if it still does not fit, the last visible line is ellipsised and the chip's ⋯ control discloses the full
+translation. The reader can also review it in the side panel; the in-place layer is presentation only.
+
+A block is one request. A multi-paragraph selection is a bounded batch of independent block requests with at most
+**three in flight**; a block that fails or is cancelled is left untranslated while the others commit. Entries are
+cached in `translations.json` inside the document's edit-cache directory, keyed by the source-text hash, the block
+rectangle in page-local 100% coordinates, the target language, the model and the prompt version. Changing the model
+or language asks for a new entry and keeps the old one valid; editing one block removes only that block's entry.
+Page rotation, deletion or a reflow that moves the block removes the affected overlays with an explanation. No PDF,
+annotation or region-card export is modified.
+
+A region card can tear the page into two display pieces with the card in the gap. Translation covers use the same
+piecewise page mapping as annotations and selection: a block above or below the tear covers only its piece, and a
+block crossing it is clipped into both pieces rather than painted through the card. The chip anchors to the piece
+with the most visible area and never sits in the gap. Opening or closing the tear only re-maps the overlay: the
+page-local cache key is unchanged, so toggling the tear sends no request.
+
+In-place block requests start through the same audited start site as the panel: one audit record per outgoing
+block request. Show original, Translate from the cache, scroll, a tab switch, a relaunch and opening or closing a
+tear add no record because they leave the machine.

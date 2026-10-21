@@ -486,6 +486,14 @@ struct AIAuditPart {
 /// a plan with several parts is several outgoing requests, and the audit must not turn them into
 /// one line. `markPartStarted` closes the previous part as sent (the transport only moves on
 /// after it succeeded); the terminal event closes the current part with its real outcome.
+///
+/// **The duration anchor is the attempt's start, not the part's.** `AIAuditedRequestStart` is
+/// entered when the reader's action is approved and the request is about to leave; the first
+/// `partStarted` can arrive much later on a loaded machine (the worker queues, the poll loop is
+/// scheduled late, or the provider is slow to respond). Timing from the part's own first event
+/// reported 25 ms for a request that was actually open for 120 ms. Every record for one attempt
+/// therefore carries the whole interval from approval to its terminal event, including the wait
+/// before the transport produced its first part.
 @MainActor
 final class AIAuditAttempt {
     private let trail: AIAuditTrail
@@ -494,7 +502,7 @@ final class AIAuditAttempt {
     private let model: String
     private let parts: [AIAuditPart]
     private let startedAt: Date
-    private var currentPart: (index: Int, startedAt: Date)?
+    private var currentPart: Int?
     private var recordedParts: Set<Int> = []
     private var startedAnyPart = false
     private var refusalRecorded = false
@@ -511,13 +519,13 @@ final class AIAuditAttempt {
     }
 
     func markPartStarted(_ index: Int) {
-        guard !finished, currentPart?.index != index else { return }
+        guard !finished, currentPart != index else { return }
         if let previous = currentPart {
-            // The transport started a later part, so the previous part completed. Its own
-            // duration ends here, not at the end of the whole plan.
-            record(part: previous.index, outcome: .sent, code: nil, startedAt: previous.startedAt)
+            // The transport started a later part, so the previous part completed. Its duration
+            // ends here; it still covers the attempt's queue wait.
+            record(part: previous, outcome: .sent, code: nil)
         }
-        currentPart = (index, Date())
+        currentPart = index
         startedAnyPart = true
     }
 
@@ -525,8 +533,7 @@ final class AIAuditAttempt {
         guard !finished else { return }
         finished = true
         if let currentPart {
-            record(part: currentPart.index, outcome: outcome, code: code,
-                   startedAt: currentPart.startedAt)
+            record(part: currentPart, outcome: outcome, code: code)
             self.currentPart = nil
             return
         }
@@ -544,12 +551,11 @@ final class AIAuditAttempt {
             image: nil,
             outcome: outcome,
             code: code,
-            durationMilliseconds: max(0, Int((Date().timeIntervalSince(startedAt) * 1000).rounded()))
+            durationMilliseconds: elapsedMilliseconds()
         ))
     }
 
-    private func record(part index: Int, outcome: AIAuditOutcome, code: AIAuditCode?,
-                        startedAt: Date) {
+    private func record(part index: Int, outcome: AIAuditOutcome, code: AIAuditCode?) {
         guard !recordedParts.contains(index),
               let part = parts.first(where: { $0.index == index })
         else { return }
@@ -564,8 +570,38 @@ final class AIAuditAttempt {
             image: part.image,
             outcome: outcome,
             code: code,
-            durationMilliseconds: max(0, Int((Date().timeIntervalSince(startedAt) * 1000).rounded()))
+            durationMilliseconds: elapsedMilliseconds()
         ))
+    }
+
+    /// The whole interval this attempt has been open, in milliseconds. The attempt is created at
+    /// the audited start site, so this includes the wait before any part event and, for a
+    /// cancelled request, the time the reader had it in flight.
+    private func elapsedMilliseconds() -> Int {
+        max(0, Int((Date().timeIntervalSince(startedAt) * 1000).rounded()))
+    }
+}
+
+/// The one start site for audited AI transports.
+///
+/// Both the assistant panel and the in-place translator build their transport inside the
+/// closure; this function appends the attempt before the transport exists, wraps the handle, and
+/// turns a start failure into a `refused` record. There is deliberately no second audit path.
+@MainActor
+enum AIAuditedRequestStart {
+    static func start(
+        plan: AiPlanRecord,
+        kind: AIAuditAction,
+        audit: AIAuditTrail,
+        makeHandle: () throws -> any AIChatHandle
+    ) throws -> any AIChatHandle {
+        let attempt = audit.begin(plan: plan, kind: kind)
+        do {
+            return AIAuditedChatHandle(base: try makeHandle(), attempt: attempt)
+        } catch {
+            attempt.finish(.refused, code: AIAuditCode.classifyStartFailure(error))
+            throw error
+        }
     }
 }
 

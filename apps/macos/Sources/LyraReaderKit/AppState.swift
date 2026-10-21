@@ -304,7 +304,7 @@ public enum ReadingLayoutPreferences {
 }
 
 @MainActor
-public final class AppState: ObservableObject {
+public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Enabled by the application entry point; library/check hosts never alter user history.
     public static var recordsRecentDocuments = false
     @Published public var document: LoadedDocument?
@@ -440,7 +440,9 @@ public final class AppState: ObservableObject {
     private var contentLoadToken = UUID()
 
     /// Pages the canvas should draw right now (usually one or two while scrolling).
-    @Published public private(set) var canvasPages: [CanvasPage] = []
+    @Published public private(set) var canvasPages: [CanvasPage] = [] {
+        didSet { refreshTranslationPaperColors() }
+    }
     private var canvasTiles: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public internal(set) var scrollYPt: CGFloat = 0
@@ -1353,6 +1355,207 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     @Published public private(set) var selection: Selection?
+
+    // MARK: - In-place translation
+    //
+    // Translation is a presentation overlay, never a document modification. `translationOverlays`
+    // is what the canvas draws; `inPlaceTranslation` owns the cache and the requests. Nothing in
+    // this section writes into the PDF, the annotation cache or the region-card export.
+    @Published public private(set) var translationOverlays: [TranslationOverlay] = []
+    /// One reader-facing sentence about the last translation action, including removals caused by
+    /// a page edit. The window shows it as a dismissible banner.
+    @Published public internal(set) var translationNotice: String?
+    /// Page paper colours sampled from the visible rasters, so a cover matches the paper it sits
+    /// on instead of assuming white.
+    @Published public private(set) var translationPaperColors: [Int: TranslationPaperColor] = [:]
+    /// The language the in-place action requests. The window keeps this in step with the AI
+    /// panel's target-language field; a check can set it directly.
+    public var inPlaceTranslationTargetLanguage = "English"
+    /// Injection points for the native checks. Production leaves both nil and uses the window's
+    /// assistant settings and the engine's AI service.
+    public var inPlaceTranslationServiceOverride: (() -> (any AIChatServicing)?)?
+    public var inPlaceTranslationSettingsOverride: AISettingsStore?
+    /// The audit trail the in-place requests append to. Production points it at the window
+    /// assistant's trail; the checks inject an isolated file.
+    public var inPlaceTranslationAuditOverride: AIAuditTrail?
+    /// The original PDF whose cache owns the translations. A page-edit revision on screen must
+    /// not create a second cache directory.
+    private var translationCacheDocumentURL: URL?
+
+    var translationDocumentURL: URL? { translationCacheDocumentURL }
+    var translationDocumentTitle: String { document?.title ?? "" }
+    var translationPageCount: Int { document?.pageCount ?? 0 }
+    var translationCurrentPage: Int { currentPage }
+    var translationLanguage: String { inPlaceTranslationTargetLanguage }
+    var translationService: (any AIChatServicing)? {
+        inPlaceTranslationServiceOverride?() ?? aiChatService
+    }
+    var translationSettings: AISettingsStore? {
+        inPlaceTranslationSettingsOverride ?? AISettingsStore.shared
+    }
+    var translationAudit: AIAuditTrail {
+        inPlaceTranslationAuditOverride ?? AIAuditTrail.shared
+    }
+    var translationPaperAppearance: PaperAppearance { ReadingAppearanceStore.shared.mode }
+
+    lazy var inPlaceTranslation: InPlaceTranslationController = {
+        let controller = InPlaceTranslationController()
+        controller.host = self
+        return controller
+    }()
+
+    /// The action the context menu and toolbar offer for the current selection. Nil when there
+    /// is no selection.
+    public var translationSelectionAction: TranslationSelectionAction? {
+        guard let selection else { return nil }
+        return inPlaceTranslation.action(for: selection.range, page: selection.page)
+    }
+
+    public var translationSelectionTitle: String {
+        switch translationSelectionAction {
+        case .showOriginal: return "Show original"
+        case .showTranslation, .translate: return "Translate"
+        case .cancel: return "Cancel Translation"
+        case .retry: return "Retry Translation"
+        case nil: return "Translate"
+        }
+    }
+
+    public var canTranslateSelection: Bool {
+        guard selection != nil, document != nil else { return false }
+        return true
+    }
+
+    /// Run the Translate / Show original action for the current selection.
+    ///
+    /// This is the only entry point: the context menu, the toolbar, ⇧⌘L and the Reading menu
+    /// all call it. The first press is the explicit action that may start requests; a flip after
+    /// that never does.
+    @discardableResult
+    public func performTranslationAction() -> Bool {
+        guard let selection else {
+            translationNotice = "Select text on the page first; there is nothing to translate."
+            return false
+        }
+        switch inPlaceTranslation.action(for: selection.range, page: selection.page) {
+        case .showOriginal:
+            for entry in inPlaceTranslation.entries(overlapping: selection.range,
+                                                     page: selection.page) {
+                inPlaceTranslation.showOriginal(entry.key)
+            }
+            return true
+        case .showTranslation:
+            for entry in inPlaceTranslation.entries(overlapping: selection.range,
+                                                     page: selection.page) {
+                inPlaceTranslation.showTranslation(entry.key)
+            }
+            return true
+        case .cancel:
+            for overlay in translationOverlays where overlay.page == selection.page
+                && overlay.isTranslating
+                && overlay.range?.overlaps(selection.range) == true {
+                inPlaceTranslation.cancel(overlay.id)
+            }
+            return true
+        case .retry:
+            for overlay in translationOverlays where overlay.page == selection.page {
+                guard case .failed = overlay.phase else { continue }
+                guard overlay.range?.overlaps(selection.range) == true else { continue }
+                inPlaceTranslation.retry(overlay.id)
+            }
+            return true
+        case .translate:
+            Task { @MainActor [weak self] in
+                await self?.beginInPlaceTranslation(selection)
+            }
+            return true
+        }
+    }
+
+    /// Translate the current selection. Called by the context menu and toolbar after the reader
+    /// has already made a selection.
+    @discardableResult
+    public func translateSelection() -> Bool {
+        performTranslationAction()
+    }
+
+    /// Chip actions. A toggle never sends: the cached entry is already in memory and on disk.
+    public func toggleTranslation(id: String) {
+        inPlaceTranslation.toggle(id)
+    }
+
+    public func cancelTranslation(id: String) {
+        inPlaceTranslation.cancel(id)
+    }
+
+    /// Test hook: establish a text selection without synthesising pointer events. The native
+    /// checks use it to address the same character range the canvas would produce.
+    func selectTranslationRange(page: Int, range: ClosedRange<Int>) {
+        selection = Selection(page: page, range: range)
+        selectionAnchor = nil
+    }
+
+    /// Flip the translation of the block the selection is in, if there is one.
+    @discardableResult
+    public func toggleTranslationForSelection() -> Bool {
+        performTranslationAction()
+    }
+
+    private func beginInPlaceTranslation(_ selection: Selection) async {
+        guard let textPage = await translationTextPage(selection.page) else {
+            translationNotice = "The text layer for this page could not be read, so nothing was sent."
+            return
+        }
+        let targets = TranslationTargetResolver.targets(
+            page: selection.page, range: selection.range, textPage: textPage)
+        guard !targets.isEmpty else {
+            translationNotice = "The selection has no text to translate."
+            return
+        }
+        inPlaceTranslation.translate(targets: targets)
+    }
+
+    // MARK: - Translation host
+
+    /// Sample the paper colour of every rasterized page. Called when the visible rasters change;
+    /// sampling a handful of pixels per page is cheaper than keeping a separate paper model.
+    private func refreshTranslationPaperColors() {
+        var colors: [Int: TranslationPaperColor] = [:]
+        for page in canvasPages {
+            guard let sampled = TranslationPaperSampler.paperColor(from: page.image) else { continue }
+            let display = ReadingAppearanceStore.shared.mode.displayColor(sampled.nsColor)
+            colors[page.placement.index] = TranslationPaperColor(nsColor: display)
+        }
+        if colors != translationPaperColors {
+            translationPaperColors = colors
+        }
+    }
+
+    func translationTextPage(_ page: Int) async -> TextPage? {
+        if let cached = textPages[page] { return cached }
+        guard page >= 0, page < (document?.pageCount ?? 0) else { return nil }
+        guard let text = try? await engine.textPage(page) else { return nil }
+        if document != nil { textPages[page] = text }
+        return text
+    }
+
+    func translationPaperColor(page: Int) -> TranslationPaperColor? {
+        translationPaperColors[page]
+    }
+
+    func translationDidChangeOverlays(_ overlays: [TranslationOverlay]) {
+        translationOverlays = overlays
+    }
+
+    func translationDidChangeNotice(_ notice: String?) {
+        translationNotice = notice
+    }
+
+    /// Dismiss the translation banner. It carries no state the reader can lose.
+    public func dismissTranslationNotice() {
+        translationNotice = nil
+        inPlaceTranslation.setNotice(nil)
+    }
 
     /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
     /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
@@ -2596,6 +2799,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var placedGlyphTextures: [PlacedGlyphKey: PageImage]
         var undoStack: [UndoableAction]
         var redoStack: [UndoableAction]
+        /// Completed translations and their show-original flags travel with the tab. In-flight
+        /// requests do not: switching tabs cancels them and leaves those blocks untranslated.
+        var translationSnapshot: TranslationSessionSnapshot
+        var translationDocumentURL: URL?
     }
 
     private struct RetainedTab {
@@ -3274,6 +3481,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadDocumentAnnotations()
             loadFormInfo()
             restoreCachedPageEdits(for: url)
+            // In-place translations belong to the original file's document cache. Load after a
+            // cached page-edit session has opened its working revision, so the cache directory is
+            // still the original PDF's, never a revision path.
+            translationCacheDocumentURL = url
+            refreshTranslationPaperColors()
+            inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
             return true
 
         } catch {
@@ -3367,6 +3580,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isSearching = false
         selection = nil
         selectionAnchor = nil
+        inPlaceTranslation.reset()
+        translationOverlays = []
+        translationNotice = nil
+        translationPaperColors = [:]
+        translationCacheDocumentURL = nil
         clearAISourceHighlight()
         selectedAnnotationID = nil
         pendingMarkSelection = nil
@@ -10055,6 +10273,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard var session = pageEditSession, !pageEditBusy else { return }
         let target = redo ? session.redo.last : session.undo.last
         guard let target, let current = pageEditSnapshot(label: redo ? "redo" : "undo") else { return }
+        let hadTranslations = !inPlaceTranslation.snapshot().isEmpty
         pageEditBusy = true
         defer { pageEditBusy = false }
         if redo {
@@ -10076,6 +10295,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )) != nil else {
             lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
             return
+        }
+        if hadTranslations {
+            inPlaceTranslation.setNotice(
+                "The page layout changed (\(redo ? "redo" : "undo")). In-place translations were "
+                + "removed because their blocks may have moved; the PDF was not modified."
+            )
         }
         session.revisionURL = target.revisionURL
         session.revisionNumber = target.revisionNumber
@@ -10196,6 +10421,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard await ensurePageEditSession() else { return false }
         guard var session = pageEditSession, !pageEditBusy else { return false }
         guard let snapshot = pageEditSnapshot(label: label) else { return false }
+        // A page edit can rotate, move, insert or delete the rectangles a translation covers.
+        // The complete entries travel through the revision and are filtered afterwards; the PDF
+        // itself is never touched by the translation layer.
+        let translationSnapshot = inPlaceTranslation.snapshot()
         let nextNumber = session.revisionNumber + 1
         let nextURL = session.directory.appendingPathComponent("rev-\(nextNumber).pdf")
         pageEditBusy = true
@@ -10254,6 +10483,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 lastError = "The page change was written, but the revision could not be reopened; the original is unchanged"
                 return false
             }
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot,
+                pageMap: report.pageMap,
+                rotatedPages: Set(rotating ?? []),
+                editedPages: [],
+                reason: "The page layout changed (\(label))."
+            )
             session.revisionURL = nextURL
             session.revisionNumber = nextNumber
             session.currentToOriginal = mapping
@@ -10279,6 +10515,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             return true
         } catch {
+            // The revision was not adopted. Put the translation overlays that were on screen
+            // back when they still describe the document that is still open.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
+                reason: nil)
             lastError = "Page change failed; nothing was written: \(error.localizedDescription)"
             statusMessage = "Page change failed"
             // A failed operation may have created a partial revision file; it is never referenced
@@ -10307,10 +10548,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         }
         let previousDocumentURL = document?.url
+        let translationURL = translationCacheDocumentURL
         resetDocumentState()
         var loaded = try engine.openDocument(at: url)
         loaded.title = title
         document = loaded
+        // The working revision is not a new document for translation-cache purposes. The caller
+        // restores the session's entries after this load; keeping the original URL here is what
+        // makes a second cache directory impossible.
+        translationCacheDocumentURL = translationURL
         annotationsURL = annotationRecordsURL
         annotationWritesBlockedReason = nil
         preservedAnnotationEntryCount = 0
@@ -11717,6 +11963,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         }
 
+        // Requests belong to the document leaving the screen. Their partial text is never kept;
+        // completed translations are already in the retained snapshot.
+        inPlaceTranslation.suspend()
+
         let target = tabs[index]
         if let cached = retainedTabs.removeValue(forKey: target.id),
            engine.activateDocument(at: cached.state.document.url ?? cached.url) {
@@ -11920,7 +12170,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noteGlyphTextures: noteGlyphTextures,
             placedGlyphTextures: placedGlyphTextures,
             undoStack: undoStack,
-            redoStack: redoStack
+            redoStack: redoStack,
+            translationSnapshot: inPlaceTranslation.snapshot(),
+            translationDocumentURL: translationCacheDocumentURL
         )
     }
 
@@ -12041,6 +12293,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         placedGlyphTextures = state.placedGlyphTextures
         undoStack = state.undoStack
         redoStack = state.redoStack
+        translationCacheDocumentURL = state.translationDocumentURL
+        inPlaceTranslation.restore(
+            state.translationSnapshot,
+            url: state.translationDocumentURL ?? state.document.url,
+            pageCount: state.document.pageCount
+        )
+        translationPaperColors = [:]
+        refreshTranslationPaperColors()
 
         // Nothing that was in flight for the previous document may land in this one.
         tilesInFlight.removeAll()
@@ -14533,6 +14793,7 @@ extension AppState {
             }
             var next: URL?
             var effectiveCommand = command
+            let translationSnapshot = inPlaceTranslation.snapshot()
             do {
                 if try await materializeAnnotationsInWorkingCopy() {
                     effectiveCommand.revision = try await engine.contentObjects(page: page).revision
@@ -14555,6 +14816,15 @@ extension AppState {
                     at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
                     annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
                     currentPage: currentPage, selection: pageSelection)
+                // The edit may have changed one block's words or reflowed it. Entries on this
+                // page are re-checked individually; translations on every other page survive.
+                await inPlaceTranslation.restoreAfterPageEdit(
+                    translationSnapshot,
+                    pageMap: nil,
+                    rotatedPages: [],
+                    editedPages: [page],
+                    reason: "The edited page changed."
+                )
                 session.revisionURL = destination
                 session.revisionNumber += 1
                 session.operations.append(label)
@@ -14571,6 +14841,12 @@ extension AppState {
                 await reloadContentObjects()
                 return true
             } catch {
+                // The edit did not land, so the blocks and their cached translations are still
+                // the ones on screen. Restore them rather than making a failed command discard
+                // overlays.
+                await inPlaceTranslation.restoreAfterPageEdit(
+                    translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
+                    reason: nil)
                 await reloadContentObjects()
                 preserveContentFailure(
                     effectiveCommand,

@@ -725,9 +725,9 @@ public final class AIAssistantModel: ObservableObject {
     /// hook exactly once, and the audit handle observes the same terminal events as the panel.
     private func startPrepared(_ plan: AiPlanRecord, service: any AIChatServicing,
                                kind: AIAuditAction? = nil) throws -> any AIChatHandle {
-        let attempt = audit.begin(plan: plan, kind: kind ?? AIAuditAction(plan.action))
-        do {
-            let handle: any AIChatHandle
+        try AIAuditedRequestStart.start(
+            plan: plan, kind: kind ?? AIAuditAction(plan.action), audit: audit
+        ) {
             if preparedConnection == .chatGPT {
                 guard settings.connectionMode == preparedConnection else {
                     throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
@@ -736,22 +736,15 @@ public final class AIAssistantModel: ObservableObject {
                       settings.chatGPT.isConnected else {
                     throw AISettingsError.invalid("The ChatGPT account changed or signed out. Prepare a new request.")
                 }
-                handle = ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
-            } else {
-                guard settings.connectionMode == preparedConnection else {
-                    throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
-                }
-                guard let key = try settings.readKey() else {
-                    throw AISettingsError.invalid(Self.noKeyMessage)
-                }
-                handle = try service.start(plan, apiKey: key)
+                return ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
             }
-            return AIAuditedChatHandle(base: handle, attempt: attempt)
-        } catch {
-            // Starting failed before any transport existed: this is a refusal, not a failed
-            // request. `finish` writes zero characters and no pages.
-            attempt.finish(.refused, code: AIAuditCode.classifyStartFailure(error))
-            throw error
+            guard settings.connectionMode == preparedConnection else {
+                throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+            }
+            guard let key = try settings.readKey() else {
+                throw AISettingsError.invalid(Self.noKeyMessage)
+            }
+            return try service.start(plan, apiKey: key)
         }
     }
 
