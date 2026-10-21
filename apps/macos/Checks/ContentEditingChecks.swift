@@ -299,6 +299,12 @@ extension ReaderChecks {
     view.mouseDown(with: event(.leftMouseDown))
     view.mouseUp(with: event(.leftMouseUp))
     require(
+      contentEditorFont("NimbusRomNo9L-Regu", size: 10).familyName?.contains("Times") == true,
+      "embedded Times fonts use a matching caret family")
+    require(
+      contentTextViews(view).first?.enclosingScrollView?.hasVerticalScroller == true,
+      "long native text drafts can scroll inside their frame")
+    require(
       !contentTextViews(view).isEmpty,
       "hosted second click opens a native text caret")
     if ProcessInfo.processInfo.environment["LYRA_CONTENT_UI_PAUSE"] != nil {

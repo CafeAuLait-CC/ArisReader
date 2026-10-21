@@ -46,7 +46,11 @@ public struct PDFContentCommand: Encodable, Sendable {
 struct PDFContentEditor: NSViewRepresentable {
   @ObservedObject var state: AppState
   func makeNSView(context: Context) -> ContentEditorView { ContentEditorView() }
-  static func dismantleNSView(_ view: ContentEditorView, coordinator: ()) { view.commitText() }
+  static func dismantleNSView(_ view: ContentEditorView, coordinator: ()) {
+    // SwiftUI tears down representables while its graph is being invalidated. Publishing an
+    // editor-state change inside that transaction causes an exclusivity trap.
+    Task { @MainActor in view.commitText() }
+  }
   func updateNSView(_ view: ContentEditorView, context: Context) {
     view.state = state
     view.needsDisplay = true
@@ -361,11 +365,12 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     textView.textContainerInset = NSSize(width: 2, height: 2)
     textView.textContainer?.widthTracksTextView = true
     textView.textContainer?.containerSize = NSSize(
-      width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
+      width: scroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
     textView.isVerticallyResizable = true
     textView.isHorizontallyResizable = false
     textView.autoresizingMask = [.width]
-    textView.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+    textView.maxSize = NSSize(
+      width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
     textView.delegate = self
     scroll.documentView = textView
     addSubview(scroll)
@@ -469,7 +474,7 @@ struct ContentEditInspector: View {
           Text("Edit PDF").font(.headline)
           Spacer()
           Button {
-            state.contentEditEnabled = false
+            state.toggleContentEditing()
           } label: {
             Image(systemName: "xmark")
           }

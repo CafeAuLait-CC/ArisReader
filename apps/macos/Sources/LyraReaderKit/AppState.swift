@@ -13596,6 +13596,7 @@ extension AppState {
     }
 
     public func toggleContentEditing() {
+        if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
         contentEditEnabled.toggle()
         annotationTool = .select
         annotationToolsVisible = false
