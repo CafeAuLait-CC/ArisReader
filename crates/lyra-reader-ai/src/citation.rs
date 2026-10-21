@@ -80,7 +80,7 @@ pub struct ResolvedCitation {
 
 /// Citation/figure index.
 ///
-/// See `docs/06-ai.md` §2 for the build pipeline; cached to sidecar JSON under `(doc_hash, content_epoch)`,
+/// See `docs/06-ai.md` §2 for the build pipeline; cached to JSON in the application cache under `(doc_hash, content_epoch)`,
 /// so it is available within a second on the next open.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct CitationIndex {

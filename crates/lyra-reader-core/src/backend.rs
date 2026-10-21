@@ -670,7 +670,7 @@ pub trait DocumentBackend: Send + Sync {
     /// Annotations **already stored in the document** (highlights, notes, free text, …).
     ///
     /// Read-only and page-scoped like [`DocumentBackend::links`]: this is what someone else's
-    /// PDF carries, not what this application wrote (that lives in the sidecar).
+    /// PDF carries, not what this application wrote (that lives in the application's annotation cache).
     fn annotations(&self, page: PageIndex) -> Result<Vec<RawAnnotation>>;
 
     /// Raw text layer (built lazily and cached by the upper layer).

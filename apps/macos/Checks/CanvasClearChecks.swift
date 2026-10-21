@@ -317,7 +317,7 @@ extension ReaderChecks {
             return leftCanvas.frameAttemptCount > attemptsAfterClear
                 && (leftCanvas.lastAttemptedQuadCount ?? 0) > 0
         }
-        // Sidecar annotations loaded from the reopened file are legitimate quads of the *new*
+        // cached annotations loaded from the reopened file are legitimate quads of the *new*
         // document, not resurrected pages, so the cache assertions look only at page-bearing
         // quads (a whole-page raster or a zoom tile names the page it belongs to).
         let reopenedPageQuads = left.state.canvasPages.filter {

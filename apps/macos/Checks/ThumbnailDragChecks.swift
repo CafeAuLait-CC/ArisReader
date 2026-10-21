@@ -29,18 +29,18 @@ extension ReaderChecks {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        func sidecarEntry<Value: Encodable>(_ value: Value) throws -> String {
+        func recordsEntry<Value: Encodable>(_ value: Value) throws -> String {
             let encoded = String(decoding: try encoder.encode([value]), as: UTF8.self)
             return String(encoded.dropFirst(2).dropLast(2))
         }
-        func writeSidecar(
+        func writeAnnotationRecords(
             _ annotations: [AppState.Annotation],
             _ bookmarks: [Bookmark],
             beside document: URL
         ) throws {
             var lines: [String] = []
-            for annotation in annotations { lines.append(try sidecarEntry(annotation)) }
-            for bookmark in bookmarks { lines.append(try sidecarEntry(bookmark)) }
+            for annotation in annotations { lines.append(try recordsEntry(annotation)) }
+            for bookmark in bookmarks { lines.append(try recordsEntry(bookmark)) }
             try Data(("[\n" + lines.joined(separator: ",\n") + "\n]").utf8)
                 .write(to: DocumentEditCache.annotationsURL(for: document))
         }
@@ -213,16 +213,16 @@ extension ReaderChecks {
 
         // ── Drag page 3 before page 1, through the staged session ───────────────
         let dragURL = try copyFixture("multipage.pdf", to: "drag-pages.pdf")
-        try writeSidecar(
+        try writeAnnotationRecords(
             [annotation("Page 1 mark", page: 0),
              annotation("Page 2 mark", page: 1),
              annotation("Page 3 mark", page: 2)],
             [Bookmark(page: 1, title: "on page two", yPt: 12)],
             beside: dragURL
         )
-        let sidecarURL = DocumentEditCache.annotationsURL(for: dragURL)
+        let annotationRecordsURL = DocumentEditCache.annotationsURL(for: dragURL)
         let originalPDF = try Data(contentsOf: dragURL)
-        let originalSidecar = try Data(contentsOf: sidecarURL)
+        let originalRecords = try Data(contentsOf: annotationRecordsURL)
         let dragState = AppState(engine: try RustEngine())
         require(dragState.open(url: dragURL), "drag fixture opens")
         require(dragState.document?.pageCount == 3, "drag fixture has three pages")
@@ -294,11 +294,11 @@ extension ReaderChecks {
         require(dragState.bookmarks.first?.page == 2,
                 "the bookmark follows its page through the drag")
         let pendingDragPDF = try Data(contentsOf: dragURL)
-        let pendingDragSidecar = try Data(contentsOf: sidecarURL)
+        let pendingDragRecords = try Data(contentsOf: annotationRecordsURL)
         require(pendingDragPDF == originalPDF,
                 "the original PDF is byte-identical while the drag is pending")
-        require(pendingDragSidecar == originalSidecar,
-                "the original sidecar is byte-identical while the drag is pending")
+        require(pendingDragRecords == originalRecords,
+                "the original annotation cache is byte-identical while the drag is pending")
 
         dragState.undoPageEdit()
         try await eventually("undo the dragged reorder", {
@@ -330,16 +330,16 @@ extension ReaderChecks {
         _ = try fixtureEngine.openDocument(at: fiveAPages)
         let fivePages = scratch.appendingPathComponent("block-five.pdf")
         _ = try await fixtureEngine.applyPageOperation(.insertBlank(index: 4), to: fivePages)
-        try writeSidecar(
+        try writeAnnotationRecords(
             [annotation("Page 2 mark", page: 1),
              annotation("Page 3 mark", page: 2),
              annotation("Blank mark", page: 3)],
             [Bookmark(page: 2, title: "on page three", yPt: 10)],
             beside: fivePages
         )
-        let fiveSidecar = DocumentEditCache.annotationsURL(for: fivePages)
+        let fiveRecords = DocumentEditCache.annotationsURL(for: fivePages)
         let fiveOriginal = try Data(contentsOf: fivePages)
-        let fiveSidecarBytes = try Data(contentsOf: fiveSidecar)
+        let fiveRecordsBytes = try Data(contentsOf: fiveRecords)
         let blockState = AppState(engine: try RustEngine())
         require(blockState.open(url: fivePages), "five-page block fixture opens")
         require(blockState.document?.pageCount == 5,
@@ -391,11 +391,11 @@ extension ReaderChecks {
         require(blockState.bookmarks.first?.page == 1,
                 "the bookmark follows its page inside a block move")
         let pendingBlockPDF = try Data(contentsOf: fivePages)
-        let pendingBlockSidecar = try Data(contentsOf: fiveSidecar)
+        let pendingBlockRecords = try Data(contentsOf: fiveRecords)
         require(pendingBlockPDF == fiveOriginal,
                 "the block fixture's PDF is byte-identical while pending")
-        require(pendingBlockSidecar == fiveSidecarBytes,
-                "the block fixture's sidecar is byte-identical while pending")
+        require(pendingBlockRecords == fiveRecordsBytes,
+                "the block fixture's annotation cache is byte-identical while pending")
 
         blockState.undoPageEdit()
         try await eventually("undo the block drag", {

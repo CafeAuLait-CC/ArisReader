@@ -1,12 +1,16 @@
 import Foundation
 
-/// Reading and writing the annotation sidecar (`<doc>.pdf.lyra-reader-annotations.json`).
+/// Reading and writing the document's annotation records.
 ///
-/// The sidecar is a JSON array of `AppState.Annotation` entries **and user bookmarks**.
-/// Both live in one file because they are the reader's marks on one document, and the
+/// The records are a JSON array of `AppState.Annotation` entries **and user bookmarks**, stored
+/// as `annotations.json` in the document cache (`DocumentEditCache`). A legacy
+/// `<doc>.pdf.lyra-reader-annotations.json` companion is imported once with a verified backup and
+/// then removed, and every later session reads and writes the cache instead.
+///
+/// Both kinds live in one file because they are the reader's marks on one document, and the
 /// array's per-entry compatibility rule keeps them safe together:
 ///
-/// * **Forward compatibility.** A sidecar written by a newer LyraReader can hold entries this
+/// * **Forward compatibility.** Records written by a newer LyraReader can hold entries this
 ///   version cannot draw: an `ink` kind, a `color` value in a shape this version does not
 ///   know, a field that did not exist yet. Treating those as "the file is invalid" would make
 ///   an older version refuse the file and, if the reader forced a reset, destroy entries the
@@ -26,7 +30,7 @@ import Foundation
 ///   four-entry palette can express. Both keys are read. Only one is written, and which one is
 ///   decided by the colour itself (see `AppState.Annotation.encode(to:)`):
 ///
-///   | sidecar | this build | the build that only knows `colorIndex` |
+///   | records file | this build | the build that only knows `colorIndex` |
 ///   | --- | --- | --- |
 ///   | `colorIndex: 2` | reads it as palette colour 2 — exactly as before | reads it as before |
 ///   | `color` = a palette colour | writes `colorIndex`, no `color` key | reads and draws it normally |
@@ -40,7 +44,7 @@ import Foundation
 ///   without id/page/range, a page outside the document, a duplicate id — is still an error.
 ///   The caller blocks writes rather than replacing a file it does not understand; the UI
 ///   then offers the explicit "back up and start fresh" recovery.
-enum AnnotationSidecar {
+enum AnnotationRecords {
     /// Where an entry came from, so the file can be reproduced in its original order.
     enum Slot: Codable {
         /// An entry this version understands; looking it up by id in the current array keeps
@@ -65,12 +69,12 @@ enum AnnotationSidecar {
         }
     }
 
-    enum SidecarError: LocalizedError {
+    enum RecordError: LocalizedError {
         case structure(String)
 
         var errorDescription: String? {
             switch self {
-            case .structure(let detail): return "Invalid annotation sidecar: \(detail)"
+            case .structure(let detail): return "Invalid annotation records: \(detail)"
             }
         }
     }
@@ -115,7 +119,7 @@ enum AnnotationSidecar {
         for element in elements {
             let elementData = Data(element.utf8)
             guard let object = try? JSONSerialization.jsonObject(with: elementData) as? [String: Any] else {
-                throw SidecarError.structure("an entry is not a JSON object")
+                throw RecordError.structure("an entry is not a JSON object")
             }
 
             let kindText = object["kind"] as? String
@@ -123,23 +127,23 @@ enum AnnotationSidecar {
             // A bookmark is classified before the annotation rules are applied. The `kind`
             // tag is what an annotation-only build sees first too, and it preserves the
             // entry because "bookmark" is a kind it cannot draw.
-            if kindText == Bookmark.sidecarKind {
+            if kindText == Bookmark.recordKind {
                 let unknownKeys = Set(object.keys).subtracting(knownBookmarkKeys)
                 guard unknownKeys.isEmpty else {
                     slots.append(.opaque(element))
                     continue
                 }
                 guard let bookmark = try? JSONDecoder().decode(Bookmark.self, from: elementData) else {
-                    throw SidecarError.structure("a bookmark is missing a required field")
+                    throw RecordError.structure("a bookmark is missing a required field")
                 }
                 guard bookmark.page >= 0, bookmark.page < pageCount else {
-                    throw SidecarError.structure("bookmark page \(bookmark.page + 1) is outside the document")
+                    throw RecordError.structure("bookmark page \(bookmark.page + 1) is outside the document")
                 }
                 guard bookmark.yPt.isFinite, bookmark.yPt >= 0 else {
-                    throw SidecarError.structure("bookmark position \(bookmark.yPt) is invalid")
+                    throw RecordError.structure("bookmark position \(bookmark.yPt) is invalid")
                 }
                 guard seenBookmarkIDs.insert(bookmark.id).inserted else {
-                    throw SidecarError.structure("duplicate bookmark identity")
+                    throw RecordError.structure("duplicate bookmark identity")
                 }
                 bookmarks.append(bookmark)
                 slots.append(.bookmark(bookmark.id))
@@ -182,23 +186,23 @@ enum AnnotationSidecar {
             // hold together: a structurally broken entry still fails the load (and therefore
             // blocks writes) instead of being silently reinterpreted.
             guard let annotation = try? JSONDecoder().decode(AppState.Annotation.self, from: elementData) else {
-                throw SidecarError.structure("an entry is missing a required field")
+                throw RecordError.structure("an entry is missing a required field")
             }
             guard annotation.page >= 0, annotation.page < pageCount else {
-                throw SidecarError.structure("page \(annotation.page + 1) is outside the document")
+                throw RecordError.structure("page \(annotation.page + 1) is outside the document")
             }
             if annotation.kind.isPlacement {
                 guard annotation.hasValidGeometry else {
-                    throw SidecarError.structure(
+                    throw RecordError.structure(
                         "an \(annotation.kind.rawValue) entry has incomplete or non-finite geometry")
                 }
             } else {
                 guard annotation.start >= 0, annotation.end >= annotation.start else {
-                    throw SidecarError.structure("invalid character range \(annotation.start)…\(annotation.end)")
+                    throw RecordError.structure("invalid character range \(annotation.start)…\(annotation.end)")
                 }
             }
             guard seenIDs.insert(annotation.id).inserted else {
-                throw SidecarError.structure("duplicate annotation identity")
+                throw RecordError.structure("duplicate annotation identity")
             }
 
             annotations.append(annotation)
@@ -210,7 +214,7 @@ enum AnnotationSidecar {
 
     // MARK: - Saving
 
-    /// The bytes to write for `annotations` and `bookmarks`, in the sidecar's original entry
+    /// The bytes to write for `annotations` and `bookmarks`, in the annotation cache's original entry
     /// order, with the preserved entries reproduced verbatim.
     ///
     /// Note the shape of the output: entries this version understands go through `JSONEncoder`
@@ -309,13 +313,13 @@ enum AnnotationSidecar {
     private static func entriesBody(of data: Data) throws -> String {
         let text = String(decoding: data, as: UTF8.self)
         guard text.hasPrefix("[\n"), text.hasSuffix("\n]") else {
-            throw SidecarError.structure("unexpected encoder output")
+            throw RecordError.structure("unexpected encoder output")
         }
         return String(text.dropFirst(2).dropLast(2))
     }
 }
 
-/// Scanner for the top-level array of a sidecar.
+/// Scanner for the top-level array of the annotation records file.
 ///
 /// `JSONDecoder` cannot hand back the bytes of an element it does not understand, and a
 /// `JSONSerialization` round trip is *not* byte-faithful (`\/` escaping, number and date
@@ -329,7 +333,7 @@ enum JSONArrayElements {
 
         var errorDescription: String? {
             switch self {
-            case .message(let detail): return "Invalid annotation sidecar: \(detail)"
+            case .message(let detail): return "Invalid annotation records: \(detail)"
             }
         }
     }
@@ -401,7 +405,7 @@ enum JSONArrayElements {
 
         skipWhitespace()
         guard index < count, bytes[index] == UInt8(ascii: "[") else {
-            throw ParseError.message("the sidecar must be a JSON array")
+            throw ParseError.message("the annotation records must be a JSON array")
         }
         index += 1
 

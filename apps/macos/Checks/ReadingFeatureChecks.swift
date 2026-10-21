@@ -3,32 +3,32 @@ import CoreGraphics
 import Foundation
 
 extension ReaderChecks {
-    /// T2.13: bookmarks survive the sidecar's round trip and an older-format file, and every
+    /// T2.13: bookmarks survive the records file's round trip and an older-format file, and every
     /// list operation writes what it says it wrote.
     ///
     /// The compatibility claim is tested from both directions this build can see:
     ///
-    /// * an **older** sidecar (an annotation written before `kind`/bookmarks existed) loads
-    ///   unchanged, and a bookmark can be added beside it without disturbing it;
+    /// * an **older** annotation cache (an annotation written before `kind`/bookmarks existed) loads
+    ///   unchanged, and a bookmark can be added to it without disturbing it;
     /// * a **newer** bookmark entry — one carrying a field this build does not know — is
     ///   preserved byte-for-byte when this build writes the file, and is not misread as one of
     ///   its own bookmarks.
     ///
     /// The third direction, "an annotation-only build preserves the bookmark", is a property of
-    /// `AnnotationSidecar`'s unknown-kind rule that `annotationRecoveryChecks` already pins for
+    /// `AnnotationRecords`'s unknown-kind rule that `annotationRecoveryChecks` already pins for
     /// `ink`: an entry whose `kind` is not `highlight`/`underline` goes to the verbatim slot
     /// before any of its other keys are looked at. The bookmark entries this check inspects all
     /// carry `"kind" : "bookmark"` for exactly that reason.
     @MainActor static func bookmarkChecks(url: URL) async throws {
         let directory = url.deletingLastPathComponent()
         let document = directory.appendingPathComponent("bookmarks-\(UUID()).pdf")
-        let sidecar = DocumentEditCache.annotationsURL(for: document)
+        let records = DocumentEditCache.annotationsURL(for: document)
         try? FileManager.default.removeItem(at: document)
-        try? FileManager.default.removeItem(at: sidecar)
+        try? FileManager.default.removeItem(at: records)
         try FileManager.default.copyItem(at: url, to: document)
         defer {
             try? FileManager.default.removeItem(at: document)
-            try? FileManager.default.removeItem(at: sidecar)
+            try? FileManager.default.removeItem(at: records)
         }
 
         let encoder = JSONEncoder()
@@ -41,14 +41,14 @@ extension ReaderChecks {
             with: encoder.encode(legacyAnnotation)
         ) as! [String: Any]
         legacyObject.removeValue(forKey: "kind")
-        try JSONSerialization.data(withJSONObject: [legacyObject]).write(to: sidecar)
+        try JSONSerialization.data(withJSONObject: [legacyObject]).write(to: records)
 
-        // ── An annotation-only sidecar, then a bookmark beside it ──────────────────────────
+        // ── An annotation-only record file, then a bookmark added to it ────────────────────────
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 900, height: 300))
         state.open(url: document)
         require(state.annotations.count == 1 && state.bookmarks.isEmpty,
-                "an older-format sidecar still loads, with no bookmarks to invent")
+                "an older-format annotation cache still loads, with no bookmarks to invent")
         require(state.annotations.first?.note == "kept from the old build",
                 "the old annotation survives loading the newer model")
 
@@ -62,7 +62,7 @@ extension ReaderChecks {
         require(first.page == 0 && abs(first.yPt - firstPosition) < 0.01,
                 "the bookmark stores the page and the page-local position")
 
-        var fileText = try String(decoding: Data(contentsOf: sidecar), as: UTF8.self)
+        var fileText = try String(decoding: Data(contentsOf: records), as: UTF8.self)
         require(fileText.contains("\"kind\" : \"bookmark\""),
                 "bookmarks carry the discriminator an annotation-only build treats as unknown")
         require(fileText.contains("\"note\" : \"kept from the old build\""),
@@ -119,10 +119,10 @@ extension ReaderChecks {
         let futureEntry = "{\"color\":\"#FF00FFFF\",\"createdAt\":800000000,"
             + "\"id\":\"\(futureID)\",\"kind\":\"bookmark\",\"page\":0,"
             + "\"title\":\"from a newer build\",\"yPt\":12}"
-        fileText = try String(decoding: Data(contentsOf: sidecar), as: UTF8.self)
+        fileText = try String(decoding: Data(contentsOf: records), as: UTF8.self)
         let closed = fileText.hasSuffix("\n]") ? String(fileText.dropLast(2)) : fileText
         let withFuture = closed + ",\n  " + futureEntry + "\n]"
-        try Data(withFuture.utf8).write(to: sidecar)
+        try Data(withFuture.utf8).write(to: records)
 
         let future = AppState(engine: try RustEngine())
         future.setViewportSize(CGSize(width: 900, height: 300))
@@ -133,7 +133,7 @@ extension ReaderChecks {
                 "the extended entry is preserved instead of rejected")
         future.gotoPage(0)
         require(future.addBookmarkAtCurrentPage(name: "Local"), "a write is possible beside a future entry")
-        let rewritten = try String(decoding: Data(contentsOf: sidecar), as: UTF8.self)
+        let rewritten = try String(decoding: Data(contentsOf: records), as: UTF8.self)
         require(rewritten.contains(futureEntry),
                 "the newer entry survives the write byte-for-byte")
         require(rewritten.contains("\"title\" : \"Local\""),

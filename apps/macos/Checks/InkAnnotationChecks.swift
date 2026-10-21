@@ -26,14 +26,14 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
         func json(_ document: URL) throws -> String {
-            String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)
+            String(decoding: try Data(contentsOf: records(for: document)), as: UTF8.self)
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
             guard let frame = state.canvasPageFrames.first(where: { $0.index == page }) else {
@@ -75,12 +75,12 @@ extension ReaderChecks {
                 "the stroke keeps its kind and a constant 2.5 pt width")
         require(savedInk.inkPaths.count == 1 && savedInk.inkPaths[0].count == stroke.count,
                 "every sampled point is stored (\(savedInk.inkPaths.first?.count ?? 0))")
-        let sidecarText = try json(document)
-        require(sidecarText.contains("\"version\" : 1"),
-                "a geometry entry is versioned in the sidecar")
-        require(sidecarText.contains("\"paths\""),
+        let recordsText = try json(document)
+        require(recordsText.contains("\"version\" : 1"),
+                "a geometry entry is versioned in the annotation cache")
+        require(recordsText.contains("\"paths\""),
                 "the stroke's points are stored under the documented key")
-        require(sidecarText.contains("\"strokeWidth\""),
+        require(recordsText.contains("\"strokeWidth\""),
                 "the stroke width is part of the entry")
 
         let reopened = AppState(engine: try RustEngine())
@@ -129,7 +129,7 @@ extension ReaderChecks {
                 "the stored page coordinates do not depend on the zoom the mark was drawn at")
         state.zoomPercent = 100
 
-        // ── 3. All four shapes, and their sidecar round trip ───────────────────────────
+        // ── 3. All four shapes, and their annotation cache round trip ───────────────────────────
         let shapes: [(AppState.Annotation.Kind, CGPoint, CGPoint, CGPoint, CGFloat)] = [
             (.square, CGPoint(x: 90, y: 300), CGPoint(x: 220, y: 380),
              CGPoint(x: 155, y: 300), 2),
@@ -159,12 +159,12 @@ extension ReaderChecks {
             }
             require(found.id == shape.id, "the click finds the \(kind.rawValue) it landed on")
         }
-        let shapeSidecar = try json(document)
-        require(shapeSidecar.contains("\"kind\" : \"square\"")
-                    && shapeSidecar.contains("\"kind\" : \"circle\"")
-                    && shapeSidecar.contains("\"kind\" : \"line\"")
-                    && shapeSidecar.contains("\"kind\" : \"arrow\""),
-                "all four shape kinds are in the sidecar")
+        let shapeRecords = try json(document)
+        require(shapeRecords.contains("\"kind\" : \"square\"")
+                    && shapeRecords.contains("\"kind\" : \"circle\"")
+                    && shapeRecords.contains("\"kind\" : \"line\"")
+                    && shapeRecords.contains("\"kind\" : \"arrow\""),
+                "all four shape kinds are in the annotation cache")
         let reopenedShapes = AppState(engine: try RustEngine())
         reopenedShapes.setViewportSize(CGSize(width: 700, height: 500))
         reopenedShapes.newTab(url: document)
@@ -288,7 +288,7 @@ extension ReaderChecks {
                          CGPoint(x: pageBounds(before).minX, y: pageBounds(before).minY),
                          "undo restores \(kind.rawValue)'s position")
             require(state.annotationWriteCount == writesAfterMove + 1,
-                    "undo wrote the restored position to the sidecar")
+                    "undo wrote the restored position to the annotation cache")
             state.redo()
             guard let redone = state.annotations.first(where: { $0.id == id }) else { continue }
             requireClose(CGPoint(x: pageBounds(redone).minX, y: pageBounds(redone).minY),
@@ -467,7 +467,7 @@ extension ReaderChecks {
   "version" : 2
 }
 """
-        try Data("[\n\(futureEntry)\n]".utf8).write(to: sidecar(for: futureDocument))
+        try Data("[\n\(futureEntry)\n]".utf8).write(to: records(for: futureDocument))
         let future = AppState(engine: try RustEngine())
         future.setViewportSize(CGSize(width: 700, height: 500))
         future.newTab(url: futureDocument)
@@ -478,9 +478,9 @@ extension ReaderChecks {
                                           start: CGPoint(x: 10, y: 10),
                                           end: CGPoint(x: 100, y: 100),
                                           color: red, strokeWidth: 2),
-                "an older build can still edit the sidecar around the future entry")
-        let futureSidecar = try json(futureDocument)
-        require(futureSidecar.contains("\"version\" : 2"),
+                "an older build can still edit the annotation cache around the future entry")
+        let futureRecords = try json(futureDocument)
+        require(futureRecords.contains("\"version\" : 2"),
                 "the future entry survives a save byte-for-byte")
     }
 

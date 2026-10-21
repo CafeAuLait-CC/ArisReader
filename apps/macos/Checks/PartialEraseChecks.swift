@@ -23,14 +23,14 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
-        func sidecarBytes(_ document: URL) throws -> Data {
-            try Data(contentsOf: sidecar(for: document))
+        func recordsBytes(_ document: URL) throws -> Data {
+            try Data(contentsOf: records(for: document))
         }
         func bytes(_ url: URL) throws -> Data { try Data(contentsOf: url) }
         func contains(_ data: Data, _ text: String) -> Bool {
@@ -181,7 +181,7 @@ extension ReaderChecks {
         let middle = try makeState(middleDocument)
         let middleStroke = addStroke(middle, straight)
         let untouchedPDF = try bytes(middleDocument)
-        let untouchedSidecar = try sidecarBytes(middleDocument)
+        let untouchedRecords = try recordsBytes(middleDocument)
         middle.toggleEraserTool()
         let middleCanvas = makeCanvas(middle)
         let middleUndo = middle.undoStack.count
@@ -210,12 +210,12 @@ extension ReaderChecks {
                     "the second piece keeps the original's untouched points")
         requireGap(pieces[0], low: 292, high: 308, "the first piece ends outside the gap")
         requireGap(pieces[1], low: 292, high: 308, "the second piece starts outside the gap")
-        let pendingCutSidecar = String(decoding: try sidecarBytes(middleDocument), as: UTF8.self)
-        require(!pendingCutSidecar.contains(middleStroke.id.uuidString),
-                "the original stroke is gone from the sidecar")
+        let pendingCutRecords = String(decoding: try recordsBytes(middleDocument), as: UTF8.self)
+        require(!pendingCutRecords.contains(middleStroke.id.uuidString),
+                "the original stroke is gone from the annotation cache")
         for piece in pieces {
-            require(pendingCutSidecar.contains(piece.id.uuidString),
-                    "each piece is in the sidecar under its own identity")
+            require(pendingCutRecords.contains(piece.id.uuidString),
+                    "each piece is in the annotation cache under its own identity")
         }
         // Selectable and movable: both are ordinary geometry annotations, not a special case.
         middle.selectTool()
@@ -236,26 +236,26 @@ extension ReaderChecks {
         require(moved.inkPaths[0] == movedFrom.inkPaths[0].map {
             CGPoint(x: $0.x + 10, y: $0.y + 5)
         }, "moving a piece translates its geometry and keeps its identity")
-        // One undo of the move, then one undo of the cut restores the untouched sidecar bytes.
+        // One undo of the move, then one undo of the cut restores the untouched cache bytes.
         middle.undo()
         require(middle.annotations == pieces,
                 "undoing the move returns to the split pieces exactly")
-        let middleSplitSidecar = try sidecarBytes(middleDocument)
+        let middleSplitRecords = try recordsBytes(middleDocument)
         middle.undo()
         require(middle.annotations == [middleStroke],
                 "one undo restores the original stroke's identity and geometry exactly")
-        let middleRestoredSidecar = try sidecarBytes(middleDocument)
-        require(middleRestoredSidecar == untouchedSidecar,
-                "undoing the cut restores the sidecar byte for byte")
+        let middleRestoredRecords = try recordsBytes(middleDocument)
+        require(middleRestoredRecords == untouchedRecords,
+                "undoing the cut restores the cache byte for byte")
         middle.redo()
         require(middle.annotations == pieces,
                 "redo re-applies the same two pieces with the same identities")
-        let middleRedoneSidecar = try sidecarBytes(middleDocument)
-        require(middleRedoneSidecar == middleSplitSidecar,
-                "redo rewrites the same sidecar it wrote after the cut")
+        let middleRedoneRecords = try recordsBytes(middleDocument)
+        require(middleRedoneRecords == middleSplitRecords,
+                "redo rewrites the same annotation cache it wrote after the cut")
 
-        // ── 2b. Sidecar entry order survives a split of a stroke loaded from the sidecar ─
-        // An annotation restored from the sidecar has a slot that fixes its place among other
+        // ── 2b. Annotation cache entry order survives a split of a stroke loaded from the annotation cache ─
+        // An annotation restored from the annotation cache has a slot that fixes its place among other
         // entries. The pieces must take that place, not jump to the end of the file.
         let orderDocument = try copy(drawing, "order.pdf")
         let orderWriter = try makeState(orderDocument)
@@ -264,38 +264,38 @@ extension ReaderChecks {
                                                   CGPoint(x: 500, y: 500)])
         let order = try makeState(orderDocument)
         require(order.annotations.map(\.id) == [orderStroke.id, laterStroke.id],
-                "reopening the sidecar restores the strokes in drawing order")
-        let orderSidecarBefore = try sidecarBytes(orderDocument)
+                "reopening the annotation cache restores the strokes in drawing order")
+        let orderRecordsBefore = try recordsBytes(orderDocument)
         order.toggleEraserTool()
         let orderCanvas = makeCanvas(order)
         drag(orderCanvas, from: content(order, page: 0, CGPoint(x: 300, y: 250)),
              through: [], to: content(order, page: 0, CGPoint(x: 300, y: 350)))
         let orderPieces = order.annotations.filter { y($0) == 300 }
         require(orderPieces.count == 2, "the loaded stroke splits into two pieces")
-        let orderSidecarText = String(decoding: try sidecarBytes(orderDocument), as: UTF8.self)
-        guard let laterRange = orderSidecarText.range(of: laterStroke.id.uuidString) else {
-            fatalError("FAIL: the later stroke is in the sidecar")
+        let orderRecordsText = String(decoding: try recordsBytes(orderDocument), as: UTF8.self)
+        guard let laterRange = orderRecordsText.range(of: laterStroke.id.uuidString) else {
+            fatalError("FAIL: the later stroke is in the annotation cache")
         }
         for piece in orderPieces {
-            guard let pieceRange = orderSidecarText.range(of: piece.id.uuidString) else {
-                fatalError("FAIL: a piece is in the sidecar")
+            guard let pieceRange = orderRecordsText.range(of: piece.id.uuidString) else {
+                fatalError("FAIL: a piece is in the annotation cache")
             }
             require(pieceRange.lowerBound < laterRange.lowerBound,
-                    "a piece's sidecar entry stays before the later stroke's entry")
+                    "a piece's annotation-cache entry stays before the later stroke's entry")
         }
         let reopenedOrder = try makeState(orderDocument)
         require(reopenedOrder.annotations.map(\.id)
                     == [orderPieces[0].id, orderPieces[1].id, laterStroke.id],
                 "reopening puts the pieces where the original stroke was, before later ink")
-        let orderSplitBytes = try sidecarBytes(orderDocument)
+        let orderSplitBytes = try recordsBytes(orderDocument)
         order.undo()
-        let orderRestoredBytes = try sidecarBytes(orderDocument)
-        require(orderRestoredBytes == orderSidecarBefore,
-                "a loaded stroke's undo restores the sidecar byte for byte")
+        let orderRestoredBytes = try recordsBytes(orderDocument)
+        require(orderRestoredBytes == orderRecordsBefore,
+                "a loaded stroke's undo restores the cache byte for byte")
         order.redo()
-        let orderRedoneBytes = try sidecarBytes(orderDocument)
+        let orderRedoneBytes = try recordsBytes(orderDocument)
         require(orderRedoneBytes == orderSplitBytes,
-                "a loaded stroke's redo restores the split sidecar byte for byte")
+                "a loaded stroke's redo restores the split cache byte for byte")
 
         // ── 3. An end cut shortens the stroke; the other end can be cut too ───────────────
         let endDocument = try copy(drawing, "end.pdf")
@@ -334,7 +334,7 @@ extension ReaderChecks {
         let gapsDocument = try copy(drawing, "gaps.pdf")
         let gaps = try makeState(gapsDocument)
         let gapsStroke = addStroke(gaps, straight)
-        let gapsSidecarBefore = try sidecarBytes(gapsDocument)
+        let gapsRecordsBefore = try recordsBytes(gapsDocument)
         let gapsCanvas = makeCanvas(gaps)
         gaps.toggleEraserTool()
         drag(gapsCanvas, from: content(gaps, page: 0, CGPoint(x: 200, y: 250)),
@@ -365,9 +365,9 @@ extension ReaderChecks {
                 "the last piece keeps the original end point")
         gaps.undo()
         require(gaps.annotations == [gapsStroke], "one undo restores both gaps at once")
-        let gapsRestoredSidecar = try sidecarBytes(gapsDocument)
-        require(gapsRestoredSidecar == gapsSidecarBefore,
-                "undoing two gaps restores the sidecar byte for byte")
+        let gapsRestoredRecords = try recordsBytes(gapsDocument)
+        require(gapsRestoredRecords == gapsRecordsBefore,
+                "undoing two gaps restores the cache byte for byte")
 
         // ── 5. One drag across two strokes produces four pieces and one undo step ────────
         let pairDocument = try copy(drawing, "pair.pdf")
@@ -402,7 +402,7 @@ extension ReaderChecks {
                              CGPoint(x: 300, y: CGFloat(yValue)),
                              CGPoint(x: 520, y: CGFloat(yValue))])
         }
-        let fiveSidecarBefore = try sidecarBytes(fiveDocument)
+        let fiveRecordsBefore = try recordsBytes(fiveDocument)
         let fiveCanvas = makeCanvas(five)
         five.toggleEraserTool()
         let fiveUndo = five.undoStack.count
@@ -437,38 +437,38 @@ extension ReaderChecks {
             require(!five.annotations.contains(where: { $0.id == original.id }),
                     "the original stroke \(index + 1) is gone from the model")
         }
-        let fiveSidecar = String(decoding: try sidecarBytes(fiveDocument), as: UTF8.self)
+        let fiveRecords = String(decoding: try recordsBytes(fiveDocument), as: UTF8.self)
         for original in originals {
-            require(!fiveSidecar.contains(original.id.uuidString),
-                    "the original stroke is gone from the sidecar")
+            require(!fiveRecords.contains(original.id.uuidString),
+                    "the original stroke is gone from the annotation cache")
         }
         for piece in five.annotations {
-            require(fiveSidecar.contains(piece.id.uuidString),
-                    "every one of the twelve pieces has its own sidecar entry")
+            require(fiveRecords.contains(piece.id.uuidString),
+                    "every one of the twelve pieces has its own annotation-cache entry")
         }
         let twelve = five.annotations
-        let fiveSidecarAfter = try sidecarBytes(fiveDocument)
+        let fiveRecordsAfter = try recordsBytes(fiveDocument)
         five.undo()
         require(five.annotations == originals,
                 "one undo restores all five original strokes, identities and order exactly")
-        let fiveRestoredSidecar = try sidecarBytes(fiveDocument)
-        require(fiveRestoredSidecar == fiveSidecarBefore,
-                "the restored sidecar is byte-for-byte the untouched sidecar")
+        let fiveRestoredRecords = try recordsBytes(fiveDocument)
+        require(fiveRestoredRecords == fiveRecordsBefore,
+                "the restored cache is byte-for-byte the untouched cache")
         five.redo()
         require(five.annotations == twelve,
                 "one redo re-applies all twelve pieces exactly")
-        let fiveRedoneSidecar = try sidecarBytes(fiveDocument)
-        require(fiveRedoneSidecar == fiveSidecarAfter,
-                "the redone sidecar is byte-for-byte the split sidecar")
+        let fiveRedoneRecords = try recordsBytes(fiveDocument)
+        require(fiveRedoneRecords == fiveRecordsAfter,
+                "the redone cache is byte-for-byte the split cache")
 
         // ── 7. Splitting the same stroke twice, undoing twice: byte-for-byte proof ───────
         // This is the undo contract in its strictest form: a second split must start from the
-        // first split's undone state, and each undo must reproduce the untouched sidecar bytes.
+        // first split's undone state, and each undo must reproduce the untouched cache bytes.
         let twiceDocument = try copy(drawing, "twice.pdf")
         let twice = try makeState(twiceDocument)
         let twiceStroke = addStroke(twice, straight)
         let twicePDF = try bytes(twiceDocument)
-        let twiceSidecar = try sidecarBytes(twiceDocument)
+        let twiceRecords = try recordsBytes(twiceDocument)
         let twiceCanvas = makeCanvas(twice)
         twice.toggleEraserTool()
         func cutMiddleOfTwiceStroke() {
@@ -479,13 +479,13 @@ extension ReaderChecks {
         require(twice.annotations.count == 2, "the first split produces two pieces")
         let firstSplit = twice.annotations
         let firstSplitIDs = Set(firstSplit.map(\.id))
-        let firstSplitSidecar = try sidecarBytes(twiceDocument)
+        let firstSplitRecords = try recordsBytes(twiceDocument)
         twice.undo()
         require(twice.annotations == [twiceStroke],
                 "after the first split, undo restores the untouched stroke exactly")
-        let firstUndoSidecar = try sidecarBytes(twiceDocument)
-        require(firstUndoSidecar == twiceSidecar,
-                "the first undo restores the untouched sidecar byte for byte")
+        let firstUndoRecords = try recordsBytes(twiceDocument)
+        require(firstUndoRecords == twiceRecords,
+                "the first undo restores the untouched cache byte for byte")
         cutMiddleOfTwiceStroke()
         require(twice.annotations.count == 2, "the same stroke splits again after undo")
         let secondSplit = twice.annotations
@@ -494,25 +494,25 @@ extension ReaderChecks {
                 "the second split names its pieces anew; no identity leaks through undo")
         require(firstSplit.map(\.inkPaths) == secondSplit.map(\.inkPaths),
                 "both splits produce exactly the same surviving geometry")
-        let secondSplitSidecar = try sidecarBytes(twiceDocument)
+        let secondSplitRecords = try recordsBytes(twiceDocument)
         twice.undo()
         require(twice.annotations == [twiceStroke],
                 "after the second split, undo restores the untouched stroke exactly")
-        let secondUndoSidecar = try sidecarBytes(twiceDocument)
-        require(secondUndoSidecar == twiceSidecar,
-                "the second undo also restores the untouched sidecar byte for byte")
+        let secondUndoRecords = try recordsBytes(twiceDocument)
+        require(secondUndoRecords == twiceRecords,
+                "the second undo also restores the untouched cache byte for byte")
         let finalPDF = try bytes(twiceDocument)
         require(finalPDF == twicePDF, "neither split wrote the PDF on disk")
         twice.redo()
         require(twice.annotations == secondSplit,
                 "redo re-applies the second split with the same identities and geometry")
-        let redoneSidecar = try sidecarBytes(twiceDocument)
-        require(redoneSidecar == secondSplitSidecar,
-                "redo reproduces the split sidecar byte for byte")
+        let redoneRecords = try recordsBytes(twiceDocument)
+        require(redoneRecords == secondSplitRecords,
+                "redo reproduces the split cache byte for byte")
         twice.undo()
-        let finalUndoSidecar = try sidecarBytes(twiceDocument)
-        require(finalUndoSidecar == twiceSidecar,
-                "a third undo (through redo) still restores the untouched sidecar byte for byte")
+        let finalUndoRecords = try recordsBytes(twiceDocument)
+        require(finalUndoRecords == twiceRecords,
+                "a third undo (through redo) still restores the untouched cache byte for byte")
 
         // ── 8. A saved copy carries the pieces and none of the removed geometry ──────────
         // The distinct x of the vertex in the gap is a token the writer emits as text in
@@ -542,13 +542,13 @@ extension ReaderChecks {
         require(saved, "a copy is saved after the split")
         let saveReport = saveState.lastAnnotationWriteReport
         require(saveReport?.sourceBytesPreserved == true,
-                "a sidecar-only split is an incremental append: the source bytes are preserved")
+                "a reader-only split is an incremental append: the source bytes are preserved")
         require((saveReport?.appendedBytes ?? 0) > 0, "the split copy appends its /Ink entries")
         require(Set(saveReport?.writtenIDs ?? []) == Set(savePieces.map(\.id.uuidString)),
                 "the write report names exactly the two pieces")
         let saveSourceBytes = try bytes(saveDocument)
         require(saveSourceBytes == savePDFBefore,
-                "splitting a sidecar stroke leaves the source PDF byte-identical")
+                "splitting a cached stroke leaves the source PDF byte-identical")
         let saveCopyBytes = try bytes(saveCopyURL)
         require(contains(saveCopyBytes, "/InkList"),
                 "the copy carries the pieces as /InkList")
@@ -604,7 +604,7 @@ extension ReaderChecks {
 
         // ── 9. A stroke the PDF owns follows the cross-reader path ──────────────────────
         // First make a real file-owned ink annotation by saving the stroke into a copy without
-        // splitting it. Reopening that copy reads the ink from the PDF, not from a sidecar.
+        // splitting it. Reopening that copy reads the ink from the PDF, not from an annotation cache.
         let singleSource = try copy(drawing, "file-source.pdf")
         let singleState = try makeState(singleSource)
         let fileStroke = addStroke(singleState, art, width: 3)
@@ -639,14 +639,14 @@ extension ReaderChecks {
         require(fileOwned.pendingFileDeletions.contains(where: { $0.identity == fileInk.id }),
                 "the file-owned original is staged for deletion by identity")
         require(fileOwned.annotations.count == 2,
-                "the file-owned stroke's pieces are sidecar ink annotations")
+                "the file-owned stroke's pieces are reader ink annotations")
         require(fileOwned.annotations.allSatisfy { $0.id != fileStroke.id },
                 "the pieces do not reuse the file-owned annotation's identity")
         let filePieces = fileOwned.annotations
-        let fileSidecar = String(decoding: try sidecarBytes(singleCopyURL), as: UTF8.self)
+        let fileRecords = String(decoding: try recordsBytes(singleCopyURL), as: UTF8.self)
         for piece in filePieces {
-            require(fileSidecar.contains(piece.id.uuidString),
-                    "the piece is in the sidecar while the original is pending deletion")
+            require(fileRecords.contains(piece.id.uuidString),
+                    "the piece is in the annotation cache while the original is pending deletion")
         }
         // One undo puts the file-owned annotation back and cancels the deletion; redo reapplies.
         fileOwned.undo()
@@ -709,7 +709,7 @@ extension ReaderChecks {
 
         // ── 9b. A bare file-owned stroke can still be erased as a whole ────────────────
         // The no-attachment case keeps the old cross-reader contract: tracing the stroke stages
-        // the annotation's deletion, writes no sidecar ink (there are no pieces), and a saved
+        // the annotation's deletion, writes no reader ink (there are no pieces), and a saved
         // copy prunes the original.
         let fullEraseURL = try copy(singleCopyURL, "file-full-erase.pdf")
         let fullErase = try makeState(fullEraseURL)
@@ -736,9 +736,9 @@ extension ReaderChecks {
         require(fullErase.pendingFileDeletions.map { $0.identity } == [fullInk.id],
                 "the whole removal is staged as one file-annotation deletion")
         require(fullErase.annotations.isEmpty,
-                "a fully erased file-owned stroke leaves no sidecar pieces")
+                "a fully erased file-owned stroke leaves no cached pieces")
         require(fullErase.annotationWriteCount == fullWrites,
-                "a fully erased file-owned stroke writes no sidecar")
+                "a fully erased file-owned stroke writes nothing to the annotation cache")
         fullErase.undo()
         require(fullErase.documentAnnotations.contains(where: { $0.id == fullInk.id }),
                 "undo restores the fully erased file-owned stroke")
@@ -766,7 +766,7 @@ extension ReaderChecks {
         require(fullBytesAfter == fullBytesBefore,
                 "the whole-erase source PDF is byte-identical")
 
-        // ── 10. An adopted file-owned stroke: the original leaves the sidecar too ────────
+        // ── 10. An adopted file-owned stroke: the original leaves the annotation cache too ────────
         let adoptedURL = try copy(singleCopyURL, "adopted-source.pdf")
         let adopted = try makeState(adoptedURL)
         try await eventually("the adopted stroke's source loads", {
@@ -784,29 +784,29 @@ extension ReaderChecks {
         }
         require(adoptedAnnotation.fileIdentity == adoptedInk.id,
                 "the adopted stroke carries the file's identity")
-        let adoptedSidecarBeforeCut = try sidecarBytes(adoptedURL)
+        let adoptedRecordsBeforeCut = try recordsBytes(adoptedURL)
         adopted.toggleEraserTool()
         let adoptedCanvas = makeCanvas(adopted)
         drag(adoptedCanvas, from: content(adopted, page: 0, CGPoint(x: 213.375, y: 250)),
              through: [], to: content(adopted, page: 0, CGPoint(x: 213.375, y: 390)))
         require(adopted.annotations.count == 2,
-                "splitting an adopted stroke leaves two ordinary sidecar pieces")
+                "splitting an adopted stroke leaves two ordinary cached pieces")
         require(adopted.annotations.allSatisfy { $0.fileIdentity == nil },
                 "the pieces are new ink, not edits of the PDF annotation")
         require(!adopted.annotations.contains(where: { $0.id == adoptedID }),
-                "the adopted original is removed from the sidecar")
+                "the adopted original is removed from the annotation cache")
         require(adopted.pendingFileDeletions.contains(where: { $0.identity == adoptedInk.id }),
                 "removing the adopted original stages its file annotation for deletion")
         let adoptedPieces = adopted.annotations
-        let adoptedSidecarAfterCut = try sidecarBytes(adoptedURL)
+        let adoptedRecordsAfterCut = try recordsBytes(adoptedURL)
         adopted.undo()
         require(adopted.annotations == [adoptedAnnotation],
                 "undo restores the adopted annotation's identity and file link exactly")
         require(adopted.pendingFileDeletions.isEmpty,
                 "undo cancels the adopted original's pending deletion")
-        let adoptedSidecarAfterUndo = try sidecarBytes(adoptedURL)
-        require(adoptedSidecarAfterUndo == adoptedSidecarBeforeCut,
-                "undoing the adopted split restores its sidecar byte for byte")
+        let adoptedRecordsAfterUndo = try recordsBytes(adoptedURL)
+        require(adoptedRecordsAfterUndo == adoptedRecordsBeforeCut,
+                "undoing the adopted split restores its cache byte for byte")
         adopted.redo()
         require(adopted.annotations == adoptedPieces,
                 "redo re-applies the adopted split exactly")
@@ -876,11 +876,11 @@ extension ReaderChecks {
         }
         performance.endEraserGesture()
         let gestureMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - gestureStart) / 1_000_000
-        print(String(format: "partial erase: full gesture on the 600-point stroke, including the sidecar write, %.2f ms", gestureMilliseconds))
+        print(String(format: "partial erase: full gesture on the 600-point stroke, including the cache write, %.2f ms", gestureMilliseconds))
         require(performance.annotations.count == 2,
                 "the real gesture path also splits the long signature into two pieces")
         require(gestureMilliseconds < 250,
-                "the gesture including the sidecar write stays under 250 ms (measured \(gestureMilliseconds) ms)")
+                "the gesture including the cache write stays under 250 ms (measured \(gestureMilliseconds) ms)")
 
         // ── 11b. A PDF-owned stroke with review text is refused, not orphaned ──────────
         // Splitting a file-owned stroke deletes its annotation identity. When that annotation
@@ -920,7 +920,7 @@ extension ReaderChecks {
             ?? commented.inkPaths[0][0]
         let barePoint = bare.inkPaths.first?.first(where: { $0.x == 300 })
             ?? bare.inkPaths[0][0]
-        // 1) The commented stroke alone: no halo, no cut, no sidecar write, no undo step.
+        // 1) The commented stroke alone: no halo, no cut, no cache write, no undo step.
         require(review.eraserTarget(atContentPoint: content(review, page: 0, commentedPoint))
                     == nil,
                 "the eraser does not promise a cut on a stroke whose thread would be orphaned")
@@ -938,11 +938,11 @@ extension ReaderChecks {
         require(review.pendingFileDeletions.count == refusedPending,
                 "a refused stroke stages no file deletion")
         require(review.annotations == refusedAnnotations,
-                "a refused stroke writes no sidecar pieces")
+                "a refused stroke writes no cached pieces")
         require(review.undoStack.count == refusedUndo,
                 "a refused stroke adds no undo step")
         require(review.annotationWriteCount == refusedWrites,
-                "a refused stroke writes no sidecar")
+                "a refused stroke writes nothing to the annotation cache")
         let refusal = review.eraserRefusalNotice ?? ""
         require(refusal == "This stroke belongs to the PDF and carries a comment, a popup and "
                     + "2 replies; splitting it would delete them.",
@@ -983,7 +983,7 @@ extension ReaderChecks {
         require(review.undoStack.count == reviewUndo + 1,
                 "the part of the drag that did apply is one undo step")
         require(review.annotations.count == 2,
-                "the bare stroke splits into two sidecar pieces")
+                "the bare stroke splits into two cached pieces")
         let reviewPieces = review.annotations
         require(reviewPieces.allSatisfy { $0.fileIdentity == nil },
                 "the pieces are new ink, not edits of the bare annotation")
@@ -1056,7 +1056,7 @@ extension ReaderChecks {
         require(reopenedComment?.hasPopup == true,
                 "the reopened copy still links the popup")
 
-        // ── 11c. The same rule holds after the stroke was adopted into the sidecar ──────
+        // ── 11c. The same rule holds after the stroke was adopted into the annotation cache ──────
         // Adoption moves the file-owned annotation into the editable model but it remains an
         // edit of the PDF's annotation by identity. Its popup is no longer in
         // `documentAnnotations`, so the guard remembers it from the file's annotation list.
@@ -1103,14 +1103,14 @@ extension ReaderChecks {
         require(adoptedReview.undoStack.count == adoptedUndo,
                 "an adopted commented stroke adds no undo step")
         require(adoptedReview.annotationWriteCount == adoptedWrites,
-                "an adopted commented stroke writes no sidecar")
+                "an adopted commented stroke writes nothing to the annotation cache")
         let adoptedRefusal = adoptedReview.eraserRefusalNotice ?? ""
         require(adoptedRefusal.contains("comment") && adoptedRefusal.contains("popup")
                     && adoptedRefusal.contains("2 replies"),
                 "the adopted refusal still names the comment, popup and replies")
 
         // ── 12. Signed documents keep the existing read-only-in-place policy ─────────────
-        // Sidecar ink can still be cut and a copy exported; replacing the signed original is
+        // reader ink can still be cut and a copy exported; replacing the signed original is
         // refused by the same gate as every other in-place write.
         let signedDocument = try copy(signed, "signed-split.pdf")
         let signedState = try makeState(signedDocument)
@@ -1121,7 +1121,7 @@ extension ReaderChecks {
         drag(signedCanvas, from: content(signedState, page: 0, CGPoint(x: 300, y: 230)),
              through: [], to: content(signedState, page: 0, CGPoint(x: 300, y: 290)))
         require(signedState.annotations.count == 2,
-                "a signed document's sidecar ink can still be split")
+                "a signed document's reader ink can still be split")
         require(!signedState.canReplaceOriginalWithAnnotations,
                 "the split cannot replace the signed original in place")
         require(signedState.canSaveAnnotationsToPDF,

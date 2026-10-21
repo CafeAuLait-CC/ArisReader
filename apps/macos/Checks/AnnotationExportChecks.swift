@@ -2,6 +2,11 @@ import LyraReaderKit
 import CoreGraphics
 import Foundation
 
+/// The CSV export's historical `source` value for the reader's own annotations. It is kept so
+/// downstream consumers that already match "sidecar" keep working; new code should read the
+/// annotation cache instead of treating the value as a storage location.
+private let csvReaderAnnotationSource = "sidecar"
+
 extension ReaderChecks {
     /// Annotation text export: exact Markdown structure, RFC 4180 round trip, the no-annotation
     /// path, document order, source labelling, suggested names and the real fixtures.
@@ -45,7 +50,7 @@ extension ReaderChecks {
                 yPt: 40
             ),
             AnnotationExportEntry(
-                id: "sidecar-highlight",
+                id: "cached-highlight",
                 page: 0,
                 kind: "highlight",
                 colorHex: "#FFD84066",
@@ -69,7 +74,7 @@ extension ReaderChecks {
                 yPt: 40
             ),
             AnnotationExportEntry(
-                id: "sidecar-underline",
+                id: "cached-underline",
                 page: 1,
                 kind: "underline",
                 colorHex: "#60A0F0AA",
@@ -126,7 +131,7 @@ extension ReaderChecks {
         - **Colour:** #FFD84066
         - **Author:** Alex
         - **Date:** 2024-06-01T10:00:00Z
-        - **Source:** LyraReader annotation sidecar (saved beside the PDF)
+        - **Source:** LyraReader annotation (stored in the application cache)
 
         **Quote**
 
@@ -144,7 +149,7 @@ extension ReaderChecks {
         - **Colour:** #60A0F0AA
         - **Author:** Alex
         - **Date:** 2024-06-01T10:05:00Z
-        - **Source:** LyraReader annotation sidecar (saved beside the PDF)
+        - **Source:** LyraReader annotation (stored in the application cache)
 
         **Quote**
 
@@ -227,8 +232,8 @@ extension ReaderChecks {
                 "a comma, a double quote and a newline all survive the CSV round trip")
         require(rows[1][6] == comment,
                 "a comment with quotes and a newline also round-trips")
-        require(rows[1][7] == "" && rows[1][8] == "root-id" && rows[1][9] == "sidecar",
-                "a top-level sidecar row has an empty reply-to, its id and its source")
+        require(rows[1][7] == "" && rows[1][8] == "root-id" && rows[1][9] == csvReaderAnnotationSource,
+                "a top-level reader-annotation row has an empty reply-to, its id and its source")
         require(rows[2][7] == "root-id",
                 "a reply row names its immediate parent")
         require(csv.contains("\"\"double quotes\"\""),
@@ -345,7 +350,7 @@ extension ReaderChecks {
                 "the state itself reports that there is nothing to export")
     }
 
-    // MARK: - The real fixtures: sidecar and file annotations together
+    // MARK: - The real fixtures: annotation cache and file annotations together
 
     @MainActor static func mixedSourceExportCheck(root: URL, scratch: URL) async throws {
         let fixture = root.appendingPathComponent("tests/fixtures/annotated-replies.pdf")
@@ -356,7 +361,7 @@ extension ReaderChecks {
         let documentURL = scratch.appendingPathComponent("replies.pdf")
         try FileManager.default.copyItem(at: fixture, to: documentURL)
 
-        // A sidecar entry is seeded through the real file format, so loading it exercises the
+        // An annotation-cache entry is seeded through the real file format, so loading it exercises the
         // same decoder an ordinary reader does. Its range is a real span of page text.
         let probe = try RustEngine()
         _ = try probe.openDocument(at: documentURL)
@@ -370,7 +375,7 @@ extension ReaderChecks {
         }
         let lastGlyph = min(firstGlyph + 24, textPage.chars.count - 1)
         let range = firstGlyph...lastGlyph
-        let sidecarAnnotation = AppState.Annotation(
+        let recordsAnnotation = AppState.Annotation(
             id: UUID(),
             kind: .highlight,
             page: 0,
@@ -381,7 +386,7 @@ extension ReaderChecks {
             createdAt: exportDate("2026-10-16T09:30:00Z")
         )
         let encoder = JSONEncoder()
-        try encoder.encode([sidecarAnnotation]).write(
+        try encoder.encode([recordsAnnotation]).write(
             to: DocumentEditCache.annotationsURL(for: documentURL)
         )
         let expectedQuote = AnnotationExport.normalized(
@@ -398,7 +403,7 @@ extension ReaderChecks {
                 "reading the reply fixture's annotations does not fail")
         require(state.documentAnnotations.count == 11,
                 "all eleven /IRT annotations are available for export")
-        require(state.annotations.count == 1, "the seeded sidecar annotation is loaded")
+        require(state.annotations.count == 1, "the seeded cached annotation is loaded")
 
         let utc = TimeZone(secondsFromGMT: 0)!
         let exportedAt = exportDate("2026-10-17T17:40:00Z")
@@ -410,9 +415,9 @@ extension ReaderChecks {
         }
         let expectedCount = state.annotations.count + state.documentAnnotations.count
         require(export.rows.count == expectedCount,
-                "every sidecar and PDF annotation is in the export")
+                "every cached annotation and PDF annotation is in the export")
         require(export.rows.filter { $0.entry.source == .sidecar }.count == 1,
-                "the sidecar annotation is marked as the reader's")
+                "the cached annotation is marked as the reader's")
         require(export.rows.filter { $0.entry.source == .pdf }.count == 11,
                 "the file's own annotations are marked as coming from the PDF")
         require(export.rows.filter { $0.entry.parentID != nil }.count
@@ -443,19 +448,19 @@ extension ReaderChecks {
                 "the document heading counts every exported annotation")
         require(markdown.contains("- **Exported:** 2026-10-17T17:40:00Z"),
                 "the document heading carries the export date")
-        require(markdown.contains("- **Source:** LyraReader annotation sidecar (saved beside the PDF)"),
-                "sidecar annotations say where they came from")
+        require(markdown.contains("- **Source:** LyraReader annotation (stored in the application cache)"),
+                "cached annotations say where they came from")
         require(markdown.contains("- **Source:** PDF annotation (read from the file)"),
                 "the file's annotations are marked as such")
         require(markdown.contains("#### Reply ·"),
                 "a first-level reply gets its own deeper heading")
         require(markdown.contains("##### Reply ·"),
                 "a second-level reply gets one level deeper still")
-        require(markdown.contains(sidecarAnnotation.note),
-                "the sidecar note's text is in the export")
+        require(markdown.contains(recordsAnnotation.note),
+                "the cached note's text is in the export")
         if let firstLine = expectedQuote?.split(separator: "\n").first {
             require(markdown.contains("> \(firstLine)"),
-                    "the quote under the sidecar highlight is recovered from the page text")
+                    "the quote under the cached highlight is recovered from the page text")
         }
         let pageOne = markdown.range(of: "## Page 1")
         let pageTwo = markdown.range(of: "## Page 2")
@@ -491,10 +496,10 @@ extension ReaderChecks {
         }
         let body = Array(rows.dropFirst())
         let sources = Set(body.map { $0[sourceColumn] })
-        require(sources == ["pdf", "sidecar"], "both sources appear in the CSV")
-        let sidecarRow = body.first { $0[idColumn] == sidecarAnnotation.id.uuidString }
-        require(sidecarRow?[sourceColumn] == "sidecar" && sidecarRow?[replyColumn] == "",
-                "the sidecar annotation is a top-level sidecar row")
+        require(sources == ["pdf", csvReaderAnnotationSource], "both sources appear in the CSV, using its historical source value")
+        let recordsRow = body.first { $0[idColumn] == recordsAnnotation.id.uuidString }
+        require(recordsRow?[sourceColumn] == csvReaderAnnotationSource && recordsRow?[replyColumn] == "",
+                "the cached annotation is a top-level reader-annotation row")
         let replyRows = body.filter { !$0[replyColumn].isEmpty }
         require(replyRows.count == state.documentAnnotations.filter(\.isReply).count,
                 "every reply row names the annotation it answers")
@@ -502,7 +507,7 @@ extension ReaderChecks {
         require(replyRows.contains { ids.contains($0[replyColumn]) },
                 "at least one reply-to names an exported annotation")
         require(csvText.contains("\"Reader's note, with a comma and a \"\"quote\"\".\""),
-                "the sidecar note's comma and quote survive CSV quoting")
+                "the cached note's comma and quote survive CSV quoting")
 
         // Human-eye evidence: the same fixtures' export, kept outside the scratch directory so
         // it can be opened in a Markdown viewer or spreadsheet (the full check suite uses

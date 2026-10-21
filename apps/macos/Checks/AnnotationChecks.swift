@@ -6,23 +6,23 @@ import UniformTypeIdentifiers
 
 extension ReaderChecks {
     @MainActor static func annotationChecks(a: URL, b: URL) async throws {
-        let sidecar = DocumentEditCache.annotationsURL(for: a)
+        let records = DocumentEditCache.annotationsURL(for: a)
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "old", createdAt: Date())
         let encoder = JSONEncoder()
         var legacy = try JSONSerialization.jsonObject(with: encoder.encode(annotation)) as! [String: Any]
         legacy.removeValue(forKey: "kind")
-        try JSONSerialization.data(withJSONObject: [legacy]).write(to: sidecar)
+        try JSONSerialization.data(withJSONObject: [legacy]).write(to: records)
         let state = AppState(engine: try RustEngine())
         state.open(url: a)
-        require(state.annotations.first?.kind == .highlight, "legacy sidecar defaults to highlight")
+        require(state.annotations.first?.kind == .highlight, "legacy annotation file defaults to highlight")
         state.updateNote("n", for: annotation.id)
         state.updateNote("new", for: annotation.id)
         require(state.undoStack.count == 1, "note typing coalesces undo")
         state.undo()
         require(state.annotations.first?.note == "old", "note undo restores original")
         state.redo()
-        let disk = try JSONDecoder().decode([AppState.Annotation].self, from: Data(contentsOf: sidecar))
+        let disk = try JSONDecoder().decode([AppState.Annotation].self, from: Data(contentsOf: records))
         require(disk.first?.note == "new", "note redo persists to disk")
         state.jump(to: annotation)
         require(state.addAnnotationFromSelection(kind: .underline), "underline persists")
@@ -39,26 +39,26 @@ extension ReaderChecks {
         state.open(url: a)
         require(state.annotations.count == 2, "ordinary reopen restores annotations")
         // A directory at the target path deterministically makes atomic persistence fail.
-        try FileManager.default.removeItem(at: sidecar)
-        try FileManager.default.createDirectory(at: sidecar, withIntermediateDirectories: false)
+        try FileManager.default.removeItem(at: records)
+        try FileManager.default.createDirectory(at: records, withIntermediateDirectories: false)
         let before = state.annotations
         state.updateNote("must not publish", for: annotation.id)
         require(state.annotations == before && state.lastError != nil, "failed save preserves state and reports error")
-        try FileManager.default.removeItem(at: sidecar)
+        try FileManager.default.removeItem(at: records)
         let corrupt = Data("{broken".utf8)
-        try corrupt.write(to: sidecar)
+        try corrupt.write(to: records)
         state.open(url: a)
         state.jump(to: annotation)
-        require(!state.addHighlightFromSelection(), "corrupt sidecar blocks writes")
-        let preserved = try Data(contentsOf: sidecar)
+        require(!state.addHighlightFromSelection(), "corrupt annotation cache blocks writes")
+        let preserved = try Data(contentsOf: records)
         require(preserved == corrupt, "corrupt bytes remain untouched")
-        try FileManager.default.removeItem(at: sidecar)
+        try FileManager.default.removeItem(at: records)
         state.open(url: a)
         state.jump(to: annotation)
-        require(state.addHighlightFromSelection(), "missing sidecar is created on first annotation")
+        require(state.addHighlightFromSelection(), "missing annotation cache is created on first annotation")
     }
 
-    // MARK: - Sidecar recovery, forward compatibility, coalescing and flush
+    // MARK: - Annotation-cache recovery, forward compatibility, coalescing and flush
 
     /// The follow-ups an independent review raised: the blocked state needs a way out, a file
     /// written by a newer version must survive this one, typing must not write once per
@@ -72,15 +72,15 @@ extension ReaderChecks {
         func fixture(_ name: String) throws -> URL {
             let document = directory.appendingPathComponent(name)
             try? FileManager.default.removeItem(at: document)
-            try? FileManager.default.removeItem(at: sidecar(of: document))
+            try? FileManager.default.removeItem(at: records(of: document))
             try FileManager.default.copyItem(at: a, to: document)
             return document
         }
-        func sidecar(of document: URL) -> URL {
+        func records(of document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
-        func readSidecar(_ document: URL) throws -> String {
-            try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
+        func readRecords(_ document: URL) throws -> String {
+            try String(decoding: Data(contentsOf: records(of: document)), as: UTF8.self)
         }
         func knownEntry(_ annotation: AppState.Annotation) throws -> String {
             // The inner text of a one-element array, i.e. exactly how `saveAnnotations` writes it.
@@ -88,49 +88,49 @@ extension ReaderChecks {
             return String(text.dropFirst(2).dropLast(2))
         }
 
-        // ── 1. A sidecar that cannot be read fails closed, and the UI offers a way out ──
+        // ── 1. An annotation cache that cannot be read fails closed, and the UI offers a way out ──
         let broken = try fixture("recovery.pdf")
-        let brokenSidecar = sidecar(of: broken)
+        let brokenRecords = records(of: broken)
         let seedAnnotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "kept", createdAt: Date())
-        try encoder.encode([seedAnnotation]).write(to: brokenSidecar)
+        try encoder.encode([seedAnnotation]).write(to: brokenRecords)
 
         let recoveryState = AppState(engine: try RustEngine())
         recoveryState.setViewportSize(CGSize(width: 700, height: 500))
         recoveryState.newTab(url: broken)
-        require(recoveryState.annotations.count == 1, "a valid sidecar loads before it is damaged")
+        require(recoveryState.annotations.count == 1, "a valid annotation cache loads before it is damaged")
 
-        try Data().write(to: brokenSidecar) // the reviewer's 0-byte reproducer
+        try Data().write(to: brokenRecords) // the reviewer's 0-byte reproducer
         recoveryState.open(url: broken)
-        require(recoveryState.annotations.isEmpty, "a 0-byte sidecar shows no annotations")
-        require(recoveryState.canRecoverUnreadableAnnotationSidecar && recoveryState.lastError != nil,
-                "a 0-byte sidecar offers recovery in the alert and blocks silently otherwise")
+        require(recoveryState.annotations.isEmpty, "a 0-byte annotation cache shows no annotations")
+        require(recoveryState.canRecoverUnreadableAnnotationRecords && recoveryState.lastError != nil,
+                "a 0-byte annotation cache offers recovery in the alert and blocks silently otherwise")
         recoveryState.jump(to: seedAnnotation)
-        require(!recoveryState.addHighlightFromSelection(), "a 0-byte sidecar refuses writes")
-        let afterRefusal = try Data(contentsOf: brokenSidecar)
-        require(afterRefusal.isEmpty, "a refused write leaves the sidecar untouched")
+        require(!recoveryState.addHighlightFromSelection(), "a 0-byte annotation cache refuses writes")
+        let afterRefusal = try Data(contentsOf: brokenRecords)
+        require(afterRefusal.isEmpty, "a refused write leaves the annotation cache untouched")
 
-        let firstBackup = recoveryState.recoverUnreadableAnnotationSidecar()
-        require(firstBackup != nil, "recovery reports where the unreadable sidecar went")
+        let firstBackup = recoveryState.recoverUnreadableAnnotationRecords()
+        require(firstBackup != nil, "recovery reports where the unreadable annotation cache went")
         require(FileManager.default.fileExists(atPath: firstBackup!.path),
                 "the backup file exists on disk")
         let firstBackupBytes = try Data(contentsOf: firstBackup!)
         require(firstBackupBytes == Data(),
-                "the backup holds the original bytes (0 bytes) and the sidecar path is free")
-        let freshSidecar = try readSidecar(broken)
-        require(freshSidecar.contains("["), "recovery writes a fresh, readable sidecar")
+                "the backup holds the original bytes (0 bytes) and the annotation cache path is free")
+        let freshRecords = try readRecords(broken)
+        require(freshRecords.contains("["), "recovery writes a fresh, readable annotation cache")
         recoveryState.jump(to: seedAnnotation)
         require(recoveryState.addHighlightFromSelection(), "writes work again after recovery")
-        require(recoveryState.annotations.count == 1 && !recoveryState.canRecoverUnreadableAnnotationSidecar,
+        require(recoveryState.annotations.count == 1 && !recoveryState.canRecoverUnreadableAnnotationRecords,
                 "the blocked state is cleared after recovery")
 
         // A second, non-empty unreadable file: the backup must be byte-identical, and an
         // earlier backup must never be overwritten.
         let secondCorrupt = Data("{not json at all".utf8)
-        try secondCorrupt.write(to: brokenSidecar)
+        try secondCorrupt.write(to: brokenRecords)
         recoveryState.open(url: broken)
-        require(recoveryState.canRecoverUnreadableAnnotationSidecar, "a truncated sidecar blocks writes again")
-        let secondBackup = recoveryState.recoverUnreadableAnnotationSidecar()
+        require(recoveryState.canRecoverUnreadableAnnotationRecords, "a truncated annotation cache blocks writes again")
+        let secondBackup = recoveryState.recoverUnreadableAnnotationRecords()
         require(secondBackup != nil && secondBackup != firstBackup,
                 "a second recovery writes a new backup file")
         let secondBackupBytes = try Data(contentsOf: secondBackup!)
@@ -141,7 +141,7 @@ extension ReaderChecks {
 
         // ── 2. Forward compatibility: entries from a newer version survive, verbatim ──
         let future = try fixture("future.pdf")
-        let futureSidecar = sidecar(of: future)
+        let futureRecords = records(of: future)
         let known = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "known entry", createdAt: Date())
         // Foreign entries are compared as the exact JSON text of the entry (from its `{` to its
@@ -187,13 +187,13 @@ extension ReaderChecks {
         let compactEntry = #"{"colorIndex":2,"id":"\#(UUID().uuidString)","kind":"ink","page":99,"strokes":[[1,2],[3,4]]}"#
         let futureFile = "[\n" + [try knownEntry(known), inkEntry, colourEntry, extraFieldEntry, compactEntry]
             .joined(separator: ",\n") + "\n]"
-        try Data(futureFile.utf8).write(to: futureSidecar)
+        try Data(futureFile.utf8).write(to: futureRecords)
 
         let futureEngine = try RustEngine()
         let futureState = AppState(engine: futureEngine)
         futureState.setViewportSize(CGSize(width: 700, height: 500))
         futureState.newTab(url: future)
-        require(futureState.annotations.count == 1, "a newer sidecar still loads this version's entries")
+        require(futureState.annotations.count == 1, "a newer annotation cache still loads this version's entries")
         require(futureState.preservedAnnotationEntryCount == 4,
                 "entries this version cannot draw are preserved, not rejected")
         let text = try await futureEngine.textPage(known.page)
@@ -226,33 +226,33 @@ extension ReaderChecks {
         try await eventually("undo restores the known annotation's rendered quads", knownAnnotationRenders)
 
         futureState.jump(to: known)
-        require(futureState.addHighlightFromSelection(), "an edit is still possible on a newer sidecar")
-        let rewritten = try readSidecar(future)
+        require(futureState.addHighlightFromSelection(), "an edit is still possible on a newer annotation cache")
+        let rewritten = try readRecords(future)
         require(rewritten.contains(inkEntry), "the unknown-kind entry survives an edit byte-for-byte")
         require(rewritten.contains(colourEntry), "the out-of-palette entry survives an edit byte-for-byte")
         require(rewritten.contains(extraFieldEntry), "the entry with unknown fields survives an edit byte-for-byte")
         require(rewritten.contains(compactEntry), "a compact foreign entry survives an edit byte-for-byte")
         require(rewritten.contains("known entry"), "the known entry is still written")
         let reparsed = try? JSONSerialization.jsonObject(with: Data(rewritten.utf8)) as? [Any]
-        require(reparsed != nil, "the rewritten sidecar is still valid JSON")
+        require(reparsed != nil, "the rewritten annotation cache is still valid JSON")
 
-        // An empty array is a valid sidecar, and a document without one starts clean.
+        // An empty array is a valid annotation cache, and a document without one starts clean.
         let empty = try fixture("empty.pdf")
-        try Data("[\n\n]".utf8).write(to: sidecar(of: empty))
+        try Data("[\n\n]".utf8).write(to: records(of: empty))
         let emptyState = AppState(engine: try RustEngine())
         emptyState.newTab(url: empty)
-        require(emptyState.annotations.isEmpty && !emptyState.canRecoverUnreadableAnnotationSidecar,
-                "an empty array is a valid sidecar")
+        require(emptyState.annotations.isEmpty && !emptyState.canRecoverUnreadableAnnotationRecords,
+                "an empty array is a valid annotation cache")
 
         // ── 3. Typing coalesces disk writes; memory and undo stay immediate ──
         let typing = try fixture("typing.pdf")
         let noteAnnotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "", createdAt: Date())
-        try encoder.encode([noteAnnotation]).write(to: sidecar(of: typing))
+        try encoder.encode([noteAnnotation]).write(to: records(of: typing))
         let typingState = AppState(engine: try RustEngine())
         typingState.setViewportSize(CGSize(width: 700, height: 500))
         typingState.newTab(url: typing)
-        require(typingState.annotations.first?.note == "", "the note sidecar loads")
+        require(typingState.annotations.first?.note == "", "the annotation cache holding the note loads")
 
         let writesBeforeBurst = typingState.annotationWriteCount
         var typed = ""
@@ -271,7 +271,7 @@ extension ReaderChecks {
                 "the coalescing window writes the pending text exactly once")
         require(!typingState.hasPendingAnnotationWrite, "nothing is pending once the window closed")
         let coalescedDisk = try JSONDecoder().decode([AppState.Annotation].self,
-                                                     from: Data(contentsOf: sidecar(of: typing)))
+                                                     from: Data(contentsOf: records(of: typing)))
         require(coalescedDisk.first?.note == typed, "the coalesced write carried the final text")
 
         // Committing the field (Return/blur) writes immediately instead of waiting.
@@ -294,7 +294,7 @@ extension ReaderChecks {
         }
         typingState.commitNoteEdits()
         let timedWrites = typingState.annotationWriteCount - writesBeforeTimed
-        print("INFO: 12 keystrokes over ~1.2 s produced \(timedWrites) sidecar write(s)")
+        print("INFO: 12 keystrokes over ~1.2 s produced \(timedWrites) cache write(s)")
         require(timedWrites <= 6 && timedWrites < 12,
                 "typing throttles writes to about one per 500 ms (\(timedWrites) for 12 keystrokes)")
         require(typingState.annotations.first?.note == timed, "the throttled text is in memory")
@@ -314,9 +314,9 @@ extension ReaderChecks {
         typingState.newTab(url: b)
         require(!typingState.hasPendingAnnotationWrite, "switching documents flushes the pending note")
         let flushedAtSwitch = try JSONDecoder().decode([AppState.Annotation].self,
-                                                       from: Data(contentsOf: sidecar(of: typing)))
+                                                       from: Data(contentsOf: records(of: typing)))
         require(flushedAtSwitch.first?.note == timed + "!!",
-                "the switch wrote the pending text to its own sidecar before leaving it")
+                "the switch wrote the pending text to its own annotation cache before leaving it")
         require(typingState.annotationWriteCount == 0, "the write counter is per document")
         require(UserDefaults.standard.object(forKey: keyBeforeOpen) != nil,
                 "switching documents flushes the pending reading position")
@@ -334,9 +334,9 @@ extension ReaderChecks {
         typingState.closeTab(2)
         require(!typingState.hasPendingAnnotationWrite, "closing a tab flushes the pending note")
         let flushedAtClose = try JSONDecoder().decode([AppState.Annotation].self,
-                                                      from: Data(contentsOf: sidecar(of: typing)))
+                                                      from: Data(contentsOf: records(of: typing)))
         require(flushedAtClose.first?.note == timed + "!!??",
-                "the note typed just before the tab closed reached the sidecar")
+                "the note typed just before the tab closed reached the annotation cache")
         typingState.closeTab(1)
         typingState.closeTab(0)
         require(typingState.document == nil, "closing the last tab closes the document")
@@ -352,9 +352,9 @@ extension ReaderChecks {
         lockedState.newTab(url: locked)
         let lockedAnnotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "first", createdAt: Date())
-        try encoder.encode([lockedAnnotation]).write(to: sidecar(of: locked))
+        try encoder.encode([lockedAnnotation]).write(to: records(of: locked))
         lockedState.open(url: locked)
-        let lockedCacheDirectory = sidecar(of: locked).deletingLastPathComponent()
+        let lockedCacheDirectory = records(of: locked).deletingLastPathComponent()
         try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedCacheDirectory.path)
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o755],
@@ -365,9 +365,9 @@ extension ReaderChecks {
         require(lockedState.annotations == lockedBefore,
                 "a read-only directory keeps the failed write out of memory")
         require(lockedState.lastError != nil, "a read-only directory reports the failure")
-        let lockedBytes = try Data(contentsOf: sidecar(of: locked))
+        let lockedBytes = try Data(contentsOf: records(of: locked))
         let lockedOnDisk = try JSONDecoder().decode([AppState.Annotation].self, from: lockedBytes)
-        require(lockedOnDisk.first?.note == "first", "the sidecar bytes survive a refused write")
+        require(lockedOnDisk.first?.note == "first", "the cache bytes survive a refused write")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: lockedDirectory.path)
             .filter { $0 != "locked.pdf" && $0 != "locked.pdf.lyra-reader-annotations.json" }
         require(leftovers.isEmpty, "a failed write leaves no temporary files behind")
@@ -652,12 +652,12 @@ extension ReaderChecks {
         }
 
         // Enough of each block to cover any real document: 4096 pages, 4096 selection boxes,
-        // 4096 sidecar annotations, 4096 loaded annotations with up to 64 quad boxes each, and
+        // 4096 cached annotations, 4096 loaded annotations with up to 64 quad boxes each, and
         // 4096 note glyphs.
         for page in 0..<4_096 { claim(PlacementIndex.pageRaster(page), "page \(page)'s raster") }
         for index in 0..<4_096 { claim(PlacementIndex.selection(index), "selection box \(index)") }
         for index in 0..<4_096 {
-            claim(PlacementIndex.ownAnnotation(index), "sidecar annotation \(index)")
+            claim(PlacementIndex.ownAnnotation(index), "cached annotation \(index)")
         }
         for annotation in 0..<4_096 {
             for box in 0..<64 {
@@ -669,7 +669,7 @@ extension ReaderChecks {
             claim(PlacementIndex.documentNote(index), "note glyph \(index)")
         }
         for index in 0..<4_096 {
-            claim(PlacementIndex.ownNote(index), "sidecar placed-text glyph \(index)")
+            claim(PlacementIndex.ownNote(index), "reader placed-text glyph \(index)")
         }
         for index in 0..<4_096 {
             claim(PlacementIndex.aiSource(index), "AI source-highlight box \(index)")
@@ -677,26 +677,26 @@ extension ReaderChecks {
 
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
-        // sidecar annotation, the last loaded annotation's last box, and the last note glyph. The
-        // capacities are the ones `PlacementIndex` documents (2^28 pages, boxes, sidecar slots and
+        // cached annotation, the last loaded annotation's last box, and the last note glyph. The
+        // capacities are the ones `PlacementIndex` documents (2^28 pages, boxes, record slots and
         // note glyphs; 2^18 loaded annotations of 2^10 boxes each).
         claim(PlacementIndex.pageRaster(PlacementIndex.block - 1), "the last page's raster")
         claim(PlacementIndex.selection(PlacementIndex.block - 1), "the last selection box")
-        claim(PlacementIndex.ownAnnotation(65_535), "the last sidecar annotation")
+        claim(PlacementIndex.ownAnnotation(65_535), "the last cached annotation")
         claim(PlacementIndex.documentAnnotation(262_143, box: 1_023),
               "the last loaded annotation's last box")
         claim(PlacementIndex.documentNote(PlacementIndex.block - 1), "the last note glyph")
-        claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last sidecar placed-text glyph")
+        claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last reader placed-text glyph")
         claim(PlacementIndex.aiSource(PlacementIndex.block - 1), "the last AI source-highlight box")
 
         require(owner.count == 4_096 * 6 + 4_096 * 64 + 7,
                 "page rasters, the selection, this reader's annotations, loaded annotations, "
-                    + "sidecar placed-text glyphs, note glyphs and the AI source highlight never share a placement index (\(owner.count) distinct indices, "
+                    + "reader placed-text glyphs, note glyphs and the AI source highlight never share a placement index (\(owner.count) distinct indices, "
                     + "including the ends of each block)")
     }
 
-    // MARK: - Colour: anything the file carries, and a sidecar that keeps working either way
-    /// The colour model, checked against both directions of the sidecar's compatibility story.
+    // MARK: - Colour: anything the file carries, and an annotation cache that keeps working either way
+    /// The colour model, checked against both directions of the annotation records' compatibility story.
     ///
     /// The user-visible regression this pins down is the one that started the work: a colour the
     /// old four-entry palette could not name used to make the whole entry "unreadable", so a
@@ -706,20 +706,20 @@ extension ReaderChecks {
 
         func fixture(_ name: String) throws -> URL {
             let document = directory.appendingPathComponent(name)
-            let sidecar = DocumentEditCache.annotationsURL(for: document)
+            let records = DocumentEditCache.annotationsURL(for: document)
             try? FileManager.default.removeItem(at: document)
-            try? FileManager.default.removeItem(at: sidecar)
+            try? FileManager.default.removeItem(at: records)
             try FileManager.default.copyItem(at: a, to: document)
             return document
         }
-        func sidecar(of document: URL) -> URL {
+        func records(of document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
         func text(of document: URL) throws -> String {
-            try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
+            try String(decoding: Data(contentsOf: records(of: document)), as: UTF8.self)
         }
 
-        // ── 1. A sidecar written by an older build: `colorIndex` still means its preset ──
+        // ── 1. An annotation cache written by an older build: `colorIndex` still means its preset ──
         let legacy = try fixture("colour-legacy.pdf")
         let legacyID = UUID().uuidString
         try Data("""
@@ -735,7 +735,7 @@ extension ReaderChecks {
     "start" : 0
   }
 ]
-""".utf8).write(to: sidecar(of: legacy))
+""".utf8).write(to: records(of: legacy))
 
         let legacyState = AppState(engine: try RustEngine())
         legacyState.setViewportSize(CGSize(width: 700, height: 500))
@@ -761,7 +761,7 @@ extension ReaderChecks {
     "start" : 0
   }
 ]
-""".utf8).write(to: sidecar(of: foreign))
+""".utf8).write(to: records(of: foreign))
 
         let foreignState = AppState(engine: try RustEngine())
         foreignState.setViewportSize(CGSize(width: 700, height: 500))
@@ -779,10 +779,10 @@ extension ReaderChecks {
         // whole compatibility contract, and a whole-file substring search could not tell which
         // entry a key came from.
         func entries(ofDocument document: URL) throws -> [[String: Any]] {
-            let data = try Data(contentsOf: sidecar(of: document))
+            let data = try Data(contentsOf: records(of: document))
             guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
                 throw NSError(domain: "AnnotationChecks", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "the sidecar is not an array of objects",
+                    NSLocalizedDescriptionKey: "the annotation cache is not an array of objects",
                 ])
             }
             return array
@@ -796,7 +796,7 @@ extension ReaderChecks {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         let preset = try fixture("colour-preset.pdf")
-        try encoder.encode([seeded]).write(to: sidecar(of: preset))
+        try encoder.encode([seeded]).write(to: records(of: preset))
         let presetState = AppState(engine: try RustEngine())
         presetState.setViewportSize(CGSize(width: 700, height: 500))
         presetState.open(url: preset)
@@ -821,7 +821,7 @@ extension ReaderChecks {
             id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "seeded", createdAt: Date()
         )
-        try encoder.encode([presetSeed]).write(to: sidecar(of: custom))
+        try encoder.encode([presetSeed]).write(to: records(of: custom))
         let customState = AppState(engine: try RustEngine())
         customState.setViewportSize(CGSize(width: 700, height: 500))
         customState.open(url: custom)

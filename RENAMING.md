@@ -14,7 +14,9 @@ FFI regeneration and native functional verification are the main integration wor
 | Swift modules | `LyraReaderKit`, `LyraReaderFFI`, `LyraReaderBindings` |
 | Native regression executable | `LyraReaderChecks` |
 | Developer environment variables | `LYRA_READER_*` |
-| New annotation / disposable index sidecars | `.lyra-reader-annotations.json` / `.lyra-reader-index.json` |
+| Current annotation records | `Library/Caches/LyraReader/Documents/<path digest>/annotations.json` (`LYRA_READER_DOCUMENT_CACHE_DIR` overrides the root) |
+| Legacy annotation companions (imported once) | `.lyra-reader-annotations.json` / `.aris-annotations.json` |
+| Disposable index cache | `LyraReader/Indexes` under the platform cache (`LYRA_READER_INDEX_CACHE_DIR` overrides the root) |
 | Appearance font | `LyraReader Sans SC` / `LyraReaderSansSC-Regular.ttf` |
 
 ## Existing installations
@@ -32,12 +34,17 @@ clearing a credential removes both services so an old token cannot reappear. No 
 copied to preferences or files. macOS may require authorization to access an existing item
 from the renamed executable, according to the item's Keychain access control.
 
-A document with an existing `.aris-annotations.json` continues using that same sidecar,
-including its bookmarks, foreign entries and corruption protection. New documents use the
-new suffix; if both exist, the new sidecar wins. No sidecar is moved or overwritten merely
-by opening a PDF. Disposable old `.aris-index.json` caches are left untouched and rebuilt
-under the new suffix. PDF annotation IDs and document content are not rewritten on open.
-Existing PDF-embedded fonts and backups remain valid; new writes use the new names.
+A document with an existing `.lyra-reader-annotations.json` or `.aris-annotations.json`
+companion is imported once on open: its annotations, bookmarks, foreign entries and
+corruption protection move together. The data is validated, copied into the document cache,
+verified byte-identical, and a byte-identical backup is written into that cache before the
+companion is removed. An unreadable companion blocks writes rather than replacing data it
+cannot read, and the reader gets the explicit "back up and start fresh" recovery. If both
+suffixes exist, `.lyra-reader-annotations.json` wins. New annotations are written only to
+the cache. Disposable legacy `.aris-index.json` and `.lyra-reader-index.json` files are
+no longer read or written and are left untouched; the index is rebuilt under the platform
+cache. PDF annotation IDs and document content are not rewritten on open. Existing
+PDF-embedded fonts and backups remain valid; new writes use the new names.
 
 ## Developer upgrade
 

@@ -151,11 +151,11 @@ fn captions_and_citations_past_page_120_are_returned_and_persisted() {
     // The persisted index carries the late records. This is the part that fails on the capped
     // implementation: its figure list stopped at page 120 and its citation map at page 120, so a
     // second open of unchanged bytes could not have answered from the cache.
-    let sidecar = cache_path(&path);
-    let bytes = fs::read(&sidecar).unwrap_or_else(|error| {
+    let cache_file = cache_path(&path);
+    let bytes = fs::read(&cache_file).unwrap_or_else(|error| {
         panic!(
             "the index cache was not written at {}: {error}",
-            sidecar.display()
+            cache_file.display()
         )
     });
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("cache is JSON");

@@ -130,12 +130,12 @@ public struct ReaderWindow: View {
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
         )) {
-            // The way out of a sidecar that failed to load: an explicit action that moves the
+            // The way out of an annotation cache that failed to load: an explicit action that moves the
             // unreadable file aside (never overwrites it) and starts a fresh one.
-            if state.canRecoverUnreadableAnnotationSidecar {
+            if state.canRecoverUnreadableAnnotationRecords {
                 Button("Back Up Recovery Data and Start Fresh") {
-                    if let backup = state.recoverUnreadableAnnotationSidecar() {
-                        state.revealSidecarBackupInFinder(backup)
+                    if let backup = state.recoverUnreadableAnnotationRecords() {
+                        state.revealAnnotationBackupInFinder(backup)
                     }
                 }
             }
@@ -609,7 +609,7 @@ public struct ReaderWindow: View {
     }
 
     /// The eraser's pending state: the strokes are gone from the reader's view and from its
-    /// sidecar, but the PDF on disk is untouched until an explicit save. Same panel, icon and
+    /// annotation cache, but the PDF on disk is untouched until an explicit save. Same panel, icon and
     /// sentence as the other pending banners; the only difference is that this one has no
     /// "Apply to Original" pair because it is a deletion, not a value.
     private var eraserPendingBanner: some View {
@@ -619,7 +619,7 @@ public struct ReaderWindow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Annotation changes pending")
                     .font(.callout.weight(.semibold))
-                Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save a copy.")
+                Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -640,7 +640,7 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Annotation deletions pending. The PDF on disk is unchanged until you save a copy."
+            "Annotation deletions pending. The PDF on disk is unchanged until you save."
         )
     }
 

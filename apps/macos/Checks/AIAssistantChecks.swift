@@ -1252,8 +1252,8 @@ extension ReaderChecks {
         state.open(url: url)
         require(state.currentPage == 1, "the reader starts on page 1")
         let annotationsBefore = state.annotations
-        let sidecar = DocumentEditCache.annotationsURL(for: url)
-        try? FileManager.default.removeItem(at: sidecar)
+        let records = DocumentEditCache.annotationsURL(for: url)
+        try? FileManager.default.removeItem(at: records)
         chip.follow(in: state)
         require(state.currentPage == chip.page,
                 "the chip jumped to page \(chip.page) (current \(state.currentPage))")
@@ -1266,15 +1266,15 @@ extension ReaderChecks {
                 "the source boxes are drawn as transient canvas quads")
         require(state.annotations == annotationsBefore,
                 "following a citation creates no annotation")
-        require(!FileManager.default.fileExists(atPath: sidecar.path),
-                "following a citation writes no sidecar annotation")
+        require(!FileManager.default.fileExists(atPath: records.path),
+                "following a citation writes no cached annotation")
         try await eventually("the source highlight disappears after the fade") {
             state.aiSourceHighlight == nil
         }
         require(!state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
                 "the transient quads are removed with the highlight")
-        require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: sidecar.path),
-                "the fade leaves no annotation or sidecar behind")
+        require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: records.path),
+                "the fade leaves no annotation or cached record behind")
 
         // 3. A second question carries the first exchange and its own retrieval.
         model.chatQuestion = "Which evaluation query set was replayed against the retrieval baseline?"

@@ -5,15 +5,16 @@
 //! ```
 //!
 //! The example opens the file twice. The first open derives the index (unless a cache already
-//! exists), the second should hit the sidecar. It prints open time, index time, validation time
+//! exists), the second should hit the cache. It prints open time, index time, validation time
 //! and the derived-component counter so the numbers can be checked rather than inferred.
 //!
 //! To measure the no-cache baseline, run the same command with the cache disabled:
 //! `LYRA_READER_INDEX_CACHE=disabled … --example index_cache`. In that mode the report says
 //! `disabled`, nothing is written, and the index time is the parse the cache replaces.
 //!
-//! Copy the PDF under `build/` before running: the sidecar belongs beside the document, and
-//! committed samples/corpora must not collect cache files.
+//! Copy the PDF under `build/` before running so committed samples/corpora cannot collect cache
+//! files. The cache itself is written under the platform cache directory, or under
+//! `LYRA_READER_INDEX_CACHE_DIR` when that is set.
 
 use lyra_reader_ffi::api::{LyraReaderDocument, LyraReaderEngine};
 use std::path::Path;

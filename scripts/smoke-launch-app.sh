@@ -196,7 +196,8 @@ trap cleanup EXIT INT TERM
 
 # The document is opened from a copy outside the checkout: a checkout under ~/Documents makes the
 # app's read of it a TCC-gated operation, and a locked console cannot answer the prompt. The copy
-# also keeps the annotation sidecar (written next to the document) out of the repository.
+# also keeps the app's document cache (which lives under the user's cache directory, keyed by the
+# document path) away from the repository's committed fixtures.
 DOC="$TMP/document.pdf"
 cp "$DOCUMENT" "$DOC" || { bad "cannot copy $DOCUMENT to $TMP"; exit 1; }
 

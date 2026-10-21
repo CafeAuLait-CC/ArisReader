@@ -20,14 +20,14 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
-        func sidecarText(_ document: URL) throws -> String {
-            String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)
+        func recordsText(_ document: URL) throws -> String {
+            String(decoding: try Data(contentsOf: records(for: document)), as: UTF8.self)
         }
         func placement(_ state: AppState, _ page: Int) -> PagePlacement {
             guard let frame = state.canvasPageFrames.first(where: { $0.index == page }) else {
@@ -71,20 +71,20 @@ extension ReaderChecks {
         close(CGPoint(x: note.shapeRect?.midX ?? -1, y: note.shapeRect?.midY ?? -1), aim,
               "the icon is centred on the page point that was clicked")
         require(state.noteWriteWindowIsOpen == false,
-                "placing a note writes the sidecar once before typing")
+                "placing a note writes the annotation cache once before typing")
 
         let firstText = "Remember the figure on page 2."
         state.updateEditingText(firstText)
         require(state.commitTextEditing(), "typing a note commits it")
         require(state.annotations.first(where: { $0.id == noteID })?.note == firstText,
                 "the note keeps the typed text in memory")
-        let noteSidecar = try sidecarText(document)
-        require(noteSidecar.contains("\"kind\" : \"stickyNote\""),
-                "the sidecar stores the sticky-note kind")
-        require(noteSidecar.contains("\"version\" : \(AppState.Annotation.placedTextVersion)"),
-                "a placed note is versioned in the sidecar")
-        require(noteSidecar.contains("\"rect\""), "the note's page-space box is stored")
-        require(!noteSidecar.contains("\"start\""),
+        let noteRecords = try recordsText(document)
+        require(noteRecords.contains("\"kind\" : \"stickyNote\""),
+                "the annotation cache stores the sticky-note kind")
+        require(noteRecords.contains("\"version\" : \(AppState.Annotation.placedTextVersion)"),
+                "a placed note is versioned in the annotation cache")
+        require(noteRecords.contains("\"rect\""), "the note's page-space box is stored")
+        require(!noteRecords.contains("\"start\""),
                 "a placed note has no character range, so no start key is written")
 
         // ── 1. A placed note survives a save/reopen, and the icon carries its text ────────
@@ -92,7 +92,7 @@ extension ReaderChecks {
         reopened.setViewportSize(CGSize(width: 700, height: 500))
         reopened.newTab(url: document)
         guard let reloadedNote = reopened.annotations.first(where: { $0.id == noteID }) else {
-            require(false, "the sticky note reloads from the sidecar")
+            require(false, "the sticky note reloads from the annotation cache")
             return
         }
         require(reloadedNote.kind == .stickyNote && reloadedNote.note == firstText,
@@ -105,7 +105,7 @@ extension ReaderChecks {
         require(reopened.canvasPages.contains(where: { PlacementIndex.isOwnNote($0.placement.index) }),
                 "the note icon is handed to the canvas as its own glyph")
         require(reopened.documentAnnotations.isEmpty,
-                "a sidecar note is not also read as an annotation from the PDF")
+                "a cached note is not also read as an annotation from the PDF")
         require(reopened.openDocumentNoteID == nil,
                 "opening the document does not pop the read-only note paper over our own note")
 
@@ -149,7 +149,7 @@ extension ReaderChecks {
         state.endPointerInteraction(at: CGPoint(x: noteHit.x + delta.x, y: noteHit.y + delta.y),
                                     wasClick: false)
         require(state.annotationWriteCount == writesBeforeMove + 1,
-                "dragging a note writes the sidecar once on mouse-up, not per event")
+                "dragging a note writes the annotation cache once on mouse-up, not per event")
         if let moved = state.annotations.first(where: { $0.id == noteID }) {
             close(CGPoint(x: moved.shapeRect?.minX ?? -1, y: moved.shapeRect?.minY ?? -1),
                   CGPoint(x: (beforeMove?.shapeRect?.minX ?? 0) + delta.x,
@@ -201,12 +201,12 @@ extension ReaderChecks {
         box = state.annotations.first(where: { $0.id == boxID })!.shapeRect!
         require(box.width <= 230 && box.height <= 70 && state.selectedAnnotationID == nil,
                 "finishing a text box fits its contents and removes its editing outline")
-        let textSidecar = try sidecarText(document)
-        require(textSidecar.contains("\"kind\" : \"textBox\""),
-                "the sidecar stores the text-box kind")
-        require(textSidecar.contains("\"fontSize\""),
+        let textRecords = try recordsText(document)
+        require(textRecords.contains("\"kind\" : \"textBox\""),
+                "the annotation cache stores the text-box kind")
+        require(textRecords.contains("\"fontSize\""),
                 "the text box's font size is part of the entry")
-        require(textSidecar.contains("\"version\" : \(AppState.Annotation.placedTextVersion)"),
+        require(textRecords.contains("\"version\" : \(AppState.Annotation.placedTextVersion)"),
                 "the text box is versioned like the note")
 
         let boxReader = AppState(engine: try RustEngine())
@@ -275,7 +275,7 @@ extension ReaderChecks {
         state.endPointerInteraction(at: CGPoint(x: corner.x + 40, y: corner.y + 25),
                                     wasClick: false)
         require(state.annotationWriteCount == writesBeforeResize + 1,
-                "resizing a text box writes the sidecar once on mouse-up")
+                "resizing a text box writes the annotation cache once on mouse-up")
         guard let resized = state.annotations.first(where: { $0.id == coverID }) else {
             require(false, "the resized text box survives")
             return
@@ -374,9 +374,9 @@ extension ReaderChecks {
                     "the written file carries \(String(decoding: needle, as: UTF8.self))")
         }
         require(writtenBytes.range(of: Data(writeNoteID.uuidString.utf8)) != nil,
-                "the sticky note's stable /NM is its sidecar identity")
+                "the sticky note's stable /NM is its annotation cache identity")
         require(writtenBytes.range(of: Data(writeBoxID.uuidString.utf8)) != nil,
-                "the text box's stable /NM is its sidecar identity")
+                "the text box's stable /NM is its annotation cache identity")
 
         let reader = AppState(engine: try RustEngine())
         reader.setViewportSize(CGSize(width: 700, height: 500))
@@ -459,7 +459,7 @@ extension ReaderChecks {
         let replaced = await replacer.replaceOriginalWithSavedAnnotations()
         require(replaced, "the placed annotations are written into the original")
         require(replacer.annotations.isEmpty,
-                "the saved entries are removed from the sidecar, so they cannot appear twice")
+                "the saved entries are removed from the annotation cache, so they cannot appear twice")
         try await eventually("the replaced file's annotations are reloaded", {
             replacer.documentAnnotations.count == 2 || replacer.documentAnnotationsError != nil
         })
@@ -478,7 +478,7 @@ extension ReaderChecks {
         require(replacer.openDocumentNoteID == nil,
                 "the replaced note is not opened as a read-only paper behind its icon")
         require(replacer.canvasAnnotationMarks.isEmpty,
-                "a PDF's own placed text is not offered as an editable sidecar mark")
+                "a PDF's own placed text is not offered as an editable cached mark")
 
         // ── 7. Another producer's notes and free text are read, and a double-click edits them
         let externalCopy = try copy(external, "external-notes.pdf")
@@ -547,7 +547,7 @@ extension ReaderChecks {
   "version" : 2
 }
 """
-        try Data("[\n\(futureEntry)\n]".utf8).write(to: sidecar(for: futureDocument))
+        try Data("[\n\(futureEntry)\n]".utf8).write(to: records(for: futureDocument))
         let future = AppState(engine: try RustEngine())
         future.setViewportSize(CGSize(width: 700, height: 500))
         future.newTab(url: futureDocument)
@@ -558,8 +558,8 @@ extension ReaderChecks {
         require(future.placeStickyNote(page: 0, at: CGPoint(x: 80, y: 80)),
                 "an older build can still add its own note around the future entry")
         future.cancelTextEditing()
-        let futureSidecar = try sidecarText(futureDocument)
-        require(futureSidecar.contains("\"version\" : 2"),
+        let futureRecords = try recordsText(futureDocument)
+        require(futureRecords.contains("\"version\" : 2"),
                 "the future entry survives a save byte-for-byte")
 
         // An unknown field on a version this build does know is also preserved, not dropped.
@@ -577,7 +577,7 @@ extension ReaderChecks {
   "futureField" : true
 }
 """
-        try Data("[\n\(unknownFieldEntry)\n]".utf8).write(to: sidecar(for: unknownFieldDocument))
+        try Data("[\n\(unknownFieldEntry)\n]".utf8).write(to: records(for: unknownFieldDocument))
         let unknownField = AppState(engine: try RustEngine())
         unknownField.setViewportSize(CGSize(width: 700, height: 500))
         unknownField.newTab(url: unknownFieldDocument)
@@ -587,7 +587,7 @@ extension ReaderChecks {
                 "this build can still add a text box beside an unknown-field entry")
         unknownField.updateEditingText("mine")
         unknownField.commitTextEditing()
-        let unknownFieldAfter = try sidecarText(unknownFieldDocument)
+        let unknownFieldAfter = try recordsText(unknownFieldDocument)
         require(unknownFieldAfter.contains("\"futureField\" : true"),
                 "the unknown field survives an ordinary save")
     }

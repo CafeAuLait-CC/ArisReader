@@ -457,7 +457,7 @@ public final class AIAssistantModel: ObservableObject {
     }
 
     /// Drop the current document's conversation and any pending chat preview. Nothing is sent
-    /// and no annotation or sidecar entry is touched. Conversations for other documents remain.
+    /// and no annotation or cached entry is touched. Conversations for other documents remain.
     public func clearChat() {
         let chatPlan = plan?.isDocumentChat == true
         let hadChat = !chatTurns.isEmpty || chatPlan

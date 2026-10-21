@@ -89,7 +89,7 @@ import Foundation
         let legacy = legacyURLs(for: document).filter { FileManager.default.fileExists(atPath: $0.path) }
         if let source = legacy.first {
             let data = try Data(contentsOf: source)
-            _ = try AnnotationSidecar.decode(data, pageCount: pageCount, paletteCount: paletteCount)
+            _ = try AnnotationRecords.decode(data, pageCount: pageCount, paletteCount: paletteCount)
             try data.write(to: cache, options: .atomic)
             guard try Data(contentsOf: cache) == data else { throw CacheError.importVerification }
             for source in legacy {

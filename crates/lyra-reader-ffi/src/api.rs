@@ -778,9 +778,9 @@ impl LyraReaderDocument {
     ///
     /// The same page, clamp and threading rules as [`LyraReaderDocument::rasterize_page`]; the only
     /// difference is PDFium's `FPDF_ANNOT` flag. The canvas must keep using the plain method:
-    /// it draws annotations itself, with live editing and the app's own sidecar marks. This one
+    /// it draws annotations itself, with live editing and the app's own cached marks. This one
     /// is for a small preview whose job is to show *where the marks are* — including marks the
-    /// canvas does not model. It does not include the sidecar, which is not part of the PDF.
+    /// canvas does not model. It does not include the reader's cached annotations, which are not part of the PDF.
     pub fn rasterize_page_with_annotations(
         &self,
         page: u32,
@@ -1085,7 +1085,7 @@ impl LyraReaderDocument {
     /// A page's citations are not a page-local question any more: a superscript numeral is only
     /// a citation when the document's bibliography carries its label, so this call depends on
     /// the document's reference list and its citation style. The first access builds that index
-    /// (or loads it from the sidecar); the reference scan already holds the scanned pages' text,
+    /// (or loads it from the index cache); the reference scan already holds the scanned pages' text,
     /// so it records each page's spans at the same time and reads the pages past its window for
     /// this purpose. A cached index therefore makes this call independent of the PDF text layer
     /// for every page of the document.
@@ -1116,7 +1116,7 @@ impl LyraReaderDocument {
         let records = citation_records(&raw, &style, page, transform);
 
         // Remember the page for repeated clicks even when it is outside the scan window. It is
-        // not written back to the sidecar: the cache is complete for every page the scan saw,
+        // not written back to the cache: the cache is complete for every page the scan saw,
         // and a late page is a one-page read, not a reason to rewrite the document index.
         if let Ok(mut cache) = self.citations.lock() {
             cache
@@ -1420,7 +1420,7 @@ impl LyraReaderDocument {
         flatten_outline(&self.backend.outline()?, 0, &mut entries);
         // Our own bookmark subtree is written into the outline. Adopt its identities and
         // page-local positions so a click lands where the bookmark was set and the bookmarks tab
-        // can show the file's copy rather than a duplicate sidecar entry. The lopdf parse is only
+        // can show the file's copy rather than a duplicate cached entry. The lopdf parse is only
         // attempted when the title we would have written is present, which keeps ordinary
         // documents from paying for a whole-file parse on open.
         if entries
@@ -1476,7 +1476,7 @@ impl LyraReaderDocument {
 
     /// Annotations the document **already carries**, from every page, in **view space**.
     ///
-    /// This is the other half of this application's annotation story: the sidecar holds what the
+    /// This is the other half of this application's annotation story: the annotation cache holds what the
     /// reader wrote, and this reads what is in the file — a PDF marked up in Preview, or one
     /// somebody else annotated. Every page is scanned: a cap like the reference index's 120 pages
     /// would silently hide notes in the back matter, and an annotation-free page costs one page
@@ -1755,7 +1755,7 @@ impl LyraReaderDocument {
     ///
     /// This object's file is never modified. The written file is verified to have the requested
     /// page count, rotations and page sizes before the final rename. `page_map[old] = Some(new)`
-    /// lets the shell remap its sidecar annotations; `None` means the page was removed.
+    /// lets the shell remap its cached annotations; `None` means the page was removed.
     pub fn apply_page_operation(
         &self,
         destination: String,
@@ -1815,9 +1815,9 @@ impl LyraReaderDocument {
     /// document selected twice, and an output that would overwrite an input are refused with a
     /// readable error and no file. The first document's outline is kept; the appended documents'
     /// outlines are not imported (`dropped_outline_entries` counts them). File-owned annotations
-    /// on appended pages travel with their pages. The reader's sidecar marks are the shell's
+    /// on appended pages travel with their pages. The reader's cached marks are the shell's
     /// concern: appending does not move existing pages, so their page indices are unchanged and
-    /// the appended pages start with no sidecar marks.
+    /// the appended pages start with no cached marks.
     pub fn merge_documents(
         &self,
         others: Vec<String>,
@@ -2006,7 +2006,7 @@ impl LyraReaderDocument {
 
     /// Writes `annotations` into a **new PDF** at `destination`.
     ///
-    /// The document that is open is not modified, and neither is its sidecar. `annotations`
+    /// The document that is open is not modified, and neither is its annotation cache. `annotations`
     /// cross the boundary as view-space geometry at `zoom`; Rust converts it to page space with
     /// the page's own `/CropBox`, `/Rotate` and `/UserUnit`, so the same highlight saved at 100%
     /// and at 300% lands in the same PDF coordinates.
@@ -3550,7 +3550,7 @@ impl LyraReaderDocument {
     /// The cache state for this document, for checks and measurements.
     ///
     /// Calling this first performs the one cache lookup (hashing the PDF and reading the
-    /// sidecar); it does not build any index component. `derived_parts` then says how much work
+    /// index cache); it does not build any index component. `derived_parts` then says how much work
     /// the following accessors actually did.
     pub fn index_cache_report(&self) -> IndexCacheReport {
         self.ensure_index_loaded();
@@ -3587,7 +3587,7 @@ impl LyraReaderDocument {
         }
     }
 
-    /// Looks the sidecar up once and, on a hit, fills every in-memory index component with it.
+    /// Looks the index cache up once and, on a hit, fills every in-memory index component with it.
     ///
     /// Lazy by design: opening a document never hashes the file or reads the cache, so the page
     /// raster and the first paint do not wait for the index. The shell's background loaders are
@@ -4072,11 +4072,11 @@ pub enum AnnotationWriteKind {
 
 /// One bookmark the shell asks the writer to put into the document's `/Outlines`.
 ///
-/// `y_pt` is page-local view space (0 at the page top), the same value the sidecar stores, so a
+/// `y_pt` is page-local view space (0 at the page top), the same value the annotation cache stores, so a
 /// bookmark survives a zoom change, a resize and a layout switch.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WriteBookmarkRecord {
-    /// The sidecar bookmark's UUID string, written as the private `/LyraReaderID` key so a
+    /// The cached bookmark's UUID string, written as the private `/LyraReaderID` key so a
     /// reopened document can adopt the file's bookmarks with their identities intact.
     pub id: String,
     pub page: u32,
@@ -4091,7 +4091,7 @@ pub struct WriteBookmarkRecord {
 /// 100% and the same highlight saved at 300% produce identical PDF coordinates.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WriteAnnotationRecord {
-    /// Stable identity written as `/NM`; the shell uses the sidecar's UUID string so a saved
+    /// Stable identity written as `/NM`; the shell uses the cached annotation's UUID string so a saved
     /// annotation can be recognised after reopening.
     pub id: String,
     pub page: u32,
@@ -4161,7 +4161,7 @@ pub struct AnnotationDeleteRecord {
 }
 
 /// What a successful write did. Every value is about the *file that was written*, not about the
-/// request: `written_ids` comes back so the shell removes exactly those sidecar entries.
+/// request: `written_ids` comes back so the shell removes exactly those cached entries.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AnnotationSaveReport {
     pub destination_path: String,
@@ -4174,7 +4174,7 @@ pub struct AnnotationSaveReport {
     /// Content annotations the source already had; every one the save did not edit or delete
     /// was verified unchanged.
     pub preexisting_annotation_count: u32,
-    /// Bookmark identities written into the outline, so the shell removes exactly those sidecar
+    /// Bookmark identities written into the outline, so the shell removes exactly those cached
     /// entries after a replacement.
     pub written_bookmark_ids: Vec<String>,
     /// Title of the rewritten bookmark subtree; `None` when the bookmark list was empty.
@@ -4364,7 +4364,7 @@ pub struct OutlineEntry {
     pub page: Option<u32>,
     /// Nesting level; 0 is a top-level entry.
     pub depth: u32,
-    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// The cached bookmark's UUID when this entry belongs to the reader's own saved subtree.
     /// `None` for every node the document's author wrote.
     pub bookmark_id: Option<String>,
     /// Page-local Y (points, 0 at the page top) when the destination names a position. This is
@@ -5020,7 +5020,7 @@ pub struct AiPlanPartRecord {
 }
 
 /// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
-/// briefly when a citation chip is clicked; they are never written to the PDF or the sidecar.
+/// briefly when a citation chip is clicked; they are never written to the PDF or the annotation cache.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct AiSourceRectRecord {
     pub x_pt: f64,

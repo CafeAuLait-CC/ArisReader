@@ -14,10 +14,10 @@ extension ReaderChecks {
     /// Bookmark write-back: the document's outline is merged with one independent subtree.
     ///
     /// The source is a scratch copy of `tests/fixtures/outlined.pdf`, which has three levels and
-    /// eight real outline entries. Three sidecar bookmarks are saved into a copy; the check then
+    /// eight real outline entries. Three cached bookmarks are saved into a copy; the check then
     /// compares the whole outline **before and after with PDFKit** (the engine Preview uses),
     /// saves a second time to prove the subtree is rewritten rather than accumulated, and
-    /// replaces the copy's original to prove the sidecar no longer duplicates what the file
+    /// replaces the copy's original to prove the annotation cache no longer duplicates what the file
     /// carries.
     @MainActor static func bookmarkWritebackChecks(root: URL) async throws {
         let fileManager = FileManager.default
@@ -33,7 +33,7 @@ extension ReaderChecks {
 
         let source = scratch.appendingPathComponent("outlined.pdf")
         try fileManager.copyItem(at: fixture, to: source)
-        let sidecar = DocumentEditCache.annotationsURL(for: source)
+        let records = DocumentEditCache.annotationsURL(for: source)
         let bookmarks = [
             Bookmark(page: 0, title: "Alpha", yPt: 120),
             Bookmark(page: 1, title: "Beta", yPt: 340),
@@ -41,18 +41,18 @@ extension ReaderChecks {
         ]
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(bookmarks).write(to: sidecar)
+        try encoder.encode(bookmarks).write(to: records)
         let sourceBytes = try Data(contentsOf: source)
-        let sidecarBytes = try Data(contentsOf: sidecar)
+        let recordsBytes = try Data(contentsOf: records)
 
         // ── 1. A document with bookmarks but no annotations can be saved ────────────────
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
         state.open(url: source)
-        try await eventually("the sidecar's three bookmarks load", {
+        try await eventually("the cache's three bookmarks load", {
             state.bookmarks.map(\.id) == bookmarks.map(\.id)
         })
-        require(state.annotations.isEmpty, "the fixture has no sidecar annotations")
+        require(state.annotations.isEmpty, "the fixture has no cached annotations")
         require(state.canSaveAnnotationsToPDF,
                 "bookmarks alone enable the save commands")
         require(state.canReplaceOriginalWithAnnotations,
@@ -68,14 +68,14 @@ extension ReaderChecks {
         require(state.lastAnnotationWriteReport?.preexistingOutlineEntryCount == 8,
                 "the report counts the document's eight existing entries")
         let sourceAfterCopy = try Data(contentsOf: source)
-        let sidecarAfterCopy = try Data(contentsOf: sidecar)
+        let recordsAfterCopy = try Data(contentsOf: records)
         require(sourceAfterCopy == sourceBytes,
                 "the original PDF is untouched by a copy save")
-        require(sidecarAfterCopy == sidecarBytes,
-                "the original sidecar is untouched by a copy save")
+        require(recordsAfterCopy == recordsBytes,
+                "the original annotation cache is untouched by a copy save")
         require(!fileManager.fileExists(
                     atPath: DocumentEditCache.annotationsURL(for: marked).path),
-                "the saved copy carries no sidecar")
+                "the saved copy carries no cached annotations")
 
         // ── 2. The reader reads the merged outline back ─────────────────────────────────
         let reopened = AppState(engine: try RustEngine())
@@ -169,20 +169,20 @@ extension ReaderChecks {
         require(reopenedAgain.outline.filter { $0.isBookmarkSubtree }.count == 1,
                 "the reader shows exactly one bookmark subtree")
 
-        // ── 5. Replace: the sidecar drops what the file now carries ─────────────────────
+        // ── 5. Replace: the annotation cache drops what the file now carries ─────────────────────
         let replaced = await reopenedAgain.replaceOriginalWithSavedAnnotations()
         require(replaced, "replacing the original with its bookmarks succeeds")
         require(reopenedAgain.lastAnnotationWriteReport?.writtenBookmarkIDs.count == 3,
                 "the replace writes the three bookmarks")
-        let replacedSidecar = DocumentEditCache.annotationsURL(for: second)
-        let replacedSidecarText = String(
-            decoding: (try? Data(contentsOf: replacedSidecar)) ?? Data(),
+        let replacedRecords = DocumentEditCache.annotationsURL(for: second)
+        let replacedRecordsText = String(
+            decoding: (try? Data(contentsOf: replacedRecords)) ?? Data(),
             as: UTF8.self
         )
         require(!bookmarks.contains(where: {
-                    replacedSidecarText.contains($0.id.uuidString)
+                    replacedRecordsText.contains($0.id.uuidString)
                 }),
-                "the replaced file's sidecar no longer duplicates the saved bookmarks")
+                "the replaced file's annotation cache no longer duplicates the saved bookmarks")
         try await eventually("the replaced document adopts its bookmarks from the file", {
             reopenedAgain.bookmarks.map(\.id) == bookmarks.map(\.id)
         })
@@ -195,18 +195,18 @@ extension ReaderChecks {
             require(false, "PDFKit could not open the replaced file")
         }
 
-        // ── 6. The crash window: a stale sidecar must not duplicate the file's copy ─────
-        // Replacing the PDF and failing to update the sidecar is the one failure mode that
+        // ── 6. The crash window: a stale annotation cache must not duplicate the file's copy ─────
+        // Replacing the PDF and failing to update the annotation cache is the one failure mode that
         // leaves both stores populated. Identity, not presence, decides: the outline's entries
         // are the same bookmarks, so the sidebar shows three, not six.
-        try encoder.encode(bookmarks).write(to: replacedSidecar)
+        try encoder.encode(bookmarks).write(to: replacedRecords)
         let stale = AppState(engine: try RustEngine())
         stale.setViewportSize(CGSize(width: 700, height: 500))
         stale.open(url: second)
-        try await eventually("the stale sidecar loads its three bookmarks", {
+        try await eventually("the stale annotation cache loads its three bookmarks", {
             stale.bookmarks.count == 3
         })
-        try await eventually("the saved file's outline loads beside it", {
+        try await eventually("the saved file's outline also loads", {
             stale.outline.contains { $0.isBookmarkSubtree }
         })
         require(stale.bookmarks.count == 3,

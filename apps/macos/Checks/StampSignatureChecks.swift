@@ -23,7 +23,7 @@ import UniformTypeIdentifiers
 /// 5. a `/Stamp` written by **PDFKit** (another producer) is read, classified as drawable, and
 ///    the same routine the canvas uses produces a picture for it;
 /// 6. deleting a saved stamp and a saved signature works, and undo restores them;
-/// 7. the sidecar writes versioned `stamp`/`signature` entries and a second reader loads them;
+/// 7. the cache writes versioned `stamp`/`signature` entries and a second reader loads them;
 /// 8. a digitally signed document refuses an in-place write and still allows a stamped copy.
 extension ReaderChecks {
     @MainActor static func stampSignatureChecks(root: URL) async throws {
@@ -133,7 +133,7 @@ extension ReaderChecks {
             fatalError("FAIL: the placed signature is in the model")
         }
         require(signature.imageData == signatureData,
-                "the sidecar model keeps the picture the reader chose")
+                "the annotation model keeps the picture the reader chose")
         require(abs(signatureBox.width / signatureBox.height - 3.0) < 0.2,
                 "the signature's initial box keeps the picture's aspect ratio")
 
@@ -147,29 +147,29 @@ extension ReaderChecks {
                     == signatureBox,
                 "undo restores the deleted signature")
 
-        // ── 3. The sidecar is versioned and round-trips ─────────────────────────────────
-        let sidecar = DocumentEditCache.annotationsURL(for: document)
-        let sidecarText = String(decoding: try Data(contentsOf: sidecar), as: UTF8.self)
-        require(sidecarText.contains("\"kind\" : \"stamp\"")
-                    && sidecarText.contains("\"stampStyle\" : \"approved\"")
-                    && sidecarText.contains("\"version\" : 1"),
-                "the sidecar writes a versioned stamp entry")
-        require(sidecarText.contains("\"kind\" : \"signature\"")
-                    && sidecarText.contains("\"image\" :"),
-                "the sidecar writes a versioned image-signature entry")
+        // ── 3. The annotation cache is versioned and round-trips ─────────────────────────────────
+        let records = DocumentEditCache.annotationsURL(for: document)
+        let recordsText = String(decoding: try Data(contentsOf: records), as: UTF8.self)
+        require(recordsText.contains("\"kind\" : \"stamp\"")
+                    && recordsText.contains("\"stampStyle\" : \"approved\"")
+                    && recordsText.contains("\"version\" : 1"),
+                "the cache writes a versioned stamp entry")
+        require(recordsText.contains("\"kind\" : \"signature\"")
+                    && recordsText.contains("\"image\" :"),
+                "the cache writes a versioned image-signature entry")
 
         let reloaded = AppState(engine: try RustEngine())
         reloaded.setViewportSize(CGSize(width: 900, height: 700))
         reloaded.newTab(url: document)
-        try await eventually("the sidecar round-trip loads both placed marks") {
+        try await eventually("the annotation cache round-trip loads both placed marks") {
             reloaded.annotations.count == 2
         }
         require(reloaded.annotations.contains {
             $0.kind == .stamp && $0.note.hasPrefix("APPROVED") && $0.stampStyle == "approved"
-        }, "a stamp entry round-trips through the sidecar")
+        }, "a stamp entry round-trips through the annotation cache")
         require(reloaded.annotations.contains {
             $0.kind == .signature && $0.imageData == signatureData
-        }, "a signature picture round-trips through the sidecar")
+        }, "a signature picture round-trips through the annotation cache")
 
         // ── 4. Save a copy, and let PDFKit judge it ─────────────────────────────────────
         let copy = scratch.appendingPathComponent("stamped-copy.pdf")
@@ -190,7 +190,7 @@ extension ReaderChecks {
         let textStamp = stamps.first { ($0.contents ?? "").contains("APPROVED") }
         require(textStamp != nil, "PDFKit reads the stamp's real text from /Contents")
 
-        // PDFKit's `bounds` is bottom-left page space; the sidecar stores top-left page space.
+        // PDFKit's `bounds` is bottom-left page space; the annotation cache stores top-left page space.
         func pdfRect(_ viewRect: CGRect) -> CGRect {
             CGRect(x: viewRect.minX, y: pageBounds.height - viewRect.maxY,
                    width: viewRect.width, height: viewRect.height)
