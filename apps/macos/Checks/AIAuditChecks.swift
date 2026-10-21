@@ -497,11 +497,12 @@ extension ReaderChecks {
         let cancelled = cancelTrail.records[0]
         require(cancelled.outcome == .cancelled, "the cancelled entry says cancelled")
         require(cancelled.code == nil, "a cancellation carries no error code")
-        // A CI runner can schedule the first partStarted event after the test's 120 ms sleep;
-        // the duration is measured from the part's own start, so it is not a wall-clock lower
-        // bound. Assert that a duration was recorded, not that the runner was fast enough.
-        require(cancelled.durationMilliseconds >= 0,
-                "the cancelled entry records a duration: \(cancelled.durationMilliseconds) ms")
+        // The audited attempt starts when send() enters the start site. The test then sleeps
+        // 120 ms before cancelling, so the recorded duration must cover essentially that whole
+        // open interval; 20 ms is the tolerance for millisecond rounding and dispatch. A part
+        // event arriving late cannot shorten it, because the duration anchor is the attempt.
+        require(cancelled.durationMilliseconds >= 100,
+                "the cancelled entry covers the open interval: \(cancelled.durationMilliseconds) ms")
         require(cancelled.characters > 0, "a started request records the characters it began to send")
 
         // A transport error after the first part started.
