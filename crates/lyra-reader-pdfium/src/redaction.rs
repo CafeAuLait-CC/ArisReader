@@ -84,6 +84,37 @@ pub enum RedactionMode {
     ReplaceOriginal,
 }
 
+/// The visible result after the sensitive content has actually been removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedactionFill {
+    Blackout,
+    Erase,
+}
+impl RedactionFill {
+    fn component(self) -> u8 {
+        if self == Self::Erase { 255 } else { 0 }
+    }
+}
+
+/// Stage either redaction style for the content editor's reversible working-copy session.
+pub fn stage_content_redaction(
+    source: &Path,
+    destination: &Path,
+    areas: &[RedactionArea],
+    fill: RedactionFill,
+    expected_source: &[u8],
+) -> Result<RedactionReport> {
+    redact_with_fill(
+        source,
+        destination,
+        areas,
+        None,
+        RedactionMode::Copy,
+        fill,
+        Some(expected_source),
+    )
+}
+
 /// One rectangle on one page, in PDF user space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RedactionArea {
@@ -219,6 +250,27 @@ pub fn redact_pdf(
     password: Option<&str>,
     mode: RedactionMode,
 ) -> Result<RedactionReport> {
+    redact_with_fill(
+        source,
+        destination,
+        areas,
+        password,
+        mode,
+        RedactionFill::Blackout,
+        None,
+    )
+}
+
+fn redact_with_fill(
+    source: &Path,
+    destination: &Path,
+    areas: &[RedactionArea],
+    password: Option<&str>,
+    mode: RedactionMode,
+    fill: RedactionFill,
+    expected_source: Option<&[u8]>,
+) -> Result<RedactionReport> {
+    let working = expected_source.is_some();
     validate_areas(areas)?;
     if password.is_some() {
         return Err(refusal(
@@ -250,6 +302,12 @@ pub fn redact_pdf(
         }
     }
     let source_bytes = read_source(source)?;
+    if expected_source.is_some_and(|expected| expected != source_bytes) {
+        return Err(refusal(
+            "the source changed while preparing this edit",
+            "reload page objects before erasing content",
+        ));
+    }
     reject_encrypted(&source_bytes)?;
     let api = redact_api()?;
     let original = RedactDocument::load(api, source_bytes.clone(), None)?;
@@ -263,19 +321,31 @@ pub fn redact_pdf(
         expected.insert(page, outside_text(&chars, rects));
     }
 
-    let analysis = analyse(&source_bytes, &grouped, &original, api)?;
+    let analysis = analyse(&source_bytes, &grouped, &original, api, fill)?;
     let stats = collect_stats(&analysis);
     let rasterized: HashSet<u32> = stats
         .iter()
         .filter(|(_, report)| report.rasterized)
         .map(|(&page, _)| page)
         .collect();
+    if working && !rasterized.is_empty() {
+        return Err(refusal(
+            "this region needs a raster redaction",
+            "the content editor keeps surviving text editable; this page's nested or unsupported content cannot yet be erased without rasterising the page",
+        ));
+    }
     let expected_outside: HashMap<u32, Vec<(u32, f64, f64)>> = expected;
     let verify_stats = stats.clone();
 
     let build =
         |file: &mut fs::File| -> Result<()> { write_redacted(&source_bytes, &analysis, file) };
     let verify = |path: &Path| -> Result<()> {
+        if read_source(source)? != source_bytes {
+            return Err(refusal(
+                "the source changed during redaction",
+                "no edit was published",
+            ));
+        }
         verify_redacted(
             path,
             &grouped,
@@ -283,6 +353,7 @@ pub fn redact_pdf(
             &rasterized,
             &verify_stats,
             page_count,
+            fill,
         )?;
         // The redaction verifier owns the text claim (outside the marks unchanged, inside the
         // marks gone). Everything a redaction does not intend to touch still has to survive the
@@ -293,8 +364,17 @@ pub fn redact_pdf(
     let (destination_path, backup_path, output_bytes, cleaned_temporaries, original_unchanged) =
         match mode {
             RedactionMode::Copy => {
-                let written =
-                    write_rewritten_pdf(source, destination, OutputMode::Copy, build, verify)?;
+                let written = write_rewritten_pdf(
+                    source,
+                    destination,
+                    if working {
+                        OutputMode::WorkingRevision
+                    } else {
+                        OutputMode::Copy
+                    },
+                    build,
+                    verify,
+                )?;
                 (
                     written.destination,
                     None,
@@ -406,6 +486,7 @@ fn analyse(
     grouped: &BTreeMap<u32, Vec<Rect>>,
     original: &RedactDocument,
     api: &'static RedactApi,
+    fill: RedactionFill,
 ) -> Result<Analysis> {
     // The lopdf document is the rewrite target; PDFium is only the microscope (char boxes,
     // object bounds, the fallback raster). The two are loaded from the same bytes.
@@ -440,10 +521,23 @@ fn analyse(
         let parsed = parse_content(&content, &fonts, &document, page_id, rects);
         let page_analysis = match parsed {
             Ok(parsed) if parsed.supported => {
-                let glyph_removals = map_glyphs_to_chars(&parsed, &chars, rects)?;
+                let mapped = map_glyphs_by_object(
+                    &document,
+                    page_id,
+                    &content,
+                    &parsed,
+                    &chars,
+                    rects,
+                    &original.page_object_types(page)?,
+                )?;
+                let (glyph_chars, glyph_removals) = if let Some((mapped, removals)) = &mapped {
+                    (mapped.as_slice(), Some(removals.clone()))
+                } else {
+                    (&chars[..], map_glyphs_to_chars(&parsed, &chars, rects)?)
+                };
                 if let Some(removals) = glyph_removals {
                     let removed_characters = removals.iter().filter(|removed| **removed).count();
-                    let bytes = rewrite_content(&parsed, &chars, &removals, rects)?;
+                    let bytes = rewrite_content(&parsed, glyph_chars, &removals, rects, fill)?;
                     PageAnalysis {
                         stats: PageBuildStats {
                             fill_marks: rects.len(),
@@ -461,7 +555,7 @@ fn analyse(
                 } else {
                     // Text did not map one-to-one: fall back to a raster. The page's whole text
                     // layer is lost, which the confirmation has warned about.
-                    let raster = render_raster(original, api, page, rects)?;
+                    let raster = render_raster(original, api, page, rects, fill)?;
                     PageAnalysis {
                         stats: PageBuildStats {
                             fill_marks: rects.len(),
@@ -479,7 +573,7 @@ fn analyse(
                 }
             }
             _ => {
-                let raster = render_raster(original, api, page, rects)?;
+                let raster = render_raster(original, api, page, rects, fill)?;
                 PageAnalysis {
                     stats: PageBuildStats {
                         fill_marks: rects.len(),
@@ -654,6 +748,8 @@ struct PageChar {
     matrix: [f64; 6],
     /// A synthetic line break PDFium inserts between text objects.
     generated: bool,
+    hyphen: bool,
+    object_index: Option<usize>,
 }
 
 impl PageChar {
@@ -692,10 +788,175 @@ fn outside_text(chars: &[PageChar], rects: &[Rect]) -> Vec<(u32, f64, f64)> {
         .collect()
 }
 
-/// Maps every glyph of the page's text-showing operators onto a PDFium character.
-///
-/// Returns `None` when the counts do not match, which is the signal to rasterise the page: glyphs
-/// that cannot be matched cannot be removed with confidence.
+/// Map each text-showing operator to its actual PDFium text object. An unrelated
+/// formula or ligature elsewhere on the page must not shift all subsequent character indices.
+/// Unselected objects keep their original bytes; selected objects require exact glyph origins
+/// and Unicode correspondence. The final verifier still checks every surviving character.
+fn map_glyphs_by_object(
+    document: &Document,
+    page_id: ObjectId,
+    content: &[u8],
+    parsed: &ParsedContent,
+    chars: &[PageChar],
+    rects: &[Rect],
+    types: &[i32],
+) -> Result<Option<(Vec<PageChar>, Vec<bool>)>> {
+    let debug = std::env::var_os("LYRA_REDACTION_DEBUG").is_some();
+    let paints: Vec<(usize, i32)> = parsed
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, op)| {
+            let kind = match op.operator.as_str() {
+                "Tj" | "TJ" | "'" | "\"" => 1,
+                "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => 2,
+                "Do" => 3,
+                "sh" => 4,
+                _ => return None,
+            };
+            Some((index, kind))
+        })
+        .collect();
+    if paints.len() != types.len()
+        || paints
+            .iter()
+            .zip(types)
+            .any(|((_, kind), actual)| *kind != *actual && !(*kind == 3 && *actual == 5))
+    {
+        if debug {
+            eprintln!("paint mismatch raw={} native={}", paints.len(), types.len());
+        }
+        return Ok(None);
+    }
+    let Some(first) = chars.first() else {
+        return Ok(None);
+    };
+    let mut representatives = vec![first.clone(); parsed.total_glyphs];
+    let mut removals = vec![false; parsed.total_glyphs];
+    let decoded = crate::text_edit::content::parse_page(document, page_id, content);
+    if decoded.problem.is_some() {
+        return Ok(None);
+    }
+    for show in &parsed.show_ops {
+        let Some(object) = paints.iter().position(|(op, _)| *op == show.index) else {
+            return Ok(None);
+        };
+        let actual: Vec<&PageChar> = chars
+            .iter()
+            .filter(|c| c.object_index == Some(object))
+            .collect();
+        if !actual.iter().any(|c| c.intersects_any(rects)) {
+            continue;
+        }
+        let glyphs: Vec<_> = decoded
+            .runs
+            .iter()
+            .filter(|r| {
+                r.operator_index == show.index
+                    && r.flags & crate::text_edit::content::FLAG_IN_FORM == 0
+            })
+            .flat_map(|r| decoded.glyphs[r.start..r.end].iter())
+            .collect();
+        if glyphs.len() != show.glyph_count {
+            if debug {
+                eprintln!(
+                    "show {} glyph count mismatch {} vs {}",
+                    show.index,
+                    glyphs.len(),
+                    show.glyph_count
+                );
+            }
+            return Ok(None);
+        }
+        let mut cursor = 0;
+        for (index, glyph) in glyphs.iter().enumerate() {
+            let Some(character) = actual.get(cursor) else {
+                return Ok(None);
+            };
+            let unicode: Vec<u32> = glyph
+                .text
+                .as_deref()
+                .map(|s| s.chars().map(u32::from).collect())
+                .unwrap_or_else(|| vec![character.unicode]);
+            let expanded: Vec<u32> = unicode
+                .iter()
+                .flat_map(|c| match c {
+                    0xfb00 => vec![102, 102],
+                    0xfb01 => vec![102, 105],
+                    0xfb02 => vec![102, 108],
+                    0xfb03 => vec![102, 102, 105],
+                    0xfb04 => vec![102, 102, 108],
+                    _ => vec![*c],
+                })
+                .collect();
+            let matches = |expected: &[u32]| {
+                actual
+                    .get(cursor..cursor + expected.len())
+                    .is_some_and(|slice| {
+                        slice.iter().map(|c| c.unicode).eq(expected.iter().copied())
+                    })
+            };
+            let count = if unicode == [45] && character.hyphen {
+                1
+            } else if !unicode.is_empty() && matches(&unicode) {
+                unicode.len()
+            } else if !expanded.is_empty() && matches(&expanded) {
+                expanded.len()
+            } else {
+                if debug {
+                    eprintln!(
+                        "show {} Unicode mismatch at {index}, character{cursor}",
+                        show.index
+                    );
+                }
+                return Ok(None);
+            };
+            if (character.origin_x - glyph.origin[0]).abs() > 0.5
+                || (character.origin_y - glyph.origin[1]).abs() > 0.5
+            {
+                if debug {
+                    eprintln!(
+                        "show {} origin mismatch at {index}: actual {},{} decoded {},{}",
+                        show.index,
+                        character.origin_x,
+                        character.origin_y,
+                        glyph.origin[0],
+                        glyph.origin[1]
+                    );
+                }
+                return Ok(None);
+            }
+            let slice = &actual[cursor..cursor + count];
+            let mut representative = (*slice[0]).clone();
+            for character in &slice[1..] {
+                representative.rect = representative.rect.union(character.rect)
+            }
+            let slot = show.glyph_start + index;
+            removals[slot] = slice.iter().any(|c| c.intersects_any(rects));
+            representatives[slot] = representative;
+            cursor += count;
+        }
+        if cursor != actual.len() {
+            if debug {
+                eprintln!(
+                    "show {} character count mismatch mapped {cursor} vs {}",
+                    show.index,
+                    actual.len()
+                );
+            }
+            return Ok(None);
+        }
+    }
+    // Characters inside an unaddressable nested form are left for the conservative fallback.
+    if chars
+        .iter()
+        .any(|c| c.intersects_any(rects) && c.object_index.is_none())
+    {
+        return Ok(None);
+    }
+    Ok(Some((representatives, removals)))
+}
+
 fn map_glyphs_to_chars(
     parsed: &ParsedContent,
     chars: &[PageChar],
@@ -1229,6 +1490,7 @@ fn rewrite_content(
     chars: &[PageChar],
     removals: &[bool],
     rects: &[Rect],
+    fill: RedactionFill,
 ) -> Result<Vec<u8>> {
     let shows: HashMap<usize, &ShowOp> = parsed
         .show_ops
@@ -1269,7 +1531,11 @@ fn rewrite_content(
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    bytes.extend_from_slice(b"q\n1 0 0 1 0 0 cm\n0 0 0 rg\n0 0 0 RG\n");
+    bytes.extend_from_slice(if fill == RedactionFill::Erase {
+        b"q\n1 0 0 1 0 0 cm\n1 1 1 rg\n1 1 1 RG\n"
+    } else {
+        b"q\n1 0 0 1 0 0 cm\n0 0 0 rg\n0 0 0 RG\n"
+    });
     for rect in rects {
         bytes.extend_from_slice(
             format!(
@@ -1299,7 +1565,7 @@ fn rewrite_show(
                 .and_then(string_bytes)
                 .ok_or_else(|| malformed("a Tj operator had no string"))?;
             let parts = rewritten_parts(string, font, chars, glyph_start, removals);
-            output.push(Operation::new("TJ", vec![Object::Array(parts)]));
+            emit_separate_text_parts(parts, output);
         }
         "'" => {
             let string = operation
@@ -1309,7 +1575,7 @@ fn rewrite_show(
                 .ok_or_else(|| malformed("a ' operator had no string"))?;
             let parts = rewritten_parts(string, font, chars, glyph_start, removals);
             output.push(Operation::new("T*", vec![]));
-            output.push(Operation::new("TJ", vec![Object::Array(parts)]));
+            emit_separate_text_parts(parts, output);
         }
         "\"" => {
             let Some(string) = operation.operands.get(2).and_then(string_bytes) else {
@@ -1328,7 +1594,8 @@ fn rewrite_show(
             let parts = rewritten_parts(string, font, chars, glyph_start, removals);
             output.push(Operation::new("Tw", vec![word_spacing]));
             output.push(Operation::new("Tc", vec![char_spacing]));
-            output.push(Operation::new("TJ", vec![Object::Array(parts)]));
+            output.push(Operation::new("T*", vec![]));
+            emit_separate_text_parts(parts, output);
         }
         "TJ" => {
             let array = operation
@@ -1337,7 +1604,7 @@ fn rewrite_show(
                 .and_then(|value| value.as_array().ok())
                 .ok_or_else(|| malformed("a TJ operator had no array"))?;
             let mut parts: Vec<Object> = Vec::new();
-            let mut glyph = glyph_start;
+            let mut glyph = 0;
             for item in array {
                 match item {
                     Object::String(bytes, format) => {
@@ -1345,18 +1612,42 @@ fn rewrite_show(
                         let end = (glyph + count).min(removals.len());
                         let slice = &removals[glyph..end];
                         parts.extend(rewritten_string_parts(
-                            bytes, *format, font, chars, glyph, slice,
+                            bytes,
+                            *format,
+                            font,
+                            chars,
+                            glyph_start + glyph,
+                            slice,
                         ));
                         glyph = end;
                     }
                     other => parts.push(other.clone()),
                 }
             }
-            output.push(Operation::new("TJ", vec![Object::Array(parts)]));
+            emit_separate_text_parts(parts, output);
         }
         _ => {}
     }
     Ok(())
+}
+
+// A separate text-showing operator per surviving segment lets PDFium rebuild disjoint
+// object bounds after an erase. Numeric TJ advances still preserve every surviving origin.
+fn emit_separate_text_parts(parts: Vec<Object>, output: &mut Vec<Operation>) {
+    let mut pending = Vec::new();
+    for part in parts {
+        let is_text = matches!(&part, Object::String(..));
+        pending.push(part);
+        if is_text {
+            output.push(Operation::new(
+                "TJ",
+                vec![Object::Array(std::mem::take(&mut pending))],
+            ));
+        }
+    }
+    if !pending.is_empty() {
+        output.push(Operation::new("TJ", vec![Object::Array(pending)]));
+    }
 }
 
 /// Rewrites one string into TJ array elements, inserting a spacing adjustment for every removed
@@ -1508,6 +1799,10 @@ fn write_redacted(source_bytes: &[u8], analysis: &Analysis, file: &mut fs::File)
             )
         })?;
         if page_analysis.rasterize {
+            document
+                .get_dictionary_mut(page_id)
+                .map_err(|e| LyraReaderError::new(ErrorCode::CorruptDocument, e.to_string()))?
+                .remove(b"LyraReaderTextFrames");
             replace_page_with_raster(&mut document, page_id, page_analysis)?;
         } else if let Some(content) = &page_analysis.content {
             let stream = Stream::new(Dictionary::new(), content.clone());
@@ -1520,6 +1815,7 @@ fn write_redacted(source_bytes: &[u8], analysis: &Analysis, file: &mut fs::File)
                         .with_detail(error.to_string())
                 })?;
             page_dictionary.set("Contents", Object::Reference(id));
+            page_dictionary.remove(b"LyraReaderTextFrames");
         }
     }
 
@@ -1620,6 +1916,7 @@ fn verify_redacted(
     rasterized: &HashSet<u32>,
     stats: &HashMap<u32, RedactionPageReport>,
     page_count: u32,
+    fill: RedactionFill,
 ) -> Result<()> {
     let api = redact_api()?;
     let bytes = fs::read(path)
@@ -1740,10 +2037,13 @@ fn verify_redacted(
                     "a redaction mark could not be sampled on the saved page",
                 ));
             };
-            if pixel.0 > 48 || pixel.1 > 48 || pixel.2 > 48 {
+            if [pixel.0, pixel.1, pixel.2]
+                .iter()
+                .any(|c| c.abs_diff(fill.component()) > 48)
+            {
                 return Err(LyraReaderError::new(
                     ErrorCode::Internal,
-                    "a redaction mark is not black on the saved page",
+                    "a redaction mark has the wrong fill on the saved page",
                 )
                 .with_detail(format!(
                     "page {}: sampled ({}, {}, {})",
@@ -1847,6 +2147,9 @@ struct RedactApi {
     close_text_page: unsafe extern "C" fn(FpdfTextPage),
     text_count_chars: unsafe extern "C" fn(FpdfTextPage) -> std::ffi::c_int,
     text_get_unicode: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_uint,
+    text_is_generated: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_int,
+    text_is_hyphen: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_int,
+    text_get_object: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> FpdfPageObject,
     text_get_loose_box:
         unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int, *mut FsRectF) -> std::ffi::c_int,
     text_get_origin:
@@ -1921,6 +2224,9 @@ unsafe fn resolve_api(library: Library) -> Option<RedactApi> {
         close_text_page: unsafe { symbol(&library, b"FPDFText_ClosePage\0")? },
         text_count_chars: unsafe { symbol(&library, b"FPDFText_CountChars\0")? },
         text_get_unicode: unsafe { symbol(&library, b"FPDFText_GetUnicode\0")? },
+        text_is_generated: unsafe { symbol(&library, b"FPDFText_IsGenerated\0")? },
+        text_is_hyphen: unsafe { symbol(&library, b"FPDFText_IsHyphen\0")? },
+        text_get_object: unsafe { symbol(&library, b"FPDFText_GetTextObject\0")? },
         text_get_loose_box: unsafe { symbol(&library, b"FPDFText_GetLooseCharBox\0")? },
         text_get_origin: unsafe { symbol(&library, b"FPDFText_GetCharOrigin\0")? },
         text_get_font_size: unsafe { symbol(&library, b"FPDFText_GetFontSize\0")? },
@@ -2017,6 +2323,15 @@ impl RedactDocument {
             )
             .with_detail(format!("page {}", page + 1)));
         }
+        let object_count = unsafe { (self.api.count_objects)(page_handle) }.max(0);
+        let objects: HashMap<usize, usize> = (0..object_count)
+            .map(|i| {
+                (
+                    unsafe { (self.api.get_object)(page_handle, i) } as usize,
+                    i as usize,
+                )
+            })
+            .collect();
         let count = unsafe { (self.api.text_count_chars)(text_page) }.max(0);
         let mut chars = Vec::with_capacity(count as usize);
         for index in 0..count {
@@ -2058,7 +2373,9 @@ impl RedactDocument {
             };
             let width = (right - left).abs();
             let height = (top - bottom).abs();
-            let generated = matches!(unicode, 10 | 13) && width <= 1e-6 && height <= 1e-6;
+            // PDFium also synthesises spaces between positioned objects. They have non-zero
+            // boxes, but no encoded glyph to remove; counting them breaks real-paper mapping.
+            let generated = unsafe { (self.api.text_is_generated)(text_page, index) } == 1;
             chars.push(PageChar {
                 unicode,
                 rect: Rect::new(left.min(right), bottom.min(top), width, height),
@@ -2074,11 +2391,29 @@ impl RedactDocument {
                     f64::from(matrix.f),
                 ],
                 generated,
+                hyphen: unsafe { (self.api.text_is_hyphen)(text_page, index) } == 1,
+                object_index: objects
+                    .get(&(unsafe { (self.api.text_get_object)(text_page, index) } as usize))
+                    .copied(),
             });
         }
         unsafe { (self.api.close_text_page)(text_page) };
         unsafe { (self.api.close_page)(page_handle) };
         Ok(chars)
+    }
+
+    fn page_object_types(&self, page: u32) -> Result<Vec<i32>> {
+        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let handle = unsafe { (self.api.load_page)(self.document, page as i32) };
+        if handle.is_null() {
+            return Err(page_error(page));
+        }
+        let count = unsafe { (self.api.count_objects)(handle) }.max(0);
+        let types = (0..count)
+            .map(|i| unsafe { (self.api.get_object_type)((self.api.get_object)(handle, i)) })
+            .collect();
+        unsafe { (self.api.close_page)(handle) };
+        Ok(types)
     }
 
     fn intersecting_graphics(&self, page: u32, rects: &[Rect]) -> Result<usize> {
@@ -2186,7 +2521,7 @@ impl RasterImage {
         Some((self.rgb[offset], self.rgb[offset + 1], self.rgb[offset + 2]))
     }
 
-    fn fill_black(&mut self, rect: &Rect) {
+    fn fill(&mut self, rect: &Rect, fill: RedactionFill) {
         if self.bounds.size.width <= 0.0 || self.bounds.size.height <= 0.0 {
             return;
         }
@@ -2208,9 +2543,9 @@ impl RasterImage {
         for y in top..bottom {
             for x in left..right {
                 let offset = (y * self.width + x) * 3;
-                self.rgb[offset] = 0;
-                self.rgb[offset + 1] = 0;
-                self.rgb[offset + 2] = 0;
+                self.rgb[offset] = fill.component();
+                self.rgb[offset + 1] = fill.component();
+                self.rgb[offset + 2] = fill.component();
             }
         }
     }
@@ -2221,6 +2556,7 @@ fn render_raster(
     api: &'static RedactApi,
     page: u32,
     rects: &[Rect],
+    fill: RedactionFill,
 ) -> Result<RasterImage> {
     let scale = RASTER_DPI / 72.0;
     let mut raster = {
@@ -2230,7 +2566,7 @@ fn render_raster(
         render_page_locked(api, document.document, page, scale)?
     };
     for rect in rects {
-        raster.fill_black(rect);
+        raster.fill(rect, fill);
     }
     Ok(raster)
 }

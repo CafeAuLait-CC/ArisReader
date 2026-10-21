@@ -84,6 +84,11 @@ public struct ReaderWindow: View {
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
+        .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
+            Button("Save Edited Copy…") {state.saveContentAndClose()}
+            Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
+            Button("Cancel",role:.cancel) {state.cancelContentClose()}
+        } message: {Text("The original file has not been changed. Save a copy to keep this editing session.")}
         .onAppear { state.installTerminationHandling() }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
             guard AppState.recordsRecentDocuments, let url else { return }
@@ -239,6 +244,14 @@ public struct ReaderWindow: View {
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
             HStack { Spacer(); ScrollIndicator(state: state) }
+
+            if state.contentEditEnabled {
+                PDFContentEditor(state:state)
+                    .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
+                        await state.reloadContentObjects()
+                    }
+                HStack { Spacer(); ContentEditInspector(state:state) }
+            }
 
             if state.document == nil {
                 LyraReaderTheme.emptyBg

@@ -1674,6 +1674,9 @@ public protocol PDFEngine: AnyObject {
     func suggestedPropertiesCopyURL(for url: URL) -> URL
     /// The `/Rotate` of every page, in quarter turns (0–3).
     func pageRotations() async throws -> [Int]
+    func contentObjects(page: Int) async throws -> PDFContentPage
+    func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data
+    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws
     /// Applies a page operation to a copy of the open document and writes it to `destination`.
     /// The open document is not modified.
     func applyPageOperation(_ operation: PageEditOperation, to destination: URL) async throws -> PageOperationReport
@@ -1763,6 +1766,15 @@ public protocol PDFEngine: AnyObject {
 }
 
 public extension PDFEngine {
+    func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data {
+        throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot export images"])
+    }
+    func contentObjects(page: Int) async throws -> PDFContentPage {
+        throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot inspect page content"])
+    }
+    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+        throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot edit page content"])
+    }
     /// A plain page raster for engines that have no annotation-burn-in path.
     ///
     /// Every test double keeps working through this default; only `RustEngine` overrides it,
@@ -2849,6 +2861,42 @@ public final class RustEngine: PDFEngine {
             }
         }
         return rotations.map(Int.init)
+    }
+
+    public func contentObjects(page: Int) async throws -> PDFContentPage {
+        guard let document else { throw NSError(domain:"LyraReader",code:1) }
+        let json: String = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do { continuation.resume(returning:try document.contentObjects(page:UInt32(page))) }
+                catch { continuation.resume(throwing:error) }
+            }
+        }
+        return try JSONDecoder().decode(PDFContentPage.self,from:Data(json.utf8))
+    }
+
+    public func contentImagePNG(page:Int,target:String,revision:String) async throws -> Data {
+        guard let document else{throw NSError(domain:"LyraReader",code:1)}
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {continuation.resume(returning:Data(try document.contentImagePng(page:UInt32(page),target:target,revision:revision)))}
+                catch {continuation.resume(throwing:error)}
+            }
+        }
+    }
+
+    public func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+        guard let document else { throw NSError(domain:"LyraReader",code:1) }
+        let data=try JSONEncoder().encode(command)
+        let json=String(decoding:data,as:UTF8.self)
+        try await withCheckedThrowingContinuation { (continuation:CheckedContinuation<Void,Error>) in
+            rasterQueue.async {
+                do {
+                    try document.applyContentEdit(page:UInt32(page),command:json,destination:destination.path)
+                    continuation.resume()
+                } catch { continuation.resume(throwing:error) }
+            }
+        }
+        invalidateCachedCopy(at:destination)
     }
 
     public func applyPageOperation(

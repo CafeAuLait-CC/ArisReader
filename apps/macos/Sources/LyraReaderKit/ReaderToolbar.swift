@@ -196,7 +196,10 @@ struct ReaderToolbar: View {
             .buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
-            pending("Edit PDF", "character.cursor.ibeam")
+            Button { state.toggleContentEditing() } label: {
+                Label("Edit PDF",systemImage:"character.cursor.ibeam")
+            }.buttonStyle(LyraReaderToolStyle(selected:state.contentEditEnabled))
+                .disabled(!state.canPageEdit)
             LyraReaderMenu(title: "Organise pages", items: [
                 LyraReaderMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
                 LyraReaderMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },

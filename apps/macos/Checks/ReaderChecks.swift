@@ -42,6 +42,10 @@ struct ReaderChecks {
 
         let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
             ?? FileManager.default.currentDirectoryPath)
+        if CommandLine.arguments.contains("--check-content-editing") {
+            try await contentEditingChecks(root:fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-rename") {
             try renameCompatibilityChecks(root: fastRoot)
             return
@@ -589,6 +593,7 @@ struct ReaderChecks {
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
         try await stampSignatureChecks(root: root)
+        try await contentEditingChecks(root: root)
         try await bookmarkWritebackChecks(root: root)
         try await crossReaderAnnotationChecks(
             replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),

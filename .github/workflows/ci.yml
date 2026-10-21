@@ -108,7 +108,7 @@ jobs:
       # committed links, but this job still never fetches it, so recall stays unmeasured here.
       - name: Record that the corpus regression did not run
         run: |
-          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need LYRA_READER_PDF_SAMPLES. A green cargo test says nothing about them. Run them on a machine that holds the corpus: LYRA_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p lyra-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run here: reference_corpus, table_corpus and the 226/227 sampled citation spans are #[ignore]d and need LYRA_READER_PDF_SAMPLES. A green cargo test says nothing about them. The real-manuscript content_edit tests also skip without LYRA_READER_PDF_SAMPLES; synthetic content-editing fixtures still run. Run them on a machine that holds the corpus: LYRA_READER_PDF_SAMPLES=pdf-samples ./scripts/check.sh (or cargo test -p lyra-reader-cli --test reference_corpus --test table_corpus -- --ignored --nocapture)."
 
       - name: Record that the reference-index evaluation did not run
         run: |
@@ -222,7 +222,7 @@ jobs:
       # covered it. Do not let a future reader assume otherwise.
       - name: Record that the corpus regression did not run
         run: |
-          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need LYRA_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them."
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need LYRA_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them. The real-manuscript content_edit tests also skip without LYRA_READER_PDF_SAMPLES; synthetic content-editing fixtures still run."
 
       # ---------------------------------------------------------- the reference-index evaluation
       # One step, because "should the evaluation run?" is a question about the *filesystem*, not

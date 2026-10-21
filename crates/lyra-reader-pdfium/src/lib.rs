@@ -51,6 +51,8 @@ mod appearance_font;
 #[cfg(feature = "pdfium")]
 mod backend;
 #[cfg(feature = "pdfium")]
+pub mod content_edit;
+#[cfg(feature = "pdfium")]
 mod document_properties;
 #[cfg(feature = "pdfium")]
 mod forms;

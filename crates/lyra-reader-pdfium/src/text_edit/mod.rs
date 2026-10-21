@@ -17,7 +17,7 @@
 //! Nothing here creates, opens for writing, or modifies a PDF. Phase two would build on the
 //! analysis, but only after this study shows a safe subset worth shipping.
 
-mod content;
+pub(crate) mod content;
 pub(crate) mod font;
 
 use content::{Glyph, ParsedPage, RunCandidate};

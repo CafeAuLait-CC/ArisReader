@@ -1083,7 +1083,7 @@ impl DocumentBackend for PdfiumBackend {
     }
 }
 
-fn page_geometry(page: &PdfPage<'_>) -> PageGeometry {
+pub(crate) fn page_geometry(page: &PdfPage<'_>) -> PageGeometry {
     // Boundary boxes are returned in unrotated PDF user space, which is
     // exactly what `PageGeometry` expects: it applies `/Rotate` itself.
     let media = page
