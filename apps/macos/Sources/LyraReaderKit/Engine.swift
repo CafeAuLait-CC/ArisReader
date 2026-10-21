@@ -8,8 +8,8 @@ import Foundation
 /// ``readOnlyReason``, and the shell disables those commands and shows the same sentence. Saving
 /// an annotated **copy** stays available because it writes a new file and never touches the
 /// signed original.
-public struct DocumentSignature: Equatable, Sendable {
-    public struct Evidence: Equatable, Sendable {
+public struct DocumentSignature: Codable, Equatable, Sendable {
+    public struct Evidence: Codable, Equatable, Sendable {
         /// Stable machine name: `sigFlags`, `docMdp`, `signatureField`, `dss` or `pdfium`.
         public let kind: String
         /// The concrete dictionary fact, for the banner and logs.

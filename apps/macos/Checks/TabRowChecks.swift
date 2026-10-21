@@ -1,5 +1,6 @@
 import AppKit
 import LyraReaderKit
+import LyraReaderBindings
 import Foundation
 import SwiftUI
 
@@ -238,10 +239,12 @@ extension ReaderChecks {
         state.gotoPage(1)
         let scrollB = state.scrollYPt
         require(scrollB > 0, "the second tab is scrolled away from the top")
-        try await eventually("the second tab's index sidecar is written", {
-            fileManager.fileExists(atPath: b.appendingPathExtension("lyra-reader-index.json").path)
+        let indexURLB = URL(fileURLWithPath: LyraReaderBindings.documentIndexCachePath(path: b.path))
+        require(indexURLB.deletingLastPathComponent() != b.deletingLastPathComponent(),
+                "the derived index uses the application cache instead of the PDF's folder")
+        try await eventually("the second tab's application index cache is written", {
+            fileManager.fileExists(atPath: indexURLB.path)
         })
-        let indexURLB = b.appendingPathExtension("lyra-reader-index.json")
         let indexAfterFirstWrite = try fileManager.attributesOfItem(atPath: indexURLB.path)
 
         // 2. Switching to the first tab is a document activation, never an open, and presents the
@@ -344,7 +347,7 @@ extension ReaderChecks {
             color: AppState.highlightPalette[0].color,
             note: "survives a tab switch", createdAt: Date()
         )
-        let annotationSidecar = annotated.appendingPathExtension("lyra-reader-annotations.json")
+        let annotationSidecar = DocumentEditCache.annotationsURL(for: annotated)
         try JSONEncoder().encode([note]).write(to: annotationSidecar)
         let annotationState = AppState(engine: try RustEngine())
         annotationState.setViewportSize(CGSize(width: 700, height: 500))

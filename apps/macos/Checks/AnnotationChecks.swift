@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 
 extension ReaderChecks {
     @MainActor static func annotationChecks(a: URL, b: URL) async throws {
-        let sidecar = a.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: a)
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "old", createdAt: Date())
         let encoder = JSONEncoder()
@@ -77,7 +77,7 @@ extension ReaderChecks {
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+            DocumentEditCache.annotationsURL(for: document)
         }
         func readSidecar(_ document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
@@ -354,10 +354,11 @@ extension ReaderChecks {
             color: AppState.highlightPalette[0].color, note: "first", createdAt: Date())
         try encoder.encode([lockedAnnotation]).write(to: sidecar(of: locked))
         lockedState.open(url: locked)
-        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedDirectory.path)
+        let lockedCacheDirectory = sidecar(of: locked).deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedCacheDirectory.path)
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o755],
-                                                   ofItemAtPath: lockedDirectory.path)
+                                                   ofItemAtPath: lockedCacheDirectory.path)
         }
         let lockedBefore = lockedState.annotations
         lockedState.updateNote("must not publish", for: lockedAnnotation.id)
@@ -705,14 +706,14 @@ extension ReaderChecks {
 
         func fixture(_ name: String) throws -> URL {
             let document = directory.appendingPathComponent(name)
-            let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
+            let sidecar = DocumentEditCache.annotationsURL(for: document)
             try? FileManager.default.removeItem(at: document)
             try? FileManager.default.removeItem(at: sidecar)
             try FileManager.default.copyItem(at: a, to: document)
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+            DocumentEditCache.annotationsURL(for: document)
         }
         func text(of document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)

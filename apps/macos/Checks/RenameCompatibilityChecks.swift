@@ -49,13 +49,16 @@ extension ReaderChecks {
                 "a real document reopens annotations from its old sidecar")
         state.updateNote("after rename", for: annotation.id)
         state.flushPendingAnnotationWrite()
-        let saved = try JSONDecoder().decode([AppState.Annotation].self, from: Data(contentsOf: legacy))
-        require(saved.first?.note == "after rename" && !FileManager.default.fileExists(atPath: current.path),
-                "editing an upgraded document persists in place without splitting annotation history")
+        let saved = try JSONDecoder().decode([AppState.Annotation].self,
+            from: Data(contentsOf: DocumentEditCache.annotationsURL(for: pdf)))
+        require(saved.first?.note == "after rename" && !FileManager.default.fileExists(atPath: current.path)
+                    && !FileManager.default.fileExists(atPath: legacy.path),
+                "editing an upgraded document uses the migrated application cache")
         try Data("[]".utf8).write(to: current)
         require(ReaderDataCompatibility.annotationSidecarURL(for: pdf) == current,
                 "the new sidecar wins deterministically if both versions exist")
         try FileManager.default.removeItem(at: current)
+        try FileManager.default.removeItem(at: DocumentEditCache.directory(for: pdf))
         let corrupt = Data("{broken legacy sidecar".utf8)
         try corrupt.write(to: legacy)
         state.open(url: pdf)

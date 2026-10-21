@@ -1252,7 +1252,7 @@ extension ReaderChecks {
         state.open(url: url)
         require(state.currentPage == 1, "the reader starts on page 1")
         let annotationsBefore = state.annotations
-        let sidecar = url.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: url)
         try? FileManager.default.removeItem(at: sidecar)
         chip.follow(in: state)
         require(state.currentPage == chip.page,

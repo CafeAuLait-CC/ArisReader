@@ -425,7 +425,7 @@ extension ReaderChecks {
         // URL instead of a committed fixture (this engine never reads the file itself).
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("lyra-reader-zoom-\(UUID()).pdf")
-        let sidecar = scratch.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: scratch)
         defer {
             try? FileManager.default.removeItem(at: scratch)
             try? FileManager.default.removeItem(at: sidecar)

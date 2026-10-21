@@ -14,6 +14,12 @@ use crate::index_cache::{
     CacheRead, CachedReferenceList, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
     disabled_by_environment, read_cache, write_cache,
 };
+
+/// Cache-management location for the native shell; does not open or index the document.
+#[uniffi::export]
+pub fn document_index_cache_path(path: String) -> String {
+    cache_path(Path::new(&path)).display().to_string()
+}
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
     Action as AiAction, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest, MergePart,

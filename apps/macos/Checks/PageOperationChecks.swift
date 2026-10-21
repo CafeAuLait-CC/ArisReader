@@ -43,7 +43,7 @@ extension ReaderChecks {
             for annotation in annotations { lines.append(try entry(annotation)) }
             for bookmark in bookmarks { lines.append(try entry(bookmark)) }
             try Data(("[\n" + lines.joined(separator: ",\n") + "\n]").utf8)
-                .write(to: document.appendingPathExtension("lyra-reader-annotations.json"))
+                .write(to: DocumentEditCache.annotationsURL(for: document))
         }
 
         let pageOne = AppState.Annotation(
@@ -69,7 +69,7 @@ extension ReaderChecks {
         let bookmark = Bookmark(page: 1, title: "on page two", yPt: 12)
         let annotated = try copyFixture("annotated.pdf", to: "seeded.pdf")
         try writeSidecar([pageOne, pageTwo], [bookmark], to: annotated)
-        let sidecarURL = annotated.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecarURL = DocumentEditCache.annotationsURL(for: annotated)
         let originalBytes = try Data(contentsOf: annotated)
         let originalSidecar = try Data(contentsOf: sidecarURL)
 
@@ -87,10 +87,12 @@ extension ReaderChecks {
             .rotate(pages: [0], quarterTurns: 1),
             label: "Rotate page 1"
         )
-        require(!rotationRefused, "rotating a page with LyraReader annotations is refused")
-        require(state.lastError?.contains("text positions") == true,
-                "the refusal explains the annotation rule")
-        require(!state.pageEditSessionActive, "a refused rotation does not start a session")
+        require(rotationRefused, "rotation automatically embeds cached text-position marks")
+        state.undoPageEdit()
+        try await eventually("rotation undo restores cached annotation anchors") {
+            state.pageEditPendingOperations.isEmpty && !state.pageEditBusy && state.annotations.count == 2
+        }
+        state.discardPageEdits()
 
         // ── Rotate, undo, redo on a page with no sidecar marks ──────────────────────
         let rotationSource = try copyFixture("multipage.pdf", to: "rotation.pdf")
@@ -223,7 +225,7 @@ extension ReaderChecks {
 
         // ── Explicit replace: backup, verify, remapped sidecar ─────────────────────
         let replaced = try copyFixture("annotated.pdf", to: "replaced.pdf")
-        let replacedSidecar = replaced.appendingPathExtension("lyra-reader-annotations.json")
+        let replacedSidecar = DocumentEditCache.annotationsURL(for: replaced)
         let replacedPageOne = AppState.Annotation(
             id: UUID(), kind: .highlight, page: 0, start: 0, end: 4,
             color: AppState.highlightPalette[0].color, note: "goes away", createdAt: Date()
@@ -254,9 +256,10 @@ extension ReaderChecks {
         let reopened = AppState(engine: try RustEngine())
         require(reopened.open(url: replaced), "the replaced PDF reopens in a fresh reader")
         require(reopened.document?.pageCount == 1, "the replaced PDF keeps exactly one page")
-        require(reopened.annotations.count == 1 && reopened.annotations[0].note == "stays"
-                && reopened.annotations[0].page == 0,
-                "the replaced original's sidecar is remapped to the surviving page")
+        try await eventually("the saved mark is read from the surviving PDF page") {
+            reopened.documentAnnotations.contains { $0.contents == "stays" && $0.page == 0 }
+        }
+        require(reopened.annotations.isEmpty, "saved marks need no duplicate cache records")
 
         // ── Save Edited Copy: original untouched, copy verified, marks beside it ────
         let source = try copyFixture("multipage.pdf", to: "copy-source.pdf")
@@ -308,7 +311,7 @@ extension ReaderChecks {
         )
         let mergeBookmark = Bookmark(page: 1, title: "merge bookmark", yPt: 10)
         try writeSidecar([mergeMark], [mergeBookmark], to: mergeFirst)
-        let mergeSidecar = mergeFirst.appendingPathExtension("lyra-reader-annotations.json")
+        let mergeSidecar = DocumentEditCache.annotationsURL(for: mergeFirst)
         let mergeFirstBytes = try Data(contentsOf: mergeFirst)
         let mergeSidecarBytes = try Data(contentsOf: mergeSidecar)
         let mergeState = AppState(engine: try RustEngine())
@@ -338,19 +341,22 @@ extension ReaderChecks {
         require(mergedState.open(url: merged), "the merged file opens")
         require(mergedState.document?.pageCount == 8,
                 "the merged file has the sum of the three documents' pages")
+        try await eventually("the merged document loads its embedded marks and bookmarks") {
+            mergedState.documentAnnotations.contains { $0.contents == "merge mark" } && mergedState.bookmarks.count == 1
+        }
         let mergedMarks = Dictionary(
-            uniqueKeysWithValues: mergedState.annotations.map { ($0.note, $0.page) }
+            uniqueKeysWithValues: mergedState.documentAnnotations.map { ($0.contents, $0.page) }
         )
         require(mergedMarks["merge mark"] == 0,
                 "our annotation keeps its page after a merge")
         require(mergedState.bookmarks.count == 1 && mergedState.bookmarks[0].page == 1,
                 "our bookmark keeps its page after a merge")
-        require(mergedState.annotations.count == 1,
-                "the appended pages start with no LyraReader sidecar marks")
+        require(mergedState.annotations.isEmpty,
+                "the merged file embeds marks without requiring cache records")
         try await eventually("the merged outline loads", {
-            mergedState.outline.count == 8
+            mergedState.outline.filter { !$0.isBookmarkSubtree && $0.bookmarkID == nil }.count == 8
         })
-        require(mergedState.outline.filter { $0.depth == 0 }.map(\.title)
+        require(mergedState.outline.filter { $0.depth == 0 && !$0.isBookmarkSubtree }.map(\.title)
                     == ["Chapter One", "Chapter Two", "Chapter Three"],
                 "the first document's outline survives the merge")
         let mergedProbe = try RustEngine()
@@ -447,7 +453,7 @@ extension ReaderChecks {
         )
         let splitBookmark = Bookmark(page: 5, title: "middle bookmark", yPt: 20)
         try writeSidecar([splitMark], [splitBookmark], to: eleven)
-        let elevenSidecar = eleven.appendingPathExtension("lyra-reader-annotations.json")
+        let elevenSidecar = DocumentEditCache.annotationsURL(for: eleven)
         let elevenBytes = try Data(contentsOf: eleven)
         let elevenSidecarBytes = try Data(contentsOf: elevenSidecar)
         let splitState = AppState(engine: try RustEngine())
@@ -497,6 +503,7 @@ extension ReaderChecks {
         let rangeSecondState = AppState(engine: try RustEngine())
         require(rangeSecondState.open(url: rangeOutputs[1]),
                 "the second range output opens")
+        try await eventually("the split bookmark loads from the output PDF") { rangeSecondState.bookmarks.count == 1 }
         require(rangeSecondState.bookmarks.count == 1
                     && rangeSecondState.bookmarks[0].page == 0
                     && rangeSecondState.bookmarks[0].title == "middle bookmark",
@@ -505,10 +512,9 @@ extension ReaderChecks {
                 "the second output carries no mark from another page")
         let rangeThirdState = AppState(engine: try RustEngine())
         require(rangeThirdState.open(url: rangeOutputs[2]), "the last range output opens")
-        require(rangeThirdState.annotations.count == 1
-                    && rangeThirdState.annotations[0].note == "last page mark"
-                    && rangeThirdState.annotations[0].page == 0,
-                "an annotation on the last page is renumbered into the last output")
+        try await eventually("the last output embeds its annotation on the remapped page") {
+            rangeThirdState.documentAnnotations.contains { $0.contents == "last page mark" && $0.page == 0 }
+        }
         require(rangeThirdState.bookmarks.isEmpty,
                 "the last output carries no bookmark from another page")
         let elevenSidecarAfter = try Data(contentsOf: elevenSidecar)
