@@ -48,6 +48,8 @@ public final class AIAssistantModel: ObservableObject {
     @Published public private(set) var statusNote: String?
     @Published public private(set) var documentKey: String?
     @Published public var selectedTab: AIAssistantTab = .summary
+    @Published public var summaryUsesSelection = false
+    @Published public var expandedChatSources: Set<UUID> = []
     /// The question for "Ask selection"; the view binds it.
     @Published public var question = ""
     /// The composer for document chat; the view binds it.
@@ -150,6 +152,7 @@ public final class AIAssistantModel: ObservableObject {
             saveCurrentConversation()
             documentKey = key
             chatTurns = key.flatMap { conversations[$0] } ?? []
+            expandedChatSources = []
             clearChatTransientState()
             phase = .idle
             statusNote = nil
@@ -463,6 +466,7 @@ public final class AIAssistantModel: ObservableObject {
             cancelWork()
         }
         chatTurns = []
+        expandedChatSources = []
         chatQuestion = ""
         if let key = documentKey { conversations[key] = [] }
         if chatPlan {

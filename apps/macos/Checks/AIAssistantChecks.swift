@@ -660,8 +660,10 @@ extension ReaderChecks {
             }
             let largestPart = documentPlan.parts.map(\.pageCharacters).max() ?? 0
             print("AI-DOCUMENT-SUMMARY pages=\(documentPlan.pageCount) parts=\(documentPlan.parts.count) total_page_chars=\(totalPageCharacters) largest_part_page_chars=\(largestPart)")
-            require(largestPart <= 12_000,
-                    "each document-summary part respects the 12,000 page-character budget")
+            require(documentPlan.parts.count == 1 && largestPart == totalPageCharacters,
+                    "the complete paper uses one independent summary request")
+            require(documentPlan.parts[0].systemPrompt.contains("Evidence and results"),
+                    "the summary prompt supports critical academic reading")
         }
 
         print("AI-SELECTION \(label) range intended=\(intendedRange) canvas=\(selection.range) charCount=\(characters.count) textCount=\(text.text.count)")
@@ -1657,6 +1659,7 @@ extension ReaderChecks {
         width: CGFloat
     ) async throws -> DocumentChatPanelMeasurements {
         model.selectedTab = .chat
+        model.expandedChatSources = Set(model.chatTurns.map(\.id))
         let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
         let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
         host.frame = container.bounds
@@ -1721,6 +1724,7 @@ extension ReaderChecks {
             historyViewportHeight: history?.contentView.bounds.height ?? 0,
             chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
         )
+        model.expandedChatSources = []
         let turnsBefore = model.chatTurns.count
         let languageBefore = model.targetLanguage
         for tab in AIAssistantTab.allCases {
