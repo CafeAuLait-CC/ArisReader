@@ -72,6 +72,10 @@ struct ReaderChecks {
             try await annotatedCopyGuardChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-extract-destination-guard") {
+            try await extractDestinationGuardChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-content-editing") {
             try await contentEditingChecks(root:fastRoot)
             return
@@ -620,6 +624,7 @@ struct ReaderChecks {
         try await contentEditingChecks(root: root)
         try await documentCacheChecks(root: root)
         try await annotatedCopyGuardChecks(root: root)
+        try await extractDestinationGuardChecks(root: root)
         try await bookmarkWritebackChecks(root: root)
         try await crossReaderAnnotationChecks(
             replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),

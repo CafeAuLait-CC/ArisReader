@@ -9706,12 +9706,53 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         Task { @MainActor [weak self] in
-            await self?.extractPages(pages, to: destination)
+            await self?.extractPagesInteractively(pages, to: destination)
         }
     }
 
+    /// Extracts the selected pages, and when the destination already holds annotation records
+    /// offers the two resolutions instead of only refusing: choose another destination, or
+    /// replace the stale records after this explicit confirmation. The direct
+    /// ``extractPages(_:to:replaceExistingRecords:)`` call stays a refusal, so a programmatic
+    /// caller cannot delete somebody else's records by accident.
+    private func extractPagesInteractively(_ pages: [Int], to destination: URL) async {
+        guard let conflict = Self.annotationRecordConflict(for: destination) else {
+            await extractPages(pages, to: destination)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText =
+            "“\(destination.lastPathComponent)” already has annotations that would duplicate these extracted pages"
+        alert.informativeText =
+            Self.annotationRecordConflictMessage(conflict, destination: destination)
+        alert.addButton(withTitle: "Choose Another Destination…")
+        alert.addButton(withTitle: "Replace Records")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            presentExtractPagesPanel()
+        case .alertSecondButtonReturn:
+            await extractPages(pages, to: destination, replaceExistingRecords: true)
+        default:
+            return
+        }
+    }
+
+    /// Writes `pages` to a new PDF at `destination`.
+    ///
+    /// A destination that already has annotation records (its document cache or a legacy
+    /// companion beside it) is refused by default: opening that file would import the stale
+    /// records next to the annotations the extracted pages carry, duplicating every mark.
+    /// `replaceExistingRecords` is the caller's confirmation that those records may be moved to
+    /// a backup and the destination rewritten; the interactive
+    /// ``presentExtractPagesPanel()`` asks before passing it.
     @discardableResult
-    public func extractPages(_ pages: [Int], to destination: URL) async -> Bool {
+    public func extractPages(
+        _ pages: [Int],
+        to destination: URL,
+        replaceExistingRecords: Bool = false
+    ) async -> Bool {
         guard let url = document?.url else { return false }
         guard !Self.resolvesToSameFile(destination, url) else {
             lastError = "The extracted pages cannot overwrite the document they came from."
@@ -9720,6 +9761,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard pageEditSession.map({ !Self.resolvesToSameFile(destination, $0.originalURL) }) ?? true else {
             lastError = "Extracted pages cannot replace the original editing document."
             return false
+        }
+        // The same conflict the annotated copy, merge and split check. Opening the output later
+        // would import these records next to the annotations its pages carry, so the marks
+        // would appear twice; move them to a backup only after the caller's explicit approval.
+        if let conflict = Self.annotationRecordConflict(for: destination) {
+            guard replaceExistingRecords else {
+                lastError = Self.annotationRecordConflictMessage(conflict, destination: destination)
+                return false
+            }
+            do {
+                let backups = try Self.retireAnnotationRecords(conflict, for: destination)
+                FileHandle.standardError.write(Data((
+                    "lyra-reader-pages: moved the destination's annotation records to "
+                    + backups.map(\.path).joined(separator: ", ") + "\n"
+                ).utf8))
+            } catch {
+                lastError =
+                    "Could not move the annotation records attached to “\(destination.lastPathComponent)” "
+                    + "out of the way; nothing was extracted: \(error.localizedDescription)"
+                return false
+            }
         }
         let bookmarkSnapshot = bookmarks
         pageEditBusy = true
