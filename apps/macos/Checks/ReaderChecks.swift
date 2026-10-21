@@ -33,6 +33,17 @@ struct ReaderChecks {
         fatalError("TIMEOUT: \(message)\n\(explanation())")
     }
 
+    /// The repository root every check resolves its fixtures against.
+    ///
+    /// `URL(fileURLWithPath: ".")` keeps the `.` component, so a fixture opened from a relative
+    /// root would compare unequal to the same file after `DocumentOpenCoordinator` standardizes
+    /// it (new-window delivery does exactly that). The checks therefore normalize the root once,
+    /// whether the test runner passes an absolute `$ROOT`, a relative `.`, or nothing.
+    @MainActor static func checkRoot(_ argument: String?) -> URL {
+        URL(fileURLWithPath: argument ?? FileManager.default.currentDirectoryPath)
+            .standardizedFileURL
+    }
+
     @MainActor static func main() async throws {
         // The reader's layout preferences live in UserDefaults (so the app remembers facing
         // pages and the page gap). Checks must not inherit them from whatever the person
@@ -44,8 +55,7 @@ struct ReaderChecks {
         AppState.usesStoredSidebarTab = false
         AppState.usesStoredSidePanelPreferences = false
 
-        let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-            ?? FileManager.default.currentDirectoryPath)
+        let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
         if CommandLine.arguments.contains("--check-content-editing") {
             try await contentEditingChecks(root:fastRoot)
             return
@@ -127,66 +137,57 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-hosted-preview") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await hostedPreviewChecks(root: root)
             return
         }
         if CommandLine.arguments.contains("--check-preview-history") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await previewHistoryChecks(
                 url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
             print("Preview history checks passed")
             return
         }
         if CommandLine.arguments.contains("--check-preview-transparency") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await previewTransparencyChecks(root: root)
             print("Preview transparency checks passed")
             return
         }
         if CommandLine.arguments.contains("--check-section-preview") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await previewSectionChecks(root: root)
             print("Section preview checks passed")
             return
         }
         if CommandLine.arguments.contains("--check-linked-preview") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await linkedPreviewChecks(root: root)
             return
         }
         if CommandLine.arguments.contains("--check-preview-actions") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await previewActionChecks(root: root)
             return
         }
         // The right-hand AI panel on its own while it is being worked on
         // (`LyraReaderChecks --check-right-panel .`).
         if CommandLine.arguments.contains("--check-right-panel") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await rightPanelChecks(root: root)
             return
         }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`LyraReaderChecks --check-transitions .`).
         if CommandLine.arguments.contains("--check-transitions") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await transitionChecks(root: root)
             return
         }
         // The calibrated zoom and its presets on their own
         // (`LyraReaderChecks --check-zoom .`).
         if CommandLine.arguments.contains("--check-zoom") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await zoomChecks(root: root)
             return
         }
@@ -201,8 +202,7 @@ struct ReaderChecks {
         // The live text-markup preview on its own
         // (`LyraReaderChecks --check-live-markup .`).
         if CommandLine.arguments.contains("--check-live-markup") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await liveMarkupChecks(
                 textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 twoColumn: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
@@ -226,15 +226,13 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-note-overlay") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await noteOverlayChecks(url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             return
         }
         // The sticky markup tools and /StrikeOut write-back on their own.
         if CommandLine.arguments.contains("--check-sticky-markup") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await stickyMarkupChecks(
                 fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
             try await strikeoutChecks(
@@ -245,8 +243,7 @@ struct ReaderChecks {
         }
         // The write-back suite on its own (`LyraReaderChecks --check-annotation-writeback .`).
         if CommandLine.arguments.contains("--check-annotation-writeback") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await annotationWritebackChecks(
                 fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
             print("Annotation write-back checks passed")
@@ -254,23 +251,20 @@ struct ReaderChecks {
         }
         // Stamps and image signatures on their own (`LyraReaderChecks --check-stamps .`).
         if CommandLine.arguments.contains("--check-stamps") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await stampSignatureChecks(root: root)
             return
         }
         // Bookmark outline write-back on its own (`LyraReaderChecks --check-bookmark-writeback .`).
         if CommandLine.arguments.contains("--check-bookmark-writeback") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await bookmarkWritebackChecks(root: root)
             print("Bookmark write-back checks passed")
             return
         }
         // The eraser on its own (`LyraReaderChecks --check-eraser .`).
         if CommandLine.arguments.contains("--check-eraser") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await eraserChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
@@ -283,8 +277,7 @@ struct ReaderChecks {
         }
         // Partial stroke erase on its own (`LyraReaderChecks --check-partial-erase .`).
         if CommandLine.arguments.contains("--check-partial-erase") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await partialEraseChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
@@ -295,8 +288,7 @@ struct ReaderChecks {
         }
         // Ink and shapes on their own (`LyraReaderChecks --check-ink-annotations .`).
         if CommandLine.arguments.contains("--check-ink-annotations") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await inkAnnotationChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
@@ -307,8 +299,7 @@ struct ReaderChecks {
         // Placeable notes and text boxes on their own
         // (`LyraReaderChecks --check-placed-text .`).
         if CommandLine.arguments.contains("--check-placed-text") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await placedTextChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
@@ -319,8 +310,7 @@ struct ReaderChecks {
         // The text-box creation flow on its own
         // (`LyraReaderChecks --check-textbox-placement .`).
         if CommandLine.arguments.contains("--check-textbox-placement") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await textBoxPlacementChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
@@ -329,8 +319,7 @@ struct ReaderChecks {
         // Click-to-select for text markup and text boxes on its own
         // (`LyraReaderChecks --check-mark-selection .`).
         if CommandLine.arguments.contains("--check-mark-selection") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await markSelectionChecks(
                 fixtures: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),
@@ -340,16 +329,14 @@ struct ReaderChecks {
         }
         // The annotation text export on its own (`LyraReaderChecks --check-annotation-export .`).
         if CommandLine.arguments.contains("--check-annotation-export") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await annotationExportChecks(root: root)
             print("Annotation export checks passed")
             return
         }
         // The cold-click regression on its own (`LyraReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await coldClickChecks(
                 citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
                 mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
@@ -360,8 +347,7 @@ struct ReaderChecks {
         // (`LyraReaderChecks --check-click-intent .`).
         if CommandLine.arguments.contains("--check-click-intent")
             || CommandLine.arguments.contains("--check-scroll-tail") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             if CommandLine.arguments.contains("--check-click-intent") {
                 try await clickIntentChecks(
                     url: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"))
@@ -377,20 +363,17 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-redaction") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await redactionChecks(root: root)
             return
         }
         if CommandLine.arguments.contains("--check-printing") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await printingChecks(root: root)
             return
         }
         if CommandLine.arguments.contains("--check-page-operations") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await pageOperationChecks(root: root)
             print("Page-operation checks passed")
             return
@@ -398,8 +381,7 @@ struct ReaderChecks {
         // Lets the thumbnail drag/reorder checks run on their own
         // (`LyraReaderChecks --check-thumbnail-drag .`).
         if CommandLine.arguments.contains("--check-thumbnail-drag") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await thumbnailDragChecks(root: root)
             print("Thumbnail-drag checks passed")
             return
@@ -411,8 +393,7 @@ struct ReaderChecks {
         // Lets the titlebar's appearance/theme checks run on their own while they are being
         // worked on (`LyraReaderChecks --check-titlebar-theme .`).
         if CommandLine.arguments.contains("--check-titlebar-theme") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await titlebarThemeChecks(root: root)
             print("Titlebar theme checks passed")
             return
@@ -420,8 +401,7 @@ struct ReaderChecks {
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-tab-row .`).
         if CommandLine.arguments.contains("--check-tab-row") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             tabRowLayoutChecks()
             titlebarResizeChecks()
             try await titlebarThemeChecks(root: root)
@@ -431,8 +411,7 @@ struct ReaderChecks {
         }
         // Lets the document-opening checks be run on their own while they are being worked on.
         if CommandLine.arguments.contains("--check-document-opening") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lyra-reader-open-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -448,8 +427,7 @@ struct ReaderChecks {
         // Lets the context-menu/new-window checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-desktop-interaction .`).
         if CommandLine.arguments.contains("--check-desktop-interaction") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lyra-reader-desktop-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -469,8 +447,7 @@ struct ReaderChecks {
         // Lets the two-window independence checks be run on their own while they are being worked
         // on: they are the direct regression for "every window shares one state".
         if CommandLine.arguments.contains("--check-window-independence") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lyra-reader-windows-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -486,8 +463,7 @@ struct ReaderChecks {
         // The clear-on-close regression on its own while it is being worked on: it needs a
         // presentable surface, so it is kept runnable outside the full suite.
         if CommandLine.arguments.contains("--check-canvas-clear") {
-            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first
-                ?? FileManager.default.currentDirectoryPath)
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lyra-reader-canvas-clear-\(UUID())")
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -500,7 +476,7 @@ struct ReaderChecks {
             print("Canvas-clear checks passed")
             return
         }
-        let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
+        let root = checkRoot(CommandLine.arguments.dropFirst().first)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }

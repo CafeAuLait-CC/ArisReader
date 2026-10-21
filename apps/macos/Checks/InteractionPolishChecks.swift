@@ -50,6 +50,11 @@ extension ReaderChecks {
             wheel3: 0
         ) else { return nil }
         cg.location = CGPoint(x: point.x, y: displayOffset - point.y)
+        // A synthesized event must carry exactly the modifiers the check names. Starting from
+        // an empty set makes a plain wheel notch plain even if the process inherited a stuck
+        // modifier flag from the environment; otherwise it could take the zoom path and fail
+        // "an ordinary scroll does not change the zoom" in a way the product did not cause.
+        cg.flags = []
         if modifiers.contains(.control) { cg.flags.insert(.maskControl) }
         if modifiers.contains(.command) { cg.flags.insert(.maskCommand) }
         _ = viewHeight
