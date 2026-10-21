@@ -41,6 +41,8 @@ separate features with their own documented limits.
   whole file, citation chips that jump to the verified source and flash it briefly, plus summarise / selection
   Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
   anything leaves the machine and the key held in the Keychain.
+  Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
+  edge; switching between them preserves drafts and keeps the PDF canvas and window geometry stable.
 
 ## Tech stack (decided)
 

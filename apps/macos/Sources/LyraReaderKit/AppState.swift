@@ -321,6 +321,13 @@ public final class AppState: ObservableObject {
     /// it closed, so the content keeps its geometry and an answer is not thrown away by a toggle.
     @Published public var rightPanelVisible: Bool = false {
         didSet {
+            if rightPanelVisible, contentEditEnabled {
+                if deferContentTransition({ [weak self] in self?.rightPanelVisible = true }) {
+                    rightPanelVisible = false
+                    return
+                }
+                contentEditEnabled = false
+            }
             guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
             ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
         }
@@ -395,7 +402,9 @@ public final class AppState: ObservableObject {
     /// The staged session. Nil means the file on disk is the document on screen.
     private var pageEditSession: PageEditSession?
 
-    @Published public var contentEditEnabled = false
+    @Published public var contentEditEnabled = false {
+        didSet { if contentEditEnabled { rightPanelVisible = false } }
+    }
     @Published public var contentEditTool = "select"
     @Published public var contentEditPage: PDFContentPage?
     @Published public var contentEditSelection: String?

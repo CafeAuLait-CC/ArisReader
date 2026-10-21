@@ -6,6 +6,17 @@ import Security
 
 // MARK: - Actions and request inputs
 
+public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
+    case summary, translation, chat
+    public var id: String { rawValue }
+    public var title: String {
+        switch self { case .summary: "Summary"; case .translation: "Translate"; case .chat: "Chat" }
+    }
+    public var icon: String {
+        switch self { case .summary: "doc.text"; case .translation: "character.bubble"; case .chat: "text.bubble" }
+    }
+}
+
 /// The actions the AI panel can request. Document chat is the conversational action; the other
 /// four stay available alongside it.
 public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
