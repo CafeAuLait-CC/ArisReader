@@ -46,6 +46,33 @@ private final class TranslationPixelPage: NSView {
     }
 }
 
+/// A torn page drawn as two paper pieces with the card's gap between them. The overlay must
+/// never paint into that gap, and Show original must leave all three bands byte-identical.
+@MainActor
+private final class TranslationTornPage: NSView {
+    static let pageLeft: CGFloat = 50
+    static let pageWidth: CGFloat = 400
+    static let splitPt: CGFloat = 300
+    static let gapPt: CGFloat = 200
+    static let pageHeight: CGFloat = 700
+
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        // Canvas surround.
+        NSColor(calibratedWhite: 0.16, alpha: 1).setFill()
+        bounds.fill()
+        // The paper above and below the tear.
+        NSColor.white.setFill()
+        NSRect(x: Self.pageLeft, y: 0, width: Self.pageWidth, height: Self.splitPt).fill()
+        NSRect(x: Self.pageLeft, y: Self.splitPt + Self.gapPt,
+               width: Self.pageWidth, height: Self.pageHeight - Self.splitPt).fill()
+        // The card's gap.
+        NSColor(calibratedRed: 0.86, green: 0.93, blue: 0.98, alpha: 1).setFill()
+        NSRect(x: Self.pageLeft, y: Self.splitPt,
+               width: Self.pageWidth, height: Self.gapPt).fill()
+    }
+}
+
 extension ReaderChecks {
     @MainActor
     static func inPlaceTranslationChecks(root: URL) async throws {
@@ -53,6 +80,8 @@ extension ReaderChecks {
         try await inPlaceTranslationTabAndRelaunchChecks(root: root)
         try await inPlaceTranslationKeyAndEditChecks(root: root)
         try await inPlaceTranslationBatchCancelAndPageEditChecks(root: root)
+        try await inPlaceTranslationRegionTearChecks(root: root)
+        try inPlaceTranslationTearGeometryChecks()
         try inPlaceTranslationLayoutAndChipChecks()
     }
 
@@ -617,6 +646,263 @@ extension ReaderChecks {
            let text = String(data: cache, encoding: .utf8) {
             require(!text.contains(deleteBlock.sourceText),
                     "the deleted page's cached translation is pruned, not left behind")
+        }
+    }
+
+    // MARK: - Torn pages
+
+    @MainActor
+    private static func tearOverlay(_ id: String, _ rect: CGRect,
+                                    phase: TranslationOverlayPhase = .translated,
+                                    text: String) -> TranslationOverlay {
+        TranslationOverlay(
+            id: id, page: 0, rect: rect, sourceText: "source " + id,
+            translatedText: phase == .original ? nil : text, phase: phase,
+            range: nil, isBlock: true, sourceFontPt: 10,
+            fit: TranslationTextLayout.fit(text: text, in: rect, sourceFontPt: 10),
+            paperColor: TranslationPaperColor(red: 255, green: 0, blue: 0))
+    }
+
+    /// The piecewise mapping on a synthetic torn page: a block above, below and across the tear;
+    /// chip reachability; and Show original leaving the page and the gap byte-identical.
+    @MainActor
+    private static func inPlaceTranslationTearGeometryChecks() throws {
+        let host = TranslationTornPage(frame: NSRect(x: 0, y: 0, width: 500, height: 900))
+        let overlay = TranslationOverlayView(frame: host.bounds)
+        host.addSubview(overlay)
+        let top = PagePlacement(index: 0, topPt: 0, leftPt: 0, widthPt: 400, heightPt: 300,
+                                sourceTopPt: 0, sourceHeightPt: 300)
+        let bottom = PagePlacement(index: 0, topPt: 500, leftPt: 0, widthPt: 400, heightPt: 400,
+                                   sourceTopPt: 300, sourceHeightPt: 400)
+        let tornFrames = [top, bottom]
+        let aboveRect = CGRect(x: 20, y: 40, width: 160, height: 40)
+        let straddleRect = CGRect(x: 20, y: 250, width: 180, height: 100)
+        let belowRect = CGRect(x: 20, y: 430, width: 160, height: 40)
+        let overlays = [
+            tearOverlay("above", aboveRect, text: "Above the tear translation"),
+            tearOverlay("straddle", straddleRect, text: "A translation that crosses the tear"),
+            tearOverlay("below", belowRect, text: "Below the tear translation"),
+        ]
+        overlay.update(overlays: overlays, frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        require(overlay.blockRectsForCheck("above").count == 1,
+                "a block above the tear maps to one piece")
+        require(overlay.blockRectsForCheck("below").count == 1,
+                "a block below the tear maps to one piece below the gap")
+        let straddlePieces = overlay.blockRectsForCheck("straddle")
+        require(straddlePieces.count == 2,
+                "a block crossing the tear maps to two pieces, not one rectangle over the card")
+        guard let gap = overlay.gapFrameForCheck(page: 0),
+              let above = overlay.blockRectsForCheck("above").first,
+              let below = overlay.blockRectsForCheck("below").first else {
+            fatalError("The torn mapping did not produce its pieces")
+        }
+        require(above.maxY <= gap.minY + 0.5, "the above block stays in the top paper piece")
+        require(below.minY >= gap.maxY - 0.5, "the below block is shifted below the gap")
+        require(straddlePieces[0].maxY <= gap.minY + 0.5
+                    && straddlePieces[1].minY >= gap.maxY - 0.5,
+                "the straddling pieces are separated by the exact tear gap")
+        require(overlay.visibleChipCount == 3, "each torn/page block keeps one chip")
+
+        for id in ["above", "straddle", "below"] {
+            guard let chip = overlay.chipFrameForCheck(id) else {
+                fatalError("The \(id) block lost its chip on a torn page")
+            }
+            require(host.bounds.contains(chip), "the \(id) chip stays reachable inside the canvas")
+            for piece in overlay.blockRectsForCheck(id) {
+                require(!chip.intersects(piece),
+                        "the \(id) chip does not cover its own translated text")
+            }
+            require(!chip.intersects(gap), "the \(id) chip does not sit in the card's gap")
+        }
+
+        // Show original restores the torn page, gap included.
+        overlay.update(overlays: [], frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        let beforeRep = bitmapRep(host)
+        let before = bitmapBytes(host)
+        overlay.update(overlays: overlays, frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        let coveredRep = bitmapRep(host)
+        guard let before, let coveredRep, let beforeRep else {
+            fatalError("The torn pixel check could not rasterize its host")
+        }
+        require(redPixelCount(coveredRep) > 0, "the torn translation paints a cover")
+        let original = overlays.map {
+            tearOverlay($0.id, $0.rect, phase: .original, text: "unused")
+        }
+        overlay.update(overlays: original, frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        let originalRep = bitmapRep(host)
+        require(originalRep != nil && redPixelCount(originalRep!) == 0,
+                "Show original paints no cover into either paper piece")
+        overlay.update(overlays: [], frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        let restored = bitmapBytes(host)
+        require(restored == before,
+                "Show original restores the torn page exactly, including the gap")
+        if let restoredRep = bitmapRep(host) {
+            require(regionMatches(beforeRep, restoredRep, in: gap),
+                    "the card's gap is unchanged by the overlay")
+        }
+
+        // Toggling the tear itself keeps the same overlays and re-maps every block.
+        let untorn = PagePlacement(index: 0, topPt: 0, leftPt: 0, widthPt: 400, heightPt: 700,
+                                   sourceTopPt: 0, sourceHeightPt: 700)
+        overlay.update(overlays: overlays, frames: [untorn], zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        require(overlay.gapFrameForCheck(page: 0) == nil, "an untorn page has no tear gap")
+        for id in ["above", "straddle", "below"] {
+            require(overlay.blockRectsForCheck(id).count == 1,
+                    "an untorn \(id) block maps to one rectangle")
+        }
+        overlay.update(overlays: overlays, frames: tornFrames, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 400, paperAppearance: .original)
+        require(overlay.blockRectsForCheck("straddle").count == 2,
+                "re-tearing the page re-maps the same overlay without touching it")
+    }
+
+    /// The real region-card tear: a translated block above and a block crossing the split,
+    /// opening and closing the card while the translation is shown, with zero requests.
+    @MainActor
+    private static func inPlaceTranslationRegionTearChecks(root: URL) async throws {
+        let paper = try translationFixture(root: root, named: "text-page.pdf")
+        let (settings, defaults, suite) = translationSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let engine = try RustEngine()
+        let service = CountingTranslationService(engine: engine)
+        let state = try await makeTranslationState(engine: engine, settings: settings,
+                                                   service: service, url: paper)
+        guard let textPage = await state.translationTextPage(0) else {
+            fatalError("the tear fixture has no text layer")
+        }
+        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        guard let straddleBlock = blocks.first(where: { $0.lineRects.count >= 2 }),
+              let aboveBlock = blocks.last(where: { $0.rect.maxY < straddleBlock.rect.minY - 1 })
+        else { fatalError("the tear fixture needs an above block and a multi-line block") }
+        let firstLine = straddleBlock.lineRects[0]
+        let secondLine = straddleBlock.lineRects[1]
+        let gapY = (firstLine.maxY + secondLine.minY) / 2
+        let tearSelection = CGRect(
+            x: firstLine.minX + 2, y: firstLine.minY + 1,
+            width: min(160, max(8, ((straddleBlock.rect.maxX - firstLine.minX) - 4))),
+            height: max(6, gapY - firstLine.minY - 2)
+        )
+
+        state.selectTranslationRange(page: 0, range: aboveBlock.range)
+        _ = state.performTranslationAction()
+        try await eventually("the above block translates") {
+            state.translationOverlays.contains { $0.isTranslated && $0.range == aboveBlock.range }
+        }
+        state.selectTranslationRange(page: 0, range: straddleBlock.range)
+        _ = state.performTranslationAction()
+        try await eventually("the straddling block translates") {
+            state.translationOverlays.contains { $0.isTranslated && $0.range == straddleBlock.range }
+        }
+        require(service.startCount == 2, "the tear fixture starts with two block requests")
+        let aboveID = state.translationOverlays.first {
+            $0.isTranslated && $0.range == aboveBlock.range
+        }!.id
+        let straddleID = state.translationOverlays.first {
+            $0.isTranslated && $0.range == straddleBlock.range
+        }!.id
+        let beforeTear = state.inPlaceTranslation.snapshot()
+
+        await state.createRegionCard(page: 0, rect: tearSelection)
+        guard let card = state.regionCards.first else {
+            fatalError("the region card did not open: \(state.lastError ?? "no error")")
+        }
+        try await eventually("the region card tears page 1") {
+            state.pageTear(forPage: 0) != nil
+                && state.canvasPageSegments.filter { $0.index == 0 }.count == 2
+        }
+        let split = state.pageTear(forPage: 0)!.splitPt
+        require(split > straddleBlock.rect.minY + 1 && split < straddleBlock.rect.maxY - 1,
+                "the card's tear crosses the selected block (split \(split), block \(straddleBlock.rect))")
+        require(aboveBlock.rect.maxY <= split, "the other block is entirely above the tear")
+        require(service.startCount == 2, "opening the region card sends no request")
+        let afterOpen = state.inPlaceTranslation.snapshot()
+        require(afterOpen.entries.count == beforeTear.entries.count
+                    && Set(afterOpen.entries.keys) == Set(beforeTear.entries.keys),
+                "the tear does not change any cache key or create a second entry")
+
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 900))
+        let overlayView = TranslationOverlayView(frame: host.bounds)
+        host.addSubview(overlayView)
+        overlayView.update(overlays: state.translationOverlays,
+                           frames: state.canvasPageSegments,
+                           zoom: state.zoomFactor, scrollYPt: 0,
+                           contentWidthPt: state.contentWidthPt,
+                           paperAppearance: .original,
+                           paperColors: state.translationPaperColors)
+        require(overlayView.blockRectsForCheck(aboveID).count == 1,
+                "the above translation maps to one piece after the tear")
+        require(overlayView.blockRectsForCheck(straddleID).count == 2,
+                "the straddling translation maps to both pieces after the tear")
+        guard let gap = overlayView.gapFrameForCheck(page: 0) else {
+            fatalError("the torn page has no gap rectangle")
+        }
+        let straddlePieces = overlayView.blockRectsForCheck(straddleID)
+        require(straddlePieces[0].maxY <= gap.minY + 0.5
+                    && straddlePieces[1].minY >= gap.maxY - 0.5,
+                "the straddling translation is clipped at the tear, not drawn through the card")
+        require(overlayView.visibleChipCount >= 1, "the torn translation keeps a reachable chip")
+        for id in [aboveID, straddleID] {
+            guard let chip = overlayView.chipFrameForCheck(id) else {
+                fatalError("the torn translation lost a chip")
+            }
+            require(host.bounds.contains(chip), "the torn chip stays inside the canvas")
+            require(!chip.intersects(gap), "the torn chip is not placed in the card's gap")
+            for piece in overlayView.blockRectsForCheck(id) {
+                require(!chip.intersects(piece), "the torn chip does not cover its translation")
+            }
+        }
+
+        // Show original / Translate on the torn page, still with zero requests.
+        state.selectTranslationRange(page: 0, range: straddleBlock.range)
+        _ = state.performTranslationAction()
+        try await eventually("Show original works on the torn page") {
+            state.translationOverlays.first { $0.id == straddleID }?.isOriginal == true
+        }
+        require(service.startCount == 2, "Show original on a torn page sends nothing")
+        _ = state.performTranslationAction()
+        try await eventually("Translate restores the torn cover") {
+            state.translationOverlays.first { $0.id == straddleID }?.isTranslated == true
+        }
+        require(service.startCount == 2, "flipping a torn translation sends nothing")
+
+        // Closing the card restores the untorn layout and the same translation entries.
+        state.closeRegionCard(id: card.id, keepHistory: false)
+        try await eventually("closing the card removes the tear") {
+            state.pageTear(forPage: 0) == nil
+                && state.canvasPageSegments.filter { $0.index == 0 }.count == 1
+        }
+        overlayView.update(overlays: state.translationOverlays,
+                           frames: state.canvasPageSegments,
+                           zoom: state.zoomFactor, scrollYPt: 0,
+                           contentWidthPt: state.contentWidthPt,
+                           paperAppearance: .original,
+                           paperColors: state.translationPaperColors)
+        require(overlayView.gapFrameForCheck(page: 0) == nil, "the untorn layout has no gap")
+        require(overlayView.blockRectsForCheck(straddleID).count == 1,
+                "the same translation is one rectangle again after the tear closes")
+        let afterClose = state.inPlaceTranslation.snapshot()
+        require(afterClose.entries.count == beforeTear.entries.count
+                    && Set(afterClose.entries.keys) == Set(beforeTear.entries.keys),
+                "closing the tear leaves the cached translation under the same key")
+        require(service.startCount == 2, "closing the region card sends no request")
+        if let cached = try? TranslationCacheStore.load(
+            from: DocumentEditCache.translationsURL(for: paper)) {
+            require(cached.count == beforeTear.entries.count
+                        && Set(cached.keys) == Set(beforeTear.entries.keys),
+                    "the tear and its removal never altered the cached entries")
+        } else {
+            fatalError("The translation cache could not be read after closing the tear")
         }
     }
 

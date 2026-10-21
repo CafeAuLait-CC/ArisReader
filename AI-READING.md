@@ -48,3 +48,9 @@ rectangle in page-local 100% coordinates, the target language, the model and the
 or language asks for a new entry and keeps the old one valid; editing one block removes only that block's entry.
 Page rotation, deletion or a reflow that moves the block removes the affected overlays with an explanation. No PDF,
 annotation or region-card export is modified.
+
+A region card can tear the page into two display pieces with the card in the gap. Translation covers use the same
+piecewise page mapping as annotations and selection: a block above or below the tear covers only its piece, and a
+block crossing it is clipped into both pieces rather than painted through the card. The chip anchors to the piece
+with the most visible area and never sits in the gap. Opening or closing the tear only re-maps the overlay: the
+page-local cache key is unchanged, so toggling the tear sends no request.

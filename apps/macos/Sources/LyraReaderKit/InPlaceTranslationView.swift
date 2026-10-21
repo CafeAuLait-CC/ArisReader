@@ -12,7 +12,10 @@ final class TranslationOverlayView: NSView {
     var onCancel: ((String) -> Void)?
 
     private var overlays: [TranslationOverlay] = []
-    private var frames: [Int: PagePlacement] = [:]
+    /// Display **segments**, not one entry per page. A torn page is two placements that share an
+    /// index and carry `sourceTopPt`/`sourceHeightPt`; the same page-local translation is mapped
+    /// piecewise through them.
+    private var frames: [PagePlacement] = []
     private var zoom: CGFloat = 1
     private var scrollYPt: CGFloat = 0
     private var contentWidthPt: CGFloat = 0
@@ -20,8 +23,8 @@ final class TranslationOverlayView: NSView {
     private var paperColors: [Int: TranslationPaperColor] = [:]
     private var chips: [String: TranslationChipView] = [:]
     /// Chips that had no room outside their block and were placed in its top-right corner.
-    /// Their height is reserved out of the text rectangle, so the chip never covers the
-    /// translated words it belongs to even at extreme zoom.
+    /// The text drawing excludes the chip's rectangle, so it never covers the translated words
+    /// it belongs to even at extreme zoom.
     private var insideChips: Set<String> = []
 
     override var isFlipped: Bool { true }
@@ -49,14 +52,14 @@ final class TranslationOverlayView: NSView {
                 scrollYPt: CGFloat, contentWidthPt: CGFloat,
                 paperAppearance: PaperAppearance,
                 paperColors: [Int: TranslationPaperColor] = [:]) {
-        let framesChanged = frames != self.frames.values.sorted { $0.index < $1.index }
+        let framesChanged = frames != self.frames
         let overlaysChanged = overlays != self.overlays
         let viewChanged = zoom != self.zoom || scrollYPt != self.scrollYPt
             || contentWidthPt != self.contentWidthPt || framesChanged
             || paperAppearance != self.paperAppearance
             || paperColors != self.paperColors
         self.overlays = overlays
-        self.frames = Dictionary(uniqueKeysWithValues: frames.map { ($0.index, $0) })
+        self.frames = frames
         self.zoom = zoom
         self.scrollYPt = scrollYPt
         self.contentWidthPt = contentWidthPt
@@ -68,18 +71,58 @@ final class TranslationOverlayView: NSView {
         }
     }
 
-    /// Page-local (100%) rectangle → this view's coordinates. Content is centred exactly as the
-    /// canvas centres it, and the scroll offset is applied before the zoom, matching
-    /// `PageChromeGeometry` and the annotation overlay.
-    func viewRect(page: Int, rect: CGRect) -> CGRect? {
-        guard let frame = frames[page] else { return nil }
-        let offsetX = max(0, (bounds.width - contentWidthPt * zoom) / 2)
-        return CGRect(
-            x: offsetX + (frame.leftPt + rect.minX) * zoom,
-            y: (frame.topPt + rect.minY - scrollYPt) * zoom,
-            width: rect.width * zoom,
-            height: rect.height * zoom
+    private var contentOffsetX: CGFloat {
+        max(0, (bounds.width - contentWidthPt * zoom) / 2)
+    }
+
+    private func segments(for page: Int) -> [PagePlacement] {
+        frames.filter { $0.index == page }
+    }
+
+    /// The view rectangles a page-local rectangle occupies, one per display segment. For an
+    /// untorn page this is one rectangle; a block crossing a tear is two, clipped to the pieces
+    /// and separated by the card's gap. This is the same `CanvasGeometry.viewRects` the
+    /// annotation overlay and the marquee use, so all three agree.
+    func viewRects(page: Int, rect: CGRect) -> [CGRect] {
+        CanvasGeometry.viewRects(
+            pageSegments: segments(for: page),
+            region: rect,
+            scrollYPt: scrollYPt,
+            zoom: zoom,
+            contentOffsetX: contentOffsetX
         )
+    }
+
+    /// The union of the pieces: useful for a quick visibility test, never for drawing a torn
+    /// block (the union would paint across the card's gap).
+    func viewRect(page: Int, rect: CGRect) -> CGRect? {
+        let rects = viewRects(page: page, rect: rect)
+        guard var union = rects.first else { return nil }
+        for rect in rects.dropFirst() { union = union.union(rect) }
+        return union
+    }
+
+    /// One display segment's full view rectangle.
+    private func segmentViewRect(_ segment: PagePlacement) -> CGRect {
+        CGRect(
+            x: contentOffsetX + segment.leftPt * zoom,
+            y: (segment.topPt - scrollYPt) * zoom,
+            width: segment.widthPt * zoom,
+            height: segment.heightPt * zoom
+        )
+    }
+
+    /// The card's gap in view space, when the page is torn.
+    func gapFrame(forPage page: Int) -> CGRect? {
+        let pieces = segments(for: page)
+        guard pieces.count >= 2 else { return nil }
+        let top = pieces[0]
+        let bottom = pieces[1]
+        let topBottom = (top.topPt + top.heightPt - scrollYPt) * zoom
+        let bottomTop = (bottom.topPt - scrollYPt) * zoom
+        guard bottomTop > topBottom + 0.01 else { return nil }
+        return CGRect(x: contentOffsetX + top.leftPt * zoom, y: topBottom,
+                      width: top.widthPt * zoom, height: bottomTop - topBottom)
     }
 
     // MARK: - Check accessors
@@ -93,19 +136,31 @@ final class TranslationOverlayView: NSView {
         return chip.frame
     }
 
-    /// The block rectangle for one overlay, in this view's coordinates.
+    /// The block rectangle for one overlay, in this view's coordinates. For a torn block this
+    /// is the union of its pieces; use `blockRectsForCheck` to see the pieces themselves.
     func blockFrameForCheck(_ id: String) -> CGRect? {
         guard let overlay = overlays.first(where: { $0.id == id }) else { return nil }
         return viewRect(page: overlay.page, rect: overlay.rect)
     }
 
+    /// The pieces of a block in this view's coordinates: one for an untorn page, two when the
+    /// block crosses the tear.
+    func blockRectsForCheck(_ id: String) -> [CGRect] {
+        guard let overlay = overlays.first(where: { $0.id == id }) else { return [] }
+        return viewRects(page: overlay.page, rect: overlay.rect)
+    }
+
+    /// The gap between the two display segments, in this view's coordinates.
+    func gapFrameForCheck(page: Int) -> CGRect? {
+        gapFrame(forPage: page)
+    }
+
     private func rebuildChips() {
         var live: Set<String> = []
         for overlay in overlays {
-            guard let block = viewRect(page: overlay.page, rect: overlay.rect),
-                  block.intersects(bounds.insetBy(dx: -1, dy: -1)) else {
-                continue
-            }
+            let blocks = viewRects(page: overlay.page, rect: overlay.rect)
+            let visible = blocks.filter { $0.intersects(bounds.insetBy(dx: -1, dy: -1)) }
+            guard let anchor = chipAnchor(visible) else { continue }
             live.insert(overlay.id)
             let overlayID = overlay.id
             let chip = chips[overlayID] ?? {
@@ -125,7 +180,8 @@ final class TranslationOverlayView: NSView {
             }()
             chip.configure(overlay)
             let size = chip.preferredSize()
-            let placement = chipFrame(block: block, size: size)
+            let placement = chipFrame(block: anchor, size: size,
+                                      page: overlay.page, blockRects: visible)
             chip.frame = placement.frame
             insideChips.remove(overlay.id)
             if placement.inside { insideChips.insert(overlay.id) }
@@ -138,12 +194,27 @@ final class TranslationOverlayView: NSView {
         }
     }
 
+    /// Which visible piece of a split block anchors the chip: the one with the most visible area,
+    /// topmost on a tie. A block whose top piece is scrolled off screen still gets a reachable
+    /// chip on the piece that is visible.
+    private func chipAnchor(_ visible: [CGRect]) -> CGRect? {
+        visible.max { lhs, rhs in
+            let a = lhs.intersection(bounds)
+            let b = rhs.intersection(bounds)
+            let areaA = a.isNull ? 0 : a.width * a.height
+            let areaB = b.isNull ? 0 : b.width * b.height
+            if abs(areaA - areaB) > 0.5 { return areaA < areaB }
+            return lhs.minY > rhs.minY
+        }
+    }
+
     /// Candidate positions, in order: to the right of the block, above it, below it, to the
-    /// left. A candidate must be fully inside the canvas and must not intersect the block.
-    /// When no such candidate exists (a paragraph wider than the viewport at deep zoom), the
-    /// chip goes into the block's top-right corner and the text drawing reserves the chip's
-    /// height, so it still does not cover the translation.
-    private func chipFrame(block: CGRect, size: CGSize) -> (frame: CGRect, inside: Bool) {
+    /// left. A candidate must be fully inside the canvas, must not intersect any piece of the
+    /// block, and must not sit in the card's gap. When no such candidate exists (a paragraph
+    /// wider than the viewport at deep zoom), the chip goes into the anchor piece's top-right
+    /// corner and the text drawing excludes the chip's rectangle.
+    private func chipFrame(block: CGRect, size: CGSize, page: Int,
+                           blockRects: [CGRect]) -> (frame: CGRect, inside: Bool) {
         let gap: CGFloat = 4
         let margin: CGFloat = 4
         let viewport = bounds.insetBy(dx: margin, dy: margin)
@@ -156,15 +227,17 @@ final class TranslationOverlayView: NSView {
             CGRect(x: block.minX - size.width - gap, y: block.minY,
                    width: size.width, height: size.height),
         ]
-        let blockHit = block.insetBy(dx: -1, dy: -1)
+        let blocked = blockRects.map { $0.insetBy(dx: -1, dy: -1) }
+        let tearGap = gapFrame(forPage: page)?.insetBy(dx: -2, dy: -2)
         for candidate in candidates {
             let clamped = clamp(candidate, to: viewport)
-            if viewport.contains(clamped) && !clamped.intersects(blockHit) {
-                return (clamped, false)
-            }
+            guard viewport.contains(clamped) else { continue }
+            if blocked.contains(where: { $0.intersects(clamped) }) { continue }
+            if let tearGap, tearGap.intersects(clamped) { continue }
+            return (clamped, false)
         }
-        // The reader still needs the control. Put it in the cover's own top-right corner and
-        // reserve that strip out of the text layout (see `reservedTop`).
+        // The reader still needs the control. Put it in the anchor's own top-right corner; the
+        // text clip excludes the chip rectangle in `draw`.
         let inside = clamp(
             CGRect(x: block.maxX - size.width - 2, y: block.minY + 2,
                    width: size.width, height: size.height),
@@ -185,28 +258,25 @@ final class TranslationOverlayView: NSView {
         context.saveGState()
         context.setShouldAntialias(true)
         for overlay in overlays {
-            guard overlay.phase == .translated,
-                  let block = viewRect(page: overlay.page, rect: overlay.rect),
-                  block.intersects(bounds.insetBy(dx: -1, dy: -1)) else { continue }
+            guard overlay.phase == .translated else { continue }
+            let blocks = viewRects(page: overlay.page, rect: overlay.rect)
+            guard blocks.contains(where: { $0.intersects(bounds.insetBy(dx: -1, dy: -1)) })
+            else { continue }
             let paper = paperColors[overlay.page] ?? overlay.paperColor
                 ?? .forAppearance(paperAppearance)
             context.setFillColor(paper.nsColor.cgColor)
-            context.fill(block)
+            for block in blocks { context.fill(block) }
 
             guard let translated = overlay.translatedText, !translated.isEmpty else { continue }
+            let pieces = segments(for: overlay.page)
+            guard let first = pieces.first else { continue }
             let fit = overlay.fit ?? TranslationTextLayout.fit(
                 text: translated, in: overlay.rect, sourceFontPt: overlay.sourceFontPt)
-            let insetX = TranslationTextLayout.horizontalInsetPt * zoom
-            let insetY = TranslationTextLayout.verticalInsetPt * zoom
-            var textRect = block.insetBy(dx: insetX, dy: insetY)
-            if insideChips.contains(overlay.id), let chip = chips[overlay.id] {
-                let top = chip.frame.maxY + 2
-                if top > textRect.minY {
-                    textRect = CGRect(x: textRect.minX, y: top, width: textRect.width,
-                                      height: max(0, textRect.maxY - top))
-                }
-            }
-            guard textRect.width > 1, textRect.height > 0.5 else { continue }
+            let textLocal = overlay.rect.insetBy(
+                dx: TranslationTextLayout.horizontalInsetPt,
+                dy: TranslationTextLayout.verticalInsetPt
+            )
+            guard textLocal.width > 0.5, textLocal.height > 0.5 else { continue }
 
             let font = NSFont.systemFont(ofSize: max(0.5, fit.fontSizePt * zoom))
             let paragraph = NSMutableParagraphStyle()
@@ -221,14 +291,36 @@ final class TranslationOverlayView: NSView {
                     .paragraphStyle: paragraph,
                 ]
             )
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: textRect).addClip()
-            attributed.draw(
-                with: textRect,
-                options: [.usesLineFragmentOrigin, .usesFontLeading,
-                          .truncatesLastVisibleLine]
-            )
-            NSGraphicsContext.restoreGraphicsState()
+            let pageTop = first.topPt
+            let pageLeft = first.leftPt
+            for segment in pieces {
+                let segmentView = segmentViewRect(segment)
+                guard segmentView.intersects(bounds.insetBy(dx: -1, dy: -1)) else { continue }
+                // The content offset this segment's paper has relative to the page top. It is
+                // zero for the top piece and the card's gap for the bottom piece.
+                let segmentOffset = segment.topPt - pageTop - segment.sourceTopPt
+                let fullTextRect = CGRect(
+                    x: contentOffsetX + (pageLeft + textLocal.minX) * zoom,
+                    y: (pageTop + textLocal.minY + segmentOffset - scrollYPt) * zoom,
+                    width: textLocal.width * zoom,
+                    height: textLocal.height * zoom
+                )
+                context.saveGState()
+                let clip = CGMutablePath()
+                clip.addRect(segmentView)
+                if insideChips.contains(overlay.id), let chip = chips[overlay.id],
+                   chip.frame.intersects(segmentView) {
+                    clip.addRect(chip.frame)
+                }
+                context.addPath(clip)
+                context.clip(using: .evenOdd)
+                attributed.draw(
+                    with: fullTextRect,
+                    options: [.usesLineFragmentOrigin, .usesFontLeading,
+                              .truncatesLastVisibleLine]
+                )
+                context.restoreGState()
+            }
         }
         context.restoreGState()
     }

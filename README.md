@@ -49,7 +49,8 @@ separate features with their own documented limits.
 - **Translate in place**: select a paragraph and choose Translate from the context menu, the toolbar or
   ⇧⌘L; the translation is drawn over that block with a Show original / Translate chip and a fitted font size,
   never a side-by-side panel. Per-block results are cached in the document cache, so flipping, switching tabs,
-  scrolling away and relaunching send nothing again. The overlay writes nothing into the PDF.
+  scrolling away and relaunching send nothing again. On a region-card tear the cover follows the page's two paper
+  pieces, and opening or closing the tear sends nothing. The overlay writes nothing into the PDF.
 
 ## Tech stack (decided)
 
