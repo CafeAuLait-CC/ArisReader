@@ -162,6 +162,17 @@ public struct TileCache {
         newest = nil
     }
 
+    /// Clears the lifetime counters without touching the cached tiles.
+    ///
+    /// `removeAll` deliberately preserves `peakBytes` and the counters so the HUD can report
+    /// what a run reached. The in-app performance panel is per document, so a document change
+    /// resets the counters; the peak restarts from what is still resident rather than claiming
+    /// a high-water mark from a document that is no longer open.
+    public mutating func resetStats() {
+        stats = TileCacheStats()
+        peakBytes = usedBytes
+    }
+
     // MARK: - Private
 
     /// Rule 4: stale-LOD tiles first, least recently used first inside each class.

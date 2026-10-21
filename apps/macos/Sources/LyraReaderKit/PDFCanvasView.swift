@@ -68,6 +68,9 @@ enum LyraReaderStatus: Int32 {
 public final class MetalCanvasView: NSView {
     /// Reports frame statistics (the view throttles them itself).
     public var onFrame: ((LyraReaderFrameStats) -> Void)?
+    /// The performance panel's seam. Weak: the reader owns the probe, and an unopened panel's
+    /// only cost is the nil/bool check in `renderFrame` before any sample is built.
+    public weak var performanceProbe: CanvasPerformanceProbe?
     /// Reports a fatal GPU/surface problem; rendering stops afterwards.
     public var onFailure: ((String) -> Void)?
     /// Reports the backing scale so the engine can rasterize at device resolution.
@@ -417,6 +420,11 @@ public final class MetalCanvasView: NSView {
     /// to be zero, which catches the regression where the model empties but the old page stays
     /// on screen because no new frame was submitted.
     package private(set) var lastSubmittedQuadCount: Int?
+    /// Pyramid-tile quads in the most recent frame the GPU accepted (`nil` before the first one).
+    ///
+    /// Tile placements are the only positive indices the canvas draws (`PlacementIndex` gives
+    /// every overlay a negative block), so this is the exact "tiles per frame" the panel reports.
+    package private(set) var lastSubmittedTileCount: Int?
     /// Frames this view has handed to the engine, whether or not the WindowServer allowed the
     /// surface to present them.
     ///
@@ -1448,8 +1456,12 @@ public final class MetalCanvasView: NSView {
         var sources: [Float] = []
         var blends: [UInt8] = []
         var submitted: [String] = []
+        var tileQuadCount = 0
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
+            // Tiles are the only positive placement block (`PlacementIndex`); this is what the
+            // performance panel calls "tiles per frame".
+            if page.placement.index >= 0 { tileQuadCount += 1 }
             // `zoom` already includes the display calibration; `scale` is the backing scale.
             // This shared helper is the only place the two are multiplied for a page quad, so
             // calibration cannot be applied a second time here.
@@ -1565,6 +1577,8 @@ public final class MetalCanvasView: NSView {
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
             // deliberately skips the draw. The frame loop retries at a low rate.
+            recordPerformanceSample(
+                stats: stats, presented: false, tileQuadCount: tileQuadCount, quadCount: textureIds.count)
             needsRender = true
             scheduleFrame(after: 0.133)
             return
@@ -1575,9 +1589,30 @@ public final class MetalCanvasView: NSView {
         // `submittedFrameCount`: together they say "a new frame reached the screen, and it had
         // this many page quads".
         lastSubmittedQuadCount = textureIds.count
+        lastSubmittedTileCount = tileQuadCount
+        recordPerformanceSample(
+            stats: stats, presented: true, tileQuadCount: tileQuadCount, quadCount: textureIds.count)
         if framesRendered == 1 || framesRendered % 15 == 0 {
             onFrame?(stats)
         }
+    }
+
+    /// Hands one frame to the performance probe, but only when it asked for samples.
+    ///
+    /// The nil/bool check is the entire closed-panel cost on the frame path; the sample value
+    /// (a POD struct) is not constructed unless a probe is sampling or the one-shot
+    /// open-to-first-frame measurement is pending.
+    private func recordPerformanceSample(
+        stats: LyraReaderFrameStats, presented: Bool, tileQuadCount: Int, quadCount: Int
+    ) {
+        guard let probe = performanceProbe, probe.wantsFrameSamples else { return }
+        probe.record(CanvasFrameSample(
+            presented: presented,
+            elapsedMicroseconds: stats.elapsed_us,
+            tileQuadCount: tileQuadCount,
+            quadCount: quadCount,
+            surfaceFrameIndex: stats.surface_frame_index
+        ))
     }
 
     /// Hands the current marks, page frames and view transform to the overlay.
@@ -1711,6 +1746,9 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onCancelTool: (() -> Bool)?
     private let onFrame: (LyraReaderFrameStats) -> Void
     private let onFailure: (String) -> Void
+    /// The window's performance probe. Only the reader's canvas gets one; the floating preview
+    /// draws its own surface and must not report into the main window's panel.
+    private let performanceProbe: CanvasPerformanceProbe?
     private let onDeviceScale: (CGFloat) -> Void
     private let onDisplayCalibration: (DisplayCalibration) -> Void
     private let onViewportSize: (CGSize) -> Void
@@ -1767,6 +1805,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         onCancelTool: (() -> Bool)? = nil,
         onFrame: @escaping (LyraReaderFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
+        performanceProbe: CanvasPerformanceProbe? = nil,
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
         onDisplayCalibration: @escaping (DisplayCalibration) -> Void = { _ in },
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
@@ -1819,6 +1858,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onCancelTool = onCancelTool
         self.onFrame = onFrame
         self.onFailure = onFailure
+        self.performanceProbe = performanceProbe
         self.onDeviceScale = onDeviceScale
         self.onDisplayCalibration = onDisplayCalibration
         self.onViewportSize = onViewportSize
@@ -1854,6 +1894,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.interactionSnapshot = interactionSnapshot
         view.onFrame = onFrame
         view.onFailure = onFailure
+        view.performanceProbe = performanceProbe
         view.onDeviceScale = onDeviceScale
         view.onDisplayCalibration = onDisplayCalibration
         view.onViewportSize = onViewportSize
