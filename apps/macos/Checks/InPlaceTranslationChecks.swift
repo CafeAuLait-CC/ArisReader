@@ -80,6 +80,7 @@ extension ReaderChecks {
         try await inPlaceTranslationTabAndRelaunchChecks(root: root)
         try await inPlaceTranslationKeyAndEditChecks(root: root)
         try await inPlaceTranslationBatchCancelAndPageEditChecks(root: root)
+        try await inPlaceTranslationAuditChecks(root: root)
         try await inPlaceTranslationRegionTearChecks(root: root)
         try inPlaceTranslationTearGeometryChecks()
         try inPlaceTranslationLayoutAndChipChecks()
@@ -647,6 +648,72 @@ extension ReaderChecks {
             require(!text.contains(deleteBlock.sourceText),
                     "the deleted page's cached translation is pruned, not left behind")
         }
+    }
+
+    // MARK: - Audit trail
+
+    /// Every outgoing block translation is one audited start; cache hits and flips add nothing.
+    @MainActor
+    private static func inPlaceTranslationAuditChecks(root: URL) async throws {
+        let paper = try translationFixture(root: root, named: "text-page.pdf")
+        let (settings, defaults, suite) = translationSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let engine = try RustEngine()
+        let service = CountingTranslationService(engine: engine)
+        let state = try await makeTranslationState(engine: engine, settings: settings,
+                                                   service: service, url: paper)
+        let auditDirectory = paper.deletingLastPathComponent()
+            .appendingPathComponent("translation-audit-\(UUID().uuidString)", isDirectory: true)
+        let audit = AIAuditTrail(directory: auditDirectory)
+        state.inPlaceTranslationAuditOverride = audit
+        guard let textPage = await state.translationTextPage(0) else {
+            fatalError("the audit fixture has no text layer")
+        }
+        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        require(blocks.count >= 2, "the audit fixture needs two blocks")
+        let first = blocks[0], second = blocks[1]
+
+        state.selectTranslationRange(page: 0, range: first.range)
+        _ = state.performTranslationAction()
+        try await waitForTranslation(state)
+        require(service.startCount == 1, "the audit fixture sends one block request")
+        require(audit.records.count == 1,
+                "one translation request produces exactly one audit record")
+        if let record = audit.records.first {
+            require(record.action == .translation, "the record names the translation action")
+            require(record.outcome == .sent, "the record says the request was sent")
+            require(record.pages == [1], "the record carries the page without document text")
+            require(record.characters > 0, "the record counts the characters sent")
+            require(record.image == nil, "a translation carries no image")
+        }
+
+        // Flip ten times: these are cache reads, not requests, so the audit count is unchanged.
+        for _ in 0..<10 {
+            _ = state.performTranslationAction()
+        }
+        require(audit.records.count == 1,
+                "Show original / Translate cache flips add no audit record")
+        require(service.startCount == 1, "the flips sent no request")
+
+        state.selectTranslationRange(page: 0, range: second.range)
+        _ = state.performTranslationAction()
+        try await waitForTranslation(state, count: 2)
+        require(service.startCount == 2, "a second block is a second request")
+        require(audit.records.count == 2,
+                "the second outgoing block has its own audit record")
+        require(audit.records.allSatisfy { $0.action == .translation && $0.outcome == .sent },
+                "both audit records describe sent translations")
+
+        // A relaunch with the same cache and audit trail reuses the translations silently.
+        let relaunchService = CountingTranslationService(engine: try RustEngine())
+        let relaunch = try await makeTranslationState(
+            engine: try RustEngine(), settings: settings, service: relaunchService, url: paper)
+        relaunch.inPlaceTranslationAuditOverride = audit
+        try await eventually("the relaunch restores the cached translations") {
+            relaunch.translationOverlays.filter { $0.isTranslated }.count >= 2
+        }
+        require(relaunchService.startCount == 0, "the relaunch sends no request")
+        require(audit.records.count == 2, "reusing the cache adds no audit record")
     }
 
     // MARK: - Torn pages

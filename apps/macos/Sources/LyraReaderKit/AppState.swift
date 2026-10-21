@@ -1375,6 +1375,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// assistant settings and the engine's AI service.
     public var inPlaceTranslationServiceOverride: (() -> (any AIChatServicing)?)?
     public var inPlaceTranslationSettingsOverride: AISettingsStore?
+    /// The audit trail the in-place requests append to. Production points it at the window
+    /// assistant's trail; the checks inject an isolated file.
+    public var inPlaceTranslationAuditOverride: AIAuditTrail?
     /// The original PDF whose cache owns the translations. A page-edit revision on screen must
     /// not create a second cache directory.
     private var translationCacheDocumentURL: URL?
@@ -1389,6 +1392,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
     var translationSettings: AISettingsStore? {
         inPlaceTranslationSettingsOverride ?? AISettingsStore.shared
+    }
+    var translationAudit: AIAuditTrail {
+        inPlaceTranslationAuditOverride ?? AIAuditTrail.shared
     }
     var translationPaperAppearance: PaperAppearance { ReadingAppearanceStore.shared.mode }
 

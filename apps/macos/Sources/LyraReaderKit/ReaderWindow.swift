@@ -111,6 +111,7 @@ public struct ReaderWindow: View {
             // The in-place action uses the same provider settings and target language as the
             // assistant panel; there is exactly one AI configuration in a window.
             state.inPlaceTranslationSettingsOverride = aiAssistant.settings
+            state.inPlaceTranslationAuditOverride = aiAssistant.audit
             state.inPlaceTranslationTargetLanguage = aiAssistant.targetLanguage
         }
         .onChange(of: aiAssistant.targetLanguage) { _, language in

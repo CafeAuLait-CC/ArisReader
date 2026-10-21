@@ -569,6 +569,29 @@ final class AIAuditAttempt {
     }
 }
 
+/// The one start site for audited AI transports.
+///
+/// Both the assistant panel and the in-place translator build their transport inside the
+/// closure; this function appends the attempt before the transport exists, wraps the handle, and
+/// turns a start failure into a `refused` record. There is deliberately no second audit path.
+@MainActor
+enum AIAuditedRequestStart {
+    static func start(
+        plan: AiPlanRecord,
+        kind: AIAuditAction,
+        audit: AIAuditTrail,
+        makeHandle: () throws -> any AIChatHandle
+    ) throws -> any AIChatHandle {
+        let attempt = audit.begin(plan: plan, kind: kind)
+        do {
+            return AIAuditedChatHandle(base: try makeHandle(), attempt: attempt)
+        } catch {
+            attempt.finish(.refused, code: AIAuditCode.classifyStartFailure(error))
+            throw error
+        }
+    }
+}
+
 /// Wraps the transport handle so every AI request — API-key, ChatGPT plan, or one unit of a
 /// layered-summary batch — inherits the same audit hook. A handle is created only after a
 /// previewed plan is approved; it observes the same terminal events the panel does.

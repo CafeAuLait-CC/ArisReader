@@ -54,3 +54,7 @@ piecewise page mapping as annotations and selection: a block above or below the 
 block crossing it is clipped into both pieces rather than painted through the card. The chip anchors to the piece
 with the most visible area and never sits in the gap. Opening or closing the tear only re-maps the overlay: the
 page-local cache key is unchanged, so toggling the tear sends no request.
+
+In-place block requests start through the same audited start site as the panel: one audit record per outgoing
+block request. Show original, Translate from the cache, scroll, a tab switch, a relaunch and opening or closing a
+tear add no record because they leave the machine.

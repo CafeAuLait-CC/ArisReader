@@ -17,6 +17,7 @@ protocol InPlaceTranslationHost: AnyObject {
     var translationLanguage: String { get }
     var translationService: (any AIChatServicing)? { get }
     var translationSettings: AISettingsStore? { get }
+    var translationAudit: AIAuditTrail { get }
     var translationPaperAppearance: PaperAppearance { get }
     func translationTextPage(_ page: Int) async -> TextPage?
     func translationPaperColor(page: Int) -> TranslationPaperColor?
@@ -80,6 +81,7 @@ final class InPlaceTranslationController {
         let documentURL: URL
         let service: (any AIChatServicing)?
         let settings: AISettingsStore
+        let audit: AIAuditTrail
         let connectionMode: AIConnectionMode
         let accountID: UUID?
         let model: String
@@ -539,6 +541,7 @@ final class InPlaceTranslationController {
             documentURL: url,
             service: service,
             settings: settings,
+            audit: host.translationAudit,
             connectionMode: settings.connectionMode,
             accountID: accountID,
             model: providerSettings.model,
@@ -585,15 +588,18 @@ final class InPlaceTranslationController {
             if item.environment.connectionMode == .chatGPT {
                 plan = try ChatGPTResponses.plan(plan)
             }
-            let handle: any AIChatHandle
-            if item.environment.connectionMode == .chatGPT {
-                guard let accountID = item.environment.accountID else {
-                    throw AISettingsError.invalid("The ChatGPT account is no longer selected. Nothing was sent.")
+            let handle = try AIAuditedRequestStart.start(
+                plan: plan, kind: .translation, audit: item.environment.audit
+            ) {
+                if item.environment.connectionMode == .chatGPT {
+                    guard let accountID = item.environment.accountID else {
+                        throw AISettingsError.invalid("The ChatGPT account is no longer selected. Nothing was sent.")
+                    }
+                    startCount += 1
+                    return ChatGPTResponsesHandle(plan: plan,
+                                                  accounts: item.environment.settings.chatGPT,
+                                                  accountID: accountID)
                 }
-                handle = ChatGPTResponsesHandle(plan: plan,
-                                                accounts: item.environment.settings.chatGPT,
-                                                accountID: accountID)
-            } else {
                 guard let service = item.environment.service else {
                     throw AISettingsError.invalid(AIAssistantModel.noEngineMessage)
                 }
@@ -601,7 +607,7 @@ final class InPlaceTranslationController {
                     throw AISettingsError.invalid(AIAssistantModel.noKeyMessage)
                 }
                 startCount += 1
-                handle = try service.start(plan, apiKey: apiKey)
+                return try service.start(plan, apiKey: apiKey)
             }
             guard var activeItem = active[key], !activeItem.cancelled,
                   documentMatches(item.environment) else {
