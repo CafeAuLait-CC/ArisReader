@@ -38,8 +38,9 @@ separate features with their own documented limits.
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
   figure/table/algorithm previews with transparent crops, metadata recognition with BibTeX export.
 - **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the
-  whole file, citation chips that jump to the verified source and flash it briefly, plus summarise / selection
-  Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
+  whole file, citation chips that jump to the verified source and flash it briefly, plus region questions - drag a
+  rectangle and the answer opens in a card set into a real gap in the page flow, then becomes a history entry that
+  exports as a Markdown knowledge document - summarise / selection Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
   anything leaves the machine and the key held in the Keychain.
   Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
   edge; switching between them preserves drafts and keeps the PDF canvas and window geometry stable.
