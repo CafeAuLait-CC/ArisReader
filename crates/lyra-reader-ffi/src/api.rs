@@ -5118,6 +5118,16 @@ pub struct AiHeaderRecord {
     pub value: String,
 }
 
+/// The exact PNG one request carries. The same bytes are embedded in `wire_body`; the shell
+/// forwards them unchanged into the ChatGPT Responses content part, so the picture the preview
+/// names and the picture that is sent cannot differ.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiPlanImageRecord {
+    pub png: Vec<u8>,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
 /// One request in the preview. `wire_body` is the exact JSON body; the key is added only when
 /// the reader presses Send, so it can never appear here.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5133,6 +5143,8 @@ pub struct AiPlanPartRecord {
     pub user_prompt: String,
     pub wire_body: String,
     pub note: Option<String>,
+    /// Present only when this exact request carries a region picture.
+    pub image: Option<AiPlanImageRecord>,
 }
 
 /// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
@@ -5551,6 +5563,11 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
                 user_prompt: part.user_prompt,
                 wire_body: part.wire_body,
                 note: part.note,
+                image: part.image.map(|image| AiPlanImageRecord {
+                    png: image.png,
+                    width_px: image.width_px,
+                    height_px: image.height_px,
+                }),
             })
             .collect(),
         source_pages: plan.source_pages,
@@ -5610,7 +5627,11 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             request_characters: part.request_characters,
             system_prompt: part.system_prompt,
             user_prompt: part.user_prompt,
-            image: None,
+            image: part.image.map(|image| ChatImage {
+                width_px: image.width_px,
+                height_px: image.height_px,
+                png: image.png,
+            }),
             wire_body: part.wire_body,
             note: part.note,
         })

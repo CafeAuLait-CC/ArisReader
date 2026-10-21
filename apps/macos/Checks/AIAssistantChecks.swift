@@ -716,7 +716,8 @@ extension ReaderChecks {
                 systemPrompt: "system",
                 userPrompt: "part \(index + 1)",
                 wireBody: "{\"stream\":true,\"max_tokens\":900}",
-                note: nil
+                note: nil,
+                image: nil
             )
         }
         let originalPlan = AiPlanRecord(

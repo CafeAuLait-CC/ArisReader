@@ -8,6 +8,12 @@ import Security
 /// All HTTP responses are synthetic. These checks never log into an account or use plan quota.
 private final class ChatGPTStubProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var route: (@Sendable (URLRequest) throws -> (Int, Data, String))?
+    /// Return this status for `/v1/responses` instead of a stream. The checks use 400 to exercise
+    /// the real refusal path for an image-bearing request without any network.
+    nonisolated(unsafe) static var refuseResponsesWithStatus: Int?
+    /// Deliver only the first SSE frame and keep the connection open until the client cancels.
+    /// This is how Cancel is exercised against a real byte stream rather than a scripted handle.
+    nonisolated(unsafe) static var holdStreamAfterFirstFrame = false
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -16,6 +22,11 @@ private final class ChatGPTStubProtocol: URLProtocol, @unchecked Sendable {
             let response = HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: "HTTP/1.1",
                                            headerFields: ["Content-Type": type])!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if Self.holdStreamAfterFirstFrame, type == "text/event-stream",
+               let boundary = data.range(of: Data("\n\n".utf8)) {
+                client?.urlProtocol(self, didLoad: data.subdata(in: 0..<boundary.upperBound))
+                return
+            }
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
         } catch { client?.urlProtocol(self, didFailWithError: error) }
@@ -188,6 +199,9 @@ extension ReaderChecks {
                     }
                     requestBodies.append(data)
                 }
+                if let status = ChatGPTStubProtocol.refuseResponsesWithStatus {
+                    return (status, Data("{\"error\":{\"message\":\"synthetic image refusal\"}}".utf8), "application/json")
+                }
                 return (200, Data("data: {\"type\":\"response.output_text.delta\",\"delta\":\"A synthetic answer.\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"total_tokens\":16}}}\n\n".utf8), "text/event-stream")
             case "/api/accounts/oauth/revoke": revokeCount += 1; return (200, Data(), "application/json")
             default: throw AISettingsError.invalid("Unexpected endpoint: \(path)")
@@ -242,10 +256,147 @@ extension ReaderChecks {
         require(model.phase == .finished && model.answer == "A synthetic answer." && model.usage?.totalTokens == 16,
                 "only completed Responses streams finish, with text and token usage (\(model.phase), \(model.errorMessage ?? "no error"))")
         require(inferenceCount == 1 && settings.hasKey == false, "ChatGPT inference needs no API key and makes one explicit request")
+        if let plan = model.plan, let part = plan.parts.first {
+            let body = try JSONSerialization.jsonObject(with: Data(part.wireBody.utf8)) as! [String: Any]
+            let input = body["input"] as! [[String: Any]]
+            let content = input[1]["content"] as! [[String: Any]]
+            require(content.count == 1 && content[0]["type"] as? String == "input_text"
+                    && content[0]["text"] as? String == part.userPrompt,
+                    "a text-only plan request carries just the text part, with no image")
+        }
+
+        // A region question travels as the documented Responses content parts: one `input_text`
+        // and one `input_image` with an inline PNG data URL. The scripted endpoint sees the same
+        // bytes the preview named, and no upload request exists or is needed.
+        func userContent(_ bodyData: Data) throws -> [[String: Any]] {
+            guard let body = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+                  let input = body["input"] as? [[String: Any]],
+                  let content = input.last?["content"] as? [[String: Any]] else { return [] }
+            return content
+        }
+        func imageBytes(_ content: [[String: Any]]) -> Data? {
+            let prefix = "data:image/png;base64,"
+            guard let image = content.first(where: { $0["type"] as? String == "input_image" }),
+                  let url = image["image_url"] as? String, url.hasPrefix(prefix) else { return nil }
+            return Data(base64Encoded: String(url.dropFirst(prefix.count)))
+        }
+        let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")!
+        let attachment = AIRegionAttachment(
+            page: 0, rect: CGRect(x: 40, y: 40, width: 120, height: 60),
+            text: "E = mc^2", png: png, pixelWidth: 1, pixelHeight: 1, captureScale: 2)
+        let beforeRegion = inferenceCount
+        await model.prepareRegion(question: "What does this formula show?",
+                                  attachment: attachment, context: context)
+        require(model.phase == .preview && inferenceCount == beforeRegion,
+                "the ChatGPT region preview is built locally and sends nothing")
+        guard let regionPlan = model.plan, let regionPart = regionPlan.parts.first else {
+            fatalError("FAIL: the ChatGPT region preview was built: \(model.errorMessage ?? "no error")")
+        }
+        require(regionPlan.endpoint == ChatGPTResponses.endpoint,
+                "the region preview keeps the fixed Responses endpoint")
+        require(regionPart.includesRegionImage && regionPart.image?.png == png
+                && regionPart.image?.widthPx == 1 && regionPart.image?.heightPx == 1,
+                "the plan carries the exact captured PNG and its pixel size")
+        require((model.statusNote ?? "").contains("image part is included"),
+                "the preview says the image is included: \(model.statusNote ?? "nil")")
+        let previewContent = try userContent(Data(regionPart.wireBody.utf8))
+        require(previewContent.count == 2
+                && previewContent[0]["type"] as? String == "input_text"
+                && previewContent[0]["text"] as? String == regionPart.userPrompt,
+                "the previewed Responses body carries the user text as an input_text part")
+        require(previewContent[1]["type"] as? String == "input_image"
+                && imageBytes(previewContent) == png,
+                "the previewed Responses body carries an input_image with the exact PNG bytes")
+        let previewWireBody = regionPart.wireBody
+        let sentBodiesBefore = requestBodies.count
+        model.send()
+        try await eventually("the ChatGPT region request streams to completion",
+                             { model.phase.isTerminal })
+        require(model.phase == .finished && !model.answer.isEmpty,
+                "the image request streams like any other answer (\(model.phase), \(model.errorMessage ?? "no error"))")
+        require(inferenceCount == beforeRegion + 1 && requestBodies.count == sentBodiesBefore + 1,
+                "one explicit image request is sent, with no upload step and no probe")
+        require(requestBodies.last == Data(previewWireBody.utf8),
+                "the scripted plan endpoint receives exactly the previewed body")
+        let sentContent = try userContent(requestBodies.last!)
+        require(imageBytes(sentContent) == png,
+                "the scripted plan endpoint sees the expected image bytes in the payload")
+
+        // A text-only action on the same connection keeps the text-only shape: no phantom image.
+        await model.prepare(action: .summarizePage, context: context)
+        require(model.phase == .preview, "the text-only preview is rebuilt after the image request")
+        if let textPart = model.plan?.parts.first {
+            require(!textPart.includesRegionImage && textPart.image == nil,
+                    "a text-only plan part has no image payload")
+            let content = try userContent(Data(textPart.wireBody.utf8))
+            require(content.count == 1 && content[0]["type"] as? String == "input_text",
+                    "a text-only Responses request has just the text part")
+        }
+
+        // A model or account that refuses the image is a stated refusal with the real status,
+        // not a silent text-only retry. The plan, question and answer cell stay usable.
+        await model.prepareRegion(question: "Explain this formula.",
+                                  attachment: attachment, context: context)
+        require(model.phase == .preview, "the refusal fixture has a region preview")
+        let refusalAttempts = inferenceCount
+        ChatGPTStubProtocol.refuseResponsesWithStatus = 400
+        model.send()
+        try await eventually("the image refusal settles", { model.phase.isTerminal })
+        require(model.phase == .failed, "an HTTP 400 refusal fails the request")
+        let refusal = model.errorMessage ?? ""
+        require(refusal.contains("region image") && refusal.contains("HTTP 400"),
+                "the refusal names the image and the real status: \(refusal)")
+        require(model.plan != nil && model.canRetry,
+                "the refused question and plan stay retryable")
+        require(inferenceCount == refusalAttempts + 1,
+                "a refused image is not silently retried as text")
+        let refusedContent = try userContent(requestBodies.last!)
+        require(imageBytes(refusedContent) == png,
+                "the refused request did carry the image")
+        ChatGPTStubProtocol.refuseResponsesWithStatus = nil
+        model.retry()
+        try await eventually("retry after the image refusal completes",
+                             { model.phase == .finished })
+        require(model.answer == "A synthetic answer.",
+                "retry after a refusal sends the same image plan and streams the answer")
+        let retriedContent = try userContent(requestBodies.last!)
+        require(inferenceCount == refusalAttempts + 2
+                && imageBytes(retriedContent) == png,
+                "the retried body carries the same image bytes")
+
+        // Cancel keeps the partial answer, and Retry re-sends the image plan unchanged.
+        await model.prepareRegion(question: "What is in the picture?",
+                                  attachment: attachment, context: context)
+        require(model.phase == .preview, "the cancel fixture has a region preview")
+        let cancelAttempts = inferenceCount
+        let cancelBodies = requestBodies.count
+        ChatGPTStubProtocol.holdStreamAfterFirstFrame = true
+        model.send()
+        try await eventually("the image stream has produced a partial answer",
+                             { model.phase == .streaming && !model.answer.isEmpty })
+        let partialImageAnswer = model.answer
+        model.cancel()
+        try await eventually("cancel settles the plan image request",
+                             { model.phase == .cancelled })
+        try await Task.sleep(for: .milliseconds(150))
+        require(model.answer == partialImageAnswer && !partialImageAnswer.isEmpty,
+                "cancel keeps the partial answer to the image question")
+        ChatGPTStubProtocol.holdStreamAfterFirstFrame = false
+        model.retry()
+        try await eventually("retry after cancel completes", { model.phase == .finished })
+        require(model.answer == "A synthetic answer.",
+                "retry after cancel streams a fresh answer")
+        require(inferenceCount == cancelAttempts + 2 && requestBodies.count == cancelBodies + 2,
+                "cancel and retry are two explicit requests, not a hidden fallback")
+        let cancelAndRetry = requestBodies.suffix(2)
+        require(cancelAndRetry.allSatisfy { (try? userContent($0)).flatMap(imageBytes) == png },
+                "the cancelled request and its retry both carry the same image bytes")
+        let beforeReroute = inferenceCount
         await model.prepare(action: .summarizePage, context: context)
         settings.connectionMode = .apiKey
         model.send()
-        require(model.phase == .failed && inferenceCount == 1, "changing provider after preview cannot silently reroute the request")
+        require(model.phase == .failed && inferenceCount == beforeReroute,
+                "changing provider after preview cannot silently reroute the request")
         await accounts.signOut()
         let signedOutCredential = try vault.readKey()
         require(!accounts.isConnected && revokeCount == 1 && signedOutCredential == nil,

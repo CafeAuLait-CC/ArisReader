@@ -31,6 +31,9 @@ struct ChatGPTConnectionView: View {
                         ForEach(accounts.models) { Text($0.name).tag($0.id) }
                     }
                 }
+                Text("Region questions send the selected picture to this model as an inline image, in the documented Responses shape. The plan's model catalog does not report image support, so LyraReader tries the request and reports a refusal instead of silently dropping the picture.")
+                    .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("Refresh Models") { Task { await accounts.loadModels() } }
                         .disabled(accounts.isLoadingModels || accounts.isSigningOut)

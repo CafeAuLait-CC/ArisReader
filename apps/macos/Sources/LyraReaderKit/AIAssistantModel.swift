@@ -378,9 +378,6 @@ public final class AIAssistantModel: ObservableObject {
         pendingChatQuestion = nil
         statusNote = "Building the request preview for this region. Nothing has been sent."
 
-        // The ChatGPT plan transport in this build writes text content only, so a picture would
-        // be silently dropped. Degrade explicitly to text and say why in the preview note.
-        let chatGPTTextOnly = preparedConnection == .chatGPT
         let request = AIMakePlanRequest(
             action: .regionQuestion,
             currentPage: context.currentPage,
@@ -389,20 +386,16 @@ public final class AIAssistantModel: ObservableObject {
             language: nil,
             history: [],
             region: attachment,
-            sendRegionImage: providerSettings.vision && !chatGPTTextOnly,
+            sendRegionImage: providerSettings.vision,
             settings: providerSettings
         )
         do {
             let source = try await service.prepare(request)
-            var plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
-            if chatGPTTextOnly && providerSettings.vision {
-                let note = "The ChatGPT plan request sends text only in this build, so the region picture is not included."
-                plan.note = [plan.note, note].compactMap { $0 }.joined(separator: " ")
-            }
+            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
             guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
             self.plan = plan
             phase = .preview
-            let imageNote = plan.parts.first?.wireBody.contains("image_url") == true
+            let imageNote = plan.parts.first?.includesRegionImage == true
                 ? "The image part is included." : "Text only: the image part is not included."
             statusNote = "Nothing has been sent yet. \(imageNote) Review the exact request below, then press Ask."
         } catch {
