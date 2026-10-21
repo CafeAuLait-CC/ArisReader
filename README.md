@@ -38,12 +38,14 @@ separate features with their own documented limits.
   (a page torn open by a region card still prints as the original page).
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
   figure/table/algorithm previews with transparent crops, metadata recognition with BibTeX export.
-- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the
-  whole file, citation chips that jump to the verified source and flash it briefly, plus region questions - drag a
-  rectangle and the answer opens in a card set into a real gap torn inside the page, at the nearest whitespace
-  below the selection (the page's own pixels are clipped into the two pieces, never re-rendered), then becomes a
-  history entry that exports as a Markdown knowledge document - summarise / selection Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
-  anything leaves the machine and the key held in the Keychain.
+- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the whole
+  file and citation chips that jump to the verified source and flash it; region questions, where a drag opens the
+  answer in a card set into a real tear in the page (the page's pixels are clipped into two pieces, never
+  re-rendered) and the exchange later exports as a Markdown knowledge document; layered summaries over the whole
+  document, its sections and its pages, each linking to its source; and in-place translation with a Show original
+  toggle that sends nothing on a cache hit. It works over an OpenAI-compatible endpoint or a ChatGPT plan, previews
+  every request before anything leaves the machine, keeps the key in the Keychain, and keeps a local record of what
+  each send contained (pages, characters, whether a picture went) that never stores document text.
   Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
   edge; switching between them preserves drafts and keeps the PDF canvas and window geometry stable.
 - **Translate in place**: select a paragraph and choose Translate from the context menu, the toolbar or
