@@ -24,7 +24,17 @@ extension ReaderChecks {
     /// presented frame wherever the window is visible. Because the empty window now shows the
     /// opaque Home surface, an unopened canvas has no stale drawable to hide in the first place;
     /// the submission requirement is what keeps the clear-frame path itself under test.
-    @MainActor static func canvasClearChecks(a: URL, b: URL) async throws {
+    @MainActor static func canvasClearChecks(a sourceA: URL, b sourceB: URL) async throws {
+        // This check starts with pristine documents. Earlier interaction checks deliberately
+        // leave recoverable rotations in the cache; reopening those paths would correctly
+        // request Save before close and would no longer exercise an empty-tab close.
+        let fixtures = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-canvas-clear-\(UUID())")
+        try FileManager.default.createDirectory(at: fixtures, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixtures) }
+        let a = fixtures.appendingPathComponent("a.pdf")
+        let b = fixtures.appendingPathComponent("b.pdf")
+        try FileManager.default.copyItem(at: sourceA, to: a)
+        try FileManager.default.copyItem(at: sourceB, to: b)
         _ = NSApplication.shared
 
         /// One reader window built the way the app builds it: the real `ReaderWindow`, so
