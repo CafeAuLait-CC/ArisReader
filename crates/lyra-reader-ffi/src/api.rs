@@ -2444,6 +2444,7 @@ impl LyraReaderDocument {
     ) -> Result<AiPlanRecord, LyraReaderFfiError> {
         let action = match request.action {
             AiActionRecord::SummarizePage => AiAction::SummarizePage,
+            AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
             AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
             AiActionRecord::AskSelection => AiAction::AskSelection,
             AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
@@ -2485,9 +2486,12 @@ impl LyraReaderDocument {
             });
         }
 
-        // Translation only needs the selected page. Every other action can retrieve context
-        // from the whole document, and a document summary needs all of it.
-        let page_list: Vec<u32> = if action == AiAction::TranslateSelection {
+        // Selection-only summary and translation send only the exact selected target.
+        // Questions can retrieve context; a document summary needs every page.
+        let page_list: Vec<u32> = if matches!(
+            action,
+            AiAction::TranslateSelection | AiAction::SummarizeSelection
+        ) {
             vec![selection.expect("checked above").page]
         } else {
             (0..page_count).collect()
@@ -4920,6 +4924,7 @@ impl LyraReaderEngine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum AiActionRecord {
     SummarizePage,
+    SummarizeSelection,
     SummarizeDocument,
     AskSelection,
     TranslateSelection,
@@ -5440,6 +5445,7 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
 fn ai_action_record(action: AiAction) -> AiActionRecord {
     match action {
         AiAction::SummarizePage => AiActionRecord::SummarizePage,
+        AiAction::SummarizeSelection => AiActionRecord::SummarizeSelection,
         AiAction::SummarizeDocument => AiActionRecord::SummarizeDocument,
         AiAction::AskSelection => AiActionRecord::AskSelection,
         AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
@@ -5450,6 +5456,7 @@ fn ai_action_record(action: AiAction) -> AiActionRecord {
 fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiError> {
     let action = match plan.action {
         AiActionRecord::SummarizePage => AiAction::SummarizePage,
+        AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
         AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
         AiActionRecord::AskSelection => AiAction::AskSelection,
         AiActionRecord::TranslateSelection => AiAction::TranslateSelection,

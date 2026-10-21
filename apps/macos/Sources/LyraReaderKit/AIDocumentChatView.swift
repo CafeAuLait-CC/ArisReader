@@ -11,6 +11,7 @@ import SwiftUI
 public struct AIDocumentChatView: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
+    @State private var followsLatest = true
 
     public init(state: AppState, model: AIAssistantModel) {
         self.state = state
@@ -94,15 +95,17 @@ public struct AIDocumentChatView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 10)
+                .background(ChatScrollPositionHost { followsLatest = $0 })
             }
             .onChange(of: model.chatTurns.count) { _, _ in
+                followsLatest = true
                 scrollToLatest(proxy)
             }
             .onChange(of: model.chatTurns.last?.answer) { _, _ in
-                scrollToLatest(proxy)
+                if followsLatest { scrollToLatest(proxy) }
             }
             .onChange(of: model.phase) { _, _ in
-                scrollToLatest(proxy)
+                if followsLatest { scrollToLatest(proxy) }
             }
         }
     }
@@ -117,9 +120,7 @@ public struct AIDocumentChatView: View {
 
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
         guard let id = model.chatTurns.last?.id else { return }
-        withAnimation(.easeOut(duration: 0.18)) {
-            proxy.scrollTo(id, anchor: .bottom)
-        }
+        proxy.scrollTo(id, anchor: .bottom)
     }
 
     private var emptyState: some View {
@@ -148,16 +149,30 @@ public struct AIDocumentChatView: View {
 
     private func chatTurn(_ turn: AIChatTurn) -> some View {
         let backlinks = turn.backlinks(pageCount: turn.pageCount)
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "person.crop.circle")
-                    .font(.caption)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Spacer(minLength: 18)
                 Text(turn.question)
-                    .font(.callout.weight(.medium))
+                    .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
+                    .padding(10)
+                    .foregroundStyle(LyraReaderTheme.selectedFg)
+                    .background(LyraReaderTheme.selectedBg, in: RoundedRectangle(cornerRadius: 10))
             }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Lyra", systemImage: "sparkles")
+                        .font(.caption.weight(.semibold)).foregroundStyle(LyraReaderTheme.accent)
+                    Spacer()
+                    if !turn.answer.isEmpty {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(turn.answer, forType: .string)
+                        } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain).help("Copy answer").accessibilityLabel("Copy answer")
+                    }
+                }
 
             if turn.state == .nothingRelevant {
                 Label("Nothing relevant was found. No request was sent.", systemImage: "exclamationmark.magnifyingglass")
@@ -186,13 +201,18 @@ public struct AIDocumentChatView: View {
             }
 
             if !backlinks.chips.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Sources sent with this answer")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(LyraReaderTheme.textSecondary)
-                    ForEach(backlinks.chips) { chip in
-                        sourceChip(chip)
+                DisclosureGroup(isExpanded: Binding(
+                    get: { model.expandedChatSources.contains(turn.id) },
+                    set: { expanded in
+                        if expanded { model.expandedChatSources.insert(turn.id) }
+                        else { model.expandedChatSources.remove(turn.id) }
                     }
+                )) {
+                    ForEach(backlinks.chips) { chip in sourceChip(chip) }
+                } label: {
+                    Text("Sources · " + backlinks.chips.map { "p.\($0.page)" }.joined(separator: ", "))
+                        .font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             ForEach(backlinks.unverified) { refusal in
@@ -238,10 +258,11 @@ public struct AIDocumentChatView: View {
                     .font(.caption2)
                     .foregroundStyle(LyraReaderTheme.textTertiary)
             }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
         }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 6))
     }
 
     private func sourceChip(_ chip: AIChatChip) -> some View {
@@ -365,7 +386,7 @@ public struct AIDocumentChatView: View {
                 .onSubmit(ask)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
-                    Text("Ask builds the preview locally.")
+                    Text("Review sources before sending.")
                         .font(.caption2)
                         .foregroundStyle(LyraReaderTheme.textTertiary)
                         .fixedSize(horizontal: true, vertical: false)
@@ -384,7 +405,7 @@ public struct AIDocumentChatView: View {
     }
 
     private var askButton: some View {
-        Button { ask() } label: { Label("Preview Question", systemImage: "arrow.up") }
+        Button { ask() } label: { Label("Review", systemImage: "arrow.up") }
             .buttonStyle(ReaderPanelButtonStyle(prominent: true))
             .background(AIDocumentChatAskMarkerHost())
             .disabled(!model.canAskDocument)
@@ -393,6 +414,7 @@ public struct AIDocumentChatView: View {
 
     private func ask() {
         guard let context = state.aiReaderContext else { return }
+        followsLatest = true
         Task { await model.prepareDocumentChat(context: context) }
     }
 
@@ -476,4 +498,35 @@ private struct AIDocumentChatChipMarkerHost: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AIDocumentChatChipMarkerView, context: Context) {}
+}
+
+/// Follow streaming output only while the reader stays near the end. Live-scroll events come
+/// from user input; layout and programmatic scroll changes must not reset this preference.
+private struct ChatScrollPositionHost: NSViewRepresentable {
+    let changed: (Bool) -> Void
+    func makeNSView(context: Context) -> ChatScrollPositionView {
+        let view = ChatScrollPositionView()
+        view.changed = changed
+        return view
+    }
+    func updateNSView(_ view: ChatScrollPositionView, context: Context) { view.changed = changed }
+}
+
+private final class ChatScrollPositionView: NSView {
+    var changed: ((Bool) -> Void)?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        NotificationCenter.default.addObserver(self, selector: #selector(didScroll(_:)),
+            name: NSScrollView.didLiveScrollNotification, object: nil)
+    }
+    convenience init() { self.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("programmatic") }
+    @objc private func didScroll(_ notification: Notification) {
+        guard let scroll = enclosingScrollView,
+              notification.object as? NSScrollView === scroll,
+              let document = scroll.documentView else { return }
+        let visible = scroll.contentView.bounds
+        let distance = document.isFlipped ? document.bounds.maxY - visible.maxY : visible.minY
+        changed?(distance <= 80)
+    }
 }
