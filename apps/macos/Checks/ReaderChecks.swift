@@ -49,6 +49,9 @@ struct ReaderChecks {
         DocumentEditCache.rootOverride = checkCache.appendingPathComponent("Documents")
         setenv("LYRA_READER_DOCUMENT_CACHE_DIR", DocumentEditCache.rootOverride!.path, 1)
         setenv("LYRA_READER_INDEX_CACHE_DIR", checkCache.appendingPathComponent("Indexes").path, 1)
+        // Keep the local AI audit trail out of the person's cache during a check run, including
+        // models that use the shared trail. Audit checks pass their own directories.
+        setenv("LYRA_READER_AI_AUDIT_DIR", checkCache.appendingPathComponent("Audit").path, 1)
         defer { try? FileManager.default.removeItem(at: checkCache) }
         // The reader's layout preferences live in UserDefaults (so the app remembers facing
         // pages and the page gap). Checks must not inherit them from whatever the person
@@ -147,6 +150,11 @@ struct ReaderChecks {
         if CommandLine.arguments.contains("--check-inside-page-tear") {
             try await insidePageTearChecks(root: fastRoot)
             print("Inside-page tear checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--check-ai-audit") {
+            try await aiAuditChecks(root: fastRoot)
+            print("AI audit trail checks passed")
             return
         }
         if CommandLine.arguments.contains("--check-facing-layout") {
@@ -677,6 +685,7 @@ struct ReaderChecks {
         try await aiAssistantChecks(root: root)
         try await regionQuestionChecks(root: root)
         try await insidePageTearChecks(root: root)
+        try await aiAuditChecks(root: root)
         try await chatGPTChecks(root: root)
         await appearanceChecks()
         try await readingPolishChecks(root: root)

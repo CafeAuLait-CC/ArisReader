@@ -77,6 +77,9 @@ public final class AIAssistantModel: ObservableObject {
     /// The Summary tab's three-layer summary. It shares the window and settings with the panel
     /// but owns its own request state, so a failed page one-liner never disturbs a chat answer.
     public let layeredSummary: LayeredSummaryModel
+    /// The local audit trail every request attempt is recorded in. The panel observes it too,
+    /// so a new record or a clear is visible without a refresh.
+    public let audit: AIAuditTrail
     private var service: (any AIChatServicing)?
     private var handle: (any AIChatHandle)?
     private var pollTask: Task<Void, Never>?
@@ -90,10 +93,42 @@ public final class AIAssistantModel: ObservableObject {
     private var streamingChatTurnID: UUID?
     private var retryingChatTurnID: UUID?
 
-    public init(settings: AISettingsStore = .shared) {
+    public init(settings: AISettingsStore = .shared, audit: AIAuditTrail = .shared) {
         self.settings = settings
-        self.layeredSummary = LayeredSummaryModel(settings: settings)
+        self.audit = audit
+        self.layeredSummary = LayeredSummaryModel(settings: settings, audit: audit)
     }
+
+    /// Host the current configuration would contact. The audit never stores a full URL.
+    private var configuredAuditHost: String {
+        if settings.connectionMode == .chatGPT { return "api.openai.com" }
+        return settings.endpointInfo?.host ?? ""
+    }
+
+    private var configuredAuditModel: String {
+        if settings.connectionMode == .chatGPT {
+            return settings.chatGPT.selected?.model ?? ""
+        }
+        return settings.model
+    }
+
+    /// The base URL a preparation refusal is reported against. The ChatGPT plan always uses the
+    /// fixed official endpoint, whatever the (unused) API-key field holds.
+    private var auditBaseURL: String {
+        settings.connectionMode == .chatGPT ? "https://api.openai.com/v1" : settings.baseURL
+    }
+
+    /// Record a refusal that happened before a plan existed. Nothing was sent.
+    private func recordRefusal(_ kind: AIAuditAction, code: AIAuditCode, startedAt: Date) {
+        audit.refuse(
+            kind: kind,
+            host: configuredAuditHost,
+            model: configuredAuditModel,
+            code: code,
+            startedAt: startedAt
+        )
+    }
+
 
     public var isSending: Bool { phase == .streaming }
     public var isPreparing: Bool { phase == .preparing }
@@ -172,13 +207,19 @@ public final class AIAssistantModel: ObservableObject {
         if documentKey != context.documentKey {
             attach(service: service, context: context)
         }
+        let auditStart = Date()
+        let auditKind = AIAuditAction(action)
         guard let service else {
+            recordRefusal(auditKind, code: .notConfigured, startedAt: auditStart)
             phase = .failed
             errorMessage = Self.noEngineMessage
             statusNote = Self.noEngineMessage
             return
         }
         guard settings.canUseAI else {
+            recordRefusal(auditKind,
+                          code: settings.connectionMode == .chatGPT ? .signedOut : .noApiKey,
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = settings.connectionMode == .chatGPT
                 ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
@@ -189,6 +230,11 @@ public final class AIAssistantModel: ObservableObject {
         do {
             providerSettings = try settings.providerSettings()
         } catch {
+            recordRefusal(auditKind,
+                          code: AIAuditCode.classifyPreparationFailure(
+                            error,
+                            baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -229,6 +275,11 @@ public final class AIAssistantModel: ObservableObject {
             statusNote = "Nothing has been sent yet. Review the request below, then press Send."
         } catch {
             guard documentKey == context.documentKey else { return }
+            recordRefusal(auditKind,
+                          code: AIAuditCode.classifyPreparationFailure(
+                            error,
+                            baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -249,13 +300,18 @@ public final class AIAssistantModel: ObservableObject {
             statusNote = "Type a question about the document first; nothing was sent."
             return
         }
+        let auditStart = Date()
         guard let service else {
+            recordRefusal(.documentChat, code: .notConfigured, startedAt: auditStart)
             phase = .failed
             errorMessage = Self.noEngineMessage
             statusNote = Self.noEngineMessage
             return
         }
         guard settings.canUseAI else {
+            recordRefusal(.documentChat,
+                          code: settings.connectionMode == .chatGPT ? .signedOut : .noApiKey,
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = settings.connectionMode == .chatGPT
                 ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
@@ -266,6 +322,11 @@ public final class AIAssistantModel: ObservableObject {
         do {
             providerSettings = try settings.providerSettings()
         } catch {
+            recordRefusal(.documentChat,
+                          code: AIAuditCode.classifyPreparationFailure(
+                            error,
+                            baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -304,6 +365,7 @@ public final class AIAssistantModel: ObservableObject {
             guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
             let message = AIReadableError.message(error)
             if message.contains("Nothing in this document is relevant") {
+                recordRefusal(.documentChat, code: .nothingRelevant, startedAt: auditStart)
                 // Honest local answer: the provider is not called with an empty context.
                 appendChatTurn(AIChatTurn(
                     question: question,
@@ -318,6 +380,11 @@ public final class AIAssistantModel: ObservableObject {
                 errorMessage = nil
                 statusNote = "Nothing relevant was found. No request was sent."
             } else {
+                recordRefusal(.documentChat,
+                              code: AIAuditCode.classifyPreparationFailure(
+                                error,
+                                baseURL: auditBaseURL),
+                              startedAt: auditStart)
                 phase = .failed
                 errorMessage = message
                 statusNote = message
@@ -346,13 +413,18 @@ public final class AIAssistantModel: ObservableObject {
             errorMessage = nil
             return
         }
+        let auditStart = Date()
         guard let service else {
+            recordRefusal(.regionQuestion, code: .notConfigured, startedAt: auditStart)
             phase = .failed
             errorMessage = Self.noEngineMessage
             statusNote = Self.noEngineMessage
             return
         }
         guard settings.canUseAI else {
+            recordRefusal(.regionQuestion,
+                          code: settings.connectionMode == .chatGPT ? .signedOut : .noApiKey,
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = settings.connectionMode == .chatGPT
                 ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
@@ -363,6 +435,11 @@ public final class AIAssistantModel: ObservableObject {
         do {
             providerSettings = try settings.providerSettings()
         } catch {
+            recordRefusal(.regionQuestion,
+                          code: AIAuditCode.classifyPreparationFailure(
+                            error,
+                            baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -405,6 +482,11 @@ public final class AIAssistantModel: ObservableObject {
         } catch {
             guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
             let message = AIReadableError.message(error)
+            recordRefusal(.regionQuestion,
+                          code: AIAuditCode.classifyPreparationFailure(
+                            error,
+                            baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = message
             statusNote = message
@@ -615,7 +697,7 @@ public final class AIAssistantModel: ObservableObject {
     public func sendMerge() {
         guard let mergePlan, let service, phase == .mergePreview else { return }
         let handle: any AIChatHandle
-        do { handle = try startPrepared(mergePlan, service: service) }
+        do { handle = try startPrepared(mergePlan, service: service, kind: .summaryLayer) }
         catch {
             phase = .failed; errorMessage = AIReadableError.message(error); statusNote = errorMessage
             return
@@ -638,18 +720,39 @@ public final class AIAssistantModel: ObservableObject {
         statusNote = "Part summaries kept. No consolidation was sent."
     }
 
-    private func startPrepared(_ plan: AiPlanRecord, service: any AIChatServicing) throws -> any AIChatHandle {
-        guard settings.connectionMode == preparedConnection else {
-            throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
-        }
-        if preparedConnection == .chatGPT {
-            guard let id = preparedAccountID, settings.chatGPT.selectedID == id, settings.chatGPT.isConnected else {
-                throw AISettingsError.invalid("The ChatGPT account changed or signed out. Prepare a new request.")
+    /// The one place both transports start: the API-key path hands the plan to the Rust worker,
+    /// the ChatGPT path hands it to `ChatGPTResponsesHandle`. Every request therefore passes this
+    /// hook exactly once, and the audit handle observes the same terminal events as the panel.
+    private func startPrepared(_ plan: AiPlanRecord, service: any AIChatServicing,
+                               kind: AIAuditAction? = nil) throws -> any AIChatHandle {
+        let attempt = audit.begin(plan: plan, kind: kind ?? AIAuditAction(plan.action))
+        do {
+            let handle: any AIChatHandle
+            if preparedConnection == .chatGPT {
+                guard settings.connectionMode == preparedConnection else {
+                    throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+                }
+                guard let id = preparedAccountID, settings.chatGPT.selectedID == id,
+                      settings.chatGPT.isConnected else {
+                    throw AISettingsError.invalid("The ChatGPT account changed or signed out. Prepare a new request.")
+                }
+                handle = ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
+            } else {
+                guard settings.connectionMode == preparedConnection else {
+                    throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+                }
+                guard let key = try settings.readKey() else {
+                    throw AISettingsError.invalid(Self.noKeyMessage)
+                }
+                handle = try service.start(plan, apiKey: key)
             }
-            return ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
+            return AIAuditedChatHandle(base: handle, attempt: attempt)
+        } catch {
+            // Starting failed before any transport existed: this is a refusal, not a failed
+            // request. `finish` writes zero characters and no pages.
+            attempt.finish(.refused, code: AIAuditCode.classifyStartFailure(error))
+            throw error
         }
-        guard let key = try settings.readKey() else { throw AISettingsError.invalid(Self.noKeyMessage) }
-        return try service.start(plan, apiKey: key)
     }
 
     // MARK: - Polling

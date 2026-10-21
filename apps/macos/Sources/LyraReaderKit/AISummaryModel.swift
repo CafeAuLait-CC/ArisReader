@@ -433,6 +433,9 @@ public final class LayeredSummaryModel: ObservableObject {
     public let bounds: AiSummaryLimitsRecord
 
     public let settings: AISettingsStore
+    /// The shared local audit trail. Each previewed unit is its own outgoing request, so a
+    /// batch writes one record per unit that actually starts.
+    public let audit: AIAuditTrail
     private var service: (any AIChatServicing)?
     private var context: AIReaderContext?
     private var documentURL: URL?
@@ -449,9 +452,34 @@ public final class LayeredSummaryModel: ObservableObject {
     private var epoch = 0
     private var concurrency = 1
 
-    public init(settings: AISettingsStore = .shared) {
+    public init(settings: AISettingsStore = .shared, audit: AIAuditTrail = .shared) {
         self.settings = settings
+        self.audit = audit
         self.bounds = aiSummaryLimits()
+    }
+
+    /// Host the current configuration would contact. The audit stores only the host.
+    private var auditHost: String {
+        if settings.connectionMode == .chatGPT { return "api.openai.com" }
+        return settings.endpointInfo?.host ?? ""
+    }
+
+    private var auditModel: String {
+        if settings.connectionMode == .chatGPT {
+            return settings.chatGPT.selected?.model ?? ""
+        }
+        return settings.model
+    }
+
+    private var auditBaseURL: String {
+        settings.connectionMode == .chatGPT ? "https://api.openai.com/v1" : settings.baseURL
+    }
+
+    /// A lazy-summary refusal never reaches a transport. One zero-count entry records the
+    /// Generate attempt; the batch itself is not several requests until Send starts them.
+    private func recordRefusal(_ code: AIAuditCode, startedAt: Date) {
+        audit.refuse(kind: .summaryLayer, host: auditHost, model: auditModel,
+                     code: code, startedAt: startedAt)
     }
 
     public var isGenerating: Bool { phase == .generating }
@@ -630,19 +658,24 @@ public final class LayeredSummaryModel: ObservableObject {
 
     private func prepare(layer: AISummaryLayer, only ids: Set<String>?) async {
         guard phase != .generating, !isPreparing else { return }
+        let auditStart = Date()
         guard let service, let context, context.documentKey == documentKey else {
+            recordRefusal(.notConfigured, startedAt: auditStart)
             phase = .failed
             errorMessage = AIAssistantModel.noEngineMessage
             statusNote = errorMessage
             return
         }
         guard pageCount > 0 else {
+            recordRefusal(.emptyContext, startedAt: auditStart)
             phase = .failed
             errorMessage = "This document has no pages."
             statusNote = errorMessage
             return
         }
         guard settings.canUseAI else {
+            recordRefusal(settings.connectionMode == .chatGPT ? .signedOut : .noApiKey,
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = settings.connectionMode == .chatGPT
                 ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent."
@@ -653,6 +686,8 @@ public final class LayeredSummaryModel: ObservableObject {
         let provider: AIProviderSettings
         do { provider = try settings.providerSettings() }
         catch {
+            recordRefusal(AIAuditCode.classifyPreparationFailure(error, baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -714,6 +749,7 @@ public final class LayeredSummaryModel: ObservableObject {
                 apply(unit: unit, id: id, layer: layer)
             }
             if batchRequests == 0 {
+                recordRefusal(.emptyContext, startedAt: auditStart)
                 phase = .failed
                 errorMessage = "None of these entries has extractable text, so there is nothing to send."
                 statusNote = errorMessage
@@ -724,6 +760,8 @@ public final class LayeredSummaryModel: ObservableObject {
             if !note.isEmpty { statusNote = (statusNote ?? "") + " " + note }
         } catch {
             guard currentEpoch == epoch else { return }
+            recordRefusal(AIAuditCode.classifyPreparationFailure(error, baseURL: auditBaseURL),
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIReadableError.message(error)
             statusNote = errorMessage
@@ -735,7 +773,10 @@ public final class LayeredSummaryModel: ObservableObject {
     /// never retained by this model.
     public func send() {
         guard phase == .preview, let preview, let layer = previewLayer else { return }
+        let auditStart = Date()
         guard settings.canUseAI else {
+            recordRefusal(settings.connectionMode == .chatGPT ? .signedOut : .noApiKey,
+                          startedAt: auditStart)
             phase = .failed
             errorMessage = AIAssistantModel.noKeyMessage
             statusNote = errorMessage
@@ -1109,22 +1150,36 @@ public final class LayeredSummaryModel: ObservableObject {
         }
     }
 
+    /// Start one previewed unit. Each unit is one outgoing request, so each gets its own audit
+    /// attempt and exactly one record when it starts and ends. A failed start is recorded as a
+    /// refusal, not silently dropped from the batch.
     private func startUnit(_ plan: AiPlanRecord) throws -> any AIChatHandle {
-        guard let service else { throw AISettingsError.invalid(AIAssistantModel.noEngineMessage) }
-        if settings.connectionMode == .chatGPT {
-            guard let account = settings.chatGPT.selected, account.connected else {
-                throw AISettingsError.invalid("Connect ChatGPT in Settings > AI first. Nothing was sent.")
+        let attempt = audit.begin(plan: plan, kind: .summaryLayer)
+        do {
+            guard let service else {
+                throw AISettingsError.invalid(AIAssistantModel.noEngineMessage)
             }
-            return ChatGPTResponsesHandle(
-                plan: plan,
-                accounts: settings.chatGPT,
-                accountID: account.id
-            )
+            let handle: any AIChatHandle
+            if settings.connectionMode == .chatGPT {
+                guard let account = settings.chatGPT.selected, account.connected else {
+                    throw AISettingsError.invalid("Connect ChatGPT in Settings > AI first. Nothing was sent.")
+                }
+                handle = ChatGPTResponsesHandle(
+                    plan: plan,
+                    accounts: settings.chatGPT,
+                    accountID: account.id
+                )
+            } else {
+                guard let key = try settings.readKey() else {
+                    throw AISettingsError.invalid(AIAssistantModel.noKeyMessage)
+                }
+                handle = try service.start(plan, apiKey: key)
+            }
+            return AIAuditedChatHandle(base: handle, attempt: attempt)
+        } catch {
+            attempt.finish(.refused, code: AIAuditCode.classifyStartFailure(error))
+            throw error
         }
-        guard let key = try settings.readKey() else {
-            throw AISettingsError.invalid(AIAssistantModel.noKeyMessage)
-        }
-        return try service.start(plan, apiKey: key)
     }
 
     private func startPumping() {
