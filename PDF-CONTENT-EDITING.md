@@ -7,6 +7,11 @@ an edited copy, not a newly valid digital signature.
 
 ## Interaction
 
+Edit PDF opens the same secondary toolbar slot used by annotation tools: Select, Text, Image,
+Link and Redact. Redact's inspector chooses Erase or Blackout. The right inspector contains
+properties for the selected tool/object, with opaque light/dark semantic surfaces and controls
+from the Lyra palette. Switching back to Annotate commits any active text draft first.
+
 - Select: solid paragraph hover, dashed first-click selection, hand drag, second-click text caret.
   Esc cancels the active caret draft. Cmd-Return commits it. Clicking elsewhere or saving commits
   it too. Ordinary typing uses the native text editor's undo; committed changes use document undo.

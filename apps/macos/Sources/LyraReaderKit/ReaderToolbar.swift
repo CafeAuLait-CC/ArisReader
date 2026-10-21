@@ -186,7 +186,7 @@ struct ReaderToolbar: View {
                 tool("Zoom in (⌘+)", "plus") { state.zoomIn() }
             }.disabled(state.pageOverviewVisible)
             separator
-            Button { state.pageOverviewVisible = false; state.annotationToolsVisible.toggle() } label: {
+            Button { state.toggleAnnotationTools() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
                     if !compact { Text("Annotate").font(.system(size: 12, weight: .medium)) }
@@ -348,6 +348,8 @@ struct ReaderSecondaryToolbar: View {
         Group {
             if state.pageOverviewVisible {
                 overviewRow
+            } else if state.contentEditEnabled {
+                contentEditRow
             } else {
                 annotationRow
             }
@@ -387,6 +389,31 @@ struct ReaderSecondaryToolbar: View {
                 Label("Done", systemImage: "checkmark")
             }.accessibilityLabel("Close page overview")
         }.font(.system(size: 12))
+    }
+
+    private var contentEditRow: some View {
+        HStack(spacing: 8) {
+            contentTool("Select", "cursorarrow", "select")
+            separator
+            contentTool("Text", "textformat", "text")
+            contentTool("Image", "photo", "image")
+            contentTool("Link", "link", "link")
+            Button { state.selectContentTool("blackout") } label: {
+                Label("Redact", systemImage: "rectangle.slash")
+            }
+            .buttonStyle(LyraReaderToolStyle(selected: ["erase", "blackout"].contains(state.contentEditTool)))
+            Spacer(minLength: 0)
+            Button { state.toggleContentEditing() } label: {
+                Label("Done", systemImage: "checkmark")
+            }.accessibilityLabel("Close PDF editing")
+        }
+        .font(.system(size: 12))
+    }
+
+    private func contentTool(_ title: String, _ icon: String, _ tool: String) -> some View {
+        Button { state.selectContentTool(tool) } label: {
+            Label(title, systemImage: icon)
+        }.buttonStyle(LyraReaderToolStyle(selected: state.contentEditTool == tool))
     }
 
     private var annotationRow: some View {
