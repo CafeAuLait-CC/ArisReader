@@ -1625,16 +1625,26 @@ fn document_blocks(pages: &[Option<&PageText>]) -> Vec<Block> {
             continue;
         };
         let text = page_context_text(page_text);
+        // Resolve each block's geometry against one character buffer per page; searching from
+        // the previous match keeps a page with many lines linear rather than quadratic.
+        let raw_chars: Vec<char> = page_text.text.chars().collect();
+        let geometry_matches = raw_chars.len() == page_text.chars.len();
+        let mut geometry_cursor = 0usize;
         for paragraph in text.split('\n') {
             let paragraph = paragraph.trim();
             if paragraph.chars().count() < 20 {
                 continue;
             }
             for chunk in split_block(paragraph) {
+                let rects = if geometry_matches {
+                    block_source_rects(page_text, &raw_chars, &chunk, &mut geometry_cursor)
+                } else {
+                    Vec::new()
+                };
                 blocks.push(Block {
                     page: page as u32,
                     terms: tokenize(&chunk),
-                    rects: block_source_rects(page_text, &chunk),
+                    rects,
                     text: chunk,
                 });
             }
@@ -1988,30 +1998,35 @@ fn snippet(text: &str) -> String {
 /// The block was built from normalised line text, so this is a search rather than an index
 /// mapping. A block whose text cannot be located gets no rectangles and the panel still jumps to
 /// the page, but it never invents a region.
-fn block_source_rects(page: &PageText, block: &str) -> Vec<SourceRect> {
-    if page.chars.is_empty() {
-        return Vec::new();
-    }
-    let haystack: Vec<char> = page.text.chars().collect();
-    if haystack.len() != page.chars.len() {
-        // The boxes and the text disagree; a geometric claim would be wrong.
+fn block_source_rects(
+    page: &PageText,
+    haystack: &[char],
+    block: &str,
+    cursor: &mut usize,
+) -> Vec<SourceRect> {
+    if page.chars.is_empty() || haystack.is_empty() {
         return Vec::new();
     }
     let needle: Vec<char> = block.trim().chars().collect();
     if needle.is_empty() {
         return Vec::new();
     }
-    let found = find_char_run(&haystack, &needle).map(|start| (start, needle.len()));
+    let found = find_char_run_from(haystack, &needle, *cursor)
+        .or_else(|| find_char_run_from(haystack, &needle, 0))
+        .map(|start| (start, needle.len()));
     let (start, length) = match found {
         Some(value) => value,
         None => {
             let prefix: Vec<char> = needle.iter().copied().take(48).collect();
-            let Some(start) = find_char_run(&haystack, &prefix) else {
+            let Some(start) = find_char_run_from(haystack, &prefix, *cursor)
+                .or_else(|| find_char_run_from(haystack, &prefix, 0))
+            else {
                 return Vec::new();
             };
             (start, prefix.len())
         }
     };
+    *cursor = start + length;
     let end = (start + length).min(page.chars.len());
     #[derive(Clone, Copy)]
     struct LineBox {
@@ -2079,12 +2094,15 @@ fn block_source_rects(page: &PageText, block: &str) -> Vec<SourceRect> {
     rects
 }
 
-fn find_char_run(haystack: &[char], needle: &[char]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
+fn find_char_run_from(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() || from >= haystack.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len())
-        .find(|&start| &haystack[start..start + needle.len()] == needle)
+    let last = haystack.len() - needle.len();
+    if from > last {
+        return None;
+    }
+    (from..=last).find(|&start| &haystack[start..start + needle.len()] == needle)
 }
 
 #[cfg(test)]
