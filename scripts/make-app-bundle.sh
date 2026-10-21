@@ -29,18 +29,18 @@ PDFIUM_LIB="$ROOT/vendor/pdfium/lib/libpdfium.dylib"
 mkdir -p "$ROOT/build"
 echo "==> swift build -c $CONFIG"
 BUILD_ARGS=(-c "$CONFIG")
-if ! (cd apps/macos && swift build "${BUILD_ARGS[@]}") >"$ROOT/build/swift-bundle.log" 2>&1; then
+if ! (cd apps/macos && swift build "${BUILD_ARGS[@]}" --product LyraReader) >"$ROOT/build/swift-bundle.log" 2>&1; then
   if grep -q "sandbox_apply" "$ROOT/build/swift-bundle.log"; then
     # A restricted sandbox (CI / agent environments) does not allow SwiftPM's nested sandbox-exec
     BUILD_ARGS+=(--disable-sandbox)
     echo "    (this environment forbids SwiftPM's nested sandbox; retrying with --disable-sandbox)"
-    (cd apps/macos && swift build "${BUILD_ARGS[@]}")
+    (cd apps/macos && swift build "${BUILD_ARGS[@]}" --product LyraReader)
   else
     cat "$ROOT/build/swift-bundle.log" >&2
     exit 1
   fi
 fi
-BIN_DIR="$(cd apps/macos && swift build "${BUILD_ARGS[@]}" --show-bin-path)"
+BIN_DIR="$(cd apps/macos && swift build "${BUILD_ARGS[@]}" --product LyraReader --show-bin-path)"
 BIN="$BIN_DIR/LyraReader"
 [ -x "$BIN" ] || { echo "Executable not found: $BIN" >&2; exit 1; }
 
