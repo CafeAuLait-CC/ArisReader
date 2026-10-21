@@ -55,6 +55,8 @@ private final class RightPanelHarness {
         return host.convert(canvas.bounds, from: canvas)
     }
 
+    var liveCanvas: MetalCanvasView? { findCanvas(in: host) }
+
     private var laneWidth: CGFloat {
         state.document == nil ? 0 : ReaderChrome.scrollIndicatorLaneWidthPt
     }
@@ -63,7 +65,11 @@ private final class RightPanelHarness {
     /// AppKit frames. Zero when it is closed.
     var panelTotalWidth: CGFloat {
         host.layoutSubtreeIfNeeded()
-        return max(0, host.bounds.width - canvasRect.maxX - laneWidth)
+        func marker(_ view: NSView) -> ReaderSidePanelMarkerView? {
+            if let found = view as? ReaderSidePanelMarkerView { return found }
+            return view.subviews.lazy.compactMap { marker($0) }.first
+        }
+        return marker(host)?.bounds.width ?? 0
     }
 
     var panelContentWidth: CGFloat {
@@ -376,10 +382,8 @@ extension ReaderChecks {
                 "the AI view's scrolling content is present in the panel")
         if let marker = findAIAssistantPanelMarker(in: harness.host) {
             let markerRect = harness.host.convert(marker.bounds, from: marker)
-            require(markerRect.minX >= harness.canvasRect.maxX
-                        + ReaderChrome.scrollIndicatorLaneWidthPt - 0.5,
-                    "the AI view is laid out inside the panel, right of the canvas and its "
-                        + "scroll lane (marker x=\(markerRect.minX) pt)")
+            require(markerRect.minX >= harness.canvasRect.maxX - harness.panelTotalWidth - 0.5,
+                    "the AI view is inside the trailing overlay (marker x=\(markerRect.minX) pt)")
         } else {
             require(false, "the AI assistant marker has a measurable frame")
         }
@@ -511,23 +515,17 @@ extension ReaderChecks {
         let expectedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
-            - harness.panelTotalWidth
         require(abs(harness.canvasRect.width - expectedCanvas) < 0.5,
                 "both panels open: canvas width \(harness.canvasRect.width) pt = window "
                     + "\(harness.host.bounds.width) - sidebar \(ReaderChrome.sidebarTotalWidthPt) "
-                    + "- indicator \(ReaderChrome.scrollIndicatorLaneWidthPt) "
-                    + "- panel \(harness.panelTotalWidth) pt")
+                    + "- indicator \(ReaderChrome.scrollIndicatorLaneWidthPt) pt; overlay width \(harness.panelTotalWidth) pt")
         require(abs(state.canvasViewportWidthPt - expectedCanvas) < 0.5,
                 "the canvas viewport equals the same number (\(state.canvasViewportWidthPt) pt)")
         require(harness.canvasRect.minX >= ReaderChrome.sidebarTotalWidthPt - 0.5,
                 "the canvas starts after the left sidebar (x=\(harness.canvasRect.minX) pt)")
-        require(harness.canvasRect.maxX
-                    <= harness.host.bounds.width - harness.panelTotalWidth + 0.5,
-                "the canvas does not extend under the right panel")
-        require(harness.canvasRect.maxX + ReaderChrome.scrollIndicatorLaneWidthPt
-                    <= harness.host.bounds.width - harness.panelTotalWidth + 0.5,
-                "the scroll indicator's lane is between the canvas and the panel, not inside "
-                    + "the panel")
+        require(abs(harness.canvasRect.maxX + ReaderChrome.scrollIndicatorLaneWidthPt
+                    - harness.host.bounds.width) < 0.5,
+                "the canvas extends beneath the overlay and keeps its scroll lane")
         require(abs(harness.panelTotalWidth
                     - ReaderSidePanelMetrics.totalWidth(contentWidth: 320)) < 0.5,
                 "the two panels coexist without either changing the other's width")
@@ -542,7 +540,6 @@ extension ReaderChecks {
         var expectedResizedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
-            - ReaderSidePanelMetrics.totalWidth(contentWidth: 240)
         require(abs(harness.canvasRect.width - expectedResizedCanvas) < 0.5,
                 "the canvas follows the minimum width (\(harness.canvasRect.width) pt)")
         require(abs(state.canvasViewportWidthPt - expectedResizedCanvas) < 0.5,
@@ -557,7 +554,6 @@ extension ReaderChecks {
         expectedResizedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
-            - ReaderSidePanelMetrics.totalWidth(contentWidth: 520)
         require(abs(harness.canvasRect.width - expectedResizedCanvas) < 0.5,
                 "the canvas follows the maximum width (\(harness.canvasRect.width) pt)")
         require(expectedResizedCanvas > 100,
@@ -599,6 +595,8 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(150))
         let reloadsBefore = state.viewportReloadCount
         let rastersBefore = state.pageRasterCacheCount
+        let canvasBeforeSlide = harness.liveCanvas
+        let windowBeforeSlide = harness.window.frame
         state.rightPanelVisible = false
         try await eventually("the panel closes for the cost sample", {
             abs(harness.panelTotalWidth) < 0.5
@@ -617,14 +615,16 @@ extension ReaderChecks {
         }
         state.transitionProgressOverride = ReaderTransitionProgress(panel: 1)
         try await Task.sleep(for: .milliseconds(80))
-        require((slideCanvasWidths.first ?? 0) - (slideCanvasWidths.last ?? 0) > 300,
-                "the cost sample really narrowed the canvas through the slide "
+        require(slideCanvasWidths.allSatisfy { abs($0 - (slideCanvasWidths.first ?? 0)) < 0.5 },
+                "opening the overlay leaves the Metal viewport width unchanged "
                     + "(\(slideCanvasWidths.first ?? 0) -> \(slideCanvasWidths.last ?? 0) pt)")
         require(state.viewportReloadCount == reloadsBefore,
                 "a width-only panel open performs no visible-band rebuild per frame "
                     + "(\(reloadsBefore) before and after 11 laid-out frames)")
         require(state.pageRasterCacheCount == rastersBefore,
                 "a width-only panel open requests no page raster per frame")
+        require(harness.liveCanvas === canvasBeforeSlide && harness.window.frame == windowBeforeSlide,
+                "opening AI preserves the Metal view instance and the window frame")
         state.transitionProgressOverride = nil
         try await Task.sleep(for: .milliseconds(120))
 
@@ -662,13 +662,10 @@ extension ReaderChecks {
             harness.canvasRect
         }
         state.endRightPanelResize()
-        try await eventually("the zoomed-in resize releases its one width-only rebuild", {
-            state.coalescedViewportReloadCount > zoomedReloads
-        })
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(for: .milliseconds(350))
         let coalesced = state.coalescedViewportReloadCount - zoomedReloads
-        require(coalesced == 1,
-                "a zoomed-in resize settles with exactly one coalesced rebuild, not one per "
+        require(coalesced == 0,
+                "a zoomed-in overlay resize performs no coalesced rebuild per "
                     + "step (\(coalesced) rebuilds for 15 width updates)")
 
         // A real (not pinned) animated close and open at the same zoom: the state holds the
@@ -676,23 +673,23 @@ extension ReaderChecks {
         // the animation, its tail, and the deferred rebuild.
         let beforeAnimatedClose = state.coalescedViewportReloadCount
         state.rightPanelVisible = false
-        try await eventually("the real animated close releases one width-only rebuild", {
-            state.coalescedViewportReloadCount > beforeAnimatedClose
+        try await eventually("the real animated overlay closes", {
+            harness.panelTotalWidth < 0.5
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedCloseReloads = state.coalescedViewportReloadCount - beforeAnimatedClose
-        require(animatedCloseReloads == 1,
-                "closing the panel with its real animation rebuilds exactly once "
+        require(animatedCloseReloads == 0,
+                "closing the overlay keeps the PDF band unchanged "
                     + "(\(animatedCloseReloads) rebuilds, not one per frame)")
         let beforeAnimatedOpen = state.coalescedViewportReloadCount
         state.rightPanelVisible = true
-        try await eventually("the real animated open releases one width-only rebuild", {
-            state.coalescedViewportReloadCount > beforeAnimatedOpen
+        try await eventually("the real animated overlay opens", {
+            abs(harness.panelContentWidth - state.rightPanelWidthPt) < 0.5
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedOpenReloads = state.coalescedViewportReloadCount - beforeAnimatedOpen
-        require(animatedOpenReloads == 1,
-                "opening the panel with its real animation rebuilds exactly once "
+        require(animatedOpenReloads == 0,
+                "opening the overlay keeps the PDF band unchanged "
                     + "(\(animatedOpenReloads) rebuilds, not one per frame)")
 
         // ── Reduce Motion ──────────────────────────────────────────────────────────────
@@ -746,6 +743,18 @@ extension ReaderChecks {
         })
         require(!state.rightPanelVisible,
                 "the burst leaves the state closed (rightPanelVisible=\(state.rightPanelVisible))")
+
+        state.toggleContentEditing()
+        require(state.contentEditEnabled && !state.rightPanelVisible, "Edit closes the AI overlay")
+        state.contentTextRecovery = "Preserve this draft"
+        state.toggleRightPanel()
+        require(state.contentEditEnabled && !state.rightPanelVisible,
+                "a recovered draft blocks panel switching until it is resolved")
+        state.discardContentTextRecovery()
+        state.toggleRightPanel()
+        require(state.rightPanelVisible && !state.contentEditEnabled, "AI closes the Edit inspector")
+        state.toggleContentEditing()
+        require(!state.rightPanelVisible && state.contentEditEnabled, "opening Edit again closes AI")
 
         print("Right-panel checks passed")
     }

@@ -47,6 +47,7 @@ public final class AIAssistantModel: ObservableObject {
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusNote: String?
     @Published public private(set) var documentKey: String?
+    @Published public var selectedTab: AIAssistantTab = .summary
     /// The question for "Ask selection"; the view binds it.
     @Published public var question = ""
     /// The composer for document chat; the view binds it.

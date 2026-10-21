@@ -90,7 +90,7 @@ public enum ReaderShortcuts {
     public static let toggleAIPanelModifiers: EventModifiers = [.command, .shift]
 }
 
-/// The right-hand panel as a sliding drawer whose width also changes the canvas.
+/// The right-hand panel as a sliding overlay on the reader canvas.
 ///
 /// It is deliberately generic: the AI assistant is its first tenant, but the host knows nothing
 /// about the assistant's model, its settings or its request state. The content is laid out once
@@ -100,8 +100,7 @@ public enum ReaderShortcuts {
 /// * the panel's own content keeps its geometry for the whole transition (no per-frame reflow of
 ///   the action grid, preview or answer);
 /// * the separator travels with the content's leading edge while the panel is partly open;
-/// * the canvas gets the freed width frame by frame, so the page's vertical position never
-///   changes;
+/// * the canvas keeps its width and drawable for the entire transition;
 /// * at zero width the panel is still in the hierarchy (an answer is not lost by closing it), but
 ///   it is clipped out and takes no pointer or accessibility input.
 ///
@@ -165,6 +164,8 @@ public struct ReaderSidePanel<Content: View>: View {
         // Leading alignment is the mirror of the left drawer: as the frame closes, the content
         // stays anchored to the inner edge and slides out past the window's trailing edge.
         .frame(width: totalWidth * progress, alignment: .leading)
+        .background(LyraReaderTheme.panelBg)
+        .background(ReaderSidePanelMarkerHost())
         .clipped()
         .allowsHitTesting(isVisible || progressOverride != nil)
         .accessibilityElement(children: .contain)
@@ -224,4 +225,11 @@ public struct ReaderSidePanel<Content: View>: View {
                 onResizeEnded()
             }
     }
+}
+
+/// Measures the actual drawer, independently of the underlying canvas geometry.
+public final class ReaderSidePanelMarkerView: NSView {}
+private struct ReaderSidePanelMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> ReaderSidePanelMarkerView { ReaderSidePanelMarkerView() }
+    func updateNSView(_ nsView: ReaderSidePanelMarkerView, context: Context) {}
 }

@@ -64,6 +64,7 @@ public struct ReaderWindow: View {
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .overlay(alignment: .trailing) { assistantDrawer }
                     // The scroll indicator is a real lane, not an overlay: the canvas viewport
                     // and the page column end before it, and the right panel starts after it.
                     if state.document != nil {
@@ -75,30 +76,12 @@ public struct ReaderWindow: View {
                         SearchResultSidebar(state: state).frame(width: ReaderChrome.sidebarTotalWidthPt)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
-                    // The AI assistant is a right-hand panel now, not a sidebar tab. The host is
-                    // generic (a sliding drawer); the assistant is only its content, so its
-                    // model, settings and request state keep their public surface.
-                    ReaderSidePanel(
-                        isVisible: state.rightPanelVisible && state.document != nil,
-                        contentWidth: state.rightPanelWidthPt,
-                        progressOverride: state.transitionProgressOverride?.panel,
-                        accessibilityLabel: "AI assistant panel",
-                        onResizeBegan: { state.beginRightPanelResize() },
-                        onResize: { state.resizeRightPanel(to: $0) },
-                        onResizeEnded: {
-                            state.endRightPanelResize()
-                            state.commitRightPanelWidth()
-                        }
-                    ) {
-                        AIAssistantRightPanelContent(state: state, model: aiAssistant)
-                    }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
                 // HStack's layout that must interpolate, so the canvas width moves with the
                 // panel instead of jumping to the final width on the first frame.
                 .animation(sidebarAnimation, value: state.sidebarVisible)
                 .animation(sidebarAnimation, value: state.searchSidebarVisible)
-                .animation(panelAnimation, value: state.rightPanelVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -179,6 +162,23 @@ public struct ReaderWindow: View {
     private var activeDocumentURL: URL? {
         guard state.document != nil, let index = state.activeTabIndex, state.tabs.indices.contains(index) else { return nil }
         return state.tabs[index].url
+    }
+
+    /// Chrome overlays the existing canvas, like the editing inspector. Opening or resizing it
+    /// never resizes the Metal drawable or invalidates the PDF's visible band.
+    private var assistantDrawer: some View {
+        ReaderSidePanel(
+            isVisible: state.rightPanelVisible && state.document != nil,
+            contentWidth: state.rightPanelWidthPt,
+            progressOverride: state.transitionProgressOverride?.panel,
+            accessibilityLabel: "AI assistant panel",
+            onResizeBegan: { state.beginRightPanelResize() },
+            onResize: { state.resizeRightPanel(to: $0) },
+            onResizeEnded: { state.endRightPanelResize(); state.commitRightPanelWidth() }
+        ) {
+            AIAssistantRightPanelContent(state: state, model: aiAssistant)
+        }
+        .animation(panelAnimation, value: state.rightPanelVisible)
     }
 
     // MARK: - Canvas

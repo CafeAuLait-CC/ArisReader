@@ -26,7 +26,8 @@ public struct AIDocumentChatView: View {
             composer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(LyraReaderTheme.panelBg.opacity(0.35))
+        .background(LyraReaderTheme.panelBg)
+        .buttonStyle(ReaderPanelButtonStyle())
         .background(AIDocumentChatMarkerHost())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
@@ -48,12 +49,12 @@ public struct AIDocumentChatView: View {
                         .help("Clear this document's chat. Nothing is sent and no annotation is created.")
                 }
             }
-            Text(model.chatHistoryLimitDescription + " Switching documents keeps each document's own chat.")
+            Text(model.chatHistoryLimitDescription)
                 .font(.caption2)
                 .foregroundStyle(LyraReaderTheme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 16)
         .padding(.vertical, 8)
     }
 
@@ -123,6 +124,8 @@ public struct AIDocumentChatView: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: "text.bubble").font(.system(size: 26, weight: .light))
+                .foregroundStyle(LyraReaderTheme.accent).padding(.bottom, 8)
             Text("Ask the whole document")
                 .font(.callout.weight(.semibold))
             Text("Answers cite pages as [p.N]. Press Send on the preview to ask; nothing is sent while you type.")
@@ -137,7 +140,8 @@ public struct AIDocumentChatView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6)
+        .padding(14)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: - Turns
@@ -327,7 +331,7 @@ public struct AIDocumentChatView: View {
             }
             HStack(spacing: 8) {
                 Button("Send question") { model.send() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                     .controlSize(.small)
                     .disabled(!model.canSendChatPreview)
                 Button("Discard") { model.discard() }
@@ -356,9 +360,8 @@ public struct AIDocumentChatView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: 5) {
             TextField("Ask about this document…", text: $model.chatQuestion, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .lineLimit(1...4)
+                .textFieldStyle(ReaderPanelFieldStyle())
+                .lineLimit(2...5)
                 .onSubmit(ask)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
@@ -375,14 +378,15 @@ public struct AIDocumentChatView: View {
                 }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(14)
+        .background(LyraReaderTheme.panelBg)
         .background(AIDocumentChatComposerMarkerHost())
     }
 
     private var askButton: some View {
-        Button("Ask") { ask() }
-            .controlSize(.small)
+        Button { ask() } label: { Label("Preview Question", systemImage: "arrow.up") }
+            .buttonStyle(ReaderPanelButtonStyle(prominent: true))
+            .background(AIDocumentChatAskMarkerHost())
             .disabled(!model.canAskDocument)
             .help("Find passages across the document and show the exact request before sending")
     }
@@ -440,6 +444,12 @@ private struct AIDocumentChatComposerMarkerHost: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AIDocumentChatComposerMarkerView, context: Context) {}
+}
+
+public final class AIDocumentChatAskMarkerView: NSView {}
+private struct AIDocumentChatAskMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIDocumentChatAskMarkerView { AIDocumentChatAskMarkerView() }
+    func updateNSView(_ nsView: AIDocumentChatAskMarkerView, context: Context) {}
 }
 
 /// One marker per citation chip, carrying the page number so a check can compare how that chip's
