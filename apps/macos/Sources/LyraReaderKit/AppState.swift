@@ -7580,26 +7580,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         Task { @MainActor [weak self] in
-            await self?.saveAnnotatedCopy(to: destination)
+            await self?.saveAnnotatedCopyInteractively(to: destination)
         }
     }
 
-    /// The clearly-labelled second choice: replace the original. The alert spells out the backup;
-    /// the engine refuses the replacement if that backup cannot be written and verified.
-    public func presentReplaceOriginalConfirmation() {
-        guard canReplaceOriginalWithAnnotations, let url = document?.url else { return }
+    /// Saves an annotated copy, and when the destination already holds annotation records offers
+    /// the two resolutions instead of only refusing: choose another destination, or replace the
+    /// stale records after this explicit confirmation. The direct
+    /// ``saveAnnotatedCopy(to:replaceExistingRecords:)`` call stays a refusal, so a programmatic
+    /// caller cannot delete somebody else's records by accident.
+    private func saveAnnotatedCopyInteractively(to destination: URL) async {
+        guard let conflict = Self.annotationRecordConflict(for: destination) else {
+            await saveAnnotatedCopy(to: destination)
+            return
+        }
         let alert = NSAlert()
-        alert.alertStyle = .critical
+        alert.alertStyle = .warning
         alert.messageText =
-            "Replace “\(url.lastPathComponent)” with the reader's annotations and bookmarks?"
+            "“\(destination.lastPathComponent)” already has annotations that would duplicate this copy"
         alert.informativeText =
-            "This changes the file on disk. A byte-identical backup is written first; "
-            + "if the backup cannot be written, nothing is replaced."
-        alert.addButton(withTitle: "Save and Replace")
+            Self.annotationRecordConflictMessage(conflict, destination: destination)
+        alert.addButton(withTitle: "Choose Another Destination…")
+        alert.addButton(withTitle: "Replace Records")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { @MainActor [weak self] in
-            await self?.replaceOriginalWithSavedAnnotations()
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            presentSaveAnnotatedCopyPanel()
+        case .alertSecondButtonReturn:
+            await saveAnnotatedCopy(to: destination, replaceExistingRecords: true)
+        default:
+            return
         }
     }
 
@@ -7610,8 +7620,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// PDF and no cached copy duplicates them. When an eraser gesture removed the last annotation
     /// there is nothing to append, and the copy is the source file byte for byte. Returns `false`
     /// when nothing was written.
+    ///
+    /// A destination that already has annotation records (its document cache or a legacy
+    /// companion beside it) is refused by default: opening that file would import the stale
+    /// records and duplicate every annotation the copy carries. `replaceExistingRecords` is the
+    /// caller's confirmation that those records may be moved to a backup and the destination
+    /// rewritten; the interactive ``presentSaveAnnotatedCopyPanel()`` asks before passing it.
     @discardableResult
-    public func saveAnnotatedCopy(to destination: URL) async -> Bool {
+    public func saveAnnotatedCopy(
+        to destination: URL,
+        replaceExistingRecords: Bool = false
+    ) async -> Bool {
         if pageEditSession != nil || contentTextEditing { return await savePageEditsCopy(to: destination) }
         guard !annotationSaveInProgress else { return false }
         guard let documentURL = document?.url else {
@@ -7630,13 +7649,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         // Annotation records already associated with the chosen copy would make every saved
         // annotation appear twice when that copy is opened: once from the PDF, once from the
-        // stale records. Refuse rather than silently deleting somebody else's file.
-        let destinationRecords = Self.annotationRecordsURL(for: destination)
-        if FileManager.default.fileExists(atPath: destinationRecords.path) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has LyraReader annotation records. "
-                + "Choose another name so the copy cannot show every annotation twice."
-            return false
+        // stale records. Refuse rather than silently deleting somebody else's file; the
+        // interactive panel offers "choose another destination" and "replace the records".
+        if let conflict = Self.annotationRecordConflict(for: destination) {
+            guard replaceExistingRecords else {
+                lastError = Self.annotationRecordConflictMessage(conflict, destination: destination)
+                return false
+            }
+            do {
+                let backups = try Self.retireAnnotationRecords(conflict, for: destination)
+                FileHandle.standardError.write(Data((
+                    "lyra-reader-annotate: moved the destination's annotation records to "
+                    + backups.map(\.path).joined(separator: ", ") + "\n"
+                ).utf8))
+            } catch {
+                lastError =
+                    "Could not move the annotation records attached to “\(destination.lastPathComponent)” "
+                    + "out of the way; nothing was saved: \(error.localizedDescription)"
+                return false
+            }
         }
 
         annotationSaveInProgress = true
@@ -9771,12 +9802,89 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             updates: [], deletions: [], zoom: zoomFactor) }
     }
 
+    /// The annotation records already attached to a destination.
+    ///
+    /// Checked in one place so every immediate-to-a-new-file command (annotated copy, page-edit
+    /// copy, merge, split) uses exactly the same predicate. A stale legacy companion counts even
+    /// when the destination has no cache yet: the next open imports it and duplicates the marks
+    /// the new file carries.
+    struct AnnotationRecordConflict: Equatable {
+        /// The destination's own cache file, when it exists.
+        let cacheURL: URL?
+        /// Legacy companion files beside the destination, newest naming convention first.
+        let legacyURLs: [URL]
+    }
+
+    /// The records already attached to `document`: its cache entry, a legacy companion beside it,
+    /// or both. Returns `nil` when the destination is clean.
+    static func annotationRecordConflict(for document: URL) -> AnnotationRecordConflict? {
+        let fileManager = FileManager.default
+        let cache = Self.annotationRecordsURL(for: document)
+        let cacheExists = fileManager.fileExists(atPath: cache.path)
+        let legacy = DocumentEditCache.legacyURLs(for: document)
+            .filter { fileManager.fileExists(atPath: $0.path) }
+        guard cacheExists || !legacy.isEmpty else { return nil }
+        return AnnotationRecordConflict(cacheURL: cacheExists ? cache : nil, legacyURLs: legacy)
+    }
+
     /// True when the destination already has annotation records: its cache entry, or either
     /// legacy companion file beside it.
     private static func annotationRecordsExist(for document: URL) -> Bool {
+        annotationRecordConflict(for: document) != nil
+    }
+
+    /// Names which store blocks the write, because the remedies differ: a cache means the
+    /// destination already has annotations, while a legacy companion means an older copy's
+    /// annotations are still sitting beside it and would be imported on the next open.
+    static func annotationRecordConflictMessage(
+        _ conflict: AnnotationRecordConflict,
+        destination: URL
+    ) -> String {
+        let name = destination.lastPathComponent
+        if conflict.cacheURL != nil {
+            let legacyNote = conflict.legacyURLs.isEmpty
+                ? ""
+                : " There is also a legacy companion (“"
+                    + conflict.legacyURLs.map(\.lastPathComponent).joined(separator: "”, “")
+                    + "”) beside it."
+            return "“\(name)” already has LyraReader annotation records in its document cache: "
+                + "the destination already has annotations.\(legacyNote) Choose another destination, "
+                + "or replace those records after confirmation, so the copy cannot show every "
+                + "annotation twice."
+        }
+        let companions = conflict.legacyURLs.map(\.lastPathComponent).joined(separator: "”, “")
+        return "“\(name)” still has a legacy annotation companion (“\(companions)”) beside it: "
+            + "an older copy's annotations are still sitting there. Opening the saved copy would "
+            + "import them and duplicate every annotation the copy carries. Choose another "
+            + "destination, or replace the legacy companion after confirmation."
+    }
+
+    /// Moves the destination's conflicting records to a backup instead of deleting them, so an
+    /// explicitly confirmed replacement cannot silently destroy the only copy of old marks.
+    @discardableResult
+    static func retireAnnotationRecords(
+        _ conflict: AnnotationRecordConflict,
+        for destination: URL
+    ) throws -> [URL] {
         let fileManager = FileManager.default
-        return ([Self.annotationRecordsURL(for: document)] + DocumentEditCache.legacyURLs(for: document))
-            .contains { fileManager.fileExists(atPath: $0.path) }
+        var backups: [URL] = []
+        if let cache = conflict.cacheURL {
+            let directory = cache.deletingLastPathComponent()
+            let backup = directory.deletingLastPathComponent()
+                .appendingPathComponent("replaced-\(UUID().uuidString)-\(directory.lastPathComponent)",
+                                         isDirectory: true)
+            try fileManager.moveItem(at: directory, to: backup)
+            backups.append(backup)
+        }
+        for legacy in conflict.legacyURLs {
+            let directory = DocumentEditCache.directory(for: destination)
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let backup = directory.appendingPathComponent(
+                "replaced-\(UUID().uuidString)-\(legacy.lastPathComponent)")
+            try fileManager.moveItem(at: legacy, to: backup)
+            backups.append(backup)
+        }
+        return backups
     }
 
     public func presentSavePageEditsCopyPanel() {
@@ -9828,33 +9936,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         } catch {
             lastError = "Could not save the PDF copy: \(error.localizedDescription)"
             return false
-        }
-    }
-
-    public func presentReplaceOriginalWithPageEditsConfirmation() {
-        if contentTextEditing {
-            commitContentText?()
-            Task { @MainActor [weak self] in
-                guard let self, let task=contentEditTask, await task.value else{return}
-                contentEditTask=nil
-                presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            return
-        }
-        guard guardWritable() else { return }
-        guard canReplaceOriginalWithPageEdits, let session = pageEditSession else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Replace “\(session.originalURL.lastPathComponent)” with the page-edited version?"
-        alert.informativeText =
-            "This changes the file on disk. A byte-identical backup is written first; if the "
-            + "backup cannot be written and verified, nothing is replaced. The reader's "
-            + "annotations and bookmarks are remapped to the new page order."
-        alert.addButton(withTitle: "Save and Replace")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { @MainActor [weak self] in
-            await self?.replaceOriginalWithPageEdits()
         }
     }
 
