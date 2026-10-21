@@ -95,6 +95,58 @@ public enum CanvasGeometry {
         )
     }
 
+    /// The view-space rectangles a page-local rectangle occupies, one per display segment.
+    ///
+    /// This is the **piecewise** page → view mapping a torn page needs. A region wholly above
+    /// the tear returns one rectangle; one wholly below returns one rectangle shifted by the
+    /// gap; one crossing the tear returns two, each clipped to its segment's page-local range,
+    /// with the gap between them. Callers that need one rectangle (a preview anchor, a highlight
+    /// region) union the result; the marquee draws all of them so a drag across the tear keeps
+    /// reading as one selection.
+    public static func viewRects(
+        pageSegments: [PagePlacement],
+        region: CGRect,
+        scrollYPt: CGFloat,
+        zoom: CGFloat,
+        contentOffsetX: CGFloat
+    ) -> [CGRect] {
+        pageSegments.compactMap { segment in
+            let source = CGRect(
+                x: 0,
+                y: segment.sourceTopPt,
+                width: segment.widthPt,
+                height: segment.sourceHeightPt
+            )
+            let clipped = region.intersection(source)
+            guard !clipped.isNull, clipped.width > 0.01, clipped.height > 0.01 else { return nil }
+            return viewRect(
+                pageTopPt: segment.topPt + (clipped.minY - segment.sourceTopPt),
+                pageLeftPt: segment.leftPt,
+                region: CGRect(x: clipped.minX, y: 0, width: clipped.width, height: clipped.height),
+                scrollYPt: scrollYPt,
+                zoom: zoom,
+                contentOffsetX: contentOffsetX
+            )
+        }
+    }
+
+    /// The union of ``viewRects(pageSegments:region:scrollYPt:zoom:contentOffsetX:)``, or the
+    /// page's ordinary rectangle when the page has one segment.
+    public static func viewRect(
+        pageSegments: [PagePlacement],
+        region: CGRect,
+        scrollYPt: CGFloat,
+        zoom: CGFloat,
+        contentOffsetX: CGFloat
+    ) -> CGRect {
+        let rects = viewRects(pageSegments: pageSegments, region: region, scrollYPt: scrollYPt,
+                              zoom: zoom, contentOffsetX: contentOffsetX)
+        guard var union = rects.first else { return .null }
+        for rect in rects.dropFirst() { union = union.union(rect) }
+        return union
+    }
+
+
     /// A page's full quad in **device pixels**, exactly as the Metal surface receives it.
     ///
     /// `zoom` is `AppState.zoomFactor`, which already contains the display calibration; the only
@@ -129,6 +181,11 @@ public enum CanvasGeometry {
 /// page-sized quad was painted with the highlight's 1x1 tint through the alpha-over pipeline — a
 /// full-page wash of the highlight's colour with the text under it gone (the highlight itself was
 /// composited correctly; the *page* had been handed the highlight's texture).
+///
+/// The one deliberate exception is the two source-clipped pieces of a torn page: they share one
+/// index **and** one `PageImage.generation` on purpose, so the canvas uploads the bitmap once and
+/// draws it twice with complementary source rectangles. That is not the collision above — the
+/// two pieces want the same texture.
 ///
 /// The blocks below cannot overlap for any document this reader can open: page rasters grow
 /// *downwards* from their base, every overlay grows *upwards* inside its own block, and the blocks

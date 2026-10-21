@@ -210,9 +210,11 @@ extension AppState {
         guard regionDocumentKey == key, (document?.pageCount ?? 0) > page else { return }
 
         let extracted: (text: String, truncated: Bool)
+        var textPage: TextPage?
         do {
-            let textPage = try await engine.textPage(page)
-            extracted = AIRegionText.extract(from: textPage, in: rect)
+            let page = try await engine.textPage(page)
+            textPage = page
+            extracted = AIRegionText.extract(from: page, in: rect)
         } catch {
             // A page with no text layer still has a picture. The request builder refuses only
             // if both are empty or the model is text-only.
@@ -239,6 +241,11 @@ extension AppState {
             return
         }
 
+        // The tear must not cut a figure or table. Wait for the caption index if it is still on
+        // its way, then re-check the document in case the wait spanned a tab switch.
+        await awaitFiguresForPlacement()
+        guard regionDocumentKey == key else { return }
+
         let attachment = AIRegionAttachment(
             page: page,
             rect: rect,
@@ -249,13 +256,38 @@ extension AppState {
             captureScale: captureScale,
             textTruncated: extracted.truncated
         )
+        // Decide where the tear goes while the text layer is in hand. The card starts at its
+        // estimate height; if the measured card is taller than the space below the selection,
+        // `updateRegionCardHeight` falls back to the page foot explicitly.
         regionRefusalMessage = nil
-        addRegionCard(attachment: attachment)
+        addRegionCard(attachment: attachment, tearPlan: tearPlan(for: attachment, textPage: textPage))
+    }
+
+    /// The placement rule's answer for one attachment, with the card's starting gap.
+    private func tearPlan(for attachment: AIRegionAttachment, textPage: TextPage?) -> PageTearPlan {
+        let size = pageSizePt(forPage: attachment.page)
+        guard size.height > 1 else { return PageTearPlan(anchor: .pageFoot) }
+        let pageBox = CGRect(x: 0, y: 0, width: size.width, height: size.height)
+        let selection = attachment.rect.intersection(pageBox)
+        let clipped = selection.isNull ? attachment.rect : selection
+        let figuresOnPage = figures.filter { $0.page == attachment.page }
+        return PageTearPlacement.plan(
+            pageHeightPt: size.height,
+            selection: clipped,
+            gapPt: AIRegionCard.initialHeightViewPt / max(zoomFactor, 0.01),
+            textPage: textPage,
+            figures: figuresOnPage,
+            selectionHasText: !attachment.text
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
     }
 
     /// Add a card for an attachment that already exists (the capture, or "ask again here").
     @discardableResult
-    private func addRegionCard(attachment: AIRegionAttachment) -> AIRegionCard? {
+    private func addRegionCard(
+        attachment: AIRegionAttachment,
+        tearPlan: PageTearPlan = PageTearPlan(anchor: .pageFoot)
+    ) -> AIRegionCard? {
         guard let key = regionDocumentKey, let context = aiReaderContext else { return nil }
         // One card at a time: starting a new region question closes the previous gap and keeps
         // that conversation in history, exactly like the card's own Done button.
@@ -273,7 +305,9 @@ extension AppState {
         let card = AIRegionCard(
             documentKey: key,
             attachment: attachment,
-            assistant: assistant
+            assistant: assistant,
+            tearSplitPt: tearPlan.splitPt,
+            tearFallbackReason: tearPlan.fallbackReason
         )
         card.updateHeight(card.heightViewPt)
         regionCards.append(card)
@@ -288,10 +322,11 @@ extension AppState {
             }
         refreshRegionLayout(preservingScroll: true)
         scrollToRegionCard(card)
+        let fallback = card.tearFallbackReason.map { " · \($0)" } ?? ""
         if attachment.textTruncated {
-            regionStatusMessage = "Region question opened · page \(attachment.page + 1) · text truncated to \(attachment.text.count) characters."
+            regionStatusMessage = "Region question opened · page \(attachment.page + 1) · text truncated to \(attachment.text.count) characters.\(fallback)"
         } else {
-            regionStatusMessage = "Region question opened · page \(attachment.page + 1) · \(attachment.pixelLabel) · \(attachment.characterCount) characters."
+            regionStatusMessage = "Region question opened · page \(attachment.page + 1) · \(attachment.pixelLabel) · \(attachment.characterCount) characters.\(fallback)"
         }
         statusMessage = regionStatusMessage ?? "Region question opened"
         return card
@@ -305,7 +340,8 @@ extension AppState {
             regionRefusalMessage = "That region belongs to another document; open it first."
             return nil
         }
-        guard let card = addRegionCard(attachment: entry.attachment) else { return nil }
+        let plan = tearPlan(for: entry.attachment, textPage: cachedTextPage(entry.attachment.page))
+        guard let card = addRegionCard(attachment: entry.attachment, tearPlan: plan) else { return nil }
         card.question = entry.question
         return card
     }
@@ -388,13 +424,32 @@ extension AppState {
     public func updateRegionCardHeight(cardID: UUID, viewHeight: CGFloat) {
         guard let card = regionCards.first(where: { $0.id == cardID }) else { return }
         let previousGap = regionGapTotalPt
-        let gapTop = regionGapTop(for: card) ?? 0
+        let previousTop = regionGapTop(for: card) ?? 0
         card.updateHeight(viewHeight)
+
+        // The tear was chosen for the card's estimate. If the measured card does not fit below
+        // the split any more, fall back explicitly to the page foot rather than leave a page cut
+        // into a piece shorter than the card. This never silently drops page content: the whole
+        // page is still drawn, and the card moves into the page-flow gap it used before.
+        if let split = card.tearSplitPt {
+            let size = pageSizePt(forPage: card.attachment.page)
+            let gap = regionGapHeightPt(card)
+            if size.height > 1, size.height - split < gap - 0.01 {
+                card.tearSplitPt = nil
+                card.tearFallbackReason =
+                    "The measured card is taller than the page below the selection, so it moved below the page instead of cutting it."
+                regionStatusMessage = card.tearFallbackReason
+                statusMessage = regionStatusMessage ?? ""
+            }
+        }
+
         let nextGap = regionGapTotalPt
+        let nextTop = regionGapTop(for: card) ?? 0
         let delta = nextGap - previousGap
-        guard abs(delta) > 0.01 else { return }
-        if scrollYPt > gapTop {
-            scrollYPt = max(0, scrollYPt + delta)
+        let anchorMove = nextTop - previousTop
+        guard abs(delta) > 0.01 || abs(anchorMove) > 0.01 else { return }
+        if scrollYPt > min(previousTop, nextTop) {
+            scrollYPt = max(0, scrollYPt + delta + max(0, anchorMove))
         }
         refreshRegionLayout(preservingScroll: false)
     }
@@ -474,7 +529,7 @@ extension AppState {
     /// Height of the gap this card opens, in content points. The card is laid out in view points
     /// (so its typography does not scale with the document), which is why the measured height is
     /// divided by the reader's current zoom.
-    func regionGapHeightPt(_ card: AIRegionCard) -> CGFloat {
+    package func regionGapHeightPt(_ card: AIRegionCard) -> CGFloat {
         max(44, card.heightViewPt) / max(zoomFactor, 0.01)
     }
 
@@ -526,6 +581,12 @@ extension AppState {
 
     func regionGapTop(for card: AIRegionCard) -> CGFloat? {
         guard document != nil else { return nil }
+        // An inside-page tear: the gap starts at the page point itself, not at the page's foot.
+        // `displayPageTop` already includes every gap from earlier rows; a facing partner in the
+        // same row is independent of this page's tear, so no same-row addition belongs here.
+        if let split = card.tearSplitPt {
+            return displayPageTop(card.attachment.page) + split
+        }
         let row = regionRow(forPage: card.attachment.page)
         var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row)
         for earlier in regionCards {
@@ -574,7 +635,11 @@ extension AppState {
                 widthPt: placement.widthPt,
                 heightPt: placement.heightPt
             )
-            return shifted.topPt < bottom && shifted.topPt + shifted.heightPt > top
+            // A torn page's display extends past its paper height by the gap: scrolled into the
+            // last card-height of its bottom segment, the page is still on screen even though its
+            // paper rect ends above the viewport.
+            let displayHeight = shifted.heightPt + (activePageTears[placement.index]?.gapPt ?? 0)
+            return shifted.topPt < bottom && shifted.topPt + displayHeight > top
                 ? shifted
                 : nil
         }

@@ -259,24 +259,43 @@ extension ReaderChecks {
                 "the card is page-width minus a margin (564 pt), got \(frame.width)")
         require(abs(frame.minX - 168) < 1.5,
                 "the card is centred on the page column, got x=\(frame.minX)")
+        // The card's height is measured asynchronously; wait until the layout has applied the
+        // same measured gap before comparing page offsets. (A single read can catch the page
+        // layout one SwiftUI pass behind the reported height.)
+        var settledGap = gap
+        try await eventually("the torn page's layout settles at the measured gap") {
+            settledGap = card.heightViewPt / state.zoomFactor
+            let page0 = state.canvasPageFrames.first { $0.index == 0 }
+            let page1 = state.canvasPageFrames.first { $0.index == 1 }
+            guard let page0, let page1 else { return false }
+            return abs(page1.topPt
+                        - (page0.topPt + page0.heightPt + state.pageGapPt + settledGap)) < 0.5
+        }
+        let page0 = state.canvasPageFrames.first { $0.index == 0 }!
         let page1 = state.canvasPageFrames.first { $0.index == 1 }!
-        require(abs(page1.topPt - (gapTop + state.pageGapPt + gap)) < 0.01,
-                "the page below starts after the full measured gap, leaving no overlap")
-        let cardBottomInContent = gapTop + gap
+        // The card is now inside page 0: the page's bottom segment and then the next page
+        // start after the gap, not at the page row boundary.
+        require(abs(page1.topPt - (page0.topPt + page0.heightPt + state.pageGapPt + settledGap)) < 0.6,
+                "the page below starts after the torn page and the full measured gap, leaving no overlap (page0 \(page0.topPt)/\(page0.heightPt), page1 \(page1.topPt), gap \(settledGap), pageGap \(state.pageGapPt))")
+        let cardBottomInContent = gapTop + settledGap
         require(cardBottomInContent <= page1.topPt,
                 "the card ends before the next page starts; it covers no page content")
+        require(gapTop > page0.topPt && gapTop < page0.topPt + page0.heightPt,
+                "the card's gap is inside the selected page, not at its foot")
         if let directory = ProcessInfo.processInfo.environment["LYRA_REGION_EVIDENCE"] {
             try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
             // Page-coloured bands above and below the gap, so the evidence image shows the card
             // occupying a real break in the page flow rather than floating over a blank window.
             container.layer?.backgroundColor = NSColor(calibratedWhite: 0.90, alpha: 1).cgColor
+            // The top segment runs to the card's top; the bottom segment starts immediately at
+            // the card's bottom (the gap *is* the card, no page gap inside the tear).
             let pageAbove = NSView(frame: NSRect(
                 x: 0, y: container.bounds.height - topInHost,
-                width: container.bounds.width, height: 260))
+                width: container.bounds.width, height: max(1, topInHost)))
             pageAbove.wantsLayer = true
             pageAbove.layer?.backgroundColor = NSColor.white.cgColor
             container.addSubview(pageAbove, positioned: .below, relativeTo: host)
-            let pageBelowTop = container.bounds.height - (topInHost + gap + state.pageGapPt)
+            let pageBelowTop = container.bounds.height - (topInHost + settledGap)
             let pageBelow = NSView(frame: NSRect(
                 x: 0, y: 0, width: container.bounds.width, height: max(1, pageBelowTop)))
             pageBelow.wantsLayer = true
@@ -501,10 +520,11 @@ extension ReaderChecks {
                 "the anchoring check reaches 150%, got \(state.zoomPercent)%")
         require(abs(viewY150 - ((gapTop - state.scrollYPt) * state.zoomFactor)) < 0.01,
                 "at 150% the card is still at its page point")
+        let page0 = state.canvasPageFrames.first { $0.index == 0 }!
         let page1 = state.canvasPageFrames.first { $0.index == 1 }!
         let expectedGap = 260 / state.zoomFactor
-        require(abs(page1.topPt - (gapTop + state.pageGapPt + expectedGap)) < 0.01,
-                "at 150% the page below still starts after the measured gap: \(page1.topPt) vs \(gapTop + state.pageGapPt + expectedGap)")
+        require(abs(page1.topPt - (page0.topPt + page0.heightPt + state.pageGapPt + expectedGap)) < 0.01,
+                "at 150% the page below still starts after the torn page and the measured gap: \(page1.topPt) vs \(page0.topPt + page0.heightPt + state.pageGapPt + expectedGap)")
         state.closeRegionCard(id: card.id, keepHistory: false)
     }
 

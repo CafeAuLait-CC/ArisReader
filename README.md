@@ -34,13 +34,15 @@ separate features with their own documented limits.
 - **Annotate**: text markup, ink, shapes, sticky notes, text boxes, stamps and image signatures — with undo,
   recovery in the application cache and verified saving into the original PDF. Signed originals use Save As.
 - **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, all staged with undo and verified
-  on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing.
+  on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing
+  (a page torn open by a region card still prints as the original page).
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
   figure/table/algorithm previews with transparent crops, metadata recognition with BibTeX export.
 - **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the
   whole file, citation chips that jump to the verified source and flash it briefly, plus region questions - drag a
-  rectangle and the answer opens in a card set into a real gap in the page flow, then becomes a history entry that
-  exports as a Markdown knowledge document - summarise / selection Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
+  rectangle and the answer opens in a card set into a real gap torn inside the page, at the nearest whitespace
+  below the selection (the page's own pixels are clipped into the two pieces, never re-rendered), then becomes a
+  history entry that exports as a Markdown knowledge document - summarise / selection Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
   anything leaves the machine and the key held in the Keychain.
   Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
   edge; switching between them preserves drafts and keeps the PDF canvas and window geometry stable.

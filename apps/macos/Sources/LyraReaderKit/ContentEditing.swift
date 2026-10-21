@@ -96,6 +96,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     let z = state.zoomFactor
     let r = item.bounds.rect
     let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
+    // `viewRect(local:onPage:)` is the piecewise mapping: one rectangle for an ordinary page,
+    // the union of the two pieces for an item that crosses a tear.
+    if let rect = state.viewRect(local: r, onPage: page.page) { return rect }
     return CGRect(
       x: offset + (placement.leftPt + r.minX) * z,
       y: (placement.topPt + r.minY - state.scrollYPt) * z, width: r.width * z, height: r.height * z)
@@ -106,9 +109,12 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     else { return nil }
     let z = state.zoomFactor
     let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
+    let contentY = rect.minY / z + state.scrollYPt
+    let localY = state.pageLocalY(forContentY: contentY, onPage: page.page)
+      ?? (rect.minY / z + state.scrollYPt - placement.topPt)
     return CGRect(
       x: (rect.minX - offset) / z - placement.leftPt,
-      y: rect.minY / z + state.scrollYPt - placement.topPt, width: rect.width / z,
+      y: localY, width: rect.width / z,
       height: rect.height / z)
   }
   private func hit(_ point: CGPoint) -> PDFContentItem? {
@@ -285,14 +291,14 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     if state.contentEditTool == "link",
       let rect = preview
         ?? state.contentLinkDraft.flatMap({ local in
-          guard
-            let placement = state.canvasPageFrames.first(where: {
-              $0.index == state.contentEditPage?.page
-            })
+          guard let page = state.contentEditPage,
+                let placement = state.canvasPageFrames.first(where: {
+                  $0.index == page.page
+                })
           else { return nil as CGRect? }
           let z = state.zoomFactor
           let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
-          return CGRect(
+          return state.viewRect(local: local, onPage: page.page) ?? CGRect(
             x: offset + (placement.leftPt + local.minX) * z,
             y: (placement.topPt + local.minY - state.scrollYPt) * z, width: local.width * z,
             height: local.height * z)

@@ -485,6 +485,85 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
     appearance: u8,
     stats: *mut LyraReaderFrameStats,
 ) -> i32 {
+    // SAFETY: the caller owns the arrays and stats under this function's documented contract.
+    unsafe {
+        draw_pages(
+            surface_id,
+            texture_ids,
+            rects,
+            std::ptr::null(),
+            blend_modes,
+            count,
+            red,
+            green,
+            blue,
+            appearance,
+            stats,
+        )
+    }
+}
+
+/// Draws with a display-only paper profile and a normalized source rectangle per quad.
+///
+/// `uvs` is `count * 4` `f32`s of `[u0, v0, u1, v1]` (origin top-left). It is how a torn page
+/// draws its two display segments from one uploaded page texture: the page is rasterized once,
+/// and the GPU samples the part each segment shows. Values outside `0…1` or an empty/inverted
+/// rectangle are a caller bug and are rejected rather than clamped.
+///
+/// # Safety
+/// When `count > 0`, `texture_ids`, `rects`, `uvs` and `blend_modes` must each cover `count`
+/// elements (`rects` and `uvs` four `f32`s each per quad). `stats` must be null or writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance_uv(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    uvs: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    appearance: u8,
+    stats: *mut LyraReaderFrameStats,
+) -> i32 {
+    // SAFETY: the caller owns the arrays and stats under this function's documented contract.
+    unsafe {
+        draw_pages(
+            surface_id,
+            texture_ids,
+            rects,
+            uvs,
+            blend_modes,
+            count,
+            red,
+            green,
+            blue,
+            appearance,
+            stats,
+        )
+    }
+}
+
+/// Shared body of the two appearance draw entry points. `uvs` null means "whole texture".
+///
+/// # Safety
+/// Arrays and `stats` follow the contract documented on the exported functions above.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_pages(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    uvs: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    appearance: u8,
+    stats: *mut LyraReaderFrameStats,
+) -> i32 {
     let appearance = match appearance {
         0 => lyra_reader_gpu::PaperAppearance::Original,
         1 => lyra_reader_gpu::PaperAppearance::Warm,
@@ -501,15 +580,35 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    let mut draws = Vec::with_capacity(count);
+    let mut draws: Vec<lyra_reader_gpu::TexturedQuad> = Vec::with_capacity(count);
     if count > 0 {
-        // SAFETY: the caller guarantees all three arrays cover `count` elements (documented above).
+        // SAFETY: the caller guarantees all arrays cover `count` elements (documented above).
         let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
         let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
+        let sources = if uvs.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(uvs, count * 4) })
+        };
         let modes = unsafe { std::slice::from_raw_parts(blend_modes, count) };
 
         for (index, id) in ids.iter().enumerate() {
             let rect = &coordinates[index * 4..index * 4 + 4];
+            let source = match sources {
+                Some(values) => {
+                    let uv = &values[index * 4..index * 4 + 4];
+                    if uv
+                        .iter()
+                        .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                        || uv[0] >= uv[2]
+                        || uv[1] >= uv[3]
+                    {
+                        return code::ERR_INVALID_ARGUMENT;
+                    }
+                    [uv[0], uv[1], uv[2], uv[3]]
+                }
+                None => [0.0, 0.0, 1.0, 1.0],
+            };
             let blend = match modes[index] {
                 blend::MULTIPLY => QuadBlend::Multiply,
                 // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
@@ -519,6 +618,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
             draws.push((
                 lyra_reader_gpu::TextureId(*id),
                 [rect[0], rect[1], rect[2], rect[3]],
+                source,
                 blend,
             ));
         }
@@ -526,7 +626,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
 
     let mut report = None;
     let result = with_context(|context| {
-        let frame = context.render_pages_with_appearance(
+        let frame = context.render_pages_with_appearance_uv(
             SurfaceId(surface_id),
             &draws,
             // The shell supplies a linear-light semantic surface color.
@@ -544,7 +644,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
         {
             let summary: Vec<String> = draws
                 .iter()
-                .map(|(_, rect, _)| {
+                .map(|(_, rect, _, _)| {
                     format!(
                         "({:.0},{:.0} {:.0}×{:.0})",
                         rect[0], rect[1], rect[2], rect[3]

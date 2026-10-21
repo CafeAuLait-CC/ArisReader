@@ -199,7 +199,7 @@ public struct ReaderWindow: View {
                 contentWidthPt: state.contentWidthPt,
                 paperAppearance: appearance.mode,
                 annotationMarks: state.canvasAnnotationMarks,
-                annotationPageFrames: state.canvasPageFrames,
+                annotationPageFrames: state.canvasPageSegments,
                 redactionMarks: state.pendingRedactionMarks,
                 annotationTool: state.annotationTool,
                 regionSelectionArmed: state.regionSelectionArmed,

@@ -23,7 +23,7 @@ pub mod context;
 pub mod page;
 
 pub use context::{FrameReport, GpuContext, SPIKE_TRIANGLE_RGBA};
-pub use page::{PaperAppearance, QuadBlend, TextureId};
+pub use page::{PaperAppearance, QuadBlend, TextureId, TexturedQuad};
 
 use lyra_reader_core::{DocId, PageIndex, Rect, Size};
 use std::ffi::c_void;

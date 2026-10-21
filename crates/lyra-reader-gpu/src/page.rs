@@ -27,6 +27,14 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TextureId(pub u64);
 
+/// One textured quad: texture, destination `[x, y, w, h]` in physical pixels, normalized source
+/// rectangle `[u0, v0, u1, v1]` (origin top-left), and blend mode.
+///
+/// The source rectangle is a clip into the uploaded bitmap. A display-only page tear draws the
+/// same texture twice with complementary source rectangles, so the page's pixels are not
+/// rasterized again and no CPU copy of the bitmap is made.
+pub type TexturedQuad = (TextureId, [f32; 4], [f32; 4], QuadBlend);
+
 /// Display-only paper conversion. Uploaded document textures and exported PDF colours stay intact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -55,8 +63,13 @@ impl PaperAppearance {
     }
 }
 
-/// Uniform block layout: `dest: vec4<f32>` + `surface: vec2<f32>` + padding.
-const UNIFORM_BYTES: u64 = 32;
+/// Uniform block layout: `dest` + `surface` + paper mode + source UV rectangle.
+///
+/// 48 bytes: four `f32` destination, two `f32` surface size, one `f32` paper mode, one
+/// `f32` padding, and four `f32` source rectangle (`u0, v0, u1, v1`). The source rectangle is
+/// what lets one uploaded page texture serve both pieces of a torn page without a second
+/// rasterisation or a CPU pixel copy.
+const UNIFORM_BYTES: u64 = 48;
 
 /// The shader that draws a textured quad in *pixel* coordinates.
 ///
@@ -71,6 +84,8 @@ struct Uniforms {
     surface: vec2<f32>,
     paper_mode: f32,
     _padding: f32,
+    // Normalized source rectangle: u0, v0, u1, v1. (0,0,1,1) is the whole texture.
+    source: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -103,7 +118,7 @@ fn vs_page(@builtin(vertex_index) index: u32) -> VertexOutput {
         0.0,
         1.0,
     );
-    out.uv = corner;
+    out.uv = mix(uniforms.source.xy, uniforms.source.zw, corner);
     return out;
 }
 
@@ -467,6 +482,36 @@ impl GpuContext {
         clear: [f64; 4],
         appearance: PaperAppearance,
     ) -> Result<FrameReport> {
+        let full: Vec<TexturedQuad> = draws
+            .iter()
+            .map(|(texture, dest, blend)| (*texture, *dest, [0.0, 0.0, 1.0, 1.0], *blend))
+            .collect();
+        self.render_quads_with_appearance(surface_id, &full, clear, appearance)
+    }
+
+    /// Draws quads that may sample only part of their texture.
+    ///
+    /// `source` is a normalized rectangle (`u0, v0, u1, v1`, origin top-left). A torn page uses
+    /// two quads with complementary source rectangles over one uploaded `PageImage`, so its
+    /// pixels are reused instead of rendered from PDFium a second time. The full-texture
+    /// methods above delegate here with `(0, 0, 1, 1)`.
+    pub fn render_pages_with_appearance_uv(
+        &mut self,
+        surface_id: SurfaceId,
+        draws: &[TexturedQuad],
+        clear: [f64; 4],
+        appearance: PaperAppearance,
+    ) -> Result<FrameReport> {
+        self.render_quads_with_appearance(surface_id, draws, clear, appearance)
+    }
+
+    fn render_quads_with_appearance(
+        &mut self,
+        surface_id: SurfaceId,
+        draws: &[TexturedQuad],
+        clear: [f64; 4],
+        appearance: PaperAppearance,
+    ) -> Result<FrameReport> {
         let started = std::time::Instant::now();
 
         let (frame, format, width, height, settings, surface_frame_index) = {
@@ -515,7 +560,7 @@ impl GpuContext {
         };
 
         // One pipeline per blend mode in use, created before the shared borrows below.
-        for (_, _, blend) in draws {
+        for (_, _, _, blend) in draws {
             self.page
                 .ensure_pipeline(&self.device, format, appearance.draw_blend(*blend));
         }
@@ -525,8 +570,8 @@ impl GpuContext {
         // inside a single encoder; the buffers stay alive until after the submit below.
         let mut bind_groups = Vec::with_capacity(draws.len());
         let mut uniform_buffers = Vec::with_capacity(draws.len());
-        for (texture_id, rect, blend) in draws {
-            let uniforms: [f32; 8] = [
+        for (texture_id, rect, source, blend) in draws {
+            let uniforms: [f32; 12] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -535,6 +580,10 @@ impl GpuContext {
                 height as f32,
                 appearance.uniform_mode(*blend),
                 0.0,
+                source[0],
+                source[1],
+                source[2],
+                source[3],
             ];
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("lyra-reader-page-uniforms"),
@@ -575,7 +624,7 @@ impl GpuContext {
         // Resolve one pipeline per draw, in draw order.
         let pipelines = draws
             .iter()
-            .map(|(_, _, blend)| {
+            .map(|(_, _, _, blend)| {
                 self.page
                     .pipeline(format, appearance.draw_blend(*blend))
                     .ok_or_else(|| {
@@ -669,6 +718,21 @@ impl GpuContext {
         height: u32,
         appearance: PaperAppearance,
     ) -> Result<Vec<u8>> {
+        let full: Vec<TexturedQuad> = draws
+            .iter()
+            .map(|(texture, dest, blend)| (*texture, *dest, [0.0, 0.0, 1.0, 1.0], *blend))
+            .collect();
+        self.offscreen_probe_layers_with_uv_and_appearance(&full, width, height, appearance)
+    }
+
+    /// Offscreen version of [`Self::render_pages_with_appearance_uv`], for checks.
+    pub fn offscreen_probe_layers_with_uv_and_appearance(
+        &mut self,
+        draws: &[TexturedQuad],
+        width: u32,
+        height: u32,
+        appearance: PaperAppearance,
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -704,8 +768,8 @@ impl GpuContext {
 
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         let mut bind_groups = Vec::with_capacity(draws.len());
-        for (texture_id, rect, blend) in draws {
-            let uniforms: [f32; 8] = [
+        for (texture_id, rect, source, blend) in draws {
+            let uniforms: [f32; 12] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -714,6 +778,10 @@ impl GpuContext {
                 height as f32,
                 appearance.uniform_mode(*blend),
                 0.0,
+                source[0],
+                source[1],
+                source[2],
+                source[3],
             ];
             let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("page-probe-uniforms"),
@@ -751,13 +819,13 @@ impl GpuContext {
             uniform_buffers.push(uniform_buffer);
         }
 
-        for (_, _, blend) in draws {
+        for (_, _, _, blend) in draws {
             self.page
                 .ensure_pipeline(&self.device, format, appearance.draw_blend(*blend));
         }
         let pipelines = draws
             .iter()
-            .map(|(_, _, blend)| {
+            .map(|(_, _, _, blend)| {
                 self.page
                     .pipeline(format, appearance.draw_blend(*blend))
                     .ok_or_else(|| {
@@ -1047,6 +1115,81 @@ mod tests {
 
         context.release_texture(texture).expect("release");
         assert_eq!(context.texture_count(), 0);
+    }
+
+    /// A source rectangle clips the uploaded texture: the two halves of a torn page are two
+    /// quads over **one** texture, not two uploads and not two rasterisations.
+    #[test]
+    fn source_rect_clips_one_texture_without_reuploading() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let (width, height, pixels) = checkerboard();
+        let texture = context
+            .upload_page_texture(width, height, &pixels)
+            .expect("upload");
+
+        // The texture's rows are [red, green] then [blue, white] (BGRA source). Drawing the top
+        // half over the whole 2x2 destination stretches that row pair; the bottom half does the
+        // same for the other pair.
+        let top = context
+            .offscreen_probe_layers_with_uv_and_appearance(
+                &[(
+                    texture,
+                    [0.0, 0.0, 2.0, 2.0],
+                    [0.0, 0.0, 1.0, 0.5],
+                    QuadBlend::Normal,
+                )],
+                2,
+                2,
+                PaperAppearance::Original,
+            )
+            .expect("top segment");
+        let bottom = context
+            .offscreen_probe_layers_with_uv_and_appearance(
+                &[(
+                    texture,
+                    [0.0, 0.0, 2.0, 2.0],
+                    [0.0, 0.5, 1.0, 1.0],
+                    QuadBlend::Normal,
+                )],
+                2,
+                2,
+                PaperAppearance::Original,
+            )
+            .expect("bottom segment");
+
+        let pixel = |image: &[u8], x: usize, y: usize| {
+            let offset = (y * 2 + x) * 4;
+            [image[offset], image[offset + 1], image[offset + 2]]
+        };
+        // Each pair samples a destination row whose centre is inside one source texel, away from
+        // the boundary where the sampler's linear filter legitimately blends two rows.
+        assert_eq!(pixel(&top, 0, 0), [255, 0, 0], "top half starts with red");
+        assert_eq!(
+            pixel(&top, 1, 0),
+            [0, 255, 0],
+            "top half keeps green beside it"
+        );
+        assert_eq!(
+            pixel(&bottom, 0, 1),
+            [0, 0, 255],
+            "bottom half starts with blue"
+        );
+        assert_eq!(
+            pixel(&bottom, 1, 1),
+            [255, 255, 255],
+            "bottom half ends white"
+        );
+        assert_eq!(
+            context.texture_count(),
+            1,
+            "one upload serves both halves of the tear"
+        );
     }
 
     /// A 1×1 straight-alpha tint texture in the colour the annotation carries.

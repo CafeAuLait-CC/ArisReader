@@ -144,6 +144,11 @@ struct ReaderChecks {
             print("Region question checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-inside-page-tear") {
+            try await insidePageTearChecks(root: fastRoot)
+            print("Inside-page tear checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-facing-layout") {
             try await facingLayoutChecks(
                 url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
@@ -671,6 +676,7 @@ struct ReaderChecks {
         try renameCompatibilityChecks(root: root)
         try await aiAssistantChecks(root: root)
         try await regionQuestionChecks(root: root)
+        try await insidePageTearChecks(root: root)
         try await chatGPTChecks(root: root)
         await appearanceChecks()
         try await readingPolishChecks(root: root)

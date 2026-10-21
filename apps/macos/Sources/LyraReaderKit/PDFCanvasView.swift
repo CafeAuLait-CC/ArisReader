@@ -82,6 +82,7 @@ public final class MetalCanvasView: NSView {
         didSet {
             let unchanged = pages.count == oldValue.count && zip(pages, oldValue).allSatisfy {
                 $0.placement == $1.placement && $0.image.generation == $1.image.generation
+                    && $0.source == $1.source && $0.blend == $1.blend
             }
             guard !unchanged else { return }
             syncTextures()
@@ -727,16 +728,44 @@ public final class MetalCanvasView: NSView {
     }
 
     /// The page under a content point and the point in that page's top-left space.
+    ///
+    /// `annotationPageFrames` are display **segments**: an untorn page contributes one, a torn
+    /// page two. The conversion subtracts the segment's top and adds its page-local offset, so a
+    /// click below the tear still names the same page point it would without the card.
     private func pageLocalPoint(atContent point: CGPoint) -> (page: Int, point: CGPoint,
                                                               frame: PagePlacement)? {
         for frame in annotationPageFrames {
             let rect = CGRect(x: frame.leftPt, y: frame.topPt,
                               width: frame.widthPt, height: frame.heightPt)
             guard rect.contains(point) else { continue }
-            return (frame.index, CGPoint(x: point.x - frame.leftPt, y: point.y - frame.topPt),
-                    frame)
+            return (
+                frame.index,
+                CGPoint(
+                    x: point.x - frame.leftPt,
+                    y: point.y - frame.topPt + frame.sourceTopPt
+                ),
+                frame
+            )
         }
         return nil
+    }
+
+    /// The page-local point under `content` on one page, or nil in the card's gap.
+    private func pageLocalPoint(atContent point: CGPoint,
+                                page: Int) -> (point: CGPoint, frame: PagePlacement)? {
+        for frame in annotationPageFrames where frame.index == page {
+            let rect = CGRect(x: frame.leftPt, y: frame.topPt,
+                              width: frame.widthPt, height: frame.heightPt)
+            guard rect.contains(point) else { continue }
+            return (CGPoint(x: point.x - frame.leftPt,
+                            y: point.y - frame.topPt + frame.sourceTopPt), frame)
+        }
+        return nil
+    }
+
+    /// The display segments of one page, in reading order.
+    private func pageSegments(_ page: Int) -> [PagePlacement] {
+        annotationPageFrames.filter { $0.index == page }
     }
 
     public override func mouseDown(with event: NSEvent) {
@@ -997,12 +1026,8 @@ public final class MetalCanvasView: NSView {
 
     private func extendRegionGesture(toContent point: CGPoint) {
         guard regionGestureActive, let page = regionGesturePage,
-              let frame = annotationPageFrames.first(where: { $0.index == page })
+              let local = regionLocalPoint(atContent: point, page: page)
         else { return }
-        let local = CGPoint(
-            x: min(max(point.x - frame.leftPt, 0), frame.widthPt),
-            y: min(max(point.y - frame.topPt, 0), frame.heightPt)
-        )
         regionGestureCurrent = local
         updateRegionMarquee()
     }
@@ -1010,28 +1035,29 @@ public final class MetalCanvasView: NSView {
     private func finishRegionGesture(atContent point: CGPoint) {
         guard regionGestureActive, let page = regionGesturePage,
               let start = regionGestureStart,
-              let frame = annotationPageFrames.first(where: { $0.index == page })
+              let local = regionLocalPoint(atContent: point, page: page)
         else {
             cancelRegionGesture()
             return
         }
-        let local = CGPoint(
-            x: min(max(point.x - frame.leftPt, 0), frame.widthPt),
-            y: min(max(point.y - frame.topPt, 0), frame.heightPt)
-        )
         let rect = CGRect(
             x: min(start.x, local.x),
             y: min(start.y, local.y),
             width: abs(local.x - start.x),
             height: abs(local.y - start.y)
         )
-        let viewRect = CanvasGeometry.viewRect(
-            pageTopPt: frame.topPt, pageLeftPt: frame.leftPt, region: rect,
+        let viewRects = CanvasGeometry.viewRects(
+            pageSegments: pageSegments(page), region: rect,
             scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
         )
+        guard var union = viewRects.first else {
+            cancelRegionGesture()
+            return
+        }
+        for viewRect in viewRects.dropFirst() { union = union.union(viewRect) }
         cancelRegionGesture()
-        guard viewRect.width >= Self.regionMinimumViewPt,
-              viewRect.height >= Self.regionMinimumViewPt
+        guard union.width >= Self.regionMinimumViewPt,
+              union.height >= Self.regionMinimumViewPt
         else {
             onRegionSelectionCancelled?(
                 "The selected area is too small to ask about. Drag a larger rectangle."
@@ -1041,14 +1067,31 @@ public final class MetalCanvasView: NSView {
         onRegionSelection?(page, rect)
     }
 
+    /// A page-local point for the marquee, clamped to the page and to the tear when the pointer
+    /// is in the card's gap. The marquee is a page rectangle, so its two display pieces are
+    /// derived from the same rectangle by `CanvasGeometry.viewRects`.
+    private func regionLocalPoint(atContent point: CGPoint, page: Int) -> CGPoint? {
+        if let hit = pageLocalPoint(atContent: point, page: page) { return hit.point }
+        let segments = pageSegments(page)
+        guard !segments.isEmpty else { return nil }
+        let first = segments[0]
+        let last = segments[segments.count - 1]
+        let x = min(max(point.x - first.leftPt, 0), first.widthPt)
+        if point.y < first.topPt { return CGPoint(x: x, y: first.sourceTopPt) }
+        if point.y > last.topPt + last.heightPt {
+            return CGPoint(x: x, y: last.sourceTopPt + last.sourceHeightPt)
+        }
+        // Inside the gap between the pieces: the page-local answer is the tear itself.
+        return CGPoint(x: x, y: first.sourceTopPt + first.sourceHeightPt)
+    }
+
     /// The marquee's minimum on-screen size. Below this a press is a click, not a rectangle.
     static let regionMinimumViewPt: CGFloat = 6
 
     private func updateRegionMarquee() {
         guard let page = regionGesturePage,
               let start = regionGestureStart,
-              let current = regionGestureCurrent,
-              let frame = annotationPageFrames.first(where: { $0.index == page })
+              let current = regionGestureCurrent
         else {
             regionMarquee?.update(nil)
             return
@@ -1059,12 +1102,14 @@ public final class MetalCanvasView: NSView {
             width: abs(current.x - start.x),
             height: abs(current.y - start.y)
         )
-        let viewRect = CanvasGeometry.viewRect(
-            pageTopPt: frame.topPt, pageLeftPt: frame.leftPt, region: rect,
+        let viewRects = CanvasGeometry.viewRects(
+            pageSegments: pageSegments(page), region: rect,
             scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
         )
-        regionMarqueeRectForTesting = viewRect
-        regionMarquee?.update(viewRect)
+        var union = viewRects.first ?? .null
+        for viewRect in viewRects.dropFirst() { union = union.union(viewRect) }
+        regionMarqueeRectForTesting = viewRects.isEmpty ? nil : union
+        regionMarquee?.update(rects: viewRects)
     }
 
     private func cancelRegionGesture() {
@@ -1369,6 +1414,7 @@ public final class MetalCanvasView: NSView {
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
+        var sources: [Float] = []
         var blends: [UInt8] = []
         var submitted: [String] = []
         for page in pages {
@@ -1395,6 +1441,12 @@ public final class MetalCanvasView: NSView {
             rects.append(Float(y))
             rects.append(Float(width))
             rects.append(Float(height))
+            // A torn page gives two quads the same texture with complementary source
+            // rectangles. The whole-page case is (0, 0, 1, 1).
+            sources.append(Float(page.source.minX))
+            sources.append(Float(page.source.minY))
+            sources.append(Float(page.source.maxX))
+            sources.append(Float(page.source.maxY))
             // A page is painted over the background; a highlight loaded from a PDF is usually
             // stored `/BM /Multiply` and has to multiply into the page under it.
             blends.append(page.blend.rawValue)
@@ -1404,12 +1456,16 @@ public final class MetalCanvasView: NSView {
                 let pixels = page.image.pixelWidth == 1 && page.image.pixelHeight == 1
                     ? " tint=\(Self.hex(page.image.bgra))"
                     : ""
+                let source = page.source == CGRect(x: 0, y: 0, width: 1, height: 1)
+                    ? ""
+                    : " source=(\(page.source.minX),\(page.source.minY))"
+                        + "(\(page.source.width)x\(page.source.height))"
                 submitted.append(
                     "idx=\(page.placement.index) tex=\(texture.id) gen=\(texture.generation) "
                         + "rect=(\(Int(x.rounded())),\(Int(y.rounded())) "
                         + "\(Int(width.rounded()))x\(Int(height.rounded())))px "
                         + "bitmap=\(page.image.pixelWidth)x\(page.image.pixelHeight)"
-                        + "\(pixels) blend=\(page.blend)")
+                        + "\(source)\(pixels) blend=\(page.blend)")
             }
         }
 
@@ -1441,16 +1497,19 @@ public final class MetalCanvasView: NSView {
         var stats = LyraReaderFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
-                blends.withUnsafeBufferPointer { modes in
-                    lyra_reader_surface_draw_pages_with_appearance(
-                        surfaceId,
-                        ids.baseAddress,
-                        rectangles.baseAddress,
-                        modes.baseAddress,
-                        textureIds.count,
-                        clear[0], clear[1], clear[2], paperAppearance.code,
-                        &stats
-                    )
+                sources.withUnsafeBufferPointer { sourceRects in
+                    blends.withUnsafeBufferPointer { modes in
+                        lyra_reader_surface_draw_pages_with_appearance_uv(
+                            surfaceId,
+                            ids.baseAddress,
+                            rectangles.baseAddress,
+                            sourceRects.baseAddress,
+                            modes.baseAddress,
+                            textureIds.count,
+                            clear[0], clear[1], clear[2], paperAppearance.code,
+                            &stats
+                        )
+                    }
                 }
             }
         }
