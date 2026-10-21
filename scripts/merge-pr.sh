@@ -45,6 +45,18 @@ PY
   echo "    $TITLE"
   echo "    mergeable=$MERGEABLE state=$STATE head=${HEAD:0:8}"
 
+  BASE="$(python3 - "$PR" <<'PY2'
+import json, sys
+n = sys.argv[1]
+print(json.load(open(f"/tmp/merge-pr-{n}.json"))["base"]["ref"])
+PY2
+)"
+  echo "    base=$BASE"
+  if [ "$BASE" != "master" ]; then
+    echo "fatal: PR #$PR targets '$BASE', not master - it is stacked on another pull request. Merging it here would land the work on a branch instead of master, and deleting the branch would break the pull request stacked below it. Merge the base pull request first." >&2
+    exit 1
+  fi
+
   if [ "$MERGEABLE" != "True" ] || [ "$STATE" != "clean" ]; then
     echo "fatal: PR #$PR is not cleanly mergeable; nothing merged, no branch deleted." >&2
     exit 1
