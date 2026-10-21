@@ -314,13 +314,13 @@ public final class AppState: ObservableObject {
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false
-    /// The reader's zoom setting. 100% means **actual physical size**, not 72 dpi on a logical
-    /// point: ``zoomFactor`` multiplies it by the current screen's calibration.
-    @Published public var zoomPercent: Int = 100
-    /// The current screen's calibration. It starts uncalibrated (factor 1) until the canvas
-    /// attaches to a window and reports its screen; checks inject a known value instead.
+    /// 100% means actual physical size, scaled by the current screen's calibration.
+    @Published public var zoomPercent: Int = 100 {
+        willSet {if newValue != zoomPercent,contentTextEditing {commitContentText?()}}
+    }
     @Published public private(set) var displayCalibration = DisplayCalibration.uncalibratedDefault
     @Published public var currentPage: Int = 1 {
+        willSet {if newValue != currentPage,contentTextEditing {commitContentText?()}}
         didSet {
             // A selected mark belongs to the page it is on. Turning to another page drops it,
             // so Delete can never remove a mark the reader can no longer see.
@@ -355,6 +355,11 @@ public final class AppState: ObservableObject {
     @Published public var contentEditLoading = false
     @Published public var contentLinkDraft: CGRect?
     @Published public var contentTextEditing = false
+    @Published public var contentTextRecovery: String?
+    @Published public private(set) var contentCommandInFlight = false
+    @Published public var contentCloseRequested = false
+    private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
+    private var pendingContentClose: Int?
     var commitContentText: (() -> Void)?
     private var contentEditTask: Task<Bool,Never>?
     private var contentLoadToken = UUID()
@@ -2971,6 +2976,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func open(url: URL) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.open(url:url)}) {return true}
         // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
         // committed after the new document actually opens, so a refused open leaves the cache and
         // the screen exactly as they were.
@@ -2978,12 +2984,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // A direct open with no tab (the launch hook, a check) has nobody to bring the old
         // document back; its handle must go, or an untabbed open path would leak one per file.
         let orphanURL = previous == nil && activeTabIndex == nil ? document?.url : nil
-        guard loadDocument(url: url, restoringTabScroll: nil) else { return false }
+        let preserveSession = previous != nil && pageEditSession.map { !Self.resolvesToSameFile(url,$0.originalURL) } == true
+        guard loadDocument(url: url, restoringTabScroll: nil,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
         if var previous {
             // The new open may have discarded a page-edit session on the previous document
             // (after the explicit alert). Its revision is gone, so the retained tab must not
             // bring a dead session back.
-            if previous.state.pageEditSession != nil && pageEditSession == nil {
+            if previous.state.pageEditSession != nil && pageEditSession == nil && !preserveSession {
                 previous.state.pageEditSession = nil
                 previous.state.pageEditPendingOperations = []
                 previous.state.pageEditIsApplied = false
@@ -3003,7 +3010,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func loadDocument(url: URL, restoringTabScroll: CGFloat?,
                               preservingPageEditSessionInSnapshot: Bool = false) -> Bool {
         openRequestCount += 1
-        if let session = pageEditSession {
+        if let session = pageEditSession, !preservingPageEditSessionInSnapshot {
             let same = Self.resolvesToSameFile(url, session.originalURL)
             let alert = NSAlert()
             alert.alertStyle = .warning
@@ -3080,6 +3087,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         contentEditSelection = nil
         contentLinkDraft = nil
         contentEditLoading = false
+        contentTextEditing = false
         // Pending writes describe the document being replaced or closed, so they have to land
         // before the state that carries them (sidecar URL, scroll offset) is cleared.
         flushPendingWrites()
@@ -6157,10 +6165,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var undoStack: [UndoableAction] = []
     @Published public private(set) var redoStack: [UndoableAction] = []
 
-    public var canUndo: Bool { contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty }
-    public var canRedo: Bool { contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty }
+    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty) }
+    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty) }
 
     public func undo() {
+        if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.undo();return}
         if contentEditEnabled { undoPageEdit(); return }
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
@@ -6212,6 +6221,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func redo() {
+        if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo();return}
         if contentEditEnabled { redoPageEdit(); return }
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
@@ -8724,7 +8734,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the page commands can run at all.
     public var canPageEdit: Bool {
-        document != nil && !annotationSaveInProgress && !pageEditBusy
+        document != nil && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
     }
 
     /// Page operations that write a new file (extract, merge, split).
@@ -9452,6 +9462,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func savePageEditsCopy(to destination: URL) async -> Bool {
+        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
         commitContentText?()
         if let task=contentEditTask {
             let succeeded=await task.value
@@ -9537,6 +9548,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithPageEdits() async -> Bool {
+        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
         commitContentText?()
         if let task=contentEditTask {
             let succeeded=await task.value
@@ -9615,12 +9627,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func undoPageEdit() {
+        if deferContentTransition({[weak self] in self?.undoPageEdit()}) {return}
         Task { @MainActor [weak self] in
             await self?.undoOrRedoPageEdit(redo: false)
         }
     }
 
     public func redoPageEdit() {
+        if deferContentTransition({[weak self] in self?.redoPageEdit()}) {return}
         Task { @MainActor [weak self] in
             await self?.undoOrRedoPageEdit(redo: true)
         }
@@ -11137,6 +11151,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// show the reader what happened.
     @discardableResult
     public func openDocumentInTab(_ url: URL) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.openDocumentInTab(url)}) {return true}
         saveActiveTabPosition()
         guard open(url: url) else { return false }
         let tab = OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
@@ -11172,6 +11187,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// with a placeholder shown until its first raster arrives.
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
+        if deferContentTransition({[weak self] in self?.selectTab(index)}) {return}
         saveActiveTabPosition()
         flushPendingWrites()
         let previousID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
@@ -11219,6 +11235,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+        if deferContentTransition({[weak self] in self?.closeTab(index)}) {return}
+        if index != activeTabIndex, retainedTabs[tabs[index].id]?.state.pageEditSession?.operations.isEmpty == false {selectTab(index)}
+        if index == activeTabIndex, pageEditSession?.operations.isEmpty == false {
+            pendingContentClose=index;contentCloseRequested=true;return
+        }
         saveActiveTabPosition()
         let closing = tabs[index]
         if index != activeTabIndex {
@@ -13591,7 +13612,9 @@ extension AppState {
         let page = currentPage - 1
         do {
             let snapshot = try await engine.contentObjects(page: page)
-            guard token == contentLoadToken, document?.url == url, currentPage - 1 == page else { return }
+            guard token == contentLoadToken, document?.url == url, currentPage - 1 == page else {
+                return
+            }
             contentEditPage = snapshot
             contentEditLoading = false
         } catch {
@@ -13604,24 +13627,48 @@ extension AppState {
     public func transformContent(_ item: PDFContentItem, to rect: CGRect, rotation: Double = 0) {
         guard let page = contentEditPage else { return }
         var command = PDFContentCommand(action: "transform", revision: page.revision)
-        command.target = item.id; command.bounds = PDFContentBox(rect); command.rotation = rotation
+        command.target = item.id
+        command.bounds = PDFContentBox(rect)
+        command.rotation = rotation
+        if item.can_edit_text, abs(rotation) < 0.001,
+            abs(rect.width - item.bounds.width) > 0.1 || abs(rect.height - item.bounds.height) > 0.1
+        {
+            command.action = "replaceText"
+            command.rotation = nil
+            command.text = item.text
+            command.font = "Original"
+            command.size = item.size
+            command.colour = item.colour
+            command.alignment = 0
+        }
         stageContentEdit(command, page: page.page, label: "Move or resize \(item.kind)")
     }
 
-    public func replaceContentText(_ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil, colour: [UInt8]? = nil, alignment: Int = 0) {
+    public func replaceContentText(
+        _ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil,
+        colour: [UInt8]? = nil, alignment: Int = 0
+    ) {
         guard let page = contentEditPage else { return }
         var command = PDFContentCommand(action: "replaceText", revision: page.revision)
-        command.target = item.id; command.bounds = item.bounds; command.text = text
-        command.font = font; command.size = size ?? item.size
-        command.colour = colour ?? item.colour; command.alignment = alignment
+        command.target = item.id
+        command.bounds = item.bounds
+        command.text = text
+        command.font = font
+        command.size = size ?? item.size
+        command.colour = colour ?? item.colour
+        command.alignment = alignment
         stageContentEdit(command, page: page.page, label: "Edit page text")
     }
 
     public func insertContentText(at rect: CGRect) {
         guard let page = contentEditPage else { return }
         var command = PDFContentCommand(action: "insertText", revision: page.revision)
-        command.bounds = PDFContentBox(rect); command.text = "New text"; command.font = "Helvetica"
-        command.size = 12; command.colour = [0,0,0,255]; command.alignment = 0
+        command.bounds = PDFContentBox(rect)
+        command.text = "New text"
+        command.font = "Helvetica"
+        command.size = 12
+        command.colour = [0, 0, 0, 255]
+        command.alignment = 0
         stageContentEdit(command, page: page.page, label: "Insert page text")
     }
 
@@ -13632,100 +13679,266 @@ extension AppState {
         stageContentEdit(command, page: page.page, label: "Delete \(item.kind)")
     }
 
-    public func redactContent(in rect:CGRect,blackout:Bool) {
-        guard let page=contentEditPage else{return}
-        var command=PDFContentCommand(action:"redact",revision:page.revision)
-        command.bounds=PDFContentBox(rect);command.blackout=blackout
-        stageContentEdit(command,page:page.page,label:blackout ? "Blackout page content" : "Erase page content")
+    public func redactContent(in rect: CGRect, blackout: Bool) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "redact", revision: page.revision)
+        command.bounds = PDFContentBox(rect)
+        command.blackout = blackout
+        stageContentEdit(
+            command, page: page.page,
+            label: blackout ? "Blackout page content" : "Erase page content")
     }
 
-    public func setContentLink(_ item:PDFContentItem?,page:Int?,uri:String?) {
-        guard let snapshot=contentEditPage,let bounds=item?.bounds.rect ?? contentLinkDraft else{return}
-        if let page,page<0 || page >= (document?.pageCount ?? 0) {lastError="Choose a page inside this document.";return}
-        var command=PDFContentCommand(action:"setLink",revision:snapshot.revision)
-        command.target=item?.id;command.bounds=PDFContentBox(bounds);command.page=page;command.uri=uri
-        contentLinkDraft=nil
-        stageContentEdit(command,page:snapshot.page,label:item == nil ? "Insert link" : "Edit link")
+    public func setContentLink(_ item: PDFContentItem?, page: Int?, uri: String?) {
+        guard let snapshot = contentEditPage, let bounds = item?.bounds.rect ?? contentLinkDraft
+        else { return }
+        if let page, page < 0 || page >= (document?.pageCount ?? 0) {
+            lastError = "Choose a page inside this document."
+            return
+        }
+        var command = PDFContentCommand(action: "setLink", revision: snapshot.revision)
+        command.target = item?.id
+        command.bounds = PDFContentBox(bounds)
+        command.page = page
+        command.uri = uri
+        contentLinkDraft = nil
+        stageContentEdit(
+            command, page: snapshot.page, label: item == nil ? "Insert link" : "Edit link")
     }
 
-    public func chooseContentImage(at rect:CGRect? = nil, replacing item:PDFContentItem? = nil) {
-        guard let page=contentEditPage else{return}
-        let panel=NSOpenPanel();panel.allowedContentTypes=[.image];panel.allowsMultipleSelection=false
-        guard panel.runModal() == .OK,let url=panel.url,let image=NSImage(contentsOf:url),
-              let cg=image.cgImage(forProposedRect:nil,context:nil,hints:nil),
-              let png=NSBitmapImageRep(cgImage:cg).representation(using:.png,properties:[:]) else{return}
-        let path=FileManager.default.temporaryDirectory.appendingPathComponent("LyraContentImage-\(UUID().uuidString).png")
-        do{try png.write(to:path,options:.atomic)}catch{lastError=error.localizedDescription;return}
-        var command=PDFContentCommand(action:item == nil ? "insertImage" : "replaceImage",revision:page.revision)
-        command.target=item?.id;command.image_path=path.path
-        if let rect {command.bounds=PDFContentBox(CGRect(x:rect.minX,y:rect.minY,width:180,height:180*Double(cg.height)/Double(cg.width)))}
-        stageContentEdit(command,page:page.page,label:item == nil ? "Insert image" : "Replace image")
+    public func chooseContentImage(at rect: CGRect? = nil, replacing item: PDFContentItem? = nil) {
+        guard let page = contentEditPage else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url, let image = NSImage(contentsOf: url),
+            let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+            let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
+        else { return }
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "LyraContentImage-\(UUID().uuidString).png")
+        do { try png.write(to: path, options: .atomic) } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        var command = PDFContentCommand(
+            action: item == nil ? "insertImage" : "replaceImage", revision: page.revision)
+        command.target = item?.id
+        command.image_path = path.path
+        if let rect {
+            command.bounds = PDFContentBox(
+                CGRect(
+                    x: rect.minX, y: rect.minY, width: 180,
+                    height: 180 * Double(cg.height) / Double(cg.width)))
+        }
+        stageContentEdit(
+            command, page: page.page, label: item == nil ? "Insert image" : "Replace image")
     }
 
-    public func cropContentImage(_ item:PDFContentItem,to crop:CGRect) {
-        guard let page=contentEditPage else{return}
-        var command=PDFContentCommand(action:"cropImage",revision:page.revision)
-        command.target=item.id;command.crop=PDFContentBox(crop)
-        stageContentEdit(command,page:page.page,label:"Crop image")
+    public func cropContentImage(_ item: PDFContentItem, to crop: CGRect) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "cropImage", revision: page.revision)
+        command.target = item.id
+        command.crop = PDFContentBox(crop)
+        stageContentEdit(command, page: page.page, label: "Crop image")
     }
 
-    public func contentImageData(_ item:PDFContentItem) async throws -> Data {
-        guard let page=contentEditPage else{throw NSError(domain:"LyraReader",code:1)}
-        if item.kind == "image" {return try await engine.contentImagePNG(page:page.page,target:item.id,revision:page.revision)}
-        let r=item.bounds.rect
-        let image=try await engine.rasterizeRegion(page:page.page,scale:2,xPt:r.minX,yPt:r.minY,widthPt:r.width,heightPt:r.height,transparentBackground:false)
-        guard let data=image.contentPNGData() else{throw NSError(domain:"LyraReader",code:2)}
+    public func contentImageData(_ item: PDFContentItem) async throws -> Data {
+        guard let page = contentEditPage else { throw NSError(domain: "LyraReader", code: 1) }
+        if item.kind == "image" {
+            return try await engine.contentImagePNG(
+                page: page.page, target: item.id, revision: page.revision)
+        }
+        let r = item.bounds.rect
+        let image = try await engine.rasterizeRegion(
+            page: page.page, scale: 2, xPt: r.minX, yPt: r.minY, widthPt: r.width,
+            heightPt: r.height, transparentBackground: false)
+        guard let data = image.contentPNGData() else {
+            throw NSError(domain: "LyraReader", code: 2)
+        }
         return data
     }
 
-    public func exportContentImage(_ item:PDFContentItem) {
+    public func exportContentImage(_ item: PDFContentItem) {
         Task { @MainActor [weak self] in
-            guard let self else{return}
+            guard let self else { return }
             do {
-                let data=try await contentImageData(item)
-                let panel=NSSavePanel();panel.allowedContentTypes=[.png];panel.nameFieldStringValue="image.png"
-                guard panel.runModal() == .OK,let url=panel.url else{return}
-                try data.write(to:url,options:.atomic)
-                statusMessage="Image exported"
-            }catch{lastError="Image export failed: \(error.localizedDescription)"}
+                let data = try await contentImageData(item)
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.png]
+                panel.nameFieldStringValue = "image.png"
+                guard panel.runModal() == .OK, let url = panel.url else { return }
+                try data.write(to: url, options: .atomic)
+                statusMessage = "Image exported"
+            } catch { lastError = "Image export failed: \(error.localizedDescription)" }
+        }
+    }
+
+    private func preserveContentFailure(
+        _ command: PDFContentCommand, _ message: String, page: Int? = nil, url: URL? = nil
+    ) {
+        if command.action == "replaceText", let text = command.text {
+            contentRecoveryCommand = (
+                command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
+            )
+            contentTextRecovery = text
+            contentEditEnabled = true
+        }
+        lastError = message
+    }
+
+    public func retryContentText(font: String) {
+        guard let pending = contentRecoveryCommand, let text = contentTextRecovery,
+            let snapshot = contentEditPage
+        else { return }
+        var command = pending.command
+        guard snapshot.revision == command.revision, document?.url == pending.url else {
+            lastError = "This draft belongs to an older page. Copy it before discarding the draft."
+            return
+        }
+        command.text = text
+        command.font = font
+        contentTextRecovery = nil
+        stageContentEdit(command, page: pending.page, label: "Edit page text")
+    }
+    public func recoverDetachedContentText(
+        _ item: PDFContentItem, text: String, revision: String, page: Int, url: URL?
+    ) {
+        var command = PDFContentCommand(action: "replaceText", revision: revision)
+        command.target = item.id
+        command.bounds = item.bounds
+        command.text = text
+        command.font = "Original"
+        command.size = item.size
+        command.colour = item.colour
+        command.alignment = 0
+        preserveContentFailure(
+            command,
+            "The page changed before this text draft was committed. Your words are preserved in the Edit sidebar.",
+            page: page, url: url)
+    }
+    public func discardContentTextRecovery() {
+        contentTextRecovery = nil
+        contentRecoveryCommand = nil
+        contentEditTask = nil
+    }
+
+    private func deferContentTransition(_ action: @escaping @MainActor () -> Void) -> Bool {
+        guard contentTextRecovery == nil else {
+            lastError = "Finish or discard the recovered text draft before leaving this document."
+            return true
+        }
+        let hadDraft = contentTextEditing
+        if hadDraft { commitContentText?() }
+        if hadDraft || contentCommandInFlight, let task = contentEditTask {
+            Task { @MainActor in if await task.value { action() } }
+            return true
+        }
+        return false
+    }
+
+    public func cancelContentClose() {
+        contentCloseRequested = false
+        pendingContentClose = nil
+    }
+    public func discardContentAndClose() {
+        guard let index = pendingContentClose else { return }
+        cancelContentClose()
+        discardPageEdits()
+        closeTab(index)
+    }
+    public func saveContentAndClose() {
+        guard let index = pendingContentClose else { return }
+        contentCloseRequested = false
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = "Edited document.pdf"
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            cancelContentClose()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, await savePageEditsCopy(to: destination) else { return }
+            pendingContentClose = nil
+            discardPageEdits()
+            closeTab(index)
         }
     }
 
     private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
+        guard contentTextRecovery == nil else {
+            lastError = "Finish or discard the recovered text draft before another edit."
+            return
+        }
+        guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
+            preserveContentFailure(
+                command, "Wait for the current page change to finish.", page: page)
+            return
+        }
+        contentCommandInFlight = true
+        let source = document?.url
         contentEditTask = Task { @MainActor [weak self] in
             defer {
-                if let path=command.image_path,URL(fileURLWithPath:path).lastPathComponent.hasPrefix("LyraContentImage-") {try? FileManager.default.removeItem(atPath:path)}
+                self?.contentCommandInFlight = false
+                if let path = command.image_path,
+                    URL(fileURLWithPath: path).lastPathComponent.hasPrefix("LyraContentImage-")
+                {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
             }
-            guard let self, !pageEditBusy, !contentEditLoading else { return false }
-            // Sidecar ranges address the PDFium text stream. A content rewrite can reorder it;
-            // refuse until range remapping is available rather than silently moving marks.
-            guard !annotations.contains(where:{$0.page == page}), !bookmarks.contains(where:{$0.page == page}) else {
-                lastError = "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content."
+            guard let self else { return false }
+            guard !annotations.contains(where: { $0.page == page }),
+                !bookmarks.contains(where: { $0.page == page })
+            else {
+                preserveContentFailure(
+                    command,
+                    "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content.",
+                    page: page)
                 return false
             }
             guard await ensurePageEditSession(), var session = pageEditSession,
-                  let snapshot = pageEditSnapshot(label: label) else { return false }
+                let snapshot = pageEditSnapshot(label: label), document?.url == source
+            else {
+                preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+                return false
+            }
             pageEditBusy = true
             defer { pageEditBusy = false }
             let next = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
             do {
-                try await engine.applyContentEdit(page:page,command:command,to:next)
-                try loadPageEditRevision(at:next,title:session.title,sidecarURL:session.sidecarURL,
-                    annotations:annotations,bookmarks:bookmarks,slots:annotationSidecarSlots,
-                    currentPage:currentPage,selection:pageSelection)
+                try await engine.applyContentEdit(page: page, command: command, to: next)
+                guard document?.url == source else {
+                    throw NSError(
+                        domain: "LyraReader", code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "The active document changed during the edit"
+                        ])
+                }
+                try loadPageEditRevision(
+                    at: next, title: session.title, sidecarURL: session.sidecarURL,
+                    annotations: annotations, bookmarks: bookmarks, slots: annotationSidecarSlots,
+                    currentPage: currentPage, selection: pageSelection)
                 session.revisionURL = next
                 session.revisionNumber += 1
                 session.operations.append(label)
-                session.undo.append(snapshot); session.redo.removeAll()
+                session.undo.append(snapshot)
+                session.redo.removeAll()
                 pageEditSession = session
                 pageEditPendingOperations = session.operations
                 pageEditIsApplied = false
+                if command.action == "replaceText" {
+                    contentRecoveryCommand = nil
+                    contentTextRecovery = nil
+                }
                 statusMessage = "\(label) · staged in working copy; Save Edited Copy to publish"
                 await reloadContentObjects()
                 return true
             } catch {
-                lastError = "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)"
-                try? FileManager.default.removeItem(at:next)
+                preserveContentFailure(
+                    command,
+                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                    page: page, url: source)
+                try? FileManager.default.removeItem(at: next)
                 return false
             }
         }

@@ -1730,6 +1730,11 @@ impl LyraReaderDocument {
             | ContentCommand::ReplaceImage { .. }
             | ContentCommand::CropImage { .. } => {}
         }
+        // The shell's positive angle turns clockwise in its Y-down view space. PDF content
+        // matrices use Y-up coordinates, including on pages with an intrinsic /Rotate.
+        if let ContentCommand::Transform { rotation, .. } = &mut command {
+            *rotation = -*rotation;
+        }
         lyra_reader_pdfium::content_edit::edit_content(
             Path::new(&self.path),
             Path::new(&destination),

@@ -10,12 +10,15 @@ use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
 use lyra_reader_core::{
     DocumentBackend, ErrorCode, LyraReaderError, PageIndex, RasterRequest, Rect, Result,
+    Transform2D,
 };
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+mod flat;
+mod layout;
 mod links;
 mod nested;
 
@@ -39,6 +42,10 @@ impl ContentBox {
             .all(|v| v.is_finite())
             && self.width > 0.0
             && self.height > 0.0
+            && self.width <= 1_000_000.0
+            && self.height <= 1_000_000.0
+            && self.x.abs() <= 10_000_000.0
+            && self.y.abs() <= 10_000_000.0
     }
     fn top(self) -> f64 {
         self.y + self.height
@@ -170,6 +177,9 @@ pub fn inspect_content(source: &Path, page_index: u32) -> Result<ContentPage> {
         inspect_open(&doc, page_index, fingerprint(&bytes))?
     };
     links::append(source, page_index, &mut snapshot)?;
+    layout::apply(&bytes, &mut snapshot)?;
+    flat::append(&bytes, &mut snapshot)?;
+    nested::apply_clips(&bytes, &mut snapshot)?;
     Ok(snapshot)
 }
 
@@ -179,18 +189,33 @@ fn inspect_open(doc: &PdfDocument<'_>, index: u32, revision: String) -> Result<C
         .get(index.try_into().map_err(pdf_error)?)
         .map_err(pdf_error)?;
     let text = page.text().map_err(pdf_error)?;
+    // Group and lay out text in the reader's orientation, with an upward Y axis.
+    // The public snapshot and every command still use unrotated PDF user space.
+    let sheet = crate::backend::page_geometry(&page)
+        .page_to_view(1.0)
+        .then(Transform2D::scale(1.0, -1.0));
     let mut items = Vec::new();
     for (index, object) in page.objects().iter().enumerate() {
         collect(
             object,
             vec![index],
             PdfMatrix::IDENTITY,
+            sheet,
             &text,
             &mut items,
             0,
         )?;
     }
+    for item in &mut items {
+        item.bounds = sheet.apply_rect(item.bounds.rect()).into();
+    }
     group_paragraphs(&mut items);
+    let inverse = sheet
+        .inverse()
+        .ok_or_else(|| failure("The page transform is singular."))?;
+    for item in &mut items {
+        item.bounds = inverse.apply_rect(item.bounds.rect()).into();
+    }
     Ok(ContentPage {
         revision,
         page: index,
@@ -238,6 +263,7 @@ fn collect(
     object: PdfPageObject<'_>,
     path: Vec<usize>,
     parent: PdfMatrix,
+    sheet: Transform2D,
     text: &PdfPageText<'_>,
     out: &mut Vec<ContentItem>,
     depth: u8,
@@ -270,23 +296,27 @@ fn collect(
     };
     match &object {
         PdfPageObject::Text(o) => {
-            item.text = text.for_object(o).trim().to_string();
+            item.text = text.for_object(o).trim().replace('\u{2}', "-");
             if item.text.trim().is_empty() || !o.is_visible() {
                 return Ok(());
             }
             item.kind = "text".into();
             item.font = o.font().name();
-            item.size = f64::from(o.scaled_font_size().value);
+            item.size = f64::from(o.unscaled_font_size().value);
             if let Ok(c) = o.fill_color() {
                 item.colour = [c.red(), c.green(), c.blue(), c.alpha()];
             }
             let matrix = o.matrix().map_err(pdf_error)?;
             let combined = matrix.multiply(parent);
-            item.baseline = f64::from(combined.f());
-            item.size *= f64::from((parent.c() * parent.c() + parent.d() * parent.d()).sqrt());
+            let oriented = combined.multiply(pdf_matrix(sheet));
+            item.baseline = f64::from(oriented.f());
+            item.size *=
+                f64::from((oriented.c() * oriented.c() + oriented.d() * oriented.d()).sqrt());
             item.can_edit_text = path.len() == 1
-                && matrix.b().abs() < 0.001
-                && matrix.c().abs() < 0.001
+                && oriented.b().abs() < 0.001
+                && oriented.c().abs() < 0.001
+                && oriented.a() > 0.0
+                && oriented.d() > 0.0
                 && !item.font.contains("Type3");
             if !item.can_edit_text {
                 item.reason =
@@ -305,7 +335,7 @@ fn collect(
             for (index, child) in form.iter().enumerate() {
                 let mut child_path = path.clone();
                 child_path.push(index);
-                collect(child, child_path, parent, text, out, depth + 1)?;
+                collect(child, child_path, parent, sheet, text, out, depth + 1)?;
             }
         }
         _ => {}
@@ -490,11 +520,13 @@ pub fn edit_content(
             destination,
             &[crate::RedactionArea::new(page_index, bounds.rect())],
             fill,
+            &bytes,
         )?;
         return Ok(());
     }
     let built = build_revision(&bytes, page_index, command, item)?;
     let mut parsed = lopdf::Document::load_mem(&built).map_err(pdf_error)?;
+    layout::update(&mut parsed, page_index, command, item)?;
     parsed.prune_objects();
     let mut output = Vec::new();
     parsed.save_to(&mut output).map_err(pdf_error)?;
@@ -513,9 +545,26 @@ pub fn edit_content(
             | ContentCommand::InsertText { text, .. } = command
             {
                 let backend = crate::PdfiumBackend::open(saved, None)?;
-                let actual = backend.raw_text_page(PageIndex(page_index))?.text;
-                let compact =
-                    |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+                let actual: String = backend
+                    .raw_text_page(PageIndex(page_index))?
+                    .chars
+                    .iter()
+                    .filter(|c| {
+                        new.is_some_and(|r| {
+                            c.origin.x >= r.x - 2.0
+                                && c.origin.x <= r.right() + 2.0
+                                && c.origin.y >= r.y - 2.0
+                                && c.origin.y <= r.top() + 2.0
+                        })
+                    })
+                    .filter_map(|c| char::from_u32(c.unicode))
+                    .collect();
+                let compact = |s: &str| {
+                    s.chars()
+                        .filter(|c| !c.is_whitespace())
+                        .map(|c| if c == '\u{2}' { '-' } else { c })
+                        .collect::<String>()
+                };
                 if !compact(&actual).contains(&compact(text)) {
                     return Err(failure(
                         "The original font cannot encode this text. Choose an installed editor font and try again.",
@@ -534,6 +583,15 @@ fn build_revision(
     command: &ContentCommand,
     item: Option<&ContentItem>,
 ) -> Result<Vec<u8>> {
+    if let Some(group) = item.filter(|i| i.id.starts_with("group:")) {
+        let (bytes, item) = flat::materialize(bytes, index, group)?;
+        return build_revision(&bytes, index, command, Some(&item));
+    }
+    if let ContentCommand::CropImage { crop, .. } = command
+        && let Some(item) = item.filter(|i| i.kind == "graphic")
+    {
+        return nested::crop_graphic(bytes, index, item, *crop);
+    }
     if matches!(command, ContentCommand::SetLink { .. }) || item.is_some_and(|i| i.kind == "link") {
         return links::rewrite(bytes, index, command, item);
     }
@@ -584,6 +642,14 @@ fn build_revision(
         .pages()
         .get(index.try_into().map_err(pdf_error)?)
         .map_err(pdf_error)?;
+    let sheet = crate::backend::page_geometry(&page)
+        .page_to_view(1.0)
+        .then(Transform2D::scale(1.0, -1.0));
+    let from_sheet = pdf_matrix(
+        sheet
+            .inverse()
+            .ok_or_else(|| failure("The page transform is singular."))?,
+    );
     page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
     match command {
         ContentCommand::Transform {
@@ -655,11 +721,36 @@ fn build_revision(
             } else {
                 choose_font(&mut doc, font)?
             };
-            let objects = layout_text(&doc, text, *bounds, token, *size, *colour, *alignment)?;
+            if font == "LyraReader Sans SC"
+                && !crate::appearance_font::missing_glyphs(text)?.is_empty()
+            {
+                return Err(failure(
+                    "The editor font does not contain every character. Choose another font or simplify this text.",
+                ));
+            }
+            let objects = layout_text(
+                &doc,
+                text,
+                sheet.apply_rect(bounds.rect()).into(),
+                token,
+                *size,
+                *colour,
+                *alignment,
+            )?;
             if let Some(item) = item {
                 remove_top_level(&mut page, &item.paths)?;
             }
-            for object in objects {
+            for mut object in objects {
+                object
+                    .transform(
+                        from_sheet.a(),
+                        from_sheet.b(),
+                        from_sheet.c(),
+                        from_sheet.d(),
+                        from_sheet.e(),
+                        from_sheet.f(),
+                    )
+                    .map_err(pdf_error)?;
                 page.objects_mut()
                     .add_text_object(object)
                     .map_err(pdf_error)?;
@@ -675,6 +766,7 @@ fn build_revision(
             bounds, image_path, ..
         } => {
             let (width, height, rgba) = decode_png(Path::new(image_path))?;
+            let bounds: ContentBox = sheet.apply_rect(bounds.rect()).into();
             let matrix = PdfMatrix::new(
                 bounds.width as f32,
                 0.0,
@@ -682,7 +774,8 @@ fn build_revision(
                 bounds.height as f32,
                 bounds.x as f32,
                 bounds.y as f32,
-            );
+            )
+            .multiply(from_sheet);
             let image = new_image(&doc, width, height, rgba, matrix)?;
             page.objects_mut()
                 .add_image_object(image)
@@ -780,6 +873,17 @@ fn build_revision(
     doc.save_to_bytes().map_err(pdf_error)
 }
 
+fn pdf_matrix(t: Transform2D) -> PdfMatrix {
+    PdfMatrix::new(
+        t.a as f32,
+        t.b as f32,
+        t.c as f32,
+        t.d as f32,
+        t.tx as f32,
+        t.ty as f32,
+    )
+}
+
 fn decode_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::BufReader::new(
         fs::File::open(path).map_err(pdf_error)?,
@@ -861,6 +965,9 @@ pub fn content_image(source: &Path, index: u32, target: &str, revision: &str) ->
         .find(|i| i.id == target && i.kind == "image")
         .ok_or_else(|| failure("Select a bitmap image to export."))?;
     let bytes = fs::read(source).map_err(pdf_error)?;
+    if fingerprint(&bytes) != snapshot.revision {
+        return Err(failure("The source changed while exporting this image."));
+    }
     let pdfium = pdfium_instance()?;
     let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let doc = pdfium

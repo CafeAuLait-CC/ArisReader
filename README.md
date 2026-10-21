@@ -67,8 +67,16 @@ Known gaps are listed in the project's design notes: bookmarks are stored beside
 its outline; text-markup geometry cannot be moved (it belongs to the text selection); `/Squiggly` and
 annotations of a kind this reader does not model can be deleted but not edited; an image stamp whose
 picture a foreign producer stored in an encoding this reader does not decode (JPEG is decoded, JPX is
-not) can be deleted but not moved or resized; partial stroke erasing, in-place text editing, AI document
+not) can be deleted but not moved or resized; unrestricted complex PDF text reflow, AI document
 chat and region questions, and the Linux and Windows shells remain.
+
+The **Edit PDF** workspace changes existing page content in a reversible working copy. Hover a
+paragraph, click to select and drag it, then click again to edit with a native text caret. It also
+inserts text and pictures, transforms and crops images/isolated vector figures, edits link destinations,
+and removes content with white Erase or Blackout. Simple text retains an editable frame after save;
+complex typography and nested graphic labels remain movable with their original drawing preserved.
+See [PDF content editing](PDF-CONTENT-EDITING.md) for the supported scope, preservation checks and
+reproducible tests.
 
 Stamps are read in both directions. A `/Stamp` this reader writes carries a private `/LyraReaderStamp`
 key so its exact words and style survive a round trip; a `/Stamp` Preview, PDFKit, Acrobat or another

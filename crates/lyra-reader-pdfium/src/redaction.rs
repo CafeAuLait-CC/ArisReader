@@ -102,6 +102,7 @@ pub fn stage_content_redaction(
     destination: &Path,
     areas: &[RedactionArea],
     fill: RedactionFill,
+    expected_source: &[u8],
 ) -> Result<RedactionReport> {
     redact_with_fill(
         source,
@@ -110,7 +111,7 @@ pub fn stage_content_redaction(
         None,
         RedactionMode::Copy,
         fill,
-        true,
+        Some(expected_source),
     )
 }
 
@@ -256,7 +257,7 @@ pub fn redact_pdf(
         password,
         mode,
         RedactionFill::Blackout,
-        false,
+        None,
     )
 }
 
@@ -267,8 +268,9 @@ fn redact_with_fill(
     password: Option<&str>,
     mode: RedactionMode,
     fill: RedactionFill,
-    working: bool,
+    expected_source: Option<&[u8]>,
 ) -> Result<RedactionReport> {
+    let working = expected_source.is_some();
     validate_areas(areas)?;
     if password.is_some() {
         return Err(refusal(
@@ -300,6 +302,12 @@ fn redact_with_fill(
         }
     }
     let source_bytes = read_source(source)?;
+    if expected_source.is_some_and(|expected| expected != source_bytes) {
+        return Err(refusal(
+            "the source changed while preparing this edit",
+            "reload page objects before erasing content",
+        ));
+    }
     reject_encrypted(&source_bytes)?;
     let api = redact_api()?;
     let original = RedactDocument::load(api, source_bytes.clone(), None)?;
@@ -332,6 +340,12 @@ fn redact_with_fill(
     let build =
         |file: &mut fs::File| -> Result<()> { write_redacted(&source_bytes, &analysis, file) };
     let verify = |path: &Path| -> Result<()> {
+        if read_source(source)? != source_bytes {
+            return Err(refusal(
+                "the source changed during redaction",
+                "no edit was published",
+            ));
+        }
         verify_redacted(
             path,
             &grouped,
@@ -505,33 +519,22 @@ fn analyse(
         let fonts = page_fonts(&document, page_id);
         let content = document.get_page_content(page_id);
         let parsed = parse_content(&content, &fonts, &document, page_id, rects);
-        #[cfg(debug_assertions)]
-        if std::env::var_os("LYRA_REDACTION_DEBUG").is_some() {
-            if let Ok(parsed) = &parsed {
-                eprintln!(
-                    "redaction mapping page {page}: supported={}, encoded glyphs={}, PDFium characters={}, shows={}",
-                    parsed.supported,
-                    parsed.total_glyphs,
-                    chars.len(),
-                    parsed.show_ops.len()
-                );
-            }
-        }
         let page_analysis = match parsed {
             Ok(parsed) if parsed.supported => {
-                let mapped = if chars.len() != parsed.total_glyphs {
-                    map_expanded_characters(
-                        &document,
-                        page_id,
-                        &content,
-                        &chars,
-                        parsed.total_glyphs,
-                    )
+                let mapped = map_glyphs_by_object(
+                    &document,
+                    page_id,
+                    &content,
+                    &parsed,
+                    &chars,
+                    rects,
+                    &original.page_object_types(page)?,
+                )?;
+                let (glyph_chars, glyph_removals) = if let Some((mapped, removals)) = &mapped {
+                    (mapped.as_slice(), Some(removals.clone()))
                 } else {
-                    None
+                    (&chars[..], map_glyphs_to_chars(&parsed, &chars, rects)?)
                 };
-                let glyph_chars = mapped.as_deref().unwrap_or(&chars);
-                let glyph_removals = map_glyphs_to_chars(&parsed, glyph_chars, rects)?;
                 if let Some(removals) = glyph_removals {
                     let removed_characters = removals.iter().filter(|removed| **removed).count();
                     let bytes = rewrite_content(&parsed, glyph_chars, &removals, rects, fill)?;
@@ -745,6 +748,8 @@ struct PageChar {
     matrix: [f64; 6],
     /// A synthetic line break PDFium inserts between text objects.
     generated: bool,
+    hyphen: bool,
+    object_index: Option<usize>,
 }
 
 impl PageChar {
@@ -783,83 +788,173 @@ fn outside_text(chars: &[PageChar], rects: &[Rect]) -> Vec<(u32, f64, f64)> {
         .collect()
 }
 
-/// Maps every glyph of the page's text-showing operators onto a PDFium character.
-///
-/// Returns `None` when the counts do not match, which is the signal to rasterise the page: glyphs
-/// that cannot be matched cannot be removed with confidence.
-/// A single encoded ligature may expand into several PDFium characters. Decode the original
-/// font CMaps and prove the entire Unicode sequence and origins before associating them with
-/// one source glyph. The verifier still compares every original Unicode character afterwards.
-fn map_expanded_characters(
+/// Map each text-showing operator to its actual PDFium text object. An unrelated
+/// formula or ligature elsewhere on the page must not shift all subsequent character indices.
+/// Unselected objects keep their original bytes; selected objects require exact glyph origins
+/// and Unicode correspondence. The final verifier still checks every surviving character.
+fn map_glyphs_by_object(
     document: &Document,
     page_id: ObjectId,
     content: &[u8],
+    parsed: &ParsedContent,
     chars: &[PageChar],
-    expected: usize,
-) -> Option<Vec<PageChar>> {
-    let parsed = crate::text_edit::content::parse_page(document, page_id, content);
+    rects: &[Rect],
+    types: &[i32],
+) -> Result<Option<(Vec<PageChar>, Vec<bool>)>> {
     let debug = std::env::var_os("LYRA_REDACTION_DEBUG").is_some();
-    if debug {
-        eprintln!(
-            "decoded glyphs={}, expected={expected}, problem={:?}",
-            parsed.glyphs.len(),
-            parsed.problem
-        );
+    let paints: Vec<(usize, i32)> = parsed
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, op)| {
+            let kind = match op.operator.as_str() {
+                "Tj" | "TJ" | "'" | "\"" => 1,
+                "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => 2,
+                "Do" => 3,
+                "sh" => 4,
+                _ => return None,
+            };
+            Some((index, kind))
+        })
+        .collect();
+    if paints.len() != types.len()
+        || paints
+            .iter()
+            .zip(types)
+            .any(|((_, kind), actual)| *kind != *actual && !(*kind == 3 && *actual == 5))
+    {
+        if debug {
+            eprintln!("paint mismatch raw={} native={}", paints.len(), types.len());
+        }
+        return Ok(None);
     }
-    if parsed.problem.is_some() || parsed.glyphs.len() != expected {
-        return None;
+    let Some(first) = chars.first() else {
+        return Ok(None);
+    };
+    let mut representatives = vec![first.clone(); parsed.total_glyphs];
+    let mut removals = vec![false; parsed.total_glyphs];
+    let decoded = crate::text_edit::content::parse_page(document, page_id, content);
+    if decoded.problem.is_some() {
+        return Ok(None);
     }
-    let mut offset = 0;
-    let mut mapped = Vec::with_capacity(expected);
-    for (index, glyph) in parsed.glyphs.into_iter().enumerate() {
-        let text = match glyph.text {
-            Some(text) => text,
-            None => char::from_u32(chars.get(offset)?.unicode)?.to_string(),
+    for show in &parsed.show_ops {
+        let Some(object) = paints.iter().position(|(op, _)| *op == show.index) else {
+            return Ok(None);
         };
-        let unicode: Vec<u32> = text
-            .chars()
-            .flat_map(|c| match c {
-                '\u{fb00}' => "ff".chars().collect::<Vec<_>>(),
-                '\u{fb01}' => "fi".chars().collect(),
-                '\u{fb02}' => "fl".chars().collect(),
-                '\u{fb03}' => "ffi".chars().collect(),
-                '\u{fb04}' => "ffl".chars().collect(),
-                _ => vec![c],
-            })
-            .map(u32::from)
+        let actual: Vec<&PageChar> = chars
+            .iter()
+            .filter(|c| c.object_index == Some(object))
             .collect();
-        if unicode.is_empty() {
-            return None;
+        if !actual.iter().any(|c| c.intersects_any(rects)) {
+            continue;
         }
-        let slice = chars.get(offset..offset + unicode.len())?;
-        if slice.iter().map(|c| c.unicode).ne(unicode) {
+        let glyphs: Vec<_> = decoded
+            .runs
+            .iter()
+            .filter(|r| {
+                r.operator_index == show.index
+                    && r.flags & crate::text_edit::content::FLAG_IN_FORM == 0
+            })
+            .flat_map(|r| decoded.glyphs[r.start..r.end].iter())
+            .collect();
+        if glyphs.len() != show.glyph_count {
             if debug {
                 eprintln!(
-                    "Unicode mismatch at glyph {index}, character {offset}, code {}",
-                    glyph.code
+                    "show {} glyph count mismatch {} vs {}",
+                    show.index,
+                    glyphs.len(),
+                    show.glyph_count
                 );
             }
-            return None;
+            return Ok(None);
         }
-        if (slice[0].origin_x - glyph.origin[0]).abs() > 0.5
-            || (slice[0].origin_y - glyph.origin[1]).abs() > 0.5
-        {
+        let mut cursor = 0;
+        for (index, glyph) in glyphs.iter().enumerate() {
+            let Some(character) = actual.get(cursor) else {
+                return Ok(None);
+            };
+            let unicode: Vec<u32> = glyph
+                .text
+                .as_deref()
+                .map(|s| s.chars().map(u32::from).collect())
+                .unwrap_or_else(|| vec![character.unicode]);
+            let expanded: Vec<u32> = unicode
+                .iter()
+                .flat_map(|c| match c {
+                    0xfb00 => vec![102, 102],
+                    0xfb01 => vec![102, 105],
+                    0xfb02 => vec![102, 108],
+                    0xfb03 => vec![102, 102, 105],
+                    0xfb04 => vec![102, 102, 108],
+                    _ => vec![*c],
+                })
+                .collect();
+            let matches = |expected: &[u32]| {
+                actual
+                    .get(cursor..cursor + expected.len())
+                    .is_some_and(|slice| {
+                        slice.iter().map(|c| c.unicode).eq(expected.iter().copied())
+                    })
+            };
+            let count = if unicode == [45] && character.hyphen {
+                1
+            } else if !unicode.is_empty() && matches(&unicode) {
+                unicode.len()
+            } else if !expanded.is_empty() && matches(&expanded) {
+                expanded.len()
+            } else {
+                if debug {
+                    eprintln!(
+                        "show {} Unicode mismatch at {index}, character{cursor}",
+                        show.index
+                    );
+                }
+                return Ok(None);
+            };
+            if (character.origin_x - glyph.origin[0]).abs() > 0.5
+                || (character.origin_y - glyph.origin[1]).abs() > 0.5
+            {
+                if debug {
+                    eprintln!(
+                        "show {} origin mismatch at {index}: actual {},{} decoded {},{}",
+                        show.index,
+                        character.origin_x,
+                        character.origin_y,
+                        glyph.origin[0],
+                        glyph.origin[1]
+                    );
+                }
+                return Ok(None);
+            }
+            let slice = &actual[cursor..cursor + count];
+            let mut representative = (*slice[0]).clone();
+            for character in &slice[1..] {
+                representative.rect = representative.rect.union(character.rect)
+            }
+            let slot = show.glyph_start + index;
+            removals[slot] = slice.iter().any(|c| c.intersects_any(rects));
+            representatives[slot] = representative;
+            cursor += count;
+        }
+        if cursor != actual.len() {
             if debug {
                 eprintln!(
-                    "origin mismatch at glyph {index}: PDFium {},{} vs {},{}",
-                    slice[0].origin_x, slice[0].origin_y, glyph.origin[0], glyph.origin[1]
+                    "show {} character count mismatch mapped {cursor} vs {}",
+                    show.index,
+                    actual.len()
                 );
             }
-            return None;
+            return Ok(None);
         }
-        let mut representative = slice[0].clone();
-        for character in &slice[1..] {
-            representative.rect = representative.rect.union(character.rect);
-        }
-        mapped.push(representative);
-        offset += slice.len();
     }
-    (offset == chars.len()).then_some(mapped)
+    // Characters inside an unaddressable nested form are left for the conservative fallback.
+    if chars
+        .iter()
+        .any(|c| c.intersects_any(rects) && c.object_index.is_none())
+    {
+        return Ok(None);
+    }
+    Ok(Some((representatives, removals)))
 }
 
 fn map_glyphs_to_chars(
@@ -1509,7 +1604,7 @@ fn rewrite_show(
                 .and_then(|value| value.as_array().ok())
                 .ok_or_else(|| malformed("a TJ operator had no array"))?;
             let mut parts: Vec<Object> = Vec::new();
-            let mut glyph = glyph_start;
+            let mut glyph = 0;
             for item in array {
                 match item {
                     Object::String(bytes, format) => {
@@ -1517,7 +1612,12 @@ fn rewrite_show(
                         let end = (glyph + count).min(removals.len());
                         let slice = &removals[glyph..end];
                         parts.extend(rewritten_string_parts(
-                            bytes, *format, font, chars, glyph, slice,
+                            bytes,
+                            *format,
+                            font,
+                            chars,
+                            glyph_start + glyph,
+                            slice,
                         ));
                         glyph = end;
                     }
@@ -1699,6 +1799,10 @@ fn write_redacted(source_bytes: &[u8], analysis: &Analysis, file: &mut fs::File)
             )
         })?;
         if page_analysis.rasterize {
+            document
+                .get_dictionary_mut(page_id)
+                .map_err(|e| LyraReaderError::new(ErrorCode::CorruptDocument, e.to_string()))?
+                .remove(b"LyraReaderTextFrames");
             replace_page_with_raster(&mut document, page_id, page_analysis)?;
         } else if let Some(content) = &page_analysis.content {
             let stream = Stream::new(Dictionary::new(), content.clone());
@@ -1711,6 +1815,7 @@ fn write_redacted(source_bytes: &[u8], analysis: &Analysis, file: &mut fs::File)
                         .with_detail(error.to_string())
                 })?;
             page_dictionary.set("Contents", Object::Reference(id));
+            page_dictionary.remove(b"LyraReaderTextFrames");
         }
     }
 
@@ -2043,6 +2148,8 @@ struct RedactApi {
     text_count_chars: unsafe extern "C" fn(FpdfTextPage) -> std::ffi::c_int,
     text_get_unicode: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_uint,
     text_is_generated: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_int,
+    text_is_hyphen: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> std::ffi::c_int,
+    text_get_object: unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int) -> FpdfPageObject,
     text_get_loose_box:
         unsafe extern "C" fn(FpdfTextPage, std::ffi::c_int, *mut FsRectF) -> std::ffi::c_int,
     text_get_origin:
@@ -2118,6 +2225,8 @@ unsafe fn resolve_api(library: Library) -> Option<RedactApi> {
         text_count_chars: unsafe { symbol(&library, b"FPDFText_CountChars\0")? },
         text_get_unicode: unsafe { symbol(&library, b"FPDFText_GetUnicode\0")? },
         text_is_generated: unsafe { symbol(&library, b"FPDFText_IsGenerated\0")? },
+        text_is_hyphen: unsafe { symbol(&library, b"FPDFText_IsHyphen\0")? },
+        text_get_object: unsafe { symbol(&library, b"FPDFText_GetTextObject\0")? },
         text_get_loose_box: unsafe { symbol(&library, b"FPDFText_GetLooseCharBox\0")? },
         text_get_origin: unsafe { symbol(&library, b"FPDFText_GetCharOrigin\0")? },
         text_get_font_size: unsafe { symbol(&library, b"FPDFText_GetFontSize\0")? },
@@ -2214,6 +2323,15 @@ impl RedactDocument {
             )
             .with_detail(format!("page {}", page + 1)));
         }
+        let object_count = unsafe { (self.api.count_objects)(page_handle) }.max(0);
+        let objects: HashMap<usize, usize> = (0..object_count)
+            .map(|i| {
+                (
+                    unsafe { (self.api.get_object)(page_handle, i) } as usize,
+                    i as usize,
+                )
+            })
+            .collect();
         let count = unsafe { (self.api.text_count_chars)(text_page) }.max(0);
         let mut chars = Vec::with_capacity(count as usize);
         for index in 0..count {
@@ -2273,11 +2391,29 @@ impl RedactDocument {
                     f64::from(matrix.f),
                 ],
                 generated,
+                hyphen: unsafe { (self.api.text_is_hyphen)(text_page, index) } == 1,
+                object_index: objects
+                    .get(&(unsafe { (self.api.text_get_object)(text_page, index) } as usize))
+                    .copied(),
             });
         }
         unsafe { (self.api.close_text_page)(text_page) };
         unsafe { (self.api.close_page)(page_handle) };
         Ok(chars)
+    }
+
+    fn page_object_types(&self, page: u32) -> Result<Vec<i32>> {
+        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let handle = unsafe { (self.api.load_page)(self.document, page as i32) };
+        if handle.is_null() {
+            return Err(page_error(page));
+        }
+        let count = unsafe { (self.api.count_objects)(handle) }.max(0);
+        let types = (0..count)
+            .map(|i| unsafe { (self.api.get_object_type)((self.api.get_object)(handle, i)) })
+            .collect();
+        unsafe { (self.api.close_page)(handle) };
+        Ok(types)
     }
 
     fn intersecting_graphics(&self, page: u32, rects: &[Rect]) -> Result<usize> {

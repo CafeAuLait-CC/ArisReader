@@ -507,3 +507,467 @@ fn real_manuscript_erase_rebuilds_the_surviving_left_paragraph() {
         "table caption must remain editable text"
     );
 }
+
+#[test]
+fn rotated_cropped_pages_insert_upright_text_and_keep_the_frame_on_reedit() {
+    use lyra_reader_core::{PageGeometry, Rect, Rotation};
+    for (rotation, value) in [
+        (Rotation::None, 0),
+        (Rotation::Clockwise90, 90),
+        (Rotation::Clockwise180, 180),
+        (Rotation::Clockwise270, 270),
+    ] {
+        let source = fixture(
+            &format!("rotate-{value}"),
+            b"BT /F1 12 Tf 300 500 Td (Neighbour) Tj ET",
+        );
+        let mut document = Document::load(&source).unwrap();
+        let page_id = document.get_pages()[&1];
+        let dictionary = document.get_dictionary_mut(page_id).unwrap();
+        dictionary.set("Rotate", value);
+        dictionary.set(
+            "CropBox",
+            vec![20.into(), 30.into(), 592.into(), 762.into()],
+        );
+        document.save(&source).unwrap();
+        let geometry = PageGeometry::new(
+            Rect::new(0., 0., 612., 792.),
+            Rect::new(20., 30., 572., 732.),
+            rotation,
+            1.,
+        );
+        let frame = Rect::new(40., 40., 180., 50.);
+        let r = geometry.view_to_page(1.).unwrap().apply_rect(frame);
+        let bounds = ContentBox {
+            x: r.origin.x,
+            y: r.origin.y,
+            width: r.size.width,
+            height: r.size.height,
+        };
+        let first = source.with_file_name("inserted.pdf");
+        let _ = std::fs::remove_file(&first);
+        eprintln!("rotation {value}");
+        edit_content(
+            &source,
+            &first,
+            0,
+            &ContentCommand::InsertText {
+                revision: inspect_content(&source, 0).unwrap().revision,
+                text: "Short".into(),
+                bounds,
+                font: "Helvetica".into(),
+                size: 12.,
+                colour: [0, 0, 0, 255],
+                alignment: 0,
+            },
+        )
+        .unwrap();
+        let snapshot = inspect_content(&first, 0).unwrap();
+        let item = snapshot
+            .items
+            .iter()
+            .find(|i| i.text == "Short")
+            .expect("inserted text");
+        assert!(item.can_edit_text, "rotation {value}: {item:?}");
+        assert!(
+            (item.bounds.width - bounds.width).abs() < 0.01,
+            "the text frame must survive reopening"
+        );
+        let second = source.with_file_name("replaced.pdf");
+        let _ = std::fs::remove_file(&second);
+        edit_content(
+            &first,
+            &second,
+            0,
+            &ContentCommand::ReplaceText {
+                revision: snapshot.revision,
+                target: item.id.clone(),
+                text: "A longer replacement\nSecond line".into(),
+                bounds: item.bounds,
+                font: "Original".into(),
+                size: 12.,
+                colour: [0, 0, 0, 255],
+                alignment: 0,
+            },
+        )
+        .unwrap();
+        let replaced = inspect_content(&second, 0).unwrap();
+        let paragraph = replaced
+            .items
+            .iter()
+            .find(|i| i.text.contains("replacement"))
+            .unwrap();
+        assert!(
+            paragraph.text.contains("Second line"),
+            "view-space rows must form one paragraph: {paragraph:?}"
+        );
+        assert!(
+            (geometry
+                .page_to_view(1.)
+                .apply_rect(Rect::new(
+                    paragraph.bounds.x,
+                    paragraph.bounds.y,
+                    paragraph.bounds.width,
+                    paragraph.bounds.height
+                ))
+                .size
+                .width
+                - 180.)
+                .abs()
+                < 0.1
+        );
+    }
+}
+
+#[test]
+fn vector_crop_is_scoped_to_one_form_and_survives_move_and_reopen() {
+    let source = fixture("form-crop", b"q /Fm Do Q q 1 0 0 1 0 -150 cm /Fm Do Q");
+    let mut document = Document::load(&source).unwrap();
+    let page = document.get_pages()[&1];
+    let font = document
+        .add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let form=document.add_object(Stream::new(dictionary!{"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![60.into(),600.into(),300.into(),720.into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F1"=>font}}},b"0 0.4 0 rg 60 600 240 120 re f BT /F1 12 Tf 72 700 Td (Vector label) Tj ET".to_vec()));
+    document.get_dictionary_mut(page).unwrap().set(
+        "Resources",
+        dictionary! {"XObject"=>dictionary!{"Fm"=>form}},
+    );
+    document.save(&source).unwrap();
+    let snapshot = inspect_content(&source, 0).unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|i| i.kind == "graphic" && i.paths == vec![vec![0]])
+        .unwrap();
+    let cropped = source.with_file_name("cropped.pdf");
+    let _ = std::fs::remove_file(&cropped);
+    edit_content(
+        &source,
+        &cropped,
+        0,
+        &ContentCommand::CropImage {
+            revision: snapshot.revision,
+            target: item.id.clone(),
+            crop: ContentBox {
+                x: 0.,
+                y: 0.,
+                width: 0.5,
+                height: 1.,
+            },
+        },
+    )
+    .unwrap();
+    let after = inspect_content(&cropped, 0).unwrap();
+    let visible = after
+        .items
+        .iter()
+        .find(|i| i.kind == "graphic" && i.paths == vec![vec![0]])
+        .unwrap();
+    assert!(
+        (visible.bounds.width - item.bounds.width * 0.5).abs() < 0.1,
+        "{after:?}"
+    );
+    let other = after
+        .items
+        .iter()
+        .find(|i| i.kind == "graphic" && i.paths == vec![vec![1]])
+        .unwrap();
+    assert!(
+        (other.bounds.width - item.bounds.width).abs() < 0.1,
+        "shared form occurrence must remain whole"
+    );
+    let moved = source.with_file_name("moved.pdf");
+    let _ = std::fs::remove_file(&moved);
+    let bounds = ContentBox {
+        x: visible.bounds.x + 10.,
+        ..visible.bounds
+    };
+    edit_content(
+        &cropped,
+        &moved,
+        0,
+        &ContentCommand::Transform {
+            revision: after.revision,
+            target: visible.id.clone(),
+            bounds,
+            rotation: 0.,
+        },
+    )
+    .unwrap();
+    let reopened = inspect_content(&moved, 0).unwrap();
+    let moved = reopened
+        .items
+        .iter()
+        .find(|i| i.kind == "graphic" && i.paths == vec![vec![0]])
+        .unwrap();
+    assert!(
+        (moved.bounds.x - bounds.x).abs() < 0.1 && (moved.bounds.width - bounds.width).abs() < 0.1,
+        "{moved:?}"
+    );
+}
+
+#[test]
+fn real_manuscript_chart_can_be_cropped_without_rasterizing_the_page() {
+    let Ok(samples) = std::env::var("LYRA_READER_PDF_SAMPLES") else {
+        return;
+    };
+    let source = Path::new(&samples).join("manuscript_0925.pdf");
+    let page = (7..10)
+        .map(|n| inspect_content(&source, n).unwrap())
+        .find(|p| {
+            p.items.iter().any(|i| {
+                (i.kind == "graphic" || i.kind == "image")
+                    && i.paths[0].len() == 1
+                    && i.bounds.width > 100.
+                    && i.bounds.height > 80.
+            })
+        })
+        .expect("manuscript chart page");
+    let chart = page
+        .items
+        .iter()
+        .filter(|i| {
+            (i.kind == "graphic" || i.kind == "image")
+                && i.paths[0].len() == 1
+                && i.bounds.width > 100.
+                && i.bounds.height > 80.
+        })
+        .max_by(|a, b| a.bounds.x.total_cmp(&b.bounds.x))
+        .expect("chart on manuscript page 8");
+    let output = std::env::temp_dir().join("lyra-manuscript-chart-cropped.pdf");
+    let _ = std::fs::remove_file(&output);
+    edit_content(
+        &source,
+        &output,
+        page.page,
+        &ContentCommand::CropImage {
+            revision: page.revision,
+            target: chart.id.clone(),
+            crop: ContentBox {
+                x: 0.1,
+                y: 0.1,
+                width: 0.8,
+                height: 0.8,
+            },
+        },
+    )
+    .unwrap();
+    let reopened = inspect_content(&output, page.page).unwrap();
+    let cropped = reopened
+        .items
+        .iter()
+        .find(|i| i.kind == chart.kind && (i.bounds.width - chart.bounds.width * 0.8).abs() < 0.1)
+        .unwrap();
+    assert!(
+        (cropped.bounds.width - chart.bounds.width * 0.8).abs() < 0.1,
+        "{cropped:?}"
+    );
+    assert!(
+        reopened
+            .items
+            .iter()
+            .any(|i| i.text.contains("Robustness to Sparse"))
+    );
+}
+
+#[test]
+fn flat_vector_figure_can_be_selected_cropped_and_moved() {
+    let mut content =
+        b"BT /F1 12 Tf 72 700 Td (Neighbour) Tj ET q 1 0 0 1 50 400 cm 0 0.4 0 rg ".to_vec();
+    for n in 0..8 {
+        content.extend_from_slice(format!("{} 0 10 100 re f ", n * 20).as_bytes());
+    }
+    content.extend_from_slice(b"BT /F1 12 Tf 0 110 Td (Flat vector label) Tj ET Q");
+    let source = fixture("flat-vector", &content);
+    let snapshot = inspect_content(&source, 0).unwrap();
+    let group = snapshot
+        .items
+        .iter()
+        .find(|i| i.id.starts_with("group:"))
+        .expect("isolated flat figure");
+    let output = source.with_file_name("cropped.pdf");
+    let _ = std::fs::remove_file(&output);
+    edit_content(
+        &source,
+        &output,
+        0,
+        &ContentCommand::CropImage {
+            revision: snapshot.revision,
+            target: group.id.clone(),
+            crop: ContentBox {
+                x: 0.1,
+                y: 0.,
+                width: 0.8,
+                height: 1.,
+            },
+        },
+    )
+    .unwrap();
+    let after = inspect_content(&output, 0).unwrap();
+    let graphic = after
+        .items
+        .iter()
+        .find(|i| i.kind == "graphic" && i.paths[0].len() == 1)
+        .unwrap();
+    assert!(
+        (graphic.bounds.width - group.bounds.width * 0.8).abs() < 0.1,
+        "{graphic:?}"
+    );
+    let moved = source.with_file_name("moved.pdf");
+    let _ = std::fs::remove_file(&moved);
+    edit_content(
+        &output,
+        &moved,
+        0,
+        &ContentCommand::Transform {
+            revision: after.revision,
+            target: graphic.id.clone(),
+            bounds: ContentBox {
+                x: graphic.bounds.x + 12.,
+                ..graphic.bounds
+            },
+            rotation: 0.,
+        },
+    )
+    .unwrap();
+    let after = inspect_content(&moved, 0).unwrap();
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.kind == "graphic" && (i.bounds.x - graphic.bounds.x - 12.).abs() < 0.1)
+    );
+}
+
+#[test]
+fn real_manuscript_simple_body_replaces_with_original_embedded_font() {
+    let Ok(samples) = std::env::var("LYRA_READER_PDF_SAMPLES") else {
+        return;
+    };
+    let source = Path::new(&samples).join("manuscript_0925.pdf");
+    let page = inspect_content(&source, 1).unwrap();
+    let item = page
+        .items
+        .iter()
+        .find(|i| i.text.starts_with("In this work, we consider") && i.can_edit_text)
+        .expect("simple manuscript paragraph");
+    let text = "In this work, we consider a direct visual motion demonstration.";
+    let output = std::env::temp_dir().join("lyra-manuscript-body-edited.pdf");
+    let _ = std::fs::remove_file(&output);
+    edit_content(
+        &source,
+        &output,
+        1,
+        &ContentCommand::ReplaceText {
+            revision: page.revision,
+            target: item.id.clone(),
+            text: text.into(),
+            bounds: item.bounds,
+            font: "Original".into(),
+            size: item.size,
+            colour: item.colour,
+            alignment: 0,
+        },
+    )
+    .unwrap();
+    let page = inspect_content(&output, 1).unwrap();
+    assert!(
+        page.items
+            .iter()
+            .any(|i| i.text == text && (i.bounds.width - item.bounds.width).abs() < 0.1)
+    );
+}
+
+#[test]
+fn chinese_editor_font_and_unsupported_glyph_failures_are_transactional() {
+    let source = fixture("cjk", b"BT /F1 12 Tf 72 700 Td (Neighbour) Tj ET");
+    let page = inspect_content(&source, 0).unwrap();
+    let bounds = ContentBox {
+        x: 72.,
+        y: 500.,
+        width: 200.,
+        height: 50.,
+    };
+    let output = source.with_file_name("chinese.pdf");
+    let _ = std::fs::remove_file(&output);
+    edit_content(
+        &source,
+        &output,
+        0,
+        &ContentCommand::InsertText {
+            revision: page.revision.clone(),
+            text: "编辑 PDF 正文".into(),
+            bounds,
+            font: "LyraReader Sans SC".into(),
+            size: 14.,
+            colour: [0, 0, 0, 255],
+            alignment: 0,
+        },
+    )
+    .unwrap();
+    let after = inspect_content(&output, 0).unwrap();
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.text.replace('\u{a0}', " ") == "编辑 PDF 正文"),
+        "{after:?}"
+    );
+    let blocked = source.with_file_name("blocked.pdf");
+    std::fs::write(&blocked, b"preserved").unwrap();
+    assert!(
+        edit_content(
+            &source,
+            &blocked,
+            0,
+            &ContentCommand::InsertText {
+                revision: page.revision,
+                text: "🦊".into(),
+                bounds,
+                font: "LyraReader Sans SC".into(),
+                size: 14.,
+                colour: [0, 0, 0, 255],
+                alignment: 0
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(blocked).unwrap(), b"preserved");
+}
+
+#[test]
+fn erase_tj_after_another_show_keeps_operator_local_character_indices() {
+    let source=fixture("tj-erase",b"BT /F1 12 Tf 72 700 Td (Neighbour) Tj 0 -30 Td [(Left ) -120 (SECRET) -120 ( Right)] TJ ET");
+    let snapshot = inspect_content(&source, 0).unwrap();
+    let output = source.with_file_name("erased.pdf");
+    let _ = std::fs::remove_file(&output);
+    edit_content(
+        &source,
+        &output,
+        0,
+        &ContentCommand::Redact {
+            revision: snapshot.revision,
+            bounds: ContentBox {
+                x: 93.,
+                y: 660.,
+                width: 54.,
+                height: 23.,
+            },
+            blackout: true,
+        },
+    )
+    .unwrap();
+    let page = inspect_content(&output, 0).unwrap();
+    let text = page
+        .items
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !text.contains("SECRET")
+            && text.contains("Neighbour")
+            && text.contains("Left")
+            && text.contains("Right"),
+        "{text}"
+    );
+}
