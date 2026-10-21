@@ -20,7 +20,7 @@ extension ReaderChecks {
 
         let document = scratch.appendingPathComponent("sticky.pdf")
         try fileManager.copyItem(at: fixture, to: document)
-        let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: document)
 
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
@@ -261,7 +261,7 @@ extension ReaderChecks {
         defer { try? fileManager.removeItem(at: scratch) }
 
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+            DocumentEditCache.annotationsURL(for: document)
         }
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
@@ -342,7 +342,7 @@ extension ReaderChecks {
             require(false, "a successful strikeout save publishes a report")
         }
 
-        let copySidecar = copyURL.appendingPathExtension("lyra-reader-annotations.json")
+        let copySidecar = DocumentEditCache.annotationsURL(for: copyURL)
         require(!fileManager.fileExists(atPath: copySidecar.path),
                 "an annotated copy carries no sidecar")
 

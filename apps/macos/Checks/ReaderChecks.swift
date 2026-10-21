@@ -45,6 +45,11 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
+        let checkCache = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-native-cache-\(UUID())")
+        DocumentEditCache.rootOverride = checkCache.appendingPathComponent("Documents")
+        setenv("LYRA_READER_DOCUMENT_CACHE_DIR", DocumentEditCache.rootOverride!.path, 1)
+        setenv("LYRA_READER_INDEX_CACHE_DIR", checkCache.appendingPathComponent("Indexes").path, 1)
+        defer { try? FileManager.default.removeItem(at: checkCache) }
         // The reader's layout preferences live in UserDefaults (so the app remembers facing
         // pages and the page gap). Checks must not inherit them from whatever the person
         // running the suite chose in the app: pin continuous/12 for this process. Setters still
@@ -56,6 +61,10 @@ struct ReaderChecks {
         AppState.usesStoredSidePanelPreferences = false
 
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-document-cache") {
+            try await documentCacheChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-content-editing") {
             try await contentEditingChecks(root:fastRoot)
             return
@@ -582,6 +591,7 @@ struct ReaderChecks {
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
         try await stampSignatureChecks(root: root)
         try await contentEditingChecks(root: root)
+        try await documentCacheChecks(root: root)
         try await bookmarkWritebackChecks(root: root)
         try await crossReaderAnnotationChecks(
             replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),

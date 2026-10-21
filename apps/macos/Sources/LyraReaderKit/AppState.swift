@@ -400,7 +400,17 @@ public final class AppState: ObservableObject {
     /// True while PDFium is rewriting a revision; commands are disabled rather than queued.
     @Published public private(set) var pageEditBusy: Bool = false
     /// The staged session. Nil means the file on disk is the document on screen.
-    private var pageEditSession: PageEditSession?
+    private var pageEditSession: PageEditSession? {
+        didSet {
+            if let session = pageEditSession {
+                Self.pageEditOwners[DocumentEditCache.recoveryURL(for: session.originalURL).path] = WeakState(self)
+                persistPageEditRecovery()
+            }
+        }
+    }
+    private static var pageEditOwners: [String: WeakState] = [:]
+    private var isChangingDocumentState = false
+    @Published public private(set) var annotationCacheIsDirty = false
 
     @Published public var contentEditEnabled = false {
         didSet { if contentEditEnabled { rightPanelVisible = false } }
@@ -1875,7 +1885,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The deletion is a pending change, like an unsaved highlight: the PDF on disk still has
     /// the annotation until "Save Copy" or "Save and Replace Original". The identity is what the
     /// writer resolves; the page is kept for the sidebar and for the report.
-    public struct FileAnnotationDeletion: Identifiable, Equatable, Sendable {
+    public struct FileAnnotationDeletion: Identifiable, Codable, Equatable, Sendable {
         public let identity: String
         public let page: Int
         public var id: String { identity }
@@ -1887,7 +1897,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Annotations deleted in this session, waiting for the next explicit save.
-    @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = []
+    @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = [] {
+        didSet { persistPendingAnnotationState() }
+    }
     /// `/Popup` presence for every annotation the file carries, keyed by identity. An adopted
     /// entry is no longer in `documentAnnotations`, but the file still owns its popup, so the
     /// eraser guard needs this to survive adoption.
@@ -2182,7 +2194,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var eraserHoverMarkID: String?
     /// Ink strokes the eraser has shortened or removed since their absence was last written to
     /// a PDF. While this is non-empty the interface says that the PDF on disk is still unchanged.
-    @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = []
+    @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = [] {
+        didSet { persistPendingAnnotationState() }
+    }
     /// Why a plain click last refused to select a mark the PDF itself carries.
     ///
     /// A mark with no editable model (a reply, a hidden annotation, a subtype this reader does
@@ -2527,6 +2541,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var bookmarks: [Bookmark]
         var preservedAnnotationEntryCount: Int
         var annotationWriteCount: Int
+        var annotationCacheIsDirty: Bool
         var lastAnnotationWriteReport: AnnotationWriteReport?
         var interruptedAnnotationSaveNotice: String?
         var lastSidecarBackupURL: URL?
@@ -3215,6 +3230,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadMetadata()
             loadDocumentAnnotations()
             loadFormInfo()
+            restoreCachedPageEdits(for: url)
             return true
 
         } catch {
@@ -3225,6 +3241,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
         contentLoadToken = UUID()
         contentEditPage = nil
         contentEditSelection = nil
@@ -6686,6 +6705,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if editingAnnotationID != nil { commitTextEditing() }
         let pendingNote = hasPendingAnnotationWrite
         let pendingPosition = self.pendingPosition != nil
+        defer { persistPageEditRecovery() }
         guard pendingNote || pendingPosition else { return }
         if pendingNote { flushPendingAnnotationWrite() }
         if pendingPosition { flushPendingPositionSave() }
@@ -7395,7 +7415,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // MARK: - Signed documents (read-only)
 
     /// The signature evidence for the open document, read by the engine once at open.
-    public var documentSignature: DocumentSignature { document?.signature ?? .unsigned }
+    public var documentSignature: DocumentSignature { pageEditSession?.originalSignature ?? document?.signature ?? .unsigned }
 
     /// True when the file carries a digital signature and every **in-place** write is refused.
     ///
@@ -7443,6 +7463,34 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Saving annotations into the PDF
 
+    public var canSaveDocument: Bool {
+        document != nil && !pageEditBusy && !annotationSaveInProgress &&
+            (canSaveAnnotationsToPDF || canSavePageEditsCopy || contentCommandInFlight)
+    }
+
+    public func saveDocument() {
+        if isReadOnlyDocument { presentSaveDocumentCopyPanel(); return }
+        Task { @MainActor [weak self] in _ = await self?.saveDocumentToOriginal() }
+    }
+
+    public func presentSaveDocumentCopyPanel() {
+        if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel() }
+        else { presentSaveAnnotatedCopyPanel() }
+    }
+
+    @discardableResult
+    public func saveDocumentToOriginal() async -> Bool {
+        guard guardWritable(), document != nil, contentTextRecovery == nil else { return false }
+        commitContentText?()
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
+        }
+        if pageEditSession != nil { return await replaceOriginalWithPageEdits() }
+        return await replaceOriginalWithSavedAnnotations()
+    }
+
     /// Whether the two PDF-writing commands can run.
     ///
     /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
@@ -7454,8 +7502,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // A signed document cannot be edited, but exporting a copy (with whatever sidecar
         // annotations it already carries, or none) never touches the signed original.
         if isReadOnlyDocument { return true }
-        return !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-            || hasPendingInkErasure || hasPendingFileDeletions
+        return annotationCacheIsDirty || hasPendingInkErasure || hasPendingFileDeletions
     }
 
     /// Whether the open document's outline already contains the reader's marked bookmark
@@ -7485,7 +7532,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
     /// document on screen (and its sidecar) stays exactly where it is.
     public func presentSaveAnnotatedCopyPanel() {
-        if contentEditEnabled {presentSavePageEditsCopyPanel();return}
+        if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel(); return }
         guard let suggestion = suggestedAnnotatedCopyURL else { return }
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
@@ -7530,6 +7577,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// nothing was written.
     @discardableResult
     public func saveAnnotatedCopy(to destination: URL) async -> Bool {
+        if pageEditSession != nil || contentTextEditing { return await savePageEditsCopy(to: destination) }
         guard !annotationSaveInProgress else { return false }
         guard let documentURL = document?.url else {
             lastError = "Open a document before saving annotations"
@@ -7651,6 +7699,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Returns `false` when nothing was replaced.
     @discardableResult
     public func replaceOriginalWithSavedAnnotations() async -> Bool {
+        if pageEditSession != nil { return await replaceOriginalWithPageEdits() }
         guard guardWritable() else { return false }
         guard !annotationSaveInProgress else { return false }
         guard let url = document?.url else {
@@ -7659,6 +7708,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
                 || hasPendingFileDeletions else {
+            annotationCacheIsDirty = false
+            persistPendingAnnotationState()
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -7672,6 +7723,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
+            try DocumentEditCache.validateSource(for: url)
             let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarkWriteRequests()
             let report = try await engine.replaceWithAnnotationChanges(
@@ -7681,6 +7733,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 deletions: changes.deletions,
                 zoom: zoomFactor
             )
+
+            try? DocumentEditCache.recordSource(for: url)
 
             // The PDF is now the source of truth. Remove exactly the written entries and the
             // adopted entries whose annotation was deleted (including a thread's cascaded
@@ -7698,6 +7752,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             let cleanedSidecar = cleanedAnnotations && cleanedBookmarks
             pendingFileDeletions.removeAll()
+            annotationCacheIsDirty = false
+            persistPendingAnnotationState()
 
             // The engine marks the old handle stale; reopen the file in place, keeping the
             // reading position and zoom.
@@ -8208,10 +8264,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// `document.pdf` → `document.pdf.lyra-reader-annotations.json`.
     private static func sidecarURL(for document: URL) -> URL {
-        ReaderDataCompatibility.annotationSidecarURL(for: document)
+        DocumentEditCache.annotationsURL(for: document)
     }
 
     private func loadAnnotations(for url: URL) {
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
+        annotationCacheIsDirty = false
         let sidecarURL = Self.sidecarURL(for: url)
         annotationsURL = sidecarURL
         annotationWritesBlockedReason = nil
@@ -8224,6 +8284,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         eraserHoverMarkID = nil
 
         do {
+            let prepared = try DocumentEditCache.prepareAnnotations(for: url,
+                pageCount: document?.pageCount ?? 0, paletteCount: Self.highlightPalette.count)
+            annotationsURL = prepared
             _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
             let data = try Data(contentsOf: sidecarURL)
             let contents = try AnnotationSidecar.decode(
@@ -8233,6 +8296,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             annotations = contents.annotations
             bookmarks = contents.bookmarks
+            annotationCacheIsDirty = !annotations.isEmpty || !bookmarks.isEmpty
             annotationSidecarSlots = contents.slots
             preservedAnnotationEntryCount = contents.preservedCount
             undoStack.removeAll()
@@ -8247,17 +8311,48 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             undoStack.removeAll()
             redoStack.removeAll()
         } catch {
+            annotationsURL = DocumentEditCache.unreadableRecordsURL(for: url)
             annotations = []
             bookmarks = []
             undoStack.removeAll()
             redoStack.removeAll()
             annotationWritesBlockedReason = error.localizedDescription
-            statusMessage = "Could not read annotations; the sidecar is protected from overwrite"
+            statusMessage = "Could not restore annotations; recovery data was kept"
             lastError = statusMessage
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: read failed; writes blocked: \(error)\n".utf8)
             )
         }
+        if annotationWritesBlockedReason == nil,
+           FileManager.default.fileExists(atPath: DocumentEditCache.pendingStateURL(for: url).path) {
+            do {
+                let data = try Data(contentsOf: DocumentEditCache.pendingStateURL(for: url))
+                let saved = try JSONDecoder().decode(PendingAnnotationState.self, from: data)
+                pendingFileDeletions = saved.deletions
+                erasedInkStrokeIDs = saved.erasedInk
+                annotationCacheIsDirty = saved.dirty
+            } catch {
+                annotationWritesBlockedReason = error.localizedDescription
+                lastError = "Pending PDF changes could not be restored; the cache was kept."
+            }
+        }
+    }
+
+    private struct PendingAnnotationState: Codable {
+        let dirty: Bool
+        let deletions: [FileAnnotationDeletion]
+        let erasedInk: Set<UUID>
+    }
+
+    private func persistPendingAnnotationState() {
+        guard !isChangingDocumentState, annotationWritesBlockedReason == nil,
+              document != nil, let records = annotationsURL else { return }
+        do {
+            let saved = PendingAnnotationState(dirty: annotationCacheIsDirty,
+                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs)
+            try JSONEncoder().encode(saved).write(to:
+                records.deletingLastPathComponent().appendingPathComponent("changes.json"), options: .atomic)
+        } catch { lastError = "Could not cache pending PDF changes: \(error.localizedDescription)" }
     }
 
     /// Writes a candidate first and publishes it only after the atomic write succeeds.
@@ -8312,6 +8407,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotations = candidateAnnotations
             bookmarks = candidateBookmarks
             annotationSidecarSlots = slots
+            if !["page-edit-session", "page-edit-revision", "saved-to-pdf", "bookmarks-saved-to-pdf", "recovery"].contains(trigger) {
+                annotationCacheIsDirty = true
+            }
+            persistPendingAnnotationState()
+            persistPageEditRecovery()
             hasPendingAnnotationWrite = false
             annotationWriteCount += 1
             let line = "lyra-reader-annotate: saved \(candidateAnnotations.count) annotation(s),"
@@ -8957,7 +9057,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One revision plus the reader's marks at that revision. Undo/redo restore both together:
     /// an annotation added to a page that a later undo removes must disappear, and come back on
     /// redo, rather than being pushed onto a neighbour.
-    private struct PageEditSnapshot {
+    private struct PageEditSnapshot: Codable {
         let revisionURL: URL
         let revisionNumber: Int
         let currentToOriginal: [Int]
@@ -8965,13 +9065,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let annotations: [Annotation]
         let bookmarks: [Bookmark]
         let slots: [AnnotationSidecar.Slot]
+        let deletions: [FileAnnotationDeletion]
+        let erasedInk: Set<UUID>
+        let annotationDirty: Bool
         let currentPage: Int
         let selection: Set<Int>
         let label: String
     }
 
-    private struct PageEditSession {
+    private struct PageEditSession: Codable {
         let originalURL: URL
+        let originalSignature: DocumentSignature
+        let sourceStamp: DocumentEditCache.SourceStamp
         let originalSidecarURL: URL
         let title: String
         let directory: URL
@@ -9085,11 +9190,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func rotateSelectedPages(clockwise: Bool) {
         let pages = selectedPageIndices
         guard !pages.isEmpty else { return }
-        if let conflict = rotationConflict(on: pages) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return
-        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             _ = await self.applyPageEdit(
@@ -9100,12 +9200,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func resetSelectedPageRotations() {
-        let checkedPages = selectedPageIndices
-        if let conflict = rotationConflict(on: checkedPages) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return
-        }
         Task { @MainActor [weak self] in
             guard let self, await self.ensurePageEditSession() else { return }
             guard let session = self.pageEditSession else { return }
@@ -9300,10 +9394,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "The extracted pages cannot overwrite the document they came from."
             return false
         }
+        guard pageEditSession.map({ !Self.resolvesToSameFile(destination, $0.originalURL) }) ?? true else {
+            lastError = "Extracted pages cannot replace the original editing document."
+            return false
+        }
+        let bookmarkSnapshot = bookmarks
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let report = try await engine.extractPages(pages, to: destination)
+            let export = try await preparedExportEngine(includeBookmarks: false)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let temporary = export.directory.appendingPathComponent("extracted.pdf")
+            let report = try await export.engine.extractPages(pages, to: temporary)
+            try await publishExport(temporary, to: destination, pages: pages.sorted(), bookmarks: bookmarkSnapshot)
             statusMessage =
                 "Extracted \(Self.pageList(pages)) to \(destination.lastPathComponent)"
                 + " · \(report.pageCount) page(s) written"
@@ -9382,7 +9485,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation sidecar could not be read (\(reason)), so the merge "
+                "This document's annotation cache could not be read (\(reason)), so the merge "
                 + "was not started: it could not tell which marks the merged file should carry."
             return false
         }
@@ -9398,33 +9501,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 + "Choose another name; the original is unchanged until Replace Original is used."
             return false
         }
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if Self.sidecarFileExists(for: destination) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
-                + "Choose another name so the merged pages cannot show two sets of marks."
+        guard !Self.sidecarFileExists(for: destination) else {
+            lastError = "The destination has unsaved recovery data. Open it before replacing it."
             return false
         }
-        let sidecarData: Data?
-        do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the reader's annotations for the merge: \(error.localizedDescription)"
-            return false
-        }
-        if let sidecarData {
-            do {
-                try sidecarData.write(to: destinationSidecar, options: .atomic)
-            } catch {
-                lastError = "Could not write the merged file's annotation sidecar: \(error.localizedDescription)"
-                return false
-            }
-        }
-
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let report = try await engine.mergeDocuments(others: others, to: destination)
+            let export = try await preparedExportEngine(includeBookmarks: true)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let report = try await export.engine.mergeDocuments(others: others, to: destination)
             let appendedNotes = report.appendedAnnotationCounts.reduce(0, +)
             let outlineNote = report.droppedOutlineEntries == 0
                 ? "kept the first document's outline (\(report.firstOutlineEntries) entries); "
@@ -9453,9 +9539,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             ).utf8))
             return true
         } catch {
-            if sidecarData != nil {
-                try? FileManager.default.removeItem(at: destinationSidecar)
-            }
             lastError = "Could not merge the documents; nothing was written: \(error.localizedDescription)"
             statusMessage = "Could not merge the documents"
             FileHandle.standardError.write(Data("lyra-reader-pages: merge failed: \(error)\n".utf8))
@@ -9518,7 +9601,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         folderPanel.message =
             "\(ranges.count) file(s) will be written here, named like "
             + "“\(source.deletingPathExtension().lastPathComponent) (pages 1-5).pdf”. "
-            + "Nothing is overwritten: an existing file or sidecar stops the split before it starts."
+            + "Nothing is overwritten: an existing file or recovery data stops the split before it starts."
         folderPanel.prompt = "Choose Folder"
         folderPanel.canChooseFiles = false
         folderPanel.canChooseDirectories = true
@@ -9549,13 +9632,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation sidecar could not be read (\(reason)), so the split "
+                "This document's annotation cache could not be read (\(reason)), so the split "
                 + "was not started: it could not tell which marks each output should carry."
             return false
         }
         guard preservedAnnotationEntryCount == 0 else {
             lastError =
-                "This document's annotation sidecar contains entries written by a newer LyraReader. "
+                "This document's annotation cache contains entries written by a newer LyraReader. "
                 + "Their pages cannot be remapped into the split outputs safely, so the split was "
                 + "not started."
             return false
@@ -9585,116 +9668,79 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         let ordered = ranges.map { $0.sorted() }
-        let partSidecarData: [Data?]
-        do {
-            partSidecarData = try ordered.map { try sidecarData(for: $0) }
-        } catch {
-            lastError = "Could not prepare the split outputs' annotations: \(error.localizedDescription)"
-            return false
-        }
-
+        let bookmarkSnapshot = bookmarks
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let parts = zip(ordered, destinations).map { pair in
-                PageSplitPart(pages: pair.0, destination: pair.1)
+            let export = try await preparedExportEngine(includeBookmarks: false)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let temporary = ordered.indices.map { export.directory.appendingPathComponent("part-\($0).pdf") }
+            let parts = zip(ordered, temporary).map { PageSplitPart(pages: $0.0, destination: $0.1) }
+            _ = try await export.engine.splitPages(parts)
+            for index in ordered.indices {
+                try await publishExport(temporary[index], to: destinations[index], pages: ordered[index], bookmarks: bookmarkSnapshot)
             }
-            let report = try await engine.splitPages(parts)
-            var sidecarFailures = 0
-            for (index, part) in report.parts.enumerated() {
-                guard index < partSidecarData.count, let data = partSidecarData[index] else { continue }
-                do {
-                    try data.write(
-                        to: Self.sidecarURL(for: part.destination),
-                        options: .atomic
-                    )
-                } catch {
-                    sidecarFailures += 1
-                }
-            }
-            let counts = report.parts.map(\.pageCount).map(String.init).joined(separator: " + ")
-            let sidecarNote = sidecarFailures == 0
-                ? "the reader's marks were copied to the output that contains each page"
-                : "\(sidecarFailures) output sidecar(s) could not be written"
-            statusMessage =
-                "Split into \(report.parts.count) file(s) · \(counts) pages · each verified · "
-                + "the source is unchanged · \(sidecarNote)"
-            if sidecarFailures > 0 {
-                lastError = "The split PDFs are valid, but \(sidecarFailures) annotation sidecar(s) could not be written."
-            }
-            FileHandle.standardError.write(Data((
-                "lyra-reader-pages: split \(source.lastPathComponent) into \(report.parts.count) "
-                + "file(s) (\(counts) pages) · source unchanged\n"
-            ).utf8))
+            statusMessage = "Split into \(destinations.count) verified PDFs · annotations and bookmarks are embedded · source unchanged"
             return true
         } catch {
-            // An output is renamed only after its verification, so any destination that now
-            // exists is a complete earlier part. Give those parts their sidecars.
-            var completed = 0
-            for (index, destination) in destinations.enumerated() {
-                guard FileManager.default.fileExists(atPath: destination.path) else { continue }
-                completed += 1
-                if index < partSidecarData.count, let data = partSidecarData[index] {
-                    try? data.write(to: Self.sidecarURL(for: destination), options: .atomic)
-                }
-            }
-            lastError =
-                "Could not split the document; \(completed) complete output(s) are on disk and "
-                + "the source is unchanged: \(error.localizedDescription)"
-            statusMessage = completed == 0
-                ? "Split failed; nothing was written"
-                : "Split stopped after \(completed) complete output(s)"
-            FileHandle.standardError.write(Data("lyra-reader-pages: split failed: \(error)\n".utf8))
+            let completed = destinations.filter { FileManager.default.fileExists(atPath: $0.path) }.count
+            lastError = "Could not finish the split; \(completed) complete output(s) are on disk: \(error.localizedDescription)"
+            statusMessage = completed == 0 ? "Split failed; nothing was written" : "Split stopped after \(completed) complete output(s)"
             return false
         }
+    }
+
+    /// A separate engine exports a snapshot so the reader's active revision and undo stay intact.
+    private func preparedExportEngine(includeBookmarks: Bool) async throws -> (engine: any PDFEngine, directory: URL) {
+        guard let source = document?.url, annotationWritesBlockedReason == nil,
+              preservedAnnotationEntryCount == 0 else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The annotation recovery data must be restored before exporting."])
+        }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The active annotation could not be cached."])
+        }
+        let changes = try await pendingAnnotationChanges()
+        let marks = includeBookmarks ? bookmarkWriteRequests() : []
+        guard document?.url == source else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The active document changed before exporting."])
+        }
+        let directory = try DocumentEditCache.newSessionDirectory(for: pageEditDisplayURL ?? source)
+        guard !changes.isEmpty || !marks.isEmpty else { return (engine, directory) }
+        do {
+            let snapshot = directory.appendingPathComponent("source.pdf")
+            _ = try await engine.saveAnnotationChanges(to: snapshot, additions: changes.additions,
+                bookmarks: marks, updates: changes.updates, deletions: changes.deletions, zoom: zoomFactor)
+            let isolated = try RustEngine()
+            _ = try isolated.openDocument(at: snapshot)
+            return (isolated, directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    private func publishExport(_ source: URL, to destination: URL, pages: [Int], bookmarks snapshot: [Bookmark]) async throws {
+        let export = try RustEngine()
+        _ = try export.openDocument(at: source)
+        let positions = Dictionary(uniqueKeysWithValues: pages.enumerated().map { ($0.element, $0.offset) })
+        let marks = snapshot.compactMap { bookmark -> BookmarkWriteRequest? in
+            guard let page = positions[bookmark.page] else { return nil }
+            return BookmarkWriteRequest(id: bookmark.id, page: page, title: bookmark.title, yPt: bookmark.yPt)
+        }
+        if marks.isEmpty { _ = try await export.saveEditedCopy(to: destination) }
+        else { _ = try await export.saveAnnotationChanges(to: destination, additions: [], bookmarks: marks,
+            updates: [], deletions: [], zoom: zoomFactor) }
     }
 
     /// True when either naming convention of the reader's sidecar exists beside `document`.
     private static func sidecarFileExists(for document: URL) -> Bool {
         let fileManager = FileManager.default
-        let current = document.appendingPathExtension("lyra-reader-annotations.json")
-        let legacy = document.appendingPathExtension("aris-annotations.json")
-        return fileManager.fileExists(atPath: current.path)
-            || fileManager.fileExists(atPath: legacy.path)
-    }
-
-    /// The reader's marks on exactly `pages`, renumbered to their position in that output.
-    ///
-    /// Opaque entries (a newer LyraReader's schema) cannot be placed and are refused before a
-    /// split starts, so this filter never silently drops one.
-    private func sidecarData(for pages: [Int]) throws -> Data? {
-        let positions = Dictionary(uniqueKeysWithValues: pages.enumerated().map { ($0.element, $0.offset) })
-        var mappedAnnotations: [Annotation] = []
-        for annotation in annotations {
-            guard let page = positions[annotation.page] else { continue }
-            var copy = annotation
-            copy.page = page
-            mappedAnnotations.append(copy)
-        }
-        var mappedBookmarks: [Bookmark] = []
-        for bookmark in bookmarks {
-            guard let page = positions[bookmark.page] else { continue }
-            var copy = bookmark
-            copy.page = page
-            mappedBookmarks.append(copy)
-        }
-        let annotationIDs = Set(mappedAnnotations.map(\.id))
-        let bookmarkIDs = Set(mappedBookmarks.map(\.id))
-        let mappedSlots = annotationSidecarSlots.filter { slot in
-            switch slot {
-            case .annotation(let id): return annotationIDs.contains(id)
-            case .bookmark(let id): return bookmarkIDs.contains(id)
-            case .opaque: return false
-            }
-        }
-        if mappedAnnotations.isEmpty && mappedBookmarks.isEmpty && mappedSlots.isEmpty {
-            return nil
-        }
-        return try AnnotationSidecar.encode(
-            annotations: mappedAnnotations,
-            bookmarks: mappedBookmarks,
-            slots: mappedSlots
-        )
+        return ([Self.sidecarURL(for: document)] + DocumentEditCache.legacyURLs(for: document))
+            .contains { fileManager.fileExists(atPath: $0.path) }
     }
 
     public func presentSavePageEditsCopyPanel() {
@@ -9702,8 +9748,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
         panel.message =
-            "Writes the staged page changes to a new PDF and leaves the original untouched. "
-            + "The reader's annotations are saved beside the copy."
+            "Writes the edited pages, annotations and bookmarks into a new PDF."
         panel.nameFieldStringValue =
             "\(source.deletingPathExtension().lastPathComponent) (page edits).pdf"
         panel.directoryURL = source.deletingLastPathComponent()
@@ -9717,59 +9762,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func savePageEditsCopy(to destination: URL) async -> Bool {
-        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        guard contentTextRecovery == nil else { lastError = "Finish or discard the recovered draft before saving."; return false }
         commitContentText?()
-        if let task=contentEditTask {
-            let succeeded=await task.value
-            contentEditTask=nil
-            if !succeeded {return false}
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
         }
-        guard let session = pageEditSession, !pageEditBusy else { return false }
-        if Self.resolvesToSameFile(destination, session.originalURL) {
-            lastError = "The edited copy would be the original. Use “Replace Original with Page Changes” for that."
+        guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
+        guard !Self.resolvesToSameFile(destination, original) else {
+            lastError = "Choose another name for Save As, or use Save to update the original."
             return false
         }
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
-                + "Choose another name so the copy cannot show every annotation twice."
+        guard !Self.sidecarFileExists(for: destination) else {
+            lastError = "The destination has unsaved recovery data. Open it before replacing it."
             return false
         }
-        let sidecarData: Data?
         do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the annotations for the copy: \(error.localizedDescription)"
-            return false
-        }
-        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
-        if hasMarks, let sidecarData {
-            do {
-                try sidecarData.write(to: destinationSidecar, options: .atomic)
-            } catch {
-                lastError = "Could not write the copy's annotation sidecar: \(error.localizedDescription)"
-                return false
-            }
-        }
-        pageEditBusy = true
-        defer { pageEditBusy = false }
-        do {
+            _ = try await materializeAnnotationsInWorkingCopy()
+            pageEditBusy = true
+            defer { pageEditBusy = false }
             let report = try await engine.saveEditedCopy(to: destination)
+            // The output already contains every annotation; it needs no companion records.
             endPageEditSession(deleteFiles: true)
             _ = open(url: destination)
             pageEditIsApplied = true
-            let notes = hasMarks ? " · annotations saved beside it" : ""
-            statusMessage =
-                "Saved edited copy \(destination.lastPathComponent) · \(report.pageCount) page(s)"
-                + " · the original is unchanged\(notes)"
+            statusMessage = "Saved \(destination.lastPathComponent) · \(report.pageCount) page(s)"
             return true
         } catch {
-            if hasMarks {
-                try? FileManager.default.removeItem(at: destinationSidecar)
-            }
-            lastError = "Could not save the edited copy: \(error.localizedDescription)"
-            statusMessage = "Could not save the edited copy"
+            lastError = "Could not save the PDF copy: \(error.localizedDescription)"
             return false
         }
     }
@@ -9803,58 +9824,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithPageEdits() async -> Bool {
-        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        guard guardWritable(), contentTextRecovery == nil else { return false }
         commitContentText?()
-        if let task=contentEditTask {
-            let succeeded=await task.value
-            contentEditTask=nil
-            if !succeeded {return false}
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
         }
-        guard let session = pageEditSession, !pageEditBusy else { return false }
-        let sidecarData: Data?
+        guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
         do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the annotations for the replacement: \(error.localizedDescription)"
-            return false
-        }
-        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
-        let hadSidecar = FileManager.default.fileExists(atPath: session.originalSidecarURL.path)
-        let previousSidecar = hadSidecar ? try? Data(contentsOf: session.originalSidecarURL) : nil
-        if hasMarks || hadSidecar, let sidecarData {
+            try DocumentEditCache.validateSource(for: original)
+            _ = try await materializeAnnotationsInWorkingCopy()
+            pageEditBusy = true
+            defer { pageEditBusy = false }
+            let report = try await engine.replaceOriginalWithPageEdits(original: original)
+            // Retire cached marks only after the verified PDF transaction succeeds.
+            var cleanupError: String?
             do {
-                try sidecarData.write(to: session.originalSidecarURL, options: .atomic)
-            } catch {
-                lastError = "Could not write the annotation sidecar; the original was left untouched: \(error.localizedDescription)"
-                return false
-            }
-        }
-        pageEditBusy = true
-        defer { pageEditBusy = false }
-        do {
-            let report = try await engine.replaceOriginalWithPageEdits(original: session.originalURL)
-            let backup = report.backupPath?.lastPathComponent ?? "none"
-            endPageEditSession(deleteFiles: true)
-            _ = open(url: session.originalURL)
+                try Data("[]".utf8).write(to: DocumentEditCache.annotationsURL(for: original), options: .atomic)
+                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [])).write(
+                    to: DocumentEditCache.pendingStateURL(for: original), options: .atomic)
+                try DocumentEditCache.recordSource(for: original)
+            } catch { cleanupError = error.localizedDescription }
+            endPageEditSession(deleteFiles: cleanupError == nil)
+            _ = open(url: original)
             pageEditIsApplied = true
-            statusMessage =
-                "Applied page changes to \(session.originalURL.lastPathComponent)"
-                + " · backup: \(backup)"
-            FileHandle.standardError.write(Data((
-                "lyra-reader-pages: replaced \(session.originalURL.path) · backup \(backup)\n"
-            ).utf8))
+            statusMessage = "Saved \(original.lastPathComponent) · backup: \(report.backupPath?.lastPathComponent ?? "none")"
+            if let cleanupError { lastError = "The PDF was saved, but its old recovery data was kept: \(cleanupError)" }
             return true
         } catch {
-            // The PDF was not replaced; put the sidecar back exactly as it was.
-            if hadSidecar {
-                if let previousSidecar {
-                    try? previousSidecar.write(to: session.originalSidecarURL, options: .atomic)
-                }
-            } else {
-                try? FileManager.default.removeItem(at: session.originalSidecarURL)
-            }
-            lastError = "Could not replace the original; it was left untouched: \(error.localizedDescription)"
-            statusMessage = "Could not replace the original"
+            lastError = "Could not save the original; the editing cache was kept: \(error.localizedDescription)"
+            persistPageEditRecovery()
             return false
         }
     }
@@ -9926,6 +9926,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         session.currentToOriginal = target.currentToOriginal
         session.operations = target.operations
         pageEditSession = session
+        pendingFileDeletions = target.deletions
+        erasedInkStrokeIDs = target.erasedInk
+        annotationCacheIsDirty = target.annotationDirty
+        persistPendingAnnotationState()
+        persistPageEditRecovery()
         pageEditPendingOperations = session.operations
         pageEditIsApplied = false
         statusMessage = "\(redo ? "Redid" : "Undid") \(target.label) · \(session.operations.count) page change(s) still pending"
@@ -9943,6 +9948,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotations: annotations,
             bookmarks: bookmarks,
             slots: annotationSidecarSlots,
+            deletions: pendingFileDeletions,
+            erasedInk: erasedInkStrokeIDs,
+            annotationDirty: annotationCacheIsDirty,
             currentPage: currentPage,
             selection: pageSelection,
             label: label
@@ -9956,9 +9964,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before editing pages"
             return false
         }
+        if let owner = Self.pageEditOwners[DocumentEditCache.recoveryURL(for: url).path]?.value,
+           owner !== self {
+            lastError = "This PDF is being edited in another window. Save or close that editing session first."
+            return false
+        }
         guard preservedAnnotationEntryCount == 0 else {
             lastError =
-                "This document's annotation sidecar contains entries written by a newer LyraReader. "
+                "This document's annotation cache contains entries written by a newer LyraReader. "
                 + "Their page numbers cannot be remapped safely, so page editing is disabled "
                 + "rather than risking an annotation on the wrong page."
             return false
@@ -9970,13 +9983,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         do {
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("LyraReaderPageEdits-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let directory = try DocumentEditCache.newSessionDirectory(for: url)
             let originalRotations = try await engine.pageRotations()
             let pageCount = document?.pageCount ?? 0
             let session = PageEditSession(
                 originalURL: url,
+                originalSignature: documentSignature,
+                sourceStamp: try DocumentEditCache.SourceStamp(url),
                 originalSidecarURL: Self.sidecarURL(for: url),
                 title: document?.title ?? url.deletingPathExtension().lastPathComponent,
                 directory: directory,
@@ -10024,11 +10037,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .rotate(let pages, _), .setRotation(let pages, _): rotating = pages
         default: rotating = nil
         }
-        if let rotating, let conflict = rotationConflict(on: rotating) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return false
-        }
         guard await ensurePageEditSession() else { return false }
         guard var session = pageEditSession, !pageEditBusy else { return false }
         guard let snapshot = pageEditSnapshot(label: label) else { return false }
@@ -10037,6 +10045,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
+            if let rotating, rotationConflict(on: rotating) != nil {
+                if try await materializeAnnotationsInWorkingCopy(), let updated = pageEditSession {
+                    session = updated
+                }
+            }
             let report = try await engine.applyPageOperation(operation, to: nextURL)
             let mappedAnnotations = Self.remap(annotations, with: report.pageMap)
             let mappedBookmarks = Self.remap(bookmarks, with: report.pageMap)
@@ -10171,6 +10184,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let directory = pageEditSession?.directory
         let revisionURL = pageEditSession?.revisionURL
         let originalURL = pageEditSession?.originalURL
+        if let originalURL {
+            let key = DocumentEditCache.recoveryURL(for: originalURL).path
+            if Self.pageEditOwners[key]?.value === self { Self.pageEditOwners.removeValue(forKey: key) }
+        }
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
@@ -10178,19 +10195,96 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             engine.closeDocument(at: revisionURL)
         }
         if deleteFiles, let directory {
+            if let originalURL { try? FileManager.default.removeItem(at: DocumentEditCache.recoveryURL(for: originalURL)) }
             try? FileManager.default.removeItem(at: directory)
         }
     }
 
-    private func pageEditSidecarData() throws -> Data? {
-        if annotations.isEmpty && bookmarks.isEmpty && annotationSidecarSlots.isEmpty {
-            return nil
+    private struct PageEditRecovery: Codable {
+        let version: Int
+        let session: PageEditSession
+        let snapshot: PageEditSnapshot
+    }
+
+    private func persistPageEditRecovery() {
+        guard let session = pageEditSession,
+              let snapshot = pageEditSnapshot(label: "Recovered editing session") else { return }
+        do {
+            let recovery = PageEditRecovery(version: 1, session: session, snapshot: snapshot)
+            try JSONEncoder().encode(recovery).write(to: DocumentEditCache.recoveryURL(for: session.originalURL), options: .atomic)
+        } catch {
+            lastError = "Could not cache the editing session: \(error.localizedDescription)"
         }
-        return try AnnotationSidecar.encode(
-            annotations: annotations,
-            bookmarks: bookmarks,
-            slots: annotationSidecarSlots
-        )
+    }
+
+    /// Freeze text-range marks into PDF geometry before changing the text layer. This is an
+    /// internal cached revision; the original PDF is only touched by the explicit Save command.
+    @discardableResult
+    private func materializeAnnotationsInWorkingCopy() async throws -> Bool {
+        guard !annotations.isEmpty || !bookmarks.isEmpty || hasPendingFileDeletions else { return false }
+        guard await ensurePageEditSession(), var session = pageEditSession else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: lastError ?? "Could not prepare the PDF cache"])
+        }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Could not cache the active annotation"])
+        }
+        let changes = try await pendingAnnotationChanges()
+        let marks = bookmarkWriteRequests()
+        guard !changes.isEmpty || !marks.isEmpty else { return false }
+        let next = session.directory.appendingPathComponent("marks-\(UUID().uuidString).pdf")
+        _ = try await engine.saveAnnotationChanges(to: next, additions: changes.additions,
+            bookmarks: marks, updates: changes.updates, deletions: changes.deletions, zoom: zoomFactor)
+        let oldScroll = scrollYPt
+        try loadPageEditRevision(at: next, title: session.title, sidecarURL: session.sidecarURL,
+            annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection)
+        session.revisionURL = next
+        pendingFileDeletions = []
+        erasedInkStrokeIDs = []
+        pageEditSession = session
+        scrollYPt = clampedScrollOffset(oldScroll)
+        reloadVisiblePages()
+        return true
+    }
+
+    private func restoreCachedPageEdits(for original: URL) {
+        guard pageEditSession == nil else { return }
+        let recoveryURL = DocumentEditCache.recoveryURL(for: original)
+        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return }
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
+        do {
+            let saved = try JSONDecoder().decode(PageEditRecovery.self, from: Data(contentsOf: recoveryURL))
+            let session = saved.session
+            let directory = DocumentEditCache.directory(for: original).standardizedFileURL.path + "/"
+            guard saved.version == 1, Self.resolvesToSameFile(session.originalURL, original),
+                  session.sourceStamp == (try DocumentEditCache.SourceStamp(original)),
+                  session.directory.standardizedFileURL.path.hasPrefix(directory),
+                  session.sidecarURL.standardizedFileURL.path.hasPrefix(session.directory.path + "/") else {
+                throw DocumentEditCache.CacheError.sourceChanged
+            }
+            func validRevision(_ url: URL) -> Bool {
+                url.standardizedFileURL == original.standardizedFileURL ||
+                    url.standardizedFileURL.path.hasPrefix(session.directory.standardizedFileURL.path + "/")
+            }
+            guard validRevision(saved.snapshot.revisionURL),
+                  (session.undo + session.redo).allSatisfy({ validRevision($0.revisionURL) }) else {
+                throw DocumentEditCache.CacheError.sourceChanged
+            }
+            try loadPageEditRevision(at: saved.snapshot.revisionURL, title: session.title,
+                sidecarURL: session.sidecarURL, annotations: saved.snapshot.annotations,
+                bookmarks: saved.snapshot.bookmarks, slots: saved.snapshot.slots,
+                currentPage: saved.snapshot.currentPage, selection: saved.snapshot.selection)
+            pendingFileDeletions = saved.snapshot.deletions
+            erasedInkStrokeIDs = saved.snapshot.erasedInk
+            annotationCacheIsDirty = saved.snapshot.annotationDirty
+            pageEditSession = session
+            pageEditPendingOperations = session.operations
+            statusMessage = "Recovered unsaved PDF changes · Save to update \(original.lastPathComponent)"
+        } catch {
+            lastError = "The cached editing session was kept but could not be restored: \(error.localizedDescription)"
+        }
     }
 
     /// Why rotating `pages` would invalidate LyraReader's own marks, or nil when it is safe.
@@ -10272,30 +10366,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func recoverUnreadableAnnotationSidecar() -> URL? {
         guard let sidecarURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
+        guard let original = pageEditSession?.originalURL ?? document?.url else { return nil }
 
         let fileManager = FileManager.default
         var backupURL: URL?
-        if fileManager.fileExists(atPath: sidecarURL.path) {
-            let destination = Self.uniqueBackupURL(for: sidecarURL)
-            do {
-                try fileManager.moveItem(at: sidecarURL, to: destination)
-                backupURL = destination
-                FileHandle.standardError.write(
-                    Data("lyra-reader-annotate: moved unreadable sidecar to \(destination.path)\n".utf8)
-                )
-            } catch {
-                let message = "Could not back up the unreadable annotation sidecar: \(error.localizedDescription)"
-                statusMessage = message
-                lastError = message
-                FileHandle.standardError.write(
-                    Data("lyra-reader-annotate: recovery failed, sidecar left in place: \(error)\n".utf8)
-                )
-                return nil
+        let records = [sidecarURL, DocumentEditCache.pendingStateURL(for: original),
+                       DocumentEditCache.recoveryURL(for: original),
+                       DocumentEditCache.directory(for: original).appendingPathComponent("source.json")]
+            + DocumentEditCache.legacyURLs(for: original)
+        var copied: [(URL, URL)] = []
+        var seen: Set<String> = []
+        do {
+            for source in records where seen.insert(source.path).inserted
+                && fileManager.fileExists(atPath: source.path) {
+                let destination = DocumentEditCache.directory(for: original)
+                    .appendingPathComponent("unreadable-\(UUID().uuidString)-\(source.lastPathComponent)")
+                let bytes = try Data(contentsOf: source)
+                try bytes.write(to: destination, options: .atomic)
+                guard try Data(contentsOf: destination) == bytes else {
+                    throw DocumentEditCache.CacheError.importVerification
+                }
+                copied.append((source, destination))
             }
+            // Verify every recovery record before retiring any. Cached PDF revisions remain
+            // available alongside the backed-up manifest for manual recovery.
+            for (source, _) in copied { try fileManager.removeItem(at: source) }
+            backupURL = copied.first?.1
+        } catch {
+            let message = "Could not back up the unreadable recovery data: \(error.localizedDescription)"
+            statusMessage = message
+            lastError = message
+            return nil
         }
 
         // The path is free now, so a stale blocked flag must not stop the fresh write.
         annotationWritesBlockedReason = nil
+        annotationsURL = DocumentEditCache.annotationsURL(for: original)
+        do { try DocumentEditCache.recordSource(for: original) }
+        catch { annotationWritesBlockedReason = error.localizedDescription; lastError = error.localizedDescription; return nil }
         annotations = []
         bookmarks = []
         annotationSidecarSlots = []
@@ -10307,13 +10415,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard saveAnnotations([], trigger: "recovery") else {
             // The rename succeeded but the directory is not writable: keep refusing writes so
             // the state stays honest, and let the reader retry (the file is already backed up).
-            annotationWritesBlockedReason = lastError ?? "the sidecar could not be recreated"
+            annotationWritesBlockedReason = lastError ?? "the annotation cache could not be recreated"
             return nil
         }
 
         statusMessage = backupURL.map {
-            "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh sidecar"
-        } ?? "Started a fresh annotation sidecar"
+            "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh annotation cache"
+        } ?? "Started a fresh annotation cache"
         return backupURL
     }
 
@@ -11643,6 +11751,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks: bookmarks,
             preservedAnnotationEntryCount: preservedAnnotationEntryCount,
             annotationWriteCount: annotationWriteCount,
+            annotationCacheIsDirty: annotationCacheIsDirty,
             lastAnnotationWriteReport: lastAnnotationWriteReport,
             interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
             lastSidecarBackupURL: lastSidecarBackupURL,
@@ -11662,6 +11771,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Puts a retained document's state back. The engine has already been told to make its
     /// document current (`RustEngine.activateDocument(at:)`), so no file is read here.
     private func restoreDocumentState(_ state: TabDocumentState) {
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
         documentEpoch &+= 1
         searchEpoch &+= 1
         renderEpoch &+= 1
@@ -11759,6 +11871,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         bookmarks = state.bookmarks
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount
+        annotationCacheIsDirty = state.annotationCacheIsDirty
         lastAnnotationWriteReport = state.lastAnnotationWriteReport
         interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
         lastSidecarBackupURL = state.lastSidecarBackupURL
@@ -14198,17 +14311,21 @@ extension AppState {
     public func saveContentAndClose() {
         guard let index = pendingContentClose else { return }
         contentCloseRequested = false
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = "Edited document.pdf"
-        guard panel.runModal() == .OK, let destination = panel.url else {
-            cancelContentClose()
-            return
+        var destination: URL?
+        if isReadOnlyDocument {
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.pdf]
+            panel.nameFieldStringValue = "Edited document.pdf"
+            guard panel.runModal() == .OK, let url = panel.url else { cancelContentClose(); return }
+            destination = url
         }
         Task { @MainActor [weak self] in
-            guard let self, await savePageEditsCopy(to: destination) else { return }
+            guard let self else { return }
+            let saved: Bool
+            if let destination { saved = await savePageEditsCopy(to: destination) }
+            else { saved = await saveDocumentToOriginal() }
+            guard saved else { return }
             pendingContentClose = nil
-            discardPageEdits()
             closeTab(index)
         }
     }
@@ -14223,6 +14340,10 @@ extension AppState {
                 command, "Wait for the current page change to finish.", page: page)
             return
         }
+        guard contentEditPage?.revision == command.revision else {
+            preserveContentFailure(command, "The page changed before this edit. Reload the page before retrying.", page: page)
+            return
+        }
         contentCommandInFlight = true
         let source = document?.url
         contentEditTask = Task { @MainActor [weak self] in
@@ -14235,27 +14356,26 @@ extension AppState {
                 }
             }
             guard let self else { return false }
-            guard !annotations.contains(where: { $0.page == page }),
-                !bookmarks.contains(where: { $0.page == page })
-            else {
-                preserveContentFailure(
-                    command,
-                    "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content.",
-                    page: page)
-                return false
-            }
-            guard await ensurePageEditSession(), var session = pageEditSession,
+            guard await ensurePageEditSession(),
                 let snapshot = pageEditSnapshot(label: label), document?.url == source
             else {
                 preserveContentFailure(command, "Could not prepare the working copy.", page: page)
                 return false
             }
-            pageEditBusy = true
-            defer { pageEditBusy = false }
-            let next = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+            var next: URL?
+            var effectiveCommand = command
             do {
-                try await engine.applyContentEdit(page: page, command: command, to: next)
-                guard document?.url == source else {
+                if try await materializeAnnotationsInWorkingCopy() {
+                    effectiveCommand.revision = try await engine.contentObjects(page: page).revision
+                }
+                guard var session = pageEditSession else { return false }
+                pageEditBusy = true
+                defer { pageEditBusy = false }
+                let destination = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+                next = destination
+                let editingSource = document?.url
+                try await engine.applyContentEdit(page: page, command: effectiveCommand, to: destination)
+                guard document?.url == editingSource else {
                     throw NSError(
                         domain: "LyraReader", code: 2,
                         userInfo: [
@@ -14263,10 +14383,10 @@ extension AppState {
                         ])
                 }
                 try loadPageEditRevision(
-                    at: next, title: session.title, sidecarURL: session.sidecarURL,
+                    at: destination, title: session.title, sidecarURL: session.sidecarURL,
                     annotations: annotations, bookmarks: bookmarks, slots: annotationSidecarSlots,
                     currentPage: currentPage, selection: pageSelection)
-                session.revisionURL = next
+                session.revisionURL = destination
                 session.revisionNumber += 1
                 session.operations.append(label)
                 session.undo.append(snapshot)
@@ -14278,15 +14398,16 @@ extension AppState {
                     contentRecoveryCommand = nil
                     contentTextRecovery = nil
                 }
-                statusMessage = "\(label) · staged in working copy; Save Edited Copy to publish"
+                statusMessage = "\(label) · unsaved PDF changes"
                 await reloadContentObjects()
                 return true
             } catch {
+                await reloadContentObjects()
                 preserveContentFailure(
-                    command,
+                    effectiveCommand,
                     "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
-                    page: page, url: source)
-                try? FileManager.default.removeItem(at: next)
+                    page: page, url: document?.url)
+                if let next { try? FileManager.default.removeItem(at: next) }
                 return false
             }
         }

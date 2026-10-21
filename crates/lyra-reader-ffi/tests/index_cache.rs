@@ -77,9 +77,9 @@ fn scratch(label: &str) -> ScratchDir {
 }
 
 fn cache_path(document: &Path) -> PathBuf {
-    let mut path = document.as_os_str().to_os_string();
-    path.push(".lyra-reader-index.json");
-    PathBuf::from(path)
+    let path = lyra_reader_ffi::document_index_cache_path(document);
+    fs::create_dir_all(path.parent().unwrap()).expect("create index cache directory");
+    path
 }
 
 fn copy_named_fixture(label: &str, name: &str) -> (ScratchDir, PathBuf) {

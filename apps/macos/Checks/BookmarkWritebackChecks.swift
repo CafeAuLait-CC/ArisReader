@@ -33,7 +33,7 @@ extension ReaderChecks {
 
         let source = scratch.appendingPathComponent("outlined.pdf")
         try fileManager.copyItem(at: fixture, to: source)
-        let sidecar = source.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: source)
         let bookmarks = [
             Bookmark(page: 0, title: "Alpha", yPt: 120),
             Bookmark(page: 1, title: "Beta", yPt: 340),
@@ -74,7 +74,7 @@ extension ReaderChecks {
         require(sidecarAfterCopy == sidecarBytes,
                 "the original sidecar is untouched by a copy save")
         require(!fileManager.fileExists(
-                    atPath: marked.appendingPathExtension("lyra-reader-annotations.json").path),
+                    atPath: DocumentEditCache.annotationsURL(for: marked).path),
                 "the saved copy carries no sidecar")
 
         // ── 2. The reader reads the merged outline back ─────────────────────────────────
@@ -174,7 +174,7 @@ extension ReaderChecks {
         require(replaced, "replacing the original with its bookmarks succeeds")
         require(reopenedAgain.lastAnnotationWriteReport?.writtenBookmarkIDs.count == 3,
                 "the replace writes the three bookmarks")
-        let replacedSidecar = second.appendingPathExtension("lyra-reader-annotations.json")
+        let replacedSidecar = DocumentEditCache.annotationsURL(for: second)
         let replacedSidecarText = String(
             decoding: (try? Data(contentsOf: replacedSidecar)) ?? Data(),
             as: UTF8.self
