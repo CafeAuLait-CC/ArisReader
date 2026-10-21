@@ -113,7 +113,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   }
   private func hit(_ point: CGPoint) -> PDFContentItem? {
     state?.contentEditPage?.items.filter {
-      (state?.contentEditTool == "link" ? $0.kind == "link" : $0.kind != "link")
+      (state?.contentEditTool == "link" ? $0.kind == "link" :
+        state?.contentEditTool == "text" ? $0.kind == "text" :
+        state?.contentEditTool == "image" ? ["image", "graphic"].contains($0.kind) : $0.kind != "link")
         && frame($0)?.insetBy(dx: -3, dy: -3).contains(point) == true
     }
     .min { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
@@ -153,13 +155,13 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       state.contentEditSelection = nil
       return
     }
-    if state.contentEditTool == "text",
+    if state.contentEditTool == "text", hit(point) == nil,
       let rect = local(CGRect(x: point.x, y: point.y, width: 250, height: 70))
     {
       state.insertContentText(at: rect)
       return
     }
-    if state.contentEditTool == "image",
+    if state.contentEditTool == "image", hit(point) == nil,
       let rect = local(CGRect(origin: point, size: CGSize(width: 1, height: 1)))
     {
       state.chooseContentImage(at: rect)
@@ -440,250 +442,6 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     } else {
       state.scrollByWheelStep(event.scrollingDeltaY)
     }
-  }
-}
-
-struct ContentEditInspector: View {
-  @ObservedObject var state: AppState
-  @State private var font = "Original"
-  @State private var size = 12.0
-  @State private var alignment = 0
-  @State private var colour = Color.black
-  @State private var x = 0.0
-  @State private var y = 0.0
-  @State private var width = 100.0
-  @State private var height = 40.0
-  @State private var imagePreview: NSImage?
-  @State private var showCrop = false
-  @State private var cropLeft = 0.0
-  @State private var cropTop = 0.0
-  @State private var cropRight = 100.0
-  @State private var cropBottom = 100.0
-  @State private var linkDestination = "page"
-  @State private var linkPage = 1
-  @State private var linkURL = "https://"
-  private let fonts = [
-    "Original", "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
-    "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic", "Courier", "Courier-Bold",
-    "LyraReader Sans SC",
-  ]
-  var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 12) {
-        HStack {
-          Text("Edit PDF").font(.headline)
-          Spacer()
-          Button {
-            state.toggleContentEditing()
-          } label: {
-            Image(systemName: "xmark")
-          }
-        }
-        HStack {
-          ForEach(["select", "text", "image", "link"], id: \.self) { tool in
-            Button(tool.capitalized) { state.contentEditTool = tool }
-              .buttonStyle(LyraReaderToolStyle(selected: state.contentEditTool == tool))
-          }
-        }
-        HStack {
-          Button("Erase") { state.contentEditTool = "erase" }
-          Button("Blackout") { state.contentEditTool = "blackout" }
-        }
-        if state.contentEditTool == "erase" || state.contentEditTool == "blackout" {
-          Text(
-            "Drag a rectangle to remove its content. Undo restores the previous working revision."
-          )
-          .font(.caption)
-        }
-        if state.contentEditTool == "link" {
-          Text("Drag a region to create a link, or select an existing link.").font(.caption)
-          if state.selectedContentItem?.kind == "link" || state.contentLinkDraft != nil {
-            Picker("Destination", selection: $linkDestination) {
-              Text("Page").tag("page")
-              Text("URL").tag("url")
-            }
-            if linkDestination == "page" {
-              TextField("Page", value: $linkPage, format: .number)
-            } else {
-              TextField("URL", text: $linkURL)
-            }
-            Button("Apply link") {
-              state.setContentLink(
-                state.selectedContentItem, page: linkDestination == "page" ? linkPage - 1 : nil,
-                uri: linkDestination == "url" ? linkURL : nil)
-            }
-          }
-        }
-        if state.contentEditLoading || state.pageEditBusy { ProgressView() }
-        if state.contentTextRecovery != nil {
-          Text("Recovered text draft").font(.headline)
-          TextEditor(
-            text: Binding(
-              get: { state.contentTextRecovery ?? "" }, set: { state.contentTextRecovery = $0 })
-          ).frame(minHeight: 100)
-          Picker("Font", selection: $font) { ForEach(fonts, id: \.self) { Text($0) } }
-          HStack {
-            Button("Retry") { state.retryContentText(font: font) }
-            Button("Copy") {
-              NSPasteboard.general.clearContents()
-              NSPasteboard.general.setString(state.contentTextRecovery ?? "", forType: .string)
-            }
-            Button("Discard") { state.discardContentTextRecovery() }
-          }
-        }
-        if let item = state.selectedContentItem {
-          Text(item.kind.capitalized).font(.headline)
-          if item.kind == "image" || item.kind == "graphic" {
-            if let imagePreview {
-              Image(nsImage: imagePreview).resizable().scaledToFit().frame(maxHeight: 130)
-            }
-            HStack {
-              Button("Replace…") { state.chooseContentImage(replacing: item) }.disabled(
-                item.paths.contains { $0.count != 1 })
-              Button("Export…") { state.exportContentImage(item) }
-            }
-            if item.paths.allSatisfy({ $0.count == 1 }) {
-              Button("Crop…") { showCrop.toggle() }
-              if showCrop {
-                Text("Retained edges (%)").font(.caption)
-                HStack {
-                  Text("Left")
-                  TextField("Left", value: $cropLeft, format: .number)
-                  Text("Right")
-                  TextField("Right", value: $cropRight, format: .number)
-                }
-                HStack {
-                  Text("Top")
-                  TextField("Top", value: $cropTop, format: .number)
-                  Text("Bottom")
-                  TextField("Bottom", value: $cropBottom, format: .number)
-                }
-                Button("Apply crop") {
-                  state.cropContentImage(
-                    item,
-                    to: CGRect(
-                      x: cropLeft / 100, y: cropTop / 100, width: (cropRight - cropLeft) / 100,
-                      height: (cropBottom - cropTop) / 100))
-                }.disabled(
-                  cropLeft < 0 || cropTop < 0 || cropRight > 100 || cropBottom > 100
-                    || cropRight <= cropLeft || cropBottom <= cropTop)
-              }
-            }
-          }
-          if item.kind == "text" {
-            Text(item.text).lineLimit(3).font(.caption).foregroundStyle(.secondary)
-            if let reason = item.reason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-            if item.can_edit_text {
-              Picker("Font", selection: $font) { ForEach(fonts, id: \.self) { Text($0) } }
-              HStack {
-                Text("Size")
-                TextField("Size", value: $size, format: .number).frame(width: 65)
-                Text("pt")
-              }
-              Picker("Alignment", selection: $alignment) {
-                Text("Left").tag(0)
-                Text("Center").tag(1)
-                Text("Right").tag(2)
-              }
-              ColorPicker("Color", selection: $colour, supportsOpacity: false)
-              Button("Apply text style") {
-                let c = NSColor(colour).usingColorSpace(.deviceRGB) ?? .black
-                let rgba: [UInt8] = [
-                  UInt8((c.redComponent * 255).rounded()),
-                  UInt8((c.greenComponent * 255).rounded()),
-                  UInt8((c.blueComponent * 255).rounded()), 255,
-                ]
-                state.replaceContentText(
-                  item, text: item.text, font: font, size: size, colour: rgba, alignment: alignment)
-              }
-            }
-          }
-          Divider()
-          HStack {
-            Text("X")
-            TextField("X", value: $x, format: .number)
-            Text("Y")
-            TextField("Y", value: $y, format: .number)
-          }
-          HStack {
-            Text("W")
-            TextField("Width", value: $width, format: .number)
-            Text("H")
-            TextField("Height", value: $height, format: .number)
-          }
-          Button("Apply position and size") {
-            state.transformContent(item, to: CGRect(x: x, y: y, width: width, height: height))
-          }
-          HStack {
-            Button {
-              state.transformContent(item, to: item.bounds.rect, rotation: -90)
-            } label: {
-              Image(systemName: "rotate.left")
-            }
-            Button {
-              state.transformContent(item, to: item.bounds.rect, rotation: 90)
-            } label: {
-              Image(systemName: "rotate.right")
-            }
-            Spacer()
-            Button("Delete", role: .destructive) { state.deleteContent(item) }.disabled(
-              item.paths.contains { $0.count != 1 })
-          }
-        } else {
-          Text(
-            "Hover to see a block. Click to select and drag; click selected text again to edit it."
-          ).font(.callout).foregroundStyle(.secondary)
-          Text("Click outside the text or press ⌘Return to apply. Escape cancels typing.").font(
-            .caption
-          ).foregroundStyle(.secondary)
-        }
-        Spacer()
-        if state.isReadOnlyDocument {
-          Text("Signed original is read-only. Changes can be saved to an unsigned copy.").font(
-            .caption)
-        }
-        HStack {
-          Button("Undo") { state.undoPageEdit() }.disabled(!state.canUndoPageEdit)
-          Button("Redo") { state.redoPageEdit() }.disabled(!state.canRedoPageEdit)
-        }
-        Button("Save Edited Copy…") { state.presentSavePageEditsCopyPanel() }.disabled(
-          !state.canSavePageEditsCopy)
-        Button("Replace Original…") { state.presentReplaceOriginalWithPageEditsConfirmation() }
-          .disabled(!state.canReplaceOriginalWithPageEdits)
-      }
-      .padding(16)
-    }.frame(width: 292).frame(maxHeight: .infinity)
-      .background(.regularMaterial)
-      .task(id: "\(state.contentEditPage?.revision ?? "")-\(state.contentEditSelection ?? "")") {
-        imagePreview = nil
-        showCrop = false
-        cropLeft = 0
-        cropTop = 0
-        cropRight = 100
-        cropBottom = 100
-        guard let item = state.selectedContentItem, item.kind == "image" || item.kind == "graphic",
-          let data = try? await state.contentImageData(item), !Task.isCancelled
-        else { return }
-        imagePreview = NSImage(data: data)
-      }
-      .onChange(of: state.selectedContentItem) { _, item in
-        guard let item else { return }
-        font = "Original"
-        size = item.size
-        x = item.bounds.x
-        y = item.bounds.y
-        width = item.bounds.width
-        height = item.bounds.height
-        linkDestination = item.link_uri == nil ? "page" : "url"
-        linkPage = (item.link_page ?? 0) + 1
-        linkURL = item.link_uri ?? "https://"
-        if item.colour.count == 4 {
-          colour = Color(
-            red: Double(item.colour[0]) / 255, green: Double(item.colour[1]) / 255,
-            blue: Double(item.colour[2]) / 255)
-        }
-      }
-      .disabled(state.pageEditBusy || state.contentCommandInFlight)
   }
 }
 

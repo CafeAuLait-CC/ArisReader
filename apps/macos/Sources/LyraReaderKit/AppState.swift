@@ -13917,9 +13917,25 @@ extension AppState {
         contentEditPage?.items.first { $0.id == contentEditSelection }
     }
 
+    public func selectContentTool(_ tool: String) {
+        guard ["select", "text", "image", "link", "erase", "blackout"].contains(tool) else { return }
+        if deferContentTransition({ [weak self] in self?.selectContentTool(tool) }) { return }
+        contentEditTool = tool
+        contentEditSelection = nil
+        contentLinkDraft = nil
+    }
+
+    public func toggleAnnotationTools() {
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleAnnotationTools() }) { return }
+        contentEditEnabled = false
+        pageOverviewVisible = false
+        annotationToolsVisible.toggle()
+    }
+
     public func toggleContentEditing() {
         if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
         contentEditEnabled.toggle()
+        if contentEditEnabled { pageOverviewVisible = false }
         annotationTool = .select
         annotationToolsVisible = false
         contentEditSelection = nil

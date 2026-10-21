@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Native semantic colors from docs/LyraReader-Palette (sRGB). PDF pixels keep their source colors.
+/// Native semantic colors from docs/Lyra-Palette (sRGB). PDF pixels keep their source colors.
 @MainActor
 public enum LyraReaderTheme {
     private static func adaptive(_ light: UInt32, _ dark: UInt32) -> NSColor {
@@ -142,5 +142,53 @@ struct LyraReaderSidebarTabStyle: ButtonStyle {
             .background(configuration.isPressed ? LyraReaderTheme.pressedBg :
                 (selected ? LyraReaderTheme.selectedBg : LyraReaderTheme.hoverBg))
             .contentShape(Rectangle())
+    }
+}
+
+/// Inspector actions share the reader's semantic surfaces in both appearances.
+struct ReaderPanelButtonStyle: ButtonStyle {
+    var prominent = false
+    var selected = false
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .frame(maxWidth: .infinity, minHeight: 32)
+            .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled : prominent ? LyraReaderTheme.onAccent :
+                (selected ? LyraReaderTheme.selectedFg : LyraReaderTheme.textPrimary))
+            .background(!enabled ? LyraReaderTheme.panelBg : prominent ?
+                (configuration.isPressed ? LyraReaderTheme.accentPressed : LyraReaderTheme.accent) :
+                (configuration.isPressed ? LyraReaderTheme.pressedBg :
+                    (selected ? LyraReaderTheme.selectedBg : LyraReaderTheme.fieldBg)),
+                in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(
+                selected ? LyraReaderTheme.accentBorder : LyraReaderTheme.controlBorder))
+            .opacity(enabled ? (configuration.isPressed ? 0.85 : 1) : 0.45)
+    }
+}
+
+struct ReaderPanelSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+            content
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct ReaderPanelFieldStyle: @preconcurrency TextFieldStyle {
+    @MainActor
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .padding(.horizontal, 9).padding(.vertical, 7)
+            .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(LyraReaderTheme.controlBorder))
     }
 }

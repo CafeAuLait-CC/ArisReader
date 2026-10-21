@@ -50,16 +50,20 @@ extension ReaderChecks {
         windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
     }
     let p = point(first)
+    state.selectContentTool("text")
     view.mouseMoved(with: event(.mouseMoved, p))
     require(view.hoveredContentID == first.id, "Edit hover identifies the complete text block")
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseUp(with: event(.leftMouseUp, p))
     require(
       state.contentEditSelection == first.id,
-      "first click selects a block without opening the text editor")
+      "Text tool selects existing text instead of inserting a new block")
     require(
       contentTextViews(view).isEmpty,
       "selection and caret editing are distinct states")
+    state.selectContentTool("select")
+    require(state.contentEditSelection == nil, "switching tools clears the previous object selection")
+    state.contentEditSelection = first.id
     let moved = CGPoint(x: p.x + 20 * state.zoomFactor, y: p.y + 12 * state.zoomFactor)
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseDragged(with: event(.leftMouseDragged, moved))
@@ -289,6 +293,9 @@ extension ReaderChecks {
     require(state.contentEditSelection == item.id, "hosted first click selects the paragraph")
     host.layoutSubtreeIfNeeded()
     if let directory = ProcessInfo.processInfo.environment["LYRA_CONTENT_EVIDENCE"] {
+      // Wait for the secondary-row reveal and selection properties before capturing chrome.
+      try await Task.sleep(for: .milliseconds(450))
+      host.layoutSubtreeIfNeeded()
       try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
       if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
         host.cacheDisplay(in: host.bounds, to: bitmap)

@@ -287,9 +287,12 @@ public struct ReaderWindow: View {
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
                     .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
-                        await state.reloadContentObjects()
+                        if state.contentEditPage?.page != state.currentPage - 1 {
+                            await state.reloadContentObjects()
+                        }
                     }
                 HStack { Spacer(); ContentEditInspector(state:state) }
+                    .padding(.top, ReaderChrome.secondaryToolbarHeightPt)
             }
 
             if state.document == nil {
@@ -421,7 +424,7 @@ public struct ReaderWindow: View {
     /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
     /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
     private var secondaryToolbarVisible: Bool {
-        state.pageOverviewVisible || state.annotationToolsVisible
+        state.pageOverviewVisible || state.annotationToolsVisible || state.contentEditEnabled
     }
 
     private var secondaryToolbarInset: CGFloat {
