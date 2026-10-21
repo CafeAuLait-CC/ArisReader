@@ -69,8 +69,11 @@ of an arbitrary collection of flat paths as one semantic figure is conservative.
 retained-edge percentages. Existing PDF links are supported; arbitrary producer-specific actions
 remain labelled as other destinations until replaced with a supported page or URL.
 
-Pages carrying LyraReader sidecar text-position marks/bookmarks currently require saving those
-marks into a PDF copy before body editing. The editor refuses to silently leave stale text anchors.
+Cached text-position marks and bookmarks are automatically embedded into an internal PDF revision
+before body edits or rotation. The user can edit immediately, and Save writes the combined revision
+into the original unsigned PDF. Working revisions and undo snapshots recover from the application
+cache after an interruption. Legacy adjacent annotation records are imported once with a verified
+backup. See [PDF document saving](PDF-DOCUMENT-SAVING.md).
 Unsupported nested redaction is refused in this workspace rather than flattening surviving text.
 
 ## Verification

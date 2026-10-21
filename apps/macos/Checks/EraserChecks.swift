@@ -26,7 +26,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+            DocumentEditCache.annotationsURL(for: document)
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
             guard let frame = state.canvasPageFrames.first(where: { $0.index == page }) else {

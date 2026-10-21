@@ -26,7 +26,7 @@ extension ReaderChecks {
             return destination
         }
         func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+            DocumentEditCache.annotationsURL(for: document)
         }
         func sidecarText(_ document: URL) throws -> String {
             String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)

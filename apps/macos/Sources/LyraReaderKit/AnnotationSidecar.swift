@@ -42,7 +42,7 @@ import Foundation
 ///   then offers the explicit "back up and start fresh" recovery.
 enum AnnotationSidecar {
     /// Where an entry came from, so the file can be reproduced in its original order.
-    enum Slot {
+    enum Slot: Codable {
         /// An entry this version understands; looking it up by id in the current array keeps
         /// edits, undo and redo working without a second copy of the data.
         case annotation(UUID)

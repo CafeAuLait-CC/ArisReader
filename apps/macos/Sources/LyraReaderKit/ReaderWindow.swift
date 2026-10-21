@@ -102,10 +102,10 @@ public struct ReaderWindow: View {
         .preferredColorScheme(appearance.mode.colorScheme)
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
         .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
-            Button("Save Edited Copy…") {state.saveContentAndClose()}
+            Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {state.saveContentAndClose()}
             Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
             Button("Cancel",role:.cancel) {state.cancelContentClose()}
-        } message: {Text("The original file has not been changed. Save a copy to keep this editing session.")}
+        } message: {Text(state.isReadOnlyDocument ? "Save an unsigned copy to keep these changes." : "Save these changes to the original PDF before closing.")}
         .onAppear { state.installTerminationHandling() }
         // Tell the state whether this toggle is a real animation. The state holds the width-only
         // viewport updates (and releases one rebuild) for the slide, because a loaded machine can
@@ -133,7 +133,7 @@ public struct ReaderWindow: View {
             // The way out of a sidecar that failed to load: an explicit action that moves the
             // unreadable file aside (never overwrites it) and starts a fresh one.
             if state.canRecoverUnreadableAnnotationSidecar {
-                Button("Back Up Sidecar and Start Fresh") {
+                Button("Back Up Recovery Data and Start Fresh") {
                     if let backup = state.recoverUnreadableAnnotationSidecar() {
                         state.revealSidecarBackupInFinder(backup)
                     }
@@ -512,14 +512,7 @@ public struct ReaderWindow: View {
                 .disabled(!state.canUndoPageEdit)
             Button("Redo") { state.redoPageEdit() }
                 .disabled(!state.canRedoPageEdit)
-            Button("Apply to Original…") {
-                state.presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            .disabled(!state.canReplaceOriginalWithPageEdits)
-            .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
-                  : "Replace the original file with the staged page changes")
-            Button("Save Copy…") { state.presentSavePageEditsCopyPanel() }
+            Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") { state.saveDocument() }
                 .disabled(!state.canSavePageEditsCopy)
             Button("Discard…") { state.presentDiscardPageEditsConfirmation() }
         }

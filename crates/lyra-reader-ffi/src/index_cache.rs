@@ -3,7 +3,7 @@
 //! Opening a PDF is cheap; deriving the reader's index from it is not. The reference list, the
 //! figure/table captions, the outline, the recognised metadata and the per-page citation spans
 //! are all read out of the text and object layers, and that work was repeated on every open. This
-//! module stores that derived index beside the PDF and reuses it when the **bytes** the index was
+//! module stores that derived index in the application cache and reuses it when the **bytes** the index was
 //! built from are the same bytes the reader has just opened.
 //!
 //! # Identity: the file's content, never its metadata
@@ -22,8 +22,8 @@
 //!
 //! # File and compatibility
 //!
-//! The sidecar is `<document>.pdf.lyra-reader-index.json`, next to the PDF, following the annotation
-//! sidecar's naming precedent (`<document>.pdf.lyra-reader-annotations.json`). It is a JSON object with
+//! The cache path is keyed by the canonical PDF path inside the platform application cache.
+//! Legacy adjacent index files are disposable and no longer read or written. Each record is a JSON object with
 //! a `kind` tag and a `format_version`. The contract is:
 //!
 //! * **Older or same format, same bytes** — read. Unknown top-level keys make the file
@@ -36,7 +36,7 @@
 //!   is looking at.
 //!
 //! A cache is disposable; derived values are never edited by the user, so unlike the annotation
-//! sidecar there is nothing to merge. The compatibility rule is still conservative: a file this
+//! cache there is nothing to merge. The compatibility rule is still conservative: a file this
 //! build cannot fully understand is left alone rather than rewritten from a partial reading.
 //!
 //! # Atomicity
@@ -100,9 +100,6 @@ pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// Tag that identifies our sidecar (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";
-
-/// Suffix appended to the PDF's own path, matching the annotation sidecar's convention.
-pub(crate) const CACHE_SUFFIX: &str = ".lyra-reader-index.json";
 
 /// Largest cache this reader will read. A derived index for a 2000-page manual is far below
 /// this; anything larger is not a file this build produced, and is preserved rather than
@@ -229,11 +226,39 @@ const KNOWN_KEYS: [&str; 10] = [
     "citations",
 ];
 
-/// `<pdf>.lyra-reader-index.json`, built as an `OsString` so a non-UTF-8 document path keeps working.
+/// Derived indexes belong to the user's platform cache, including PDFs in read-only folders.
 pub(crate) fn cache_path(document_path: &Path) -> PathBuf {
-    let mut path = document_path.as_os_str().to_os_string();
-    path.push(CACHE_SUFFIX);
-    PathBuf::from(path)
+    let root = std::env::var_os("LYRA_READER_INDEX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(platform_cache_root);
+    let canonical = document_path
+        .canonicalize()
+        .unwrap_or_else(|_| document_path.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    root.join(format!("{key}.json"))
+}
+
+fn platform_cache_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library/Caches");
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cache")
+        });
+    root.join("LyraReader/Indexes")
 }
 
 /// Whether this environment asks for the cache to be off. The native regression suite sets it so
@@ -351,6 +376,7 @@ pub(crate) fn write_cache(path: &Path, file: &IndexCacheFile) -> io::Result<u64>
     bytes.push(b'\n');
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

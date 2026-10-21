@@ -148,7 +148,7 @@ extension ReaderChecks {
                 "undo restores the deleted signature")
 
         // ── 3. The sidecar is versioned and round-trips ─────────────────────────────────
-        let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: document)
         let sidecarText = String(decoding: try Data(contentsOf: sidecar), as: UTF8.self)
         require(sidecarText.contains("\"kind\" : \"stamp\"")
                     && sidecarText.contains("\"stampStyle\" : \"approved\"")

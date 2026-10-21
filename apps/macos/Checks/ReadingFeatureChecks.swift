@@ -22,7 +22,7 @@ extension ReaderChecks {
     @MainActor static func bookmarkChecks(url: URL) async throws {
         let directory = url.deletingLastPathComponent()
         let document = directory.appendingPathComponent("bookmarks-\(UUID()).pdf")
-        let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: document)
         try? FileManager.default.removeItem(at: document)
         try? FileManager.default.removeItem(at: sidecar)
         try FileManager.default.copyItem(at: url, to: document)

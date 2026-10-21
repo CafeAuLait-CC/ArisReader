@@ -382,7 +382,7 @@ extension ReaderChecks {
         )
         let encoder = JSONEncoder()
         try encoder.encode([sidecarAnnotation]).write(
-            to: documentURL.appendingPathExtension("lyra-reader-annotations.json")
+            to: DocumentEditCache.annotationsURL(for: documentURL)
         )
         let expectedQuote = AnnotationExport.normalized(
             AnnotationExport.text(in: textPage, range: range) ?? ""
