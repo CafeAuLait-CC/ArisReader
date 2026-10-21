@@ -34,6 +34,9 @@ public struct AIAssistantPanel: View {
                         if !settings.canUseAI {
                             keyMissing
                         }
+                        if model.selectedTab == .summary {
+                            AISummaryPanelView(state: state, model: model.layeredSummary)
+                        }
                         actions
                         if displaysCurrentRequest, let note = model.statusNote, !note.isEmpty,
                            !model.isDocumentChatPlan, !model.isChatStreaming,
@@ -91,6 +94,7 @@ public struct AIAssistantPanel: View {
         .textFieldStyle(ReaderPanelFieldStyle())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
+        .onChange(of: state.outline.count) { _, _ in syncLayered() }
     }
 
     private var noDocument: some View {
@@ -562,6 +566,19 @@ public struct AIAssistantPanel: View {
 
     private func sync() {
         model.attach(service: state.aiChatService, context: state.aiReaderContext)
+        syncLayered()
+    }
+
+    /// The outline loads asynchronously after the document opens, so the layered summary is
+    /// attached again when its entry count changes. The model ignores a repeated attach for the
+    /// same document and outline.
+    private func syncLayered() {
+        model.layeredSummary.attach(
+            service: state.aiChatService,
+            context: state.aiReaderContext,
+            outline: state.outline,
+            documentURL: state.document?.url
+        )
     }
 }
 
