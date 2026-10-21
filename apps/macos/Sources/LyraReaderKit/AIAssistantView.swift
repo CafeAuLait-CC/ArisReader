@@ -101,7 +101,7 @@ public struct AIAssistantPanel: View {
             Text("No document")
                 .font(.callout)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
-            Text("Open a PDF to summarise a page, ask about a selection, or translate one.")
+            Text("Open a PDF to summarise, translate a passage or start a conversation.")
                 .font(.caption)
                 .foregroundStyle(LyraReaderTheme.textTertiary)
                 .multilineTextAlignment(.center)
@@ -172,29 +172,37 @@ public struct AIAssistantPanel: View {
                     TextField("Translate to", text: $model.targetLanguage)
                         .accessibilityLabel("Target language")
                 }
-                ForEach(model.selectedTab == .translation ? [.translateSelection] :
-                    [AIAssistantAction.summarizePage, .summarizeDocument]) { action in
-                    Button {
-                        prepare(action)
-                    } label: {
-                        Label(action.title, systemImage: action.systemImage)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
+                if model.selectedTab != .translation {
+                    Picker("Target", selection: $model.summaryUsesSelection) {
+                        Text("Document").tag(false)
+                        Text("Selected text").tag(true)
                     }
-                    .disabled(disabled(action))
+                    .pickerStyle(.segmented).labelsHidden()
+                    Text("Research question, approach, evidence and limitations in one complete summary.")
+                        .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                let action: AIAssistantAction = model.selectedTab == .translation ? .translateSelection :
+                    (model.summaryUsesSelection ? .summarizeSelection : .summarizeDocument)
+                Button { prepare(action) } label: {
+                    Label(model.selectedTab == .translation ? "Preview Translation" : "Preview Summary",
+                          systemImage: model.selectedTab == .translation ? "character.bubble" : "sparkles")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(ReaderPanelButtonStyle(prominent: true))
+                .disabled(disabled(action))
             }
             if let selection = state.selection {
                 Label("\(selection.range.count) characters · page \(selection.page + 1)", systemImage: "text.quote")
                     .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
             } else {
                 Text(model.selectedTab == .translation ? "Select text on the page to translate it." :
-                    "Summarise this page or the whole document. Select text to ask a focused question.")
+                    "Choose the complete document, or select a passage on the page.")
                     .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textTertiary)
             }
             if model.selectedTab != .translation {
-                ReaderPanelSection(title: "Ask Selection") {
+                DisclosureGroup("Question about a selection") {
                     TextField("Question about the selected text…", text: $model.question, axis: .vertical)
                         .lineLimit(2...5)
                     Button("Preview Question") { prepare(.askSelection) }
@@ -569,16 +577,19 @@ public struct AIAssistantRightPanelContent: View {
                 Button { state.toggleRightPanel() } label: { Image(systemName: "xmark") }
                     .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Close AI assistant")
             }.padding(.horizontal, 14).padding(.vertical, 8)
-            HStack(spacing: 1) {
-                ForEach(AIAssistantTab.allCases) { tab in
-                    Button { model.selectedTab = tab } label: {
-                        Text(tab.title).lineLimit(1).minimumScaleFactor(0.85)
-                            .font(.system(size: 12, weight: .medium)).frame(maxWidth: .infinity)
+            GeometryReader { geometry in
+                HStack(spacing: 1) {
+                    ForEach(AIAssistantTab.allCases) { tab in
+                        Button { model.selectedTab = tab } label: {
+                            Text(tab.title).fixedSize(horizontal: true, vertical: false)
+                                .font(.system(size: 12, weight: .medium))
+                                .frame(width: max(0, (geometry.size.width - 2) / 3))
+                        }
+                        .buttonStyle(LyraReaderSidebarTabStyle(selected: model.selectedTab == tab))
+                        .accessibilityAddTraits(model.selectedTab == tab ? .isSelected : [])
                     }
-                    .buttonStyle(LyraReaderSidebarTabStyle(selected: model.selectedTab == tab))
-                    .accessibilityAddTraits(model.selectedTab == tab ? .isSelected : [])
-                }
-            }.background(LyraReaderTheme.separator).padding(.horizontal, 12).padding(.bottom, 12)
+                }.background(LyraReaderTheme.separator)
+            }.frame(height: 32).padding(.horizontal, 12).padding(.bottom, 12)
             Divider().overlay(LyraReaderTheme.separator)
             if model.selectedTab == .chat {
                 AIDocumentChatView(state: state, model: model)
