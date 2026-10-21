@@ -13,8 +13,10 @@ pub mod openai;
 pub mod provider;
 
 pub use chat::{
-    Action, ChatPart, ChatPlan, ChatSettings, EndpointInfo, PageText, PlanRequest, SelectionRange,
-    inspect_base_url, validate_model,
+    Action, CHAT_RETRIEVED_BLOCKS, ChatPart, ChatPlan, ChatSettings, ChatSource, ConversationTurn,
+    DocumentChatRequest, EndpointInfo, MAX_CHAT_CONTEXT_CHARS, MAX_CHAT_HISTORY_CHARS,
+    MAX_CHAT_HISTORY_TURNS, NOTHING_RELEVANT_MESSAGE, PageText, PlanRequest, SelectionRange,
+    SourceRect, build_document_chat_plan, inspect_base_url, validate_model,
 };
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
 pub use mock::MockProvider;

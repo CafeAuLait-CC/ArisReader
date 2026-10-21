@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::chat::ChatPlan;
+use crate::chat::{Action, ChatPlan};
 use crate::openai::{CancellationToken, RunEvent, TokenUsage};
 use crate::provider::AiError;
 
@@ -77,6 +77,22 @@ impl MockProvider {
                 std::thread::sleep(self.delay.min(Duration::from_millis(250)));
                 cancel.check()?;
                 emit(RunEvent::Delta(chunk.replace("{page}", &page.to_string())));
+            }
+            // A document-chat answer is about several retrieved pages; cite every page that
+            // was sent so the panel's citation chips and the unverified-citation refusal are
+            // both exercisable without inventing pages in the test itself.
+            if plan.action == Action::DocumentChat {
+                let mut pages = part.pages.clone();
+                pages.sort_unstable();
+                pages.dedup();
+                let citations = pages
+                    .iter()
+                    .map(|page| format!("[p.{page}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !citations.is_empty() {
+                    emit(RunEvent::Delta(format!("\n\nSources: {citations}.")));
+                }
             }
             emit(RunEvent::Usage(self.usage));
         }

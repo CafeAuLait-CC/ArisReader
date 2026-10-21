@@ -27,6 +27,17 @@ pub const MAX_SELECTION_CHARS: usize = 12_000;
 pub const MAX_RETRIEVED_CHARS: usize = 2_000;
 /// Retrieved blocks considered for one request.
 pub const RETRIEVED_BLOCKS: usize = 4;
+/// Document chat is read-only retrieval over the whole document: more context than a page
+/// summary, but still a small set of passages rather than the document.
+pub const CHAT_RETRIEVED_BLOCKS: usize = 6;
+/// Largest amount of retrieved document text sent with one chat question.
+pub const MAX_CHAT_CONTEXT_CHARS: usize = 4_000;
+/// Previous exchanges kept in a document chat. Each exchange is one question and its answer;
+/// the bound is applied by the UI and again here, so a stale caller cannot grow the request.
+pub const MAX_CHAT_HISTORY_TURNS: usize = 6;
+/// Largest amount of earlier conversation text placed in one chat request. Oldest exchanges
+/// are dropped until the rest fit; the current question and retrieval are never counted here.
+pub const MAX_CHAT_HISTORY_CHARS: usize = 8_000;
 /// A page longer than this is split into several context segments before the parts are grouped.
 const MAX_SEGMENT_CHARS: usize = 3_500;
 /// Longest single paragraph kept intact before it is split on a whitespace boundary.
@@ -43,6 +54,8 @@ pub enum Action {
     AskSelection,
     /// Translate the current selection.
     TranslateSelection,
+    /// Answer a question about the whole document, carrying the conversation forward.
+    DocumentChat,
 }
 
 impl Action {
@@ -53,6 +66,7 @@ impl Action {
             Self::SummarizeDocument => "Summarise the document",
             Self::AskSelection => "Ask about the selection",
             Self::TranslateSelection => "Translate the selection",
+            Self::DocumentChat => "Ask the document",
         }
     }
 
@@ -315,6 +329,35 @@ impl SelectionRange {
     }
 }
 
+/// One previous exchange in a document chat. The answer is what the reader saw, including a
+/// partial answer kept after Cancel; the UI decides which turns are worth carrying forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub question: String,
+    pub answer: String,
+}
+
+/// A rectangle of the page a retrieved passage came from, in 100% page-local view space
+/// (top-left origin) — the same coordinates the reader's text selection uses. The shell turns
+/// these into the transient source highlight, so no PDF annotation is ever written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceRect {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// One retrieved passage attached to a chat plan: the page the model was given, a short
+/// reader-facing snippet, and the page geometry to highlight when the reader follows a citation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatSource {
+    /// 1-based page, matching `[p.N]` and the preview.
+    pub page: u32,
+    pub snippet: String,
+    pub rects: Vec<SourceRect>,
+}
+
 /// Everything the context builder needs. The FFI layer fills `pages` from the open document; the
 /// Rust tests fill it with synthetic pages, so both exercise the same selection logic.
 #[derive(Clone, Debug, PartialEq)]
@@ -327,6 +370,23 @@ pub struct PlanRequest {
     pub selection: Option<SelectionRange>,
     pub question: Option<String>,
     pub language: Option<String>,
+    pub pages: Vec<PageText>,
+    pub settings: ChatSettings,
+}
+
+/// The local input to one document-chat question. It is separate from [`PlanRequest`] because
+/// the conversation is part of the request: the builder bounds it, renders it into the prompt
+/// and reports how many turns were kept. The FFI fills `pages` with the whole document's text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentChatRequest {
+    pub document_title: String,
+    pub page_count: u32,
+    /// 0-based page the reader is looking at; the retrieval is never limited to it.
+    pub current_page: u32,
+    pub question: String,
+    /// Oldest first. At most [`MAX_CHAT_HISTORY_TURNS`] and
+    /// [`MAX_CHAT_HISTORY_CHARS`] survive; the builder states which were dropped.
+    pub history: Vec<ConversationTurn>,
     pub pages: Vec<PageText>,
     pub settings: ChatSettings,
 }
@@ -374,6 +434,11 @@ pub struct ChatPlan {
     pub source_pages: Vec<u32>,
     /// Long-document or truncation explanation, shown above the preview.
     pub note: Option<String>,
+    /// Passages sent with this plan, with page geometry. Document chat uses these for chips
+    /// and for the transient source highlight; other actions may also carry retrieved passages.
+    pub sources: Vec<ChatSource>,
+    /// Previous exchanges included in a document-chat request, after the bound was applied.
+    pub history_turns: u32,
 }
 
 impl ChatPlan {
@@ -503,6 +568,8 @@ pub fn build_merge_plan(request: MergePlanRequest) -> Result<ChatPlan, AiError> 
         }],
         source_pages: pages,
         note,
+        sources: Vec::new(),
+        history_turns: 0,
     })
 }
 
@@ -723,6 +790,17 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
             request.current_page + 1
         )));
     }
+    if request.action == Action::DocumentChat {
+        return build_document_chat_plan(DocumentChatRequest {
+            document_title: request.document_title,
+            page_count: request.page_count,
+            current_page: request.current_page,
+            question: request.question.unwrap_or_default(),
+            history: Vec::new(),
+            pages: request.pages,
+            settings: request.settings,
+        });
+    }
     let (endpoint, model, temperature, max_tokens, reasoning) =
         validate_settings(&request.settings)?;
 
@@ -742,6 +820,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
         temperature,
         max_tokens,
         reasoning,
+        sources: Vec::new(),
     };
 
     let (parts, note) = match request.action {
@@ -759,7 +838,13 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
         }
         Action::SummarizePage => builder.summarize_page(&pages)?,
         Action::SummarizeDocument => builder.summarize_document(&pages)?,
+        Action::DocumentChat => {
+            return Err(empty_context(
+                "Ask the document uses its conversation-aware request builder.",
+            ));
+        }
     };
+    let sources = std::mem::take(&mut builder.sources);
 
     let mut source_pages: Vec<u32> = parts
         .iter()
@@ -782,6 +867,8 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
         parts,
         source_pages,
         note,
+        sources,
+        history_turns: 0,
     })
 }
 
@@ -791,6 +878,8 @@ struct PlanBuilder<'a> {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     reasoning: Option<ReasoningRequest>,
+    /// Retrieval attached to the plan by the action that built it.
+    sources: Vec<ChatSource>,
 }
 
 impl PlanBuilder<'_> {
@@ -820,6 +909,7 @@ impl PlanBuilder<'_> {
             RETRIEVED_BLOCKS,
             MAX_RETRIEVED_CHARS,
         );
+        self.record_sources(&retrieved);
         let context = RetrievalText::render(&retrieved);
 
         let mut used_pages = vec![page + 1];
@@ -918,6 +1008,7 @@ impl PlanBuilder<'_> {
             RETRIEVED_BLOCKS,
             MAX_RETRIEVED_CHARS,
         );
+        self.record_sources(&retrieved);
         let context = RetrievalText::render(&retrieved);
 
         let mut used_pages = vec![page + 1];
@@ -1109,6 +1200,19 @@ impl PlanBuilder<'_> {
             None
         };
         Ok((parts, note))
+    }
+
+    /// Keep the retrieved passages (page, snippet, line boxes) on the plan for the panel's
+    /// citation chips. Other actions also get `sources`; only chat renders them as backlinks.
+    fn record_sources(&mut self, retrieved: &[Retrieved]) {
+        self.sources = retrieved
+            .iter()
+            .map(|block| ChatSource {
+                page: block.page + 1,
+                snippet: snippet(&block.text),
+                rects: block.rects.clone(),
+            })
+            .collect();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1431,12 +1535,15 @@ struct Block {
     page: u32,
     text: String,
     terms: Vec<String>,
+    /// Page-local line boxes for this block, when the text layer carries geometry.
+    rects: Vec<SourceRect>,
 }
 
 #[derive(Clone, Debug)]
 struct Retrieved {
     page: u32,
     text: String,
+    rects: Vec<SourceRect>,
 }
 
 struct RetrievalText;
@@ -1527,6 +1634,7 @@ fn document_blocks(pages: &[Option<&PageText>]) -> Vec<Block> {
                 blocks.push(Block {
                     page: page as u32,
                     terms: tokenize(&chunk),
+                    rects: block_source_rects(page_text, &chunk),
                     text: chunk,
                 });
             }
@@ -1681,12 +1789,302 @@ fn retrieve(
         results.push(Retrieved {
             page: block.page,
             text,
+            rects: block.rects.clone(),
         });
         if results.len() >= limit {
             break;
         }
     }
     results
+}
+
+// ── Document chat ───────────────────────────────────────────────────────────────────────────
+
+/// The reader-facing answer when retrieval finds nothing. The shell recognises this sentence to
+/// keep the question as a local exchange instead of showing a provider error.
+pub const NOTHING_RELEVANT_MESSAGE: &str = "Nothing in this document is relevant to the question, so nothing was sent. Try a different wording or a more specific term.";
+
+/// Build one document-chat request: rank blocks from the whole document, fit them into the
+/// retrieval budget, carry the bounded conversation forward, and attach the page geometry the
+/// panel needs for citation chips and the transient source highlight.
+///
+/// No I/O, no key, no network. An empty retrieval is an [`AiError::EmptyContext`], not a plan
+/// with an empty context, so the panel can answer honestly without calling the provider.
+pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan, AiError> {
+    if request.page_count == 0 {
+        return Err(empty_context("This document has no pages."));
+    }
+    if request.current_page >= request.page_count {
+        return Err(empty_context(format!(
+            "The current page {} is outside this document.",
+            request.current_page + 1
+        )));
+    }
+    let (endpoint, model, temperature, max_tokens, reasoning) =
+        validate_settings(&request.settings)?;
+    let question = request.question.trim();
+    if question.is_empty() {
+        return Err(empty_context("Type a question first; nothing was sent."));
+    }
+    if question.chars().count() > 4_000 {
+        return Err(empty_context(
+            "The question is longer than 4,000 characters; shorten it and retry. Nothing was sent.",
+        ));
+    }
+
+    let mut pages: Vec<Option<&PageText>> = vec![None; request.page_count as usize];
+    for page in &request.pages {
+        if let Some(slot) = pages.get_mut(page.page as usize) {
+            *slot = Some(page);
+        }
+    }
+    let blocks = document_blocks(&pages);
+    let retrieved = retrieve(
+        &blocks,
+        question,
+        None,
+        CHAT_RETRIEVED_BLOCKS,
+        MAX_CHAT_CONTEXT_CHARS,
+    );
+    if retrieved.is_empty() {
+        return Err(empty_context(NOTHING_RELEVANT_MESSAGE));
+    }
+    let context = RetrievalText::render(&retrieved);
+
+    let mut source_pages: Vec<u32> = retrieved.iter().map(|block| block.page + 1).collect();
+    source_pages.sort_unstable();
+    source_pages.dedup();
+    let sources: Vec<ChatSource> = retrieved
+        .iter()
+        .map(|block| ChatSource {
+            page: block.page + 1,
+            snippet: snippet(&block.text),
+            rects: block.rects.clone(),
+        })
+        .collect();
+
+    let (history, dropped) = bounded_history(&request.history);
+    let mut user = format!(
+        "Answer the reader's question about the document \"{}\" using the retrieved passages below.\n",
+        request.document_title
+    );
+    if !history.is_empty() {
+        user.push_str("\n[Earlier conversation]\n");
+        for (index, turn) in history.iter().enumerate() {
+            user.push_str(&format!(
+                "Q{}: {}\nA{}: {}\n",
+                index + 1,
+                turn.question.trim(),
+                index + 1,
+                turn.answer.trim()
+            ));
+        }
+    }
+    user.push_str("\n[Retrieved passages from the document]\n");
+    user.push_str(&context);
+    user.push_str(&format!(
+        "\n\n[Current question]\n{question}\n\nAnswer in a few short paragraphs. Cite every factual claim with [p.N], using only the 1-based page numbers that appear in the retrieved passages above. If the passages do not contain the answer, say so plainly rather than guessing."
+    ));
+    let system = document_chat_system_prompt();
+    let wire_body = make_wire_body(
+        &model,
+        temperature,
+        max_tokens,
+        reasoning.as_ref(),
+        &system,
+        &user,
+    );
+    let request_characters = (system.chars().count() + user.chars().count()) as u64;
+    let page_characters = context.chars().count() as u64;
+    let primary_page = source_pages.first().copied().unwrap_or(1);
+    let label = page_label(&source_pages);
+    let note = (dropped > 0).then(|| {
+        format!(
+            "{dropped} older conversation turn(s) were left out: the last {MAX_CHAT_HISTORY_TURNS} turns are kept, within {MAX_CHAT_HISTORY_CHARS} characters."
+        )
+    });
+    Ok(ChatPlan {
+        action: Action::DocumentChat,
+        document_title: request.document_title,
+        page_count: request.page_count,
+        base_url: endpoint.base_url,
+        endpoint: endpoint.endpoint,
+        host: endpoint.host,
+        is_local: endpoint.is_local,
+        model,
+        temperature,
+        max_tokens,
+        parts: vec![ChatPart {
+            index: 0,
+            total: 1,
+            label,
+            pages: source_pages.clone(),
+            primary_page,
+            page_characters,
+            request_characters,
+            system_prompt: system,
+            user_prompt: user,
+            wire_body,
+            note: note.clone(),
+        }],
+        source_pages,
+        note,
+        sources,
+        history_turns: u32::try_from(history.len()).unwrap_or(u32::MAX),
+    })
+}
+
+fn document_chat_system_prompt() -> String {
+    "You are LyraReader, a careful reading assistant inside a PDF reader. Answer only from the retrieved passages and earlier conversation in this request; do not add outside knowledge. Cite every factual claim with a marker in the exact form [p.12], using the 1-based page numbers in the retrieved passages. Cite only pages that appear in those passages; never cite a page that was not sent. If the passages do not contain the answer, say so plainly. Be concise and do not repeat the whole retrieved text.".to_string()
+}
+
+/// Keep the most recent exchanges, then the oldest are dropped until the character budget fits.
+/// Returning the number dropped lets the plan explain the truncation instead of silently losing
+/// the conversation.
+fn bounded_history(history: &[ConversationTurn]) -> (Vec<ConversationTurn>, usize) {
+    let mut turns: Vec<ConversationTurn> = history
+        .iter()
+        .filter(|turn| !turn.question.trim().is_empty() && !turn.answer.trim().is_empty())
+        .cloned()
+        .collect();
+    let original = turns.len();
+    if turns.len() > MAX_CHAT_HISTORY_TURNS {
+        turns.drain(..turns.len() - MAX_CHAT_HISTORY_TURNS);
+    }
+    let mut total: usize = turns
+        .iter()
+        .map(|turn| turn.question.chars().count() + turn.answer.chars().count())
+        .sum();
+    while total > MAX_CHAT_HISTORY_CHARS && turns.len() > 1 {
+        let removed = turns.remove(0);
+        total -= removed.question.chars().count() + removed.answer.chars().count();
+    }
+    if total > MAX_CHAT_HISTORY_CHARS {
+        let turn = &mut turns[0];
+        let question_chars = turn.question.chars().count();
+        let budget = MAX_CHAT_HISTORY_CHARS.saturating_sub(question_chars);
+        turn.answer = truncate_chars(&turn.answer, budget).0;
+    }
+    let kept = turns.len();
+    (turns, original - kept)
+}
+
+/// A reader-facing excerpt for a citation chip. Whitespace is collapsed because the chip is one
+/// line; the full passage still goes to the model.
+fn snippet(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = collapsed.chars();
+    let prefix: String = characters.by_ref().take(160).collect();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+/// Map a retrieved block back to the page's character boxes so a citation can highlight the
+/// passage instead of only jumping to the page.
+///
+/// The block was built from normalised line text, so this is a search rather than an index
+/// mapping. A block whose text cannot be located gets no rectangles and the panel still jumps to
+/// the page, but it never invents a region.
+fn block_source_rects(page: &PageText, block: &str) -> Vec<SourceRect> {
+    if page.chars.is_empty() {
+        return Vec::new();
+    }
+    let haystack: Vec<char> = page.text.chars().collect();
+    if haystack.len() != page.chars.len() {
+        // The boxes and the text disagree; a geometric claim would be wrong.
+        return Vec::new();
+    }
+    let needle: Vec<char> = block.trim().chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let found = find_char_run(&haystack, &needle).map(|start| (start, needle.len()));
+    let (start, length) = match found {
+        Some(value) => value,
+        None => {
+            let prefix: Vec<char> = needle.iter().copied().take(48).collect();
+            let Some(start) = find_char_run(&haystack, &prefix) else {
+                return Vec::new();
+            };
+            (start, prefix.len())
+        }
+    };
+    let end = (start + length).min(page.chars.len());
+    #[derive(Clone, Copy)]
+    struct LineBox {
+        min_x: f64,
+        max_x: f64,
+        min_y: f64,
+        max_y: f64,
+        line_y: f64,
+    }
+    impl LineBox {
+        fn into_rect(self) -> Option<SourceRect> {
+            (self.max_x > self.min_x && self.max_y > self.min_y).then_some(SourceRect {
+                x_pt: self.min_x,
+                y_pt: self.min_y,
+                width_pt: self.max_x - self.min_x,
+                height_pt: self.max_y - self.min_y,
+            })
+        }
+    }
+    let mut rects: Vec<SourceRect> = Vec::new();
+    let mut current: Option<LineBox> = None;
+    for character in &page.chars[start..end] {
+        if character.width_pt <= 0.0 || character.height_pt <= 0.0 {
+            continue;
+        }
+        let top = character.y_pt;
+        let bottom = character.y_pt + character.height_pt;
+        let left = character.x_pt;
+        let right = character.x_pt + character.width_pt;
+        match &mut current {
+            Some(line) => {
+                let line_height = (line.max_y - line.min_y).max(bottom - top);
+                if (top - line.line_y).abs() > line_height.max(1.0) * 0.6 {
+                    if let Some(rect) = current.take().and_then(LineBox::into_rect) {
+                        rects.push(rect);
+                    }
+                    current = Some(LineBox {
+                        min_x: left,
+                        max_x: right,
+                        min_y: top,
+                        max_y: bottom,
+                        line_y: top,
+                    });
+                } else {
+                    line.min_x = line.min_x.min(left);
+                    line.max_x = line.max_x.max(right);
+                    line.min_y = line.min_y.min(top);
+                    line.max_y = line.max_y.max(bottom);
+                }
+            }
+            None => {
+                current = Some(LineBox {
+                    min_x: left,
+                    max_x: right,
+                    min_y: top,
+                    max_y: bottom,
+                    line_y: top,
+                });
+            }
+        }
+    }
+    if let Some(rect) = current.and_then(LineBox::into_rect) {
+        rects.push(rect);
+    }
+    rects
+}
+
+fn find_char_run(haystack: &[char], needle: &[char]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .find(|&start| &haystack[start..start + needle.len()] == needle)
 }
 
 #[cfg(test)]
@@ -2371,8 +2769,262 @@ mod tests {
         }
     }
 
+    // ── Document chat ───────────────────────────────────────────────────────────────────────
+
+    /// A page whose character boxes match its text exactly. Geometry is required here: the
+    /// source highlight must come from the passage that was sent, not from a whole-page guess.
+    fn page_with_geometry(page: u32, lines: &[&str]) -> PageText {
+        let text = lines.join("\n");
+        let mut chars = Vec::new();
+        for (line_index, line) in lines.iter().enumerate() {
+            for (column, character) in line.chars().enumerate() {
+                chars.push(PageChar {
+                    unicode: character as u32,
+                    x_pt: 72.0 + column as f64 * 6.0,
+                    y_pt: 72.0 + line_index as f64 * 14.0,
+                    width_pt: 5.5,
+                    height_pt: 11.0,
+                });
+            }
+            if line_index + 1 < lines.len() {
+                chars.push(PageChar {
+                    unicode: 10,
+                    x_pt: 72.0,
+                    y_pt: 72.0 + line_index as f64 * 14.0 + 12.0,
+                    width_pt: 0.0,
+                    height_pt: 0.0,
+                });
+            }
+        }
+        PageText { page, text, chars }
+    }
+
+    /// Eight pages. Only pages 2, 4 and 6 answer the question; the rest are plausible decoys
+    /// that share the document's ordinary vocabulary.
+    fn chat_document() -> Vec<PageText> {
+        vec![
+            page_with_geometry(
+                0,
+                &["This introduction describes the reading study and its broad background."],
+            ),
+            page_with_geometry(
+                1,
+                &["The spectral absorbance experiment measured light across the sample."],
+            ),
+            page_with_geometry(
+                2,
+                &["A discussion of unrelated administrative scheduling details for the team."],
+            ),
+            page_with_geometry(
+                3,
+                &["The retrieval baseline improved recall on every evaluation query."],
+            ),
+            page_with_geometry(
+                4,
+                &["Appendix notes about typography, margins and page layout decisions."],
+            ),
+            page_with_geometry(
+                5,
+                &["The evaluation query set was replayed against the retrieval baseline."],
+            ),
+            page_with_geometry(
+                6,
+                &["Acknowledgements thank the library staff for their patient help."],
+            ),
+            page_with_geometry(
+                7,
+                &["References point to prior work on reading interfaces and typography."],
+            ),
+        ]
+    }
+
+    fn chat_request(history: Vec<ConversationTurn>) -> DocumentChatRequest {
+        DocumentChatRequest {
+            document_title: "Chat paper".to_string(),
+            page_count: 8,
+            current_page: 0,
+            question: "How did the spectral absorbance experiment and the retrieval baseline change the evaluation query results?".to_string(),
+            history,
+            pages: chat_document(),
+            settings: settings("http://localhost:11434/v1"),
+        }
+    }
+
+    #[test]
+    fn document_chat_retrieves_from_several_pages_not_the_whole_document() {
+        let plan = build_document_chat_plan(chat_request(Vec::new())).unwrap();
+        assert_eq!(plan.action, Action::DocumentChat);
+        assert_eq!(plan.parts.len(), 1);
+        let part = &plan.parts[0];
+        assert_eq!(part.pages, vec![2, 4, 6], "pages: {:?}", part.pages);
+        assert!(part.pages.len() > 1, "several pages are retrieved");
+        assert!(part.pages.len() < plan.page_count as usize);
+        assert_eq!(plan.source_pages, part.pages);
+        for page in &part.pages {
+            assert!(
+                part.user_prompt.contains(&format!("[Page {page}]")),
+                "page {page} is labelled in the prompt"
+            );
+            assert!(
+                part.wire_body
+                    .contains(&format!("[Retrieved context] [Page {page}]")),
+                "page {page} is labelled in the body"
+            );
+        }
+        for absent in ["[Page 1]", "[Page 3]", "[Page 5]", "[Page 7]", "[Page 8]"] {
+            assert!(
+                !part.wire_body.contains(absent),
+                "{absent} must not be sent: {}",
+                part.wire_body
+            );
+        }
+        assert!(
+            !part.wire_body.contains("administrative scheduling details"),
+            "a decoy page's text was not included"
+        );
+        assert!(
+            part.page_characters > 0
+                && part.page_characters
+                    < plan
+                        .parts
+                        .iter()
+                        .map(|part| part.page_characters)
+                        .sum::<u64>()
+                        + 1,
+            "the preview reports the retrieval characters"
+        );
+        assert!(part.request_characters > part.page_characters);
+    }
+
+    #[test]
+    fn document_chat_carries_the_previous_turn_and_its_new_retrieval() {
+        let history = vec![ConversationTurn {
+            question: "What did the introduction say?".to_string(),
+            answer: "The introduction described the reading study [p.1].".to_string(),
+        }];
+        let plan = build_document_chat_plan(chat_request(history)).unwrap();
+        assert_eq!(plan.history_turns, 1);
+        let prompt = &plan.parts[0].user_prompt;
+        assert!(prompt.contains("[Earlier conversation]"));
+        assert!(prompt.contains("What did the introduction say?"));
+        assert!(prompt.contains("The introduction described the reading study [p.1]."));
+        assert!(prompt.contains("[Page 4]"), "new retrieval is present");
+        assert!(
+            plan.parts[0]
+                .wire_body
+                .contains("The introduction described the reading study [p.1]."),
+            "the earlier answer is in the exact request body"
+        );
+        assert!(
+            prompt.find("What did the introduction say?").unwrap()
+                < prompt.find("[Retrieved passages").unwrap(),
+            "history precedes the current retrieval"
+        );
+    }
+
+    #[test]
+    fn document_chat_history_keeps_the_last_six_turns_and_drops_the_oldest() {
+        let history: Vec<ConversationTurn> = (0..7)
+            .map(|index| ConversationTurn {
+                question: format!("oldest-marker-{index}: what did page {} say?", index + 1),
+                answer: format!("answer-marker-{index}: it described the method [p.2]."),
+            })
+            .collect();
+        let plan = build_document_chat_plan(chat_request(history)).unwrap();
+        assert_eq!(plan.history_turns, MAX_CHAT_HISTORY_TURNS as u32);
+        let prompt = &plan.parts[0].user_prompt;
+        assert!(
+            !prompt.contains("oldest-marker-0"),
+            "the oldest turn is dropped"
+        );
+        assert!(
+            !prompt.contains("answer-marker-0"),
+            "its answer is dropped too"
+        );
+        assert!(
+            prompt.contains("oldest-marker-1"),
+            "the second-oldest turn is kept"
+        );
+        assert!(
+            prompt.contains("oldest-marker-6"),
+            "the newest turn is kept"
+        );
+        assert!(
+            plan.note
+                .as_deref()
+                .unwrap_or("")
+                .contains("1 older conversation turn")
+        );
+        assert_eq!(prompt.matches("[Earlier conversation]").count(), 1);
+    }
+
+    #[test]
+    fn document_chat_history_character_budget_drops_older_turns() {
+        let huge = "detail ".repeat(2_000);
+        let history = vec![
+            ConversationTurn {
+                question: "older-question".to_string(),
+                answer: huge.clone(),
+            },
+            ConversationTurn {
+                question: "newer-question".to_string(),
+                answer: "short answer [p.2]".to_string(),
+            },
+        ];
+        let plan = build_document_chat_plan(chat_request(history)).unwrap();
+        assert_eq!(plan.history_turns, 1);
+        assert!(plan.parts[0].user_prompt.contains("newer-question"));
+        assert!(!plan.parts[0].user_prompt.contains("older-question"));
+    }
+
+    #[test]
+    fn document_chat_with_no_relevant_passage_refuses_before_a_request() {
+        let mut request = chat_request(Vec::new());
+        request.question = "zzzz-quasar-xylophone".to_string();
+        let error = build_document_chat_plan(request).unwrap_err();
+        match error {
+            AiError::EmptyContext(message) => {
+                assert!(message.contains("Nothing in this document is relevant"));
+                assert!(message.contains("nothing was sent"));
+            }
+            other => panic!("expected EmptyContext, got {other:?}"),
+        }
+
+        let mut blank = chat_request(Vec::new());
+        blank.question = "   ".to_string();
+        assert!(build_document_chat_plan(blank).is_err());
+    }
+
+    #[test]
+    fn document_chat_sources_carry_the_sent_snippet_and_page_geometry() {
+        let plan = build_document_chat_plan(chat_request(Vec::new())).unwrap();
+        assert_eq!(plan.sources.len(), plan.parts[0].pages.len());
+        for source in &plan.sources {
+            assert!(plan.parts[0].pages.contains(&source.page));
+            assert!(!source.snippet.is_empty());
+            assert!(!source.snippet.contains('\n'));
+            assert!(source.snippet.chars().count() <= 161);
+            assert!(
+                !source.rects.is_empty(),
+                "page {} has geometry",
+                source.page
+            );
+            for rect in &source.rects {
+                assert!(rect.width_pt > 0.0 && rect.height_pt > 0.0);
+                assert!(rect.x_pt >= 72.0 - 0.01 && rect.y_pt >= 72.0 - 0.01);
+            }
+            assert!(
+                plan.parts[0]
+                    .user_prompt
+                    .contains(source.snippet.trim_end_matches('…')),
+                "the chip snippet came from the passage that was sent"
+            );
+        }
+    }
+
     #[test]
     fn action_labels_are_stable_for_the_preview() {
         assert_eq!(Action::SummarizePage.label(), "Summarise this page");
+        assert_eq!(Action::DocumentChat.label(), "Ask the document");
     }
 }
