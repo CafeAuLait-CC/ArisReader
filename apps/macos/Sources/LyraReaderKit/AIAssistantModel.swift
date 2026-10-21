@@ -46,6 +46,9 @@ public final class AIAssistantModel: ObservableObject {
     @Published public private(set) var usageUpdateCount = 0
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusNote: String?
+    /// The fixed transport category of the current failure. `.other` unless the last request
+    /// failed with a recognized offline or local-server transport error.
+    @Published public private(set) var requestFailure: AIRequestFailure = .other
     @Published public private(set) var documentKey: String?
     @Published public var selectedTab: AIAssistantTab = .summary
     @Published public var summaryUsesSelection = false
@@ -140,6 +143,13 @@ public final class AIAssistantModel: ObservableObject {
     public var canSendMerge: Bool { mergePlan != nil && phase == .mergePreview }
     public var canCancel: Bool { phase == .streaming }
 
+    /// The calm hint that belongs beside the current transport error. Nil for every
+    /// non-transport failure and for HTTP status errors (401/429/500), which keep their own text.
+    public var offlineHint: AIOfflineHint? {
+        guard phase == .failed else { return nil }
+        return AIOfflineHint.forFailure(requestFailure)
+    }
+
     /// The current plan is a document-chat question (as opposed to one of the four single-shot
     /// actions). The chat section stays visible alongside the action UI either way.
     public var isDocumentChatPlan: Bool { plan?.isDocumentChat == true }
@@ -209,6 +219,7 @@ public final class AIAssistantModel: ObservableObject {
         }
         let auditStart = Date()
         let auditKind = AIAuditAction(action)
+        requestFailure = .other
         guard let service else {
             recordRefusal(auditKind, code: .notConfigured, startedAt: auditStart)
             phase = .failed
@@ -531,6 +542,7 @@ public final class AIAssistantModel: ObservableObject {
             return
         }
         guard !isSending else { return }
+        requestFailure = .other
         if plan.isDocumentChat {
             sendDocumentChat(plan, service: service)
             return
@@ -579,6 +591,7 @@ public final class AIAssistantModel: ObservableObject {
             chatTurns[index].answer = ""
             chatTurns[index].reasoning = ""
             chatTurns[index].error = nil
+            chatTurns[index].failure = nil
             chatTurns[index].usage = nil
             chatTurns[index].state = .streaming
             turnID = chatTurns[index].id
@@ -696,6 +709,7 @@ public final class AIAssistantModel: ObservableObject {
     /// this is the only place the merge request is sent, and only after the reader presses it.
     public func sendMerge() {
         guard let mergePlan, let service, phase == .mergePreview else { return }
+        requestFailure = .other
         let handle: any AIChatHandle
         do { handle = try startPrepared(mergePlan, service: service, kind: .summaryLayer) }
         catch {
@@ -819,7 +833,7 @@ public final class AIAssistantModel: ObservableObject {
                 diagnostics.append(reported)
             case .done:
                 handleDone()
-            case .error(let message, let cancelled):
+            case .error(let message, let cancelled, let failure):
                 if cancelled {
                     phase = .cancelled
                     statusNote = answer.isEmpty
@@ -827,6 +841,7 @@ public final class AIAssistantModel: ObservableObject {
                         : "Cancelled after \(answer.count) characters. The partial answer is kept."
                 } else {
                     phase = .failed
+                    requestFailure = failure
                     errorMessage = message
                     var note = message
                     if !merging,
@@ -883,11 +898,11 @@ public final class AIAssistantModel: ObservableObject {
                 diagnostics.append(reported)
             case .done:
                 finishChatTurn(.finished)
-            case .error(let message, let cancelled):
+            case .error(let message, let cancelled, let failure):
                 if cancelled {
                     finishChatTurn(.cancelled)
                 } else {
-                    failChatTurn(message)
+                    failChatTurn(message, failure: failure)
                 }
             }
         }
@@ -919,6 +934,7 @@ public final class AIAssistantModel: ObservableObject {
             chatTurns[index].usage = usage
             if state == .finished, !chatTurns[index].answer.isEmpty {
                 chatTurns[index].error = nil
+                chatTurns[index].failure = nil
             }
         }
         let final = chatTurns.first(where: { $0.id == id })
@@ -953,9 +969,10 @@ public final class AIAssistantModel: ObservableObject {
         saveCurrentConversation()
     }
 
-    private func failChatTurn(_ message: String) {
+    private func failChatTurn(_ message: String, failure: AIRequestFailure = .other) {
         guard let id = streamingChatTurnID else {
             phase = .failed
+            requestFailure = failure
             errorMessage = message
             statusNote = message
             return
@@ -964,8 +981,10 @@ public final class AIAssistantModel: ObservableObject {
         if let index = chatTurns.firstIndex(where: { $0.id == id }) {
             chatTurns[index].state = .failed
             chatTurns[index].error = message
+            chatTurns[index].failure = failure
             chatTurns[index].usage = usage
         }
+        requestFailure = failure
         handle = nil
         pollTask?.cancel()
         errorMessage = message
@@ -1222,5 +1241,6 @@ public final class AIAssistantModel: ObservableObject {
         contentDeltaCount = 0
         reasoningDeltaCount = 0
         usageUpdateCount = 0
+        requestFailure = .other
     }
 }

@@ -5,8 +5,15 @@
 pub enum AiError {
     /// No provider configured (in this case the UI should hide the AI entry point rather than show a greyed-out button).
     NotConfigured,
-    /// Network unreachable / timed out.
+    /// A transport failure that is not one of the recognized categories below (for example a
+    /// TLS handshake error, a remote host that refused the connection, or a malformed response).
     Unreachable(String),
+    /// The request never left this Mac: no route to the provider, the network is down, or the
+    /// provider's name could not be resolved. Only produced for a remote endpoint.
+    Offline(String),
+    /// The configured endpoint is loopback and nothing is listening there. This is not evidence
+    /// that the Mac has no network.
+    LocalServer(String),
     /// Authentication failed (invalid or expired key).
     Unauthorized,
     /// Rate or quota limit exceeded.
@@ -34,6 +41,8 @@ impl std::fmt::Display for AiError {
         match self {
             Self::NotConfigured => write!(f, "AI provider not configured"),
             Self::Unreachable(what) => write!(f, "provider unreachable: {what}"),
+            Self::Offline(what) => write!(f, "provider unreachable: {what}"),
+            Self::LocalServer(what) => write!(f, "provider unreachable: {what}"),
             Self::Unauthorized => write!(f, "unauthorized (check API key)"),
             Self::RateLimited => write!(f, "rate limited"),
             Self::Cancelled => write!(f, "cancelled"),
@@ -49,6 +58,30 @@ impl std::fmt::Display for AiError {
 }
 
 impl std::error::Error for AiError {}
+
+/// Why a transport failed, reduced to the few cases the shell can describe honestly.
+///
+/// The shell shows a no-network hint only for [`AiFailure::Offline`], and a "the local server is
+/// not running" sentence only for [`AiFailure::LocalServer`]. Everything else keeps the existing
+/// transport error text. This crosses the FFI boundary with every error event so neither the
+/// panel nor the audit trail has to match on a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiFailure {
+    Other,
+    Offline,
+    LocalServer,
+}
+
+impl AiError {
+    /// The stable category of this error. Message text is never inspected.
+    pub fn failure(&self) -> AiFailure {
+        match self {
+            Self::Offline(_) => AiFailure::Offline,
+            Self::LocalServer(_) => AiFailure::LocalServer,
+            _ => AiFailure::Other,
+        }
+    }
+}
 
 /// Model capabilities.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

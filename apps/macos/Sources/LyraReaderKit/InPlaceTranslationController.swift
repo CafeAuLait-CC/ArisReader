@@ -23,6 +23,7 @@ protocol InPlaceTranslationHost: AnyObject {
     func translationPaperColor(page: Int) -> TranslationPaperColor?
     func translationDidChangeOverlays(_ overlays: [TranslationOverlay])
     func translationDidChangeNotice(_ notice: String?)
+    func translationDidChangeFailure(_ failure: AIRequestFailure?)
 }
 
 /// Everything a completed or failed translation needs to survive a tab switch or a page edit.
@@ -39,6 +40,8 @@ struct TranslationSessionSnapshot {
         let key: String
         let language: String
         let model: String
+        /// The fixed transport category of this failure. `.other` for cache or validation errors.
+        var failure: AIRequestFailure = .other
     }
 
     var isEmpty: Bool { entries.isEmpty && failed.isEmpty }
@@ -52,6 +55,16 @@ struct TranslationSessionSnapshot {
 /// merged into one prompt — a provider can merge or split paragraphs, and one malformed answer
 /// would then corrupt several blocks. Per-block requests keep cancellation, cache invalidation
 /// and partial failure local to the block.
+
+/// A provider failure that keeps its fixed transport category, so the banner can show the same
+/// hint the assistant panel shows instead of matching on the message.
+private struct TranslationTransportFailure: LocalizedError {
+    let message: String
+    let failure: AIRequestFailure
+
+    var errorDescription: String? { message }
+}
+
 @MainActor
 final class InPlaceTranslationController {
     static let maxConcurrentRequests = 3
@@ -634,9 +647,9 @@ final class InPlaceTranslationController {
                         text += delta
                     case .done:
                         done = true
-                    case .error(let message, let cancelled):
+                    case .error(let message, let cancelled, let failure):
                         if cancelled { return }
-                        throw AISettingsError.invalid(message)
+                        throw TranslationTransportFailure(message: message, failure: failure)
                     case .partStarted, .reasoningDelta, .usage, .diagnostics:
                         break
                     }
@@ -651,7 +664,11 @@ final class InPlaceTranslationController {
             commit(item, translatedText: text.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             guard active[key]?.cancelled != true, documentMatches(item.environment) else { return }
-            failRequest(item, message: AIReadableError.message(error))
+            failRequest(
+                item,
+                message: AIReadableError.message(error),
+                failure: (error as? TranslationTransportFailure)?.failure ?? .other
+            )
         }
     }
 
@@ -700,10 +717,15 @@ final class InPlaceTranslationController {
         publish()
     }
 
-    private func failRequest(_ item: Queued, message: String) {
+    private func failRequest(
+        _ item: Queued,
+        message: String,
+        failure: AIRequestFailure
+    ) {
         failed[item.key] = .init(target: item.target, message: message, key: item.key,
                                   language: item.environment.language,
-                                  model: item.environment.model)
+                                  model: item.environment.model,
+                                  failure: failure)
         lastError = message
         notice = "Translation failed for this block: \(message) The block was left untranslated."
         publish()
@@ -852,10 +874,20 @@ final class InPlaceTranslationController {
         )
     }
 
+    /// The most specific failure still visible in this session: a no-network row outranks a
+    /// local-server row, and either outranks an unrelated validation failure.
+    private var sessionFailure: AIRequestFailure? {
+        let failures = failed.values.map(\.failure)
+        if failures.contains(.offline) { return .offline }
+        if failures.contains(.localServer) { return .localServer }
+        return nil
+    }
+
     private func publish() {
         guard let host else { return }
         host.translationDidChangeOverlays(overlays())
         host.translationDidChangeNotice(notice)
+        host.translationDidChangeFailure(sessionFailure)
     }
 }
 

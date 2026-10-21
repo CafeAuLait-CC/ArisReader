@@ -51,6 +51,9 @@ public struct AISummaryPanelView: View {
                     .foregroundStyle(LyraReaderTheme.errorFg)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let hint = model.offlineHint {
+                AIOfflineHintView(hint: hint)
+            }
             Text("Layered summaries are generated text, not annotations: they are saved in this document's cache, never written into the PDF.")
                 .font(.system(size: 9))
                 .foregroundStyle(LyraReaderTheme.textTertiary)

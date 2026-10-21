@@ -32,7 +32,7 @@ pub use openai::{
     preview_headers, redact, redact_error, run_plan, run_plan_with_transport,
 };
 pub use provider::{
-    AiError, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,
+    AiError, AiFailure, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,
 };
 
 /// Image reference (a screenshot of the marquee-selected region; supplied by the render layer, M5).

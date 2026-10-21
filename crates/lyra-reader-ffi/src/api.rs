@@ -5610,6 +5610,27 @@ pub struct AiStreamDiagnostics {
     pub reasoning_tokens: Option<u64>,
 }
 
+/// The stable category of a transport failure. The panel and the audit trail read this instead
+/// of matching error text; `Other` keeps the existing error display unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiFailureRecord {
+    Other,
+    /// The request never left this Mac: no route / network down / name resolution failed.
+    Offline,
+    /// The endpoint is loopback and nothing is listening there.
+    LocalServer,
+}
+
+impl From<lyra_reader_ai::AiFailure> for AiFailureRecord {
+    fn from(failure: lyra_reader_ai::AiFailure) -> Self {
+        match failure {
+            lyra_reader_ai::AiFailure::Other => Self::Other,
+            lyra_reader_ai::AiFailure::Offline => Self::Offline,
+            lyra_reader_ai::AiFailure::LocalServer => Self::LocalServer,
+        }
+    }
+}
+
 /// One event from a running request. The shell polls a handle and renders these in order.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum AiEventRecord {
@@ -5639,6 +5660,9 @@ pub enum AiEventRecord {
     Error {
         message: String,
         cancelled: bool,
+        /// Why the transport failed, as a fixed category. `Other` for every error that is not a
+        /// recognized offline/local-server transport failure.
+        failure: AiFailureRecord,
     },
 }
 
@@ -5809,18 +5833,21 @@ pub fn start_ai_request(
                     worker_job.push(AiEventRecord::Error {
                         message: "Cancelled".to_string(),
                         cancelled: true,
+                        failure: AiFailureRecord::Other,
                     });
                 }
                 Ok(Err(error)) => {
                     worker_job.push(AiEventRecord::Error {
                         message: error.to_string(),
                         cancelled: false,
+                        failure: AiFailureRecord::from(error.failure()),
                     });
                 }
                 Err(_) => {
                     worker_job.push(AiEventRecord::Error {
                         message: "The AI request worker stopped unexpectedly.".to_string(),
                         cancelled: false,
+                        failure: AiFailureRecord::Other,
                     });
                 }
             }
@@ -6056,6 +6083,29 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn transport_failures_cross_the_ffi_as_fixed_categories() {
+        // The shell and the audit trail read this enum, never the message string.
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::Offline),
+            AiFailureRecord::Offline
+        );
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::LocalServer),
+            AiFailureRecord::LocalServer
+        );
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::Other),
+            AiFailureRecord::Other
+        );
+        assert_eq!(
+            AiFailureRecord::from(
+                lyra_reader_ai::AiError::Offline("no route".to_string()).failure()
+            ),
+            AiFailureRecord::Offline
+        );
+    }
 
     /// Resolves a committed fixture at run time.
     ///

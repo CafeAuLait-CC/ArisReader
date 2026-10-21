@@ -232,6 +232,8 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
     public let answer: String
     public let state: AIRegionAnswerState
     public let error: String?
+    /// The fixed transport category of a failed answer. Nil for a cancelled or successful turn.
+    public let failure: AIRequestFailure?
     public let createdAt: Date
 
     public init(
@@ -242,6 +244,7 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
         answer: String,
         state: AIRegionAnswerState,
         error: String? = nil,
+        failure: AIRequestFailure? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -251,6 +254,7 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
         self.answer = answer
         self.state = state
         self.error = error
+        self.failure = failure
         self.createdAt = createdAt
     }
 
@@ -373,6 +377,7 @@ public final class AIRegionCard: ObservableObject, Identifiable {
             answer: assistant.answer,
             state: answerState,
             error: assistant.errorMessage,
+            failure: answerState == .failed ? assistant.requestFailure : nil,
             createdAt: createdAt
         )
     }

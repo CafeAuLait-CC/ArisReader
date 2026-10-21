@@ -54,6 +54,9 @@ public struct AIAssistantPanel: View {
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
+                        if displaysCurrentRequest, let hint = model.offlineHint {
+                            AIOfflineHintView(hint: hint)
+                        }
                         if displaysCurrentRequest, model.isPreparing, model.pendingChatQuestion == nil {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)

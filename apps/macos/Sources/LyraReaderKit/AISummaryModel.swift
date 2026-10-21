@@ -101,6 +101,9 @@ public struct AISummaryEntry: Identifiable, Equatable, Sendable {
     public var state: AISummaryEntryState = .notGenerated
     public var summary: String = ""
     public var error: String?
+    /// The fixed transport category when this row failed. Nil for local refusals and after a
+    /// successful retry.
+    public var failure: AIRequestFailure?
     /// The honest coverage line from the builder, e.g. "Summarised from pages 1-12 of 20."
     public var note: String?
     /// The page actually reached when the budget cut the unit.
@@ -431,6 +434,18 @@ public final class LayeredSummaryModel: ObservableObject {
     @Published public private(set) var cacheURL: URL?
     @Published public private(set) var cacheError: String?
     public let bounds: AiSummaryLimitsRecord
+
+    /// The same calm hint the assistant panel shows, derived from the rows' fixed transport
+    /// categories. Nil when no row failed with a recognized offline/local-server error.
+    public var offlineHint: AIOfflineHint? {
+        guard phase == .failed || phase == .finished || phase == .cancelled else {
+            return nil
+        }
+        let failures = entries.compactMap(\.failure)
+        if failures.contains(.offline) { return AIOfflineHint(kind: .noNetwork) }
+        if failures.contains(.localServer) { return AIOfflineHint(kind: .localServer) }
+        return nil
+    }
 
     public let settings: AISettingsStore
     /// The shared local audit trail. Each previewed unit is its own outgoing request, so a
@@ -841,6 +856,7 @@ public final class LayeredSummaryModel: ObservableObject {
             generationLayer = entry.kind
             phase = .generating
             errorMessage = nil
+            updateEntry(id) { $0.failure = nil }
             answers[id] = ""
             handles = [:]
             queue = [id]
@@ -1219,17 +1235,19 @@ public final class LayeredSummaryModel: ObservableObject {
                 case .done:
                     complete(id)
                     terminal = true
-                case .error(let message, let cancelled):
+                case .error(let message, let cancelled, let failure):
                     if cancelled {
                         updateEntry(id) {
                             $0.state = .cancelled
                             $0.error = "Cancelled. The completed rows are kept."
+                            $0.failure = nil
                         }
                         finishedRequests += 1
                     } else {
                         updateEntry(id) {
                             $0.state = .failed(message)
                             $0.error = message
+                            $0.failure = failure
                         }
                         finishedRequests += 1
                     }
@@ -1279,6 +1297,7 @@ public final class LayeredSummaryModel: ObservableObject {
             $0.summaryLanguage = self.cacheLanguage
             $0.state = .ready
             $0.error = nil
+            $0.failure = nil
         }
         if let plan = preparedPlans[id] {
             storeCache(for: id, plan: plan, summary: summary)

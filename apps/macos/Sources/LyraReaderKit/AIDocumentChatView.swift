@@ -233,6 +233,11 @@ public struct AIDocumentChatView: View {
                     .foregroundStyle(LyraReaderTheme.errorFg)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if turn.id == model.chatTurns.last?.id,
+               model.phase == .failed,
+               let hint = turn.failure.flatMap(AIOfflineHint.forFailure) {
+                AIOfflineHintView(hint: hint)
+            }
             if turn.state == .cancelled || turn.state == .failed {
                 HStack(spacing: 6) {
                     Button("Retry") { model.retry() }
