@@ -245,6 +245,16 @@ struct ReaderToolbar: View {
                   ?? "Drag a rectangle over the page; the question opens in a gap below it")
             .accessibilityLabel("Ask about a region")
             .accessibilityValue(state.regionSelectionArmed ? "Armed" : "")
+            tool(state.translationSelectionTitle, "character.bubble",
+                 selected: state.translationSelectionAction == .showOriginal) {
+                state.performTranslationAction()
+            }
+            .disabled(!state.canTranslateSelection)
+            .help(state.selection == nil
+                  ? "Select text on the page to translate it in place"
+                  : "\(state.translationSelectionTitle) (⇧⌘L)")
+            .accessibilityLabel(state.translationSelectionTitle)
+            .accessibilityValue(state.selection == nil ? "No selection" : "Selection on page \(state.selection!.page + 1)")
             tool("AI assistant (⇧⌘A)", "sparkles", selected: state.rightPanelVisible) {
                 state.toggleRightPanel()
             }

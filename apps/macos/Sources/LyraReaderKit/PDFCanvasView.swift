@@ -115,6 +115,29 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// In-place translations to draw over their source blocks. The model is page-local; the
+    /// overlay applies the same placement and zoom as the annotation layer.
+    public var translationOverlays: [TranslationOverlay] = [] {
+        didSet {
+            guard translationOverlays != oldValue else { return }
+            syncTranslationOverlay()
+        }
+    }
+
+    /// Paper colours sampled from each visible page. A missing page falls back to the display
+    /// appearance's paper colour.
+    public var translationPaperColors: [Int: TranslationPaperColor] = [:] {
+        didSet {
+            guard translationPaperColors != oldValue else { return }
+            syncTranslationOverlay()
+        }
+    }
+
+    /// The chip was pressed. AppState decides whether this is a flip, a retry or a fresh request.
+    public var onTranslationToggle: ((String) -> Void)?
+    /// The cancel affordance on a translating block.
+    public var onTranslationCancel: ((String) -> Void)?
+
     /// One-shot region selection: the pointer becomes a crosshair, a drag draws a marquee with
     /// visible bounds, and the release hands the page rectangle to the shell.
     ///
@@ -204,6 +227,7 @@ public final class MetalCanvasView: NSView {
 
     private var pageChrome: PageChromeOverlayView?
     private var annotationOverlay: AnnotationOverlayView?
+    private var translationOverlay: TranslationOverlayView?
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
     private var drawingPlacesRedaction = false
@@ -435,6 +459,12 @@ public final class MetalCanvasView: NSView {
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
         annotationOverlay = overlay
+        let translations = TranslationOverlayView(frame: bounds)
+        translations.autoresizingMask = [.width, .height]
+        translations.onToggle = { [weak self] id in self?.onTranslationToggle?(id) }
+        translations.onCancel = { [weak self] id in self?.onTranslationCancel?(id) }
+        addSubview(translations)
+        translationOverlay = translations
         let marquee = AIRegionMarqueeOverlayView(frame: bounds)
         marquee.autoresizingMask = [.width, .height]
         addSubview(marquee)
@@ -538,6 +568,7 @@ public final class MetalCanvasView: NSView {
         super.layout()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
+        translationOverlay?.frame = bounds
         regionMarquee?.frame = bounds
         syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
@@ -1574,6 +1605,22 @@ public final class MetalCanvasView: NSView {
             paperAppearance: paperAppearance
         )
         overlay.updateRedactions(redactionMarks, frames: annotationPageFrames)
+        syncTranslationOverlay()
+    }
+
+    /// Hands the translation model to its own layer. It is separate from the annotation overlay
+    /// so hiding a translation cannot disturb a mark, and so the chip can take a click without
+    /// giving the annotation layer pointer ownership.
+    private func syncTranslationOverlay() {
+        translationOverlay?.update(
+            overlays: translationOverlays,
+            frames: annotationPageFrames,
+            zoom: zoom,
+            scrollYPt: scrollYPt,
+            contentWidthPt: contentWidthPt,
+            paperAppearance: paperAppearance,
+            paperColors: translationPaperColors
+        )
     }
 
     // MARK: - Geometry
@@ -1640,6 +1687,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let canvasClearColor: NSColor?
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
+    private let translationOverlays: [TranslationOverlay]
+    private let translationPaperColors: [Int: TranslationPaperColor]
     private let redactionMarks: [CanvasRedactionMark]
     private let annotationTool: AnnotationTool
     private let regionSelectionArmed: Bool
@@ -1682,6 +1731,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let fileDrop: DocumentOpenCoordinator?
     /// Right-click command list, rendered in the shared LyraReader panel. `nil` offers no menu.
     private let onContextMenu: ((CGPoint) -> NSMenu?)?
+    private let onTranslationToggle: ((String) -> Void)?
+    private let onTranslationCancel: ((String) -> Void)?
 
     public init(
         pages: [CanvasPage] = [],
@@ -1692,6 +1743,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         canvasClearColor: NSColor? = nil,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
+        translationOverlays: [TranslationOverlay] = [],
+        translationPaperColors: [Int: TranslationPaperColor] = [:],
         redactionMarks: [CanvasRedactionMark] = [],
         annotationTool: AnnotationTool = .select,
         regionSelectionArmed: Bool = false,
@@ -1730,7 +1783,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         onRedo: @escaping () -> Void = {},
         interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
         fileDrop: DocumentOpenCoordinator? = nil,
-        onContextMenu: ((CGPoint) -> NSMenu?)? = nil
+        onContextMenu: ((CGPoint) -> NSMenu?)? = nil,
+        onTranslationToggle: ((String) -> Void)? = nil,
+        onTranslationCancel: ((String) -> Void)? = nil
     ) {
         self.pages = pages
         self.scrollYPt = scrollYPt
@@ -1740,6 +1795,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.canvasClearColor = canvasClearColor
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
+        self.translationOverlays = translationOverlays
+        self.translationPaperColors = translationPaperColors
         self.redactionMarks = redactionMarks
         self.annotationTool = annotationTool
         self.regionSelectionArmed = regionSelectionArmed
@@ -1779,6 +1836,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.interactionSnapshot = interactionSnapshot
         self.fileDrop = fileDrop
         self.onContextMenu = onContextMenu
+        self.onTranslationToggle = onTranslationToggle
+        self.onTranslationCancel = onTranslationCancel
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -1810,6 +1869,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onUndo = onUndo
         view.onRedo = onRedo
         view.onContextMenu = onContextMenu
+        view.onTranslationToggle = onTranslationToggle
+        view.onTranslationCancel = onTranslationCancel
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
@@ -1817,6 +1878,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.canvasClearColor = canvasClearColor
         view.annotationMarks = annotationMarks
         view.annotationPageFrames = annotationPageFrames
+        view.translationOverlays = translationOverlays
+        view.translationPaperColors = translationPaperColors
         view.redactionMarks = redactionMarks
         view.annotationTool = annotationTool
         view.regionSelectionArmed = regionSelectionArmed

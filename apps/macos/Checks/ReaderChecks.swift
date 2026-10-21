@@ -142,6 +142,11 @@ struct ReaderChecks {
             print("AI assistant checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-inplace-translation") {
+            try await inPlaceTranslationChecks(root: fastRoot)
+            print("In-place translation checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-region-questions") {
             try await regionQuestionChecks(root: fastRoot)
             print("Region question checks passed")
@@ -683,6 +688,7 @@ struct ReaderChecks {
         try await prefetchBandChecks(url: b)
         try renameCompatibilityChecks(root: root)
         try await aiAssistantChecks(root: root)
+        try await inPlaceTranslationChecks(root: root)
         try await regionQuestionChecks(root: root)
         try await insidePageTearChecks(root: root)
         try await aiAuditChecks(root: root)

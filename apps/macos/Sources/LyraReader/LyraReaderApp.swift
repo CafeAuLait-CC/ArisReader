@@ -230,6 +230,17 @@ struct ReaderCommands: Commands {
                                   modifiers: ReaderShortcuts.toggleAIPanelModifiers)
                 .disabled(session == nil)
 
+            // In-place translation. ⇧⌘L is the Rust keymap's TranslateSelection binding; the
+            // comment there reserves it because ⇧⌘T already belongs to "reopen closed tab".
+            // The title follows the selection: Show original after a translation, Translate
+            // otherwise. The command is disabled without a selection, so it cannot appear to do
+            // something to a page that has no text selected.
+            Button(session?.state.translationSelectionTitle ?? "Translate Selection") {
+                session?.state.performTranslationAction()
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .disabled(session?.state.canTranslateSelection != true)
+
             Divider()
 
             Button("Add Bookmark") { session?.state.addBookmarkAtCurrentPage() }
