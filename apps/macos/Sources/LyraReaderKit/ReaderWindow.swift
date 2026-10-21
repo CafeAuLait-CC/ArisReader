@@ -126,6 +126,13 @@ public struct ReaderWindow: View {
         .onChange(of: state.document?.url) { _, url in
             if url == nil { state.pageOverviewVisible = false }
         }
+        .onChange(of: state.document?.id) { _, _ in
+            // Covers direct open/close paths that do not go through a tab switch. Switching
+            // tabs already closes the card in AppState; this call is then a no-op.
+            state.finishRegionCardsForDocumentSwitch(
+                reason: "Document switched. The region conversation was moved to Region questions."
+            )
+        }
         .alert("LyraReader", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
@@ -195,6 +202,13 @@ public struct ReaderWindow: View {
                 annotationPageFrames: state.canvasPageFrames,
                 redactionMarks: state.pendingRedactionMarks,
                 annotationTool: state.annotationTool,
+                regionSelectionArmed: state.regionSelectionArmed,
+                onRegionSelection: { page, rect in
+                    state.handleRegionSelection(page: page, rect: rect)
+                },
+                onRegionSelectionCancelled: { reason in
+                    state.cancelRegionSelection(reason: reason)
+                },
                 annotationColor: state.annotationStrokeColor,
                 annotationStrokeWidth: AppState.defaultAnnotationStrokeWidth,
                 onAnnotationDraft: { draft in
@@ -284,6 +298,24 @@ public struct ReaderWindow: View {
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
 
+            AIRegionOverlayHost(
+                state: state,
+                onOpenInPanel: { entry in
+                    guard let context = state.aiReaderContext else { return }
+                    aiAssistant.importConversation(
+                        question: entry.question,
+                        answer: entry.answer,
+                        attachment: entry.attachment,
+                        context: context
+                    )
+                    state.rightPanelVisible = true
+                },
+                onShowHistory: {
+                    state.rightPanelVisible = true
+                    aiAssistant.selectedTab = .regions
+                }
+            )
+
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
                     .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
@@ -324,7 +356,8 @@ public struct ReaderWindow: View {
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil
-                || state.eraserRefusalNotice != nil {
+                || state.eraserRefusalNotice != nil
+                || state.regionRefusalMessage != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
@@ -335,6 +368,9 @@ public struct ReaderWindow: View {
                     }
                     if state.eraserRefusalNotice != nil {
                         eraserRefusalBanner
+                    }
+                    if state.regionRefusalMessage != nil {
+                        regionRefusalBanner
                     }
                     if state.hasPendingInkErasure || state.hasPendingFileDeletions {
                         eraserPendingBanner
@@ -681,6 +717,34 @@ public struct ReaderWindow: View {
     /// The eraser's refusal when cutting a PDF-owned stroke would delete its review thread.
     /// The sentence comes from `AppState.inkAttachmentRefusal`, so the check and the banner
     /// cannot disagree about what would be lost.
+    private var regionRefusalBanner: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "rectangle.dashed")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Region question was not created")
+                    .font(.caption.weight(.semibold))
+                Text(state.regionRefusalMessage ?? "")
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button { state.regionRefusalMessage = nil } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss region refusal")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(LyraReaderTheme.panelBg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7)
+            .strokeBorder(LyraReaderTheme.warningFg.opacity(0.5), lineWidth: 0.75))
+        .frame(maxWidth: 620)
+    }
+
     private var eraserRefusalBanner: some View {
         let message = state.eraserRefusalNotice
             ?? "This stroke belongs to the PDF and carries review text; splitting it would delete it."

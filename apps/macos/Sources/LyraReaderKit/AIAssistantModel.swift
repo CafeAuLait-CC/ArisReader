@@ -63,6 +63,9 @@ public final class AIAssistantModel: ObservableObject {
     /// The exact question the current chat preview/send belongs to. Captured when Ask is
     /// pressed, so editing the composer afterwards cannot change what Send will do.
     @Published public private(set) var pendingChatQuestion: String?
+    /// The question the current region preview/send belongs to. The card keeps its editable
+    /// field; this snapshot is what history and the panel import record.
+    @Published public private(set) var regionAskedQuestion: String?
 
     /// Most recent exchanges kept per document, in the panel and in the request. The Rust
     /// builder applies the same bound again.
@@ -154,6 +157,7 @@ public final class AIAssistantModel: ObservableObject {
             chatTurns = key.flatMap { conversations[$0] } ?? []
             expandedChatSources = []
             clearChatTransientState()
+            regionAskedQuestion = nil
             phase = .idle
             statusNote = nil
         }
@@ -317,6 +321,129 @@ public final class AIAssistantModel: ObservableObject {
         }
     }
 
+    /// Prepare a question about a marquee-selected region.
+    ///
+    /// Unlike `prepare(action:context:)` this is not retrieval: the request carries the reader's
+    /// exact rectangle, its extracted text and (when the model accepts images) the PNG capture.
+    /// The preview is the same `AiPlanRecord` every other action shows, so nothing can be sent
+    /// that the card did not display.
+    public func prepareRegion(
+        question rawQuestion: String,
+        attachment: AIRegionAttachment,
+        context: AIReaderContext
+    ) async {
+        if documentKey != context.documentKey {
+            attach(service: service, context: context)
+        }
+        let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else {
+            phase = .idle
+            statusNote = "Type a question about the selected region first; nothing was sent."
+            errorMessage = nil
+            return
+        }
+        guard let service else {
+            phase = .failed
+            errorMessage = Self.noEngineMessage
+            statusNote = Self.noEngineMessage
+            return
+        }
+        guard settings.canUseAI else {
+            phase = .failed
+            errorMessage = settings.connectionMode == .chatGPT
+                ? "Sign in with ChatGPT in Settings > AI first. Nothing was sent." : Self.noKeyMessage
+            statusNote = errorMessage
+            return
+        }
+        let providerSettings: AIProviderSettings
+        do {
+            providerSettings = try settings.providerSettings()
+        } catch {
+            phase = .failed
+            errorMessage = AIReadableError.message(error)
+            statusNote = errorMessage
+            return
+        }
+
+        cancelWork()
+        preparedConnection = settings.connectionMode
+        preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
+        phase = .preparing
+        plan = nil
+        resetMergeState()
+        resetStreamOutput()
+        errorMessage = nil
+        retryingChatTurnID = nil
+        regionAskedQuestion = question
+        pendingChatQuestion = nil
+        statusNote = "Building the request preview for this region. Nothing has been sent."
+
+        // The ChatGPT plan transport in this build writes text content only, so a picture would
+        // be silently dropped. Degrade explicitly to text and say why in the preview note.
+        let chatGPTTextOnly = preparedConnection == .chatGPT
+        let request = AIMakePlanRequest(
+            action: .regionQuestion,
+            currentPage: context.currentPage,
+            selection: nil,
+            question: question,
+            language: nil,
+            history: [],
+            region: attachment,
+            sendRegionImage: providerSettings.vision && !chatGPTTextOnly,
+            settings: providerSettings
+        )
+        do {
+            let source = try await service.prepare(request)
+            var plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
+            if chatGPTTextOnly && providerSettings.vision {
+                let note = "The ChatGPT plan request sends text only in this build, so the region picture is not included."
+                plan.note = [plan.note, note].compactMap { $0 }.joined(separator: " ")
+            }
+            guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
+            self.plan = plan
+            phase = .preview
+            let imageNote = plan.parts.first?.wireBody.contains("image_url") == true
+                ? "The image part is included." : "Text only: the image part is not included."
+            statusNote = "Nothing has been sent yet. \(imageNote) Review the exact request below, then press Ask."
+        } catch {
+            guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
+            let message = AIReadableError.message(error)
+            phase = .failed
+            errorMessage = message
+            statusNote = message
+        }
+    }
+
+    /// Copy a finished region conversation into this document's panel chat. It is an explicit
+    /// save action: nothing is written to the PDF, and the card remains.
+    public func importConversation(
+        question: String,
+        answer: String,
+        attachment: AIRegionAttachment,
+        context: AIReaderContext
+    ) {
+        if documentKey != context.documentKey {
+            attach(service: service, context: context)
+        }
+        let source = AIChatSource(
+            page: attachment.page + 1,
+            snippet: attachment.text.isEmpty
+                ? "Region image · \(attachment.pixelWidth)×\(attachment.pixelHeight) px"
+                : String(attachment.text.prefix(160)),
+            rects: [attachment.rect]
+        )
+        let turn = AIChatTurn(
+            question: question,
+            answer: answer,
+            sources: [source],
+            pageCount: context.pageCount,
+            state: .finished
+        )
+        appendChatTurn(turn)
+        selectedTab = .chat
+        statusNote = "Region conversation copied into the panel chat. It is still not a PDF annotation."
+    }
+
     /// Send the previewed plan. The key is read here, handed to the worker, and not retained.
     public func send() {
         guard let plan, let service else {
@@ -341,9 +468,11 @@ public final class AIAssistantModel: ObservableObject {
         resetStreamOutput()
         errorMessage = nil
         phase = .streaming
-        statusNote = plan.parts.count > 1
-            ? "Streaming 1 of \(plan.parts.count)."
-            : "Streaming…"
+        statusNote = plan.action == .regionQuestion
+            ? "Asking about the region…"
+            : (plan.parts.count > 1
+                ? "Streaming 1 of \(plan.parts.count)."
+                : "Streaming…")
         startPolling(handle)
     }
 

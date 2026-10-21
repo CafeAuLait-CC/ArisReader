@@ -236,11 +236,21 @@ struct ReaderToolbar: View {
                      ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
                      : "Fill & Sign · fill this PDF's form fields"))
             separator
+            tool("Ask about a region", "rectangle.dashed",
+                 selected: state.regionSelectionArmed) {
+                state.toggleRegionSelection()
+            }
+            .disabled(!state.canArmRegionSelection)
+            .help(state.regionSelectionUnavailableReason
+                  ?? "Drag a rectangle over the page; the question opens in a gap below it")
+            .accessibilityLabel("Ask about a region")
+            .accessibilityValue(state.regionSelectionArmed ? "Armed" : "")
             tool("AI assistant (⇧⌘A)", "sparkles", selected: state.rightPanelVisible) {
                 state.toggleRightPanel()
             }
             .accessibilityLabel("AI assistant panel")
             .accessibilityValue(state.rightPanelVisible ? "Open" : "Closed")
+            .keyboardShortcut("a", modifiers: [.command, .shift])
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
                 LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",
@@ -250,6 +260,14 @@ struct ReaderToolbar: View {
                 .separator("more"),
                 LyraReaderMenuItem("Undo", icon: "arrow.uturn.backward", shortcut: "⌘Z", enabled: state.canUndo) { state.undo() },
                 LyraReaderMenuItem("Close Reference Preview", icon: "rectangle.on.rectangle", enabled: state.referencePreview != nil) { state.closeReferencePreview() },
+                LyraReaderMenuItem("Ask about a Region", icon: "rectangle.dashed",
+                                   enabled: state.canArmRegionSelection) {
+                    state.toggleRegionSelection()
+                },
+                LyraReaderMenuItem("Export Region Questions…", icon: "square.and.arrow.up",
+                                   enabled: state.hasExportableRegionHistory) {
+                    state.presentRegionHistoryExportPanel()
+                },
                 LyraReaderMenuItem("Document Information…", icon: "info.circle", shortcut: "⌥⌘I", enabled: state.document != nil) {
                     state.showDocumentInformation = true
                 },

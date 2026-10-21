@@ -7,13 +7,23 @@ import Security
 // MARK: - Actions and request inputs
 
 public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
-    case summary, translation, chat
+    case summary, translation, chat, regions
     public var id: String { rawValue }
     public var title: String {
-        switch self { case .summary: "Summary"; case .translation: "Translate"; case .chat: "Chat" }
+        switch self {
+        case .summary: "Summary"
+        case .translation: "Translate"
+        case .chat: "Chat"
+        case .regions: "Regions"
+        }
     }
     public var icon: String {
-        switch self { case .summary: "doc.text"; case .translation: "character.bubble"; case .chat: "text.bubble" }
+        switch self {
+        case .summary: "doc.text"
+        case .translation: "character.bubble"
+        case .chat: "text.bubble"
+        case .regions: "rectangle.dashed"
+        }
     }
 }
 
@@ -26,6 +36,8 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
     case summarizeSelection
     case askSelection
     case translateSelection
+    /// Not a panel action: a question about a marquee-selected region, built by the inline card.
+    case regionQuestion
 
     public var id: String { rawValue }
 
@@ -37,6 +49,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .summarizeSelection: return "Summarise selection"
         case .askSelection: return "Ask selection"
         case .translateSelection: return "Translate selection"
+        case .regionQuestion: return "Ask about a region"
         }
     }
 
@@ -48,6 +61,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .summarizeSelection: return "text.quote"
         case .askSelection: return "questionmark.bubble"
         case .translateSelection: return "character.bubble"
+        case .regionQuestion: return "rectangle.dashed"
         }
     }
 
@@ -60,6 +74,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .summarizeSelection: return .summarizeSelection
         case .askSelection: return .askSelection
         case .translateSelection: return .translateSelection
+        case .regionQuestion: return .regionQuestion
         }
     }
 
@@ -329,6 +344,10 @@ public struct AIProviderSettings: Equatable, Sendable {
     public var maxTokens: Int?
     public var reasoningMode: AIReasoningMode
     public var reasoningEncoding: AIReasoningEncoding
+    /// Whether the configured model accepts image input. When false, a region question sends
+    /// the extracted text only and the preview says so; it never sends a picture to a text-only
+    /// endpoint.
+    public var vision: Bool
 
     public init(
         baseURL: String,
@@ -336,7 +355,8 @@ public struct AIProviderSettings: Equatable, Sendable {
         temperature: Double?,
         maxTokens: Int?,
         reasoningMode: AIReasoningMode = .off,
-        reasoningEncoding: AIReasoningEncoding = .thinking
+        reasoningEncoding: AIReasoningEncoding = .thinking,
+        vision: Bool = false
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -344,6 +364,7 @@ public struct AIProviderSettings: Equatable, Sendable {
         self.maxTokens = maxTokens
         self.reasoningMode = reasoningMode
         self.reasoningEncoding = reasoningEncoding
+        self.vision = vision
     }
 
     /// Plain words for the request preview. This is the part that changes cost and latency.
@@ -385,6 +406,12 @@ public struct AIMakePlanRequest: Sendable {
     public let language: String?
     /// Oldest first. Only document chat reads it; the Rust builder applies the bound again.
     public let history: [AIConversationTurn]
+    /// Present only for `regionQuestion`. The capture travels with the preview, so the request
+    /// body and the preview are built from the same bytes.
+    public let region: AIRegionAttachment?
+    /// Whether the region picture should be included. Mirrors `settings.vision` and is explicit
+    /// in the record so a text-only preview says why the image is absent.
+    public let sendRegionImage: Bool
     public let settings: AIProviderSettings
 
     public init(
@@ -394,6 +421,8 @@ public struct AIMakePlanRequest: Sendable {
         question: String?,
         language: String?,
         history: [AIConversationTurn] = [],
+        region: AIRegionAttachment? = nil,
+        sendRegionImage: Bool = false,
         settings: AIProviderSettings
     ) {
         self.action = action
@@ -402,6 +431,8 @@ public struct AIMakePlanRequest: Sendable {
         self.question = question
         self.language = language
         self.history = history
+        self.region = region
+        self.sendRegionImage = sendRegionImage
         self.settings = settings
     }
 }
@@ -603,6 +634,20 @@ public final class RustAIChatService: AIChatServicing {
                 end: UInt32($0.end)
             )
         }
+        let region = request.region.map { attachment in
+            AiRegionRecord(
+                page: UInt32(max(0, attachment.page)),
+                xPt: Double(attachment.rect.minX),
+                yPt: Double(attachment.rect.minY),
+                widthPt: Double(attachment.rect.width),
+                heightPt: Double(attachment.rect.height),
+                text: attachment.text,
+                imagePng: attachment.png,
+                imageWidthPx: UInt32(max(0, attachment.pixelWidth)),
+                imageHeightPx: UInt32(max(0, attachment.pixelHeight)),
+                sendImage: request.sendRegionImage && request.settings.vision
+            )
+        }
         let record = AiPlanRequestRecord(
             action: request.action.generated,
             currentPage: UInt32(max(0, request.currentPage - 1)),
@@ -612,6 +657,7 @@ public final class RustAIChatService: AIChatServicing {
             history: request.history.map {
                 AiConversationTurnRecord(question: $0.question, answer: $0.answer)
             },
+            region: region,
             baseUrl: request.settings.baseURL,
             model: request.settings.model,
             temperature: request.settings.temperature,
@@ -873,6 +919,7 @@ public final class AISettingsStore: ObservableObject {
     public static let maxTokensKey = "aiMaxTokens"
     public static let reasoningModeKey = "aiReasoningMode"
     public static let reasoningEncodingKey = "aiReasoningEncoding"
+    public static let modelAcceptsImagesKey = "aiModelAcceptsImages"
 
     public static let defaultBaseURL = "https://api.openai.com/v1"
     public static let defaultModel = "gpt-4o-mini"
@@ -880,6 +927,7 @@ public final class AISettingsStore: ObservableObject {
     public static let defaultMaxTokens = 900
     public static let defaultReasoningMode = AIReasoningMode.off
     public static let defaultReasoningEncoding = AIReasoningEncoding.thinking
+    public static let defaultModelAcceptsImages = false
     public static let temperatureRange = 0.0...2.0
     public static let maxTokensRange = 1...32_768
 
@@ -891,6 +939,10 @@ public final class AISettingsStore: ObservableObject {
     @Published public private(set) var maxTokens: Int
     @Published public private(set) var reasoningMode: AIReasoningMode
     @Published public private(set) var reasoningEncoding: AIReasoningEncoding
+    /// The reader's statement that this model accepts image input. It is not guessed from the
+    /// model name: a wrong guess would either leak a picture to a text-only model or silently
+    /// drop the picture the reader asked about.
+    @Published public private(set) var modelAcceptsImages: Bool
     @Published public private(set) var hasKey: Bool
     @Published public var connectionMode: AIConnectionMode {
         didSet { defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode") }
@@ -925,6 +977,9 @@ public final class AISettingsStore: ObservableObject {
             .flatMap(AIReasoningMode.init(rawValue:)) ?? Self.defaultReasoningMode
         self.reasoningEncoding = defaults.string(forKey: Self.reasoningEncodingKey)
             .flatMap(AIReasoningEncoding.init(rawValue:)) ?? Self.defaultReasoningEncoding
+        self.modelAcceptsImages = defaults.object(forKey: Self.modelAcceptsImagesKey) == nil
+            ? Self.defaultModelAcceptsImages
+            : defaults.bool(forKey: Self.modelAcceptsImagesKey)
         self.hasKey = (try? keyStore.hasKey()) ?? false
         self.endpointInfo = try? inspectAiBaseUrl(baseUrl: self.baseURL)
         self.invalidSettingsMessage = Self.validateBaseAndModel(
@@ -946,7 +1001,8 @@ public final class AISettingsStore: ObservableObject {
         maxTokens: Int,
         apiKey: String?,
         reasoningMode: AIReasoningMode = .off,
-        reasoningEncoding: AIReasoningEncoding = .thinking
+        reasoningEncoding: AIReasoningEncoding = .thinking,
+        modelAcceptsImages: Bool = false
     ) -> Bool {
         invalidSettingsMessage = nil
         let endpoint: AiEndpointRecord
@@ -995,12 +1051,14 @@ public final class AISettingsStore: ObservableObject {
         defaults.set(maxTokens, forKey: Self.maxTokensKey)
         defaults.set(reasoningMode.rawValue, forKey: Self.reasoningModeKey)
         defaults.set(reasoningEncoding.rawValue, forKey: Self.reasoningEncodingKey)
+        defaults.set(modelAcceptsImages, forKey: Self.modelAcceptsImagesKey)
         baseURL = endpoint.baseUrl
         self.model = model
         self.temperature = temperature
         self.maxTokens = maxTokens
         self.reasoningMode = reasoningMode
         self.reasoningEncoding = reasoningEncoding
+        self.modelAcceptsImages = modelAcceptsImages
         endpointInfo = endpoint
         hasKey = (try? keyStore.hasKey()) ?? false
         return true
@@ -1034,7 +1092,8 @@ public final class AISettingsStore: ObservableObject {
             }
             return AIProviderSettings(baseURL: "https://api.openai.com/v1", model: account.model,
                                       temperature: nil, maxTokens: nil,
-                                      reasoningMode: .providerDefault, reasoningEncoding: .none)
+                                      reasoningMode: .providerDefault, reasoningEncoding: .none,
+                                      vision: true)
         }
         let endpoint = try inspectAiBaseUrl(baseUrl: baseURL)
         let model = try validateAiModel(model: model)
@@ -1053,7 +1112,8 @@ public final class AISettingsStore: ObservableObject {
             temperature: temperature,
             maxTokens: maxTokens,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            vision: modelAcceptsImages
         )
     }
 

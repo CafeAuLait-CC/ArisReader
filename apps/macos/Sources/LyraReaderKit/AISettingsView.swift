@@ -9,6 +9,7 @@ public struct AISettingsView: View {
     @State private var maxTokens = AISettingsStore.defaultMaxTokens
     @State private var reasoningMode = AISettingsStore.defaultReasoningMode
     @State private var reasoningEncoding = AISettingsStore.defaultReasoningEncoding
+    @State private var modelAcceptsImages = AISettingsStore.defaultModelAcceptsImages
     @State private var keyDraft = ""
     @State private var savedMessage: String?
 
@@ -78,6 +79,23 @@ public struct AISettingsView: View {
                 Text("API key")
             } footer: {
                 Text("The key is stored only in the macOS Keychain. It is never written to UserDefaults, a file, the request preview, or a log. LyraReader reads it only when you press Send in the AI panel.")
+                    .font(.caption)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Toggle("Model accepts image input (vision)", isOn: $modelAcceptsImages)
+                Text(modelAcceptsImages
+                     ? "Region questions send the selected rectangle as a PNG, plus its extracted text. The preview names the pixel size before you send."
+                     : "Text-only configuration: region questions send the extracted text only. The picture is captured for the preview and the knowledge export, but it is not sent to the model.")
+                    .font(.caption)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Text("Region pictures")
+            } footer: {
+                Text("LyraReader never guesses from the model name. Leave this off for a text-only model; turn it on only when the provider documents image input for the model above.")
                     .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -162,6 +180,7 @@ public struct AISettingsView: View {
         maxTokens = store.maxTokens
         reasoningMode = store.reasoningMode
         reasoningEncoding = store.reasoningEncoding
+        modelAcceptsImages = store.modelAcceptsImages
         keyDraft = ""
         savedMessage = nil
     }
@@ -173,7 +192,8 @@ public struct AISettingsView: View {
             temperature: temperature,
             maxTokens: maxTokens,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            vision: modelAcceptsImages
         )
     }
 
@@ -185,7 +205,8 @@ public struct AISettingsView: View {
             maxTokens: maxTokens,
             apiKey: keyDraft,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            modelAcceptsImages: modelAcceptsImages
         )
         if succeeded {
             keyDraft = ""
