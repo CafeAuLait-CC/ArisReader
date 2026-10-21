@@ -304,6 +304,12 @@ extension ReaderChecks {
     @MainActor
     private static func rightPanelWindowChecks(root: URL) async throws {
         _ = NSApplication.shared
+        // Pin motion for this window suite rather than inheriting the machine's setting. The
+        // animation checks need to know whether a toggle animates; the Reduce Motion section
+        // below sets its own value and the defer restores whatever the process had.
+        let savedReduceMotion = ReaderMotion.reduceMotionOverride
+        ReaderMotion.reduceMotionOverride = false
+        defer { ReaderMotion.reduceMotionOverride = savedReduceMotion }
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("lyra-reader-right-panel-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
