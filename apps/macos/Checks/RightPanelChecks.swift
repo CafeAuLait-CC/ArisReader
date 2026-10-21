@@ -578,6 +578,24 @@ extension ReaderChecks {
         try await eventually("the cheap-slide fixture has a page raster", {
             state.pageRasterCacheCount > 0
         })
+        // A text layer or a raster arriving during the 11 sampled frames also re-evaluates the
+        // band (`viewportReloadCount` moves for that reason too, see AppState). Wait until the
+        // visible pages' text layers are in and the counter has stopped moving, so the sample
+        // measures the panel slide rather than unrelated late background work.
+        try await eventually("the cheap-slide pages have their text layers", {
+            state.canvasPageFrames.allSatisfy { state.hasTextLayer($0.index) }
+        })
+        var lastReloadCount = -1
+        var stableSamples = 0
+        while stableSamples < 5 {
+            if state.viewportReloadCount == lastReloadCount {
+                stableSamples += 1
+            } else {
+                stableSamples = 0
+                lastReloadCount = state.viewportReloadCount
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
         try await Task.sleep(for: .milliseconds(150))
         let reloadsBefore = state.viewportReloadCount
         let rastersBefore = state.pageRasterCacheCount
