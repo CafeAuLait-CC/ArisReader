@@ -90,7 +90,7 @@ public struct ReaderWindow: View {
                             state.commitRightPanelWidth()
                         }
                     ) {
-                        AIAssistantPanel(state: state, model: aiAssistant)
+                        AIAssistantRightPanelContent(state: state, model: aiAssistant)
                     }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this

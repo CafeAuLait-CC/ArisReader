@@ -1,12 +1,15 @@
 import LyraReaderBindings
 import Combine
+import CoreGraphics
 import Foundation
 import Security
 
 // MARK: - Actions and request inputs
 
-/// The four actions the AI panel can request. Deliberately small: no free-form document chat yet.
+/// The actions the AI panel can request. Document chat is the conversational action; the other
+/// four stay available alongside it.
 public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
+    case documentChat
     case summarizePage
     case summarizeDocument
     case askSelection
@@ -16,6 +19,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
 
     public var title: String {
         switch self {
+        case .documentChat: return "Ask the document"
         case .summarizePage: return "Summarise page"
         case .summarizeDocument: return "Summarise document"
         case .askSelection: return "Ask selection"
@@ -25,6 +29,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
 
     public var systemImage: String {
         switch self {
+        case .documentChat: return "text.bubble"
         case .summarizePage: return "doc.text"
         case .summarizeDocument: return "doc.on.doc"
         case .askSelection: return "questionmark.bubble"
@@ -35,6 +40,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
     /// The Rust action this maps to.
     var generated: AiActionRecord {
         switch self {
+        case .documentChat: return .documentChat
         case .summarizePage: return .summarizePage
         case .summarizeDocument: return .summarizeDocument
         case .askSelection: return .askSelection
@@ -46,6 +52,10 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
     public var requiresSelection: Bool {
         self == .askSelection || self == .translateSelection
     }
+
+    /// The conversational action keeps the panel's chat section, even while a different action
+    /// is previewing: the two share the host but not their request state.
+    public var isDocumentChat: Bool { self == .documentChat }
 }
 
 /// A selected character range in the reader's 0-based text layer. `page` is 1-based for display.
@@ -85,6 +95,160 @@ public struct AIReaderContext: Equatable, Sendable {
         self.pageCount = pageCount
         self.currentPage = currentPage
         self.selection = selection
+    }
+}
+
+// MARK: - Document chat
+
+/// One passage that was actually sent with a chat question: where it came from, a one-line
+/// snippet, and the page-local line boxes used for the transient source highlight.
+public struct AIChatSource: Equatable, Sendable {
+    /// 1-based, matching `[p.N]`.
+    public let page: Int
+    public let snippet: String
+    /// 100% page-local view-space boxes, top-left origin. Empty when the text layer had no
+    /// geometry; the chip still jumps, but no rectangle is invented.
+    public let rects: [CGRect]
+
+    public init(page: Int, snippet: String, rects: [CGRect]) {
+        self.page = page
+        self.snippet = snippet
+        self.rects = rects
+    }
+
+    public init(record: AiSourceRecord) {
+        self.init(
+            page: Int(record.page),
+            snippet: record.snippet,
+            rects: record.rects.map {
+                CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt)
+            }
+        )
+    }
+}
+
+/// A verified citation: the model cited this page and the page was sent. Clicking the chip
+/// jumps to it and flashes the passage's boxes.
+public struct AIChatChip: Identifiable, Equatable, Sendable {
+    public let page: Int
+    public let snippet: String
+    public let rects: [CGRect]
+
+    public var id: Int { page }
+
+    /// The chip's click action, kept next to the data so the panel and the checks exercise the
+    /// same jump+highlight path rather than each spelling the page conversion themselves.
+    @MainActor
+    public func follow(in state: AppState) {
+        state.revealAISource(page: page - 1, rects: rects)
+    }
+}
+
+/// A citation the panel refuses to turn into a link or a chip, with the reason in plain words.
+public struct AIUnverifiedCitation: Identifiable, Equatable, Sendable {
+    public let page: Int
+    public let reason: String
+
+    public var id: Int { page }
+}
+
+public struct AIAnswerBacklinks: Equatable, Sendable {
+    public let chips: [AIChatChip]
+    public let unverified: [AIUnverifiedCitation]
+
+    public init(chips: [AIChatChip], unverified: [AIUnverifiedCitation]) {
+        self.chips = chips
+        self.unverified = unverified
+    }
+
+    public var sentPages: Set<Int> { Set(chips.map(\.page)) }
+}
+
+/// One exchange in a document's chat. The question is stored when Send is pressed, so Cancel and
+/// provider errors leave the reader's question on screen with whatever answer arrived.
+public struct AIChatTurn: Identifiable, Equatable, Sendable {
+    public enum State: Equatable, Sendable {
+        case streaming
+        case finished
+        case cancelled
+        case failed
+        /// Retrieval found nothing relevant and no request was made.
+        case nothingRelevant
+    }
+
+    public let id: UUID
+    public let question: String
+    public var answer: String
+    public var reasoning: String
+    public let sources: [AIChatSource]
+    /// The document page count when this turn was sent, so citations in old turns are still
+    /// verified against the right document after the current plan changes.
+    public let pageCount: Int
+    public var state: State
+    public var error: String?
+    public var usage: AIUsage?
+
+    public init(
+        id: UUID = UUID(),
+        question: String,
+        answer: String = "",
+        reasoning: String = "",
+        sources: [AIChatSource] = [],
+        pageCount: Int = 0,
+        state: State = .streaming,
+        error: String? = nil,
+        usage: AIUsage? = nil
+    ) {
+        self.id = id
+        self.question = question
+        self.answer = answer
+        self.reasoning = reasoning
+        self.sources = sources
+        self.pageCount = pageCount
+        self.state = state
+        self.error = error
+        self.usage = usage
+    }
+
+    public var isStreaming: Bool { state == .streaming }
+    public var sentPages: Set<Int> { Set(sources.map(\.page)) }
+
+    /// Split the strict `[p.N]` citations into chips for pages that were sent and refusals for
+    /// every other cited page. A citation outside the document is not made clickable either.
+    public func backlinks(pageCount: Int) -> AIAnswerBacklinks {
+        let sent = sentPages
+        var chips: [AIChatChip] = []
+        var unverified: [AIUnverifiedCitation] = []
+        for page in AIAnswerMarkdown.allCitedPages(in: answer) {
+            if page < 1 || page > pageCount {
+                unverified.append(AIUnverifiedCitation(
+                    page: page,
+                    reason: "Page \(page) is not in this document, so the citation could not be verified."
+                ))
+                continue
+            }
+            guard sent.contains(page) else {
+                unverified.append(AIUnverifiedCitation(
+                    page: page,
+                    reason: "Page \(page) was not sent with this question, so the citation could not be verified."
+                ))
+                continue
+            }
+            guard !chips.contains(where: { $0.page == page }) else { continue }
+            // A page can contribute more than one retrieved passage. The chip is one per page;
+            // its snippet and highlight cover every passage that was sent from that page.
+            let pageSources = sources.filter { $0.page == page }
+            let snippet = pageSources
+                .map(\.snippet)
+                .filter { !$0.isEmpty }
+                .joined(separator: " … ")
+            chips.append(AIChatChip(
+                page: page,
+                snippet: snippet,
+                rects: pageSources.flatMap(\.rects)
+            ))
+        }
+        return AIAnswerBacklinks(chips: chips, unverified: unverified)
     }
 }
 
@@ -204,6 +368,8 @@ public struct AIMakePlanRequest: Sendable {
     public let selection: AIReaderSelection?
     public let question: String?
     public let language: String?
+    /// Oldest first. Only document chat reads it; the Rust builder applies the bound again.
+    public let history: [AIConversationTurn]
     public let settings: AIProviderSettings
 
     public init(
@@ -212,6 +378,7 @@ public struct AIMakePlanRequest: Sendable {
         selection: AIReaderSelection?,
         question: String?,
         language: String?,
+        history: [AIConversationTurn] = [],
         settings: AIProviderSettings
     ) {
         self.action = action
@@ -219,7 +386,19 @@ public struct AIMakePlanRequest: Sendable {
         self.selection = selection
         self.question = question
         self.language = language
+        self.history = history
         self.settings = settings
+    }
+}
+
+/// One previous chat exchange. This is the unit the panel bounds and the model receives.
+public struct AIConversationTurn: Equatable, Sendable {
+    public let question: String
+    public let answer: String
+
+    public init(question: String, answer: String) {
+        self.question = question
+        self.answer = answer
     }
 }
 
@@ -415,6 +594,9 @@ public final class RustAIChatService: AIChatServicing {
             selection: selection,
             question: request.question,
             language: request.language,
+            history: request.history.map {
+                AiConversationTurnRecord(question: $0.question, answer: $0.answer)
+            },
             baseUrl: request.settings.baseURL,
             model: request.settings.model,
             temperature: request.settings.temperature,
@@ -996,6 +1178,13 @@ extension AiPlanRecord {
     }
 
     public var isMultiPart: Bool { parts.count > 1 }
+
+    public var isDocumentChat: Bool { action == .documentChat }
+
+    /// The passages that were sent, in the same form the chips and highlight use.
+    public var chatSources: [AIChatSource] {
+        sources.map(AIChatSource.init(record:))
+    }
 }
 
 extension AiPlanPartRecord {

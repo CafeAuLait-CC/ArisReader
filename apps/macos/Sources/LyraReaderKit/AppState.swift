@@ -1323,6 +1323,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @Published public private(set) var selection: Selection?
 
+    /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
+    /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
+    /// PDF or the sidecar. `id` makes two clicks on the same page restart the fade.
+    public struct AISourceHighlight: Identifiable, Equatable, Sendable {
+        public let id: UUID
+        public let page: Int
+        /// Page-local view space (points, top-left origin, 100% zoom).
+        public let rects: [CGRect]
+        public var phase: Phase
+
+        public enum Phase: Equatable, Sendable {
+            case full, soft, faint
+        }
+
+        public init(id: UUID = UUID(), page: Int, rects: [CGRect], phase: Phase = .full) {
+            self.id = id
+            self.page = page
+            self.rects = rects
+            self.phase = phase
+        }
+    }
+
+    @Published public private(set) var aiSourceHighlight: AISourceHighlight?
+    private var aiSourceHighlightTask: Task<Void, Never>?
+
     /// A rectangle the reader marked for redaction, pending until the explicit apply command.
     public struct PendingRedaction: Identifiable, Equatable, Sendable {
         public let id: UUID
@@ -2560,6 +2585,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         generation: 1
     )
 
+    /// The AI source highlight fades through three 1×1 amber textures. They use the same
+    /// textured-quad pipeline as selection, so no overlay view or annotation path is involved.
+    private lazy var aiSourceFullImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x66]),
+        generation: 1
+    )
+    private lazy var aiSourceSoftImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x3D]),
+        generation: 1
+    )
+    private lazy var aiSourceFaintImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x1A]),
+        generation: 1
+    )
+
     /// Raster scale as a discrete pyramid level: the smallest LOD whose scale covers the
     /// zoom. Zooming therefore stops re-rasterizing anything — the GPU scales the quad from
     /// the nearest LOD, and only the tile *set* changes.
@@ -3246,6 +3295,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isSearching = false
         selection = nil
         selectionAnchor = nil
+        clearAISourceHighlight()
         selectedAnnotationID = nil
         pendingMarkSelection = nil
         moveOriginalAnnotation = nil
@@ -11946,6 +11996,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         beginScrollActivity()
     }
 
+    /// Jump to a chat citation's page and flash the passage it came from.
+    ///
+    /// This creates no annotation and writes no sidecar: the boxes live in `aiSourceHighlight`
+    /// for the length of the fade and are then dropped. The page is scrolled so the first line
+    /// of the passage is visible, not merely so the page top is.
+    public func revealAISource(page: Int, rects: [CGRect]) {
+        guard let document, page >= 0, page < document.pageCount else { return }
+        let clipped = rects.filter {
+            $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
+        }
+        let pageTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let passageTop = clipped.map(\.minY).min() ?? 0
+        cancelScrollGlide()
+        scrollYPt = clampedScrollOffset(max(pageTop, pageTop + passageTop - 40))
+        let highlight = AISourceHighlight(page: page, rects: clipped)
+        aiSourceHighlight = highlight
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = clipped.isEmpty
+            ? "Jumped to page \(page + 1). The source region has no text geometry."
+            : "Source highlighted on page \(page + 1); it fades and is not saved."
+        fadeAISourceHighlight(id: highlight.id)
+    }
+
+    /// Drop the transient highlight immediately (new document, panel closed, clear chat).
+    public func clearAISourceHighlight() {
+        aiSourceHighlightTask?.cancel()
+        aiSourceHighlightTask = nil
+        guard aiSourceHighlight != nil else { return }
+        aiSourceHighlight = nil
+        refreshSelectionOverlay()
+    }
+
+    private func fadeAISourceHighlight(id: UUID) {
+        aiSourceHighlightTask?.cancel()
+        aiSourceHighlightTask = Task { @MainActor [weak self] in
+            for (phase, delay) in [
+                (AISourceHighlight.Phase.soft, Duration.milliseconds(450)),
+                (.faint, .milliseconds(450)),
+            ] {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, let self,
+                      self.aiSourceHighlight?.id == id else { return }
+                self.aiSourceHighlight?.phase = phase
+                self.refreshSelectionOverlay()
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self,
+                  self.aiSourceHighlight?.id == id else { return }
+            self.aiSourceHighlight = nil
+            self.refreshSelectionOverlay()
+        }
+    }
+
     /// Jumps so that `page` (0-based) sits at the top of the viewport.
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
@@ -12634,6 +12738,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
+        if let highlight = aiSourceHighlight,
+           let placement = visiblePagePlacements.first(where: { $0.index == highlight.page }) {
+            let image: PageImage = switch highlight.phase {
+            case .full: aiSourceFullImage
+            case .soft: aiSourceSoftImage
+            case .faint: aiSourceFaintImage
+            }
+            for (index, rect) in highlight.rects.enumerated() {
+                pages.append(CanvasPage(
+                    placement: PagePlacement(
+                        index: PlacementIndex.aiSource(index),
+                        topPt: placement.topPt + rect.minY,
+                        leftPt: placement.leftPt + rect.minX,
+                        widthPt: rect.width,
+                        heightPt: rect.height
+                    ),
+                    image: image,
+                    blend: .normal
+                ))
+            }
+        }
+
         if let selection, !isMarkingTextSelection {
             // While a markup tool is armed the selection *is* the mark about to be committed:
             // it is drawn with the same quads, colour and blend as the finished annotation, so
