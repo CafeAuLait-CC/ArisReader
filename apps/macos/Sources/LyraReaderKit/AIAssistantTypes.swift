@@ -344,9 +344,11 @@ public struct AIProviderSettings: Equatable, Sendable {
     public var maxTokens: Int?
     public var reasoningMode: AIReasoningMode
     public var reasoningEncoding: AIReasoningEncoding
-    /// Whether the configured model accepts image input. When false, a region question sends
-    /// the extracted text only and the preview says so; it never sends a picture to a text-only
-    /// endpoint.
+    /// Whether the request should carry the region picture. The API-key connection takes the
+    /// reader's explicit statement, because a wrong guess could silently send a picture to a
+    /// text-only endpoint. The ChatGPT plan connection sets it because the documented Responses
+    /// shape carries an inline image; if the model refuses it, the send fails with a real error
+    /// rather than degrading to a text-only request.
     public var vision: Bool
 
     public init(
@@ -1090,6 +1092,10 @@ public final class AISettingsStore: ObservableObject {
             guard let account = chatGPT.selected, account.connected, !account.model.isEmpty else {
                 throw AISettingsError.invalid("Connect ChatGPT and select a model in Settings > AI first.")
             }
+            // The Responses transport carries an inline picture, so a region question always
+            // asks for one. The catalog exposes no documented vision flag; sending the
+            // documented content part and reporting a real refusal is honest, whereas dropping
+            // the picture because we guessed would answer a different question.
             return AIProviderSettings(baseURL: "https://api.openai.com/v1", model: account.model,
                                       temperature: nil, maxTokens: nil,
                                       reasoningMode: .providerDefault, reasoningEncoding: .none,
@@ -1270,6 +1276,11 @@ extension AiPlanPartRecord {
     public var characterLabel: String {
         "\(pageCharacters) page characters · \(requestCharacters) request characters"
     }
+
+    /// Whether this exact request carries the region PNG. The Rust planner sets it together with
+    /// the picture embedded in `wire_body`; both transports preserve the same capture, so the
+    /// preview can ask this instead of searching the JSON for a transport-specific key.
+    public var includesRegionImage: Bool { image != nil }
 }
 
 public enum AIPlanFormatting {

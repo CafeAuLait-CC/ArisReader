@@ -215,7 +215,7 @@ struct AIRegionCardView: View {
 
     private var imageStatement: String {
         if let plan = assistant.plan {
-            return plan.parts.first?.wireBody.contains("image_url") == true
+            return plan.parts.first?.includesRegionImage == true
                 ? "Image included in the request as PNG."
                 : "Text-only request: the picture is shown here and kept for export, but not sent."
         }
@@ -311,7 +311,7 @@ struct AIRegionCardView: View {
             previewRow("Pages", plan.sourcePageLabel)
             previewRow("Region", card.attachment.sizeLabel)
             previewRow("Text", "\(card.attachment.characterCount.formatted()) characters")
-            previewRow("Picture", plan.parts.first?.wireBody.contains("image_url") == true
+            previewRow("Picture", plan.parts.first?.includesRegionImage == true
                 ? "\(card.attachment.pixelLabel) PNG included"
                 : "Not sent (text-only model configuration)")
             if card.attachment.textTruncated {
