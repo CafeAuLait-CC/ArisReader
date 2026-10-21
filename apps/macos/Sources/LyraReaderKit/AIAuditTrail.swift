@@ -633,7 +633,26 @@ final class AIAuditedChatHandle: AIChatHandle {
     }
 
     func poll() -> [AIStreamEvent] {
-        let events = base.poll()
+        var events = base.poll()
+        observe(events)
+        // A finished base may still deliver its last events in a final poll (the handle contract
+        // says so). Asking once more before calling it a failure is what keeps this wrapper from
+        // recording `failed` for a request whose `.done` arrives on that poll.
+        if base.isFinished && !recorded {
+            let remaining = base.poll()
+            if !remaining.isEmpty {
+                events.append(contentsOf: remaining)
+                observe(remaining)
+            }
+        }
+        // A transport that stops without a terminal event is a failure, not a silent success.
+        if base.isFinished && !recorded {
+            record(.failed, code: .providerError)
+        }
+        return events
+    }
+
+    private func observe(_ events: [AIStreamEvent]) {
         for event in events {
             switch event {
             case .partStarted(let index, _, _):
@@ -656,11 +675,6 @@ final class AIAuditedChatHandle: AIChatHandle {
                 break
             }
         }
-        // A transport that stops without a terminal event is a failure, not a silent success.
-        if base.isFinished && !recorded {
-            record(.failed, code: .providerError)
-        }
-        return events
     }
 
     func cancel() {

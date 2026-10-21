@@ -148,6 +148,7 @@ extension ReaderChecks {
     @MainActor
     static func aiAuditChecks(root: URL) async throws {
         try await auditSummaryAndRegionChecks(root: root)
+        try await auditFinalPollChecks(root: root)
         try await auditRefusalChecks(root: root)
         try await auditCancelledAndFailedChecks(root: root)
         try await auditTornPageRegionChecks(root: root)
@@ -315,7 +316,10 @@ extension ReaderChecks {
         }
         let region = trail.records[0]
         require(region.action == .regionQuestion, "the region entry has the region-question kind")
-        require(region.outcome == .sent, "the region entry says it was sent")
+        require(
+            region.outcome == .sent,
+            "the region entry says it was sent: \(region.outcome.rawValue) \(String(describing: region.code))"
+        )
         require(region.pages == [1], "the region entry names its page")
         require(region.characters == planCharacters(regionPlan),
                 "the region entry counts the request characters")
@@ -370,6 +374,75 @@ extension ReaderChecks {
                 "the inventory says both connections carry the same picture")
         require(!AIAuditPanelCopy.neverSent.contains(where: { $0.contains("text-only") }),
                 "the inventory no longer calls any connection text-only")
+    }
+
+    // MARK: - The final poll
+
+    /// The handle contract says a finished base may still return its last events in a final
+    /// poll. This base reports `isFinished` one poll before it hands over `.done`; the audit
+    /// wrapper must wait for that poll instead of recording a `providerError` failure while the
+    /// model goes on to finish.
+    @MainActor
+    private final class LateTerminalHandle: AIChatHandle {
+        private var polls = 0
+
+        func poll() -> [AIStreamEvent] {
+            polls += 1
+            switch polls {
+            case 1: return [.partStarted(index: 0, total: 1, label: "Summary")]
+            case 2: return []
+            default: return [.done]
+            }
+        }
+
+        func cancel() {}
+
+        var isFinished: Bool { polls >= 2 }
+    }
+
+    @MainActor
+    private final class LateTerminalService: AIChatServicing {
+        let base: RustAIChatService
+
+        init(engine: RustEngine) {
+            self.base = RustAIChatService(engine: engine, useMockProvider: true)
+        }
+
+        func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
+            try await base.prepare(request)
+        }
+
+        func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+            LateTerminalHandle()
+        }
+    }
+
+    @MainActor
+    private static func auditFinalPollChecks(root: URL) async throws {
+        let fixture = makeAuditSettings()
+        defer { fixture.cleanup() }
+        let directory = makeAuditDirectory()
+        defer { removeAuditDirectory(directory) }
+        let trail = AIAuditTrail(directory: directory)
+        let (engine, _, context) = try openAuditDocument(root: root)
+        let model = AIAssistantModel(settings: fixture.store, audit: trail)
+        model.attach(service: LateTerminalService(engine: engine), context: context)
+        await model.prepare(action: .summarizePage, context: context)
+        guard model.phase == .preview else {
+            fatalError("FAIL: the late-terminal preview was built: \(model.errorMessage ?? "nil")")
+        }
+        model.send()
+        try await eventually("the late-terminal attempt finishes", { model.phase == .finished })
+        try await eventually("the late-terminal attempt records one entry", {
+            trail.records.count == 1
+        })
+        guard let record = trail.records.first else {
+            fatalError("FAIL: the late-terminal attempt produced no audit record")
+        }
+        require(
+            record.outcome == .sent,
+            "a request whose done arrives on the final poll is recorded as sent, not \(record.outcome.rawValue) \(String(describing: record.code))"
+        )
     }
 
     // MARK: - Refusals
