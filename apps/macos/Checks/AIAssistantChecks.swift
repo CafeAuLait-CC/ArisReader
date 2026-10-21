@@ -2,6 +2,7 @@ import AppKit
 import CoreText
 import LyraReaderBindings
 import LyraReaderKit
+import SwiftUI
 import Darwin
 import Foundation
 
@@ -150,6 +151,7 @@ extension ReaderChecks {
         try await aiPanelChecks(root: root)
         try await aiMergeChecks()
         try await aiDocumentChatChecks(root: root)
+        try await aiDocumentChatLayoutChecks(root: root)
     }
 
     @MainActor
@@ -1486,6 +1488,255 @@ extension ReaderChecks {
                 "switching back restores the first document's bounded conversation")
 
         print("AI-DOCCHAT pages=\(sentPages.sorted()) document_chars=\(preview.parts[0].pageCharacters) request_chars=\(preview.parts[0].requestCharacters) chips=\(links.chips.map(\.page))")
+    }
+}
+
+// MARK: - Document chat layout at the panel's width limits
+
+private struct DocumentChatPanelMeasurements {
+    let hostBounds: CGRect
+    let chat: CGRect
+    let composer: CGRect
+    let actions: CGRect
+    let composerField: CGRect?
+    let askButton: CGRect?
+    let historyContentHeight: CGFloat
+    let historyViewportHeight: CGFloat
+    /// Page → chip frame, sorted top-to-bottom; the first occurrence of each page is kept.
+    let chipFrames: [(page: Int, frame: CGRect)]
+}
+
+extension ReaderChecks {
+    /// Host the real right-panel content at the panel's minimum and maximum content widths and
+    /// measure the chat's AppKit frames. This is the narrow/wide acceptance evidence: the chat
+    /// fills the remaining height, the composer stays usable, chips wrap (their height grows at
+    /// 240 pt rather than their width clipping), and the history remains a scroll view whose
+    /// content is taller than its viewport.
+    @MainActor
+    private static func aiDocumentChatLayoutChecks(root: URL) async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lyra-reader-docchat-layout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let url = scratch.appendingPathComponent("long-paper.pdf")
+        try writeDocumentChatFixture(to: url)
+
+        let engine = try RustEngine()
+        _ = try engine.openDocument(at: url)
+        let context = AIReaderContext(
+            documentKey: url.standardizedFileURL.path,
+            documentTitle: "Long paper",
+            pageCount: 8,
+            currentPage: 1,
+            selection: nil
+        )
+        let fixture = makeSettings(key: "sk-docchat-layout")
+        defer { fixture.cleanup() }
+        require(fixture.store.save(
+            baseURL: "http://127.0.0.1:11434/v1",
+            model: "mock-model",
+            temperature: 0.2,
+            maxTokens: 900,
+            apiKey: "sk-docchat-layout"
+        ), "the layout fixture saves its provider")
+
+        // Long answers with several short citations give the history enough content to scroll
+        // and the chips a snippet that must wrap at 240 pt but not at 520 pt.
+        let answer = "The spectral absorbance experiment measured every sample, and the retrieval "
+            + "baseline improved recall on the evaluation query. "
+            + String(repeating: "The result was checked against the baseline. ", count: 6)
+            + " [p.2] [p.4] [p.6]"
+        let service = ScriptedAIChatService(
+            engine: engine,
+            events: [
+                .partStarted(index: 0, total: 1, label: "Retrieved passages"),
+                .delta(answer),
+                .done,
+            ]
+        )
+        let model = AIAssistantModel(settings: fixture.store)
+        model.attach(service: service, context: context)
+        for index in 1...6 {
+            model.chatQuestion = "How did the spectral absorbance experiment and the retrieval baseline change the evaluation query results? (\(index))"
+            await model.prepareDocumentChat(context: context)
+            try await eventually("layout chat preview \(index)", {
+                model.phase == .preview && model.plan != nil
+            })
+            model.send()
+            try await eventually("layout chat answer \(index)", {
+                model.chatTurns.last?.state == .finished
+            })
+        }
+        require(model.chatTurns.count == 6, "the layout fixture has six chat turns")
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        require(state.open(url: url), "the layout fixture opens in the reader state")
+
+        let narrow = try await measureDocumentChatPanel(
+            state: state, model: model, width: ReaderSidePanelMetrics.minimumContentWidthPt
+        )
+        let wide = try await measureDocumentChatPanel(
+            state: state, model: model, width: ReaderSidePanelMetrics.maximumContentWidthPt
+        )
+
+        for (label, measurement, expectedWidth) in [
+            ("240 pt", narrow, ReaderSidePanelMetrics.minimumContentWidthPt),
+            ("520 pt", wide, ReaderSidePanelMetrics.maximumContentWidthPt),
+        ] {
+            require(abs(measurement.chat.width - expectedWidth) < 1,
+                    "\(label): the chat fills the panel width (\(measurement.chat.width) pt)")
+            require(measurement.chat.height > 250,
+                    "\(label): the chat gets the panel height below the actions (\(measurement.chat.height) pt)")
+            require(measurement.actions.height >= 170 && measurement.actions.height <= 280,
+                    "\(label): the single-shot actions keep a bounded scrollable area (\(measurement.actions.height) pt)")
+            require(measurement.chat.minX >= -0.5
+                        && measurement.chat.maxX <= measurement.hostBounds.maxX + 0.5,
+                    "\(label): the chat is not clipped horizontally")
+            require(measurement.composer.width > 180 && measurement.composer.width <= expectedWidth + 0.5,
+                    "\(label): the composer keeps a usable width (\(measurement.composer.width) pt)")
+            require(measurement.composerField != nil,
+                    "\(label): the composer has an editable text field")
+            if let field = measurement.composerField {
+                require(field.width > 120 && field.height > 0,
+                        "\(label): the question field is usable (\(field.width)×\(field.height) pt)")
+            }
+            require(measurement.askButton != nil,
+                    "\(label): the Ask button is present")
+            require(measurement.historyViewportHeight > 0,
+                    "\(label): the history has a scroll viewport")
+            require(measurement.historyContentHeight > measurement.historyViewportHeight + 40,
+                    "\(label): the history is scrollable when it overflows "
+                        + "(\(measurement.historyContentHeight) content vs "
+                        + "\(measurement.historyViewportHeight) viewport)")
+            require(measurement.chipFrames.count >= 3,
+                    "\(label): the answer shows citation chips")
+            for (page, frame) in measurement.chipFrames {
+                require(frame.width > 0 && frame.height > 0,
+                        "\(label): chip p.\(page) has a laid-out frame")
+                require(frame.maxX <= measurement.chat.maxX + 0.5,
+                        "\(label): chip p.\(page) wraps inside the panel rather than crossing its edge "
+                            + "(maxX \(frame.maxX) vs \(measurement.chat.maxX))")
+            }
+            let sorted = measurement.chipFrames.sorted { $0.frame.minY < $1.frame.minY }
+            for pair in zip(sorted, sorted.dropFirst()) {
+                require(pair.1.frame.minY >= pair.0.frame.maxY - 0.5,
+                        "\(label): citation chips stack without clipping each other")
+            }
+        }
+
+        let narrowChips = Dictionary(
+            narrow.chipFrames.map { ($0.page, $0.frame.height) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let wideChips = Dictionary(
+            wide.chipFrames.map { ($0.page, $0.frame.height) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for page in narrowChips.keys.sorted() {
+            guard let narrowHeight = narrowChips[page], let wideHeight = wideChips[page] else { continue }
+            require(narrowHeight >= wideHeight - 0.5,
+                    "chip p.\(page) gets taller at 240 pt (\(narrowHeight)) than at 520 pt (\(wideHeight)) "
+                        + "because its snippet wraps")
+        }
+        require(narrowChips.values.max() ?? 0 > (wideChips.values.max() ?? 0) + 4,
+                "at least one snippet visibly wraps to more lines at 240 pt")
+
+        print("AI-DOCCHAT-LAYOUT narrow=240 chat=\(narrow.chat.size) composer=\(narrow.composer.size) "
+            + "chips=\(narrow.chipFrames.map { "\($0.page):\($0.frame.height)" }) "
+            + "history=\(narrow.historyContentHeight)/\(narrow.historyViewportHeight) "
+            + "wide=520 chat=\(wide.chat.size) composer=\(wide.composer.size) "
+            + "chips=\(wide.chipFrames.map { "\($0.page):\($0.frame.height)" }) "
+            + "history=\(wide.historyContentHeight)/\(wide.historyViewportHeight)")
+    }
+
+    @MainActor
+    private static func measureDocumentChatPanel(
+        state: AppState,
+        model: AIAssistantModel,
+        width: CGFloat
+    ) async throws -> DocumentChatPanelMeasurements {
+        let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
+        let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
+        host.frame = container.bounds
+        host.autoresizingMask = [.width, .height]
+        container.addSubview(host)
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: width, height: 800),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = container
+        window.setContentSize(NSSize(width: width, height: 800))
+        window.orderFrontRegardless()
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+        try await Task.sleep(for: .milliseconds(120))
+        host.layoutSubtreeIfNeeded()
+        require(abs(host.bounds.height - 800) < 1,
+                "the layout host keeps the requested 800 pt height (got \(host.bounds.height))")
+
+        guard let chatMarker = findView(AIDocumentChatMarkerView.self, in: host),
+              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host),
+              let actionsMarker = findView(AIAssistantPanelMarkerView.self, in: host) else {
+            fatalError("FAIL: the hosted right panel is missing a chat, composer or actions marker")
+        }
+        let chat = host.convert(chatMarker.bounds, from: chatMarker)
+        let composer = host.convert(composerMarker.bounds, from: composerMarker)
+        let actions = host.convert(actionsMarker.bounds, from: actionsMarker)
+        let composerFrame = host.convert(composerMarker.bounds, from: composerMarker)
+        let fields = findViews(NSTextField.self, in: host)
+            .filter {
+                !$0.isHidden && $0.frame.width > 1
+                    && host.convert($0.bounds, from: $0).intersects(composerFrame)
+            }
+        let buttons = findViews(NSButton.self, in: host)
+            .filter {
+                !$0.isHidden && host.convert($0.bounds, from: $0).intersects(composerFrame)
+            }
+        let history = findViews(NSScrollView.self, in: host)
+            .filter { host.convert($0.bounds, from: $0).intersects(chat.insetBy(dx: -1, dy: -1)) }
+            .max { lhs, rhs in
+                host.convert(lhs.bounds, from: lhs).height
+                    < host.convert(rhs.bounds, from: rhs).height
+            }
+        let chipMarkers = findViews(AIDocumentChatChipMarkerView.self, in: host)
+            .map { ($0.page, host.convert($0.bounds, from: $0)) }
+            .filter { $0.1.intersects(chat.insetBy(dx: -1, dy: -1)) }
+            .sorted { $0.1.minY < $1.1.minY }
+        var seenPages: Set<Int> = []
+        let firstChipPerPage = chipMarkers.filter { seenPages.insert($0.0).inserted }
+        return DocumentChatPanelMeasurements(
+            hostBounds: host.bounds,
+            chat: chat,
+            composer: composer,
+            actions: actions,
+            composerField: fields.first.map { host.convert($0.bounds, from: $0) },
+            askButton: buttons.first.map { host.convert($0.bounds, from: $0) },
+            historyContentHeight: history?.documentView?.frame.height ?? 0,
+            historyViewportHeight: history?.contentView.bounds.height ?? 0,
+            chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
+        )
+    }
+
+    @MainActor
+    private static func findView<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+        if let found = view as? T { return found }
+        for subview in view.subviews {
+            if let found = findView(type, in: subview) { return found }
+        }
+        return nil
+    }
+
+    @MainActor
+    private static func findViews<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+        var found: [T] = []
+        if let value = view as? T { found.append(value) }
+        for subview in view.subviews {
+            found.append(contentsOf: findViews(type, in: subview))
+        }
+        return found
     }
 }
 

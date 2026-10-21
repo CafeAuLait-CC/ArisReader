@@ -31,7 +31,9 @@ public struct AIAssistantPanel: View {
                             keyMissing
                         }
                         actions
-                        if let note = model.statusNote, !note.isEmpty {
+                        if let note = model.statusNote, !note.isEmpty,
+                           !model.isDocumentChatPlan, !model.isChatStreaming,
+                           model.pendingChatQuestion == nil {
                             Text(note)
                                 .font(.caption)
                                 .foregroundStyle(
@@ -42,7 +44,7 @@ public struct AIAssistantPanel: View {
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
-                        if model.isPreparing {
+                        if model.isPreparing, model.pendingChatQuestion == nil {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
                                 Text("Reading text and building the preview…")

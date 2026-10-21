@@ -1,3 +1,4 @@
+import AppKit
 import LyraReaderBindings
 import SwiftUI
 
@@ -26,6 +27,7 @@ public struct AIDocumentChatView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(LyraReaderTheme.panelBg.opacity(0.35))
+        .background(AIDocumentChatMarkerHost())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
     }
@@ -253,13 +255,16 @@ public struct AIDocumentChatView: View {
                 Text(chip.snippet.isEmpty ? "Passage sent from page \(chip.page)" : chip.snippet)
                     .font(.caption2)
                     .foregroundStyle(LyraReaderTheme.textSecondary)
-                    .lineLimit(2)
+                    // No line clamp: at the panel's narrow width the snippet wraps to as many
+                    // lines as it needs instead of being clipped or forcing the row wider.
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(5)
             .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 5))
+            .background(AIDocumentChatChipMarkerHost(page: chip.page))
         }
         .buttonStyle(.plain)
         .help("Jump to page \(chip.page) and briefly highlight the passage that was sent")
@@ -355,19 +360,31 @@ public struct AIDocumentChatView: View {
                 .font(.caption)
                 .lineLimit(1...4)
                 .onSubmit(ask)
-            HStack(spacing: 6) {
-                Text("Ask builds the preview locally.")
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-                Spacer()
-                Button("Ask") { ask() }
-                    .controlSize(.small)
-                    .disabled(!model.canAskDocument)
-                    .help("Find passages across the document and show the exact request before sending")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    Text("Ask builds the preview locally.")
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 4)
+                    askButton
+                }
+                HStack(spacing: 6) {
+                    Spacer(minLength: 0)
+                    askButton
+                }
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+        .background(AIDocumentChatComposerMarkerHost())
+    }
+
+    private var askButton: some View {
+        Button("Ask") { ask() }
+            .controlSize(.small)
+            .disabled(!model.canAskDocument)
+            .help("Find passages across the document and show the exact request before sending")
     }
 
     private func ask() {
@@ -378,4 +395,75 @@ public struct AIDocumentChatView: View {
     private func sync() {
         model.attach(service: state.aiChatService, context: state.aiReaderContext)
     }
+}
+
+
+// MARK: - Check markers
+
+/// Real AppKit views make the SwiftUI layout measurable from the native checks, exactly as the
+/// right panel's assistant marker does. They are zero-content backgrounds, never visible.
+public final class AIDocumentChatMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("Document chat content")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("Document chat content")
+    }
+}
+
+private struct AIDocumentChatMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIDocumentChatMarkerView {
+        AIDocumentChatMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIDocumentChatMarkerView, context: Context) {}
+}
+
+public final class AIDocumentChatComposerMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("Document chat composer")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("Document chat composer")
+    }
+}
+
+private struct AIDocumentChatComposerMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIDocumentChatComposerMarkerView {
+        AIDocumentChatComposerMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIDocumentChatComposerMarkerView, context: Context) {}
+}
+
+/// One marker per citation chip, carrying the page number so a check can compare how that chip's
+/// snippet wraps at the panel's minimum and maximum widths.
+public final class AIDocumentChatChipMarkerView: NSView {
+    public let page: Int
+
+    public init(page: Int, frame frameRect: NSRect) {
+        self.page = page
+        super.init(frame: frameRect)
+        setAccessibilityLabel("Citation chip page \(page)")
+    }
+
+    public required init?(coder: NSCoder) {
+        fatalError("AIDocumentChatChipMarkerView is programmatic")
+    }
+}
+
+private struct AIDocumentChatChipMarkerHost: NSViewRepresentable {
+    let page: Int
+
+    func makeNSView(context: Context) -> AIDocumentChatChipMarkerView {
+        AIDocumentChatChipMarkerView(page: page, frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIDocumentChatChipMarkerView, context: Context) {}
 }
