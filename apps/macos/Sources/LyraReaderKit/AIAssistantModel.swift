@@ -462,6 +462,7 @@ public final class AIAssistantModel: ObservableObject {
             cancelWork()
         }
         chatTurns = []
+        chatQuestion = ""
         if let key = documentKey { conversations[key] = [] }
         if chatPlan {
             plan = nil
