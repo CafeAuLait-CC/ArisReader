@@ -783,7 +783,7 @@ public final class MetalCanvasView: NSView {
 
         // Selecting a mark is decided on the press, not after the drag slop: the mark is what
         // the reader aimed at, and waiting would let the text under it start a text selection.
-        // Only an editable mark (one in the sidecar) qualifies.
+        // Only an editable mark (one in the annotation cache) qualifies.
         if annotationTool == .select,
            annotationOverlay?.hitTestMark(atContentPoint: content,
                                          toleranceViewPt: AnnotationGeometry.hitTolerancePt) != nil {

@@ -50,7 +50,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     /// The markup kind a finished text selection becomes, or `nil` for every other tool.
     ///
-    /// The three kinds are text marks, not glyphs drawn by a pointer: they live in the sidecar,
+    /// The three kinds are text marks, not glyphs drawn by a pointer: they live in the annotation cache,
     /// are written as `/QuadPoints`, and are hit-tested/selected through their text range.
     public var textMarkupKind: AppState.Annotation.Kind? {
         switch self {
@@ -176,7 +176,7 @@ public enum TextBoxResizeHandle: CaseIterable, Sendable {
 /// One geometry mark as the canvas overlay draws it.
 ///
 /// Coordinates are **page-local view space** (points at 100%, origin at the page's top-left),
-/// which is exactly what the sidecar stores and what the write-back path converts once. The
+/// which is exactly what the annotation cache stores and what the write-back path converts once. The
 /// canvas maps them to the view with the page's placement and the current zoom.
 /// A rectangle the reader marked for redaction, drawn while it is still pending.
 ///

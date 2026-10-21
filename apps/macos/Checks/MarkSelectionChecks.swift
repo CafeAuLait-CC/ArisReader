@@ -22,14 +22,14 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
-        func sidecarText(_ document: URL) throws -> String {
-            String(decoding: try Data(contentsOf: sidecar(for: document)), as: UTF8.self)
+        func recordsText(_ document: URL) throws -> String {
+            String(decoding: try Data(contentsOf: records(for: document)), as: UTF8.self)
         }
 
         let viewport = CGSize(width: 700, height: 500)
@@ -288,7 +288,7 @@ extension ReaderChecks {
         }
         state.clearAnnotationSelection()
 
-        // ── 4. Delete removes each kind with one undo step and one sidecar write ──────
+        // ── 4. Delete removes each kind with one undo step and one cache write ──────
         for entry in created {
             click(at: clickPoint(for: entry))
             require(state.selectedAnnotationID == entry.id,
@@ -302,13 +302,13 @@ extension ReaderChecks {
             require(state.selectedAnnotationID == nil,
                     "deleting the \(entry.kind.rawValue) clears its selection")
             require(state.annotationWriteCount == writesBefore + 1,
-                    "one Delete writes the sidecar once for the \(entry.kind.rawValue) "
+                    "one Delete writes the annotation cache once for the \(entry.kind.rawValue) "
                         + "(\(state.annotationWriteCount - writesBefore) writes)")
             require(state.undoStack.count == undoBefore + 1,
                     "one Delete is one undo step for the \(entry.kind.rawValue)")
-            let savedAfterDelete = try sidecarText(document)
+            let savedAfterDelete = try recordsText(document)
             require(!savedAfterDelete.contains(entry.id.uuidString),
-                    "the deleted \(entry.kind.rawValue) is gone from the sidecar")
+                    "the deleted \(entry.kind.rawValue) is gone from the annotation cache")
             state.undo()
             require(state.annotations.contains(where: { $0.id == entry.id }),
                     "undo restores the deleted \(entry.kind.rawValue)")
@@ -334,7 +334,7 @@ extension ReaderChecks {
         require(state.selectedAnnotationID == nil,
                 "the drag does not select the highlight")
         require(state.annotationWriteCount == writesBeforeDrag,
-                "selecting text over a mark does not write the sidecar")
+                "selecting text over a mark does not write the annotation cache")
         state.clearSelection()
 
         // ── 6. A drag inside an unselected text box selects text; the box stays put ────

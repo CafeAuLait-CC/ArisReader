@@ -8,11 +8,11 @@ extension ReaderChecks {
     /// PDF write-back: copy, replace, backup, duplicate avoidance and what another viewer sees.
     ///
     /// This runs the real engine end to end on a scratch copy of `tests/fixtures/text-page.pdf`:
-    /// it seeds a sidecar with two annotations, writes them into a PDF, reopens that PDF with the
+    /// it seeds an annotation cache with two annotations, writes them into a PDF, reopens that PDF with the
     /// reader, and renders it with **PDFKit** — the engine Preview uses — to check that the
     /// highlight is visible and the glyphs stay black under it. The Rust tests cover the
     /// field-by-field round trip, the backup failure and the interrupted-save paths; this check
-    /// covers the shell half: which entries disappear from the sidecar, which do not, and that a
+    /// covers the shell half: which entries disappear from the annotation cache, which do not, and that a
     /// reopen shows each annotation exactly once.
     @MainActor static func annotationWritebackChecks(fixture: URL) async throws {
         let fileManager = FileManager.default
@@ -21,7 +21,7 @@ extension ReaderChecks {
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
-        // ── The text ranges the two sidecar annotations cover ──────────────────────────
+        // ── The text ranges the two cached annotations cover ──────────────────────────
         let probe = try RustEngine()
         let loaded = try probe.openDocument(at: fixture)
         require(loaded.pageCount == 1, "write-back fixture is one page")
@@ -85,12 +85,12 @@ extension ReaderChecks {
         func makeDocument(named name: String, withStaleTemporary: Bool) throws -> URL {
             let document = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: fixture, to: document)
-            let sidecar = DocumentEditCache.annotationsURL(for: document)
-            let sidecarText = "[\n"
+            let records = DocumentEditCache.annotationsURL(for: document)
+            let recordsText = "[\n"
                 + [try entry(first), try entry(second), try entry(bookmark), foreignEntry]
                     .joined(separator: ",\n")
                 + "\n]"
-            try Data(sidecarText.utf8).write(to: sidecar)
+            try Data(recordsText.utf8).write(to: records)
             if withStaleTemporary {
                 // A crashed save leaves this behind; the rename is the last step, so the
                 // document itself is still the last good file.
@@ -102,11 +102,11 @@ extension ReaderChecks {
             return document
         }
 
-        // ── 1. Save an annotated copy; the original and its sidecar are untouched ──────
+        // ── 1. Save an annotated copy; the original and its annotation cache are untouched ──────
         let copySource = try makeDocument(named: "copy-source.pdf", withStaleTemporary: true)
-        let copySourceSidecar = DocumentEditCache.annotationsURL(for: copySource)
+        let copySourceRecords = DocumentEditCache.annotationsURL(for: copySource)
         let copyOriginalBytes = try Data(contentsOf: copySource)
-        let copySidecarBytes = try Data(contentsOf: copySourceSidecar)
+        let copyRecordsBytes = try Data(contentsOf: copySourceRecords)
         let staleTemporary = scratch.appendingPathComponent(
             "\(copySource.lastPathComponent).lyra-reader-save-999-1.tmp"
         )
@@ -114,7 +114,7 @@ extension ReaderChecks {
         let copyState = AppState(engine: try RustEngine())
         copyState.setViewportSize(CGSize(width: 700, height: 500))
         copyState.newTab(url: copySource)
-        require(copyState.annotations.count == 2, "the seeded sidecar loads two annotations")
+        require(copyState.annotations.count == 2, "the seeded annotation cache loads two annotations")
         require(copyState.interruptedAnnotationSaveNotice != nil,
                 "a leftover temporary is reported on open")
         require(copyState.canSaveAnnotationsToPDF, "the save commands are enabled with annotations")
@@ -124,11 +124,11 @@ extension ReaderChecks {
         require(copied, "saving an annotated copy succeeds")
         require(fileManager.fileExists(atPath: copyURL.path), "the annotated copy exists")
         let copySourceAfter = try Data(contentsOf: copySource)
-        let copySidecarAfter = try Data(contentsOf: copySourceSidecar)
+        let copyRecordsAfter = try Data(contentsOf: copySourceRecords)
         require(copySourceAfter == copyOriginalBytes,
                 "the original PDF is byte-identical after a copy save")
-        require(copySidecarAfter == copySidecarBytes,
-                "the original sidecar is untouched after a copy save")
+        require(copyRecordsAfter == copyRecordsBytes,
+                "the original annotation cache is untouched after a copy save")
         require(!fileManager.fileExists(atPath: staleTemporary.path),
                 "the interrupted save's temporary file was cleaned up")
         if let report = copyState.lastAnnotationWriteReport {
@@ -148,14 +148,14 @@ extension ReaderChecks {
             require(false, "a successful save publishes a report")
         }
 
-        // ── 2. Reopening the copy: one copy of each annotation, from the PDF, no sidecar ──
-        let copySidecarURL = DocumentEditCache.annotationsURL(for: copyURL)
-        require(!fileManager.fileExists(atPath: copySidecarURL.path),
-                "a copy carries no sidecar, so reopening it cannot duplicate entries")
+        // ── 2. Reopening the copy: one copy of each annotation, from the PDF, no annotation cache ──
+        let copyRecordsURL = DocumentEditCache.annotationsURL(for: copyURL)
+        require(!fileManager.fileExists(atPath: copyRecordsURL.path),
+                "a copy carries no cached annotations, so reopening it cannot duplicate entries")
         let copyReopen = AppState(engine: try RustEngine())
         copyReopen.setViewportSize(CGSize(width: 700, height: 500))
         copyReopen.newTab(url: copyURL)
-        require(copyReopen.annotations.isEmpty, "the copy has no sidecar annotations")
+        require(copyReopen.annotations.isEmpty, "the copy has no cached annotations")
         try await eventually("reopening the copy reads its PDF annotations", {
             copyReopen.documentAnnotations.count == 2
         })
@@ -202,7 +202,7 @@ extension ReaderChecks {
         let reopenedUnderline = copyReopen.documentAnnotations
             .first { $0.id == "nm:\(secondID.uuidString)" }!
         require(reopenedUnderline.kind == "underline",
-                "the sidecar's underline is written as /Subtype /Underline")
+                "the annotation cache's underline is written as /Subtype /Underline")
         require(reopenedUnderline.blend == "multiply",
                 "an underline with no /BM reads back as multiply")
 
@@ -264,9 +264,9 @@ extension ReaderChecks {
         require(notePixels > 30,
                 "PDFKit renders a note icon for the /Text annotation (\(notePixels) non-white px)")
 
-        // ── 4. Replace the original: verified backup, exact sidecar removal, no duplicates ──
+        // ── 4. Replace the original: verified backup, exact annotation cache removal, no duplicates ──
         let replaceSource = try makeDocument(named: "replace-source.pdf", withStaleTemporary: false)
-        let replaceSidecar = DocumentEditCache.annotationsURL(for: replaceSource)
+        let replaceRecords = DocumentEditCache.annotationsURL(for: replaceSource)
         let replaceOriginalBytes = try Data(contentsOf: replaceSource)
         let replaceState = AppState(engine: try RustEngine())
         replaceState.setViewportSize(CGSize(width: 700, height: 500))
@@ -291,14 +291,14 @@ extension ReaderChecks {
         require(backupBytes == replaceOriginalBytes,
                 "the backup is byte-identical to the original")
 
-        let sidecarText = String(decoding: try Data(contentsOf: replaceSidecar), as: UTF8.self)
-        require(!sidecarText.contains(firstID.uuidString)
-                    && !sidecarText.contains(secondID.uuidString),
-                "exactly the saved entries are removed from the sidecar")
-        require(sidecarText.contains(foreignEntry),
+        let recordsText = String(decoding: try Data(contentsOf: replaceRecords), as: UTF8.self)
+        require(!recordsText.contains(firstID.uuidString)
+                    && !recordsText.contains(secondID.uuidString),
+                "exactly the saved entries are removed from the annotation cache")
+        require(recordsText.contains(foreignEntry),
                 "a foreign entry is preserved verbatim through the replace")
-        require(!sidecarText.contains(bookmark.id.uuidString),
-                "the bookmark is saved into the PDF and removed from the sidecar")
+        require(!recordsText.contains(bookmark.id.uuidString),
+                "the bookmark is saved into the PDF and removed from the annotation cache")
         try await eventually("the replaced document reopens with its PDF annotations", {
             replaceState.documentAnnotations.count == 2
         })
@@ -306,7 +306,7 @@ extension ReaderChecks {
             replaceState.bookmarks.map(\.id) == [bookmark.id]
         })
         require(replaceState.annotations.isEmpty,
-                "the saved entries are gone from the sidecar model")
+                "the saved entries are gone from the annotation model")
         require(replaceState.documentAnnotations.count == 2,
                 "reopening the replaced file shows each annotation once")
         try await eventually("the replaced page has one tint quad per annotation", {
@@ -315,20 +315,20 @@ extension ReaderChecks {
             }.count == 2
         })
 
-        // ── 5. Reconciliation when the sidecar still has saved entries ────────────────
-        // This is the failure mode a PDF-first save leaves: the PDF is written, the sidecar
+        // ── 5. Reconciliation when the annotation cache still has saved entries ────────────────
+        // This is the failure mode a PDF-first save leaves: the PDF is written, the annotation cache
         // write is not. Reopening must show the PDF's copy once, not the PDF's copy plus the
-        // sidecar's.
+        // annotation cache's.
         let staleText = "[\n" + [try entry(first), try entry(second)].joined(separator: ",\n") + "\n]"
-        try Data(staleText.utf8).write(to: replaceSidecar)
+        try Data(staleText.utf8).write(to: replaceRecords)
         let reconciled = AppState(engine: try RustEngine())
         reconciled.setViewportSize(CGSize(width: 700, height: 500))
         reconciled.newTab(url: replaceSource)
-        require(reconciled.annotations.count == 2, "the stale sidecar loads before reconciliation")
+        require(reconciled.annotations.count == 2, "the stale annotation cache loads before reconciliation")
         try await eventually("the PDF annotations load for reconciliation", {
             reconciled.documentAnnotations.count == 2
         })
-        try await eventually("saved sidecar entries are reconciled away", {
+        try await eventually("saved annotation-cache entries are reconciled away", {
             reconciled.annotations.isEmpty
         })
         try await eventually("the canvas draws one quad per annotation after reconciliation", {
@@ -339,14 +339,14 @@ extension ReaderChecks {
         require(reconciled.documentAnnotations.count == 2,
                 "the reopened file still shows each annotation once")
 
-        // The next ordinary sidecar write drops the reconciled entries from the file too.
+        // The next ordinary cache write drops the reconciled entries from the file too.
         reconciled.addBookmarkAtCurrentPage(name: "after reconciliation")
-        let cleanedText = String(decoding: try Data(contentsOf: replaceSidecar), as: UTF8.self)
+        let cleanedText = String(decoding: try Data(contentsOf: replaceRecords), as: UTF8.self)
         require(!cleanedText.contains(firstID.uuidString)
                     && !cleanedText.contains(secondID.uuidString),
-                "a later sidecar write removes the reconciled entries")
+                "a later cache write removes the reconciled entries")
         require(cleanedText.contains("after reconciliation"),
-                "a later bookmark is still written to the same sidecar")
+                "a later bookmark is still written to the same annotation cache")
     }
 
     /// Renders page 0 of `url` with PDFKit and counts highlight and glyph pixels inside

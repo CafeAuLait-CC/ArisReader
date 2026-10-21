@@ -160,10 +160,11 @@ else
 fi
 
 if [ "$SWIFT_BUILT" = "1" ]; then
-  # The native checks open the committed fixtures by their repository paths. The index cache
-  # writes beside the PDF by design, so the suite disables it rather than leaving sidecars in
-  # tests/fixtures; the cache itself is covered by the Rust integration tests, which copy their
-  # fixtures into a scratch directory first.
+  # The native checks open the committed fixtures by their repository paths. They redirect the
+  # document cache (and the index-cache directory) to a temporary directory of their own; the
+  # index cache is disabled on top of that so the suite never reads or writes the user's cache
+  # and cannot depend on what an earlier run left there. The cache itself is covered by the Rust
+  # integration tests, which copy their fixtures into a scratch directory first.
   if LYRA_READER_INDEX_CACHE=disabled \
     LYRA_READER_PDFIUM_PATH="${LYRA_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
     "$ROOT/apps/macos/.build/debug/LyraReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then

@@ -23,7 +23,7 @@ extension ReaderChecks {
             color: AppState.highlightPalette[0].color, note: "Keep this evidence", createdAt: Date())
         let bookmark = Bookmark(page: 0, title: "Research question", yPt: 30)
         let legacy = source.appendingPathExtension("aris-annotations.json")
-        let records = try AnnotationSidecar.encode(annotations: [mark], bookmarks: [bookmark],
+        let records = try AnnotationRecords.encode(annotations: [mark], bookmarks: [bookmark],
             slots: [.annotation(mark.id), .bookmark(bookmark.id)])
         try records.write(to: legacy)
         weak var previousOwner: AppState?
@@ -82,7 +82,7 @@ extension ReaderChecks {
         require(!resumed.pageEditSessionActive, "successful Save retires the working session")
         require(!fm.fileExists(atPath: DocumentEditCache.recoveryURL(for: source).path), "successful Save retires the recovery manifest")
         require(DocumentEditCache.legacyURLs(for: source).allSatisfy { !fm.fileExists(atPath: $0.path) },
-                "saving does not recreate adjacent sidecars")
+                "saving does not recreate the legacy annotation files")
         try await eventually("saved bookmarks reload from the PDF outline") { resumed.bookmarks.count == 1 }
         require(!resumed.annotationCacheIsDirty, "embedded bookmarks do not mark a saved document dirty")
 
@@ -112,17 +112,17 @@ extension ReaderChecks {
         try corrupt.write(to: oldRecords)
         let protected = AppState(engine: try RustEngine())
         protected.open(url: invalid)
-        require(protected.canRecoverUnreadableAnnotationSidecar && (try? Data(contentsOf: oldRecords)) == corrupt,
+        require(protected.canRecoverUnreadableAnnotationRecords && (try? Data(contentsOf: oldRecords)) == corrupt,
                 "invalid legacy records are preserved and never silently replaced")
         let pendingCorrupt = Data("{invalid pending deletions".utf8)
         try pendingCorrupt.write(to: DocumentEditCache.pendingStateURL(for: invalid))
-        let backup = protected.recoverUnreadableAnnotationSidecar()
+        let backup = protected.recoverUnreadableAnnotationRecords()
         require(backup != nil && (try? Data(contentsOf: backup!)) == corrupt,
                 "explicit recovery keeps the original unreadable annotation bytes")
         let recoveryFiles = try fm.contentsOfDirectory(at: DocumentEditCache.directory(for: invalid), includingPropertiesForKeys: nil)
         require(recoveryFiles.contains { (try? Data(contentsOf: $0)) == pendingCorrupt },
                 "explicit recovery also preserves unreadable pending deletion metadata")
-        require(!protected.canRecoverUnreadableAnnotationSidecar,
+        require(!protected.canRecoverUnreadableAnnotationRecords,
                 "verified backup permits a fresh annotation cache")
         print("Document cache checks passed")
     }

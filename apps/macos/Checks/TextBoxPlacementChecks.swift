@@ -20,10 +20,10 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
@@ -454,7 +454,7 @@ extension ReaderChecks {
                     == "Clicking the page keeps this.",
                 "clicking outside keeps the text box and its text")
 
-        // ── 4. A pre-change sidecar entry still opens, edits and keeps its shape ─────────
+        // ── 4. A pre-change annotation-cache entry still opens, edits and keeps its shape ─────────
         let legacyDocument = try copy(drawing, "legacy-textbox.pdf")
         let legacyID = UUID()
         let legacyEntry = """
@@ -470,10 +470,10 @@ extension ReaderChecks {
   "version" : 1
 }
 """
-        try Data("[\n\(legacyEntry)\n]".utf8).write(to: sidecar(for: legacyDocument))
+        try Data("[\n\(legacyEntry)\n]".utf8).write(to: records(for: legacyDocument))
         let legacy = try makeState(legacyDocument)
         guard let loadedLegacy = legacy.annotations.first(where: { $0.id == legacyID }) else {
-            require(false, "a pre-change text box decodes from the sidecar")
+            require(false, "a pre-change text box decodes from the annotation cache")
             return
         }
         require(loadedLegacy.note == "A box from an older build."
@@ -495,14 +495,14 @@ extension ReaderChecks {
         let legacyReopened = try makeState(legacyDocument)
         require(legacyReopened.annotations.first(where: { $0.id == legacyID })?.note
                     == "A box from an older build, edited today.",
-                "the edited pre-change box reloads from the unchanged sidecar shape")
-        let legacySidecar = String(decoding: try Data(contentsOf: sidecar(for: legacyDocument)),
+                "the edited pre-change box reloads from the unchanged annotation cache shape")
+        let legacyRecords = String(decoding: try Data(contentsOf: records(for: legacyDocument)),
                                    as: UTF8.self)
-        require(legacySidecar.contains("\"kind\" : \"textBox\"")
-                    && legacySidecar.contains("\"rect\"")
-                    && legacySidecar.contains("\"fontSize\"")
-                    && legacySidecar.contains("\"version\" : 1"),
-                "the pre-change sidecar shape is still what is written")
+        require(legacyRecords.contains("\"kind\" : \"textBox\"")
+                    && legacyRecords.contains("\"rect\"")
+                    && legacyRecords.contains("\"fontSize\"")
+                    && legacyRecords.contains("\"version\" : 1"),
+                "the pre-change annotation cache shape is still what is written")
 
         // ── 5. Save Annotated Copy writes the grown rectangle as /FreeText ──────────────
         let writerDocument = try copy(annotated, "textbox-write.pdf")

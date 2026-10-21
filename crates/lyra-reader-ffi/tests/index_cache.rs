@@ -2,7 +2,7 @@
 //!
 //! Every cache-dependent test runs with a private temporary application cache and copies its
 //! fixture into a separate scratch directory. Tests neither need access to the user's cache
-//! nor create PDF-adjacent sidecars.
+//! nor create cache files beside the PDF.
 //!
 //! The central assertion is a counter, not a clock: `IndexCacheReport::derived_parts` is the
 //! number of index components this document instance built from the PDF. A second open that
@@ -184,13 +184,13 @@ fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
         drop(first);
 
         // Simulate an index from the previous detector: no narrative spans and stale crops.
-        let sidecar = cache_path(&path);
+        let cache_file = cache_path(&path);
         let mut old: serde_json::Value =
-            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&cache_file).unwrap()).unwrap();
         old["format_version"] = 4.into();
         old["citations"] = serde_json::json!({"0": []});
         old["figures"] = serde_json::json!([]);
-        fs::write(&sidecar, serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::write(&cache_file, serde_json::to_vec(&old).unwrap()).unwrap();
         let rebuilt = engine
             .open_document(path.display().to_string(), None)
             .unwrap();
@@ -233,10 +233,10 @@ fn a_second_open_uses_the_cache_and_returns_the_same_index_field_by_field() {
         report.derived_parts, 4,
         "the four components are built from the PDF on a cold open"
     );
-    let sidecar = cache_path(&path);
+    let cache_file = cache_path(&path);
     assert!(
-        sidecar.is_file(),
-        "the complete index was written beside the PDF"
+        cache_file.is_file(),
+        "the complete index was written to the application cache"
     );
     drop(first);
 
@@ -404,11 +404,11 @@ fn a_truncated_cache_is_ignored_rebuilt_and_the_document_still_parses() {
     let fresh = snapshot(&first);
     drop(first);
 
-    let sidecar = cache_path(&path);
-    let length = fs::metadata(&sidecar).expect("cache exists").len();
+    let cache_file = cache_path(&path);
+    let length = fs::metadata(&cache_file).expect("cache exists").len();
     OpenOptions::new()
         .write(true)
-        .open(&sidecar)
+        .open(&cache_file)
         .expect("open cache")
         .set_len(length / 2)
         .expect("truncate cache");
@@ -448,7 +448,7 @@ fn a_newer_cache_is_ignored_and_left_byte_for_byte_untouched() {
         return;
     }
     let (_directory, path) = copy_fixture("future-version");
-    let sidecar = cache_path(&path);
+    let cache_file = cache_path(&path);
     let future = br#"{
   "kind": "lyra-reader-document-index",
   "format_version": 9999,
@@ -462,7 +462,7 @@ fn a_newer_cache_is_ignored_and_left_byte_for_byte_untouched() {
   "citations": {}
 }
 "#;
-    fs::write(&sidecar, future).expect("write a future cache");
+    fs::write(&cache_file, future).expect("write a future cache");
 
     let (engine, document) = open(&path);
     let report = document.index_cache_report();
@@ -484,7 +484,7 @@ fn a_newer_cache_is_ignored_and_left_byte_for_byte_untouched() {
     drop(engine);
 
     assert_eq!(
-        fs::read(&sidecar).expect("future cache still exists"),
+        fs::read(&cache_file).expect("future cache still exists"),
         future,
         "the newer LyraReader's cache must survive this build opening the document"
     );
@@ -546,7 +546,7 @@ fn a_read_only_pdf_directory_still_writes_and_reuses_the_application_cache() {
     assert_eq!(
         fs::read_dir(&directory.path).unwrap().count(),
         1,
-        "no adjacent cache is created"
+        "no cache file is created beside the PDF"
     );
     drop(document);
     drop(engine);

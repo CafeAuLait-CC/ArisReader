@@ -111,7 +111,7 @@ pub struct SaveReport {
     /// Content annotations the source already had (they are all verified unchanged).
     pub preexisting_annotation_count: usize,
     /// The bookmark identities written into the outline, so the shell removes exactly those
-    /// sidecar entries after a replacement.
+    /// cached entries after a replacement.
     pub written_bookmark_ids: Vec<String>,
     /// Title of the rewritten bookmark subtree; `None` when the list was empty.
     pub bookmark_outline_title: Option<String>,
@@ -3747,7 +3747,7 @@ mod tests {
         .page_map;
         assert_eq!(page_map, vec![Some(1), Some(2), Some(0)]);
 
-        // The shell remaps the sidecar bookmark pages from the same report.
+        // The shell remaps the cached bookmark pages from the same report.
         let remapped = [
             bookmark("22222222-2222-2222-2222-222222222201", 1, "Alpha", 120.0),
             bookmark("22222222-2222-2222-2222-222222222202", 2, "Beta", 340.0),
@@ -3776,7 +3776,7 @@ mod tests {
             "destinations are written against the written page order"
         );
 
-        // Delete old page 1 from the first save: Beta was on it and the sidecar mapping drops
+        // Delete old page 1 from the first save: Beta was on it and the cached bookmark mapping drops
         // it. The save must then carry Alpha only, with no destination to a missing page.
         let deleted = directory.join("deleted.pdf");
         let delete_map = crate::page_ops::apply_page_operation(

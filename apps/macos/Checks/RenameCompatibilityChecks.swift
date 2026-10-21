@@ -38,7 +38,7 @@ extension ReaderChecks {
         try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: pdf)
         let current = pdf.appendingPathExtension("lyra-reader-annotations.json")
         let legacy = pdf.appendingPathExtension("aris-annotations.json")
-        require(ReaderDataCompatibility.annotationSidecarURL(for: pdf) == current,
+        require(ReaderDataCompatibility.legacyAnnotationURL(for: pdf) == current,
                 "a new document uses the LyraReader annotation suffix")
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "before rename", createdAt: Date())
@@ -46,7 +46,7 @@ extension ReaderChecks {
         let state = AppState(engine: try RustEngine())
         state.open(url: pdf)
         require(state.annotations.first?.note == "before rename",
-                "a real document reopens annotations from its old sidecar")
+                "a real document imports annotations from its legacy annotation file")
         state.updateNote("after rename", for: annotation.id)
         state.flushPendingAnnotationWrite()
         let saved = try JSONDecoder().decode([AppState.Annotation].self,
@@ -55,15 +55,15 @@ extension ReaderChecks {
                     && !FileManager.default.fileExists(atPath: legacy.path),
                 "editing an upgraded document uses the migrated application cache")
         try Data("[]".utf8).write(to: current)
-        require(ReaderDataCompatibility.annotationSidecarURL(for: pdf) == current,
-                "the new sidecar wins deterministically if both versions exist")
+        require(ReaderDataCompatibility.legacyAnnotationURL(for: pdf) == current,
+                "the new annotation cache wins deterministically if both versions exist")
         try FileManager.default.removeItem(at: current)
         try FileManager.default.removeItem(at: DocumentEditCache.directory(for: pdf))
-        let corrupt = Data("{broken legacy sidecar".utf8)
+        let corrupt = Data("{broken legacy annotation file".utf8)
         try corrupt.write(to: legacy)
         state.open(url: pdf)
-        require(state.canRecoverUnreadableAnnotationSidecar && (try? Data(contentsOf: legacy)) == corrupt,
-                "a corrupt legacy sidecar still blocks writes and preserves the original bytes")
+        require(state.canRecoverUnreadableAnnotationRecords && (try? Data(contentsOf: legacy)) == corrupt,
+                "a corrupt legacy annotation file still blocks writes and preserves the original bytes")
         print("Rename compatibility checks passed")
     }
 }

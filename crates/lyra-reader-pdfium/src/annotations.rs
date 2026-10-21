@@ -366,7 +366,7 @@ pub enum WriteAnnotationKind {
     /// `/Highlight`: the filled, quad-based text markup.
     Highlight,
     /// `/Underline`: the same shape as a highlight, drawn along the baseline. Not required by
-    /// the write-back task, but the sidecar already models underlines and the code is the same.
+    /// the write-back task, but the reader's annotation model already has underlines and the code is the same.
     Underline,
     /// `/StrikeOut`: the same quads and colour as an underline, drawn through the middle of the
     /// glyphs by the viewer that synthesises its appearance.

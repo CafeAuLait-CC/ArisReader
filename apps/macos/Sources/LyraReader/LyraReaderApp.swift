@@ -52,7 +52,7 @@ struct LyraReaderApp: App {
            let milliseconds = Int(raw), milliseconds >= 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
                 NSApplication.shared.terminate(nil)
-                // An attached sheet (the "sidecar could not be read" alert) holds AppKit's
+                // An attached sheet (the "annotation cache could not be read" alert) holds AppKit's
                 // termination back until the reader answers it. Fall back to the signal path,
                 // which flushes and exits, so a dev run cannot become an unkillable process.
                 // A timer on a background queue, because the run loop may be in a modal mode.
@@ -266,19 +266,19 @@ struct ReaderCommands: Commands {
 
             Divider()
 
-            // Recovery for a sidecar that could not be read. The file is moved aside, never
-            // overwritten, and a fresh empty sidecar takes its place.
+            // Recovery for an annotation cache that could not be read. The file is moved aside, never
+            // overwritten, and a fresh empty annotation cache takes its place.
             Button("Back Up Unreadable Annotations and Start Fresh…") {
-                if let backup = session?.state.recoverUnreadableAnnotationSidecar() {
-                    session?.state.revealSidecarBackupInFinder(backup)
+                if let backup = session?.state.recoverUnreadableAnnotationRecords() {
+                    session?.state.revealAnnotationBackupInFinder(backup)
                 }
             }
-            .disabled(session?.state.canRecoverUnreadableAnnotationSidecar != true)
+            .disabled(session?.state.canRecoverUnreadableAnnotationRecords != true)
 
             Button("Reveal Annotation Backup in Finder") {
-                session?.state.revealSidecarBackupInFinder()
+                session?.state.revealAnnotationBackupInFinder()
             }
-            .disabled(session?.state.lastSidecarBackupURL == nil)
+            .disabled(session?.state.lastAnnotationBackupURL == nil)
         }
 
         // Redaction (T3.12). Marks are pending until one of the two explicit apply commands;

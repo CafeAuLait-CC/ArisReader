@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 ///
 /// The format is a property of the *file being written*, not of the reader's state: nothing is
 /// sent anywhere and no network code is involved, so the only thing the choice changes is the
-/// bytes that land beside the PDF.
+/// bytes written to the destination the reader picks.
 public enum AnnotationExportFormat: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case csv
@@ -41,25 +41,27 @@ public enum AnnotationExportFormat: String, CaseIterable, Identifiable, Sendable
 
 /// One annotation in an export, before replies are threaded under their parents.
 ///
-/// A single shape covers both sources the reader knows: the sidecar annotations it created
+/// A single shape covers both sources the reader knows: the cached annotations it created
 /// (`source == .sidecar`) and the annotations the PDF itself carries (`source == .pdf`). The
 /// source is part of the exported document so a reader can tell the two apart — the PDF's
-/// annotations are not the reader's work, and the sidecar's are not in the PDF.
+/// annotations are not the reader's work, and the reader's annotations live in the document cache.
 public struct AnnotationExportEntry: Equatable, Sendable {
     public enum Source: String, Equatable, Sendable {
+        /// Historical case name, kept because its raw value is the `source` column of the CSV
+        /// export. The annotations themselves live in the document cache.
         case sidecar
         case pdf
 
         /// How the Markdown export names the source.
         public var markdownDescription: String {
             switch self {
-            case .sidecar: return "LyraReader annotation sidecar (saved beside the PDF)"
+            case .sidecar: return "LyraReader annotation (stored in the application cache)"
             case .pdf: return "PDF annotation (read from the file)"
             }
         }
     }
 
-    /// Stable identity: the sidecar UUID, or the PDF annotation's own id (`nm:<NM>` or a
+    /// Stable identity: the cached annotation's UUID, or the PDF annotation's own id (`nm:<NM>` or a
     /// fingerprint). It is what the CSV's `id` column carries and what replies name.
     public let id: String
     /// Zero-based page index.
@@ -70,12 +72,12 @@ public struct AnnotationExportEntry: Equatable, Sendable {
     public let colorHex: String?
     /// The author the source names, or `nil` when it names none.
     public let author: String?
-    /// Creation time for a sidecar entry; the file's `/M` for a PDF annotation (the closest
+    /// Creation time for a cached entry; the file's `/M` for a PDF annotation (the closest
     /// thing a PDF has to a creation time — it stores no `/CreationDate` for annotations).
     public let date: Date?
     /// The text the annotation covers, when the source has one.
     public let quote: String?
-    /// The annotation's own text (a sidecar note, `/Contents` for a PDF annotation).
+    /// The annotation's own text (a cached note, `/Contents` for a PDF annotation).
     public let comment: String?
     public let source: Source
     /// The parent this annotation answers through `/IRT`, when it is a reply.

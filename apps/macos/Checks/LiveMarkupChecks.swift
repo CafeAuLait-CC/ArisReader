@@ -44,7 +44,7 @@ extension ReaderChecks {
     /// the same three `AppState` calls the canvas makes on press / drag / release, so the
     /// comparison is between the real mid-gesture canvas state and the real committed state.
     ///
-    /// The fixtures are scratch copies: the committed PDF and its sidecar are never touched.
+    /// The fixtures are scratch copies: the committed PDF and its annotation cache are never touched.
     @MainActor static func liveMarkupChecks(textPage: URL, twoColumn: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory

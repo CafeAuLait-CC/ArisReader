@@ -22,10 +22,10 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
@@ -202,7 +202,7 @@ extension ReaderChecks {
         require(beforeCopyBytes.range(of: Data(strokeB.id.uuidString.utf8)) != nil,
                 "the pre-erase copy contains stroke B's /NM")
 
-        let sidecarBeforeFirstErase = try Data(contentsOf: sidecar(for: document))
+        let recordsBeforeFirstErase = try Data(contentsOf: records(for: document))
         state.toggleEraserTool()
         let undoBeforeFirstErase = state.undoStack.count
         let writesBeforeFirstErase = state.annotationWriteCount
@@ -218,7 +218,7 @@ extension ReaderChecks {
         require(state.undoStack.count == undoBeforeFirstErase + 1,
                 "the whole gesture is one undo step")
         require(state.annotationWriteCount == writesBeforeFirstErase + 1,
-                "the gesture wrote the sidecar once, on release")
+                "the gesture wrote the annotation cache once, on release")
 
         // ── 5. The pending banner says the PDF on disk is unchanged ──────────────────────
         require(state.hasPendingInkErasure, "the erased stroke is pending a PDF write")
@@ -227,15 +227,15 @@ extension ReaderChecks {
         let pdfAfterFirstErase = try Data(contentsOf: document)
         require(pdfAfterFirstErase == originalPDFBytes,
                 "erasing changed the reader's state, not the PDF on disk")
-        let sidecarAfterFirstErase = try Data(contentsOf: sidecar(for: document))
-        require(sidecarAfterFirstErase != sidecarBeforeFirstErase,
-                "the sidecar is the pending store and did change")
-        let pendingSidecar = String(decoding: try Data(contentsOf: sidecar(for: document)),
+        let recordsAfterFirstErase = try Data(contentsOf: records(for: document))
+        require(recordsAfterFirstErase != recordsBeforeFirstErase,
+                "the cache is the pending store and did change")
+        let pendingRecords = String(decoding: try Data(contentsOf: records(for: document)),
                                     as: UTF8.self)
-        require(!pendingSidecar.contains(strokeA.id.uuidString),
-                "the erased stroke is gone from the sidecar")
-        require(pendingSidecar.contains(strokeB.id.uuidString),
-                "the untouched stroke is still in the sidecar")
+        require(!pendingRecords.contains(strokeA.id.uuidString),
+                "the erased stroke is gone from the annotation cache")
+        require(pendingRecords.contains(strokeB.id.uuidString),
+                "the untouched stroke is still in the annotation cache")
 
         // ── 6. A drag across two strokes removes both as one undo step ───────────────────
         require(state.addInkAnnotation(page: 0,
@@ -268,7 +268,7 @@ extension ReaderChecks {
         require(ids(state) == orderBeforeSweep,
                 "undo restores the strokes at their original positions in drawing order")
         require(state.annotationWriteCount == writesBeforeFirstErase + 4,
-                "undo wrote the restored sidecar once (erase A, add C, erase sweep, undo sweep)")
+                "undo wrote the restored annotation cache once (erase A, add C, erase sweep, undo sweep)")
         state.redo()
         require(!state.annotations.contains(where: { $0.id == strokeB.id })
                     && !state.annotations.contains(where: { $0.id == strokeC.id }),
@@ -282,18 +282,18 @@ extension ReaderChecks {
         let idsBeforeNoOp = ids(state)
         let writesBeforeNoOp = state.annotationWriteCount
         let undoBeforeNoOp = state.undoStack.count
-        let sidecarBeforeNoOp = try Data(contentsOf: sidecar(for: document))
+        let recordsBeforeNoOp = try Data(contentsOf: records(for: document))
         drag(canvas, from: content(state, page: 0, CGPoint(x: 500, y: 600)),
              through: [content(state, page: 0, CGPoint(x: 540, y: 620))],
              to: content(state, page: 0, CGPoint(x: 580, y: 640)))
         require(ids(state) == idsBeforeNoOp, "a drag over empty page erases nothing")
         require(state.annotationWriteCount == writesBeforeNoOp,
-                "a gesture that erased nothing does not write the sidecar")
+                "a gesture that erased nothing does not write the annotation cache")
         require(state.undoStack.count == undoBeforeNoOp,
                 "a gesture that erased nothing adds no undo step")
-        let sidecarAfterNoOp = try Data(contentsOf: sidecar(for: document))
-        require(sidecarAfterNoOp == sidecarBeforeNoOp,
-                "a gesture that erased nothing leaves the sidecar byte-identical")
+        let recordsAfterNoOp = try Data(contentsOf: records(for: document))
+        require(recordsAfterNoOp == recordsBeforeNoOp,
+                "a gesture that erased nothing leaves the cache byte-identical")
 
         // ── 8. A stroke outside the tolerance survives; one inside is erased ───────────
         require(state.addInkAnnotation(page: 0,
@@ -441,11 +441,11 @@ extension ReaderChecks {
         require(external.pendingFileDeletions.isEmpty,
                 "a refused file-owned stroke stages no deletion")
         require(external.annotations.isEmpty,
-                "a refused file-owned stroke writes no sidecar ink")
+                "a refused file-owned stroke writes no reader ink")
         require(external.undoStack.count == externalUndo,
                 "a refused file-owned stroke adds no undo step")
         require(external.annotationWriteCount == externalWrites,
-                "a refused file-owned stroke writes no sidecar")
+                "a refused file-owned stroke writes nothing to the annotation cache")
         let externalRefusal = external.eraserRefusalNotice ?? ""
         require(externalRefusal.contains("belongs to the PDF")
                     && externalRefusal.contains("comment"),

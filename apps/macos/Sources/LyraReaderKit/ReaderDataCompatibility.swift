@@ -1,7 +1,10 @@
 import Foundation
 
-/// Upgrade only storage that is safe to copy. Annotation sidecars stay at their existing URL,
-/// so old and new app versions cannot silently fork a document's annotation history.
+/// Upgrade only storage that is safe to copy.
+///
+/// `legacyAnnotationURL(for:)` names the old companion file the one-time import reads. It is
+/// kept as a small, testable helper even though the production load path goes through
+/// `DocumentEditCache.prepareAnnotations`, which applies the same suffix rule.
 @MainActor public enum ReaderDataCompatibility {
     private static let migrationKey = "lyrareader.didMigratePreferences"
 
@@ -22,7 +25,7 @@ import Foundation
         defaults.set(true, forKey: migrationKey)
     }
 
-    public static func annotationSidecarURL(for document: URL) -> URL {
+    public static func legacyAnnotationURL(for document: URL) -> URL {
         let current = document.appendingPathExtension("lyra-reader-annotations.json")
         let legacy = document.appendingPathExtension("aris-annotations.json")
         if !FileManager.default.fileExists(atPath: current.path),

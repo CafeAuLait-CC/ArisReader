@@ -92,7 +92,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
 /// colour (`/C` and `/CA`), and because a highlight is *meant* to be translucent: 0x66 is the
 /// alpha every preset below uses, so the text under a highlight stays readable.
 ///
-/// Encoded as a single `#RRGGBBAA` string in the sidecar: one key, and impossible to misread the
+/// Encoded as a single `#RRGGBBAA` string in the annotation cache: one key, and impossible to misread the
 /// channel order of.
 public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     public var red: UInt8
@@ -114,7 +114,7 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     }
 
     /// Parses `#RRGGBBAA` (or `#RRGGBB`, taken as opaque). Anything else is rejected rather than
-    /// guessed at: a sidecar is a file the reader must be able to trust.
+    /// guessed at: an annotation cache is a file the reader must be able to trust.
     public init?(hex: String) {
         var digits = hex
         guard digits.hasPrefix("#") else { return nil }
@@ -202,14 +202,14 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
 /// the layout switches between continuous and facing pages — all of those move a page's top
 /// without moving anything inside the page.
 ///
-/// Persisted in the same sidecar as the reader's annotations, tagged `"kind": "bookmark"`.
+/// Persisted in the same annotation cache as the reader's annotations, tagged `"kind": "bookmark"`.
 /// The tag is what keeps an annotation-only build from misreading the entry: that build puts
 /// unknown kinds in its verbatim bucket before it looks at `page` or `title`, so it preserves
-/// this entry even though `yPt` is not an annotation key. See `AnnotationSidecar`.
+/// this entry even though `yPt` is not an annotation key. See `AnnotationRecords`.
 public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
-    /// The discriminator written to the sidecar. Also the reason an older build preserves the
+    /// The discriminator written to the annotation cache. Also the reason an older build preserves the
     /// entry instead of trying to decode it as a highlight.
-    public static let sidecarKind = "bookmark"
+    public static let recordKind = "bookmark"
 
     public let id: UUID
     public var page: Int
@@ -239,7 +239,7 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
-        // `kind` is checked by `AnnotationSidecar` before this decoder runs. Tolerating its
+        // `kind` is checked by `AnnotationRecords` before this decoder runs. Tolerating its
         // absence here keeps the model decodable on its own (tests, future formats).
         _ = try values.decodeIfPresent(String.self, forKey: .kind)
         page = try values.decode(Int.self, forKey: .page)
@@ -251,7 +251,7 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
-        try values.encode(Self.sidecarKind, forKey: .kind)
+        try values.encode(Self.recordKind, forKey: .kind)
         try values.encode(page, forKey: .page)
         try values.encode(title, forKey: .title)
         try values.encode(yPt, forKey: .yPt)
@@ -262,8 +262,8 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
 /// The reader's global layout preferences (T2.10): facing pages and the gap between pages.
 ///
 /// These are view preferences, not document content, so they live in `UserDefaults` rather
-/// than in the sidecar: a reader who prefers facing spreads wants them in the next paper too,
-/// and the sidecar is the place for marks on *this* file. The checks disable stored lookups
+/// than in the document's annotation records: a reader who prefers facing spreads wants them in
+/// the next paper too, and the cache is the place for marks on *this* file. The checks disable stored lookups
 /// (`AppState.usesStoredReadingLayoutPreferences`) so their geometry never depends on what the
 /// person running them chose in the app.
 public enum ReadingLayoutPreferences {
@@ -808,9 +808,9 @@ public enum StampStyle: String, CaseIterable, Codable, Sendable, Identifiable {
 
 /// A highlight the reader added.
 ///
-/// Stored in a sidecar JSON next to the document rather than inside the PDF itself: writing
+/// Stored in the document cache's `annotations.json` rather than inside the PDF itself: writing
 /// PDF annotations means round-tripping the file through PDFium (`FPDF_Annot_*` +
-/// `FPDF_SaveAsCopy`), and a sidecar keeps the original untouched until that lands. The
+/// `FPDF_SaveAsCopy`), and the cache keeps the original untouched until the reader saves. The
 /// durable model and its undo/redo transactions belong in `lyra-reader-edit` (T3.1).
 public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// How the annotation is drawn.
@@ -883,9 +883,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         public var isPlacement: Bool { isGeometry || isPlacedText || isStampArtwork }
     }
 
-    /// One point of a stored ink stroke or line, as the sidecar writes it.
+    /// One point of a stored ink stroke or line, as the cache writes it.
     ///
-    /// Deliberately not `CGPoint`: the JSON shape is part of the sidecar's compatibility story
+    /// Deliberately not `CGPoint`: the JSON shape is part of the annotation records' compatibility story
     /// (a newer build reads it, an older build preserves the whole entry), and spelling out
     /// `x`/`y` keeps that shape independent of a platform type's Codable representation.
     public struct StoredPoint: Codable, Equatable, Sendable {
@@ -913,24 +913,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// The sidecar schema version of a geometry entry.
+    /// The annotation-record schema version of a geometry entry.
     ///
     /// Text-markup entries have no version: they are the shape every older build already knows.
     /// Geometry entries do, so a newer build can change them without an older one guessing at
-    /// the new meaning. `AnnotationSidecar` preserves any entry it cannot interpret verbatim.
+    /// the new meaning. `AnnotationRecords` preserves any entry it cannot interpret verbatim.
     public static let geometryVersion = 1
 
-    /// The sidecar schema version of a placed-text entry (sticky note or text box).
+    /// The annotation-record schema version of a placed-text entry (sticky note or text box).
     ///
     /// Separate from `geometryVersion` on purpose: the two kinds are drawn and written by
     /// different code, and a future change to one must never make the other's entries look
-    /// half-understood. `AnnotationSidecar` preserves any version it does not know.
+    /// half-understood. `AnnotationRecords` preserves any version it does not know.
     public static let placedTextVersion = 1
 
-    /// The sidecar schema version of a text stamp entry.
+    /// The annotation-record schema version of a text stamp entry.
     public static let stampVersion = 1
 
-    /// The sidecar schema version of an image-signature entry.
+    /// The annotation-record schema version of an image-signature entry.
     public static let signatureVersion = 1
 
     /// The size a newly placed sticky note icon occupies on the page, in points.
@@ -951,11 +951,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The width is wide enough for a few narrow glyphs but small enough for the box a
     /// double-click creates (about three characters, see `TextBoxLayout.creationSize`); the
-    /// height is one line at the smallest font. Older sidecars' larger boxes stay valid.
+    /// height is one line at the smallest font. Older cached annotations' larger boxes stay valid.
     public static let minimumTextBoxSize = CGSize(width: 24, height: 24)
 
     public let id: UUID
-    /// Defaults to `.highlight` for sidecars written before kinds existed.
+    /// Defaults to `.highlight` for cached annotations written before kinds existed.
     public var kind: Kind = .highlight
     public var page: Int
     /// Inclusive character range in the page's text layer; zero for geometry annotations.
@@ -988,7 +988,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The value is exactly `DocumentAnnotation.id` (`nm:<NM>`, or `fp:<fingerprint>` when the
     /// file carries no `/NM`). It is what the writer resolves at save time, so the annotation's
-    /// `/NM`, author, flags, popup, parent and reply links stay the file's own. Sidecar entries
+    /// `/NM`, author, flags, popup, parent and reply links stay the file's own. Cached entries
     /// with an identity are hidden from the PDF-annotation list while they are open, so a mark
     /// is never drawn twice.
     public var fileIdentity: String?
@@ -1009,7 +1009,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `date`. `nil` for every other kind.
     public var stampStyle: String?
     /// The picture of a `.signature` entry, exactly the bytes the reader chose (PNG or JPEG).
-    /// Stored base64 in the sidecar, and re-encoded into the PDF as an image XObject on save.
+    /// Stored base64 in the annotation cache, and re-encoded into the PDF as an image XObject on save.
     public var imageData: Data?
 
     private enum CodingKeys: String, CodingKey {
@@ -1066,7 +1066,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the annotation's geometry is complete and finite.
     ///
-    /// The sidecar encoder and the write-back path both rely on this: a mark that cannot be
+    /// The annotation-record encoder and the write-back path both rely on this: a mark that cannot be
     /// drawn or written must be refused before it reaches a file, not turned into an empty
     /// annotation on the page.
     public var hasValidGeometry: Bool {
@@ -1156,12 +1156,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return copy
     }
 
-    /// Older sidecars predate `kind`; decode them as highlights while preserving all
-    /// explicitly stored kinds in newer sidecars.
+    /// Older cached annotations predate `kind`; decode them as highlights while preserving all
+    /// explicitly stored kinds in newer cached annotations.
     ///
     /// Colour has two shapes in the wild, and the order matters: `color` is this version's
     /// (any RGB value), `colorIndex` is the older build's index into `AppState.highlightPalette`.
-    /// An index outside the palette is not decodable — `AnnotationSidecar` classifies such an
+    /// An index outside the palette is not decodable — `AnnotationRecords` classifies such an
     /// entry as one this version cannot interpret and keeps it verbatim instead of guessing.
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -1262,7 +1262,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Writes a palette colour as `colorIndex` and anything else as `color`.
     ///
     /// The asymmetry is deliberate and is the whole backward-compatibility story (see
-    /// `AnnotationSidecar`): a colour that *is* one of the presets is written exactly as the
+    /// `AnnotationRecords`): a colour that *is* one of the presets is written exactly as the
     /// older build wrote it, with no new key, so an older build both reads and draws it. Only a
     /// colour the old model cannot express needs the new key — and for that one the older build
     /// preserves the entry verbatim instead of misreading it.
@@ -1344,7 +1344,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
     /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
-    /// PDF or the sidecar. `id` makes two clicks on the same page restart the fade.
+    /// PDF or the annotation cache. `id` makes two clicks on the same page restart the fade.
     public struct AISourceHighlight: Identifiable, Equatable, Sendable {
         public let id: UUID
         public let page: Int
@@ -1867,9 +1867,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Annotations the **PDF itself carries**, in view space — highlights and notes somebody
     /// else made (or the reader made in another viewer).
     ///
-    /// A different thing from `annotations` below: that is what this reader wrote to its sidecar,
+    /// A different thing from `annotations` below: that is what this reader wrote to its annotation cache,
     /// this is what the file says. Both sources share sentence excerpts in the sidebar, while
-    /// only the sidecar annotations can be edited here.
+    /// only the cached annotations can be edited here.
     @Published public private(set) var documentAnnotations: [DocumentAnnotation] = [] {
         didSet { passageTextMaps = [:]; rebuildAnnotationPassages() }
     }
@@ -1883,8 +1883,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// file yet.
     ///
     /// The deletion is a pending change, like an unsaved highlight: the PDF on disk still has
-    /// the annotation until "Save Copy" or "Save and Replace Original". The identity is what the
-    /// writer resolves; the page is kept for the sidebar and for the report.
+    /// the annotations until the reader saves. The identity is what the writer resolves; the
+    /// page is kept for the sidebar and for the report.
     public struct FileAnnotationDeletion: Identifiable, Codable, Equatable, Sendable {
         public let identity: String
         public let page: Int
@@ -2070,7 +2070,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 inkPaths: document.inkPaths, strokeWidth: width, fileIdentity: document.id)
         case .square, .circle:
             guard box.width > 0, box.height > 0 else { return nil }
-            // The sidecar stores the stroke's centre line; a PDF `/Rect` is its outer edge.
+            // The annotation cache stores the stroke's centre line; a PDF `/Rect` is its outer edge.
             let inset = box.insetBy(dx: width / 2, dy: width / 2)
             guard inset.width > 0, inset.height > 0 else { return nil }
             return Annotation(
@@ -2143,8 +2143,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// This is the array this version can *render and edit*. Entries a newer version wrote in
     /// a shape this one does not understand are not in here: they live in
-    /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
-    /// `AnnotationSidecar`).
+    /// `annotationRecordSlots` as raw JSON and are written back untouched (see
+    /// `AnnotationRecords`).
     @Published public private(set) var annotations: [Annotation] = [] {
         didSet { rebuildAnnotationPassages() }
     }
@@ -2220,7 +2220,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             refreshSelectionOverlay()
         }
     }
-    /// The annotation the reader last clicked, if any. Only sidecar annotations can be selected:
+    /// The annotation the reader last clicked, if any. Only cached annotations can be selected:
     /// a PDF's own ink, shapes, notes and text are drawn but not editable, because moving them
     /// would mean rewriting somebody else's annotation.
     @Published public private(set) var selectedAnnotationID: UUID?
@@ -2245,7 +2245,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var resizeOriginalAnnotation: Annotation?
     private var resizeStartPagePoint: CGPoint?
     private var resizeHandle: TextBoxResizeHandle?
-    /// The sidecar annotation whose text editor is open, and the state needed to commit or
+    /// The cached annotation whose text editor is open, and the state needed to commit or
     /// cancel that one editing session as one undoable change.
     @Published public private(set) var editingAnnotationID: UUID?
     private var editingWasCreated = false
@@ -2255,31 +2255,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The annotations as they were when the current eraser drag began, and the cuts it has made
     /// so far. Both are empty when no gesture is in flight.
     private var eraserGestureBase: [Annotation]?
-    /// One splitter per original path, keyed by the sidecar annotation they came from.
-    private var eraserGestureSidecarSplits: [UUID: SidecarInkSplit] = [:]
+    /// One splitter per original path, keyed by the cached annotation they came from.
+    private var eraserGestureRecordSplits: [UUID: RecordInkSplit] = [:]
     /// The same for ink the PDF carries; a split of one of those is a **cross-reader** change:
     /// the original annotation is deleted by identity and its surviving pieces become new
-    /// sidecar ink.
+    /// reader ink.
     private var eraserGestureDocumentSplits: [String: DocumentInkSplit] = [:]
     /// File-owned strokes this drag found but must not touch: splitting one would orphan its
     /// review thread. Cached so every pointer sample does not rebuild the same sentence.
     private var eraserGestureRefusedDocumentIDs: Set<String> = []
-    /// Adopted sidecar entries that are file-owned and carry review text, refused for this drag.
-    private var eraserGestureRefusedSidecarIDs: Set<UUID> = []
+    /// Adopted annotation-cache entries that are file-owned and carry review text, refused for this drag.
+    private var eraserGestureRefusedRecordIDs: Set<UUID> = []
     /// What the canvas should draw while a drag is cutting. `nil` while no gesture is in flight.
     /// Preview marks are not annotations: they carry stable, throwaway identities so a pointer
-    /// sample cannot churn the model or the sidecar.
+    /// sample cannot churn the model or the annotation cache.
     @Published public private(set) var eraserPreviewMarks: [CanvasAnnotationMark]?
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
-    /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
+    /// Stored in the same annotation cache as `annotations` (see `Bookmark` and `AnnotationRecords`);
     /// entries a newer build wrote in a shape this one cannot interpret stay in the slot list
     /// and are written back verbatim, exactly as foreign annotation entries are.
     @Published public private(set) var bookmarks: [Bookmark] = []
-    /// Number of sidecar entries preserved verbatim because this version cannot interpret
+    /// Number of annotation-cache entries preserved verbatim because this version cannot interpret
     /// them (unknown `kind`, colour outside the palette, unknown fields).
     @Published public private(set) var preservedAnnotationEntryCount = 0
-    /// How many times this document's sidecar has been written since the document opened.
+    /// How many times this document's annotation cache has been written since the document opened.
     /// Instrumentation: it is what makes write coalescing measurable instead of asserted.
     @Published public private(set) var annotationWriteCount = 0
     /// True while a PDF write-back is running, so the save commands cannot run twice at once.
@@ -2291,29 +2291,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var interruptedAnnotationSaveNotice: String?
     /// What the last successful write-back did, for the status line, diagnostics and checks.
     @Published public private(set) var lastAnnotationWriteReport: AnnotationWriteReport?
-    /// True while the note editor holds text that has not reached the sidecar yet.
+    /// True while the note editor holds text that has not reached the annotation cache yet.
     @Published public private(set) var hasPendingAnnotationWrite = false
     /// The last recovery backup, so the UI can offer to reveal it in Finder.
-    @Published public private(set) var lastSidecarBackupURL: URL?
+    @Published public private(set) var lastAnnotationBackupURL: URL?
     private var annotationsURL: URL?
-    /// A failed read permanently blocks writes for this document, protecting its sidecar.
+    /// A failed read permanently blocks writes for this document, protecting its annotation cache.
     /// The only way out is the explicit recovery action, which backs the file up first.
     private var annotationWritesBlockedReason: String?
-    /// The order entries had in the sidecar, so foreign entries keep their place across saves.
-    private var annotationSidecarSlots: [AnnotationSidecar.Slot] = []
+    /// The order entries had in the annotation cache, so foreign entries keep their place across saves.
+    private var annotationRecordSlots: [AnnotationRecords.Slot] = []
     /// Open coalescing window for note typing; see `updateNote`.
     private var noteFlushTask: Task<Void, Never>?
     /// True when a keystroke arrived after the current window's flush was scheduled, i.e. the
     /// reader is still typing and the window should stay open for another round.
     private var noteWindowSawKeystrokes = false
-    /// How long a note edit may stay in memory only. At most one sidecar write per window
+    /// How long a note edit may stay in memory only. At most one cache write per window
     /// while typing, plus immediate writes on commit, blur, undo, redo and flush points.
     private static let noteCoalescingWindow = Duration.milliseconds(500)
     /// Highlight colours offered when **creating** an annotation (translucent, so the text under
     /// a highlight stays readable).
     ///
     /// The first four entries are the palette this application has always had, in the same order
-    /// and with the same bytes: a sidecar written by an older build stores `colorIndex` 0…3, and
+    /// and with the same bytes: an annotation cache written by an older build stores `colorIndex` 0…3, and
     /// those indices must keep meaning exactly what they meant. The rest were added because four
     /// colours is not a palette a reader can work in; a loaded annotation is not limited to these
     /// at all (see `AnnotationColor`).
@@ -2321,7 +2321,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// decodes its legacy `colorIndex` against this table from any thread. It is a `let` of
     /// `Sendable` values, so sharing it is safe.
     /// LyraReader presets for new annotations. The legacy indexed palette below remains stable so
-    /// old sidecars retain their original colors when decoded or re-saved.
+    /// old cached annotations retain their original colors when decoded or re-saved.
     public nonisolated static let annotationPalette: [(name: String, color: AnnotationColor)] = [
         ("Gold", AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 82)),
         ("Apricot", AnnotationColor(red: 0xEF, green: 0xA7, blue: 0x7D, alpha: 77)),
@@ -2354,7 +2354,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// annotation, at the scale the canvas is currently drawing it at. Cleared with the rest of
     /// the annotation textures when the document changes.
     private var noteGlyphTextures: [NoteGlyphKey: PageImage] = [:]
-    /// Textures for the sidecar's sticky notes and text boxes: the icon and the laid-out text,
+    /// Textures for the cached sticky notes and text boxes: the icon and the laid-out text,
     /// keyed by every input that changes a pixel.
     private var placedGlyphTextures: [PlacedGlyphKey: PageImage] = [:]
     /// Stamp badges and signature images, keyed by every input that changes a pixel.
@@ -2544,10 +2544,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var annotationCacheIsDirty: Bool
         var lastAnnotationWriteReport: AnnotationWriteReport?
         var interruptedAnnotationSaveNotice: String?
-        var lastSidecarBackupURL: URL?
+        var lastAnnotationBackupURL: URL?
         var annotationsURL: URL?
         var annotationWritesBlockedReason: String?
-        var annotationSidecarSlots: [AnnotationSidecar.Slot]
+        var annotationRecordSlots: [AnnotationRecords.Slot]
         var selectedDocumentAnnotationID: String?
         var openDocumentNoteID: String?
         var annotationTextures: [AnnotationTextureKey: PageImage]
@@ -3032,20 +3032,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
-            // Development aid: LYRA_READER_RECOVER_SIDECAR=1 runs the explicit recovery for a
-            // sidecar that failed to load, so the backup path is visible on stderr.
+            // Development aid: LYRA_READER_RECOVER_SIDECAR=1 runs the explicit recovery for an
+            // annotation cache that failed to load, so the backup path is visible on stderr.
             if ProcessInfo.processInfo.environment["LYRA_READER_RECOVER_SIDECAR"] == "1" {
                 if let reason = annotationWritesBlockedReason {
                     FileHandle.standardError.write(
                         Data("lyra-reader-annotate: writes blocked: \(reason)\n".utf8)
                     )
-                    let backup = recoverUnreadableAnnotationSidecar()
+                    let backup = recoverUnreadableAnnotationRecords()
                     FileHandle.standardError.write(
                         Data("lyra-reader-annotate: recovery \(backup == nil ? "failed" : "backup=\(backup!.path)")\n".utf8)
                     )
                 } else {
                     FileHandle.standardError.write(
-                        Data("lyra-reader-annotate: recovery hook found no blocked sidecar\n".utf8)
+                        Data("lyra-reader-annotate: recovery hook found no blocked annotation cache\n".utf8)
                     )
                 }
             }
@@ -3251,7 +3251,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         contentEditLoading = false
         contentTextEditing = false
         // Pending writes describe the document being replaced or closed, so they have to land
-        // before the state that carries them (sidecar URL, scroll offset) is cleared.
+        // before the state that carries them (annotation cache URL, scroll offset) is cleared.
         flushPendingWrites()
         // A glide belongs to the document that was scrolling; the next one starts still.
         cancelScrollGlide()
@@ -3344,16 +3344,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         markSelectionRefusalNotice = nil
         eraserRefusalNotice = nil
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserGestureRefusedDocumentIDs = []
-        eraserGestureRefusedSidecarIDs = []
+        eraserGestureRefusedRecordIDs = []
         eraserPreviewMarks = nil
         pageSelection = []
         pageSelectionAnchor = nil
         annotationsURL = nil
         annotationWritesBlockedReason = nil
-        annotationSidecarSlots = []
+        annotationRecordSlots = []
         preservedAnnotationEntryCount = 0
         hasPendingAnnotationWrite = false
         noteFlushTask?.cancel()
@@ -4486,7 +4486,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return appendPlacedArtwork(annotation)
     }
 
-    /// The one commit path for a placed stamp or signature: sidecar first, then one undo step.
+    /// The one commit path for a placed stamp or signature: one cache write, then one undo step.
     private func appendPlacedArtwork(_ annotation: Annotation) -> Bool {
         guard annotation.hasValidGeometry else { return false }
         var updated = annotations
@@ -4756,7 +4756,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         // A note that belongs to the PDF is read-only; opening its paper is better than placing
-        // a sidecar note on top of it.
+        // a cached note on top of it.
         if openDocumentNote(at: point) { return true }
         guard let pageHit = pagePoint(atContentPoint: point) else { return false }
         return placeStickyNote(page: pageHit.page, at: pageHit.point)
@@ -4843,7 +4843,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The double-click path (`placeTextBox`) computes the one-line-high creation rect; this
     /// rectangle-based entry point remains for callers that already have a box, such as an
-    /// older sidecar or a restored session. Its contents then grow from that box.
+    /// older annotation cache or a restored session. Its contents then grow from that box.
     @discardableResult
     public func addTextBox(page: Int, rect: CGRect) -> Bool {
         guard let document, page >= 0, page < document.pageCount,
@@ -4920,7 +4920,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
-    /// Applies text typed in the editor. Sidecar writes are coalesced by `updateNote`; undo
+    /// Applies text typed in the editor. Cache writes are coalesced by `updateNote`; undo
     /// merges consecutive keystrokes into one step for the session.
     public func updateEditingText(_ text: String) {
         guard let id = editingAnnotationID,
@@ -4959,7 +4959,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
-    /// Commits the open editor: flushes the coalesced sidecar write and closes the editor.
+    /// Commits the open editor: flushes the coalesced cache write and closes the editor.
     @discardableResult
     public func commitTextEditing() -> Bool {
         guard editingAnnotationID != nil else { return true }
@@ -4980,7 +4980,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Cancelling a brand-new note or box removes it again (and the creation step); cancelling
     /// an edit restores the previous text and drops the undo steps the session added. In both
-    /// cases the sidecar is written once so memory and disk agree.
+    /// cases the annotation cache is written once so memory and disk agree.
     public func cancelTextEditing() {
         guard let id = editingAnnotationID else { return }
         noteFlushTask?.cancel()
@@ -5086,7 +5086,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Commits a resize on mouse-up: one sidecar write and one undo step for the whole drag.
+    /// Commits a resize on mouse-up: one cache write and one undo step for the whole drag.
     private func finishAnnotationResize(
         original: Annotation,
         handle: TextBoxResizeHandle,
@@ -5146,7 +5146,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// Every geometry mark the overlay should draw, in sidecar order followed by the file's own.
+    /// Every geometry mark the overlay should draw, in record order followed by the file's own.
     ///
     /// Text marks travel here too, carrying the quads of the character range they cover. They
     /// are not stroked by the overlay (the canvas draws their tint), but the quads are what the
@@ -5203,7 +5203,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// One sidecar annotation as the canvas draws it, or `nil` for a kind the canvas does not
+    /// One cached annotation as the canvas draws it, or `nil` for a kind the canvas does not
     /// paint itself (its text layer or note bitmap does).
     private func canvasMark(for annotation: Annotation) -> CanvasAnnotationMark? {
         guard annotation.kind.isPlacement || annotation.kind.isTextMarkup else { return nil }
@@ -5286,7 +5286,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The reader's own text mark under a content point, with the point in its page space.
     ///
-    /// Only sidecar marks are considered: a highlight the PDF itself carries is reported by
+    /// Only cached marks are considered: a highlight the PDF itself carries is reported by
     /// `fileOwnedMarkupHit` so the click can be refused with an explanation. The hit is the
     /// marked words themselves, including a few points of hand tolerance.
     public func textMarkupHit(
@@ -5374,7 +5374,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
-    /// The sidecar annotation whose stroke is within `tolerance` points of `point` (page space).
+    /// The cached annotation whose stroke is within `tolerance` points of `point` (page space).
     public func hitTestGeometryAnnotation(page: Int, point: CGPoint,
                                           tolerance: CGFloat) -> UUID? {
         for annotation in annotations.reversed() where annotation.kind.isGeometry {
@@ -5392,7 +5392,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// The sidecar annotation under a content point, with the point in its page space.
+    /// The cached annotation under a content point, with the point in its page space.
     ///
     /// `toleranceViewPt` is converted to page points with the current zoom: a 4 pt allowance on
     /// screen is 4/zoom points on the page, so a hairline stays easy to hit at 300% without
@@ -5413,21 +5413,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // The eraser removes the ink under its pointer path, not whole annotations. A stroke is cut
     // where the pointer reaches it; the pieces that survive become new ink annotations, and one
     // undo restores the original. The geometry rule lives in `InkStrokeSplitter`; this section is
-    // the model half: identity, ordering, the sidecar and the undo action.
+    // the model half: identity, ordering, the annotation cache and the undo action.
 
     /// What an armed eraser is over, and therefore what a press would begin to cut.
     ///
-    /// Sidecar strokes are cut into pieces. A stroke the PDF itself carries follows the
-    /// cross-reader path: its surviving pieces become new sidecar ink and the original annotation
+    /// Cached strokes are cut into pieces. A stroke the PDF itself carries follows the
+    /// cross-reader path: its surviving pieces become new reader ink and the original annotation
     /// is staged for deletion by identity, because the writer deletes a file annotation rather
     /// than rewriting its `/InkList` in place.
     public enum EraserTarget: Equatable, Sendable {
-        case sidecar(id: UUID, page: Int)
+        case records(id: UUID, page: Int)
         case document(id: String, page: Int)
 
         public var page: Int {
             switch self {
-            case .sidecar(_, let page), .document(_, let page): return page
+            case .records(_, let page), .document(_, let page): return page
             }
         }
 
@@ -5442,7 +5442,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Only `.ink` is considered: highlights, underlines, strikeouts, notes, text boxes and the
     /// four shapes are annotations, not ink, and the eraser deliberately leaves them alone (they
-    /// are still removed with Select + Delete). Sidecar ink is tested before the PDF's own ink so
+    /// are still removed with Select + Delete). Reader ink is tested before the PDF's own ink so
     /// a stroke the reader drew on top of a file annotation stays erasable; the hover halo shows
     /// which one the eraser picked.
     public func eraserTarget(atContentPoint point: CGPoint) -> EraserTarget? {
@@ -5458,7 +5458,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 inkPaths: annotation.inkPaths, color: annotation.color,
                 strokeWidth: annotation.strokeWidth, isSelected: false, isEditable: true)
             if AnnotationGeometry.hitTest(mark, at: hit.point, tolerance: tolerance) {
-                return .sidecar(id: annotation.id, page: hit.page)
+                return .records(id: annotation.id, page: hit.page)
             }
         }
         for annotation in documentAnnotations.reversed()
@@ -5485,7 +5485,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         let id: String? = switch target {
-        case .sidecar(let id, _): id.uuidString
+        case .records(let id, _): id.uuidString
         case .document(let id, _): "pdf:" + id
         }
         if eraserHoverMarkID != id { eraserHoverMarkID = id }
@@ -5496,7 +5496,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The model is not touched while the pointer moves: the gesture only accumulates the
     /// parameter intervals each stroke has lost and publishes throwaway preview marks. The
-    /// sidecar write, the final annotations and the undo step are created together on release,
+    /// cache write, the final annotations and the undo step are created together on release,
     /// so a cancel or a failed write leaves the page exactly as it was.
     public func beginEraserGesture(atContentPoint point: CGPoint) {
         guard annotationTool == .eraser, document != nil else { return }
@@ -5515,37 +5515,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         eraseInk(alongContentSegment: previous, to: point)
     }
 
-    /// Ends the gesture and writes its result to the sidecar as one change.
+    /// Ends the gesture and writes its result to the annotation cache as one change.
     ///
     /// Every original stroke the drag reached is replaced by the pieces that survived, in the
     /// original's place in drawing order and in the original path's order. The originals are
-    /// removed from the sidecar; the pieces get new identities. A stroke the PDF itself carried
+    /// removed from the annotation cache; the pieces get new identities. A stroke the PDF itself carried
     /// is removed through the cross-reader path: its identity joins `pendingFileDeletions`, and
-    /// its surviving pieces become ordinary sidecar ink, so saving a copy both prunes the
+    /// its surviving pieces become ordinary reader ink, so saving a copy both prunes the
     /// original geometry and appends the pieces.
     ///
     /// The PDF on disk is untouched. Returns the number of original strokes the drag changed
-    /// (not the number of pieces), or `0` when it reached nothing or the sidecar write failed.
+    /// (not the number of pieces), or `0` when it reached nothing or the cache write failed.
     @discardableResult
     public func endEraserGesture() -> Int {
         guard let base = eraserGestureBase else { return 0 }
-        let sidecarSplits = eraserGestureSidecarSplits
+        let recordsSplits = eraserGestureRecordSplits
         let documentSplits = eraserGestureDocumentSplits
         resetEraserGesture()
-        guard !sidecarSplits.isEmpty || !documentSplits.isEmpty else {
+        guard !recordsSplits.isEmpty || !documentSplits.isEmpty else {
             // A refused file-owned stroke is not "nothing happened": the banner explains what
             // would have been destroyed, and the page is untouched.
             statusMessage = eraserRefusalNotice ?? "The eraser did not reach any ink"
             return 0
         }
 
-        // Rebuild the sidecar list: each touched stroke stands where it did, as its surviving
+        // Rebuild the record list: each touched stroke stands where it did, as its surviving
         // pieces (none at all when the drag covered it completely).
         var updated: [Annotation] = []
         var pieces = 0
         var slotInsertions: [(original: UUID, pieces: [UUID])] = []
         for annotation in base {
-            guard let split = sidecarSplits[annotation.id] else {
+            guard let split = recordsSplits[annotation.id] else {
                 updated.append(annotation)
                 continue
             }
@@ -5557,7 +5557,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
 
-        // A file-owned stroke's pieces are new sidecar ink, after the reader's own marks, in the
+        // A file-owned stroke's pieces are new reader ink, after the reader's own marks, in the
         // order the page drew the file's annotations.
         var documents: [ErasedFileAnnotation] = []
         var deletions: [FileAnnotationDeletion] = []
@@ -5572,7 +5572,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             updated.append(contentsOf: segments)
         }
         for annotation in base {
-            guard let split = sidecarSplits[annotation.id] else { continue }
+            guard let split = recordsSplits[annotation.id] else { continue }
             if let identity = split.annotation.fileIdentity {
                 addDeletion(FileAnnotationDeletion(identity: identity,
                                                    page: split.annotation.page),
@@ -5585,13 +5585,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             !pendingFileDeletions.contains(where: { $0.identity == deletion.identity })
         }
 
-        // Keep the sidecar's own entry order: the original's slot stays as the anchor (it is
+        // Keep the annotation cache's own entry order: the original's slot stays as the anchor (it is
         // skipped while the annotation is absent) and the pieces' slots follow it. Undo restores
         // the original array, and the now-orphaned piece slots are skipped by the encoder, so
         // the untouched bytes come back exactly; redo finds the piece slots already in place.
-        let slotsBefore = annotationSidecarSlots
+        let slotsBefore = annotationRecordSlots
         if !slotInsertions.isEmpty {
-            var slots = annotationSidecarSlots
+            var slots = annotationRecordSlots
             for insertion in slotInsertions {
                 guard let index = slots.firstIndex(where: { slot in
                     if case .annotation(let id) = slot { return id == insertion.original }
@@ -5600,13 +5600,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 slots.insert(contentsOf: insertion.pieces.map { .annotation($0) },
                              at: index + 1)
             }
-            annotationSidecarSlots = slots
+            annotationRecordSlots = slots
         }
         if updated != base {
             guard saveAnnotations(updated, trigger: "erase-ink") else {
                 // The write never reached disk: no annotation is removed, no deletion is staged
-                // and no undo step claims a cut the sidecar does not have.
-                annotationSidecarSlots = slotsBefore
+                // and no undo step claims a cut the annotation cache does not have.
+                annotationRecordSlots = slotsBefore
                 statusMessage = "Could not save the cut ink; the page is unchanged"
                 refreshSelectionOverlay()
                 return 0
@@ -5615,7 +5615,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotations = updated
         }
 
-        // Only now, with the sidecar holding the pieces, remove the file-owned originals from
+        // Only now, with the annotation cache holding the pieces, remove the file-owned originals from
         // the page and stage their pruned deletion.
         let removedDocumentIDs = Set(documents.map(\.document.id))
         documentAnnotations.removeAll { removedDocumentIDs.contains($0.id) }
@@ -5634,8 +5634,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
         refreshSelectionOverlay()
 
-        let changed = sidecarSplits.count + documentSplits.count
-        let fullyRemoved = (sidecarSplits.values.filter { $0.survivingPaths.isEmpty }.count)
+        let changed = recordsSplits.count + documentSplits.count
+        let fullyRemoved = (recordsSplits.values.filter { $0.survivingPaths.isEmpty }.count)
             + (documentSplits.values.filter { $0.survivingPaths.isEmpty }.count)
         if pieces == 0 {
             statusMessage = changed == 1
@@ -5652,7 +5652,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Abandons a gesture in flight (Escape, or a tool switch). Nothing reached the model, the
-    /// sidecar or the PDF, so clearing the preview is the whole undo.
+    /// annotation cache or the PDF, so clearing the preview is the whole undo.
     public func cancelEraserGesture() {
         guard eraserGestureBase != nil else { return }
         resetEraserGesture()
@@ -5663,7 +5663,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// pointer was down, so this is also the cancel path.
     private func resetEraserGesture() {
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserGestureRefusedDocumentIDs = []
         eraserPreviewMarks = nil
@@ -5714,8 +5714,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Eraser gesture state and geometry
 
-    /// One sidecar ink annotation's cuts, with the splitters that produced them.
-    private struct SidecarInkSplit {
+    /// One reader ink annotation's cuts, with the splitters that produced them.
+    private struct RecordInkSplit {
         let annotation: Annotation
         var splitters: [InkStrokeSplitter]
         var survivingPaths: [[CGPoint]]
@@ -5734,20 +5734,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// would orphan.
     ///
     /// Splitting a PDF-owned stroke is implemented as "delete the original annotation by
-    /// identity, append its surviving pieces as new sidecar ink". That is the cross-reader path
+    /// identity, append its surviving pieces as new reader ink". That is the cross-reader path
     /// and it is safe for bare ink, but the original annotation can also own review data the
     /// reader does not model as separate marks: its `/Contents`, a `/Popup` window, and the
     /// `/IRT` replies that name it. Deleting it would destroy that conversation, so the eraser
-    /// leaves the stroke whole and says what is at stake. Sidecar ink has no such attachments.
+    /// leaves the stroke whole and says what is at stake. Reader ink has no such attachments.
     private func inkAttachmentRefusal(for annotation: DocumentAnnotation) -> String? {
         inkAttachmentRefusal(contents: annotation.contents,
                              hasPopup: annotation.hasPopup,
                              identity: annotation.id)
     }
 
-    /// The adopted-entry form. It is still a file-owned stroke: the sidecar entry edits the PDF's
+    /// The adopted-entry form. It is still a file-owned stroke: the annotation-cache entry edits the PDF's
     /// own annotation by identity, so the file's popup (remembered in `documentPopupFlags`), its
-    /// current comment (kept in the sidecar note), and the `/IRT` replies still in
+    /// current comment (kept in the cached note), and the `/IRT` replies still in
     /// `documentAnnotations` would all be deleted by a split.
     private func inkAttachmentRefusal(for annotation: Annotation) -> String? {
         guard let identity = annotation.fileIdentity else { return nil }
@@ -5805,17 +5805,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                    y: clipped.end.y - placement.topPt)
             for annotation in base
             where annotation.kind == .ink && annotation.page == placement.index {
-                if eraserGestureRefusedSidecarIDs.contains(annotation.id) { continue }
+                if eraserGestureRefusedRecordIDs.contains(annotation.id) { continue }
                 if let reason = inkAttachmentRefusal(for: annotation) {
-                    eraserGestureRefusedSidecarIDs.insert(annotation.id)
+                    eraserGestureRefusedRecordIDs.insert(annotation.id)
                     eraserRefusalNotice = reason
                     statusMessage = reason
                     continue
                 }
                 let reach = AnnotationGeometry.eraserReach(
                     strokeWidth: annotation.strokeWidth, zoom: zoom)
-                var split = eraserGestureSidecarSplits[annotation.id]
-                    ?? SidecarInkSplit(
+                var split = eraserGestureRecordSplits[annotation.id]
+                    ?? RecordInkSplit(
                         annotation: annotation,
                         splitters: annotation.inkPaths.map {
                             InkStrokeSplitter(points: $0, reach: reach)
@@ -5828,7 +5828,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
                 if pathChanged {
                     split.survivingPaths = Self.survivingPaths(of: split.splitters)
-                    eraserGestureSidecarSplits[annotation.id] = split
+                    eraserGestureRecordSplits[annotation.id] = split
                     changed = true
                 }
             }
@@ -5839,7 +5839,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if eraserGestureRefusedDocumentIDs.contains(annotation.id) { continue }
                 if let reason = inkAttachmentRefusal(for: annotation) {
                     // Refuse this stroke for the whole gesture: no cuts, no pending deletion,
-                    // no sidecar entry. Other strokes under the same drag still split.
+                    // no annotation-cache entry. Other strokes under the same drag still split.
                     eraserGestureRefusedDocumentIDs.insert(annotation.id)
                     eraserRefusalNotice = reason
                     statusMessage = reason
@@ -5885,7 +5885,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// These are previews, not model entries: their identities are derived from the original and
     /// the piece index, so a pointer sample cannot create annotation churn. On release the same
-    /// geometry becomes real annotations with real UUIDs and one sidecar write.
+    /// geometry becomes real annotations with real UUIDs and one cache write.
     private func rebuildEraserPreviewMarks() {
         guard let base = eraserGestureBase else {
             eraserPreviewMarks = nil
@@ -5893,7 +5893,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         var marks: [CanvasAnnotationMark] = []
         for annotation in base {
-            if let split = eraserGestureSidecarSplits[annotation.id] {
+            if let split = eraserGestureRecordSplits[annotation.id] {
                 for (index, path) in split.survivingPaths.enumerated() {
                     marks.append(previewInkMark(
                         id: "erase-preview:\(annotation.id.uuidString):\(index)",
@@ -5953,7 +5953,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// The new sidecar ink a file-owned split produces. The original's identity and review
+    /// The new reader ink a file-owned split produces. The original's identity and review
     /// thread are not copied: the original annotation is deleted by identity through the
     /// cross-reader path, and these pieces are the reader's new ink.
     private func inkSegments(from annotation: DocumentAnnotation,
@@ -5999,7 +5999,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Deletes the selected annotation (ink, shape, text mark, note or text box). Returns
     /// whether anything was deleted.
     ///
-    /// Every kind goes through the same removal: one sidecar write, one undo step, one reload.
+    /// Every kind goes through the same removal: one cache write, one undo step, one reload.
     @discardableResult
     public func deleteSelectedAnnotation() -> Bool {
         guard let id = selectedAnnotationID else { return false }
@@ -6083,7 +6083,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Moves one annotation the PDF carries into the editable model.
     ///
     /// The file's identity (`/NM`, or the stable fingerprint when there is none) travels with the
-    /// sidecar entry; the PDF's copy is removed from `documentAnnotations` so the page shows the
+    /// annotation-cache entry; the PDF's copy is removed from `documentAnnotations` so the page shows the
     /// adopted mark exactly once. Nothing about the file changes until an explicit save. Returns
     /// the new entry's id, or `nil` when the kind has no editable model.
     @discardableResult
@@ -6267,7 +6267,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let document, document.pageCount > 0, let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
         if annotationWritesBlockedReason != nil {
-            statusMessage = "Could not add the bookmark because the sidecar could not be loaded"
+            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
             lastError = statusMessage
             return false
         }
@@ -6281,9 +6281,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let bookmark = Bookmark(page: page, title: title, yPt: yPt)
         var updated = bookmarks
         updated.append(bookmark)
-        var slots = annotationSidecarSlots
+        var slots = annotationRecordSlots
         slots.append(.bookmark(bookmark.id))
-        guard writeSidecar(
+        guard writeAnnotationRecords(
             annotations: annotations,
             bookmarks: updated,
             slots: slots,
@@ -6301,10 +6301,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let title = bookmarks[index].title
         var updated = bookmarks
         updated.remove(at: index)
-        guard writeSidecar(
+        guard writeAnnotationRecords(
             annotations: annotations,
             bookmarks: updated,
-            slots: annotationSidecarSlots,
+            slots: annotationRecordSlots,
             trigger: "bookmark-remove"
         ) else { return }
         statusMessage = "Deleted bookmark “\(title)”"
@@ -6317,16 +6317,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               bookmarks[index].title != title else { return }
         var updated = bookmarks
         updated[index].title = title
-        guard writeSidecar(
+        guard writeAnnotationRecords(
             annotations: annotations,
             bookmarks: updated,
-            slots: annotationSidecarSlots,
+            slots: annotationRecordSlots,
             trigger: "bookmark-rename"
         ) else { return }
     }
 
     /// Moves a bookmark by `offset` places in the reader's order. The order is the array's,
-    /// and it is persisted by reordering the bookmark slots in the sidecar in place, so
+    /// and it is persisted by reordering the bookmark slots in the annotation cache in place, so
     /// foreign entries keep their positions.
     public func moveBookmark(_ id: UUID, by offset: Int) {
         guard let index = bookmarks.firstIndex(where: { $0.id == id }), offset != 0 else { return }
@@ -6336,7 +6336,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var updated = bookmarks
         let bookmark = updated.remove(at: index)
         updated.insert(bookmark, at: target)
-        guard writeSidecar(
+        guard writeAnnotationRecords(
             annotations: annotations,
             bookmarks: updated,
             slots: bookmarkSlots(matching: updated),
@@ -6372,10 +6372,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Rebuilds the `.bookmark` slots in the current order while leaving every other slot in
     /// place. Appending covers bookmarks added after the file was loaded.
-    private func bookmarkSlots(matching ordered: [Bookmark]) -> [AnnotationSidecar.Slot] {
+    private func bookmarkSlots(matching ordered: [Bookmark]) -> [AnnotationRecords.Slot] {
         var remaining = ordered.makeIterator()
-        var slots: [AnnotationSidecar.Slot] = []
-        for slot in annotationSidecarSlots {
+        var slots: [AnnotationRecords.Slot] = []
+        for slot in annotationRecordSlots {
             if case .bookmark = slot {
                 if let next = remaining.next() {
                     slots.append(.bookmark(next.id))
@@ -6414,7 +6414,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case replaced(before: Annotation, after: Annotation)
         case noteChanged(id: UUID, oldNote: String, newNote: String)
         /// Everything one eraser drag changed. The two annotation arrays are the **complete**
-        /// before/after state of the sidecar list, so undo restores the exact original strokes —
+        /// before/after state of the record list, so undo restores the exact original strokes —
         /// geometry, order and identities — and redo re-applies the exact pieces. A drag is one
         /// gesture and therefore **one undo step**, even when it splits five strokes into
         /// twelve pieces: one ⌘Z puts the drawing back together, because the reader made one
@@ -6422,14 +6422,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         ///
         /// `documents` are file-owned originals removed through the cross-reader path, with
         /// their pre-gesture indices. `deletions` are every file identity the gesture stages for
-        /// deletion (including adopted sidecar entries, which are represented in the arrays).
+        /// deletion (including adopted annotation-cache entries, which are represented in the arrays).
         /// `erasedStrokeIDs` are the reader-created strokes whose absence is pending a PDF.
         case erasedInk(before: [Annotation], after: [Annotation],
                        documents: [ErasedFileAnnotation],
                        deletions: [FileAnnotationDeletion],
                        erasedStrokeIDs: Set<UUID>)
         /// A file annotation was adopted into the editable model. Undo puts it back in the PDF's
-        /// list and removes the sidecar entry, exactly as if it had never been touched.
+        /// list and removes the annotation-cache entry, exactly as if it had never been touched.
         case adoptedFile(annotation: Annotation, document: DocumentAnnotation, index: Int)
         /// A file annotation was deleted in this session. Undo restores it (and cancels the
         /// pending deletion) until a save makes the removal real.
@@ -6448,7 +6448,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
-        // A direct deletion never touched the sidecar, so undo is a pure in-memory restoration
+        // A direct deletion never touched the annotation cache, so undo is a pure in-memory restoration
         // (and the pending deletion goes away with it).
         if case .deletedFile(let document, let index) = action {
             pendingFileDeletions.removeAll { $0.identity == document.id }
@@ -6578,7 +6578,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 updated[index].note = undoing ? oldNote : newNote
             }
         case .erasedInk(let before, let after, _, _, _):
-            // The arrays are the exact sidecar state on either side of the gesture, so restoring
+            // The arrays are the exact annotation cache state on either side of the gesture, so restoring
             // them is what guarantees the original identities, geometry and order (and lets redo
             // re-apply the same pieces).
             updated = undoing ? before : after
@@ -6677,12 +6677,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         scheduleNoteFlush()
     }
 
-    /// True while an open coalescing window is still holding note text back from the sidecar.
+    /// True while an open coalescing window is still holding note text back from the annotation cache.
     /// (Instrumentation: it is what lets a check or a log line tell "queued" from "written".)
     public var noteWriteWindowIsOpen: Bool { noteFlushTask != nil }
 
     /// Called when the note field is committed (Return) or loses focus: the text reaches the
-    /// sidecar now instead of at the end of the coalescing window.
+    /// annotation cache now instead of at the end of the coalescing window.
     public func commitNoteEdits() {
         flushPendingAnnotationWrite()
     }
@@ -7419,7 +7419,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// True when the file carries a digital signature and every **in-place** write is refused.
     ///
-    /// Edits are still allowed: they go to the sidecar and can be saved to a new file. The
+    /// Edits are still allowed: they go to the annotation cache and can be saved to a new file. The
     /// decision lives in Rust; the shell mirrors it only to disable the in-place controls and
     /// explain them. A direct engine call is still refused by the same gate, so a stale button
     /// cannot rewrite a signed file.
@@ -7441,7 +7441,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         "Saving a copy is allowed; the copy leaves the signature fields out."
     }
 
-    /// True when annotation tools may create or remove marks. Sidecar edits are allowed for a
+    /// True when annotation tools may create or remove marks. Cache edits are allowed for a
     /// signed document too: they can be written to a copy, and the signed original is untouched.
     public var canEditAnnotations: Bool { document != nil }
 
@@ -7493,13 +7493,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the two PDF-writing commands can run.
     ///
-    /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
+    /// The cache holds unsaved work, but it is not the feature: saving is always an explicit
     /// command from the reader, and it is disabled when there is nothing to write. A pending
     /// erasure counts even when it removed the last annotation: the copy must still be
     /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
         guard document != nil, !annotationSaveInProgress else { return false }
-        // A signed document cannot be edited, but exporting a copy (with whatever sidecar
+        // A signed document cannot be edited, but exporting a copy (with whatever cached
         // annotations it already carries, or none) never touches the signed original.
         if isReadOnlyDocument { return true }
         return annotationCacheIsDirty || hasPendingInkErasure || hasPendingFileDeletions
@@ -7530,7 +7530,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
-    /// document on screen (and its sidecar) stays exactly where it is.
+    /// document on screen (and its annotation cache) stays exactly where it is.
     public func presentSaveAnnotatedCopyPanel() {
         if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel(); return }
         guard let suggestion = suggestedAnnotatedCopyURL else { return }
@@ -7570,11 +7570,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Writes every annotation currently in the reader's list into a new PDF at `destination`.
     ///
-    /// The original document is not touched, and its sidecar is not changed: the copy carries
-    /// the annotations itself, so a fresh LyraReader opening that copy sees them from the PDF and no
-    /// sidecar duplicates them. When an eraser gesture removed the last annotation there is
-    /// nothing to append, and the copy is the source file byte for byte. Returns `false` when
-    /// nothing was written.
+    /// The original document is not touched, and its cached annotations are not changed: the copy
+    /// carries the annotations itself, so a fresh LyraReader opening that copy sees them from the
+    /// PDF and no cached copy duplicates them. When an eraser gesture removed the last annotation
+    /// there is nothing to append, and the copy is the source file byte for byte. Returns `false`
+    /// when nothing was written.
     @discardableResult
     public func saveAnnotatedCopy(to destination: URL) async -> Bool {
         if pageEditSession != nil || contentTextEditing { return await savePageEditsCopy(to: destination) }
@@ -7590,16 +7590,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         if Self.resolvesToSameFile(destination, documentURL) {
-            lastError = "The annotated copy would be the original. Choose another name, or use “Save and Replace Original”."
+            lastError = "The annotated copy would be the original. Choose another name, or use Save to update the original."
             return false
         }
-        // A sidecar beside the chosen copy would make every saved annotation appear twice when
-        // that copy is opened: once from the PDF, once from the stale sidecar. Refuse rather
-        // than silently deleting somebody else's file.
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
+        // Annotation records already associated with the chosen copy would make every saved
+        // annotation appear twice when that copy is opened: once from the PDF, once from the
+        // stale records. Refuse rather than silently deleting somebody else's file.
+        let destinationRecords = Self.annotationRecordsURL(for: destination)
+        if FileManager.default.fileExists(atPath: destinationRecords.path) {
             lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
+                "“\(destination.lastPathComponent)” already has LyraReader annotation records. "
                 + "Choose another name so the copy cannot show every annotation twice."
             return false
         }
@@ -7657,7 +7657,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
             lastAnnotationWriteReport = report
             // The erasure now exists in a PDF (the copy), so the pending-erasure banner has
-            // nothing left to warn about. The open document and its sidecar are unchanged; a
+            // nothing left to warn about. The open document and its annotation cache are unchanged; a
             // pending *file deletion* stays pending because the open file still has the mark.
             erasedInkStrokeIDs.removeAll()
             let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
@@ -7693,7 +7693,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Replaces the open document with one carrying the reader's annotations and bookmarks.
     ///
     /// The engine writes a verified backup first and replaces the original by an atomic rename
-    /// of a verified temporary file. Only after that succeeds are exactly the saved sidecar
+    /// of a verified temporary file. Only after that succeeds are exactly the saved annotation cache
     /// entries removed; the document is reopened so its annotations and bookmark subtree now
     /// come from the PDF.
     /// Returns `false` when nothing was replaced.
@@ -7738,7 +7738,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
             // The PDF is now the source of truth. Remove exactly the written entries and the
             // adopted entries whose annotation was deleted (including a thread's cascaded
-            // replies) from the sidecar, so reopening shows each annotation once.
+            // replies) from the annotation cache, so reopening shows each annotation once.
             let deletedFileIDs = Set(report.deletedFileIDs)
             let writtenEntries = Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
             let deletedAdopted = Set(annotations.compactMap { annotation -> UUID? in
@@ -7750,7 +7750,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let cleanedBookmarks = forgetBookmarksSavedToPDF(
                 ids: Set(report.writtenBookmarkIDs.compactMap { UUID(uuidString: $0) })
             )
-            let cleanedSidecar = cleanedAnnotations && cleanedBookmarks
+            let cleanedRecords = cleanedAnnotations && cleanedBookmarks
             pendingFileDeletions.removeAll()
             annotationCacheIsDirty = false
             persistPendingAnnotationState()
@@ -7768,11 +7768,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             selectedDocumentAnnotationID = nil
             openDocumentNoteID = nil
             invalidateTiles()
-            if cleanedSidecar {
+            if cleanedRecords {
                 loadAnnotations(for: url)
             }
             // The file now carries the bookmark subtree; reload the outline so the sidebar can
-            // show it (and adopt the file's bookmarks instead of a duplicate sidecar list).
+            // show it (and adopt the file's bookmarks instead of a duplicate record list).
             outline = []
             outlineLoadCompleted = false
             loadOutline()
@@ -7782,9 +7782,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastAnnotationWriteReport = report
             // The current annotations (and therefore the erasures) are in the PDF itself now.
             erasedInkStrokeIDs.removeAll()
-            if !cleanedSidecar {
+            if !cleanedRecords {
                 lastError =
-                    "The annotations are saved in the PDF, but the sidecar could not be updated. "
+                    "The annotations are saved in the PDF, but the annotation cache could not be updated. "
                     + "They will be reconciled the next time the document is opened, so they do not appear twice."
             }
             let backup = report.backupPath
@@ -7802,12 +7802,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if report.deletedReplyCount > 0 {
                 statusMessage += " · \(report.deletedReplyCount) repl\(report.deletedReplyCount == 1 ? "y" : "ies") removed with their thread"
             }
-            if !cleanedSidecar {
-                statusMessage += " · the sidecar could not be updated and will be reconciled on open"
+            if !cleanedRecords {
+                statusMessage += " · the annotation cache could not be updated and will be reconciled on open"
             }
             FileHandle.standardError.write(Data((
                 "lyra-reader-annotate: replaced \(url.path) with \(written),"
-                + " \(deletedCount) annotation deletion(s), backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
+                + " \(deletedCount) annotation deletion(s), backup \(backup), cache cleaned: \(cleanedRecords)\n"
             ).utf8))
             return true
         } catch {
@@ -7843,7 +7843,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Builds write requests from the sidecar annotations.
+    /// Builds write requests from the cached annotations.
     ///
     /// The quads are the same `TextPage.selectionRects` the canvas draws, scaled to the zoom the
     /// reader is at now. They are **view-space** on purpose: the engine inverts that scale with
@@ -7973,7 +7973,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One placed-text annotation as a write request: a `/Text` sticky note for an icon, a
     /// `/FreeText` annotation for a box.
     ///
-    /// The sidecar's box is page space at 100%; the request wants view space at the current zoom,
+    /// The cached annotation's box is page space at 100%; the request wants view space at the current zoom,
     /// exactly like the stroked kinds. A text box keeps its font size in page points (the zoom
     /// is a display transform, not part of the stored text) and carries its alignment.
     private func placedTextWriteRequest(
@@ -8017,7 +8017,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// One stroked annotation as a write request.
     ///
-    /// The sidecar stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
+    /// The annotation cache stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
     /// space scaled to the zoom the canvas is at. That multiplication and the engine's inverse
     /// are the pair the zoom-independence check exercises: the PDF's coordinates come back
     /// identical whichever zoom this ran at.
@@ -8104,20 +8104,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
-    /// Removes exactly `ids` from the sidecar, keeping every other entry, foreign entry, bookmark
-    /// and their order. Returns false when the sidecar could not be written; the in-memory model
+    /// Removes exactly `ids` from the annotation cache, keeping every other entry, foreign entry, bookmark
+    /// and their order. Returns false when the annotation cache could not be written; the in-memory model
     /// is still trimmed so the canvas cannot show a duplicate until the next open reconciles it.
     @discardableResult
     private func forgetAnnotationsSavedToPDF(ids: Set<UUID>) -> Bool {
         guard !ids.isEmpty else { return true }
         let remaining = annotations.filter { !ids.contains($0.id) }
-        let slots = annotationSidecarSlots.filter { slot in
+        let slots = annotationRecordSlots.filter { slot in
             if case .annotation(let id) = slot { return !ids.contains(id) }
             return true
         }
         undoStack.removeAll()
         redoStack.removeAll()
-        if writeSidecar(
+        if writeAnnotationRecords(
             annotations: remaining,
             bookmarks: bookmarks,
             slots: slots,
@@ -8126,29 +8126,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         annotations = remaining
-        annotationSidecarSlots = slots
+        annotationRecordSlots = slots
         FileHandle.standardError.write(Data(
-            "lyra-reader-annotate: the PDF was saved but the sidecar could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
+            "lyra-reader-annotate: the PDF was saved but the annotation cache could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
         ))
         return false
     }
 
     /// Removes exactly the bookmark entries a replacement wrote into the outline.
     ///
-    /// Mirrors [`forgetAnnotationsSavedToPDF`]: the PDF now owns them, so the sidecar must not
-    /// keep a second copy. Returns `false` when the sidecar write failed; the in-memory list is
+    /// Mirrors [`forgetAnnotationsSavedToPDF`]: the PDF now owns them, so the annotation cache must not
+    /// keep a second copy. Returns `false` when the cache write failed; the in-memory list is
     /// still trimmed, and the next open adopts the file's copy instead of showing both.
     @discardableResult
     private func forgetBookmarksSavedToPDF(ids: Set<UUID>) -> Bool {
         guard !ids.isEmpty else { return true }
         let remaining = bookmarks.filter { !ids.contains($0.id) }
-        let slots = annotationSidecarSlots.filter { slot in
+        let slots = annotationRecordSlots.filter { slot in
             if case .bookmark(let id) = slot { return !ids.contains(id) }
             return true
         }
         undoStack.removeAll()
         redoStack.removeAll()
-        if writeSidecar(
+        if writeAnnotationRecords(
             annotations: annotations,
             bookmarks: remaining,
             slots: slots,
@@ -8157,9 +8157,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         bookmarks = remaining
-        annotationSidecarSlots = slots
+        annotationRecordSlots = slots
         FileHandle.standardError.write(Data(
-            ("lyra-reader-annotate: the PDF carries the bookmarks but the sidecar could not be "
+            ("lyra-reader-annotate: the PDF carries the bookmarks but the annotation cache could not be "
                 + "updated; the saved entries are hidden in memory and the outline supplies them "
                 + "on the next open\n").utf8
         ))
@@ -8168,10 +8168,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The open-time half of duplicate avoidance for bookmarks.
     ///
-    /// A saved file carries its bookmarks in the outline, with the sidecar's UUID in a private
+    /// A saved file carries its bookmarks in the outline, with the cached annotation's UUID in a private
     /// key. Adopting them gives the sidebar back the reader's own list — identities, titles and
-    /// page positions — without a sidecar and without showing a second copy. This runs once per
-    /// open, after [`loadOutline`]; it never writes a sidecar on its own.
+    /// page positions — without writing the cache and without showing a second copy. This runs
+    /// once per open, after [`loadOutline`]; it never writes the cache on its own.
     private func adoptEmbeddedBookmarks(from entries: [OutlineEntry]) {
         guard let document else { return }
         var known = Set(bookmarks.map(\.id))
@@ -8201,11 +8201,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The open-time half of duplicate avoidance.
     ///
-    /// A write-back can succeed and then fail to update the sidecar (or somebody can restore an
-    /// old sidecar). The PDF's `/NM` is the sidecar's UUID string, so an entry whose identity is
-    /// already in the file is stale by definition: show the PDF's copy and drop the sidecar's,
+    /// A write-back can succeed and then fail to update the annotation cache (or somebody can restore an
+    /// old annotation cache). The PDF's `/NM` is the cached annotation's UUID string, so an entry whose identity is
+    /// already in the file is stale by definition: show the PDF's copy and drop the cached copy,
     /// never both. The stale entries are removed from the slot list, so the next ordinary
-    /// sidecar write also drops them from the file.
+    /// cache write also drops them from the file.
     private func reconcileAnnotationsAlreadySaved(_ found: [DocumentAnnotation]) {
         guard !annotations.isEmpty else { return }
         let identities = Set(found.map(\.id))
@@ -8213,7 +8213,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !saved.isEmpty else { return }
         let savedIDs = Set(saved.map(\.id))
         annotations.removeAll { savedIDs.contains($0.id) }
-        annotationSidecarSlots.removeAll { slot in
+        annotationRecordSlots.removeAll { slot in
             if case .annotation(let id) = slot { return savedIDs.contains(id) }
             return true
         }
@@ -8222,7 +8222,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage =
             "\(savedIDs.count) annotation(s) in this PDF were already saved; they now come from the file"
         FileHandle.standardError.write(Data(
-            "lyra-reader-annotate: reconciled \(savedIDs.count) sidecar entr(ies) already present in the PDF\n".utf8
+            "lyra-reader-annotate: reconciled \(savedIDs.count) cached entr(ies) already present in the PDF\n".utf8
         ))
     }
 
@@ -8262,8 +8262,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return firstPath == secondPath
     }
 
-    /// `document.pdf` → `document.pdf.lyra-reader-annotations.json`.
-    private static func sidecarURL(for document: URL) -> URL {
+    /// The cached annotation records file for `document`.
+    private static func annotationRecordsURL(for document: URL) -> URL {
         DocumentEditCache.annotationsURL(for: document)
     }
 
@@ -8272,11 +8272,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
         annotationCacheIsDirty = false
-        let sidecarURL = Self.sidecarURL(for: url)
-        annotationsURL = sidecarURL
+        let recordsURL = Self.annotationRecordsURL(for: url)
+        annotationsURL = recordsURL
         annotationWritesBlockedReason = nil
         preservedAnnotationEntryCount = 0
-        annotationSidecarSlots = []
+        annotationRecordSlots = []
         annotationWriteCount = 0
         hasPendingAnnotationWrite = false
         erasedInkStrokeIDs = []
@@ -8287,9 +8287,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let prepared = try DocumentEditCache.prepareAnnotations(for: url,
                 pageCount: document?.pageCount ?? 0, paletteCount: Self.highlightPalette.count)
             annotationsURL = prepared
-            _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
-            let data = try Data(contentsOf: sidecarURL)
-            let contents = try AnnotationSidecar.decode(
+            _ = try FileManager.default.attributesOfItem(atPath: recordsURL.path)
+            let data = try Data(contentsOf: recordsURL)
+            let contents = try AnnotationRecords.decode(
                 data,
                 pageCount: document?.pageCount ?? 0,
                 paletteCount: Self.highlightPalette.count
@@ -8297,7 +8297,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotations = contents.annotations
             bookmarks = contents.bookmarks
             annotationCacheIsDirty = !annotations.isEmpty || !bookmarks.isEmpty
-            annotationSidecarSlots = contents.slots
+            annotationRecordSlots = contents.slots
             preservedAnnotationEntryCount = contents.preservedCount
             undoStack.removeAll()
             redoStack.removeAll()
@@ -8356,40 +8356,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Writes a candidate first and publishes it only after the atomic write succeeds.
-    /// Any unreadable/corrupt existing sidecar is protected from accidental replacement.
+    /// Any unreadable/corrupt existing annotation cache is protected from accidental replacement.
     ///
     /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
     /// happened (a keystroke, a coalesced flush, a tab switch, …).
     @discardableResult
     private func saveAnnotations(_ candidate: [Annotation], trigger: String) -> Bool {
-        writeSidecar(
+        writeAnnotationRecords(
             annotations: candidate,
             bookmarks: bookmarks,
-            slots: annotationSidecarSlots,
+            slots: annotationRecordSlots,
             trigger: trigger
         )
     }
 
-    /// Writes both kinds of entry to the one sidecar and publishes the new arrays only after
-    /// the atomic write succeeds. Any unreadable/corrupt existing sidecar is protected from
+    /// Writes both kinds of entry to the one annotation cache and publishes the new arrays only after
+    /// the atomic write succeeds. Any unreadable/corrupt existing annotation cache is protected from
     /// accidental replacement.
     ///
     /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
     /// happened (a keystroke, a coalesced flush, a bookmark move, …).
     @discardableResult
-    private func writeSidecar(
+    private func writeAnnotationRecords(
         annotations candidateAnnotations: [Annotation],
         bookmarks candidateBookmarks: [Bookmark],
-        slots: [AnnotationSidecar.Slot],
+        slots: [AnnotationRecords.Slot],
         trigger: String
     ) -> Bool {
         guard let annotationsURL else {
-            statusMessage = "Could not save annotations: no document sidecar is selected"
+            statusMessage = "Could not save annotations: no document is open"
             lastError = statusMessage
             return false
         }
         if let reason = annotationWritesBlockedReason {
-            statusMessage = "Could not save annotations because the sidecar could not be loaded; it was left untouched"
+            statusMessage = "Could not save annotations because the annotation cache could not be loaded; it was left untouched"
             lastError = statusMessage
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: write blocked [\(trigger)]: \(reason)\n".utf8)
@@ -8398,7 +8398,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
-            let data = try AnnotationSidecar.encode(
+            let data = try AnnotationRecords.encode(
                 annotations: candidateAnnotations,
                 bookmarks: candidateBookmarks,
                 slots: slots
@@ -8406,7 +8406,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             try data.write(to: annotationsURL, options: .atomic)
             annotations = candidateAnnotations
             bookmarks = candidateBookmarks
-            annotationSidecarSlots = slots
+            annotationRecordSlots = slots
             if !["page-edit-session", "page-edit-revision", "saved-to-pdf", "bookmarks-saved-to-pdf", "recovery"].contains(trigger) {
                 annotationCacheIsDirty = true
             }
@@ -8443,7 +8443,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Every annotation the file carries is included, including ones whose `/F` hides them from
     /// the page: the flag says what to paint, not what the review thread contains. The reader's
-    /// own sidecar entries are included of course. Bookmarks are not annotations and are not part
+    /// own cached entries are included of course. Bookmarks are not annotations and are not part
     /// of this export.
     public var hasAnnotationsToExport: Bool {
         !annotations.isEmpty || !documentAnnotations.isEmpty
@@ -8452,7 +8452,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Why an export found nothing, without pretending a failed read was an empty file.
     private var noAnnotationsToExportDetail: String {
         if let error = documentAnnotationsError {
-            return "The PDF's annotations could not be read (\(error)), and LyraReader's sidecar has "
+            return "The PDF's annotations could not be read (\(error)), and LyraReader has cached "
                 + "none, so no file was written."
         }
         return "This document has no annotations from LyraReader and none in the PDF, so no file was written."
@@ -8520,7 +8520,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The ordered, source-labelled export of the current document, or `nil` when it has no
     /// annotations.
     ///
-    /// Text layers are fetched only for pages the export needs: a sidecar highlight's character
+    /// Text layers are fetched only for pages the export needs: a cached highlight's character
     /// range gives both its quote and its vertical position, and a file markup annotation's
     /// quads give its quote the same way. A page whose text layer cannot be read still exports
     /// its annotations — the quote and the vertical position are simply absent, rather than the
@@ -8611,7 +8611,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Writes the export at `destination` and returns whether a file was written.
     ///
-    /// This is a local file write with the same atomic discipline as the sidecar: the complete
+    /// This is a local file write with the same atomic discipline as the annotation cache: the complete
     /// document is written to a sibling temporary file and renamed into place, so an interrupted
     /// or failed export cannot leave a truncated file where the reader expects a complete one.
     /// With no annotations the method writes nothing, reports why, and returns `false`.
@@ -8633,7 +8633,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         // A note that is still inside the typing debounce is already in `annotations`; flushing
-        // it first keeps the sidecar consistent with what this export says.
+        // it first keeps the annotation cache consistent with what this export says.
         flushPendingWrites()
 
         guard let export = await annotationExportDocument(exportedAt: exportedAt, timeZone: timeZone) else {
@@ -8657,14 +8657,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
 
-        let sidecarCount = export.rows.filter { $0.entry.source == .sidecar }.count
-        let pdfCount = export.rows.count - sidecarCount
+        let cachedCount = export.rows.filter { $0.entry.source == .sidecar }.count
+        let pdfCount = export.rows.count - cachedCount
         statusMessage =
             "Exported \(export.rows.count) annotation(s) to \(destination.lastPathComponent)"
-            + " · \(format.displayName) · \(sidecarCount) from the sidecar, \(pdfCount) from the PDF"
+            + " · \(format.displayName) · \(cachedCount) from LyraReader, \(pdfCount) from the PDF"
         FileHandle.standardError.write(Data((
             "lyra-reader-annotate-export: wrote \(export.rows.count) annotation(s) to \(destination.path)"
-            + " (\(format.rawValue), \(sidecarCount) sidecar, \(pdfCount) pdf)\n"
+            + " (\(format.rawValue), \(cachedCount) cached, \(pdfCount) pdf)\n"
         ).utf8))
         return true
     }
@@ -9049,10 +9049,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     //
     // The original file is never modified until the reader chooses "Replace Original". Every
     // operation is applied by the Rust engine to a temporary revision in a session directory;
-    // the app renders that revision and keeps the reader's sidecar in a session copy. That gives
-    // a coherent undo history (a stack of revisions, not an inverse operation that cannot restore
-    // deleted content) and means a crash or a discarded session leaves the PDF and its sidecar
-    // exactly as they were.
+    // the app renders that revision and keeps the reader's cached annotations in a session copy.
+    // That gives a coherent undo history (a stack of revisions, not an inverse operation that cannot restore
+    // deleted content) and means a crash or a discarded session leaves the PDF and its cached
+    // annotations exactly as they were.
 
     /// One revision plus the reader's marks at that revision. Undo/redo restore both together:
     /// an annotation added to a page that a later undo removes must disappear, and come back on
@@ -9064,7 +9064,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let operations: [String]
         let annotations: [Annotation]
         let bookmarks: [Bookmark]
-        let slots: [AnnotationSidecar.Slot]
+        let slots: [AnnotationRecords.Slot]
         let deletions: [FileAnnotationDeletion]
         let erasedInk: Set<UUID>
         let annotationDirty: Bool
@@ -9077,10 +9077,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let originalURL: URL
         let originalSignature: DocumentSignature
         let sourceStamp: DocumentEditCache.SourceStamp
-        let originalSidecarURL: URL
+        let originalRecordsURL: URL
         let title: String
         let directory: URL
-        let sidecarURL: URL
+        let annotationRecordsURL: URL
         /// `/Rotate` of every page of the file the session started from.
         let originalRotations: [Int]
         var revisionURL: URL
@@ -9429,11 +9429,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // session and are not undoable. The source is only read. The outputs are files the reader
     // asked for by name, each written through the engine's verified temporary-file path.
     //
-    // Sidecar rules: a merge appends, so existing pages keep their indices and the reader's
-    // marks are copied unchanged to the merged file's sidecar. The appended pages start with no
-    // LyraReader marks because this app has no sidecar for the other documents (their file-owned
+    // Annotation-cache rules: a merge appends, so existing pages keep their indices and the
+    // reader's marks are copied unchanged to the merged file's records. The appended pages start
+    // with no reader marks because this app has no cached marks for the other documents (their file-owned
     // annotations travel inside the PDF). A split renumbers pages per output, so each output's
-    // sidecar holds exactly the marks whose pages that output contains, at their new indices.
+    // cache holds exactly the marks whose pages that output contains, at their new indices.
 
     public func presentMergeDocumentsPanel() {
         guard let source = pageEditDisplayURL else { return }
@@ -9474,7 +9474,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The open document (and any staged page-edit session) is left exactly as it is: this is
     /// the same immediate-to-a-new-file shape as ``extractPages(_:to:)``. The destination's
-    /// sidecar receives the current marks unchanged, because appending does not move a page.
+    /// records receive the current marks unchanged, because appending does not move a page.
     @discardableResult
     public func mergeDocuments(_ others: [URL], to destination: URL) async -> Bool {
         guard let source = document?.url else { return false }
@@ -9501,8 +9501,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 + "Choose another name; the original is unchanged until Replace Original is used."
             return false
         }
-        guard !Self.sidecarFileExists(for: destination) else {
-            lastError = "The destination has unsaved recovery data. Open it before replacing it."
+        guard !Self.annotationRecordsExist(for: destination) else {
+            lastError = "The destination already has LyraReader annotation records. Open it before replacing it."
             return false
         }
         pageEditBusy = true
@@ -9620,7 +9620,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Like ``extractPages(_:to:)`` this is immediate: it does not start or end a page-edit
     /// session. Every output is verified by the engine. If a later output fails, earlier outputs
-    /// are complete and stay in place; each one that exists gets its remapped sidecar, so a
+    /// are complete and stay in place; each one that exists gets its remapped records, so a
     /// partial split still leaves usable files with the right marks.
     @discardableResult
     public func splitPages(_ ranges: [[Int]], to destinations: [URL]) async -> Bool {
@@ -9659,9 +9659,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     + "another folder or remove the file."
                 return false
             }
-            if Self.sidecarFileExists(for: destination) {
+            if Self.annotationRecordsExist(for: destination) {
                 lastError =
-                    "“\(destination.lastPathComponent)” already has LyraReader annotations beside it. "
+                    "“\(destination.lastPathComponent)” already has LyraReader annotation records. "
                     + "Nothing was written; choose another folder."
                 return false
             }
@@ -9736,10 +9736,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             updates: [], deletions: [], zoom: zoomFactor) }
     }
 
-    /// True when either naming convention of the reader's sidecar exists beside `document`.
-    private static func sidecarFileExists(for document: URL) -> Bool {
+    /// True when the destination already has annotation records: its cache entry, or either
+    /// legacy companion file beside it.
+    private static func annotationRecordsExist(for document: URL) -> Bool {
         let fileManager = FileManager.default
-        return ([Self.sidecarURL(for: document)] + DocumentEditCache.legacyURLs(for: document))
+        return ([Self.annotationRecordsURL(for: document)] + DocumentEditCache.legacyURLs(for: document))
             .contains { fileManager.fileExists(atPath: $0.path) }
     }
 
@@ -9774,8 +9775,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Choose another name for Save As, or use Save to update the original."
             return false
         }
-        guard !Self.sidecarFileExists(for: destination) else {
-            lastError = "The destination has unsaved recovery data. Open it before replacing it."
+        guard !Self.annotationRecordsExist(for: destination) else {
+            lastError = "The destination already has LyraReader annotation records. Open it before replacing it."
             return false
         }
         do {
@@ -9911,7 +9912,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard (try? loadPageEditRevision(
             at: target.revisionURL,
             title: session.title,
-            sidecarURL: session.sidecarURL,
+            annotationRecordsURL: session.annotationRecordsURL,
             annotations: target.annotations,
             bookmarks: target.bookmarks,
             slots: target.slots,
@@ -9947,7 +9948,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             operations: session.operations,
             annotations: annotations,
             bookmarks: bookmarks,
-            slots: annotationSidecarSlots,
+            slots: annotationRecordSlots,
             deletions: pendingFileDeletions,
             erasedInk: erasedInkStrokeIDs,
             annotationDirty: annotationCacheIsDirty,
@@ -9990,10 +9991,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 originalURL: url,
                 originalSignature: documentSignature,
                 sourceStamp: try DocumentEditCache.SourceStamp(url),
-                originalSidecarURL: Self.sidecarURL(for: url),
+                originalRecordsURL: Self.annotationRecordsURL(for: url),
                 title: document?.title ?? url.deletingPathExtension().lastPathComponent,
                 directory: directory,
-                sidecarURL: directory.appendingPathComponent("annotations.json"),
+                annotationRecordsURL: directory.appendingPathComponent("annotations.json"),
                 originalRotations: originalRotations,
                 revisionURL: url,
                 revisionNumber: 0,
@@ -10003,16 +10004,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 redo: []
             )
             pageEditSession = session
-            annotationsURL = session.sidecarURL
-            let wrote = writeSidecar(
+            annotationsURL = session.annotationRecordsURL
+            let wrote = writeAnnotationRecords(
                 annotations: annotations,
                 bookmarks: bookmarks,
-                slots: annotationSidecarSlots,
+                slots: annotationRecordSlots,
                 trigger: "page-edit-session"
             )
             guard wrote else {
                 pageEditSession = nil
-                annotationsURL = session.originalSidecarURL
+                annotationsURL = session.originalRecordsURL
                 try? FileManager.default.removeItem(at: directory)
                 return false
             }
@@ -10029,7 +10030,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     private func applyPageEdit(_ operation: PageEditOperation, label: String) async -> Bool {
         // A rotation changes the page's text-layer order (PDFium reports a 90° page's text in
-        // rotated order). The sidecar addresses annotations by character range, so rotating a
+        // rotated order). The annotation cache addresses annotations by character range, so rotating a
         // page that has LyraReader marks would silently move them onto different words. Embedded PDF
         // annotations are unaffected: they are page-space geometry and rotate with the page.
         let rotating: [Int]?
@@ -10055,7 +10056,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let mappedBookmarks = Self.remap(bookmarks, with: report.pageMap)
             let annotationIDs = Set(mappedAnnotations.map(\.id))
             let bookmarkIDs = Set(mappedBookmarks.map(\.id))
-            let mappedSlots = annotationSidecarSlots.filter { slot in
+            let mappedSlots = annotationRecordSlots.filter { slot in
                 switch slot {
                 case .annotation(let id): return annotationIDs.contains(id)
                 case .bookmark(let id): return bookmarkIDs.contains(id)
@@ -10088,7 +10089,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard (try? loadPageEditRevision(
                 at: nextURL,
                 title: session.title,
-                sidecarURL: session.sidecarURL,
+                annotationRecordsURL: session.annotationRecordsURL,
                 annotations: mappedAnnotations,
                 bookmarks: mappedBookmarks,
                 slots: mappedSlots,
@@ -10128,10 +10129,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func loadPageEditRevision(
         at url: URL,
         title: String,
-        sidecarURL: URL,
+        annotationRecordsURL: URL,
         annotations newAnnotations: [Annotation],
         bookmarks newBookmarks: [Bookmark],
-        slots newSlots: [AnnotationSidecar.Slot],
+        slots newSlots: [AnnotationRecords.Slot],
         currentPage newCurrentPage: Int,
         selection newSelection: Set<Int>
     ) throws {
@@ -10148,19 +10149,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var loaded = try engine.openDocument(at: url)
         loaded.title = title
         document = loaded
-        annotationsURL = sidecarURL
+        annotationsURL = annotationRecordsURL
         annotationWritesBlockedReason = nil
         preservedAnnotationEntryCount = 0
         annotations = newAnnotations
         bookmarks = newBookmarks
-        annotationSidecarSlots = newSlots
+        annotationRecordSlots = newSlots
         pageSelection = newSelection
         pageSelectionAnchor = newSelection.first
         currentPage = min(max(1, newCurrentPage), max(loaded.pageCount, 1))
         invalidateTiles()
         scrollYPt = engine.pageTopPt(currentPage - 1, gapPt: pageGapPt, layout: layoutMode)
         reloadVisiblePages()
-        _ = writeSidecar(
+        _ = writeAnnotationRecords(
             annotations: newAnnotations,
             bookmarks: newBookmarks,
             slots: newSlots,
@@ -10238,7 +10239,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         _ = try await engine.saveAnnotationChanges(to: next, additions: changes.additions,
             bookmarks: marks, updates: changes.updates, deletions: changes.deletions, zoom: zoomFactor)
         let oldScroll = scrollYPt
-        try loadPageEditRevision(at: next, title: session.title, sidecarURL: session.sidecarURL,
+        try loadPageEditRevision(at: next, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
             annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection)
         session.revisionURL = next
         pendingFileDeletions = []
@@ -10261,7 +10262,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard saved.version == 1, Self.resolvesToSameFile(session.originalURL, original),
                   session.sourceStamp == (try DocumentEditCache.SourceStamp(original)),
                   session.directory.standardizedFileURL.path.hasPrefix(directory),
-                  session.sidecarURL.standardizedFileURL.path.hasPrefix(session.directory.path + "/") else {
+                  session.annotationRecordsURL.standardizedFileURL.path.hasPrefix(session.directory.path + "/") else {
                 throw DocumentEditCache.CacheError.sourceChanged
             }
             func validRevision(_ url: URL) -> Bool {
@@ -10273,7 +10274,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 throw DocumentEditCache.CacheError.sourceChanged
             }
             try loadPageEditRevision(at: saved.snapshot.revisionURL, title: session.title,
-                sidecarURL: session.sidecarURL, annotations: saved.snapshot.annotations,
+                annotationRecordsURL: session.annotationRecordsURL, annotations: saved.snapshot.annotations,
                 bookmarks: saved.snapshot.bookmarks, slots: saved.snapshot.slots,
                 currentPage: saved.snapshot.currentPage, selection: saved.snapshot.selection)
             pendingFileDeletions = saved.snapshot.deletions
@@ -10289,7 +10290,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Why rotating `pages` would invalidate LyraReader's own marks, or nil when it is safe.
     ///
-    /// Sidecar annotations address character ranges in the page's text layer, and a rotated
+    /// cached annotations address character ranges in the page's text layer, and a rotated
     /// page's text layer is reported in a different order. Rotating the page would not move the
     /// highlight with the words; it would leave the same offsets pointing at different text.
     /// Annotations already embedded in the PDF are page-space geometry and rotate correctly, so
@@ -10348,29 +10349,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return "pages " + pages.map { String($0 + 1) }.joined(separator: ", ")
     }
 
-    // MARK: - Recovery from a sidecar that cannot be read
+    // MARK: - Recovery from an annotation cache that cannot be read
 
-    /// True when this document's sidecar failed to load, so writes are refused until the
+    /// True when this document's annotation cache failed to load, so writes are refused until the
     /// reader explicitly decides what to do with the file.
-    public var canRecoverUnreadableAnnotationSidecar: Bool {
+    public var canRecoverUnreadableAnnotationRecords: Bool {
         annotationsURL != nil && annotationWritesBlockedReason != nil
     }
 
     /// The explicit way out of the blocked state.
     ///
-    /// It never overwrites the unreadable file: the sidecar is *moved* to
+    /// It never overwrites the unreadable file: the annotation cache is *moved* to
     /// `<name>.corrupt-<timestamp>.json` in the same directory, so the reader can inspect or
-    /// restore it, and only then is a fresh empty sidecar written. Returns the backup URL, or
+    /// restore it, and only then is a fresh empty annotation cache written. Returns the backup URL, or
     /// `nil` when nothing was recovered (in which case the blocked state is kept and the
     /// reason is reported).
     @discardableResult
-    public func recoverUnreadableAnnotationSidecar() -> URL? {
-        guard let sidecarURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
+    public func recoverUnreadableAnnotationRecords() -> URL? {
+        guard let annotationRecordsURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
         guard let original = pageEditSession?.originalURL ?? document?.url else { return nil }
 
         let fileManager = FileManager.default
         var backupURL: URL?
-        let records = [sidecarURL, DocumentEditCache.pendingStateURL(for: original),
+        let records = [annotationRecordsURL, DocumentEditCache.pendingStateURL(for: original),
                        DocumentEditCache.recoveryURL(for: original),
                        DocumentEditCache.directory(for: original).appendingPathComponent("source.json")]
             + DocumentEditCache.legacyURLs(for: original)
@@ -10406,11 +10407,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         catch { annotationWritesBlockedReason = error.localizedDescription; lastError = error.localizedDescription; return nil }
         annotations = []
         bookmarks = []
-        annotationSidecarSlots = []
+        annotationRecordSlots = []
         preservedAnnotationEntryCount = 0
         undoStack.removeAll()
         redoStack.removeAll()
-        lastSidecarBackupURL = backupURL
+        lastAnnotationBackupURL = backupURL
 
         guard saveAnnotations([], trigger: "recovery") else {
             // The rename succeeded but the directory is not writable: keep refusing writes so
@@ -10427,8 +10428,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// `<doc>.pdf.lyra-reader-annotations.json` → `<doc>.pdf.lyra-reader-annotations.corrupt-<stamp>.json`,
     /// with a numeric suffix if that name is taken: an earlier backup is never overwritten.
-    static func uniqueBackupURL(for sidecarURL: URL, now: Date = Date()) -> URL {
-        let base = sidecarURL.deletingPathExtension()
+    static func uniqueBackupURL(for annotationRecordsURL: URL, now: Date = Date()) -> URL {
+        let base = annotationRecordsURL.deletingPathExtension()
         let stamp = backupStampFormatter.string(from: now)
         var candidate = base.appendingPathExtension("corrupt-\(stamp).json")
         var counter = 2
@@ -10447,8 +10448,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }()
 
     /// Reveals a recovery backup in Finder (called by the UI, never by the checks).
-    public func revealSidecarBackupInFinder(_ url: URL? = nil) {
-        guard let target = url ?? lastSidecarBackupURL else { return }
+    public func revealAnnotationBackupInFinder(_ url: URL? = nil) {
+        guard let target = url ?? lastAnnotationBackupURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([target])
     }
 
@@ -10617,7 +10618,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Commits or cancels the drag begun by `beginSelection`.
     ///
-    /// A drag that moved the mark writes the sidecar once and records a single `.replaced`
+    /// A drag that moved the mark writes the annotation cache once and records a single `.replaced`
     /// operation; a click (or a drag below one point) only selects it. A failed write puts the
     /// original geometry back, so the page never shows a position that is not on disk.
     private func finishAnnotationMove(original: Annotation, start: CGPoint,
@@ -11618,7 +11619,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         retainedTabs.removeValue(forKey: closing.id)
         let closingDocumentURL = document?.url
         activeTabIndex = nil
-        // Flush first: while the page-edit session is still current, its sidecar path is the
+        // Flush first: while the page-edit session is still current, its records path is the
         // working copy. Deleting the working directory before the flush would lose the note.
         resetDocumentState()
         endPageEditSession(deleteFiles: true)
@@ -11754,10 +11755,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotationCacheIsDirty: annotationCacheIsDirty,
             lastAnnotationWriteReport: lastAnnotationWriteReport,
             interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
-            lastSidecarBackupURL: lastSidecarBackupURL,
+            lastAnnotationBackupURL: lastAnnotationBackupURL,
             annotationsURL: annotationsURL,
             annotationWritesBlockedReason: annotationWritesBlockedReason,
-            annotationSidecarSlots: annotationSidecarSlots,
+            annotationRecordSlots: annotationRecordSlots,
             selectedDocumentAnnotationID: selectedDocumentAnnotationID,
             openDocumentNoteID: openDocumentNoteID,
             annotationTextures: annotationTextures,
@@ -11865,7 +11866,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         erasedInkStrokeIDs = state.erasedInkStrokeIDs
         eraserHoverMarkID = nil
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserPreviewMarks = nil
         bookmarks = state.bookmarks
@@ -11874,10 +11875,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationCacheIsDirty = state.annotationCacheIsDirty
         lastAnnotationWriteReport = state.lastAnnotationWriteReport
         interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
-        lastSidecarBackupURL = state.lastSidecarBackupURL
+        lastAnnotationBackupURL = state.lastAnnotationBackupURL
         annotationsURL = state.annotationsURL
         annotationWritesBlockedReason = state.annotationWritesBlockedReason
-        annotationSidecarSlots = state.annotationSidecarSlots
+        annotationRecordSlots = state.annotationRecordSlots
         selectedDocumentAnnotationID = state.selectedDocumentAnnotationID
         openDocumentNoteID = state.openDocumentNoteID
         annotationTextures = state.annotationTextures
@@ -12120,7 +12121,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Jump to a chat citation's page and flash the passage it came from.
     ///
-    /// This creates no annotation and writes no sidecar: the boxes live in `aiSourceHighlight`
+    /// This creates no annotation and writes nothing to the cache: the boxes live in `aiSourceHighlight`
     /// for the length of the fade and are then dropped. The page is scrolled so the first line
     /// of the passage is visible, not merely so the page top is.
     public func revealAISource(page: Int, rects: [CGRect]) {
@@ -13272,7 +13273,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return image
     }
 
-    /// The bitmap for one sidecar sticky note or text box, from the cache or freshly rendered.
+    /// The bitmap for one cached sticky note or text box, from the cache or freshly rendered.
     private func placedGlyphTexture(for annotation: Annotation, index: Int) -> PageImage? {
         guard let box = annotation.shapeRect, box.width > 0, box.height > 0 else { return nil }
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
@@ -13670,7 +13671,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             else { return }
             annotations[index].shapeRect = rect
             // The text box's text is a canvas quad, so it has to be re-laid out at the new size
-            // while the drag is in flight. This is a canvas refresh, not a sidecar write: the
+            // while the drag is in flight. This is a canvas refresh, not a cache write: the
             // file is written once, on mouse-up.
             refreshSelectionOverlay()
             return
@@ -13684,7 +13685,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                   let index = annotations.firstIndex(where: { $0.id == original.id }) else { return }
             var updated = annotations
             updated[index] = moved
-            // In memory only: one drag is one sidecar write, on mouse-up. Writing per pointer
+            // In memory only: one drag is one cache write, on mouse-up. Writing per pointer
             // event would turn a single gesture into hundreds of disk writes.
             annotations = updated
             if original.kind.isPlacedText {
@@ -14387,8 +14388,8 @@ extension AppState {
                         ])
                 }
                 try loadPageEditRevision(
-                    at: destination, title: session.title, sidecarURL: session.sidecarURL,
-                    annotations: annotations, bookmarks: bookmarks, slots: annotationSidecarSlots,
+                    at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
+                    annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
                     currentPage: currentPage, selection: pageSelection)
                 session.revisionURL = destination
                 session.revisionNumber += 1

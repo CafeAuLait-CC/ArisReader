@@ -444,7 +444,7 @@ public struct SidebarView: View {
     /// The reader's own bookmarks: one section per page, in the order the reader set.
     ///
     /// Renaming is committed on Return or blur (`BookmarkNameField`), not on every keystroke,
-    /// so typing a title costs one sidecar write rather than one per character. Moving is
+    /// so typing a title costs one cache write rather than one per character. Moving is
     /// explicit (↑/↓) instead of drag-only: the list is also reachable from the keyboard, and
     /// a drag in a grouped `List` cannot say whether the reader meant to reorder or to regroup.
     private var bookmarkList: some View {
@@ -536,8 +536,8 @@ public struct SidebarView: View {
 
     /// Everything annotation-shaped about this document, in one list.
     ///
-    /// PDF and sidecar markup share sentence excerpts; non-text annotations and threaded
-    /// replies retain their individual rows. Only sidecar entries are editable here.
+    /// PDF and cached markup share sentence excerpts; non-text annotations and threaded
+    /// replies retain their individual rows. Only annotation-cache entries are editable here.
     private var annotationList: some View {
         Group {
             if state.annotations.isEmpty && state.documentAnnotations.isEmpty && !state.documentAnnotationsLoading {
@@ -798,7 +798,7 @@ public struct SidebarView: View {
         }
     }
 
-    /// The one line under a sidecar annotation's note field.
+    /// The one line under a cached annotation's note field.
     private func ownAnnotationSubtitle(_ annotation: AppState.Annotation) -> String {
         let kind = annotation.kind.rawValue
         let source = annotation.isFileOwned ? "PDF annotation · " : ""
@@ -883,7 +883,7 @@ public struct SidebarView: View {
 ///
 /// The field is not bound straight to `AppState`: a `TextField` setter fires per keystroke, and
 /// unlike note typing there is no coalescing window for bookmarks. A small draft keeps the
-/// sidecar write count equal to the number of edits the reader actually finished.
+/// cache write count equal to the number of edits the reader actually finished.
 private struct BookmarkNameField: View {
     let state: AppState
     let bookmark: Bookmark

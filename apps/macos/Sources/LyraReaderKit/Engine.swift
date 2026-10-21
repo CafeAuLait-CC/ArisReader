@@ -652,7 +652,7 @@ public enum AnnotationSkipReason: String, Sendable {
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
 ///
 /// The counterpart of `AppState.Annotation`: that one is what this reader wrote and keeps in a
-/// sidecar, this one is what the file itself carries — a highlight made in Preview, a colleague's
+/// annotation cache, this one is what the file itself carries — a highlight made in Preview, a colleague's
 /// sticky note. `quads` is what markup annotations are really drawn from; `xPt`/`yPt`/`widthPt`/
 /// `heightPt` is the `/Rect` and the fallback when a file has no quad points.
 public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
@@ -811,7 +811,7 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         case signature
     }
 
-    /// Written as `/NM`; the sidecar's UUID string, so a saved annotation can be recognised.
+    /// Written as `/NM`; the cached annotation's UUID string, so a saved annotation can be recognised.
     public let id: String
     public let page: Int
     public let kind: Kind
@@ -895,7 +895,7 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
 
 /// One bookmark the shell asks the engine to write into the document's outline.
 ///
-/// `yPt` is page-local view space (0 at the page top), the same value the sidecar stores, so the
+/// `yPt` is page-local view space (0 at the page top), the same value the annotation cache stores, so the
 /// written destination survives a zoom change, a resize and a layout switch.
 public struct BookmarkWriteRequest: Sendable, Equatable {
     public let id: UUID
@@ -967,9 +967,9 @@ public struct RedactionReport: Sendable, Equatable {
 
 public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
-    /// The `/NM` values written, so the sidecar can remove exactly those entries.
+    /// The `/NM` values written, so the annotation cache can remove exactly those entries.
     public let writtenIDs: [String]
-    /// The bookmark identities written into the outline, so the sidecar can remove exactly
+    /// The bookmark identities written into the outline, so the annotation cache can remove exactly
     /// those entries after a replacement.
     public let writtenBookmarkIDs: [String]
     /// Title of the bookmark subtree written into the outline; `nil` when the list was empty.
@@ -1369,7 +1369,7 @@ public struct PageSplitOutput: Sendable, Equatable {
 ///
 /// Each part is an independent verified atomic write. On a later failure the engine throws, and
 /// the earlier outputs are already complete and stay on disk; the shell checks which destinations
-/// exist to write their sidecars.
+/// exist to write their cached annotations.
 public struct PageSplitReport: Sendable, Equatable {
     public let parts: [PageSplitOutput]
     public let sourcePageCount: Int
@@ -1417,7 +1417,7 @@ public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
     public let page: Int?
     public let depth: Int
-    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// The cached bookmark's UUID when this entry belongs to the reader's own saved subtree.
     /// `nil` for every node the document's author wrote.
     public let bookmarkID: String?
     /// Page-local Y (points, 0 at the page top) when the destination names a position.

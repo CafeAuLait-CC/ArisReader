@@ -55,7 +55,7 @@
 //! # Page order
 //!
 //! The page index is resolved against the file being written, so a staged page reorder is
-//! honoured: the shell remaps the sidecar's bookmark pages when it edits pages, and this writer
+//! honoured: the shell remaps the cached bookmark pages when it edits pages, and this writer
 //! resolves those indices in the current revision. A bookmark whose page no longer exists is
 //! refused by [`validate_bookmarks`] before anything is written, so a deleted page cannot leave
 //! a dangling destination.
@@ -77,7 +77,7 @@ pub const DEFAULT_BOOKMARK_TITLE: &str = "My bookmarks";
 const MARKER_KEY: &[u8] = b"LyraReaderBookmarks";
 const MARKER_VALUE: &str = "lyra-reader-bookmarks:v1";
 
-/// Private key on every child: the sidecar bookmark's UUID, so a reopened document can adopt
+/// Private key on every child: the cached bookmark's UUID, so a reopened document can adopt
 /// the file's bookmarks with their identities intact.
 pub(crate) const ID_KEY: &[u8] = b"LyraReaderID";
 
@@ -90,7 +90,7 @@ const MAX_OUTLINE_DEPTH: usize = 64;
 /// One bookmark the shell asks the writer to put into the outline.
 ///
 /// `y_pt` is a **page-local view-space** Y: 0 at the top of the page, increasing downwards,
-/// independent of zoom and window size (the same value the sidecar stores).
+/// independent of zoom and window size (the same value the annotation cache stores).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteBookmark {
     pub id: String,
@@ -245,7 +245,7 @@ pub(crate) fn append_bookmarks(
 
     // Everything that needs the old document must happen before it moves into the incremental
     // writer. Geometry and destinations are computed here; the requested Y is clamped into the
-    // page's visible height so an out-of-range sidecar value cannot create a destination far off
+    // page's visible height so an out-of-range cached value cannot create a destination far off
     // the page.
     struct Prepared<'a> {
         bookmark: &'a WriteBookmark,

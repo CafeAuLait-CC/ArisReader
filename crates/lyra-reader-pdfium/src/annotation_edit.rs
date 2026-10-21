@@ -50,7 +50,7 @@
 //! Annotations are found by the same identity [`crate::annotations::AnnotationReader`] reports:
 //! `nm:<NM>` when the file names the annotation, otherwise a stable fingerprint of its subtype,
 //! `/Rect`, `/Contents`, `/T` and `/M`. An annotation that has no `/NM` gets one when it is first
-//! edited (the shell supplies its sidecar UUID as `assign_name`), so the identity the reader
+//! edited (the shell supplies its cached annotation UUID as `assign_name`), so the identity the reader
 //! shows after the save is stable too.
 
 #![allow(unsafe_code)]
@@ -104,7 +104,7 @@ impl AnnotationChanges {
     }
 }
 
-/// What [`apply_changes`] did, in the terms the shell needs for its sidecar.
+/// What [`apply_changes`] did, in the terms the shell needs for its annotation cache.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppliedChangesReport {
     /// Identities of every annotation removed from the annotation tree, including replies and

@@ -355,7 +355,7 @@ extension ReaderChecks {
     ) throws {
         // A long document: with only one spread, zooming out clamps the scroll at the content
         // end and the viewport top necessarily names the row above the one being fitted. Work on
-        // a scratch copy so a restored reading position or a sidecar cannot leak into the check.
+        // a scratch copy so a restored reading position or an annotation cache cannot leak into the check.
         let scratchDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lyra-reader-facing-zoom-\(UUID())")
         try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
@@ -421,14 +421,14 @@ extension ReaderChecks {
     /// A view point for a page coordinate must invert to that same page coordinate at any
     /// calibrated zoom, which is what annotation placement depends on.
     @MainActor private static func annotationPlacementChecks(calibration: DisplayCalibration) {
-        // The marks below are persisted to the sidecar next to the document, so use a scratch
+        // The marks below are persisted to the application cache, so use a scratch
         // URL instead of a committed fixture (this engine never reads the file itself).
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("lyra-reader-zoom-\(UUID()).pdf")
-        let sidecar = DocumentEditCache.annotationsURL(for: scratch)
+        let records = DocumentEditCache.annotationsURL(for: scratch)
         defer {
             try? FileManager.default.removeItem(at: scratch)
-            try? FileManager.default.removeItem(at: sidecar)
+            try? FileManager.default.removeItem(at: records)
         }
         let viewport = CGSize(width: 900, height: 700)
         let state = AppState(

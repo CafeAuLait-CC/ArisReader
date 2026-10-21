@@ -294,16 +294,16 @@ extension ReaderChecks {
         require(!state.canReplaceOriginalWithDocumentProperties,
                 "writing properties into the signed original is disabled")
 
-        // Annotation and bookmark edits are sidecar work; the copy export carries them.
+        // Annotation and bookmark edits are annotation cache work; the copy export carries them.
         let addedInk = state.addInkAnnotation(
             page: 0, points: [CGPoint(x: 40, y: 40), CGPoint(x: 140, y: 80)])
-        require(addedInk, "an annotation can be added to the signed document's sidecar")
+        require(addedInk, "an annotation can be added to the signed document's annotation cache")
         guard let inkID = state.annotations.last?.id else {
             require(false, "the added ink stroke has an identity")
             return
         }
         require(state.addBookmarkAtCurrentPage(name: "Copy bookmark"),
-                "a bookmark can be added to the signed document's sidecar")
+                "a bookmark can be added to the signed document's annotation cache")
         state.toggleEraserTool()
         require(state.annotationTool == .eraser, "the eraser can be armed")
         state.selectTool()
@@ -341,7 +341,7 @@ extension ReaderChecks {
         require(!state.canReplaceOriginalWithDocumentProperties,
                 "a properties draft cannot be written into the signed original")
 
-        // The shell's annotated-copy export writes the sidecar marks into a new, unsigned file.
+        // The shell's annotated-copy export writes the cached marks into a new, unsigned file.
         let shellCopy = scratch.appendingPathComponent("shell-annotated-copy.pdf")
         let exported = await state.saveAnnotatedCopy(to: shellCopy)
         require(exported, "the shell exports an annotated copy of the signed document")
@@ -350,14 +350,14 @@ extension ReaderChecks {
         require(contains(shellCopyBytes, "a-signed-copy-highlight") == false,
                 "the shell copy is a new file, not the engine test's copy")
         require(contains(shellCopyBytes, inkID.uuidString),
-                "the shell copy carries the sidecar ink stroke")
+                "the shell copy carries the reader ink stroke")
         require(contains(shellCopyBytes, "Copy bookmark"),
-                "the shell copy carries the sidecar bookmark")
+                "the shell copy carries the cached bookmark")
         require(state.lastAnnotationWriteReport?.sourceBytesPreserved == false,
                 "the shell reports that the signed copy was rewritten")
 
         // A staged page edit is allowed; applying it to the original is not.
-        // An inserted blank page has no text-position conflict with the sidecar marks.
+        // An inserted blank page has no text-position conflict with the cached marks.
         let staged = await state.applyPageEditOperation(
             .insertBlank(index: 1), label: "insert blank page")
         require(staged, "a page edit can be staged on a signed document")
@@ -452,7 +452,7 @@ extension ReaderChecks {
         require(eraseState.pendingFileDeletions.isEmpty,
                 "a refused file-owned stroke stages no deletion")
         require(eraseState.annotations.isEmpty,
-                "a refused file-owned stroke writes no sidecar ink")
+                "a refused file-owned stroke writes no reader ink")
         require(eraseState.undoStack.isEmpty,
                 "a refused file-owned stroke adds no undo step")
         require(eraseState.eraserRefusalNotice?.contains("comment") == true,

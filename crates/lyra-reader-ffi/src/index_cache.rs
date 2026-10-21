@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Version 1 caches were written by the caption detector that read a wrapped prose line as a
 /// caption, and by the index that stopped at page 120. Both defects are fixed by *deleting*
 /// entries from the persisted `figures` list and by *adding* pages to `citations`; a version-1
-/// sidecar for unchanged PDF bytes would therefore be a hit and the fix would stay invisible —
+/// cache for unchanged PDF bytes would therefore be a hit and the fix would stay invisible —
 /// the old false positives would keep entering the index and page 121+ would stay empty. The
 /// version is bumped so every version-1 cache is re-derived from the document. The layout is
 /// otherwise unchanged; the bump is about the values, which is exactly what this constant
@@ -81,7 +81,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// The reference half gained the document's other reference lists (`lists` and
 /// `document_wide`): a page-aware citation resolution needs them to attribute a citation to its
-/// section's list. A version-2 sidecar has only the document-wide list, so using it would make
+/// section's list. A version-2 cache has only the document-wide list, so using it would make
 /// an appendix citation resolve into the main list again. Every version-2 cache is therefore
 /// re-derived once; the replacement carries the lists.
 ///
@@ -98,7 +98,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// and short equation bars also change the derived crops, so old indexes are rebuilt on open.
 pub(crate) const FORMAT_VERSION: u32 = 5;
 
-/// Tag that identifies our sidecar (a JSON file at the right name is not enough).
+/// Tag that identifies our index cache (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";
 
 /// Largest cache this reader will read. A derived index for a 2000-page manual is far below
@@ -200,7 +200,7 @@ pub(crate) struct IndexCacheFile {
     pub citations: BTreeMap<u32, Vec<CitationRecord>>,
 }
 
-/// What reading the sidecar found.
+/// What reading the index cache found.
 pub(crate) enum CacheRead {
     Hit(Box<IndexCacheFile>),
     Stale,
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn a_version_one_cache_is_not_read_after_the_caption_and_page_fixes() {
         // T4.12/T4.13 changed what a parse derives for the same bytes (fewer captions, and
-        // citations for every page), so a version-1 sidecar would be a plausible-looking hit
+        // citations for every page), so a version-1 cache would be a plausible-looking hit
         // with the old, wrong values. It is re-derived instead; see `FORMAT_VERSION`.
         let directory =
             std::env::temp_dir().join(format!("lyra-reader-index-cache-v1-{}", std::process::id()));

@@ -9,7 +9,7 @@ extension ReaderChecks {
     ///
     /// Every selection here is produced by the same three `AppState` calls the canvas makes on
     /// press / drag / release, so the check exercises the real mouse-up path rather than a
-    /// testing-only shortcut. The fixture is a scratch copy: the committed PDF and its sidecar
+    /// testing-only shortcut. The fixture is a scratch copy: the committed PDF and its annotation cache
     /// are never written.
     @MainActor static func stickyMarkupChecks(fixture: URL) async throws {
         let fileManager = FileManager.default
@@ -20,7 +20,7 @@ extension ReaderChecks {
 
         let document = scratch.appendingPathComponent("sticky.pdf")
         try fileManager.copyItem(at: fixture, to: document)
-        let sidecar = DocumentEditCache.annotationsURL(for: document)
+        let records = DocumentEditCache.annotationsURL(for: document)
 
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
@@ -229,15 +229,15 @@ extension ReaderChecks {
         require(state.undoStack.count == undoBeforeRapid + 2,
                 "each rapid mark is its own undo step")
 
-        // ── 9. The kind is part of the sidecar, not only of memory ────────────────────
-        let sidecarText = String(decoding: try Data(contentsOf: sidecar), as: UTF8.self)
-        require(sidecarText.contains("\"kind\" : \"strikeout\""),
-                "the strikeout is stored under its own sidecar kind")
+        // ── 9. The kind is part of the annotation cache, not only of memory ────────────────────
+        let recordsText = String(decoding: try Data(contentsOf: records), as: UTF8.self)
+        require(recordsText.contains("\"kind\" : \"strikeout\""),
+                "the strikeout is stored under its own annotation cache kind")
         let reopened = AppState(engine: try RustEngine())
         reopened.setViewportSize(CGSize(width: 700, height: 500))
         reopened.newTab(url: document)
         require(reopened.annotations.contains { $0.kind == .strikeout },
-                "a reopened sidecar restores the strikeout kind")
+                "a reopened annotation cache restores the strikeout kind")
         require(reopened.annotations.filter { $0.kind == .strikeout }.count == 2,
                 "both strikeouts survive the reopen")
 
@@ -260,13 +260,13 @@ extension ReaderChecks {
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: scratch) }
 
-        func sidecar(for document: URL) -> URL {
+        func records(for document: URL) -> URL {
             DocumentEditCache.annotationsURL(for: document)
         }
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
         func index(of needle: String, in text: TextPage) -> Int {
@@ -287,7 +287,7 @@ extension ReaderChecks {
         let red = AnnotationColor(red: 200, green: 30, blue: 40, alpha: 255)
         let strikeoutID = UUID()
 
-        // ── 1. LyraReader's own write: a real gesture creates the sidecar entry, save writes it ──
+        // ── 1. LyraReader's own write: a real gesture creates the annotation-cache entry, save writes it ──
         let source = try copy(textPage, "strikeout-source.pdf")
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
@@ -322,7 +322,7 @@ extension ReaderChecks {
         state.extendSelection(to: end)
         state.endPointerInteraction(at: end, wasClick: false)
         require(state.annotations.count == 1 && state.annotations.first?.kind == .strikeout,
-                "a strikeout gesture creates a strikeout sidecar entry")
+                "a strikeout gesture creates a strikeout annotation-cache entry")
         guard let created = state.annotations.first else {
             require(false, "the strikeout is in the model")
             return
@@ -342,9 +342,9 @@ extension ReaderChecks {
             require(false, "a successful strikeout save publishes a report")
         }
 
-        let copySidecar = DocumentEditCache.annotationsURL(for: copyURL)
-        require(!fileManager.fileExists(atPath: copySidecar.path),
-                "an annotated copy carries no sidecar")
+        let copyRecords = DocumentEditCache.annotationsURL(for: copyURL)
+        require(!fileManager.fileExists(atPath: copyRecords.path),
+                "an annotated copy carries no cached annotations")
 
         // ── 2. LyraReader reads its own /StrikeOut back as a strikeout ──────────────────────
         let reopened = AppState(engine: try RustEngine())
@@ -424,14 +424,14 @@ extension ReaderChecks {
         )
         let encoded = String(decoding: try encoder.encode([entry]), as: UTF8.self)
         let entryText = String(encoded.dropFirst(2).dropLast(2))
-        try Data("[\n\(entryText)\n]".utf8).write(to: sidecar(for: replaceSource))
+        try Data("[\n\(entryText)\n]".utf8).write(to: records(for: replaceSource))
         let originalBytes = try Data(contentsOf: replaceSource)
 
         let replaceState = AppState(engine: try RustEngine())
         replaceState.setViewportSize(CGSize(width: 700, height: 500))
         replaceState.newTab(url: replaceSource)
         require(replaceState.annotations.count == 1,
-                "the seeded sidecar loads the strikeout to write")
+                "the seeded annotation cache loads the strikeout to write")
         let replaced = await replaceState.replaceOriginalWithSavedAnnotations()
         require(replaced, "replacing a file that already has annotations succeeds")
         guard let report = replaceState.lastAnnotationWriteReport else {
@@ -448,10 +448,10 @@ extension ReaderChecks {
         let backupBytes = try Data(contentsOf: URL(fileURLWithPath: backupPath))
         require(backupBytes == originalBytes,
                 "the backup is byte-identical to the pre-save file")
-        let replaceSidecarText = String(decoding: try Data(contentsOf: sidecar(for: replaceSource)),
+        let replaceRecordsText = String(decoding: try Data(contentsOf: records(for: replaceSource)),
                                         as: UTF8.self)
-        require(!replaceSidecarText.contains(strikeoutID.uuidString),
-                "the saved strikeout is removed from the sidecar, so a reopen cannot duplicate it")
+        require(!replaceRecordsText.contains(strikeoutID.uuidString),
+                "the saved strikeout is removed from the annotation cache, so a reopen cannot duplicate it")
 
         let afterExternal = AppState(engine: try RustEngine())
         afterExternal.setViewportSize(CGSize(width: 700, height: 500))

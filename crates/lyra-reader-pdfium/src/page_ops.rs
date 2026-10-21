@@ -23,7 +23,7 @@
 //!
 //! Every report carries `page_map`: `page_map[old] = Some(new)` for a page that survived and
 //! `None` for a page that was deleted (or not selected by an extraction). The shell uses it to
-//! remap the reader's sidecar annotations and bookmarks. Embedded PDF annotations are handled by
+//! remap the reader's cached annotations and bookmarks. Embedded PDF annotations are handled by
 //! PDFium: moving a page moves its annotation dictionary with it, deleting a page deletes its
 //! annotations, and importing pages copies them. The tests assert that, because it is the kind
 //! of behaviour a viewer must not assume from a page-tree edit.
@@ -42,15 +42,15 @@
 //! tree, and inventing destinations for another author's outline would be worse than leaving it
 //! out. [`MergeReport::dropped_outline_entries`] counts what was left out so the shell can say
 //! so. A split keeps no outline in any output for the same reason: the source outline's
-//! destinations refer to pages that may be in a different output; the shell's sidecar bookmarks
+//! destinations refer to pages that may be in a different output; the shell's cached bookmarks
 //! are remapped per output instead.
 //!
-//! **Sidecar rule.** The reader's own annotations/bookmarks live outside this module, in a
-//! sidecar keyed by page index. Merge only appends, so the first document's pages keep their
+//! **Annotation-cache rule.** The reader's own annotations/bookmarks live outside this module,
+//! in the application's document cache, keyed by page index. Merge only appends, so the first document's pages keep their
 //! indices and every existing mark keeps pointing at its page; the appended pages are new
-//! indices with no sidecar marks, because this app has no sidecar for the other documents (their
+//! indices with no reader marks, because this app has no annotation cache for the other documents (their
 //! file-owned annotations do travel with them). Split outputs are renumbered, so the shell
-//! remaps the sidecar per output.
+//! remaps the cached records per output.
 //!
 //! **Split failure model.** The whole plan is validated before anything is written (indices,
 //! overlapping outputs, destinations). Outputs are then written one at a time, each with its own
@@ -379,9 +379,9 @@ pub fn extract_pages(
 /// not be any of them. The result is verified before its atomic rename: page count, rotations,
 /// sizes, per-page text, per-page file-owned annotations, and the first document's outline.
 ///
-/// What happens to the second document's outline, and to the reader's sidecar, is documented at
+/// What happens to the second document's outline, and to the reader's cached annotations, is documented at
 /// the top of this module. In short: its outline is not imported (and is counted in the report),
-/// its embedded annotations travel, and the first document's sidecar marks keep their page
+/// its embedded annotations travel, and the first document's cached marks keep their page
 /// indices because nothing before the appended pages moves.
 pub fn merge_documents(
     source: &Path,
