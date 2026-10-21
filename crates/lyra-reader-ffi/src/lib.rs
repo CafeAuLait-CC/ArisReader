@@ -42,6 +42,11 @@ pub mod api;
 mod index_cache;
 pub use api::{DocumentSummary, LyraReaderEngine, LyraReaderFfiError};
 
+/// Location of a document's disposable derived index, for cache management and diagnostics.
+pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathBuf {
+    index_cache::cache_path(document)
+}
+
 /// ABI version. **Must be bumped whenever the signature or semantics of any exported function changes**.
 ///
 /// 2 added the `blend_modes` array to [`lyra_reader_surface_draw_pages`]: a page quad and a

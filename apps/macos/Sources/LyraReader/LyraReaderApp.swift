@@ -118,21 +118,20 @@ struct ReaderCommands: Commands {
                 .disabled(session == nil)
         }
 
-        // The only two ways this application writes into a PDF. Both are explicit commands,
-        // and the second one is deliberately labelled with what it replaces: it is not a save
-        // key that silently overwrites the document the reader opened.
+        // Ordinary Save writes unsigned documents to their original path. Save As chooses
+        // an explicit destination; signed originals retain the protected-copy workflow.
         CommandGroup(replacing: .saveItem) {
-            Button("Save Annotated Copy…") {
-                session?.state.presentSaveAnnotatedCopyPanel()
+            Button("Save") {
+                session?.state.saveDocument()
             }
             .keyboardShortcut("s", modifiers: .command)
-            .disabled(session?.state.canSaveAnnotationsToPDF != true)
+            .disabled(session?.state.canSaveDocument != true)
 
-            Button("Save and Replace Original…") {
-                session?.state.presentReplaceOriginalConfirmation()
+            Button("Save As…") {
+                session?.state.presentSaveDocumentCopyPanel()
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
-            .disabled(session?.state.canReplaceOriginalWithAnnotations != true)
+            .disabled(session?.state.canSaveDocument != true)
 
             Divider()
 
@@ -377,14 +376,6 @@ struct ReaderCommands: Commands {
 
             Divider()
 
-            Button("Save Edited Copy…") {
-                session?.state.presentSavePageEditsCopyPanel()
-            }
-            .disabled(session?.state.canSavePageEditsCopy != true)
-            Button("Replace Original with Page Changes…") {
-                session?.state.presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            .disabled(session?.state.canReplaceOriginalWithPageEdits != true)
             Button("Discard Page Changes…") {
                 session?.state.presentDiscardPageEditsConfirmation()
             }

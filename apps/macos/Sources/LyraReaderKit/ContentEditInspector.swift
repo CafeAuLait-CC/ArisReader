@@ -239,8 +239,8 @@ struct ContentEditInspector: View {
                 Button { state.undoPageEdit() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }.disabled(!state.canUndoPageEdit)
                 Button { state.redoPageEdit() } label: { Label("Redo", systemImage: "arrow.uturn.forward") }.disabled(!state.canRedoPageEdit)
             }
-            Button("Save Edited Copy…") { state.presentSavePageEditsCopyPanel() }.disabled(!state.canSavePageEditsCopy)
-            Button("Replace Original…") { state.presentReplaceOriginalWithPageEditsConfirmation() }.disabled(!state.canReplaceOriginalWithPageEdits)
+            Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") { state.saveDocument() }
+                .buttonStyle(ReaderPanelButtonStyle(prominent: true)).disabled(!state.canSaveDocument)
         }
     }
 

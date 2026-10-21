@@ -7,12 +7,15 @@
 //! every click and never persisted. This test pins both halves:
 //!
 //! * the API returns the late captions and the late citation;
-//! * the sidecar on disk carries them, which is what makes the second open a hit rather than a
+//! * the application cache on disk carries them, which is what makes the second open a hit rather than a
 //!   re-derivation (a version-1 cache would have neither field for this file).
 //!
-//! The fixture is copied into a scratch directory first: the cache writes beside the PDF by
-//! design, and the committed fixtures must stay clean. Every assertion is skipped with an
+//! Both the fixture and the application cache use private temporary directories, so the
+//! committed fixtures and the user's cache remain untouched. Every assertion is skipped with an
 //! announcement when PDFium is unavailable, like the other FFI integration tests.
+
+#[path = "support/index_cache.rs"]
+mod cache_test;
 
 use lyra_reader_ffi::api::LyraReaderEngine;
 use std::fs;
@@ -64,13 +67,16 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn cache_path(document: &Path) -> PathBuf {
-    let mut path = document.as_os_str().to_os_string();
-    path.push(".lyra-reader-index.json");
-    PathBuf::from(path)
+    let path = lyra_reader_ffi::document_index_cache_path(document);
+    fs::create_dir_all(path.parent().unwrap()).expect("create index cache directory");
+    path
 }
 
 #[test]
 fn captions_and_citations_past_page_120_are_returned_and_persisted() {
+    if !cache_test::isolated("captions_and_citations_past_page_120_are_returned_and_persisted") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;

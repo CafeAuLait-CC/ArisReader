@@ -660,8 +660,10 @@ extension ReaderChecks {
             }
             let largestPart = documentPlan.parts.map(\.pageCharacters).max() ?? 0
             print("AI-DOCUMENT-SUMMARY pages=\(documentPlan.pageCount) parts=\(documentPlan.parts.count) total_page_chars=\(totalPageCharacters) largest_part_page_chars=\(largestPart)")
-            require(largestPart <= 12_000,
-                    "each document-summary part respects the 12,000 page-character budget")
+            require(documentPlan.parts.count == 1 && largestPart == totalPageCharacters,
+                    "the complete paper uses one independent summary request")
+            require(documentPlan.parts[0].systemPrompt.contains("Evidence and results"),
+                    "the summary prompt supports critical academic reading")
         }
 
         print("AI-SELECTION \(label) range intended=\(intendedRange) canvas=\(selection.range) charCount=\(characters.count) textCount=\(text.text.count)")
@@ -1250,7 +1252,7 @@ extension ReaderChecks {
         state.open(url: url)
         require(state.currentPage == 1, "the reader starts on page 1")
         let annotationsBefore = state.annotations
-        let sidecar = url.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecar = DocumentEditCache.annotationsURL(for: url)
         try? FileManager.default.removeItem(at: sidecar)
         chip.follow(in: state)
         require(state.currentPage == chip.page,
@@ -1266,9 +1268,9 @@ extension ReaderChecks {
                 "following a citation creates no annotation")
         require(!FileManager.default.fileExists(atPath: sidecar.path),
                 "following a citation writes no sidecar annotation")
-        try await Task.sleep(for: .milliseconds(1_700))
-        require(state.aiSourceHighlight == nil,
-                "the source highlight disappears after the fade")
+        try await eventually("the source highlight disappears after the fade") {
+            state.aiSourceHighlight == nil
+        }
         require(!state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
                 "the transient quads are removed with the highlight")
         require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: sidecar.path),
@@ -1586,10 +1588,10 @@ extension ReaderChecks {
         ] {
             require(abs(measurement.chat.width - expectedWidth) < 1,
                     "\(label): the chat fills the panel width (\(measurement.chat.width) pt)")
-            require(measurement.chat.height > 250,
-                    "\(label): the chat gets the panel height below the actions (\(measurement.chat.height) pt)")
-            require(measurement.actions.height >= 170 && measurement.actions.height <= 280,
-                    "\(label): the single-shot actions keep a bounded scrollable area (\(measurement.actions.height) pt)")
+            require(measurement.chat.height > 650,
+                    "\(label): chat uses the full tab beneath the header (\(measurement.chat.height) pt)")
+            require(measurement.actions == .zero,
+                    "\(label): summary actions are absent from the Chat tab")
             require(measurement.chat.minX >= -0.5
                         && measurement.chat.maxX <= measurement.hostBounds.maxX + 0.5,
                     "\(label): the chat is not clipped horizontally")
@@ -1656,6 +1658,8 @@ extension ReaderChecks {
         model: AIAssistantModel,
         width: CGFloat
     ) async throws -> DocumentChatPanelMeasurements {
+        model.selectedTab = .chat
+        model.expandedChatSources = Set(model.chatTurns.map(\.id))
         let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
         let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
         host.frame = container.bounds
@@ -1678,13 +1682,13 @@ extension ReaderChecks {
                 "the layout host keeps the requested 800 pt height (got \(host.bounds.height))")
 
         guard let chatMarker = findView(AIDocumentChatMarkerView.self, in: host),
-              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host),
-              let actionsMarker = findView(AIAssistantPanelMarkerView.self, in: host) else {
-            fatalError("FAIL: the hosted right panel is missing a chat, composer or actions marker")
+              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host) else {
+            fatalError("FAIL: the hosted Chat tab is missing its chat or composer")
         }
         let chat = host.convert(chatMarker.bounds, from: chatMarker)
         let composer = host.convert(composerMarker.bounds, from: composerMarker)
-        let actions = host.convert(actionsMarker.bounds, from: actionsMarker)
+        let actions = findView(AIAssistantPanelMarkerView.self, in: host)
+            .map { host.convert($0.bounds, from: $0) } ?? .zero
         let composerFrame = host.convert(composerMarker.bounds, from: composerMarker)
         let fields = findViews(NSTextField.self, in: host)
             .filter {
@@ -1707,17 +1711,43 @@ extension ReaderChecks {
             .sorted { $0.1.minY < $1.1.minY }
         var seenPages: Set<Int> = []
         let firstChipPerPage = chipMarkers.filter { seenPages.insert($0.0).inserted }
-        return DocumentChatPanelMeasurements(
+        let measurement = DocumentChatPanelMeasurements(
             hostBounds: host.bounds,
             chat: chat,
             composer: composer,
             actions: actions,
             composerField: fields.first.map { host.convert($0.bounds, from: $0) },
-            askButton: buttons.first.map { host.convert($0.bounds, from: $0) },
+            askButton: findView(AIDocumentChatAskMarkerView.self, in: host)
+                .map { host.convert($0.bounds, from: $0) }
+                ?? buttons.first.map { host.convert($0.bounds, from: $0) },
             historyContentHeight: history?.documentView?.frame.height ?? 0,
             historyViewportHeight: history?.contentView.bounds.height ?? 0,
             chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
         )
+        model.expandedChatSources = []
+        let turnsBefore = model.chatTurns.count
+        let languageBefore = model.targetLanguage
+        for tab in AIAssistantTab.allCases {
+            model.selectedTab = tab
+            try await Task.sleep(for: .milliseconds(100))
+            host.layoutSubtreeIfNeeded()
+            if tab != .chat {
+                require(findView(AIDocumentChatMarkerView.self, in: host) == nil,
+                        "\(tab.title) has its own workspace without a stacked chat")
+                require(findView(AIAssistantPanelMarkerView.self, in: host) != nil,
+                        "\(tab.title) hosts the task controls")
+            }
+            if let directory = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"],
+               let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to:
+                    URL(fileURLWithPath: directory).appendingPathComponent("ai-\(tab.rawValue)-\(Int(width)).png"))
+            }
+        }
+        require(model.chatTurns.count == turnsBefore && model.targetLanguage == languageBefore,
+                "switching AI tabs preserves conversation and translation inputs")
+        return measurement
     }
 
     @MainActor

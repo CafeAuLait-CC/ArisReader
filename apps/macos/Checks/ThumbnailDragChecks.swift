@@ -42,7 +42,7 @@ extension ReaderChecks {
             for annotation in annotations { lines.append(try sidecarEntry(annotation)) }
             for bookmark in bookmarks { lines.append(try sidecarEntry(bookmark)) }
             try Data(("[\n" + lines.joined(separator: ",\n") + "\n]").utf8)
-                .write(to: document.appendingPathExtension("lyra-reader-annotations.json"))
+                .write(to: DocumentEditCache.annotationsURL(for: document))
         }
         func annotation(_ note: String, page: Int) -> AppState.Annotation {
             AppState.Annotation(
@@ -220,7 +220,7 @@ extension ReaderChecks {
             [Bookmark(page: 1, title: "on page two", yPt: 12)],
             beside: dragURL
         )
-        let sidecarURL = dragURL.appendingPathExtension("lyra-reader-annotations.json")
+        let sidecarURL = DocumentEditCache.annotationsURL(for: dragURL)
         let originalPDF = try Data(contentsOf: dragURL)
         let originalSidecar = try Data(contentsOf: sidecarURL)
         let dragState = AppState(engine: try RustEngine())
@@ -337,7 +337,7 @@ extension ReaderChecks {
             [Bookmark(page: 2, title: "on page three", yPt: 10)],
             beside: fivePages
         )
-        let fiveSidecar = fivePages.appendingPathExtension("lyra-reader-annotations.json")
+        let fiveSidecar = DocumentEditCache.annotationsURL(for: fivePages)
         let fiveOriginal = try Data(contentsOf: fivePages)
         let fiveSidecarBytes = try Data(contentsOf: fiveSidecar)
         let blockState = AppState(engine: try RustEngine())

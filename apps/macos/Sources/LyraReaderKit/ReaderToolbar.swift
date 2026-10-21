@@ -214,13 +214,8 @@ struct ReaderToolbar: View {
                                    help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentSplitPagesPanel() },
             ]) { menuLabel("doc.on.doc") }
             LyraReaderMenu(title: "Export and save", items: [
-                LyraReaderMenuItem("Save Annotated Copy…", icon: "square.and.arrow.up", shortcut: "⌘S", enabled: state.canSaveAnnotationsToPDF) { state.presentSaveAnnotatedCopyPanel() },
-                LyraReaderMenuItem("Save and Replace Original…", icon: "doc.badge.arrow.up", shortcut: "⇧⌘S",
-                                   enabled: state.canReplaceOriginalWithAnnotations,
-                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentReplaceOriginalConfirmation() },
-                .separator("export"),
-                LyraReaderMenuItem("Save Edited Copy…", icon: "doc.on.doc", enabled: state.canSavePageEditsCopy,
-                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) { state.presentSavePageEditsCopyPanel() },
+                LyraReaderMenuItem("Save", icon: "square.and.arrow.down", shortcut: "⌘S", enabled: state.canSaveDocument) { state.saveDocument() },
+                LyraReaderMenuItem("Save As…", icon: "doc.on.doc", shortcut: "⇧⌘S", enabled: state.canSaveDocument) { state.presentSaveDocumentCopyPanel() },
                 .separator("forms"),
                 LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {

@@ -12,6 +12,9 @@
 //! → `LyraReaderDocument::resolve_citations_on`) is compiled by `check.sh`; it is not driven here,
 //! because these tests deliberately stay on the Rust side of the FFI boundary.
 
+#[path = "support/index_cache.rs"]
+mod cache_test;
+
 use lyra_reader_ffi::api::{
     CitationRecord, IndexCacheOutcome, LyraReaderDocument, LyraReaderEngine, ReferenceRecord,
     ResolvedReference,
@@ -234,6 +237,9 @@ fn a_single_list_document_resolves_exactly_as_before() {
 
 #[test]
 fn a_cache_hit_keeps_the_lists_and_still_attributes_the_appendix() {
+    if !cache_test::isolated("a_cache_hit_keeps_the_lists_and_still_attributes_the_appendix") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -253,7 +259,7 @@ fn a_cache_hit_keeps_the_lists_and_still_attributes_the_appendix() {
             "the cold open did not write an index: {written:?}"
         );
     }
-    // A second open of the same bytes must hit the sidecar and still know both lists.
+    // A second open of the same bytes must hit the application cache and still know both lists.
     let (_engine, document) = open(&path);
     let hit = document.index_cache_report();
     assert_eq!(hit.outcome, IndexCacheOutcome::Hit, "{hit:?}");

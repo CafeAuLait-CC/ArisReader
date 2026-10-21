@@ -85,7 +85,7 @@ extension ReaderChecks {
         func makeDocument(named name: String, withStaleTemporary: Bool) throws -> URL {
             let document = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: fixture, to: document)
-            let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
+            let sidecar = DocumentEditCache.annotationsURL(for: document)
             let sidecarText = "[\n"
                 + [try entry(first), try entry(second), try entry(bookmark), foreignEntry]
                     .joined(separator: ",\n")
@@ -104,7 +104,7 @@ extension ReaderChecks {
 
         // ── 1. Save an annotated copy; the original and its sidecar are untouched ──────
         let copySource = try makeDocument(named: "copy-source.pdf", withStaleTemporary: true)
-        let copySourceSidecar = copySource.appendingPathExtension("lyra-reader-annotations.json")
+        let copySourceSidecar = DocumentEditCache.annotationsURL(for: copySource)
         let copyOriginalBytes = try Data(contentsOf: copySource)
         let copySidecarBytes = try Data(contentsOf: copySourceSidecar)
         let staleTemporary = scratch.appendingPathComponent(
@@ -149,7 +149,7 @@ extension ReaderChecks {
         }
 
         // ── 2. Reopening the copy: one copy of each annotation, from the PDF, no sidecar ──
-        let copySidecarURL = copyURL.appendingPathExtension("lyra-reader-annotations.json")
+        let copySidecarURL = DocumentEditCache.annotationsURL(for: copyURL)
         require(!fileManager.fileExists(atPath: copySidecarURL.path),
                 "a copy carries no sidecar, so reopening it cannot duplicate entries")
         let copyReopen = AppState(engine: try RustEngine())
@@ -266,7 +266,7 @@ extension ReaderChecks {
 
         // ── 4. Replace the original: verified backup, exact sidecar removal, no duplicates ──
         let replaceSource = try makeDocument(named: "replace-source.pdf", withStaleTemporary: false)
-        let replaceSidecar = replaceSource.appendingPathExtension("lyra-reader-annotations.json")
+        let replaceSidecar = DocumentEditCache.annotationsURL(for: replaceSource)
         let replaceOriginalBytes = try Data(contentsOf: replaceSource)
         let replaceState = AppState(engine: try RustEngine())
         replaceState.setViewportSize(CGSize(width: 700, height: 500))

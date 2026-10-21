@@ -6,12 +6,24 @@ import Security
 
 // MARK: - Actions and request inputs
 
+public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
+    case summary, translation, chat
+    public var id: String { rawValue }
+    public var title: String {
+        switch self { case .summary: "Summary"; case .translation: "Translate"; case .chat: "Chat" }
+    }
+    public var icon: String {
+        switch self { case .summary: "doc.text"; case .translation: "character.bubble"; case .chat: "text.bubble" }
+    }
+}
+
 /// The actions the AI panel can request. Document chat is the conversational action; the other
 /// four stay available alongside it.
 public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
     case documentChat
     case summarizePage
     case summarizeDocument
+    case summarizeSelection
     case askSelection
     case translateSelection
 
@@ -22,6 +34,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return "Ask the document"
         case .summarizePage: return "Summarise page"
         case .summarizeDocument: return "Summarise document"
+        case .summarizeSelection: return "Summarise selection"
         case .askSelection: return "Ask selection"
         case .translateSelection: return "Translate selection"
         }
@@ -32,6 +45,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return "text.bubble"
         case .summarizePage: return "doc.text"
         case .summarizeDocument: return "doc.on.doc"
+        case .summarizeSelection: return "text.quote"
         case .askSelection: return "questionmark.bubble"
         case .translateSelection: return "character.bubble"
         }
@@ -43,6 +57,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return .documentChat
         case .summarizePage: return .summarizePage
         case .summarizeDocument: return .summarizeDocument
+        case .summarizeSelection: return .summarizeSelection
         case .askSelection: return .askSelection
         case .translateSelection: return .translateSelection
         }
@@ -50,7 +65,7 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
 
     /// Whether the panel must have a live selection before offering the action.
     public var requiresSelection: Bool {
-        self == .askSelection || self == .translateSelection
+        self == .askSelection || self == .translateSelection || self == .summarizeSelection
     }
 
     /// The conversational action keeps the panel's chat section, even while a different action
