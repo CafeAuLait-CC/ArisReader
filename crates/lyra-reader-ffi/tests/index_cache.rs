@@ -1,13 +1,16 @@
 //! The persistent document index cache, exercised through the same FFI object the shell uses.
 //!
-//! Every test that writes a cache copies a committed fixture into its own scratch directory:
-//! opening `tests/fixtures/*.pdf` directly would leave sidecars in the repository, and a test
-//! suite must not dirty the tree it is checking.
+//! Every cache-dependent test runs with a private temporary application cache and copies its
+//! fixture into a separate scratch directory. Tests neither need access to the user's cache
+//! nor create PDF-adjacent sidecars.
 //!
 //! The central assertion is a counter, not a clock: `IndexCacheReport::derived_parts` is the
 //! number of index components this document instance built from the PDF. A second open that
 //! reports `Hit` **and** zero derived parts cannot have reparsed anything, whatever the machine's
 //! speed.
+
+#[path = "support/index_cache.rs"]
+mod cache_test;
 
 use lyra_reader_ffi::api::{
     CitationRecord, DocumentMetadataRecord, FigureRecord, IndexCacheOutcome, LyraReaderDocument,
@@ -138,6 +141,11 @@ fn open(
 
 #[test]
 fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
+    if !cache_test::isolated(
+        "stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open",
+    ) {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -208,6 +216,11 @@ fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
 
 #[test]
 fn a_second_open_uses_the_cache_and_returns_the_same_index_field_by_field() {
+    if !cache_test::isolated(
+        "a_second_open_uses_the_cache_and_returns_the_same_index_field_by_field",
+    ) {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -256,6 +269,9 @@ fn a_second_open_uses_the_cache_and_returns_the_same_index_field_by_field() {
 
 #[test]
 fn every_index_component_survives_a_cache_round_trip() {
+    if !cache_test::isolated("every_index_component_survives_a_cache_round_trip") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -314,6 +330,10 @@ fn every_index_component_survives_a_cache_round_trip() {
 
 #[test]
 fn touching_the_file_keeps_the_cache_and_changing_a_byte_invalidates_it() {
+    if !cache_test::isolated("touching_the_file_keeps_the_cache_and_changing_a_byte_invalidates_it")
+    {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -372,6 +392,9 @@ fn touching_the_file_keeps_the_cache_and_changing_a_byte_invalidates_it() {
 
 #[test]
 fn a_truncated_cache_is_ignored_rebuilt_and_the_document_still_parses() {
+    if !cache_test::isolated("a_truncated_cache_is_ignored_rebuilt_and_the_document_still_parses") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -417,6 +440,9 @@ fn a_truncated_cache_is_ignored_rebuilt_and_the_document_still_parses() {
 
 #[test]
 fn a_newer_cache_is_ignored_and_left_byte_for_byte_untouched() {
+    if !cache_test::isolated("a_newer_cache_is_ignored_and_left_byte_for_byte_untouched") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -465,51 +491,112 @@ fn a_newer_cache_is_ignored_and_left_byte_for_byte_untouched() {
 }
 
 #[test]
-fn a_read_only_directory_still_opens_and_indexes() {
+fn a_read_only_pdf_directory_still_writes_and_reuses_the_application_cache() {
+    if !cache_test::isolated(
+        "a_read_only_pdf_directory_still_writes_and_reuses_the_application_cache",
+    ) {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
     }
-    let directory = scratch("read-only");
-    let path = directory.path.join("document.pdf");
-    fs::copy(fixture("two-column-references.pdf"), &path).expect("copy fixture");
+    let (directory, path) = copy_fixture("read-only-pdf");
+    let before = fs::read(&path).expect("original PDF");
     let guard = ReadOnlyDir::new(&directory.path);
-    let sidecar = cache_path(&path);
+    let cache = cache_path(&path);
+    assert!(
+        !cache.starts_with(&directory.path),
+        "the cache must be outside the read-only PDF directory"
+    );
+    let (engine, document) = open(&path);
+    assert_eq!(
+        document.index_cache_report().outcome,
+        IndexCacheOutcome::Missing
+    );
+    let expected = snapshot(&document);
+    assert!(
+        !expected.references.is_empty(),
+        "the fixture has a nonempty index"
+    );
+    let written = document.index_cache_report();
+    assert!(
+        cache.is_file() && written.cache_bytes > 0,
+        "cold open must persist the application cache: {written:?}"
+    );
+    assert!(
+        !written.write_disabled && written.write_error.is_none(),
+        "{written:?}"
+    );
+    drop(document);
+    drop(engine);
 
     let (engine, document) = open(&path);
-    // Report first: the lookup itself must not fail just because the directory is read-only.
-    let report = document.index_cache_report();
-    assert!(
-        matches!(
-            report.outcome,
-            IndexCacheOutcome::Missing | IndexCacheOutcome::Unreadable
-        ),
-        "{report:?}"
+    assert_eq!(
+        document.index_cache_report().outcome,
+        IndexCacheOutcome::Hit
     );
-    let references = document.references().expect("references");
-    let figures = document.figures().expect("figures");
-    let metadata = document.metadata().expect("metadata");
-    let outline = document.outline().expect("outline");
-    assert!(!references.is_empty(), "the fixture's index is not empty");
-    let _ = (figures, metadata, outline);
-    let after = document.index_cache_report();
-    if sidecar.exists() {
-        // Root (or a filesystem that ignores the mode) can still write; the requirement is that
-        // the document worked, so do not turn a permissive environment into a failure.
-        eprintln!("note: the scratch directory is still writable by this user");
-    } else {
-        assert!(
-            after.write_disabled,
-            "a failed cache write disables further writes: {after:?}"
-        );
-        assert!(
-            after.write_error.is_some(),
-            "the failure is reported, not hidden"
-        );
-    }
+    assert_eq!(snapshot(&document), expected);
+    assert_eq!(
+        document.index_cache_report().derived_parts,
+        0,
+        "a warm hit must not rebuild the index"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before, "the PDF is unchanged");
+    assert_eq!(
+        fs::read_dir(&directory.path).unwrap().count(),
+        1,
+        "no adjacent cache is created"
+    );
     drop(document);
     drop(engine);
     drop(guard);
+}
+
+#[test]
+fn an_unwritable_application_cache_keeps_the_index_usable_in_memory() {
+    if !cache_test::isolated("an_unwritable_application_cache_keeps_the_index_usable_in_memory") {
+        return;
+    }
+    if !lyra_reader_pdfium::is_available() {
+        eprintln!("skipping: PDFium unavailable");
+        return;
+    }
+    let (_directory, path) = copy_fixture("blocked-application-cache");
+    let before = fs::read(&path).unwrap();
+    let cache = cache_path(&path);
+    // A directory at the destination cannot be replaced by a cache file, even under root.
+    // This exercises the write-failure path without relying on chmod enforcement by the OS.
+    fs::create_dir(&cache).unwrap();
+    let (engine, document) = open(&path);
+    let initial = document.index_cache_report();
+    let expected = snapshot(&document);
+    assert!(!expected.references.is_empty());
+    let failed = document.index_cache_report();
+    assert!(
+        failed.write_disabled && failed.write_error.is_some(),
+        "{failed:?}"
+    );
+    assert_eq!(failed.cache_path, cache.to_string_lossy());
+    assert_eq!(failed.cache_bytes, initial.cache_bytes);
+    drop(document);
+    drop(engine);
+    let (_engine, document) = open(&path);
+    assert_eq!(
+        snapshot(&document),
+        expected,
+        "failed persistence must not affect the in-memory index"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(
+        cache.is_dir(),
+        "the failed write preserves the blocking destination"
+    );
+    assert_eq!(
+        fs::read_dir(cache.parent().unwrap()).unwrap().count(),
+        1,
+        "failed writes leave no temporary files"
+    );
 }
 
 /// Makes a directory non-writable for the duration of a test, restoring it on drop (and on panic,

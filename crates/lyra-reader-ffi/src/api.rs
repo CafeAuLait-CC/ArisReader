@@ -3820,7 +3820,8 @@ impl LyraReaderDocument {
                 runtime.write_disabled = true;
                 runtime.write_error = Some(error.to_string());
                 eprintln!(
-                    "lyra-reader-index: cache not writable beside the PDF ({error}); continuing with the in-memory index"
+                    "lyra-reader-index: cache not writable at {} ({error}); continuing with the in-memory index",
+                    path.display()
                 );
             }
         }

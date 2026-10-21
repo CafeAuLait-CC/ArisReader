@@ -261,8 +261,8 @@ fn platform_cache_root() -> PathBuf {
     root.join("LyraReader/Indexes")
 }
 
-/// Whether this environment asks for the cache to be off. The native regression suite sets it so
-/// checks never write sidecars into the committed fixtures; the app does not set it.
+/// Whether this environment asks for the derived application cache to be off.
+/// The app normally keeps caching enabled; test processes can disable it explicitly.
 pub(crate) fn disabled_by_environment() -> bool {
     match std::env::var("LYRA_READER_INDEX_CACHE") {
         Ok(value) => matches!(
