@@ -37,8 +37,10 @@ separate features with their own documented limits.
   on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing.
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
   figure/table/algorithm previews with transparent crops, metadata recognition with BibTeX export.
-- **Assist**: an optional assistant over an OpenAI-compatible endpoint or a ChatGPT plan, with the request
-  previewed before anything leaves the machine and the key held in the Keychain.
+- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the
+  whole file, citation chips that jump to the verified source and flash it briefly, plus summarise / selection
+  Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
+  anything leaves the machine and the key held in the Keychain.
 
 ## Tech stack (decided)
 
