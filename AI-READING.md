@@ -9,3 +9,23 @@ Above the one-shot actions, Summary also shows a layered summary the reader can 
 The academic reading prompt asks for a short takeaway, research question, approach, contributions, evidence/results, limitations/assumptions and reading notes, using only available evidence with page citations. Missing information must be stated rather than invented. Translation preserves paragraph structure and technical terms.
 
 Chat uses a warm question bubble and a separate answer surface with Copy. Source passages are collapsed by default and expand to page links. The composer stays at the bottom; streaming follows the answer while near the end and stops following when the reader scrolls up. Conversations remain bounded and isolated per document. Review builds the local passage/request preview; Send is the only action that starts a provider request. Tests use scripted streams and do not contact a provider.
+
+## Local audit trail
+
+Every outgoing AI request appends one record to a local audit file in the application cache
+(`LyraReader/Audit/ai-requests.jsonl` for the current macOS user): a multi-part plan writes one
+record per part, and a layered-summary Generate batch writes one record per previewed unit (up to
+24), not one line for the batch. The record holds the time, the
+action kind, the endpoint host, the model, the number of characters sent, the page numbers, the
+attached picture's pixel size, the outcome and the duration. Its shape has no field for document
+text, questions, answers, file paths, document names or image bytes. The newest 500 records or
+256 KiB are kept; older entries are dropped. Clear in the AI panel truncates the file.
+
+The panel's "What AI requests send" list is the live inventory: selected text and page text,
+retrieved passages, region text and (when image input is on) the region picture, questions and the
+last six chat exchanges, the layered summary's per-entry text, the part summaries for a
+consolidation, the document's display name, and the instruction prompts. The PDF file,
+its embedded files, the file path, annotations, reading history and other documents are not sent;
+a whole-document summary does send every page's extracted text. A Rust guard
+(`crates/lyra-reader-ai/tests/network_guard.rs`) fails if the AI layer gains an unlisted network
+call or an analytics identifier without an explicit opt-in gate.

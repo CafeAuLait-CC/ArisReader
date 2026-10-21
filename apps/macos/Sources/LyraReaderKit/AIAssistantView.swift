@@ -11,6 +11,8 @@ public struct AIAssistantPanel: View {
     @ObservedObject private var model: AIAssistantModel
     @ObservedObject private var settings: AISettingsStore
     @ObservedObject private var chatGPT: ChatGPTAccountStore
+    @ObservedObject private var audit: AIAuditTrail
+    @State private var confirmingAuditClear = false
 
     private var displaysCurrentRequest: Bool {
         guard let action = model.plan?.action else { return true }
@@ -22,6 +24,7 @@ public struct AIAssistantPanel: View {
         self.model = model
         _settings = ObservedObject(wrappedValue: model.settings)
         _chatGPT = ObservedObject(wrappedValue: model.settings.chatGPT)
+        _audit = ObservedObject(wrappedValue: model.audit)
     }
 
     public var body: some View {
@@ -77,6 +80,7 @@ public struct AIAssistantPanel: View {
                             answerSection
                         }
                         if displaysCurrentRequest { controls }
+                        auditSection
                         DisclosureGroup("Connection") { providerHeader.padding(.top, 8) }
                             .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                     }
@@ -564,6 +568,136 @@ public struct AIAssistantPanel: View {
         }
     }
 
+    // MARK: - Local audit trail
+
+    /// The audit section is laid out for the panel's 240 pt minimum width: every line wraps or
+    /// truncates vertically, and no row relies on a horizontal stack wide enough to clip.
+    private var auditSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(AIAuditPanelCopy.sectionTitle)
+                    .font(.caption.weight(.semibold))
+                Spacer(minLength: 4)
+                Button(AIAuditPanelCopy.clearButton) { confirmingAuditClear = true }
+                    .font(.caption2)
+                    .controlSize(.small)
+                    .disabled(audit.records.isEmpty)
+                    .accessibilityLabel("Clear the local AI audit trail")
+            }
+            Text(AIAuditPanelCopy.note)
+                .font(.caption2)
+                .foregroundStyle(LyraReaderTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let error = audit.lastError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.errorFg)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if audit.records.isEmpty {
+                Text(AIAuditPanelCopy.empty)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(audit.records.prefix(5).enumerated()), id: \.offset) { _, record in
+                        auditRow(record)
+                    }
+                }
+                if audit.records.count > 5 {
+                    Text("\(audit.records.count - 5) older entries are in the file.")
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text(AIAuditPanelCopy.bounds)
+                .font(.caption2)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup(AIAuditPanelCopy.whatIsSentTitle) {
+                whatIsSentInventory
+            }
+            .font(.caption2)
+            .foregroundStyle(LyraReaderTheme.textSecondary)
+        }
+        .background(AIAuditSectionMarkerHost())
+        .confirmationDialog(
+            AIAuditPanelCopy.clearConfirmationTitle,
+            isPresented: $confirmingAuditClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Audit Trail", role: .destructive) { audit.clear() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(AIAuditPanelCopy.clearConfirmationMessage)
+        }
+    }
+
+    private func auditRow(_ record: AIAuditRecord) -> some View {
+        let imageSuffix = record.image.map { " · image \($0.label)" } ?? ""
+        return VStack(alignment: .leading, spacing: 1) {
+            Text("\(record.at.formatted(date: .omitted, time: .shortened)) · \(record.action.label) · \(pagesLabel(record.pages))")
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("\(record.outcome.label) · \(durationLabel(record.durationMilliseconds)) · \(record.characters.formatted()) chars\(imageSuffix)")
+                .foregroundStyle(outcomeColor(record.outcome))
+                .fixedSize(horizontal: false, vertical: true)
+            if !record.host.isEmpty || !record.model.isEmpty {
+                Text("\(record.host.isEmpty ? "no endpoint" : record.host) · \(record.model.isEmpty ? "no model" : record.model)")
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            if let code = record.code {
+                Text(code.label)
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(.caption2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var whatIsSentInventory: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(AIAuditPanelCopy.whatIsSent, id: \.self) { item in
+                Text("• \(item)")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(AIAuditPanelCopy.wholeDocumentNote)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(AIAuditPanelCopy.neverSentTitle)
+                .font(.caption2.weight(.semibold))
+                .padding(.top, 2)
+            ForEach(AIAuditPanelCopy.neverSent, id: \.self) { item in
+                Text("• \(item)")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func pagesLabel(_ pages: [Int]) -> String {
+        pages.isEmpty ? "No pages" : AIPlanFormatting.pageLabel(pages)
+    }
+
+    private func durationLabel(_ milliseconds: Int) -> String {
+        milliseconds < 1000
+            ? "\(milliseconds) ms"
+            : String(format: "%.1f s", Double(milliseconds) / 1000)
+    }
+
+    private func outcomeColor(_ outcome: AIAuditOutcome) -> Color {
+        switch outcome {
+        case .sent: return LyraReaderTheme.successFg
+        case .refused: return LyraReaderTheme.warningFg
+        case .failed: return LyraReaderTheme.errorFg
+        case .cancelled: return LyraReaderTheme.textSecondary
+        }
+    }
+
     private func sync() {
         model.attach(service: state.aiChatService, context: state.aiReaderContext)
         syncLayered()
@@ -656,4 +790,26 @@ private struct AIAssistantPanelMarkerHost: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AIAssistantPanelMarkerView, context: Context) {}
+}
+
+/// The same seam for the audit section: a hosted check can prove the section exists at the
+/// panel's minimum width without asking SwiftUI's lazy accessibility tree.
+public final class AIAuditSectionMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("AI audit trail section")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("AI audit trail section")
+    }
+}
+
+private struct AIAuditSectionMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIAuditSectionMarkerView {
+        AIAuditSectionMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIAuditSectionMarkerView, context: Context) {}
 }
