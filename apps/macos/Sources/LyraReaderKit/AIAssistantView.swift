@@ -367,6 +367,15 @@ public struct AIAssistantPanel: View {
                 Text(answerHeader)
                     .font(.caption.weight(.semibold))
                 Spacer()
+                if !model.answer.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(model.answer, forType: .string)
+                    } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain)
+                        .help("Copy Markdown source")
+                        .accessibilityLabel("Copy answer as Markdown")
+                }
                 if model.phase == .streaming {
                     ProgressView().controlSize(.small)
                 }
@@ -399,8 +408,8 @@ public struct AIAssistantPanel: View {
                     onJump: { page in state.gotoPage(page - 1) }
                 )
                 Text(model.plan?.action == .translateSelection
-                     ? "Rendered as paragraphs, headings, bullet and numbered lists. This action did not ask for page citations, so no numbers are linkified; other Markdown is shown literally."
-                     : "Rendered as paragraphs, headings, bullet and numbered lists. Only [p.N] citations are clickable; other Markdown is shown literally.")
+                     ? "Rendered as Markdown, with a local subset for mathematics. This action did not ask for page citations, so no numbers are linkified. Unsupported math falls back to its monospace source."
+                     : "Rendered as Markdown, with a local subset for mathematics. Only [p.N] citations are clickable. Unsupported math falls back to its monospace source.")
                     .font(.caption2)
                     .foregroundStyle(LyraReaderTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -583,7 +592,7 @@ public struct AIAssistantRightPanelContent: View {
                         Button { model.selectedTab = tab } label: {
                             Text(tab.title).fixedSize(horizontal: true, vertical: false)
                                 .font(.system(size: 12, weight: .medium))
-                                .frame(width: max(0, (geometry.size.width - 2) / 3))
+                                .frame(width: max(0, (geometry.size.width - 3) / 4))
                         }
                         .buttonStyle(LyraReaderSidebarTabStyle(selected: model.selectedTab == tab))
                         .accessibilityAddTraits(model.selectedTab == tab ? .isSelected : [])
@@ -594,97 +603,15 @@ public struct AIAssistantRightPanelContent: View {
             if model.selectedTab == .chat {
                 AIDocumentChatView(state: state, model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.selectedTab == .regions {
+                AIRegionHistoryView(state: state, aiAssistant: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 AIAssistantPanel(state: state, model: model)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(LyraReaderTheme.panelBg)
-    }
-}
-
-/// Renders the streamed answer. Paragraphs, headings and lists are interpreted; citations are
-/// clickable only when they are the exact `[p.N]` form and name a page in this document.
-struct AIAnswerView: View {
-    let text: String
-    let pageCount: Int
-    /// `nil` keeps the single-shot actions' existing rule (any in-document page is clickable).
-    /// Document chat passes the pages that were actually sent, so an unverified citation stays
-    /// plain text and is explained below the answer instead of linking somewhere plausible.
-    var verifiedPages: Set<Int>? = nil
-    let onJump: (Int) -> Void
-
-    var body: some View {
-        let document = AIAnswerMarkdown.parse(
-            text, pageCount: pageCount, verifiedPages: verifiedPages
-        )
-        VStack(alignment: .leading, spacing: 7) {
-            ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
-                blockView(block)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .environment(\.openURL, OpenURLAction { url in
-            guard url.scheme == "lyra-reader-page",
-                  let host = url.host,
-                  let page = Int(host),
-                  page >= 1, page <= pageCount else {
-                return .systemAction
-            }
-            onJump(page)
-            return .handled
-        })
-    }
-
-    @ViewBuilder
-    private func blockView(_ block: AIAnswerBlock) -> some View {
-        switch block {
-        case .paragraph(let runs):
-            Text(attributed(runs))
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-        case .heading(let level, let runs):
-            Text(attributed(runs))
-                .font(level <= 2 ? .headline : .subheadline.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .padding(.top, 2)
-        case .bullet(let runs):
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("•")
-                Text(attributed(runs))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-            .font(.callout)
-        case .numbered(let number, let runs):
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("\(number).")
-                    .monospacedDigit()
-                Text(attributed(runs))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-            .font(.callout)
-        }
-    }
-
-    private func attributed(_ runs: [AIInlineRun]) -> AttributedString {
-        var result = AttributedString()
-        for run in runs {
-            switch run {
-            case .text(let text):
-                result.append(AttributedString(text))
-            case .citation(let page, let raw):
-                var piece = AttributedString(raw)
-                piece.link = URL(string: "lyra-reader-page://\(page)")
-                piece.foregroundColor = .accentColor
-                piece.underlineStyle = .single
-                result.append(piece)
-            }
-        }
-        return result
     }
 }
 

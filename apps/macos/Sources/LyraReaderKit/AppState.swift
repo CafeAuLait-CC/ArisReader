@@ -352,7 +352,9 @@ public final class AppState: ObservableObject {
     @Published public private(set) var formLoadCompleted = false
     /// The form tool is a mode like the ink and markup tools: while it is on, a click on a field
     /// edits it and a click elsewhere still reads the page. Leaving it restores normal reading.
-    @Published public var formToolActive = false
+    @Published public var formToolActive = false {
+        didSet { if formToolActive { cancelRegionSelection(reason: "Region selection cancelled: Fill & Sign took the pointer.") } }
+    }
     /// The field that owns the keyboard while the form tool is active.
     @Published public private(set) var formFocusedFieldID: String?
     /// The drop-down whose option list is open, when the form tool is active.
@@ -364,7 +366,9 @@ public final class AppState: ObservableObject {
     @Published public private(set) var documentInfoLoading = false
     @Published public private(set) var documentInfoError: String?
     @Published public private(set) var propertiesSaveInProgress = false
-    @Published public var pageOverviewVisible: Bool = false
+    @Published public var pageOverviewVisible: Bool = false {
+        didSet { if pageOverviewVisible { cancelRegionSelection(reason: "Region selection cancelled: page overview opened.") } }
+    }
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false
@@ -413,7 +417,12 @@ public final class AppState: ObservableObject {
     @Published public private(set) var annotationCacheIsDirty = false
 
     @Published public var contentEditEnabled = false {
-        didSet { if contentEditEnabled { rightPanelVisible = false } }
+        didSet {
+            if contentEditEnabled {
+                rightPanelVisible = false
+                cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
+            }
+        }
     }
     @Published public var contentEditTool = "select"
     @Published public var contentEditPage: PDFContentPage?
@@ -434,7 +443,7 @@ public final class AppState: ObservableObject {
     @Published public private(set) var canvasPages: [CanvasPage] = []
     private var canvasTiles: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
-    @Published public private(set) var scrollYPt: CGFloat = 0
+    @Published public internal(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
     @Published public private(set) var isScrolling = false
     /// True while the pointer is in the indicator's lane, so a faded-out scroller comes back as
@@ -454,7 +463,7 @@ public final class AppState: ObservableObject {
     }
     private var pendingPosition: PendingPosition?
     /// Total content height in points (for scrollbars and clamping).
-    @Published public private(set) var contentHeightPt: CGFloat = 0
+    @Published public internal(set) var contentHeightPt: CGFloat = 0
     /// Width of the widest page in points; the canvas centres the content with it.
     @Published public private(set) var contentWidthPt: CGFloat = 0
 
@@ -485,7 +494,7 @@ public final class AppState: ObservableObject {
     private var layoutPreferencesObserver: NSObjectProtocol?
 
     /// Viewport size in screen points, reported by the canvas.
-    private var viewportSizePt: CGSize = .zero
+    var viewportSizePt: CGSize = .zero
     /// One coalesced rebuild for width-only changes that can move the visible columns.
     private var pendingViewportReload: DispatchWorkItem?
     /// True while the right panel is sliding or being dragged. Its width changes arrive once per
@@ -730,7 +739,7 @@ public final class AppState: ObservableObject {
     @Published package private(set) var annotationSidebarPages: [AnnotationSidebarPage] = []
     private var textPagesInFlight: Set<Int> = []
     /// Page placements from the last layout pass (hit-testing needs them).
-    private var visiblePagePlacements: [PagePlacement] = []
+    var visiblePagePlacements: [PagePlacement] = []
 
     /// The small, honest set of stamps a reader actually uses.
 ///
@@ -1367,6 +1376,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var aiSourceHighlight: AISourceHighlight?
     private var aiSourceHighlightTask: Task<Void, Never>?
 
+    // MARK: - Region questions (inline cards)
+    //
+    // A card is a reading aid, never an annotation: `regionCards` and `regionHistory` are
+    // in-memory only. The gap they open is a presentation shift of the page layout, computed by
+    // the helpers in AIRegionState.swift; the engine's layout is untouched, so removing a card
+    // restores every page offset exactly.
+    @Published public internal(set) var regionCards: [AIRegionCard] = []
+    /// Finished conversations by document key. Kept for this window's session; deliberately not
+    /// written to disk (see AIRegionState.swift's persistence note).
+    @Published public internal(set) var regionHistory: [String: [AIRegionHistoryEntry]] = [:]
+    @Published public internal(set) var regionSelectionArmed = false
+    @Published public internal(set) var regionCaptureInFlight = false
+    /// A refusal the reader can read: empty selection, blank region, oversized capture, no engine.
+    @Published public internal(set) var regionRefusalMessage: String?
+    /// A short status shown near the card / page HUD.
+    @Published public internal(set) var regionStatusMessage: String?
+    /// Injection points for the native checks: production keeps both nil.
+    public var regionAssistantFactory: (() -> AIAssistantModel)?
+    public var regionChatServiceOverride: (() -> (any AIChatServicing)?)?
+    var regionHeightObservers: [UUID: AnyCancellable] = [:]
+    var regionEscapeMonitor: Any?
+
     /// A rectangle the reader marked for redaction, pending until the explicit apply command.
     public struct PendingRedaction: Identifiable, Equatable, Sendable {
         public let id: UUID
@@ -1758,7 +1789,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         cancelScrollGlide()
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(page)
         let margin: CGFloat = 24
         scrollYPt = clampedScrollOffset(top + region.minY - margin)
         reloadVisiblePages()
@@ -2165,6 +2196,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 formOpenChoiceFieldID = nil
             }
             if annotationTool != oldValue {
+                if annotationTool != .select {
+                    cancelRegionSelection(reason: "Region selection cancelled: another annotation tool took the pointer.")
+                }
                 // The hover halo and any draft gesture belong to the tool that was armed. A tool
                 // switch from the toolbar mid-drag cannot leave a half-erased gesture behind.
                 if annotationTool != .eraser {
@@ -3135,6 +3169,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func open(url: URL) -> Bool {
         if deferContentTransition({[weak self] in _ = self?.open(url:url)}) {return true}
+        finishRegionCardsForDocumentSwitch(reason: "The document changed. The region conversation was moved to Region questions.")
         // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
         // committed after the new document actually opens, so a refused open leaves the cache and
         // the screen exactly as they were.
@@ -3215,6 +3250,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+                    + regionGapTotalPt
                 contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
                 scrollYPt = min(max(0, restoringTabScroll),
                                 max(0, contentHeightPt - viewportHeightContentPt))
@@ -3501,8 +3537,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .viewportTop:
             scrollYPt = clampedScrollOffset(scrollYPt)
         case .pageTop(let page):
-            scrollYPt = clampedScrollOffset(
-                engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode))
+            scrollYPt = clampedScrollOffset(displayPageTop(page))
         }
         reloadVisiblePages()
         schedulePositionSave()
@@ -6273,7 +6308,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         let page = min(max(currentPage - 1, 0), document.pageCount - 1)
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(page)
         let yPt = max(0, scrollYPt - top)
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
@@ -6349,7 +6384,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func jump(to bookmark: Bookmark) {
         guard let document, bookmark.page >= 0, bookmark.page < document.pageCount else { return }
         cancelScrollGlide()
-        let top = engine.pageTopPt(bookmark.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(bookmark.page)
         scrollYPt = clampedScrollOffset(top + bookmark.yPt)
         reloadVisiblePages()
         schedulePositionSave()
@@ -6717,7 +6752,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Shows an annotation: selects its range (or its mark) and scrolls it into view.
     public func jump(to annotation: Annotation) {
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(annotation.page)
         if annotation.kind.isGeometry || annotation.kind.isPlacedText {
             // A geometry mark and a placed note/box have no character range. Select the mark so
             // the overlay shows its halo, and scroll to it rather than to the page's first
@@ -6755,7 +6790,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // sidebar highlights the row it was asked to show, and a click on the annotation's own
         // glyph on the page comes here too.
         selectedDocumentAnnotationID = annotation.id
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(annotation.page)
         let box = annotation.boxes.first
         // Put the annotation a third of the way down the viewport rather than at its very top:
         // a highlight is easier to recognise with the text above it visible.
@@ -10115,6 +10150,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 "lyra-reader-pages: \(label) · revision \(nextNumber) · "
                 + "\(session.operations.count) pending change(s)\n"
             ).utf8))
+            // A page rotation, insertion or deletion changes what the captured rectangle means.
+            // Rather than leave a card pointing at a different page, close it into history and
+            // say why. The captured image and text stay exactly as they were asked about.
+            closeAllRegionCards(
+                reason: "The page layout changed (\(label)). Region conversations were closed into Region questions.",
+                keepHistory: true
+            )
             return true
         } catch {
             lastError = "Page change failed; nothing was written: \(error.localizedDescription)"
@@ -10159,7 +10201,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageSelectionAnchor = newSelection.first
         currentPage = min(max(1, newCurrentPage), max(loaded.pageCount, 1))
         invalidateTiles()
-        scrollYPt = engine.pageTopPt(currentPage - 1, gapPt: pageGapPt, layout: layoutMode)
+        scrollYPt = displayPageTop(currentPage - 1)
         reloadVisiblePages()
         _ = writeAnnotationRecords(
             annotations: newAnnotations,
@@ -10466,7 +10508,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = Selection(page: hit.page, range: hit.start...(max(hit.start, hit.end - 1)))
         selectionAnchor = nil
 
-        let top = engine.pageTopPt(hit.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(hit.page)
         if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
             scrollYPt = top
         }
@@ -11516,6 +11558,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func openDocumentInTab(_ url: URL) -> Bool {
         if deferContentTransition({[weak self] in _ = self?.openDocumentInTab(url)}) {return true}
+        finishRegionCardsForDocumentSwitch(reason: "A document was opened. The region conversation was moved to Region questions.")
         saveActiveTabPosition()
         guard open(url: url) else { return false }
         let tab = OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
@@ -11552,6 +11595,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
         if deferContentTransition({[weak self] in self?.selectTab(index)}) {return}
+        finishRegionCardsForDocumentSwitch(reason: "Tab switched. The region conversation was moved to Region questions.")
         saveActiveTabPosition()
         flushPendingWrites()
         let previousID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
@@ -11604,6 +11648,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if index == activeTabIndex, pageEditSession?.operations.isEmpty == false {
             pendingContentClose=index;contentCloseRequested=true;return
         }
+        if index == activeTabIndex {
+            finishRegionCardsForDocumentSwitch(reason: "Tab closed. The region conversation was moved to Region questions.")
+        }
         saveActiveTabPosition()
         let closing = tabs[index]
         if index != activeTabIndex {
@@ -11650,7 +11697,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func saveActiveTabPosition() {
         guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
-        tabs[index].scrollYPt = scrollYPt
+        tabs[index].scrollYPt = regionUnshiftedScrollYPt(scrollYPt)
     }
 
     private func restoreActiveTabPosition() {
@@ -12031,7 +12078,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func schedulePositionSave() {
         guard let url = document?.url else { return }
-        pendingPosition = PendingPosition(url: url, offset: scrollYPt)
+        pendingPosition = PendingPosition(url: url,
+                                         offset: regionUnshiftedScrollYPt(scrollYPt))
         positionSaveTask?.cancel()
         positionSaveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
@@ -12054,7 +12102,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pendingPosition = nil
         // Prefer the live offset: while its document is still on screen it is the reader's
         // real position, which matters when a restore or a resize moved it after scheduling.
-        let offset = document?.url == pending.url ? scrollYPt : pending.offset
+        let offset = document?.url == pending.url
+            ? regionUnshiftedScrollYPt(scrollYPt) : pending.offset
         UserDefaults.standard.set(Double(offset), forKey: Self.positionKey(for: pending.url))
         // The system flushes defaults on a normal quit but not when the process is killed,
         // and losing the reading position is exactly what this flush exists to prevent.
@@ -12129,7 +12178,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let clipped = rects.filter {
             $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
         }
-        let pageTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let pageTop = displayPageTop(page)
         let passageTop = clipped.map(\.minY).min() ?? 0
         cancelScrollGlide()
         scrollYPt = clampedScrollOffset(max(pageTop, pageTop + passageTop - 40))
@@ -12181,9 +12230,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
         cancelScrollGlide()
-        scrollYPt = engine.pageTopPt(
-            max(0, page), gapPt: pageGapPt, layout: layoutMode
-        )
+        scrollYPt = displayPageTop(max(0, page))
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -12197,7 +12244,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         cancelScrollGlide()
-        let top = engine.pageTopPt(max(0, page), gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(max(0, page))
         scrollYPt = clampedScrollOffset(top + CGFloat(y))
         reloadVisiblePages()
         schedulePositionSave()
@@ -12290,10 +12337,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func readingLayoutAnchor() -> ReadingLayoutAnchor {
         guard document != nil else { return ReadingLayoutAnchor(page: 0, offsetY: 0) }
-        let page = engine.pageIndex(
-            atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode
-        )
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let page = regionCurrentPage(at: scrollYPt)
+        let top = displayPageTop(page)
         return ReadingLayoutAnchor(page: page, offsetY: max(0, scrollYPt - top))
     }
 
@@ -12309,8 +12354,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+            + regionGapTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
-        let top = engine.pageTopPt(anchor.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(anchor.page)
         scrollYPt = clampedScrollOffset(top + anchor.offsetY)
         reloadVisiblePages()
         schedulePositionSave()
@@ -12391,16 +12437,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+            + regionGapTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt
         let margin = viewportHeight * 2
-        let visible = engine.visiblePages(
+        // Region cards shift pages down without changing the engine's layout. The shifted
+        // query is a superset of the viewport; `regionVisiblePages` filters it after applying
+        // the same shift the canvas draws with. With no cards this is exactly the engine call.
+        let visible = regionVisiblePages(
             scrollYPt: scrollYPt,
             viewportHeightPt: viewportHeight,
-            gapPt: pageGapPt,
-            marginPt: margin,
-            layout: layoutMode
+            marginPt: margin
         )
 
         let lod = rasterLod
@@ -12559,7 +12607,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         evictTiles()
         canvasPages = pages
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
-        currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode) + 1
+        currentPage = regionCurrentPage(at: scrollYPt) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
@@ -13942,14 +13990,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
                                        viewportHeight: CGFloat, screenScale: CGFloat) {
         desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
-        let current = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode)
+        let current = regionCurrentPage(at: scrollYPt)
         let bandPages = Set(band.map(\.placement.index))
         let candidates: [PagePlacement]
         let budget: Int
         if usesScreenPageRasters {
-            candidates = engine.visiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
-                gapPt: pageGapPt, marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3),
-                layout: layoutMode)
+            candidates = regionVisiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
+                marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3))
                 .filter { abs($0.index - current) <= 3 && canRasterizeScreenPage($0, scale: screenScale) }
             budget = tileCache.budgetBytes
         } else {

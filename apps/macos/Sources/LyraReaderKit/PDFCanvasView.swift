@@ -114,6 +114,30 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// One-shot region selection: the pointer becomes a crosshair, a drag draws a marquee with
+    /// visible bounds, and the release hands the page rectangle to the shell.
+    ///
+    /// The gesture is checked before every annotation, text-selection and page-edit path, so it
+    /// cannot fight a text-selection handle or a drawing tool. `AppState` refuses to arm it while
+    /// any of those modes owns the pointer; this view is the second guard.
+    public var regionSelectionArmed = false {
+        didSet {
+            guard regionSelectionArmed != oldValue else { return }
+            if !regionSelectionArmed { cancelRegionGesture() }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    /// A completed marquee: 0-based page and page-local rectangle, in points.
+    public var onRegionSelection: ((Int, CGRect) -> Void)?
+    /// The drag was too small or left the page; the shell shows the reason and disarms.
+    public var onRegionSelectionCancelled: ((String) -> Void)?
+
+    private var regionMarquee: AIRegionMarqueeOverlayView?
+    private var regionGestureActive = false
+    private var regionGesturePage: Int?
+    private var regionGestureStart: CGPoint?
+    private var regionGestureCurrent: CGPoint?
+
     /// The tool a pointer drag uses. `.select` leaves text selection and mark selection intact.
     ///
     /// The eraser owns the gesture in the same way the pen does: a press starts a gesture, every
@@ -410,6 +434,10 @@ public final class MetalCanvasView: NSView {
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
         annotationOverlay = overlay
+        let marquee = AIRegionMarqueeOverlayView(frame: bounds)
+        marquee.autoresizingMask = [.width, .height]
+        addSubview(marquee)
+        regionMarquee = marquee
     }
 
     @available(*, unavailable)
@@ -490,6 +518,15 @@ public final class MetalCanvasView: NSView {
         super.mouseExited(with: event)
     }
 
+    /// The crosshair is a real cursor rect: it appears over the whole canvas while the region
+    /// tool is armed and disappears with it, without a global cursor push that could leak.
+    public override func resetCursorRects() {
+        super.resetCursorRects()
+        if regionSelectionArmed {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
+    }
+
     public override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         syncPageChrome()
@@ -500,6 +537,7 @@ public final class MetalCanvasView: NSView {
         super.layout()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
+        regionMarquee?.frame = bounds
         syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
@@ -709,6 +747,13 @@ public final class MetalCanvasView: NSView {
         let content = contentPoint(for: event)
         annotationDoubleClickConsumed = false
 
+        // The region marquee owns the gesture while it is armed. It is checked before every
+        // other path so a text handle, a mark or a drawing tool can never start underneath it.
+        if regionSelectionArmed {
+            beginRegionGesture(atContent: content)
+            return
+        }
+
         // A double-click on a placed text annotation opens its editor. It is decided before the
         // ordinary press paths so the second press of the pair cannot start a move.
         if annotationTool == .select, event.clickCount == 2,
@@ -798,6 +843,10 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if regionGestureActive {
+            extendRegionGesture(toContent: contentPoint(for: event))
+            return
+        }
         if eraserGestureActive {
             let content = contentPoint(for: event)
             let previous = eraserLastContentPoint ?? content
@@ -846,6 +895,19 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if regionGestureActive {
+            finishRegionGesture(atContent: contentPoint(for: event))
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
+        if regionSelectionArmed {
+            // The press missed every page, so no marquee started. Do not fall through to a
+            // text selection in the same gesture.
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
         if eraserGestureActive {
             eraserGestureActive = false
             eraserLastContentPoint = nil
@@ -921,6 +983,120 @@ public final class MetalCanvasView: NSView {
         syncInteraction()
     }
 
+    // MARK: - Region marquee
+
+    /// A press with the region tool armed. Only a press that lands on a page starts a marquee.
+    private func beginRegionGesture(atContent point: CGPoint) {
+        guard let hit = pageLocalPoint(atContent: point) else { return }
+        regionGestureActive = true
+        regionGesturePage = hit.page
+        regionGestureStart = hit.point
+        regionGestureCurrent = hit.point
+        updateRegionMarquee()
+    }
+
+    private func extendRegionGesture(toContent point: CGPoint) {
+        guard regionGestureActive, let page = regionGesturePage,
+              let frame = annotationPageFrames.first(where: { $0.index == page })
+        else { return }
+        let local = CGPoint(
+            x: min(max(point.x - frame.leftPt, 0), frame.widthPt),
+            y: min(max(point.y - frame.topPt, 0), frame.heightPt)
+        )
+        regionGestureCurrent = local
+        updateRegionMarquee()
+    }
+
+    private func finishRegionGesture(atContent point: CGPoint) {
+        guard regionGestureActive, let page = regionGesturePage,
+              let start = regionGestureStart,
+              let frame = annotationPageFrames.first(where: { $0.index == page })
+        else {
+            cancelRegionGesture()
+            return
+        }
+        let local = CGPoint(
+            x: min(max(point.x - frame.leftPt, 0), frame.widthPt),
+            y: min(max(point.y - frame.topPt, 0), frame.heightPt)
+        )
+        let rect = CGRect(
+            x: min(start.x, local.x),
+            y: min(start.y, local.y),
+            width: abs(local.x - start.x),
+            height: abs(local.y - start.y)
+        )
+        let viewRect = CanvasGeometry.viewRect(
+            pageTopPt: frame.topPt, pageLeftPt: frame.leftPt, region: rect,
+            scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
+        )
+        cancelRegionGesture()
+        guard viewRect.width >= Self.regionMinimumViewPt,
+              viewRect.height >= Self.regionMinimumViewPt
+        else {
+            onRegionSelectionCancelled?(
+                "The selected area is too small to ask about. Drag a larger rectangle."
+            )
+            return
+        }
+        onRegionSelection?(page, rect)
+    }
+
+    /// The marquee's minimum on-screen size. Below this a press is a click, not a rectangle.
+    static let regionMinimumViewPt: CGFloat = 6
+
+    private func updateRegionMarquee() {
+        guard let page = regionGesturePage,
+              let start = regionGestureStart,
+              let current = regionGestureCurrent,
+              let frame = annotationPageFrames.first(where: { $0.index == page })
+        else {
+            regionMarquee?.update(nil)
+            return
+        }
+        let rect = CGRect(
+            x: min(start.x, current.x),
+            y: min(start.y, current.y),
+            width: abs(current.x - start.x),
+            height: abs(current.y - start.y)
+        )
+        let viewRect = CanvasGeometry.viewRect(
+            pageTopPt: frame.topPt, pageLeftPt: frame.leftPt, region: rect,
+            scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
+        )
+        regionMarqueeRectForTesting = viewRect
+        regionMarquee?.update(viewRect)
+    }
+
+    private func cancelRegionGesture() {
+        regionGestureActive = false
+        regionGesturePage = nil
+        regionGestureStart = nil
+        regionGestureCurrent = nil
+        regionMarqueeRectForTesting = nil
+        regionMarquee?.update(nil)
+    }
+
+    /// The marquee rectangle in view space while a drag is in flight; nil otherwise.
+    package private(set) var regionMarqueeRectForTesting: CGRect?
+
+    /// Drives the same gesture the mouse events drive, in content points. The native checks use
+    /// this instead of synthesising AppKit events, so the geometry under test is the shipped one.
+    package func simulateRegionGesture(fromContent start: CGPoint, toContent end: CGPoint) {
+        beginRegionGesture(atContent: start)
+        extendRegionGesture(toContent: end)
+        finishRegionGesture(atContent: end)
+    }
+
+    /// The same drag without the release, for the marquee evidence screenshot.
+    package func simulateRegionDrag(fromContent start: CGPoint, toContent end: CGPoint) {
+        beginRegionGesture(atContent: start)
+        extendRegionGesture(toContent: end)
+    }
+
+    package func simulateRegionRelease(atContent point: CGPoint) {
+        finishRegionGesture(atContent: point)
+    }
+
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Delete removes the selected ink/shape mark. It is consumed only when there is one, so
         // a Delete meant for a text field still reaches it.
@@ -961,6 +1137,11 @@ public final class MetalCanvasView: NSView {
             if onDeleteAnnotation?() == true { return }
             super.keyDown(with: event)
         case "\u{1B}":
+            if regionSelectionArmed || regionGestureActive {
+                cancelRegionGesture()
+                onRegionSelectionCancelled?("Region selection cancelled. Nothing was created.")
+                return
+            }
             annotationOverlay?.cancelLiveStroke()
             drawingKind = nil
             drawingPage = nil
@@ -1402,6 +1583,9 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let annotationPageFrames: [PagePlacement]
     private let redactionMarks: [CanvasRedactionMark]
     private let annotationTool: AnnotationTool
+    private let regionSelectionArmed: Bool
+    private let onRegionSelection: ((Int, CGRect) -> Void)?
+    private let onRegionSelectionCancelled: ((String) -> Void)?
     private let annotationColor: AnnotationColor
     private let annotationStrokeWidth: CGFloat
     private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
@@ -1451,6 +1635,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         annotationPageFrames: [PagePlacement] = [],
         redactionMarks: [CanvasRedactionMark] = [],
         annotationTool: AnnotationTool = .select,
+        regionSelectionArmed: Bool = false,
+        onRegionSelection: ((Int, CGRect) -> Void)? = nil,
+        onRegionSelectionCancelled: ((String) -> Void)? = nil,
         annotationColor: AnnotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255),
         annotationStrokeWidth: CGFloat = 2,
         onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
@@ -1496,6 +1683,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.annotationPageFrames = annotationPageFrames
         self.redactionMarks = redactionMarks
         self.annotationTool = annotationTool
+        self.regionSelectionArmed = regionSelectionArmed
+        self.onRegionSelection = onRegionSelection
+        self.onRegionSelectionCancelled = onRegionSelectionCancelled
         self.annotationColor = annotationColor
         self.annotationStrokeWidth = annotationStrokeWidth
         self.onAnnotationDraft = onAnnotationDraft
@@ -1570,6 +1760,9 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.annotationPageFrames = annotationPageFrames
         view.redactionMarks = redactionMarks
         view.annotationTool = annotationTool
+        view.regionSelectionArmed = regionSelectionArmed
+        view.onRegionSelection = onRegionSelection
+        view.onRegionSelectionCancelled = onRegionSelectionCancelled
         view.annotationColor = annotationColor
         view.annotationStrokeWidth = annotationStrokeWidth
         view.onAnnotationDraft = onAnnotationDraft

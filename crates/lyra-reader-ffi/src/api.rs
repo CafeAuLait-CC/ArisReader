@@ -22,10 +22,11 @@ pub fn document_index_cache_path(path: String) -> String {
 }
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
-    Action as AiAction, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest, MergePart,
-    MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
-    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, build_document_chat_plan,
-    build_merge_plan, build_plan, inspect_base_url, validate_model,
+    Action as AiAction, ChatImage, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest,
+    MergePart, MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
+    RegionQuestionRequest, RegionRect, SelectionRange as AiSelectionRange,
+    SourceRect as AiSourceRect, build_document_chat_plan, build_merge_plan, build_plan,
+    build_region_question_plan, inspect_base_url, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
@@ -2455,6 +2456,7 @@ impl LyraReaderDocument {
             AiActionRecord::AskSelection => AiAction::AskSelection,
             AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
             AiActionRecord::DocumentChat => AiAction::DocumentChat,
+            AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
         };
         let page_count = self.page_count();
         if page_count == 0 {
@@ -2490,6 +2492,98 @@ impl LyraReaderDocument {
                     selection.page + 1
                 ),
             });
+        }
+
+        // A region question sends exactly the reader's rectangle: no retrieval, no page text
+        // beyond what the shell extracted from that rectangle.
+        if action == AiAction::RegionQuestion {
+            let region = request.region.ok_or_else(|| LyraReaderFfiError::Ai {
+                message: "The region question has no region; nothing was sent.".to_string(),
+            })?;
+            if region.page >= page_count {
+                return Err(LyraReaderFfiError::Ai {
+                    message: format!(
+                        "The selected region is on page {}, outside this document ({} pages).",
+                        region.page + 1,
+                        page_count
+                    ),
+                });
+            }
+            let temperature = request.temperature.and_then(|value| {
+                if value.is_finite() {
+                    Some(value as f32)
+                } else {
+                    None
+                }
+            });
+            let temperature = if request.temperature.is_some_and(|value| !value.is_finite()) {
+                Some(f32::NAN)
+            } else {
+                temperature
+            };
+            let reasoning_mode =
+                ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+                    LyraReaderFfiError::InvalidArgument {
+                        message: format!(
+                            "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                            request.reasoning_mode
+                        ),
+                    }
+                })?;
+            let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
+                .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                    message: format!(
+                        "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                        request.reasoning_encoding
+                    ),
+                })?;
+            let settings = ChatSettings {
+                base_url: request.base_url,
+                model: request.model,
+                temperature,
+                max_tokens: request.max_tokens,
+                reasoning_mode,
+                reasoning_encoding,
+            };
+            let document_title = Path::new(&self.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Document")
+                .to_string();
+            let image = match (
+                region.image_png,
+                region.image_width_px,
+                region.image_height_px,
+            ) {
+                (Some(png), Some(width), Some(height)) => Some(ChatImage {
+                    width_px: width,
+                    height_px: height,
+                    png,
+                }),
+                (None, _, _) => None,
+                _ => {
+                    return Err(LyraReaderFfiError::InvalidArgument {
+                        message: "The region picture is missing its pixel size.".to_string(),
+                    });
+                }
+            };
+            let plan = build_region_question_plan(RegionQuestionRequest {
+                document_title,
+                page_count,
+                page: region.page,
+                rect: RegionRect {
+                    x_pt: region.x_pt,
+                    y_pt: region.y_pt,
+                    width_pt: region.width_pt,
+                    height_pt: region.height_pt,
+                },
+                text: region.text,
+                image,
+                send_image: region.send_image,
+                question: request.question.unwrap_or_default(),
+                settings,
+            })?;
+            return Ok(ai_plan_record(plan));
         }
 
         // Selection-only summary and translation send only the exact selected target.
@@ -4936,6 +5030,7 @@ pub enum AiActionRecord {
     AskSelection,
     TranslateSelection,
     DocumentChat,
+    RegionQuestion,
 }
 
 /// A selected character range on one page (0-based, inclusive).
@@ -4944,6 +5039,25 @@ pub struct AiSelectionRecord {
     pub page: u32,
     pub start: u32,
     pub end: u32,
+}
+
+/// A marquee-selected page region. `page` is 0-based; the rectangle is page-local view space in
+/// points, top-left origin, exactly what `rasterize_region` and the text layer use.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiRegionRecord {
+    pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// Text extracted from the text layer inside the rectangle. May be empty for a picture.
+    pub text: String,
+    /// The PNG capture, when the shell produced one.
+    pub image_png: Option<Vec<u8>>,
+    pub image_width_px: Option<u32>,
+    pub image_height_px: Option<u32>,
+    /// Whether the configured model accepts image input. False degrades to text only.
+    pub send_image: bool,
 }
 
 /// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
@@ -4964,6 +5078,8 @@ pub struct AiPlanRequestRecord {
     pub language: Option<String>,
     /// Oldest first. Only used by document chat.
     pub history: Vec<AiConversationTurnRecord>,
+    /// Present only for `region_question`.
+    pub region: Option<AiRegionRecord>,
     pub base_url: String,
     pub model: String,
     pub temperature: Option<f64>,
@@ -5457,6 +5573,7 @@ fn ai_action_record(action: AiAction) -> AiActionRecord {
         AiAction::AskSelection => AiActionRecord::AskSelection,
         AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
         AiAction::DocumentChat => AiActionRecord::DocumentChat,
+        AiAction::RegionQuestion => AiActionRecord::RegionQuestion,
     }
 }
 
@@ -5468,6 +5585,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         AiActionRecord::AskSelection => AiAction::AskSelection,
         AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
         AiActionRecord::DocumentChat => AiAction::DocumentChat,
+        AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {
@@ -5492,6 +5610,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             request_characters: part.request_characters,
             system_prompt: part.system_prompt,
             user_prompt: part.user_prompt,
+            image: None,
             wire_body: part.wire_body,
             note: part.note,
         })

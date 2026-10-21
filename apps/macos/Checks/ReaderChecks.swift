@@ -135,6 +135,11 @@ struct ReaderChecks {
             print("AI assistant checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-region-questions") {
+            try await regionQuestionChecks(root: fastRoot)
+            print("Region question checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-facing-layout") {
             try await facingLayoutChecks(
                 url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
@@ -660,6 +665,7 @@ struct ReaderChecks {
         try await prefetchBandChecks(url: b)
         try renameCompatibilityChecks(root: root)
         try await aiAssistantChecks(root: root)
+        try await regionQuestionChecks(root: root)
         try await chatGPTChecks(root: root)
         await appearanceChecks()
         try await readingPolishChecks(root: root)

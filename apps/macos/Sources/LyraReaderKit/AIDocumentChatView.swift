@@ -170,7 +170,7 @@ public struct AIDocumentChatView: View {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(turn.answer, forType: .string)
                         } label: { Image(systemName: "doc.on.doc") }
-                        .buttonStyle(.plain).help("Copy answer").accessibilityLabel("Copy answer")
+                        .buttonStyle(.plain).help("Copy Markdown source").accessibilityLabel("Copy answer as Markdown")
                     }
                 }
 
