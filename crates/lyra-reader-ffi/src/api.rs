@@ -24,9 +24,12 @@ use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
     Action as AiAction, ChatImage, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest,
     MergePart, MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
-    RegionQuestionRequest, RegionRect, SelectionRange as AiSelectionRange,
-    SourceRect as AiSourceRect, build_document_chat_plan, build_merge_plan, build_plan,
-    build_region_question_plan, inspect_base_url, validate_model,
+    RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES,
+    SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
+    SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange, SourceRect as AiSourceRect,
+    SummaryLayer, SummaryLayerRequest, SummaryUnitRequest, build_document_chat_plan,
+    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
+    inspect_base_url, inspect_summary_layer, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
@@ -2457,6 +2460,13 @@ impl LyraReaderDocument {
             AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
             AiActionRecord::DocumentChat => AiAction::DocumentChat,
             AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
+            AiActionRecord::SummarizeAbstract
+            | AiActionRecord::SummarizeSection
+            | AiActionRecord::SummarizePageLine => {
+                return Err(LyraReaderFfiError::Ai {
+                    message: "A layered summary uses its own per-unit request builder.".to_string(),
+                });
+            }
         };
         let page_count = self.page_count();
         if page_count == 0 {
@@ -2676,6 +2686,236 @@ impl LyraReaderDocument {
             })?
         };
         Ok(ai_plan_record(plan))
+    }
+
+    /// Inspect one layered-summary level without building prompts or wire bodies. The panel
+    /// calls this when it opens: every unit returns the hash of exactly the text it would send,
+    /// so a cached summary can be matched (or marked stale) with no request.
+    pub fn inspect_ai_summary(
+        &self,
+        request: AiSummaryRequestRecord,
+    ) -> Result<Vec<AiSummaryFingerprintRecord>, LyraReaderFfiError> {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return Err(LyraReaderFfiError::Ai {
+                message: "This document has no pages.".to_string(),
+            });
+        }
+        let layer = summary_layer_from_record(request.layer);
+        let pages = summary_page_texts(self, layer, &request.units, page_count)?;
+        let units = summary_units(&request.units);
+        let settings = ChatSettings {
+            base_url: "http://127.0.0.1".to_string(),
+            model: "inspect".to_string(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,
+        };
+        let core = SummaryLayerRequest {
+            layer,
+            document_title: request.document_title,
+            page_count,
+            language: request.language,
+            units,
+            pages,
+            settings,
+        };
+        let coverages = inspect_summary_layer(&core)?;
+        Ok(core
+            .units
+            .iter()
+            .zip(coverages)
+            .map(|(unit, coverage)| AiSummaryFingerprintRecord {
+                index: unit.index,
+                kind: summary_layer_record(unit.kind),
+                requested_page_start: unit.page_start,
+                requested_page_end: unit.page_end,
+                covered_page_start: coverage.covered_page_start,
+                covered_page_end: coverage.covered_page_end,
+                pages: coverage.pages,
+                truncated: coverage.truncated,
+                text_hash: coverage.text_hash,
+                characters: coverage.characters,
+            })
+            .collect())
+    }
+
+    /// Build one preview per unit of a layered-summary level. This never opens a connection;
+    /// the shell previews the requests and starts them only after the reader presses Send.
+    pub fn prepare_ai_summary(
+        &self,
+        request: AiSummaryRequestRecord,
+    ) -> Result<AiSummaryPlanRecord, LyraReaderFfiError> {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return Err(LyraReaderFfiError::Ai {
+                message: "This document has no pages.".to_string(),
+            });
+        }
+        let layer = summary_layer_from_record(request.layer);
+        let settings = summary_settings(&request)?;
+        let pages = summary_page_texts(self, layer, &request.units, page_count)?;
+        let units = summary_units(&request.units);
+        let document_title = if request.document_title.trim().is_empty() {
+            Path::new(&self.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Document")
+                .to_string()
+        } else {
+            request.document_title
+        };
+        let core = SummaryLayerRequest {
+            layer,
+            document_title,
+            page_count,
+            language: request.language,
+            units,
+            pages,
+            settings,
+        };
+        let plan = build_summary_layer(core)?;
+        Ok(ai_summary_plan_record(plan))
+    }
+}
+
+/// Page text for exactly the pages a layer can send. The abstract reads only its bounded
+/// prefix; section and page units read their own ranges. Deduplicated, so a 20-section
+/// document extracts each page once.
+fn summary_page_texts(
+    document: &LyraReaderDocument,
+    layer: SummaryLayer,
+    units: &[AiSummaryUnitRequestRecord],
+    page_count: u32,
+) -> Result<Vec<PageText>, LyraReaderFfiError> {
+    let mut needed = std::collections::BTreeSet::new();
+    match layer {
+        SummaryLayer::Abstract => {
+            for page in 0..page_count.min(SUMMARY_ABSTRACT_MAX_PAGES as u32) {
+                needed.insert(page);
+            }
+        }
+        SummaryLayer::Section | SummaryLayer::Page => {
+            for unit in units {
+                if unit.page_start == 0 {
+                    continue;
+                }
+                let start = unit.page_start.min(page_count);
+                let end = unit.page_end.max(unit.page_start).min(page_count);
+                for page in start..=end {
+                    needed.insert(page - 1);
+                }
+            }
+        }
+    }
+    let mut pages = Vec::with_capacity(needed.len());
+    for page in needed {
+        let (text, chars) = document.ai_page(page)?;
+        pages.push(PageText { page, text, chars });
+    }
+    Ok(pages)
+}
+
+fn summary_layer_record(layer: SummaryLayer) -> AiSummaryLayerRecord {
+    match layer {
+        SummaryLayer::Abstract => AiSummaryLayerRecord::Abstract,
+        SummaryLayer::Section => AiSummaryLayerRecord::Section,
+        SummaryLayer::Page => AiSummaryLayerRecord::Page,
+    }
+}
+
+fn summary_layer_from_record(layer: AiSummaryLayerRecord) -> SummaryLayer {
+    match layer {
+        AiSummaryLayerRecord::Abstract => SummaryLayer::Abstract,
+        AiSummaryLayerRecord::Section => SummaryLayer::Section,
+        AiSummaryLayerRecord::Page => SummaryLayer::Page,
+    }
+}
+
+fn summary_units(units: &[AiSummaryUnitRequestRecord]) -> Vec<SummaryUnitRequest> {
+    units
+        .iter()
+        .map(|unit| SummaryUnitRequest {
+            kind: summary_layer_from_record(unit.kind),
+            index: unit.index,
+            title: unit.title.clone(),
+            number: unit.number.clone(),
+            depth: unit.depth,
+            page_start: unit.page_start,
+            page_end: unit.page_end,
+        })
+        .collect()
+}
+
+fn summary_settings(request: &AiSummaryRequestRecord) -> Result<ChatSettings, LyraReaderFfiError> {
+    let temperature = request.temperature.and_then(|value| {
+        if value.is_finite() {
+            Some(value as f32)
+        } else {
+            None
+        }
+    });
+    let temperature = if request.temperature.is_some_and(|value| !value.is_finite()) {
+        Some(f32::NAN)
+    } else {
+        temperature
+    };
+    let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+        LyraReaderFfiError::InvalidArgument {
+            message: format!(
+                "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                request.reasoning_mode
+            ),
+        }
+    })?;
+    let reasoning_encoding =
+        ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
+            LyraReaderFfiError::InvalidArgument {
+                message: format!(
+                    "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                    request.reasoning_encoding
+                ),
+            }
+        })?;
+    Ok(ChatSettings {
+        base_url: request.base_url.clone(),
+        model: request.model.clone(),
+        temperature,
+        max_tokens: request.max_tokens,
+        reasoning_mode,
+        reasoning_encoding,
+    })
+}
+
+fn ai_summary_plan_record(plan: lyra_reader_ai::SummaryLayerPlan) -> AiSummaryPlanRecord {
+    AiSummaryPlanRecord {
+        layer: summary_layer_record(plan.layer),
+        page_count: plan.page_count,
+        units: plan
+            .units
+            .into_iter()
+            .map(|unit| AiSummaryUnitRecord {
+                index: unit.unit.index,
+                kind: summary_layer_record(unit.unit.kind),
+                title: unit.unit.title,
+                number: unit.unit.number,
+                depth: unit.unit.depth,
+                page_start: unit.unit.page_start,
+                page_end: unit.unit.page_end,
+                covered_page_end: unit.coverage.covered_page_end,
+                pages: unit.coverage.pages,
+                truncated: unit.coverage.truncated,
+                text_hash: unit.coverage.text_hash,
+                characters: unit.coverage.characters,
+                note: unit.note,
+                plan: unit.plan.map(ai_plan_record),
+                error: unit.error,
+            })
+            .collect(),
+        note: plan.note,
+        max_requests_per_batch: SUMMARY_MAX_REQUESTS_PER_BATCH as u32,
+        max_concurrent_requests: SUMMARY_MAX_CONCURRENT_REQUESTS as u32,
     }
 }
 
@@ -5031,6 +5271,12 @@ pub enum AiActionRecord {
     TranslateSelection,
     DocumentChat,
     RegionQuestion,
+    /// One request for the abstract-level summary of the whole document.
+    SummarizeAbstract,
+    /// One request for one outline section's summary.
+    SummarizeSection,
+    /// One request for one page's one-line decision aid.
+    SummarizePageLine,
 }
 
 /// A selected character range on one page (0-based, inclusive).
@@ -5215,6 +5461,133 @@ pub fn inspect_ai_base_url(base_url: String) -> Result<AiEndpointRecord, LyraRea
 #[uniffi::export]
 pub fn validate_ai_model(model: String) -> Result<String, LyraReaderFfiError> {
     Ok(validate_model(&model)?)
+}
+
+// ── Layered summaries ───────────────────────────────────────────────────────────────────────
+
+/// One level of the layered summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiSummaryLayerRecord {
+    /// One paragraph for the whole document, from a bounded prefix of its pages.
+    Abstract,
+    /// One entry per outline section, or per page range when there is no outline.
+    Section,
+    /// One line per page.
+    Page,
+}
+
+/// What the shell asks one layer to build. The outline lives in the shell's sidebar model, so
+/// the section ranges arrive here rather than being derived a second time.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryUnitRequestRecord {
+    pub kind: AiSummaryLayerRecord,
+    /// 0-based position within the layer; the row identity for matching results.
+    pub index: u32,
+    /// Row title: "Abstract", "1.1 Background" or "Page 3".
+    pub title: String,
+    /// Outline number when the section came from an outline.
+    pub number: Option<String>,
+    pub depth: u32,
+    /// 1-based, inclusive. The abstract ignores these and starts at page 1.
+    pub page_start: u32,
+    pub page_end: u32,
+}
+
+/// One layer's build request: no key, no network.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryRequestRecord {
+    pub layer: AiSummaryLayerRecord,
+    pub units: Vec<AiSummaryUnitRequestRecord>,
+    /// `None` means the document's own language.
+    pub language: Option<String>,
+    pub document_title: String,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    /// One of `default`, `off`, `low`, `high`, `max`.
+    pub reasoning_mode: String,
+    /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
+    pub reasoning_encoding: String,
+}
+
+/// The text one unit sends and the hash the cache keys on, without prompts.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryFingerprintRecord {
+    pub index: u32,
+    pub kind: AiSummaryLayerRecord,
+    /// The pages the row asked for (1-based, inclusive).
+    pub requested_page_start: u32,
+    pub requested_page_end: u32,
+    /// The pages actually sent (1-based, inclusive).
+    pub covered_page_start: u32,
+    pub covered_page_end: u32,
+    pub pages: Vec<u32>,
+    pub truncated: bool,
+    /// SHA-256 of exactly the covered text. The cache key includes this.
+    pub text_hash: String,
+    pub characters: u64,
+}
+
+/// One previewable request of one layer.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryUnitRecord {
+    pub index: u32,
+    pub kind: AiSummaryLayerRecord,
+    pub title: String,
+    pub number: Option<String>,
+    pub depth: u32,
+    /// The pages the row asked for (1-based, inclusive).
+    pub page_start: u32,
+    pub page_end: u32,
+    /// The last page actually sent; smaller than `page_end` when the budget cut the unit.
+    pub covered_page_end: u32,
+    pub pages: Vec<u32>,
+    pub truncated: bool,
+    pub text_hash: String,
+    pub characters: u64,
+    /// The honest coverage line ("Summarised from pages 1-12 of 20.").
+    pub note: Option<String>,
+    /// Exactly what one request will send. `None` when the unit has no extractable text.
+    pub plan: Option<AiPlanRecord>,
+    /// Why this unit cannot be requested, when `plan` is `None`.
+    pub error: Option<String>,
+}
+
+/// One layer's preview: every request one Generate press may start.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryPlanRecord {
+    pub layer: AiSummaryLayerRecord,
+    pub page_count: u32,
+    pub units: Vec<AiSummaryUnitRecord>,
+    /// The batch/concurrency bounds and what each request sends.
+    pub note: String,
+    pub max_requests_per_batch: u32,
+    pub max_concurrent_requests: u32,
+}
+
+/// The bounds the panel states before anything is sent.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct AiSummaryLimitsRecord {
+    pub abstract_max_pages: u32,
+    pub abstract_max_chars: u64,
+    pub section_max_chars: u64,
+    pub page_max_chars: u64,
+    pub max_requests_per_batch: u32,
+    pub max_concurrent_requests: u32,
+}
+
+/// The layered-summary bounds, available before a plan is built so the panel can state them.
+#[uniffi::export]
+pub fn ai_summary_limits() -> AiSummaryLimitsRecord {
+    AiSummaryLimitsRecord {
+        abstract_max_pages: SUMMARY_ABSTRACT_MAX_PAGES as u32,
+        abstract_max_chars: SUMMARY_ABSTRACT_MAX_CHARS as u64,
+        section_max_chars: SUMMARY_SECTION_MAX_CHARS as u64,
+        page_max_chars: SUMMARY_PAGE_MAX_CHARS as u64,
+        max_requests_per_batch: SUMMARY_MAX_REQUESTS_PER_BATCH as u32,
+        max_concurrent_requests: SUMMARY_MAX_CONCURRENT_REQUESTS as u32,
+    }
 }
 
 /// Per-request instrumentation. Counts and byte totals only; no content.
@@ -5591,6 +5964,9 @@ fn ai_action_record(action: AiAction) -> AiActionRecord {
         AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
         AiAction::DocumentChat => AiActionRecord::DocumentChat,
         AiAction::RegionQuestion => AiActionRecord::RegionQuestion,
+        AiAction::SummarizeAbstract => AiActionRecord::SummarizeAbstract,
+        AiAction::SummarizeSection => AiActionRecord::SummarizeSection,
+        AiAction::SummarizePageLine => AiActionRecord::SummarizePageLine,
     }
 }
 
@@ -5603,6 +5979,9 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
         AiActionRecord::DocumentChat => AiAction::DocumentChat,
         AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
+        AiActionRecord::SummarizeAbstract => AiAction::SummarizeAbstract,
+        AiActionRecord::SummarizeSection => AiAction::SummarizeSection,
+        AiActionRecord::SummarizePageLine => AiAction::SummarizePageLine,
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {

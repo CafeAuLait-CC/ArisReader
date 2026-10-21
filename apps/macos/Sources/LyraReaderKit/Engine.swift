@@ -3913,6 +3913,75 @@ public final class RustEngine: PDFEngine {
         return plan
     }
 
+    /// Inspect one layered-summary level without building prompts: every unit comes back with
+    /// the hash of exactly the text it would send. The panel uses this to show cached rows and
+    /// mark a changed section stale with no request. Runs on the serialised raster queue for the
+    /// same reason as the preview: it reads the text layer page by page.
+    public func inspectAISummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> [AiSummaryFingerprintRecord] {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let fingerprints: [AiSummaryFingerprintRecord] = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.inspectAiSummary(request: request))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the summary coverage was being read; nothing was sent."]
+            )
+        }
+        return fingerprints
+    }
+
+    /// Build one previewable request per layered-summary unit. Local work: no key, no network.
+    public func prepareAISummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> AiSummaryPlanRecord {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let plan: AiSummaryPlanRecord = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.prepareAiSummary(request: request))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the summary preview was being prepared; nothing was sent."]
+            )
+        }
+        return plan
+    }
+
 }
 
 /// Fallback engine for builds where the Rust backend cannot start (for example a build

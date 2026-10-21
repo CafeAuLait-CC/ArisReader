@@ -74,6 +74,9 @@ public final class AIAssistantModel: ObservableObject {
         "Keeps the most recent \(chatTurnLimit) questions and answers per document; older turns are dropped."
 
     public let settings: AISettingsStore
+    /// The Summary tab's three-layer summary. It shares the window and settings with the panel
+    /// but owns its own request state, so a failed page one-liner never disturbs a chat answer.
+    public let layeredSummary: LayeredSummaryModel
     private var service: (any AIChatServicing)?
     private var handle: (any AIChatHandle)?
     private var pollTask: Task<Void, Never>?
@@ -89,6 +92,7 @@ public final class AIAssistantModel: ObservableObject {
 
     public init(settings: AISettingsStore = .shared) {
         self.settings = settings
+        self.layeredSummary = LayeredSummaryModel(settings: settings)
     }
 
     public var isSending: Bool { phase == .streaming }

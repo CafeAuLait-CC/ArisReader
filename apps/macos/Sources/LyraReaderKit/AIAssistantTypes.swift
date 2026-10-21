@@ -605,6 +605,11 @@ public protocol AIChatHandle: AnyObject {
 public protocol AIChatServicing: AnyObject {
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord
+    /// Coverage-only inspection for the layered summary. No prompts are built, so opening the
+    /// panel can match cached rows without a request.
+    func inspectSummary(_ request: AiSummaryRequestRecord) async throws -> [AiSummaryFingerprintRecord]
+    /// One preview per layered-summary unit; this is what the panel shows before Send.
+    func prepareSummary(_ request: AiSummaryRequestRecord) async throws -> AiSummaryPlanRecord
     func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle
 }
 
@@ -612,6 +617,15 @@ public extension AIChatServicing {
     /// Older test doubles do not need to implement consolidation; the production service does.
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
         throw AISettingsError.invalid("This service cannot prepare a consolidation request.")
+    }
+
+    /// Test doubles that do not model the layered summary keep building the old actions.
+    func inspectSummary(_ request: AiSummaryRequestRecord) async throws -> [AiSummaryFingerprintRecord] {
+        throw AISettingsError.invalid("This service cannot inspect a layered summary.")
+    }
+
+    func prepareSummary(_ request: AiSummaryRequestRecord) async throws -> AiSummaryPlanRecord {
+        throw AISettingsError.invalid("This service cannot prepare a layered summary.")
     }
 }
 
@@ -690,6 +704,18 @@ public final class RustAIChatService: AIChatServicing {
                 reasoningEncoding: request.settings.reasoningEncoding.rawValue
             )
         )
+    }
+
+    public func inspectSummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> [AiSummaryFingerprintRecord] {
+        try await engine.inspectAISummary(request)
+    }
+
+    public func prepareSummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> AiSummaryPlanRecord {
+        try await engine.prepareAISummary(request)
     }
 
     public func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {

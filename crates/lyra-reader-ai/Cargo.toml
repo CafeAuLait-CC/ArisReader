@@ -12,6 +12,10 @@ workspace = true
 [dependencies]
 lyra-reader-core = { workspace = true }
 serde_json = "1"
+# The layered summary cache is keyed by a hash of exactly the page text a request sends, so
+# editing one section invalidates that section and nothing else. SHA-256 is already in the
+# workspace through the document layer; using the same digest keeps the key stable.
+sha2 = "0.11"
 # One synchronous client for http:// and https://. rustls is the TLS provider; the bundled
 # webpki roots are only a fallback when the OS trust store cannot be loaded.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
