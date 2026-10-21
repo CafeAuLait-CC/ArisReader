@@ -6,6 +6,11 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Sidebar tabs (see `docs/04-ui-ux.md` §2.2).
+///
+/// The AI assistant used to be a tab here. It now lives in the reader's right-hand panel
+/// (``ReaderSidePanel``), so a window can show the document and the assistant at the same time.
+/// `.search` and `.metadata` remain because their content is reachable programmatically (search
+/// results and the information sheet), but they are not part of the picker.
 public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
     case thumbnails
     case outline
@@ -13,7 +18,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
     case annotations
     case metadata
     case search
-    case ai
 
     public var id: String { rawValue }
 
@@ -25,7 +29,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "Annotations"
         case .metadata: return "Metadata"
         case .search: return "Search"
-        case .ai: return "AI"
         }
     }
 
@@ -37,7 +40,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "highlighter"
         case .metadata: return "text.badge.checkmark"
         case .search: return "magnifyingglass"
-        case .ai: return "sparkles"
         }
     }
 
@@ -49,8 +51,34 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "M3"
         case .metadata: return "M4"
         case .search: return "M2"
-        case .ai: return "M5"
         }
+    }
+
+    /// The tabs the left sidebar's picker offers, in reading order. No AI entry: it moved out.
+    public static let sidebarPickerTabs: [SidebarTab] = [
+        .bookmarks, .outline, .annotations, .thumbnails,
+    ]
+
+    public var isSidebarPickerTab: Bool { Self.sidebarPickerTabs.contains(self) }
+
+    /// `UserDefaults` key for the reader's last sidebar tab.
+    public static let persistedKey = "sidebarTab"
+
+    /// Reads the persisted picker tab, falling back to a valid tab when the stored value names a
+    /// tab that no longer exists.
+    ///
+    /// This is the migration path for a reader who left the sidebar on the old AI tab: the raw
+    /// value `"ai"` no longer decodes, and an unreadable or non-picker value must not leave the
+    /// sidebar blank. The fallback is written back so the next launch does not repeat the lookup.
+    public static func restored(defaults: UserDefaults = .standard) -> SidebarTab {
+        let stored = defaults.string(forKey: persistedKey)
+        let restored = stored.flatMap(SidebarTab.init(rawValue:))
+            .flatMap { $0.isSidebarPickerTab ? $0 : nil }
+            ?? .thumbnails
+        if stored != restored.rawValue {
+            defaults.set(restored.rawValue, forKey: persistedKey)
+        }
+        return restored
     }
 }
 
@@ -280,8 +308,27 @@ public final class AppState: ObservableObject {
     /// Enabled by the application entry point; library/check hosts never alter user history.
     public static var recordsRecentDocuments = false
     @Published public var document: LoadedDocument?
-    @Published public var sidebarTab: SidebarTab = .thumbnails
+    @Published public var sidebarTab: SidebarTab = .thumbnails {
+        didSet {
+            guard oldValue != sidebarTab, Self.usesStoredSidebarTab else { return }
+            UserDefaults.standard.set(sidebarTab.rawValue, forKey: SidebarTab.persistedKey)
+        }
+    }
     @Published public var sidebarVisible: Bool = true
+    /// Whether the right-hand panel (the AI assistant's new home) is open.
+    ///
+    /// The panel is a drawer, not a conditional view: this stays true while the window animates
+    /// it closed, so the content keeps its geometry and an answer is not thrown away by a toggle.
+    @Published public var rightPanelVisible: Bool = false {
+        didSet {
+            guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
+            ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
+        }
+    }
+    /// Content width of the right-hand panel, kept across launches and clamped on every write.
+    /// The 6 pt resize handle and 1 pt separator are added by ``ReaderSidePanelMetrics``.
+    @Published public private(set) var rightPanelWidthPt =
+        ReaderSidePanelMetrics.defaultContentWidthPt
     /// Test-only transition progress. The app never sets it; `TransitionChecks` pins a value and
     /// steps it so a "partly open" frame is a deterministic layout, not a race with the display
     /// link on a loaded runner.
@@ -407,6 +454,14 @@ public final class AppState: ObservableObject {
     /// The app never changes it.
     public static var usesStoredReadingLayoutPreferences = true
 
+    /// Whether this process restores and records the sidebar's selected tab. Checks turn it off
+    /// so a run cannot move the person's sidebar to whatever tab the checks exercise.
+    public static var usesStoredSidebarTab = true
+
+    /// Whether this process restores and records the right panel's width and visibility. Checks
+    /// turn it off and pass an isolated defaults suite where they need to prove persistence.
+    public static var usesStoredSidePanelPreferences = true
+
     /// Set while `AppState` listens for a preference change made in another window.
     private var layoutPreferencesObserver: NSObjectProtocol?
 
@@ -414,9 +469,24 @@ public final class AppState: ObservableObject {
     private var viewportSizePt: CGSize = .zero
     /// One coalesced rebuild for width-only changes that can move the visible columns.
     private var pendingViewportReload: DispatchWorkItem?
+    /// True while the right panel is sliding or being dragged. Its width changes arrive once per
+    /// display frame; on a loaded runner a frame can take longer than the ordinary coalescing
+    /// window, so those updates are held here and released as one rebuild when the movement ends.
+    private var rightPanelLayoutIsMoving = false
+    /// Set when a width-only update during that movement really could change the visible
+    /// columns. No rebuild is needed at all when the page fits every width in the range.
+    private var rightPanelDeferredReloadNeeded = false
+    private var rightPanelSettleTask: Task<Void, Never>?
     /// How many times the visible band was rebuilt. Read by the transition checks: a width-only
     /// slide that cannot move the band must leave this unchanged for the whole animation.
     public private(set) var viewportReloadCount = 0
+    /// The subset of ``viewportReloadCount`` that came from the width-only coalescing path.
+    ///
+    /// `viewportReloadCount` also moves when a raster arrives (the band is re-evaluated with the
+    /// finished image), so it cannot answer "did resizing the panel rebuild the band per frame?"
+    /// on a zoomed-in document. This counter only moves for a deferred width-only rebuild, which
+    /// is exactly the cost the panel must not pay per frame.
+    public private(set) var coalescedViewportReloadCount = 0
     /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
     private let tileSizePx = 512
 
@@ -2587,6 +2657,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public let engine: PDFEngine
 
+    /// Domain the right panel's width/visibility are remembered in. The app uses `.standard`; a
+    /// check can pass an isolated suite so "remembered across launches" is proved without
+    /// touching the reader's own preferences.
+    private let panelDefaults: UserDefaults
+
     /// Whether the `LYRA_READER_OPEN` launch hook has already opened its document.
     ///
     /// One process launches once. With a window per session there is an `AppState` per window, and
@@ -2597,7 +2672,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// environment and the `cacheBudgetMB` setting; the checks use it so their arithmetic does
     /// not depend on how the machine running them is configured.
     public init(engine: PDFEngine? = nil, tileCacheBudgetBytes: Int? = nil,
-                preferFullPageRasters: Bool? = nil) {
+                preferFullPageRasters: Bool? = nil,
+                panelDefaults: UserDefaults = .standard) {
+        self.panelDefaults = panelDefaults
         self.preferFullPageRasters = preferFullPageRasters
             ?? (ProcessInfo.processInfo.environment["LYRA_READER_SHARP_PAGE_RASTERS"] != "0")
         // Prefer the real engine; fall back to the mock so the window still works when
@@ -2611,6 +2688,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         statusMessage = self.engine.version
         if let tileCacheBudgetBytes { tileCache.setBudget(max(1, tileCacheBudgetBytes)) }
+
+        if Self.usesStoredSidebarTab {
+            sidebarTab = SidebarTab.restored()
+        }
+        if Self.usesStoredSidePanelPreferences {
+            rightPanelWidthPt = ReaderSidePanelPreferences.width(defaults: panelDefaults)
+            rightPanelVisible = ReaderSidePanelPreferences.isVisible(defaults: panelDefaults)
+        }
 
         if Self.usesStoredReadingLayoutPreferences {
             layoutMode = ReadingLayoutPreferences.layoutMode()
@@ -3518,7 +3603,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if !heightChanged {
             let contentWidth = contentWidthPt * max(zoomFactor, 0.01)
             let fitsBoth = contentWidth <= min(previous.width, size.width) + 0.5
-            if fitsBoth {
+            if rightPanelLayoutIsMoving {
+                // The panel is the source of this width change. Holding the update until the
+                // movement ends is what makes "no rebuild per frame" true even when a frame on a
+                // loaded machine is slower than the ordinary coalescing window. Re-arming on
+                // every frame is also what makes the release follow the animation's real end
+                // instead of a fixed timer that a loaded machine can outrun.
+                cancelPendingViewportReload()
+                if !fitsBoth { rightPanelDeferredReloadNeeded = true }
+                armRightPanelSettle(after: 0.15)
+            } else if fitsBoth {
                 cancelPendingViewportReload()
             } else {
                 scheduleViewportReload()
@@ -3528,19 +3622,121 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
     }
 
+    /// The canvas width the engine last received, in points.
+    ///
+    /// Read-only on purpose: the canvas owns the viewport. The right-panel checks need the number
+    /// to prove that Fit Width fits the canvas and not the window, and that a panel resize lands
+    /// on the expected width after the layout settles.
+    public var canvasViewportWidthPt: CGFloat { viewportSizePt.width }
+
+    /// Opens or closes the right-hand panel.
+    ///
+    /// Opening it leaves page overview: the assistant is a reading surface and the overview
+    /// covers the whole content area, so keeping both on would show the assistant "open" behind
+    /// a grid. The left sidebar's old AI button had the same rule.
+    public func toggleRightPanel() {
+        if rightPanelVisible {
+            rightPanelVisible = false
+        } else {
+            pageOverviewVisible = false
+            rightPanelVisible = true
+        }
+    }
+
+    /// Sets the panel width and remembers it at once (one discrete change, not a gesture). A live
+    /// drag uses ``resizeRightPanel(to:)`` for every pointer sample and commits on release.
+    public func setRightPanelWidth(_ width: CGFloat) {
+        resizeRightPanel(to: width)
+        commitRightPanelWidth()
+    }
+
+    /// Follows the pointer during a resize. Deliberately does not write preferences per frame:
+    /// the drag commits once when it ends.
+    public func resizeRightPanel(to width: CGFloat) {
+        let clamped = ReaderSidePanelMetrics.clampedContentWidth(width)
+        guard abs(clamped - rightPanelWidthPt) > 0.01 else { return }
+        rightPanelWidthPt = clamped
+    }
+
+    /// Persists the settled panel width (the resize gesture's release).
+    public func commitRightPanelWidth() {
+        guard Self.usesStoredSidePanelPreferences else { return }
+        ReaderSidePanelPreferences.store(width: rightPanelWidthPt, defaults: panelDefaults)
+    }
+
+    /// Called by the window when the right panel's visibility changes. A real animation holds
+    /// width updates for its duration; Reduce Motion and a live window resize toggle at once, so
+    /// they take the instantaneous branch.
+    public func noteRightPanelVisibilityChange(animated: Bool) {
+        guard document != nil else { return }
+        beginRightPanelMovement()
+        guard animated else {
+            finishRightPanelMovement()
+            return
+        }
+        // Hold for at least the animation's nominal length. Every frame that arrives re-arms
+        // this, so a loaded machine that delivers the slide late does not release the hold early.
+        armRightPanelSettle(after: ReaderMotion.panelDuration + 0.15)
+    }
+
+    /// A drag of the panel's inner edge began. The view calls this once per gesture.
+    public func beginRightPanelResize() {
+        beginRightPanelMovement()
+    }
+
+    /// The drag ended (or was cancelled): release the single deferred rebuild, if one is needed.
+    ///
+    /// The release waits briefly for the last layout pass. The pointer can be released before
+    /// SwiftUI has laid out the final width; those trailing viewport reports belong to the drag
+    /// and must be held too, or a loaded machine turns them back into one rebuild per frame.
+    public func endRightPanelResize() {
+        armRightPanelSettle(after: 0.15)
+    }
+
+    /// Releases the movement once `seconds` pass without another width report. The timer is
+    /// replaced, not accumulated, so the rebuild happens after the last frame, not after the
+    /// first one.
+    private func armRightPanelSettle(after seconds: TimeInterval) {
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
+            guard !Task.isCancelled, let self else { return }
+            self.finishRightPanelMovement()
+        }
+    }
+
+    private func beginRightPanelMovement() {
+        rightPanelLayoutIsMoving = true
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = nil
+        cancelPendingViewportReload()
+    }
+
+    private func finishRightPanelMovement() {
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = nil
+        guard rightPanelLayoutIsMoving else { return }
+        rightPanelLayoutIsMoving = false
+        if rightPanelDeferredReloadNeeded {
+            rightPanelDeferredReloadNeeded = false
+            scheduleViewportReload(after: 0.02)
+        }
+    }
+
     /// A width-only change that can move the visible columns (a zoomed-in page wider than the
     /// canvas) is rebuilt once after the width stops changing rather than on every frame.
-    private func scheduleViewportReload() {
+    private func scheduleViewportReload(after delay: TimeInterval = 0.08) {
         pendingViewportReload?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.pendingViewportReload = nil
+                self.coalescedViewportReloadCount += 1
                 self.reloadVisiblePages()
             }
         }
         pendingViewportReload = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func cancelPendingViewportReload() {

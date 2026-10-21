@@ -241,10 +241,11 @@ struct ReaderToolbar: View {
                      ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
                      : "Fill & Sign · fill this PDF's form fields"))
             separator
-            tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
-                state.pageOverviewVisible = false
-                state.sidebarTab = .ai; state.sidebarVisible = true
+            tool("AI assistant (⇧⌘A)", "sparkles", selected: state.rightPanelVisible) {
+                state.toggleRightPanel()
             }
+            .accessibilityLabel("AI assistant panel")
+            .accessibilityValue(state.rightPanelVisible ? "Open" : "Closed")
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
                 LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",

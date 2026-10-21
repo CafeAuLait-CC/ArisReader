@@ -2,7 +2,9 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Main window: toolbar + collapsible sidebar + canvas (`docs/04-ui-ux.md` §2).
+/// Main window: toolbar + collapsible sidebar + canvas + optional right-hand side panel
+/// (`docs/04-ui-ux.md` §2). The right panel is the AI assistant's home; the left sidebar keeps
+/// thumbnails, outline, annotations and bookmarks, so both can be open at once.
 ///
 /// The skeleton phase uses a hand-rolled `HStack` split instead of `NavigationSplitView`:
 /// the latter would bring the system sidebar material and automatic collapsing, but its
@@ -23,17 +25,24 @@ public struct ReaderWindow: View {
     /// Tracked so a toggle made while the window edge is being dragged changes layout at once
     /// instead of animating against the pointer (see ``WindowLiveResizeReporter``).
     @State private var isLiveResizing = false
+    /// One assistant per window. It moves out of the sidebar but not out of the window's
+    /// ownership: closing and reopening the right panel must not discard an answer, and a second
+    /// window must not share the first window's request state. Injectable so the checks can
+    /// point it at an isolated settings suite.
+    @StateObject private var aiAssistant: AIAssistantModel
 
     public init(
         state: AppState,
         opener: DocumentOpenCoordinator,
         previewPanels: ReferencePreviewPanelController = .shared,
-        integratesTitlebar: Bool = false
+        integratesTitlebar: Bool = false,
+        aiAssistant: AIAssistantModel? = nil
     ) {
         self.state = state
         self.opener = opener
         self.previewPanels = previewPanels
         self.integratesTitlebar = integratesTitlebar
+        _aiAssistant = StateObject(wrappedValue: aiAssistant ?? AIAssistantModel())
     }
 
     public var body: some View {
@@ -55,9 +64,33 @@ public struct ReaderWindow: View {
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
                     canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // The scroll indicator is a real lane, not an overlay: the canvas viewport
+                    // and the page column end before it, and the right panel starts after it.
+                    if state.document != nil {
+                        ScrollIndicator(state: state)
+                            .frame(width: ReaderChrome.scrollIndicatorLaneWidthPt)
+                            .background(LyraReaderTheme.canvasBg)
+                    }
                     if state.searchSidebarVisible && state.document != nil {
                         SearchResultSidebar(state: state).frame(width: ReaderChrome.sidebarTotalWidthPt)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
+                    // The AI assistant is a right-hand panel now, not a sidebar tab. The host is
+                    // generic (a sliding drawer); the assistant is only its content, so its
+                    // model, settings and request state keep their public surface.
+                    ReaderSidePanel(
+                        isVisible: state.rightPanelVisible && state.document != nil,
+                        contentWidth: state.rightPanelWidthPt,
+                        progressOverride: state.transitionProgressOverride?.panel,
+                        accessibilityLabel: "AI assistant panel",
+                        onResizeBegan: { state.beginRightPanelResize() },
+                        onResize: { state.resizeRightPanel(to: $0) },
+                        onResizeEnded: {
+                            state.endRightPanelResize()
+                            state.commitRightPanelWidth()
+                        }
+                    ) {
+                        AIAssistantPanel(state: state, model: aiAssistant)
                     }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
@@ -65,6 +98,7 @@ public struct ReaderWindow: View {
                 // panel instead of jumping to the final width on the first frame.
                 .animation(sidebarAnimation, value: state.sidebarVisible)
                 .animation(sidebarAnimation, value: state.searchSidebarVisible)
+                .animation(panelAnimation, value: state.rightPanelVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -90,6 +124,12 @@ public struct ReaderWindow: View {
             Button("Cancel",role:.cancel) {state.cancelContentClose()}
         } message: {Text("The original file has not been changed. Save a copy to keep this editing session.")}
         .onAppear { state.installTerminationHandling() }
+        // Tell the state whether this toggle is a real animation. The state holds the width-only
+        // viewport updates (and releases one rebuild) for the slide, because a loaded machine can
+        // take longer per frame than the ordinary coalescing window.
+        .onChange(of: state.rightPanelVisible) { _, _ in
+            state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
+        }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
             guard AppState.recordsRecentDocuments, let url else { return }
             RecentDocumentStore.shared.record(url)
@@ -243,7 +283,6 @@ public struct ReaderWindow: View {
                 }
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
-            HStack { Spacer(); ScrollIndicator(state: state) }
 
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
@@ -351,8 +390,11 @@ public struct ReaderWindow: View {
                 ReaderSecondaryToolbar(state: state)
             }
         }
-        // Same rule as the sidebar: the animation has to own the layout that changes.
-        .padding(.trailing, state.searchSidebarVisible && !state.pageOverviewVisible ? ReaderChrome.sidebarTotalWidthPt : 0)
+        // Same rule as the sidebar: the animation has to own the layout that changes. The row
+        // ends at the canvas's trailing edge, before the scroll lane and the right panel; the
+        // trailing inset uses their settled widths (like the leading sidebar inset) so the row's
+        // own controls do not reflow on every animation frame.
+        .padding(.trailing, secondaryToolbarTrailingInset)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
     }
 
@@ -368,6 +410,14 @@ public struct ReaderWindow: View {
         return isLiveResizing ? nil : ReaderMotion.secondaryRowAnimation
     }
 
+    /// Right panel animation follows the same three rules as the left sidebar: Reduce Motion,
+    /// no animation during a live window resize, and no animation when the checks pin a
+    /// transition progress.
+    private var panelAnimation: Animation? {
+        if state.transitionProgressOverride != nil { return nil }
+        return isLiveResizing ? nil : ReaderMotion.panelAnimation
+    }
+
     /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
     /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
     private var secondaryToolbarVisible: Bool {
@@ -377,6 +427,19 @@ public struct ReaderWindow: View {
     private var secondaryToolbarInset: CGFloat {
         guard !state.pageOverviewVisible, state.sidebarVisible else { return 0 }
         return ReaderChrome.sidebarTotalWidthPt
+    }
+
+    /// Everything between the canvas's trailing edge and the window's: the scroll lane, the
+    /// search results and the right panel. Page overview draws over the whole content area, so it
+    /// suppresses all three like it suppresses the leading inset.
+    private var secondaryToolbarTrailingInset: CGFloat {
+        ReaderChrome.trailingChromeWidth(
+            documentOpen: state.document != nil,
+            pageOverviewVisible: state.pageOverviewVisible,
+            searchVisible: state.searchSidebarVisible,
+            rightPanelVisible: state.rightPanelVisible,
+            rightPanelContentWidth: state.rightPanelWidthPt
+        )
     }
 
     /// The read-only explanation for a digitally signed document.
