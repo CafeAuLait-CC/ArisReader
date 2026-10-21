@@ -900,6 +900,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde_json",
+ "sha2",
  "ureq",
 ]
 

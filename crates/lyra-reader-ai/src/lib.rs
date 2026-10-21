@@ -17,8 +17,12 @@ pub use chat::{
     ConversationTurn, DocumentChatRequest, EndpointInfo, MAX_CHAT_CONTEXT_CHARS,
     MAX_CHAT_HISTORY_CHARS, MAX_CHAT_HISTORY_TURNS, MAX_REGION_IMAGE_BYTES,
     MAX_REGION_QUESTION_CHARS, MAX_REGION_TEXT_CHARS, NOTHING_RELEVANT_MESSAGE, PageText,
-    PlanRequest, RegionQuestionRequest, RegionRect, SelectionRange, SourceRect,
-    build_document_chat_plan, build_region_question_plan, inspect_base_url, validate_model,
+    PlanRequest, RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS,
+    SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH,
+    SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS, SelectionRange, SourceRect, SummaryCoverage,
+    SummaryLayer, SummaryLayerPlan, SummaryLayerRequest, SummaryUnitPlan, SummaryUnitRequest,
+    build_document_chat_plan, build_region_question_plan, build_summary_layer, inspect_base_url,
+    inspect_summary_layer, validate_model,
 };
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
 pub use mock::MockProvider;
