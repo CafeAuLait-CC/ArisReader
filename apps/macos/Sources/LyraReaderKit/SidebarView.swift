@@ -5,8 +5,10 @@ import UniformTypeIdentifiers
 
 /// Sidebar: tab switching plus the content of each tab (`docs/04-ui-ux.md` §2.2).
 ///
-/// Bookmarks, outline, annotations, thumbnails and AI share the horizontal navigator.
-/// Search results and document information have their own surfaces.
+/// Bookmarks, outline, annotations and thumbnails share the horizontal navigator.
+/// The AI assistant is not a tab here: it lives in the window's right-hand panel, so the
+/// sidebar and the assistant can be open at the same time. Search results and document
+/// information have their own surfaces.
 public struct SidebarView: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
@@ -27,9 +29,6 @@ public struct SidebarView: View {
     /// opened to read annotations, and a review PDF's threads should not hide behind a second
     /// click. Disclosure is local view state, so switching tabs or documents resets it.
     @State private var collapsedAnnotationPages: Set<Int> = []
-    /// One assistant per window's sidebar. It outlives tab switches (so an answer is not lost
-    /// when the reader checks the outline) but not the window.
-    @StateObject private var aiAssistant = AIAssistantModel()
     /// The visible thumbnail cells, in the strip's coordinate space. The AppKit drag overlay
     /// uses these frames to decide which page a press is on and where an insertion line belongs;
     /// the values only change when cells appear or disappear, not while the strip scrolls.
@@ -51,14 +50,16 @@ public struct SidebarView: View {
             } else {
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
-                        ForEach([SidebarTab.bookmarks, .outline, .annotations, .thumbnails, .ai]) { tab in
+                        ForEach(SidebarTab.sidebarPickerTabs) { tab in
                             Button { state.sidebarTab = tab } label: {
                                 Image(systemName: tab.systemImage)
                                     .frame(maxWidth: .infinity, minHeight: 30)
                             }
                             .buttonStyle(LyraReaderSidebarTabStyle(selected: state.sidebarTab == tab))
                             .overlay(alignment: .trailing) {
-                                if tab != .ai { LyraReaderTheme.border.frame(width: 1) }
+                                if tab != SidebarTab.sidebarPickerTabs.last {
+                                    LyraReaderTheme.border.frame(width: 1)
+                                }
                             }
                             .accessibilityLabel(tab.title).help(tab.title)
                             .accessibilityValue(state.sidebarTab == tab ? "Selected" : "")
@@ -121,8 +122,6 @@ public struct SidebarView: View {
             annotationList
         case .metadata:
             DocumentInformationContent(state: state)
-        case .ai:
-            AIAssistantPanel(state: state, model: aiAssistant)
         }
     }
 

@@ -39,6 +39,10 @@ struct ReaderChecks {
         // running the suite chose in the app: pin continuous/12 for this process. Setters still
         // exercise the real layout path, they just do not write the preference.
         AppState.usesStoredReadingLayoutPreferences = false
+        // Same rule for the sidebar's remembered tab and the right panel's width/visibility: a
+        // check run must not move the person's app into the state the check exercises.
+        AppState.usesStoredSidebarTab = false
+        AppState.usesStoredSidePanelPreferences = false
 
         let fastRoot = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
             ?? FileManager.default.currentDirectoryPath)
@@ -160,6 +164,14 @@ struct ReaderChecks {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
                 ?? FileManager.default.currentDirectoryPath)
             try await previewActionChecks(root: root)
+            return
+        }
+        // The right-hand AI panel on its own while it is being worked on
+        // (`LyraReaderChecks --check-right-panel .`).
+        if CommandLine.arguments.contains("--check-right-panel") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await rightPanelChecks(root: root)
             return
         }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
@@ -641,6 +653,7 @@ struct ReaderChecks {
         placementIndexChecks()
         try await hostedPreviewChecks(root: root)
         try await transitionChecks(root: root)
+        try await rightPanelChecks(root: root)
         try await previewChecks(url: b)
         try await previewHistoryChecks(url: b)
         try await previewTransparencyChecks(root: root)

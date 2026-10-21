@@ -2,8 +2,10 @@ import AppKit
 import LyraReaderBindings
 import SwiftUI
 
-/// The AI sidebar tab. Everything visible here is local state until the reader presses Send:
-/// the action buttons only build a preview, and the preview is the exact plan Rust will execute.
+/// The AI assistant, hosted in the reader window's right-hand panel. Everything visible here is
+/// local state until the reader presses Send: the action buttons only build a preview, and the
+/// preview is the exact plan Rust will execute. The view's public surface is the panel's:
+/// `state` and `model` are supplied by the host, which owns the model for the window's lifetime.
 public struct AIAssistantPanel: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
@@ -70,6 +72,11 @@ public struct AIAssistantPanel: View {
                 }
             }
         }
+        // A zero-size AppKit marker is the stable way for the hosted-window checks to prove that
+        // the right panel's content really is this view. SwiftUI's accessibility tree is lazy
+        // and empty for a window no assistive client has queried, so asking it would be a check
+        // that depends on the machine, not on the layout.
+        .background(AIAssistantPanelMarkerHost())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
     }
@@ -595,4 +602,30 @@ struct AIAnswerView: View {
         }
         return result
     }
+}
+
+/// A zero-size marker view for the hosted-window checks.
+///
+/// `NSHostingView` does not expose the SwiftUI view tree, and its accessibility children are not
+/// built until an assistive client asks for them. A real, empty `NSView` in the hierarchy is the
+/// same seam the canvas already provides: the checks can find the assistant content by type
+/// without inspecting SwiftUI internals.
+public final class AIAssistantPanelMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("AI assistant panel content")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("AI assistant panel content")
+    }
+}
+
+private struct AIAssistantPanelMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIAssistantPanelMarkerView {
+        AIAssistantPanelMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIAssistantPanelMarkerView, context: Context) {}
 }

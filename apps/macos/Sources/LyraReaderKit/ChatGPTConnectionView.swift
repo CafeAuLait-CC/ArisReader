@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The same connection controls are reachable from Settings and the AI sidebar.
+/// The same connection controls are reachable from Settings and the AI panel.
 struct ChatGPTConnectionView: View {
     @ObservedObject var accounts: ChatGPTAccountStore
 

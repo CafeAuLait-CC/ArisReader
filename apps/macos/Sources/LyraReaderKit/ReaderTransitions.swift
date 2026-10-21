@@ -11,9 +11,38 @@ public enum ReaderChrome {
     public static var sidebarTotalWidthPt: CGFloat { sidebarWidthPt + sidebarSeparatorWidthPt }
     /// The annotation / page-overview row: 32 pt controls plus 7 pt padding above and below.
     public static let secondaryToolbarHeightPt: CGFloat = 46
+    /// Width of the scroll indicator's lane at the canvas's trailing edge.
+    ///
+    /// The indicator is a sibling of the canvas rather than an overlay, so this strip is real
+    /// layout: the page, Fit Width and the pointer anchor all use the canvas width *without* it,
+    /// and the right panel starts after it. The lane is only present while a document is open.
+    public static let scrollIndicatorLaneWidthPt: CGFloat = 18
+
+    /// Everything the layout puts between the canvas and the window's trailing edge.
+    ///
+    /// The secondary toolbar is drawn over the content row, so it has to stop at the same place:
+    /// the scroll lane, then search results, then the right panel. Page overview covers the whole
+    /// content area, so it has no trailing chrome to avoid. Kept as a pure function so the
+    /// checks can assert the overlay's arithmetic without a screenshot.
+    public static func trailingChromeWidth(
+        documentOpen: Bool,
+        pageOverviewVisible: Bool,
+        searchVisible: Bool,
+        rightPanelVisible: Bool,
+        rightPanelContentWidth: CGFloat
+    ) -> CGFloat {
+        guard documentOpen, !pageOverviewVisible else { return 0 }
+        var width = scrollIndicatorLaneWidthPt
+        if searchVisible { width += sidebarTotalWidthPt }
+        if rightPanelVisible {
+            width += ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelContentWidth)
+        }
+        return width
+    }
 }
 
-/// A deterministic progress override for the two transitions, used only by the native checks.
+/// A deterministic progress override for the drawer and row transitions, used only by the native
+/// checks.
 ///
 /// SwiftUI's animation is driven by the display link: a check that samples a real animation on a
 /// wall clock can miss every intermediate frame on a loaded runner, which is exactly how the
@@ -25,16 +54,19 @@ public struct ReaderTransitionProgress: Equatable, Sendable {
     public var sidebar: Double?
     /// 0 is collapsed, 1 is the full 46 pt row.
     public var row: Double?
+    /// 0 is closed, 1 is the full right panel. `nil` means "use `isVisible` and animate normally".
+    public var panel: Double?
 
-    public init(sidebar: Double? = nil, row: Double? = nil) {
+    public init(sidebar: Double? = nil, row: Double? = nil, panel: Double? = nil) {
         self.sidebar = sidebar
         self.row = row
+        self.panel = panel
     }
 }
 
-/// Timings and the system motion preference for the reader's two show/hide transitions.
+/// Timings and the system motion preference for the reader's show/hide transitions.
 ///
-/// Both transitions use a cubic ease-out and stay inside the requested 0.18-0.25 s:
+/// All of them use a cubic ease-out and stay inside the requested 0.18-0.25 s:
 ///
 /// * the sidebar takes `sidebarDuration` (0.22 s). Ease-out starts at its fastest and settles
 ///   without overshooting, so the panel does not jump past its 251 pt resting width and then
@@ -42,12 +74,15 @@ public struct ReaderTransitionProgress: Equatable, Sendable {
 /// * the secondary row takes `secondaryRowDuration` (0.18 s). It is a short reveal of a row
 ///   whose content is already laid out, so it can be slightly quicker than the sidebar without
 ///   looking abrupt.
+/// * the right panel takes `panelDuration`, which is the sidebar's duration: the two drawers can
+///   be toggled together and must not read as different pieces of furniture.
 ///
-/// SwiftUI drives both animations from its display link. A frame of either animation costs a
-/// layout pass of the transition views and a canvas resize; it deliberately does **not** ask the
-/// engine for a page raster. `AppState.setViewportSize` recognises width-only viewport changes
-/// that cannot move the visible page band and skips the band rebuild for them, and coalesces the
-/// ones that can, so a slide cannot schedule a raster or a tile per frame.
+/// SwiftUI drives the animations from its display link. A frame of any animation costs a layout
+/// pass of the transition views and a canvas resize; it deliberately does **not** ask the engine
+/// for a page raster. `AppState.setViewportSize` recognises width-only viewport changes that
+/// cannot move the visible page band and skips the band rebuild for them, coalesces the ones
+/// that can, and holds a moving right panel's updates until it settles, so a slide cannot
+/// schedule a raster or a tile per frame.
 @MainActor
 public enum ReaderMotion {
     public static let sidebarDuration: TimeInterval = 0.22
@@ -67,6 +102,14 @@ public enum ReaderMotion {
 
     public static var secondaryRowAnimation: Animation? {
         reduceMotionEnabled ? nil : .easeOut(duration: secondaryRowDuration)
+    }
+
+    /// The right panel uses the sidebar's duration and curve, not a second timing language: the
+    /// two drawers can be toggled together and must not look like different pieces of furniture.
+    public static var panelDuration: TimeInterval { sidebarDuration }
+
+    public static var panelAnimation: Animation? {
+        reduceMotionEnabled ? nil : .easeOut(duration: panelDuration)
     }
 }
 

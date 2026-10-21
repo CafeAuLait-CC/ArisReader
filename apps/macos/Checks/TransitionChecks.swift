@@ -52,9 +52,13 @@ private final class TransitionHarness {
     }
 
     /// Width the layout gives the sidebar (panel plus its separator).
+    ///
+    /// The scroll indicator is its own lane now, so it is not part of the sidebar's width; the
+    /// right panel is hidden in this harness.
     var sidebarWidth: CGFloat {
         let rect = canvasRect
-        return host.bounds.width - rect.width
+        let lane = state.document == nil ? 0 : ReaderChrome.scrollIndicatorLaneWidthPt
+        return host.bounds.width - rect.width - lane
     }
 
     /// Top of a page in the host view's coordinates, using the same transform the canvas uses.

@@ -94,9 +94,11 @@ struct ScrollIndicator: View {
 
     /// Thumb width in points.
     private let width: CGFloat = 9
-    /// The hit-testable lane: the thumb plus room to aim at a 9 pt bar.
-    private let laneWidth: CGFloat = 18
-    /// Distance from the window edge to the thumb.
+    /// The hit-testable lane: the thumb plus room to aim at a 9 pt bar. It is real layout
+    /// (`ReaderChrome.scrollIndicatorLaneWidthPt`), not an overlay, so the page column ends
+    /// before it and the right-hand panel starts after it.
+    private var laneWidth: CGFloat { ReaderChrome.scrollIndicatorLaneWidthPt }
+    /// Distance from the lane's trailing edge to the thumb.
     private let trailingInset: CGFloat = 2
 
     /// The drag in flight, if any. Cleared when the document changes, so a cancelled gesture
