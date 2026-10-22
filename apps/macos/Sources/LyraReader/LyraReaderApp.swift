@@ -401,7 +401,7 @@ struct ReaderCommands: Commands {
             Button("Discard Page Changes…") {
                 session?.state.presentDiscardPageEditsConfirmation()
             }
-            .disabled(session?.state.pageEditSessionActive != true)
+            .disabled(session?.state.pageEditHasPendingChanges != true)
 
             Divider()
 

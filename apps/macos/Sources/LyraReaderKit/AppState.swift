@@ -3484,19 +3484,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                               preservingPageEditSessionInSnapshot: Bool = false) -> Bool {
         openRequestCount += 1
         if let session = pageEditSession, !preservingPageEditSessionInSnapshot {
-            let same = Self.resolvesToSameFile(url, session.originalURL)
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = same
-                ? "Discard the pending page changes and reopen the original?"
-                : "Discard the pending page changes to “\(session.originalURL.lastPathComponent)”?"
-            alert.informativeText =
-                "The original file is unchanged, but annotations and bookmarks added during the "
-                + "page-editing session are discarded with the working copy."
-            alert.addButton(withTitle: "Discard and Open")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return false }
-            endPageEditSession(deleteFiles: true)
+            // A working copy with no staged change is not something to confirm discarding; it
+            // only has to be closed before the new document takes its place.
+            if session.operations.isEmpty {
+                endPageEditSession(deleteFiles: true)
+            } else {
+                let same = Self.resolvesToSameFile(url, session.originalURL)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = same
+                    ? "Discard the pending page changes and reopen the original?"
+                    : "Discard the pending page changes to “\(session.originalURL.lastPathComponent)”?"
+                alert.informativeText =
+                    "The original file is unchanged, but annotations and bookmarks added during the "
+                    + "page-editing session are discarded with the working copy."
+                alert.addButton(withTitle: "Discard and Open")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return false }
+                endPageEditSession(deleteFiles: true)
+            }
         }
         do {
             // One-shot, not a timer: stamps the request now; the first *presented* frame clears
@@ -9524,11 +9530,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Page operations that write a new file (extract, merge, split).
     public var canPageOperations: Bool { document != nil }
 
+    /// Whether a page-editing session exists at all. A session is prepared before the first
+    /// write, so this can be true with nothing staged yet; the interface must ask
+    /// ``pageEditHasPendingChanges`` before saying anything is pending.
     public var pageEditSessionActive: Bool { pageEditSession != nil }
+
+    /// Whether the session has a page change the reader must still save. This — not the mere
+    /// existence of a working copy — is the one guard for the "Page changes pending" banner and
+    /// for every confirmation that offers to save or discard pending changes. A failed first
+    /// edit leaves a prepared session behind; it is not something pending.
+    public var pageEditHasPendingChanges: Bool {
+        pageEditSession?.operations.isEmpty == false
+    }
+
     public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
     public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
     public var canSavePageEditsCopy: Bool {
-        (pageEditSession != nil || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
+        (pageEditHasPendingChanges || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
     }
 
     /// Applying the staged revision to the signed file itself. "Save Copy" stays available.
@@ -9543,9 +9561,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return await applyPageEdit(operation, label: label)
     }
 
-    /// What the interface must say about the staged state. Nil when nothing is pending.
+    /// What the interface must say about the staged state. Nil when nothing is pending: a
+    /// prepared working copy with zero operations is not a page change, and a banner claiming
+    /// "0 page changes pending" would ask the reader to confirm something that does not exist.
     public var pageEditPendingSummary: String? {
-        guard let session = pageEditSession else { return nil }
+        guard let session = pageEditSession, !session.operations.isEmpty else { return nil }
         let count = session.operations.count
         let label = count == 1 ? "1 page change pending" : "\(count) page changes pending"
         return "\(label) · the file on disk is unchanged"
@@ -10308,7 +10328,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSavePageEditsCopyPanel() {
-        guard let source = pageEditDisplayURL, pageEditSession != nil || contentTextEditing else { return }
+        guard let source = pageEditDisplayURL, pageEditHasPendingChanges || contentTextEditing else { return }
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
         panel.message =
@@ -10334,6 +10354,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if !succeeded { return false }
         }
         guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
+        guard pageEditHasPendingChanges else {
+            lastError = "There are no page changes to save"
+            return false
+        }
         guard !Self.resolvesToSameFile(destination, original) else {
             lastError = "Choose another name for Save As, or use Save to update the original."
             return false
@@ -10369,6 +10393,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if !succeeded { return false }
         }
         guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
+        guard pageEditHasPendingChanges else {
+            lastError = "There are no page changes to save"
+            return false
+        }
         do {
             try DocumentEditCache.validateSource(for: original)
             _ = try await materializeAnnotationsInWorkingCopy()
@@ -10397,7 +10425,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentDiscardPageEditsConfirmation() {
-        guard pageEditSession != nil else { return }
+        guard let session = pageEditSession else { return }
+        guard pageEditHasPendingChanges else {
+            // A prepared session with zero operations has nothing to discard, so there is
+            // nothing to confirm. Close it as the discard action would, and reopen the original
+            // only if a cached revision had already replaced the open document.
+            let original = session.originalURL
+            let moved = document?.url != original
+            endPageEditSession(deleteFiles: true)
+            if moved { _ = open(url: original) }
+            return
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Discard the pending page changes?"
@@ -10688,6 +10726,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // A failed operation may have created a partial revision file; it is never referenced
             // by the session, so remove it best-effort.
             try? FileManager.default.removeItem(at: nextURL)
+            // If this was the session's first operation, no page change exists; close the
+            // prepared working copy instead of leaving an "editing" state with nothing pending.
+            discardEmptyPageEditSession()
             return false
         }
     }
@@ -10776,6 +10817,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let version: Int
         let session: PageEditSession
         let snapshot: PageEditSnapshot
+    }
+
+    /// Closes a session a command prepared but left with nothing staged.
+    ///
+    /// The first write prepares the working copy before it knows whether the write will land. If
+    /// it fails, keeping that empty session would leave the reader in an "editing" state with no
+    /// page change to save (and, before ``pageEditHasPendingChanges``, would have presented a
+    /// "0 page changes pending" banner). Only a session that still points at the original and
+    /// has no operation is discarded here; a session with an earlier change is kept intact.
+    private func discardEmptyPageEditSession() {
+        guard let session = pageEditSession, session.operations.isEmpty,
+              session.revisionURL == session.originalURL else { return }
+        endPageEditSession(deleteFiles: true)
     }
 
     private func persistPageEditRecovery() {
@@ -15044,6 +15098,10 @@ extension AppState {
                     "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
                     page: page, url: document?.url)
                 if let next { try? FileManager.default.removeItem(at: next) }
+                // A failed first edit leaves a prepared working copy with zero operations. It is
+                // not a pending page change, so close it: there is nothing to confirm or save,
+                // and the edit error is the only thing the reader must see.
+                discardEmptyPageEditSession()
                 return false
             }
         }

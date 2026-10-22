@@ -122,11 +122,25 @@ pub struct AppliedChangesReport {
     pub(crate) removed_objects: Vec<(u32, u16)>,
 }
 
+/// Where one annotation dictionary lives in the file.
+///
+/// Almost every annotation is an indirect object referenced by a page's `/Annots`, but a
+/// producer may write the dictionary **inline** in that array instead. PDFium reads both forms,
+/// so the reader lists and adopts both; the editor must therefore be able to name the inline
+/// form too, even though it has no object id. An inline annotation is addressed by the page that
+/// carries it and its position in the source array.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AnnotationKey {
+    Object(ObjectId),
+    Inline { page_id: ObjectId, index: usize },
+}
+
 /// One annotation found in the source, for planning and verification.
 #[derive(Clone, Debug)]
 struct AnnotationInfo {
     page: usize,
     identity: Option<String>,
+    subtype: Option<String>,
     reply: bool,
     popup: bool,
 }
@@ -177,10 +191,12 @@ pub(crate) fn apply_changes(
         .collect();
     let font = build_free_text_font(&mut incremental.new_document, &free_text)?;
 
-    apply_removals(&mut incremental, &removal)?;
-    for (object_id, update) in &updates {
-        update_one(&mut incremental, *object_id, update, font.as_ref())?;
+    // Edits go first: an inline annotation is addressed by its position in the source
+    // `/Annots` array, and removing a sibling would shift that position.
+    for (key, update) in &updates {
+        update_one(&mut incremental, *key, update, font.as_ref())?;
     }
+    apply_removals(&mut incremental, &removal)?;
     for annotation in &changes.additions {
         if !annotation.kind.is_direct() {
             return Err(LyraReaderError::new(
@@ -219,69 +235,135 @@ pub(crate) fn apply_changes(
     Ok(report)
 }
 
-/// Every annotation referenced by a page's `/Annots`, keyed by object id.
+/// Every annotation referenced by a page's `/Annots`, keyed by where its dictionary lives.
 ///
 /// Pages are numbered from one in `get_pages`; the reported page is the zero-based index the
 /// shell uses. Annotations that are only referenced from a `/Popup` key are added by the removal
 /// planner, because their page is the page of the annotation that owns the window.
-fn collect_annotations(document: &Document) -> Result<BTreeMap<ObjectId, AnnotationInfo>> {
+fn collect_annotations(document: &Document) -> Result<BTreeMap<AnnotationKey, AnnotationInfo>> {
     let mut infos = BTreeMap::new();
     for (number, page_id) in document.get_pages() {
         let page = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
-        for object_id in page_annotation_ids(document, page_id)? {
-            if infos.contains_key(&object_id) {
+        for key in page_annotation_keys(document, page_id)? {
+            if infos.contains_key(&key) {
                 continue;
             }
-            let info = annotation_info(document, object_id, page)?;
-            infos.insert(object_id, info);
+            let info = annotation_info(document, key, page)?;
+            infos.insert(key, info);
         }
     }
     Ok(infos)
 }
 
-fn annotation_info(
-    document: &Document,
-    object_id: ObjectId,
-    page: usize,
-) -> Result<AnnotationInfo> {
-    let dictionary = annotation_dictionary(document, object_id)?;
+fn annotation_info(document: &Document, key: AnnotationKey, page: usize) -> Result<AnnotationInfo> {
+    let dictionary = annotation_dictionary(document, key)?;
+    let subtype = subtype(dictionary);
     Ok(AnnotationInfo {
         page,
         identity: annotation_identity(document, dictionary),
         reply: dictionary.get(b"IRT").is_ok(),
-        popup: subtype(dictionary).as_deref() == Some("Popup"),
+        popup: subtype.as_deref() == Some("Popup"),
+        subtype,
     })
 }
 
-fn annotation_dictionary(document: &Document, object_id: ObjectId) -> Result<&Dictionary> {
-    document
-        .get_object(object_id)
-        .and_then(Object::as_dict)
-        .map_err(|error| {
-            LyraReaderError::new(
-                ErrorCode::CorruptDocument,
-                "an annotation reference does not name an annotation dictionary",
-            )
-            .with_detail(format!("{object_id:?}: {error}"))
-        })
+fn annotation_dictionary(document: &Document, key: AnnotationKey) -> Result<&Dictionary> {
+    match key {
+        AnnotationKey::Object(object_id) => document
+            .get_object(object_id)
+            .and_then(Object::as_dict)
+            .map_err(|error| {
+                LyraReaderError::new(
+                    ErrorCode::CorruptDocument,
+                    "an annotation reference does not name an annotation dictionary",
+                )
+                .with_detail(format!("{object_id:?}: {error}"))
+            }),
+        AnnotationKey::Inline { page_id, index } => {
+            let array = page_annotation_objects(document, page_id)?;
+            array
+                .and_then(|array| array.get(index))
+                .and_then(|object| object.as_dict().ok())
+                .ok_or_else(|| {
+                    LyraReaderError::new(
+                        ErrorCode::CorruptDocument,
+                        "an inline annotation in a page's /Annots is not a dictionary",
+                    )
+                    .with_detail(format!("{page_id:?} /Annots[{index}]"))
+                })
+        }
+    }
 }
 
-fn page_annotation_ids(document: &Document, page_id: ObjectId) -> Result<Vec<ObjectId>> {
+fn page_annotation_objects(document: &Document, page_id: ObjectId) -> Result<Option<&Vec<Object>>> {
     let page = document.get_dictionary(page_id).map_err(|error| {
         lopdf_error("could not read a page while looking for annotations", error)
     })?;
-    let Some(annots) = page
+    Ok(page
         .get(b"Annots")
         .ok()
         .and_then(|object| deref(document, object))
-        .and_then(|object| object.as_array().ok())
-    else {
+        .and_then(|object| object.as_array().ok()))
+}
+
+/// The address of every entry in a page's `/Annots`, in array order.
+///
+/// `None` for the rare entry that is neither an indirect reference nor an inline dictionary; the
+/// old reader ignored those too, and `annotation_dictionary` reports a corrupt reference when one
+/// is addressed directly.
+fn page_annotation_keys(document: &Document, page_id: ObjectId) -> Result<Vec<AnnotationKey>> {
+    let Some(annots) = page_annotation_objects(document, page_id)? else {
         return Ok(Vec::new());
     };
     Ok(annots
         .iter()
-        .filter_map(|object| object.as_reference().ok())
+        .enumerate()
+        .filter_map(|(index, object)| match object {
+            Object::Reference(object_id) => Some(AnnotationKey::Object(*object_id)),
+            Object::Dictionary(_) => Some(AnnotationKey::Inline { page_id, index }),
+            _ => None,
+        })
         .collect())
+}
+
+/// The annotation dictionary to change in the new revision, copied there first.
+///
+/// An indirect annotation is copied as its own object. An inline one is changed inside the
+/// page's copied `/Annots` array, so the file keeps the producer's layout and no object id is
+/// invented for it.
+fn annotation_dictionary_mut(
+    incremental: &mut IncrementalDocument,
+    key: AnnotationKey,
+) -> Result<&mut Dictionary> {
+    match key {
+        AnnotationKey::Object(object_id) => {
+            incremental
+                .opt_clone_object_to_new_document(object_id)
+                .map_err(|error| {
+                    lopdf_error("could not copy the annotation into the new revision", error)
+                })?;
+            incremental
+                .new_document
+                .get_object_mut(object_id)
+                .map_err(|error| lopdf_error("the edited annotation is missing", error))?
+                .as_dict_mut()
+                .map_err(|error| lopdf_error("the edited annotation is not a dictionary", error))
+        }
+        AnnotationKey::Inline { page_id, index } => {
+            let annots = annots_array(incremental, page_id)?;
+            annots
+                .get_mut(index)
+                .ok_or_else(|| {
+                    LyraReaderError::new(
+                        ErrorCode::Internal,
+                        "an inline annotation is missing from the new revision",
+                    )
+                    .with_detail(format!("{page_id:?} /Annots[{index}]"))
+                })?
+                .as_dict_mut()
+                .map_err(|error| lopdf_error("the edited annotation is not a dictionary", error))
+        }
+    }
 }
 
 fn subtype(dictionary: &Dictionary) -> Option<String> {
@@ -426,62 +508,65 @@ fn pdf_text(document: &Document, object: &Object) -> Option<String> {
 /// The annotations a deletion removes: the targets, their reply descendants and their popup
 /// windows, plus any popup of an annotation that is itself being removed.
 struct RemovalPlan {
-    removed: BTreeSet<ObjectId>,
+    removed: BTreeSet<AnnotationKey>,
+    /// Every annotation the plan could see, including popup windows that no page's `/Annots`
+    /// references. The writer uses it to clear dangling links on survivors.
+    all: BTreeMap<AnnotationKey, AnnotationInfo>,
     report: AppliedChangesReport,
 }
 
 fn plan_removal(
     document: &Document,
-    annotations: &BTreeMap<ObjectId, AnnotationInfo>,
+    annotations: &BTreeMap<AnnotationKey, AnnotationInfo>,
     deletions: &[AnnotationDelete],
 ) -> Result<RemovalPlan> {
     let mut removed = BTreeSet::new();
     for deletion in deletions {
-        let object_id = find_identity(annotations, &deletion.target)?;
-        removed.insert(object_id);
+        let key = find_identity(annotations, &deletion.target)?;
+        removed.insert(key);
     }
 
     // A popup can be referenced by `/Popup` without being in a page's `/Annots`; collect those
     // objects too so the closure below can see them.
-    let mut extra: BTreeMap<ObjectId, AnnotationInfo> = BTreeMap::new();
-    for object_id in annotations.keys().copied().collect::<Vec<_>>() {
-        collect_popup(document, object_id, &mut extra)?;
+    let mut extra: BTreeMap<AnnotationKey, AnnotationInfo> = BTreeMap::new();
+    for key in annotations.keys().copied().collect::<Vec<_>>() {
+        collect_popup(document, key, &mut extra)?;
     }
-    let all: BTreeMap<ObjectId, AnnotationInfo> = annotations
+    let all: BTreeMap<AnnotationKey, AnnotationInfo> = annotations
         .iter()
         .chain(extra.iter())
-        .map(|(id, info)| (*id, info.clone()))
+        .map(|(key, info)| (*key, info.clone()))
         .collect();
 
     loop {
         let mut added = Vec::new();
-        for (object_id, info) in &all {
-            if removed.contains(object_id) {
+        for (key, info) in &all {
+            if removed.contains(key) {
                 continue;
             }
-            let dictionary = annotation_dictionary(document, *object_id)?;
+            let dictionary = annotation_dictionary(document, *key)?;
             let reply_to_removed = dictionary
                 .get(b"IRT")
                 .ok()
                 .and_then(|object| object.as_reference().ok())
-                .is_some_and(|parent| removed.contains(&parent));
+                .is_some_and(|parent| removed.contains(&AnnotationKey::Object(parent)));
             let popup_of_removed = info.popup
                 && dictionary
                     .get(b"Parent")
                     .ok()
                     .and_then(|object| object.as_reference().ok())
-                    .is_some_and(|parent| removed.contains(&parent));
+                    .is_some_and(|parent| removed.contains(&AnnotationKey::Object(parent)));
             if reply_to_removed || popup_of_removed {
-                added.push(*object_id);
+                added.push(*key);
             }
         }
-        for object_id in removed.iter().copied().collect::<Vec<_>>() {
-            if let Ok(dictionary) = annotation_dictionary(document, object_id)
+        for key in removed.iter().copied().collect::<Vec<_>>() {
+            if let Ok(dictionary) = annotation_dictionary(document, key)
                 && let Ok(popup) = dictionary.get(b"Popup").and_then(Object::as_reference)
-                && all.contains_key(&popup)
-                && !removed.contains(&popup)
+                && all.contains_key(&AnnotationKey::Object(popup))
+                && !removed.contains(&AnnotationKey::Object(popup))
             {
-                added.push(popup);
+                added.push(AnnotationKey::Object(popup));
             }
         }
         if added.is_empty() {
@@ -491,8 +576,8 @@ fn plan_removal(
     }
 
     let mut report = AppliedChangesReport::default();
-    for object_id in &removed {
-        let Some(info) = all.get(object_id) else {
+    for key in &removed {
+        let Some(info) = all.get(key) else {
             continue;
         };
         if info.reply {
@@ -506,21 +591,32 @@ fn plan_removal(
         }
     }
     report.deleted_ids.sort();
-    report.removed_objects = removed.iter().copied().collect();
-    Ok(RemovalPlan { removed, report })
+    report.removed_objects = removed
+        .iter()
+        .filter_map(|key| match key {
+            AnnotationKey::Object(object_id) => Some(*object_id),
+            AnnotationKey::Inline { .. } => None,
+        })
+        .collect();
+    Ok(RemovalPlan {
+        removed,
+        all,
+        report,
+    })
 }
 
 fn collect_popup(
     document: &Document,
-    object_id: ObjectId,
-    extra: &mut BTreeMap<ObjectId, AnnotationInfo>,
+    key: AnnotationKey,
+    extra: &mut BTreeMap<AnnotationKey, AnnotationInfo>,
 ) -> Result<()> {
-    let Ok(dictionary) = annotation_dictionary(document, object_id) else {
+    let Ok(dictionary) = annotation_dictionary(document, key) else {
         return Ok(());
     };
     let Ok(popup) = dictionary.get(b"Popup").and_then(Object::as_reference) else {
         return Ok(());
     };
+    let popup = AnnotationKey::Object(popup);
     if extra.contains_key(&popup) {
         return Ok(());
     }
@@ -531,6 +627,42 @@ fn collect_popup(
 }
 
 fn apply_removals(incremental: &mut IncrementalDocument, plan: &RemovalPlan) -> Result<()> {
+    // A surviving annotation must not keep a link to an object that is no longer in the tree.
+    // Cascading already removes every reply and popup that depends on a deleted target, so this
+    // finds only a malformed file; it is still cheaper to clear the link than to leave a viewer
+    // following a dangling reference. This runs before the array entries are removed: an inline
+    // annotation is addressed by its source position, and removing an earlier entry would shift
+    // the position of every surviving inline annotation after it.
+    for key in plan.all.keys() {
+        if plan.removed.contains(key) {
+            continue;
+        }
+        let needs_cleanup = {
+            let dictionary = annotation_dictionary(incremental.get_prev_documents(), *key)?;
+            [b"IRT".as_slice(), b"Popup".as_slice()].iter().any(|name| {
+                dictionary
+                    .get(name)
+                    .ok()
+                    .and_then(|object| object.as_reference().ok())
+                    .is_some_and(|target| plan.removed.contains(&AnnotationKey::Object(target)))
+            })
+        };
+        if !needs_cleanup {
+            continue;
+        }
+        let dictionary = annotation_dictionary_mut(incremental, *key)?;
+        for name in [b"IRT".as_slice(), b"Popup".as_slice()] {
+            let removed = dictionary
+                .get(name)
+                .ok()
+                .and_then(|object| object.as_reference().ok())
+                .is_some_and(|target| plan.removed.contains(&AnnotationKey::Object(target)));
+            if removed {
+                dictionary.remove(name);
+            }
+        }
+    }
+
     let pages: Vec<ObjectId> = incremental
         .get_prev_documents()
         .get_pages()
@@ -538,92 +670,85 @@ fn apply_removals(incremental: &mut IncrementalDocument, plan: &RemovalPlan) -> 
         .copied()
         .collect();
     for page_id in pages {
-        let existing = page_annotation_ids(incremental.get_prev_documents(), page_id)?;
-        if !existing.iter().any(|id| plan.removed.contains(id)) {
+        let existing = page_annotation_keys(incremental.get_prev_documents(), page_id)?;
+        let positions: BTreeSet<usize> = existing
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| plan.removed.contains(key))
+            .map(|(index, _)| index)
+            .collect();
+        if positions.is_empty() {
             continue;
         }
         let annots = annots_array(incremental, page_id)?;
-        annots.retain(|object| {
-            object
-                .as_reference()
-                .map(|id| !plan.removed.contains(&id))
-                .unwrap_or(true)
+        let mut index = 0;
+        annots.retain(|_| {
+            let keep = !positions.contains(&index);
+            index += 1;
+            keep
         });
-    }
-
-    // A surviving annotation must not keep a link to an object that is no longer in the tree.
-    // Cascading already removes every reply and popup that depends on a deleted target, so this
-    // finds only a malformed file; it is still cheaper to clear the link than to leave a viewer
-    // following a dangling reference.
-    let mut remaining: BTreeSet<ObjectId> = BTreeSet::new();
-    for page_id in incremental.get_prev_documents().get_pages().values() {
-        remaining.extend(page_annotation_ids(
-            incremental.get_prev_documents(),
-            *page_id,
-        )?);
-    }
-    remaining.retain(|id| !plan.removed.contains(id));
-    for object_id in remaining {
-        let needs_clone = {
-            let dictionary = annotation_dictionary(incremental.get_prev_documents(), object_id)?;
-            [b"IRT".as_slice(), b"Popup".as_slice()].iter().any(|key| {
-                dictionary
-                    .get(key)
-                    .ok()
-                    .and_then(|object| object.as_reference().ok())
-                    .is_some_and(|target| plan.removed.contains(&target))
-            })
-        };
-        if !needs_clone {
-            continue;
-        }
-        incremental
-            .opt_clone_object_to_new_document(object_id)
-            .map_err(|error| lopdf_error("could not copy an annotation for link cleanup", error))?;
-        let dictionary = incremental
-            .new_document
-            .get_object_mut(object_id)
-            .map_err(|error| lopdf_error("the annotation is missing from the new revision", error))?
-            .as_dict_mut()
-            .map_err(|error| lopdf_error("the annotation is not a dictionary", error))?;
-        for key in [b"IRT".as_slice(), b"Popup".as_slice()] {
-            let removed = dictionary
-                .get(key)
-                .ok()
-                .and_then(|object| object.as_reference().ok())
-                .is_some_and(|target| plan.removed.contains(&target));
-            if removed {
-                dictionary.remove(key);
-            }
-        }
     }
     Ok(())
 }
 
+/// Whether the editor owns this annotation subtype.
+///
+/// A file may carry kinds this editor does not model (`/Link`, `/Widget`, `/Squiggly`, …). They
+/// still belong to the document, so naming one in an edit is a deliberate refusal: the problem is
+/// the kind, not that the annotation is missing.
+fn is_editable_subtype(subtype: Option<&str>) -> bool {
+    matches!(
+        subtype,
+        Some(
+            "Highlight"
+                | "Underline"
+                | "StrikeOut"
+                | "Text"
+                | "FreeText"
+                | "Ink"
+                | "Square"
+                | "Circle"
+                | "Line"
+                | "Stamp"
+        )
+    )
+}
+
 fn plan_updates<'a>(
-    annotations: &BTreeMap<ObjectId, AnnotationInfo>,
-    removed: &BTreeSet<ObjectId>,
+    annotations: &BTreeMap<AnnotationKey, AnnotationInfo>,
+    removed: &BTreeSet<AnnotationKey>,
     changes: &'a AnnotationChanges,
-) -> Result<Vec<(ObjectId, &'a AnnotationUpdate)>> {
+) -> Result<Vec<(AnnotationKey, &'a AnnotationUpdate)>> {
     let mut planned = Vec::with_capacity(changes.updates.len());
     let mut targets = BTreeSet::new();
     for update in &changes.updates {
-        let object_id = find_identity(annotations, &update.target)?;
-        if removed.contains(&object_id) {
+        let key = find_identity(annotations, &update.target)?;
+        if removed.contains(&key) {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
                 "an annotation cannot be both edited and deleted in one save",
             )
             .with_detail(update.target.clone()));
         }
-        if !targets.insert(object_id) {
+        if !targets.insert(key) {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
                 "the same annotation was edited twice in one save",
             )
             .with_detail(update.target.clone()));
         }
-        let info = &annotations[&object_id];
+        let info = &annotations[&key];
+        if !is_editable_subtype(info.subtype.as_deref()) {
+            return Err(LyraReaderError::new(
+                ErrorCode::UnsupportedFeature,
+                "this annotation is of a kind the editor cannot modify",
+            )
+            .with_detail(format!(
+                "{}: /{}",
+                update.target,
+                info.subtype.as_deref().unwrap_or("unknown")
+            )));
+        }
         if info.page != usize::try_from(update.values.page.get()).unwrap_or(usize::MAX) {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -636,23 +761,23 @@ fn plan_updates<'a>(
                 update.values.page.get()
             )));
         }
-        planned.push((object_id, update));
+        planned.push((key, update));
     }
     Ok(planned)
 }
 
 fn find_identity(
-    annotations: &BTreeMap<ObjectId, AnnotationInfo>,
+    annotations: &BTreeMap<AnnotationKey, AnnotationInfo>,
     target: &str,
-) -> Result<ObjectId> {
+) -> Result<AnnotationKey> {
     let mut found = Vec::new();
-    for (object_id, info) in annotations {
+    for (key, info) in annotations {
         if info.identity.as_deref() == Some(target) {
-            found.push(*object_id);
+            found.push(*key);
         }
     }
     match found.as_slice() {
-        [object_id] => Ok(*object_id),
+        [key] => Ok(*key),
         [] => Err(LyraReaderError::new(
             ErrorCode::NotFound,
             "the PDF does not contain the annotation this edit names",
@@ -670,16 +795,11 @@ fn find_identity(
 
 fn update_one(
     incremental: &mut IncrementalDocument,
-    object_id: ObjectId,
+    key: AnnotationKey,
     update: &AnnotationUpdate,
     font: Option<&EmbeddedFreeTextFont>,
 ) -> Result<()> {
-    let source = incremental
-        .get_prev_documents()
-        .get_object(object_id)
-        .and_then(Object::as_dict)
-        .map_err(|error| lopdf_error("could not read the annotation being edited", error))?
-        .clone();
+    let source = annotation_dictionary(incremental.get_prev_documents(), key)?.clone();
 
     let expected_subtype = update.values.kind.pdf_name();
     let actual_subtype = subtype(&source).unwrap_or_default();
@@ -713,17 +833,7 @@ fn update_one(
     let appearance = regenerate
         .then(|| add_appearance_object(&mut incremental.new_document, &update.values, font));
 
-    incremental
-        .opt_clone_object_to_new_document(object_id)
-        .map_err(|error| {
-            lopdf_error("could not copy the annotation into the new revision", error)
-        })?;
-    let dictionary = incremental
-        .new_document
-        .get_object_mut(object_id)
-        .map_err(|error| lopdf_error("the edited annotation is missing", error))?
-        .as_dict_mut()
-        .map_err(|error| lopdf_error("the edited annotation is not a dictionary", error))?;
+    let dictionary = annotation_dictionary_mut(incremental, key)?;
 
     dictionary.set("C", colour_array(update.values.color));
     dictionary.set("CA", Object::Real(update.values.opacity as f32));
@@ -1102,32 +1212,61 @@ pub(crate) fn verify_changes(
     let saved_annotations = collect_annotations(&saved_document)?;
     let removal = plan_removal(&source_document, &source_annotations, &changes.deletions)?;
 
-    // Nothing removed may still be reachable, and nothing reachable may point at it.
-    for page_id in saved_document.get_pages().values() {
-        for object_id in page_annotation_ids(&saved_document, *page_id)? {
-            if removal.removed.contains(&object_id) {
+    // A deleted inline annotation is matched by identity: removing one array entry shifts the
+    // positions of the entries after it, so a survivor can inherit the removed entry's old key.
+    // Indirect annotations keep their object id through both an incremental update and a full
+    // rewrite, so an object id remains the precise key for them.
+    let removed_inline_identities: BTreeSet<&str> = removal
+        .removed
+        .iter()
+        .filter(|key| matches!(key, AnnotationKey::Inline { .. }))
+        .filter_map(|key| removal.all.get(key))
+        .filter_map(|info| info.identity.as_deref())
+        .collect();
+
+    // Nothing removed may still be reachable, and nothing reachable may point at it. Both the
+    // indirect and the inline forms are in the map, so a deletion cannot silently leave one form
+    // behind while the other disappears.
+    for (key, info) in &saved_annotations {
+        let still_present = match key {
+            AnnotationKey::Object(_) => removal.removed.contains(key),
+            AnnotationKey::Inline { .. } => info
+                .identity
+                .as_deref()
+                .is_some_and(|identity| removed_inline_identities.contains(identity)),
+        };
+        if still_present {
+            return Err(verification(
+                "a deleted annotation is still in a page's /Annots",
+                info.identity.clone().unwrap_or_else(|| format!("{key:?}")),
+            ));
+        }
+        let dictionary = annotation_dictionary(&saved_document, *key)?;
+        for name in [b"IRT".as_slice(), b"Popup".as_slice()] {
+            if let Ok(target) = dictionary.get(name).and_then(Object::as_reference)
+                && removal.removed.contains(&AnnotationKey::Object(target))
+            {
                 return Err(verification(
-                    "a deleted annotation is still in a page's /Annots",
-                    format!("{object_id:?}"),
+                    "an annotation still points at a deleted annotation",
+                    format!("{key:?} /{name:?} -> {target:?}"),
                 ));
-            }
-            let dictionary = annotation_dictionary(&saved_document, object_id)?;
-            for key in [b"IRT".as_slice(), b"Popup".as_slice()] {
-                if let Ok(target) = dictionary.get(key).and_then(Object::as_reference)
-                    && removal.removed.contains(&target)
-                {
-                    return Err(verification(
-                        "an annotation still points at a deleted annotation",
-                        format!("{object_id:?} /{key:?} -> {target:?}"),
-                    ));
-                }
             }
         }
     }
 
-    // Untouched annotations are semantically identical, key by key.
-    for (object_id, info) in &source_annotations {
-        if removal.removed.contains(object_id) {
+    // Untouched annotations are semantically identical, key by key. They are matched by identity
+    // for the same reason as the removal check: an inline survivor's array position can change.
+    // A file may carry two identical unnamed annotations (the sample has two such popups), so a
+    // fingerprint may name more than one entry; any of them is the same value to compare.
+    let mut saved_by_identity: BTreeMap<&str, Vec<AnnotationKey>> = BTreeMap::new();
+    for (key, info) in &saved_annotations {
+        if let Some(identity) = info.identity.as_deref() {
+            saved_by_identity.entry(identity).or_default().push(*key);
+        }
+    }
+    let mut matched_saved: BTreeSet<AnnotationKey> = BTreeSet::new();
+    for (key, info) in &source_annotations {
+        if removal.removed.contains(key) {
             continue;
         }
         let updated = changes
@@ -1137,14 +1276,27 @@ pub(crate) fn verify_changes(
         if updated.is_some() {
             continue;
         }
-        let before = annotation_dictionary(&source_document, *object_id)?;
-        let after = annotation_dictionary(&saved_document, *object_id)?;
-        if before != after {
+        let before = annotation_dictionary(&source_document, *key)?;
+        let candidates: Vec<AnnotationKey> = match info.identity.as_deref() {
+            Some(identity) => saved_by_identity.get(identity).cloned().unwrap_or_default(),
+            None => vec![*key],
+        };
+        let mut matched = false;
+        for saved_key in candidates {
+            if matched_saved.contains(&saved_key) {
+                continue;
+            }
+            let after = annotation_dictionary(&saved_document, saved_key)?;
+            if dictionaries_equivalent(before, after) {
+                matched_saved.insert(saved_key);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
             return Err(verification(
-                "an annotation the save did not edit changed",
-                info.identity
-                    .clone()
-                    .unwrap_or_else(|| format!("{object_id:?}")),
+                "an annotation the save did not edit changed or disappeared",
+                info.identity.clone().unwrap_or_else(|| format!("{key:?}")),
             ));
         }
     }
@@ -1160,7 +1312,7 @@ pub(crate) fn verify_changes(
 
 fn find_saved_annotation<'a>(
     document: &'a Document,
-    annotations: &'a BTreeMap<ObjectId, AnnotationInfo>,
+    annotations: &'a BTreeMap<AnnotationKey, AnnotationInfo>,
     update: &AnnotationUpdate,
 ) -> Result<&'a Dictionary> {
     let expected = if update.target.starts_with("nm:") {
@@ -1177,13 +1329,13 @@ fn find_saved_annotation<'a>(
                 )
             })?
     };
-    let object_id = find_identity(annotations, &expected).map_err(|_| {
+    let key = find_identity(annotations, &expected).map_err(|_| {
         verification(
             "the edited annotation is not in the saved file under its expected identity",
             format!("{} -> {expected}", update.target),
         )
     })?;
-    annotation_dictionary(document, object_id)
+    annotation_dictionary(document, key)
 }
 
 fn verify_update(
@@ -1202,7 +1354,11 @@ fn verify_update(
         if owned_key(key) {
             continue;
         }
-        if after.get(key).ok() != Some(value) {
+        if !after
+            .get(key)
+            .ok()
+            .is_some_and(|after| objects_equivalent(value, after))
+        {
             return Err(fail(format!(
                 "{}: /{} changed or disappeared",
                 update.target,
@@ -1492,6 +1648,48 @@ fn colour_of(object: &Object) -> Option<[u8; 3]> {
         *slot = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     Some(channels)
+}
+
+/// Whether two objects are the same PDF value.
+///
+/// The full rewrite path (a deletion) saves the document through lopdf, whose writer renders a
+/// `Real` with no fractional part as a bare integer; reading the result back then yields
+/// `Integer`. `/C [1 0.384308 0]` is the same colour either way, so the untouched-key proof must
+/// compare numbers by value instead of by variant. Every other difference still fails.
+fn objects_equivalent(left: &Object, right: &Object) -> bool {
+    match (left, right) {
+        (Object::Integer(integer), Object::Real(real))
+        | (Object::Real(real), Object::Integer(integer)) => {
+            real.is_finite()
+                && real.fract() == 0.0
+                && real.abs() <= i64::MAX as f32
+                && *integer == *real as i64
+        }
+        (Object::Array(left), Object::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| objects_equivalent(left, right))
+        }
+        (Object::Dictionary(left), Object::Dictionary(right)) => {
+            dictionaries_equivalent(left, right)
+        }
+        (Object::Stream(left), Object::Stream(right)) => {
+            left.content == right.content && dictionaries_equivalent(&left.dict, &right.dict)
+        }
+        _ => left == right,
+    }
+}
+
+fn dictionaries_equivalent(left: &Dictionary, right: &Dictionary) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, value)| {
+            right
+                .get(key)
+                .ok()
+                .is_some_and(|other| objects_equivalent(value, other))
+        })
 }
 
 fn verification(message: &str, detail: String) -> LyraReaderError {
