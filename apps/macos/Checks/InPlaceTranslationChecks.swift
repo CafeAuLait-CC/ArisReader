@@ -257,7 +257,7 @@ extension ReaderChecks {
         overlay.update(overlays: [], frames: frames, zoom: 1, scrollYPt: 0,
                        contentWidthPt: 600, paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let beforeRep = bitmapRep(host)
+        let beforeRep = bitmapRepAtOneX(host)
         let before = bitmapBytes(host)
         let block = CGRect(x: 100, y: 80, width: 220, height: 60)
         let cover = TranslationOverlay(
@@ -268,7 +268,7 @@ extension ReaderChecks {
         overlay.update(overlays: [cover], frames: frames, zoom: 1, scrollYPt: 0,
                        contentWidthPt: 600, paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let coveredRep = bitmapRep(host)
+        let coveredRep = bitmapRepAtOneX(host)
         let covered = bitmapBytes(host)
         guard let before, let covered, let coveredRep, let beforeRep else {
             fatalError("The pixel check could not rasterize its host view")
@@ -295,7 +295,7 @@ extension ReaderChecks {
             frames: frames, zoom: 1, scrollYPt: 0, contentWidthPt: 600,
             paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let originalRep = bitmapRep(host)
+        let originalRep = bitmapRepAtOneX(host)
         require(originalRep != nil && redPixelCount(originalRep!) == 0,
                 "Show original paints no cover pixel over the block")
         require(originalRep != nil && regionMatches(beforeRep, originalRep!, in: block),
@@ -308,11 +308,14 @@ extension ReaderChecks {
                 "Show original restores every page pixel exactly, with no residual cover")
     }
 
+    /// Rasterizes the whole view at a defined 1× scale.
+    ///
+    /// The comparison still covers every point of the view; only the device-pixel density is
+    /// pinned, so rectangles given in points address the same pixels on every display.
+    /// `bitmapImageRepForCachingDisplay` follows the host's backing scale, which made the
+    /// pixel counts 4× too large on a Retina machine and let the counts depend on the runner.
     @MainActor
-    private static func bitmapRep(_ view: NSView) -> NSBitmapImageRep? {
-        // Cache at 1× so rectangles given in points address the same pixels on every display.
-        // `bitmapImageRepForCachingDisplay` follows the host's backing scale, which made the
-        // pixel counts 4× too large on a Retina machine.
+    private static func bitmapRepAtOneX(_ view: NSView) -> NSBitmapImageRep? {
         let width = max(1, Int(view.bounds.width.rounded()))
         let height = max(1, Int(view.bounds.height.rounded()))
         guard let rep = NSBitmapImageRep(
@@ -327,7 +330,7 @@ extension ReaderChecks {
 
     @MainActor
     private static func bitmapBytes(_ view: NSView) -> Data? {
-        guard let rep = bitmapRep(view), let bytes = rep.bitmapData else { return nil }
+        guard let rep = bitmapRepAtOneX(view), let bytes = rep.bitmapData else { return nil }
         return Data(bytes: bytes, count: rep.bytesPerRow * rep.pixelsHigh)
     }
 
@@ -804,12 +807,12 @@ extension ReaderChecks {
         overlay.update(overlays: [], frames: tornFrames, zoom: 1, scrollYPt: 0,
                        contentWidthPt: 400, paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let beforeRep = bitmapRep(host)
+        let beforeRep = bitmapRepAtOneX(host)
         let before = bitmapBytes(host)
         overlay.update(overlays: overlays, frames: tornFrames, zoom: 1, scrollYPt: 0,
                        contentWidthPt: 400, paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let coveredRep = bitmapRep(host)
+        let coveredRep = bitmapRepAtOneX(host)
         guard let before, let coveredRep, let beforeRep else {
             fatalError("The torn pixel check could not rasterize its host")
         }
@@ -820,7 +823,7 @@ extension ReaderChecks {
         overlay.update(overlays: original, frames: tornFrames, zoom: 1, scrollYPt: 0,
                        contentWidthPt: 400, paperAppearance: .original)
         host.layoutSubtreeIfNeeded()
-        let originalRep = bitmapRep(host)
+        let originalRep = bitmapRepAtOneX(host)
         require(originalRep != nil && redPixelCount(originalRep!) == 0,
                 "Show original paints no cover into either paper piece")
         overlay.update(overlays: [], frames: tornFrames, zoom: 1, scrollYPt: 0,
@@ -829,7 +832,7 @@ extension ReaderChecks {
         let restored = bitmapBytes(host)
         require(restored == before,
                 "Show original restores the torn page exactly, including the gap")
-        if let restoredRep = bitmapRep(host) {
+        if let restoredRep = bitmapRepAtOneX(host) {
             require(regionMatches(beforeRep, restoredRep, in: gap),
                     "the card's gap is unchanged by the overlay")
         }
@@ -1047,7 +1050,7 @@ extension ReaderChecks {
         textOverlay.update(overlays: [textCover], frames: onScreen, zoom: 1, scrollYPt: 0,
                            contentWidthPt: 500, paperAppearance: .original)
         textHost.layoutSubtreeIfNeeded()
-        if let rep = bitmapRep(textHost) {
+        if let rep = bitmapRepAtOneX(textHost) {
             require(darkPixelCount(rep, in: textRect) > 20,
                     "the translated words are drawn inside the block, not only a cover")
         } else {
