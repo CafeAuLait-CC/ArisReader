@@ -169,12 +169,13 @@ fn fingerprint(bytes: &[u8]) -> String {
 pub fn inspect_content(source: &Path, page_index: u32) -> Result<ContentPage> {
     let bytes = fs::read(source).map_err(pdf_error)?;
     let pdfium = pdfium_instance()?;
+    let frames = layout::frames(&bytes, page_index)?;
     let mut snapshot = {
         let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let doc = pdfium
             .load_pdf_from_byte_slice(&bytes, None)
             .map_err(pdf_error)?;
-        inspect_open(&doc, page_index, fingerprint(&bytes))?
+        inspect_open(&doc, page_index, fingerprint(&bytes), &frames)?
     };
     links::append(source, page_index, &mut snapshot)?;
     layout::apply(&bytes, &mut snapshot)?;
@@ -183,7 +184,12 @@ pub fn inspect_content(source: &Path, page_index: u32) -> Result<ContentPage> {
     Ok(snapshot)
 }
 
-fn inspect_open(doc: &PdfDocument<'_>, index: u32, revision: String) -> Result<ContentPage> {
+fn inspect_open(
+    doc: &PdfDocument<'_>,
+    index: u32,
+    revision: String,
+    frames: &[layout::Frame],
+) -> Result<ContentPage> {
     let page = doc
         .pages()
         .get(index.try_into().map_err(pdf_error)?)
@@ -209,7 +215,11 @@ fn inspect_open(doc: &PdfDocument<'_>, index: u32, revision: String) -> Result<C
     for item in &mut items {
         item.bounds = sheet.apply_rect(item.bounds.rect()).into();
     }
+    // Edited frames retain their own line identities, even when their new height touches a
+    // neighbouring paragraph. Otherwise spatial grouping merges the two on the next click.
+    let framed = layout::take_frames(&mut items, frames, sheet);
     group_paragraphs(&mut items);
+    items.extend(framed);
     let inverse = sheet
         .inverse()
         .ok_or_else(|| failure("The page transform is singular."))?;
@@ -524,9 +534,27 @@ pub fn edit_content(
         )?;
         return Ok(());
     }
-    let built = build_revision(&bytes, page_index, command, item)?;
+    // The writer can grow a text frame while keeping its top and wrapping width stable.
+    // Persist and verify that actual frame, rather than the original ink-sized rectangle.
+    let mut fitted_command = command.clone();
+    let mut written_lines = Vec::new();
+    let built = build_revision(
+        &bytes,
+        page_index,
+        &mut fitted_command,
+        item,
+        &mut written_lines,
+    )?;
+    let command = &fitted_command;
+    let new = match command {
+        ContentCommand::ReplaceText { bounds, .. } | ContentCommand::InsertText { bounds, .. } => {
+            Some(*bounds)
+        }
+        _ => new,
+    };
+    let allowed = new.map_or(allowed, |bounds| allowed.union(bounds));
     let mut parsed = lopdf::Document::load_mem(&built).map_err(pdf_error)?;
-    layout::update(&mut parsed, page_index, command, item)?;
+    layout::update(&mut parsed, page_index, command, item, &written_lines)?;
     parsed.prune_objects();
     let mut output = Vec::new();
     parsed.save_to(&mut output).map_err(pdf_error)?;
@@ -544,28 +572,27 @@ pub fn edit_content(
             if let ContentCommand::ReplaceText { text, .. }
             | ContentCommand::InsertText { text, .. } = command
             {
-                let backend = crate::PdfiumBackend::open(saved, None)?;
-                let actual: String = backend
-                    .raw_text_page(PageIndex(page_index))?
-                    .chars
-                    .iter()
-                    .filter(|c| {
-                        new.is_some_and(|r| {
-                            c.origin.x >= r.x - 2.0
-                                && c.origin.x <= r.right() + 2.0
-                                && c.origin.y >= r.y - 2.0
-                                && c.origin.y <= r.top() + 2.0
-                        })
-                    })
-                    .filter_map(|c| char::from_u32(c.unicode))
-                    .collect();
                 let compact = |s: &str| {
                     s.chars()
                         .filter(|c| !c.is_whitespace())
                         .map(|c| if c == '\u{2}' { '-' } else { c })
                         .collect::<String>()
                 };
-                if !compact(&actual).contains(&compact(text)) {
+                // Verify the independently extracted frame, not every glyph inside its
+                // rectangle: a growing frame can overlap a neighbour, whose glyphs otherwise
+                // interleave with the requested words and falsely look like font corruption.
+                let reopened = inspect_content(saved, page_index)?;
+                let requested = compact(text);
+                if !requested.is_empty()
+                    && !reopened.items.iter().any(|item| {
+                        item.kind == "text"
+                            && compact(&item.text) == requested
+                            && new.is_some_and(|r| {
+                                (item.bounds.x - r.x).abs() < 4.0
+                                    && (item.bounds.top() - r.top()).abs() < 4.0
+                            })
+                    })
+                {
                     return Err(failure(
                         "The original font cannot encode this text. Choose an installed editor font and try again.",
                     ));
@@ -580,12 +607,13 @@ pub fn edit_content(
 fn build_revision(
     bytes: &[u8],
     index: u32,
-    command: &ContentCommand,
+    command: &mut ContentCommand,
     item: Option<&ContentItem>,
+    written_lines: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
     if let Some(group) = item.filter(|i| i.id.starts_with("group:")) {
         let (bytes, item) = flat::materialize(bytes, index, group)?;
-        return build_revision(&bytes, index, command, Some(&item));
+        return build_revision(&bytes, index, command, Some(&item), written_lines);
     }
     if let ContentCommand::CropImage { crop, .. } = command
         && let Some(item) = item.filter(|i| i.kind == "graphic")
@@ -728,15 +756,31 @@ fn build_revision(
                     "The editor font does not contain every character. Choose another font or simplify this text.",
                 ));
             }
-            let objects = layout_text(
+            let mut text_bounds: ContentBox = sheet.apply_rect(bounds.rect()).into();
+            let (objects, lines) = layout_text(
                 &doc,
                 text,
-                sheet.apply_rect(bounds.rect()).into(),
+                &mut text_bounds,
                 token,
                 *size,
                 *colour,
                 *alignment,
             )?;
+            *written_lines = lines;
+            // Sheet Y points upwards; the page's visible bottom is -height. Text stays
+            // editable in the native draft when it reaches that edge instead of disappearing
+            // into an off-page PDF object.
+            let page_height = crate::backend::page_geometry(&page).view_size(1.0).height;
+            if text_bounds.y < -page_height - 1.0 {
+                return Err(failure(
+                    "This text reaches the page edge. Widen the frame or reduce the font size; your draft is preserved.",
+                ));
+            }
+            *bounds = sheet
+                .inverse()
+                .unwrap()
+                .apply_rect(text_bounds.rect())
+                .into();
             if let Some(item) = item {
                 remove_top_level(&mut page, &item.paths)?;
             }
@@ -1108,12 +1152,12 @@ fn choose_font(doc: &mut PdfDocument<'_>, name: &str) -> Result<PdfFontToken> {
 fn layout_text<'a>(
     doc: &PdfDocument<'a>,
     text: &str,
-    bounds: ContentBox,
+    bounds: &mut ContentBox,
     font: PdfFontToken,
     size: f64,
     colour: [u8; 4],
     alignment: u8,
-) -> Result<Vec<PdfPageTextObject<'a>>> {
+) -> Result<(Vec<PdfPageTextObject<'a>>, Vec<String>)> {
     if !size.is_finite()
         || !(1.0..=512.0).contains(&size)
         || text.chars().count() > 100_000
@@ -1122,7 +1166,7 @@ fn layout_text<'a>(
         return Err(failure("The text style or text length is invalid."));
     }
     if text.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     if text
         .chars()
@@ -1170,10 +1214,11 @@ fn layout_text<'a>(
         lines.push(line);
     }
     let leading = size * 1.2;
-    if size + (lines.len().saturating_sub(1) as f64) * leading > bounds.height + size * 0.3 {
-        return Err(failure(
-            "The edited text exceeds this block. Enlarge the block or reduce its font size.",
-        ));
+    let required = size + (lines.len().saturating_sub(1) as f64) * leading;
+    if required > bounds.height {
+        let top = bounds.top();
+        bounds.height = required;
+        bounds.y = top - required;
     }
     let mut objects = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -1200,7 +1245,10 @@ fn layout_text<'a>(
             .map_err(pdf_error)?;
         objects.push(object);
     }
-    Ok(objects)
+    Ok((
+        objects,
+        lines.into_iter().filter(|line| !line.is_empty()).collect(),
+    ))
 }
 
 /// A changed shared form, leaked graphics state or moved neighbour is a failed transaction,

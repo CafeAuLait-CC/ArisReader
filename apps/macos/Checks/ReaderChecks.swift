@@ -64,6 +64,10 @@ struct ReaderChecks {
         AppState.usesStoredSidePanelPreferences = false
 
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-feedback-editing") {
+            try await feedbackEditingChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-document-cache") {
             try await documentCacheChecks(root: fastRoot)
             return

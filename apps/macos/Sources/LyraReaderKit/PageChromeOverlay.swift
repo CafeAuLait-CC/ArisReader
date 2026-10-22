@@ -17,6 +17,7 @@ package enum PageChromeGeometry {
 
 /// A transparent layer above Metal, below annotations. Its shadow is masked out of paper interiors.
 package final class PageChromeOverlayView: NSView {
+    package private(set) var pageRectangles: [CGRect] = []
     private let edges = CAShapeLayer()
     private let shadows = CALayer()
     private let outsidePaper = CAShapeLayer()
@@ -40,6 +41,7 @@ package final class PageChromeOverlayView: NSView {
                         scrollYPt: CGFloat, scale: CGFloat) {
         let rects = PageChromeGeometry.rectangles(frames: frames, viewport: bounds.size,
             contentWidthPt: contentWidthPt, zoom: zoom, scrollYPt: scrollYPt)
+        pageRectangles = rects
         let lineWidth = 1 / max(1, scale)
         let edgePath = CGMutablePath()
         let paperPath = CGMutablePath()

@@ -90,7 +90,7 @@ public enum ReaderShortcuts {
     public static let toggleAIPanelModifiers: EventModifiers = [.command, .shift]
 }
 
-/// The right-hand panel as a sliding overlay on the reader canvas.
+/// A sliding right-hand column beside the reader canvas.
 ///
 /// It is deliberately generic: the AI assistant is its first tenant, but the host knows nothing
 /// about the assistant's model, its settings or its request state. The content is laid out once

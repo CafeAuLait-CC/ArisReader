@@ -82,6 +82,13 @@ extension ReaderChecks {
             state.closeDocumentNote()
             host.layoutSubtreeIfNeeded()
             guard let canvas = canvas(in: host) else { fatalError("FAIL: missing canvas") }
+            try await eventually("the hosted viewport and canvas have applied their layout", {
+                host.layoutSubtreeIfNeeded()
+                let width = canvas.enclosingScrollView?.contentView.bounds.width ?? canvas.bounds.width
+                return abs(state.canvasViewportWidthPt - width) < 0.5
+                    && abs(canvas.zoom - state.zoomFactor) < 0.001
+                    && abs(canvas.scrollYPt - state.scrollYPt) < 0.001
+            })
             // The toolbar and sidebar determine the real canvas viewport. Compute the click
             // anchor after hosting/layout, rather than using the provisional 1000pt viewport.
             guard let marker = state.inlineNoteMarkers.first(where: { $0.id == first.id }),

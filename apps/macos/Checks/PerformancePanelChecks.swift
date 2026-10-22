@@ -213,9 +213,10 @@ extension ReaderChecks {
         require(!state.performancePanel.isSamplingTaskRunning,
                 "no sampling task runs while the panel has never been opened")
 
-        // Open and close without touching the document. The panel's own work must not move the
-        // counters the reader already had: this is the closed-panel cost evidence.
-        let beforePanel = harness.existingCounters()
+        // The panel now reserves viewport width, so opening it legitimately submits layout
+        // frames. It must preserve the reading position and stop all work once layout settles.
+        let scrollBeforePanel = state.scrollYPt
+        let zoomBeforePanel = state.zoomFactor
         state.togglePerformancePanel()
         require(state.performancePanelVisible, "the menu action opens the performance panel")
         require(state.performancePanel.isSampling && state.performancePanel.isSamplingTaskRunning,
@@ -226,8 +227,13 @@ extension ReaderChecks {
         require(!state.performancePanel.isSamplingTaskRunning,
                 "closing the panel leaves no sampling task behind")
         require(!state.performanceProbe.isSampling, "closing the panel disables the frame probe")
-        require(harness.existingCounters() == beforePanel,
-                "opening and closing the panel changes none of the existing counters")
+        require(state.scrollYPt == scrollBeforePanel && state.zoomFactor == zoomBeforePanel,
+                "opening and closing the panel preserves the reading position and zoom")
+        try await Task.sleep(for: .milliseconds(600))
+        let afterPanelLayout = harness.existingCounters()
+        try await Task.sleep(for: .milliseconds(700))
+        require(harness.existingCounters() == afterPanelLayout,
+                "closing the panel stops counter changes after the viewport settles")
         require(!state.performanceProbe.wantsFrameSamples,
                 "after the one-shot open measurement no per-frame sampling remains")
 

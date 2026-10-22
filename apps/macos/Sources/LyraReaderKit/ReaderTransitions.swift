@@ -16,7 +16,7 @@ public enum ReaderChrome {
     /// The indicator is a sibling of the canvas rather than an overlay, so this strip is real
     /// layout: the page, Fit Width and the pointer anchor all use the canvas width *without* it,
     /// and the right panel starts after it. The lane is only present while a document is open.
-    public static let scrollIndicatorLaneWidthPt: CGFloat = 18
+    public static let scrollIndicatorLaneWidthPt: CGFloat = 13
 
     /// Everything the layout puts between the canvas and the window's trailing edge.
     ///
@@ -56,11 +56,13 @@ public struct ReaderTransitionProgress: Equatable, Sendable {
     public var row: Double?
     /// 0 is closed, 1 is the full right panel. `nil` means "use `isVisible` and animate normally".
     public var panel: Double?
+    public var editingPanel: Double?
 
-    public init(sidebar: Double? = nil, row: Double? = nil, panel: Double? = nil) {
+    public init(sidebar: Double? = nil, row: Double? = nil, panel: Double? = nil, editingPanel: Double? = nil) {
         self.sidebar = sidebar
         self.row = row
         self.panel = panel
+        self.editingPanel = editingPanel
     }
 }
 

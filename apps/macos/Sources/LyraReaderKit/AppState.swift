@@ -449,11 +449,13 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public var contentLinkDraft: CGRect?
     @Published public var contentTextEditing = false
     @Published public var contentTextRecovery: String?
+    @Published public private(set) var contentTextNotice: String?
     @Published public private(set) var contentCommandInFlight = false
     @Published public var contentCloseRequested = false
     private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
     private var pendingContentClose: Int?
     var commitContentText: (() -> Void)?
+    private var pendingWindowCloseAction: (() -> Void)?
     private var contentEditTask: Task<Bool,Never>?
     private var contentLoadToken = UUID()
 
@@ -2802,6 +2804,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var metadataLoadCompleted: Bool
         var formInfo: FormInfo
         var formDraft: [String: FormFieldValue]
+        var formHasPendingChanges: Bool
         var formToolActive: Bool
         var formLoadCompleted: Bool
         var formError: String?
@@ -4056,6 +4059,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// on the expected width after the layout settles.
     public var canvasViewportWidthPt: CGFloat { viewportSizePt.width }
 
+    private var horizontalViewportOrigin: CGFloat = 0
+    public func setHorizontalViewportOrigin(_ origin: CGFloat) {
+        guard abs(origin - horizontalViewportOrigin) > 0.5 else { return }
+        horizontalViewportOrigin = max(0, origin)
+        scheduleViewportReload()
+    }
+
     /// Opens or closes the right-hand panel.
     ///
     /// Opening it leaves page overview: the assistant is a reading surface and the overview
@@ -4065,6 +4075,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if rightPanelVisible {
             rightPanelVisible = false
         } else {
+            if contentEditEnabled {
+                if deferContentTransition({ [weak self] in self?.toggleRightPanel() }) { return }
+                contentEditEnabled = false
+            }
             pageOverviewVisible = false
             // Both live in the same right-hand slot, so opening one closes the other rather
             // than drawing two drawers on top of each other.
@@ -6820,12 +6834,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var undoStack: [UndoableAction] = []
     @Published public private(set) var redoStack: [UndoableAction] = []
 
-    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty) }
-    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty) }
+    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (canUndoPageEdit || !undoStack.isEmpty) }
+    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (canRedoPageEdit || !redoStack.isEmpty) }
 
     public func undo() {
         if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.undo();return}
-        if contentEditEnabled { undoPageEdit(); return }
+        if canUndoPageEdit && (contentEditEnabled || undoStack.isEmpty) { undoPageEdit(); return }
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -6877,7 +6891,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func redo() {
         if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo();return}
-        if contentEditEnabled { redoPageEdit(); return }
+        if canRedoPageEdit && (contentEditEnabled || redoStack.isEmpty) { redoPageEdit(); return }
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -7847,6 +7861,46 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canSaveDocument: Bool {
         document != nil && !pageEditBusy && !annotationSaveInProgress &&
             (canSaveAnnotationsToPDF || canSavePageEditsCopy || contentCommandInFlight)
+    }
+
+    public var hasUnsavedDocumentChanges: Bool {
+        pageEditHasPendingChanges || contentTextEditing || contentTextRecovery != nil
+            || annotationCacheIsDirty || hasPendingInkErasure || hasPendingFileDeletions
+            || formHasPendingChanges || !pendingRedactions.isEmpty
+    }
+
+    public func tabHasUnsavedChanges(_ index: Int) -> Bool {
+        guard tabs.indices.contains(index) else { return false }
+        if index == activeTabIndex { return hasUnsavedDocumentChanges }
+        guard let saved = retainedTabs[tabs[index].id]?.state else { return false }
+        return !saved.pageEditPendingOperations.isEmpty || saved.annotationCacheIsDirty
+            || !saved.erasedInkStrokeIDs.isEmpty || !saved.pendingFileDeletions.isEmpty
+            || !saved.pendingRedactions.isEmpty || saved.formHasPendingChanges
+    }
+
+    public var closeRequiresReview: Bool {
+        formHasPendingChanges || !pendingRedactions.isEmpty
+    }
+
+    public var closeChangesMessage: String {
+        if closeRequiresReview {
+            return "Form values and pending redaction marks need their dedicated save or apply command. Review them before closing, or discard the changes."
+        }
+        return isReadOnlyDocument
+            ? "Save an unsigned copy to keep these changes."
+            : "Save these changes to the original PDF before closing."
+    }
+
+    public func reviewChangesBeforeClosing() {
+        cancelContentClose()
+        contentEditEnabled = false
+        if formHasPendingChanges {
+            if !formToolActive { toggleFormTool() }
+            statusMessage = "Save the filled form before closing"
+        } else {
+            if annotationTool != .redact { toggleRedactionTool() }
+            statusMessage = "Apply or clear the pending redaction marks before closing"
+        }
     }
 
     public func saveDocument() {
@@ -12219,8 +12273,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
         if deferContentTransition({[weak self] in self?.closeTab(index)}) {return}
-        if index != activeTabIndex, retainedTabs[tabs[index].id]?.state.pageEditSession?.operations.isEmpty == false {selectTab(index)}
-        if index == activeTabIndex, pageEditSession?.operations.isEmpty == false {
+        if index != activeTabIndex, tabHasUnsavedChanges(index) {
+            selectTab(index)
+            guard activeTabIndex == index else { return }
+        }
+        if index == activeTabIndex, hasUnsavedDocumentChanges {
+            flushPendingWrites()
             pendingContentClose=index;contentCloseRequested=true;return
         }
         if index == activeTabIndex {
@@ -12364,6 +12422,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             metadataLoadCompleted: metadataLoadCompleted,
             formInfo: formInfo,
             formDraft: formDraft,
+            formHasPendingChanges: formHasPendingChanges,
             formToolActive: formToolActive,
             formLoadCompleted: formLoadCompleted,
             formError: formError,
@@ -12569,7 +12628,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func trimRetainedDocuments() {
         while retainedDocumentCount > Self.maximumRetainedDocuments {
             let victim = retainedTabs.values
-                .filter { $0.state.pageEditSession == nil }
+                .filter { $0.state.pageEditSession == nil && !$0.state.annotationCacheIsDirty
+                    && $0.state.pendingFileDeletions.isEmpty && $0.state.erasedInkStrokeIDs.isEmpty
+                    && !$0.state.formHasPendingChanges && $0.state.pendingRedactions.isEmpty }
                 .min { $0.lastUsed < $1.lastUsed }
             guard let victim else { return }
             retainedTabs.removeValue(forKey: victim.tabID)
@@ -13274,7 +13335,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let zoom = max(zoomFactor, 0.01)
         let centreOffsetPt = max(0, (viewportSizePt.width - contentWidthPt * zoomFactor) / 2)
         return CGRect(
-            x: -centreOffsetPt / zoom,
+            x: (horizontalViewportOrigin - centreOffsetPt) / zoom,
             y: scrollYPt,
             width: max(1, viewportSizePt.width) / zoom,
             height: viewportHeight
@@ -14731,7 +14792,11 @@ extension AppState {
     public func toggleContentEditing() {
         if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
         contentEditEnabled.toggle()
-        if contentEditEnabled { pageOverviewVisible = false }
+        if contentEditEnabled {
+            pageOverviewVisible = false
+            rightPanelVisible = false
+            performancePanelVisible = false
+        }
         annotationTool = .select
         annotationToolsVisible = false
         contentEditSelection = nil
@@ -14919,7 +14984,12 @@ extension AppState {
             contentTextRecovery = text
             contentEditEnabled = true
         }
-        lastError = message
+        if command.action == "replaceText" {
+            contentTextNotice = message
+            statusMessage = "Text draft preserved · see the Edit sidebar"
+        } else {
+            lastError = message
+        }
     }
 
     public func retryContentText(font: String) {
@@ -14954,13 +15024,14 @@ extension AppState {
     }
     public func discardContentTextRecovery() {
         contentTextRecovery = nil
+        contentTextNotice = nil
         contentRecoveryCommand = nil
         contentEditTask = nil
     }
 
     private func deferContentTransition(_ action: @escaping @MainActor () -> Void) -> Bool {
         guard contentTextRecovery == nil else {
-            lastError = "Finish or discard the recovered text draft before leaving this document."
+            contentTextNotice = "Finish or discard the recovered text draft before leaving this document."
             return true
         }
         let hadDraft = contentTextEditing
@@ -14975,15 +15046,50 @@ extension AppState {
     public func cancelContentClose() {
         contentCloseRequested = false
         pendingContentClose = nil
+        pendingWindowCloseAction = nil
     }
+
+    /// Called by the native red close button. Continue through the same document close sheet
+    /// after saving/discarding each dirty tab; cancelling keeps the window and its work open.
+    public func prepareWindowClose(continueClosing: @escaping () -> Void) -> Bool {
+        if deferContentTransition({ [weak self] in
+            if self?.prepareWindowClose(continueClosing: continueClosing) == true { continueClosing() }
+        }) { return false }
+        guard let dirty = tabs.indices.first(where: { tabHasUnsavedChanges($0) }) else { return true }
+        pendingWindowCloseAction = continueClosing
+        closeTab(dirty)
+        return false
+    }
+
     public func discardContentAndClose() {
         guard let index = pendingContentClose else { return }
+        let continueClosing = pendingWindowCloseAction
         cancelContentClose()
         discardPageEdits()
+        flushPendingWrites()
+        guard writeAnnotationRecords(annotations: [], bookmarks: [],
+            slots: annotationRecordSlots.filter {
+                if case .annotation = $0 { return false }
+                if case .bookmark = $0 { return false }
+                return true
+            }, trigger: "saved-to-pdf") else {
+            lastError = "Could not clear the saved annotation draft. The document is still open."
+            return
+        }
+        annotationCacheIsDirty = false
+        pendingFileDeletions = []
+        erasedInkStrokeIDs = []
+        pendingRedactions = []
+        formDraft = [:]
+        undoStack = []
+        redoStack = []
+        persistPendingAnnotationState()
         closeTab(index)
+        continueClosing?()
     }
     public func saveContentAndClose() {
         guard let index = pendingContentClose else { return }
+        guard !closeRequiresReview else { reviewChangesBeforeClosing(); return }
         contentCloseRequested = false
         var destination: URL?
         if isReadOnlyDocument {
@@ -14999,14 +15105,21 @@ extension AppState {
             if let destination { saved = await savePageEditsCopy(to: destination) }
             else { saved = await saveDocumentToOriginal() }
             guard saved else { return }
+            guard !hasUnsavedDocumentChanges else {
+                statusMessage = "Changes remain unsaved · the document is still open"
+                return
+            }
+            let continueClosing = pendingWindowCloseAction
+            pendingWindowCloseAction = nil
             pendingContentClose = nil
             closeTab(index)
+            continueClosing?()
         }
     }
 
     private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
         guard contentTextRecovery == nil else {
-            lastError = "Finish or discard the recovered text draft before another edit."
+            contentTextNotice = "Finish or discard the recovered text draft before another edit."
             return
         }
         guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
@@ -15081,6 +15194,7 @@ extension AppState {
                 if command.action == "replaceText" {
                     contentRecoveryCommand = nil
                     contentTextRecovery = nil
+                    contentTextNotice = nil
                 }
                 statusMessage = "\(label) · unsaved PDF changes"
                 await reloadContentObjects()

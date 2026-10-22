@@ -63,17 +63,12 @@ public struct ReaderWindow: View {
                         SidebarView(state: state, opener: opener)
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
-                    canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .overlay(alignment: .trailing) { assistantDrawer }
-                        .overlay(alignment: .trailing) {
-                            // Conditional on purpose: the panel is off by default, and a closed
-                            // panel should not leave a zero-width drawer or its sampling task in
-                            // the hierarchy. The AI drawer keeps its always-present drawer so an
-                            // answer survives closing; the performance panel has no such state.
-                            if state.performancePanelVisible {
-                                performanceDrawer
-                            }
-                        }
+                    HorizontalDocumentViewport(
+                        contentWidth: state.contentWidthPt * state.zoomFactor,
+                        onViewport: { state.setViewportSize($0) },
+                        onHorizontalScroll: { state.setHorizontalViewportOrigin($0) }
+                    ) { canvas }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     // The scroll indicator is a real lane, not an overlay: the canvas viewport
                     // and the page column end before it, and the right panel starts after it.
                     if state.document != nil {
@@ -85,12 +80,24 @@ public struct ReaderWindow: View {
                         SearchResultSidebar(state: state).frame(width: ReaderChrome.sidebarTotalWidthPt)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
+                    assistantDrawer
+                    if state.performancePanelVisible { performanceDrawer }
+                    ReaderEditingPanelTransition(
+                        isVisible: state.contentEditEnabled && state.document != nil,
+                        progressOverride: state.transitionProgressOverride?.editingPanel
+                    ) {
+                        ContentEditInspector(state: state)
+                            .padding(.top, ReaderChrome.secondaryToolbarHeightPt)
+                    }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
                 // HStack's layout that must interpolate, so the canvas width moves with the
                 // panel instead of jumping to the final width on the first frame.
                 .animation(sidebarAnimation, value: state.sidebarVisible)
                 .animation(sidebarAnimation, value: state.searchSidebarVisible)
+                .animation(panelAnimation, value: state.rightPanelVisible)
+                .animation(panelAnimation, value: state.performancePanelVisible)
+                .animation(panelAnimation, value: state.contentEditEnabled)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -106,15 +113,20 @@ public struct ReaderWindow: View {
         .frame(minWidth: 900, minHeight: 600)
         .background(LyraReaderTheme.windowBg)
         .background(WindowLiveResizeReporter { isLiveResizing = $0 })
+        .background(DocumentEditedReporter(isEdited: state.tabs.indices.contains { state.tabHasUnsavedChanges($0) }))
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
         .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
-            Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {state.saveContentAndClose()}
+            if state.closeRequiresReview {
+                Button("Review Changes") { state.reviewChangesBeforeClosing() }
+            } else {
+                Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {state.saveContentAndClose()}
+            }
             Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
             Button("Cancel",role:.cancel) {state.cancelContentClose()}
-        } message: {Text(state.isReadOnlyDocument ? "Save an unsigned copy to keep these changes." : "Save these changes to the original PDF before closing.")}
+        } message: { Text(state.closeChangesMessage) }
         .onAppear {
             state.installTerminationHandling()
             // The in-place action uses the same provider settings and target language as the
@@ -130,6 +142,9 @@ public struct ReaderWindow: View {
         // viewport updates (and releases one rebuild) for the slide, because a loaded machine can
         // take longer per frame than the ordinary coalescing window.
         .onChange(of: state.rightPanelVisible) { _, _ in
+            state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
+        }
+        .onChange(of: state.contentEditEnabled) { _, _ in
             state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
         }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
@@ -190,8 +205,8 @@ public struct ReaderWindow: View {
         return state.tabs[index].url
     }
 
-    /// Chrome overlays the existing canvas, like the editing inspector. Opening or resizing it
-    /// never resizes the Metal drawable or invalidates the PDF's visible band.
+    /// The drawer reserves a column beside the document viewport. Width changes recenter the
+    /// page horizontally while preserving its vertical scroll position.
     private var assistantDrawer: some View {
         ReaderSidePanel(
             isVisible: state.rightPanelVisible && state.document != nil,
@@ -305,7 +320,7 @@ public struct ReaderWindow: View {
                 onDisplayCalibration: { calibration in
                     state.setDisplayCalibration(calibration)
                 },
-                onViewportSize: { size in state.setViewportSize(size) },
+                onViewportSize: { _ in },
                 // Precise input preserves system deltas; wheel input applies its accelerated
                 // distance immediately, with no queued motion after the wheel stops.
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
@@ -364,12 +379,10 @@ public struct ReaderWindow: View {
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
                     .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
-                        if state.contentEditPage?.page != state.currentPage - 1 {
+                        if !state.contentEditLoading, state.contentEditPage?.page != state.currentPage - 1 {
                             await state.reloadContentObjects()
                         }
                     }
-                HStack { Spacer(); ContentEditInspector(state:state) }
-                    .padding(.top, ReaderChrome.secondaryToolbarHeightPt)
             }
 
             if state.document == nil {
@@ -396,7 +409,7 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.isReadOnlyDocument || state.pageEditHasPendingChanges
+            if state.isReadOnlyDocument
                 || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
@@ -407,7 +420,6 @@ public struct ReaderWindow: View {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
-                    if state.pageEditHasPendingChanges { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
                     if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner
@@ -521,11 +533,11 @@ public struct ReaderWindow: View {
     /// search results and the right panel. Page overview draws over the whole content area, so it
     /// suppresses all three like it suppresses the leading inset.
     private var secondaryToolbarTrailingInset: CGFloat {
-        ReaderChrome.trailingChromeWidth(
+        (state.contentEditEnabled ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0) + ReaderChrome.trailingChromeWidth(
             documentOpen: state.document != nil,
             pageOverviewVisible: state.pageOverviewVisible,
             searchVisible: state.searchSidebarVisible,
-            rightPanelVisible: state.rightPanelVisible,
+            rightPanelVisible: state.rightPanelVisible || state.performancePanelVisible,
             rightPanelContentWidth: state.rightPanelWidthPt
         )
     }
@@ -614,45 +626,6 @@ public struct ReaderWindow: View {
         .accessibilityLabel(
             "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
         )
-    }
-
-    /// The one place the interface states, without qualification, that the file on disk is not
-    /// what is on screen. It stays visible for the whole staged session, not just after an action.
-    private var pageEditBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "square.stack.3d.up")
-                .foregroundStyle(LyraReaderTheme.warningFg)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Page changes pending")
-                    .font(.callout.weight(.semibold))
-                Text(
-                    [state.pageEditPendingSummary, state.pageEditLastAction]
-                        .compactMap { $0 }
-                        .joined(separator: " · ")
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Divider().frame(height: 24)
-            Button("Undo") { state.undoPageEdit() }
-                .disabled(!state.canUndoPageEdit)
-            Button("Redo") { state.redoPageEdit() }
-                .disabled(!state.canRedoPageEdit)
-            Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") { state.saveDocument() }
-                .disabled(!state.canSavePageEditsCopy)
-            Button("Discard…") { state.presentDiscardPageEditsConfirmation() }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(LyraReaderTheme.warningFg.opacity(0.5), lineWidth: 1)
-        )
-        .shadow(radius: 3, y: 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Page changes pending. The file on disk is unchanged.")
     }
 
     /// The form session's version of the page-edit banner: the same raised panel, the same

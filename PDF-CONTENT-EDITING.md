@@ -31,9 +31,20 @@ from the Lyra palette. Switching back to Annotate commits any active text draft 
   text regions. The content workspace refuses operations that would require rasterizing a whole
   page. The separate existing redaction workflow retains its explicit raster fallback.
 
-An overflowing or unsupported text write preserves the previous revision and the typed draft.
-The inspector lets the reader copy, change the font and retry, or discard that draft. Tab changes
-wait for a pending write; closing an edited tab offers Save, Discard and Cancel.
+Text frames grow downwards at their existing wrapping width as words are added. The native draft
+also grows while typing, and uses a red border when it reaches the visible canvas edge. Original
+PDF line breaks are treated as soft wraps on entering the caret editor. Edited frames retain
+per-line text hashes so a larger frame remains independently selectable on the next edit.
+Text that reaches the page edge or cannot be encoded by its font stays in an editable recovery
+draft in the inspector, with an inline explanation and font/retry controls. It raises no modal
+error. Tab changes wait for a pending write; closing an edited tab or window offers Save, Discard
+and Cancel. Unsaved work appears as a dot in the document tab and the native close button, with
+no pending-changes banner over the page. Committed body edits can also be undone from Annotate.
+
+Right panels reserve their width in the document row, with the vertical scroll lane immediately
+to their left. The Edit inspector uses the same slide timing as the other drawers. Wide pages
+can be panned using the bottom horizontal scrollbar; Fit Width uses the actual visible viewport.
+Paper borders and shadows update with the Metal frame and share its Core Animation transaction.
 
 ## Why the earlier narrow text replacement was insufficient
 
@@ -91,6 +102,13 @@ actual embedded-font body replacement, the green Time-Aware Pose Encoder label, 
 and page 7 partial erasure. Synthetic coverage includes TJ kerning, shared Form isolation, flat
 vector groups, image insert/crop/replace/export, links, Chinese, unsupported glyphs, stale revisions,
 and 0/90/180/270-degree cropped-page insertion and reediting.
+
+For the feedback corpus, set `LYRA_READER_FEEDBACK_PAPERS` to a directory containing
+`review_ashley_0826.pdf`, `review_du_0923.pdf` and `manuscript_0925.pdf`, then run
+`apps/macos/.build/debug/LyraReaderChecks --check-feedback-editing "$PWD"`. This copies only the
+sample bytes into writable scratch PDFs, adds an unsaved annotation, edits a real paragraph
+repeatedly (insert, delete, replace, longer text), switches tools, undoes/redoes, saves and checks
+the reopened PDF with PDFKit. Originals and their Finder lock flags are preserved.
 
 After rebuilding Rust bindings and Swift, run
 `apps/macos/.build/debug/LyraReaderChecks --check-content-editing "$PWD"` for native mouse/caret,

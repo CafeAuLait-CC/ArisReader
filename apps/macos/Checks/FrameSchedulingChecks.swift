@@ -12,6 +12,8 @@ extension ReaderChecks {
                               bgra: Data([255, 255, 255, 255]), generation: 1)
         canvas!.pages = [CanvasPage(placement: PagePlacement(index: 0, topPt: 0, leftPt: 0,
                                       widthPt: 320, heightPt: 240), image: image)]
+        canvas!.annotationPageFrames = [PagePlacement(index: 0, topPt: 0, leftPt: 0,
+                                                     widthPt: 320, heightPt: 240)]
         canvas!.onFailure = { fatalError("canvas regression: \($0)") }
         window.contentView = canvas
         window.makeKeyAndOrderFront(nil)
@@ -19,9 +21,14 @@ extension ReaderChecks {
         try await eventually("attached canvas submits a real GPU frame", { canvas!.submittedFrameCount > 0 })
         try await Task.sleep(for: .milliseconds(200))
         let before = canvas!.submittedFrameCount
+        let edgesBefore = canvas!.pageChromeRectangles
         for offset in 1...100 { canvas!.scrollYPt = CGFloat(offset) }
         require(canvas!.submittedFrameCount == before, "a burst of model changes waits for one coalesced frame")
+        require(canvas!.pageChromeRectangles == edgesBefore,
+                "scrollbar updates cannot move paper edges before the corresponding Metal frame")
         try await eventually("queued model changes reach the GPU", { canvas!.submittedFrameCount > before })
+        require(abs((canvas!.pageChromeRectangles.first?.minY ?? 0) + 100) < 0.01,
+                "the submitted paper and page gap use the same final scroll position")
         try await Task.sleep(for: .milliseconds(200))
         require(canvas!.submittedFrameCount == before + 1, "a burst draws once and an idle canvas submits nothing")
 

@@ -97,7 +97,7 @@ public struct TabStrip: View {
             .accessibilityAction { state.selectTab(index) }
 
             Button { state.closeTab(index) } label: {
-                Image(systemName: "xmark")
+                Image(systemName: state.tabHasUnsavedChanges(index) ? "circle.fill" : "xmark")
                     .font(.system(size: 10, weight: .semibold))
                     .frame(width: TabRowLayout.closeButtonWidth,
                            height: TabRowLayout.contentHeight)
@@ -105,7 +105,7 @@ public struct TabStrip: View {
             }
             .buttonStyle(.plain)
             .padding(.trailing, TabRowLayout.closeButtonTrailingInset)
-            .help("Close \(tab.title)")
+            .help(state.tabHasUnsavedChanges(index) ? "Unsaved changes · Close \(tab.title)" : "Close \(tab.title)")
             .accessibilityLabel("Close \(tab.title)")
         }
         .frame(width: width, height: TabRowLayout.height)

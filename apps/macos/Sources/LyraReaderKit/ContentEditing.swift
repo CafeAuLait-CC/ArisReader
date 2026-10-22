@@ -73,6 +73,8 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   private var editingRevision: String?
   private var editingPage: Int?
   private var editingURL: URL?
+  private var originalEditingText: String?
+  private var wheelMotion = WheelMotion()
   private var wasSelected = false
   private var guides: [CGFloat] = []
   private var horizontalGuides: [CGFloat] = []
@@ -147,6 +149,27 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     guard let state, !state.pageEditBusy, !state.contentEditLoading, !state.contentCommandInFlight,
       state.contentTextRecovery == nil
     else { return }
+    let contentPoint = CanvasGeometry.contentPoint(viewX: point.x, viewYTop: point.y,
+      scrollYPt: state.scrollYPt, zoom: state.zoomFactor,
+      contentOffsetX: max(0, (bounds.width - state.contentWidthPt * state.zoomFactor) / 2))
+    if let page = state.pagePlacement(at: contentPoint)?.index,
+       page != state.contentEditPage?.page {
+      // A visible page is editable even when the viewport's top still belongs to the
+      // previous page. Inspect the clicked page, then complete this first selection.
+      state.contentEditSelection = nil
+      wasSelected = false
+      let url = state.document?.url
+      Task { @MainActor [weak self, weak state] in
+        guard let self, let state else { return }
+        state.currentPage = page + 1
+        await state.reloadContentObjects()
+        guard self.state === state, state.document?.url == url,
+              state.contentEditPage?.page == page else { return }
+        self.mouseDown(with: event)
+        self.mouseUp(with: event)
+      }
+      return
+    }
     if state.contentEditTool == "erase" || state.contentEditTool == "blackout" {
       origin = point
       original = nil
@@ -363,13 +386,20 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     scroll.hasVerticalScroller = true
     scroll.autohidesScrollers = true
     scroll.borderType = .noBorder
-    let textView = NSTextView(frame: CGRect(origin: .zero, size: scroll.contentSize))
+    let textView = ContentDraftTextView(frame: CGRect(origin: .zero, size: scroll.contentSize))
+    textView.onCommit = { [weak self] in
+      self?.commitText()
+      self?.window?.makeFirstResponder(self)
+    }
     textView.isRichText = false
     textView.allowsUndo = true
     textView.drawsBackground = true
     textView.backgroundColor = .textBackgroundColor
     textView.font = contentEditorFont(item.font, size: item.size * state.zoomFactor)
-    textView.string = item.text
+    // Inspection's newlines are visual PDF lines, not paragraph breaks. Let the native
+    // container rewrap a paragraph naturally when a word is inserted in an existing line.
+    textView.string = item.text.replacingOccurrences(of: "\n", with: " ")
+    originalEditingText = textView.string
     textView.textContainerInset = NSSize(width: 2, height: 2)
     textView.textContainer?.widthTracksTextView = true
     textView.textContainer?.containerSize = NSSize(
@@ -393,6 +423,19 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     textView.setSelectedRange(
       NSRange(location: min(position, textView.string.utf16.count), length: 0))
   }
+
+  func textDidChange(_ notification: Notification) {
+    guard let editor, let scroll = editor.enclosingScrollView,
+          let manager = editor.layoutManager, let container = editor.textContainer else { return }
+    manager.ensureLayout(for: container)
+    let needed = manager.usedRect(for: container).height + editor.textContainerInset.height * 2 + 6
+    let available = max(24, bounds.height - scroll.frame.minY)
+    let height = min(available, max(scroll.frame.height, needed))
+    scroll.setFrameSize(CGSize(width: scroll.frame.width, height: height))
+    scroll.wantsLayer = true
+    scroll.layer?.borderWidth = 1
+    scroll.layer?.borderColor = (needed > available ? NSColor.systemRed : NSColor.controlAccentColor).cgColor
+  }
   func commitText() {
     guard let editor, let item = editingItem else { return }
     state?.contentTextEditing = false
@@ -400,13 +443,14 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     (editor.enclosingScrollView ?? editor).removeFromSuperview()
     self.editor = nil
     editingItem = nil
-    if value != item.text, editingRevision == state?.contentEditPage?.revision {
+    if value != originalEditingText, editingRevision == state?.contentEditPage?.revision {
       state?.replaceContentText(item, text: value)
-    } else if value != item.text, let revision = editingRevision, let page = editingPage {
+    } else if value != originalEditingText, let revision = editingRevision, let page = editingPage {
       state?.recoverDetachedContentText(
         item, text: value, revision: revision, page: page, url: editingURL)
     }
     editingRevision = nil
+    originalEditingText = nil
   }
   func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
     if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -443,11 +487,37 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       super.scrollWheel(with: event)
       return
     }
-    if event.hasPreciseScrollingDeltas {
-      state.scroll(byScreenPoints: event.scrollingDeltaY)
-    } else {
-      state.scrollByWheelStep(event.scrollingDeltaY)
+    if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
+      super.scrollWheel(with: event)
+      return
     }
+    let delta = wheelMotion.delta(scrollingDeltaY: event.scrollingDeltaY,
+      precise: event.hasPreciseScrollingDeltas, timestamp: event.timestamp)
+    if event.hasPreciseScrollingDeltas {
+      state.scroll(byScreenPoints: delta)
+    } else {
+      state.scrollByWheelStep(delta)
+    }
+  }
+}
+
+/// Cmd-Return is a commit command, independent of the user's text key-binding selector.
+/// NSTextView can translate it to insertNewlineIgnoringFieldEditor rather than insertNewline.
+private final class ContentDraftTextView: NSTextView {
+  var onCommit: (() -> Void)?
+  override func keyDown(with event: NSEvent) {
+    if [36, 76].contains(event.keyCode), event.modifierFlags.contains(.command) {
+      onCommit?()
+    } else {
+      super.keyDown(with: event)
+    }
+  }
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    if [36, 76].contains(event.keyCode), event.modifierFlags.contains(.command) {
+      onCommit?()
+      return true
+    }
+    return super.performKeyEquivalent(with: event)
   }
 }
 

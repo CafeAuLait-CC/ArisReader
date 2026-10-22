@@ -48,6 +48,11 @@ private final class TransitionHarness {
 
     var canvasRect: CGRect {
         host.layoutSubtreeIfNeeded()
+        // visibleRect also subtracts an overlay scroller while it is awake. Measure the
+        // actual clip viewport, whose geometry must stay fixed when that scroller fades.
+        if let clip = canvas.enclosingScrollView?.contentView {
+            return host.convert(clip.bounds, from: clip)
+        }
         return host.convert(canvas.bounds, from: canvas)
     }
 
@@ -365,7 +370,7 @@ extension ReaderChecks {
         require(topFrames.allSatisfy { abs($0 - anchorCanvasTop) < 0.001 }
                     && heightFrames.allSatisfy { abs($0 - anchorCanvasHeight) < 0.001 },
                 "the canvas top (\(anchorCanvasTop) pt) and height (\(anchorCanvasHeight) pt) "
-                    + "are unchanged through the whole slide")
+                    + "are unchanged through the whole slide (tops \(topFrames), heights \(heightFrames))")
         require(state.zoomPercent == anchorZoom,
                 "zoom stays at \(anchorZoom)% during and after the slide (no per-frame rescale)")
         state.transitionProgressOverride = nil

@@ -6,9 +6,65 @@ use lopdf::{Document, Object};
 
 pub(crate) const KEY: &[u8] = b"LyraReaderTextFrames";
 #[derive(Serialize, Deserialize)]
-struct Frame {
+pub(super) struct Frame {
     digest: String,
     bounds: ContentBox,
+    #[serde(default)]
+    lines: Vec<String>,
+}
+
+pub(super) fn frames(bytes: &[u8], index: u32) -> Result<Vec<Frame>> {
+    let document = Document::load_mem(bytes).map_err(pdf_error)?;
+    let page = document
+        .get_pages()
+        .get(&index.saturating_add(1))
+        .copied()
+        .ok_or_else(|| failure("The requested page does not exist."))?;
+    Ok(read(&document, page))
+}
+
+/// Match the writer's individual lines before spatial paragraph grouping. Hashes contain no
+/// original plaintext and never override the independently extracted text or its font.
+pub(super) fn take_frames(
+    items: &mut Vec<ContentItem>,
+    frames: &[Frame],
+    sheet: Transform2D,
+) -> Vec<ContentItem> {
+    let mut result = Vec::new();
+    for frame in frames.iter().filter(|frame| !frame.lines.is_empty()) {
+        let bounds: ContentBox = sheet.apply_rect(frame.bounds.rect()).into();
+        let mut chosen = Vec::new();
+        for line in &frame.lines {
+            let found = items.iter().enumerate().find(|(index, item)| {
+                !chosen.contains(index)
+                    && item.kind == "text"
+                    && item.can_edit_text
+                    && digest(&item.text) == *line
+                    && contains(bounds, item.bounds)
+            });
+            let Some((index, _)) = found else { break };
+            chosen.push(index);
+        }
+        if chosen.len() != frame.lines.len() {
+            continue;
+        }
+        let mut grouped = items[chosen[0]].clone();
+        for index in chosen.iter().skip(1) {
+            merge_item(&mut grouped, items[*index].clone(), "\n")
+        }
+        if digest(&grouped.text) != frame.digest {
+            continue;
+        }
+        grouped.bounds = bounds;
+        let mut index = 0;
+        items.retain(|_| {
+            let keep = !chosen.contains(&index);
+            index += 1;
+            keep
+        });
+        result.push(grouped);
+    }
+    result
 }
 
 fn digest(text: &str) -> String {
@@ -64,6 +120,7 @@ pub(super) fn update(
     index: u32,
     command: &ContentCommand,
     item: Option<&ContentItem>,
+    written_lines: &[String],
 ) -> Result<()> {
     let page = document.get_pages()[&(index + 1)];
     let mut frames = read(document, page);
@@ -79,6 +136,7 @@ pub(super) fn update(
             frames.push(Frame {
                 digest: digest(text),
                 bounds: *bounds,
+                lines: written_lines.iter().map(|line| digest(line)).collect(),
             })
         }
         ContentCommand::Transform {
@@ -89,6 +147,7 @@ pub(super) fn update(
             frames.push(Frame {
                 digest: digest(&item.unwrap().text),
                 bounds: *bounds,
+                lines: item.unwrap().text.lines().map(digest).collect(),
             })
         }
         _ => {}

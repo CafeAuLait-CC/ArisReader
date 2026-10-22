@@ -116,6 +116,12 @@ extension ReaderChecks {
         state.updateFormText(stateNotes.id, text: "Written on page two.")
         require(state.formHasPendingChanges, "the edits are pending in the reader")
         require(state.formChangedFields.count == 6, "six fields differ from the file")
+        state.closeTab(0)
+        require(state.contentCloseRequested && state.closeRequiresReview,
+                "closing a filled form protects its pending values")
+        state.saveContentAndClose()
+        require(state.document != nil && state.formHasPendingChanges && !state.contentCloseRequested,
+                "reviewing form changes keeps the tab and values instead of saving annotations and closing")
         require(state.formPendingSummary?.contains("the file on disk is unchanged") == true,
                 "the banner says the file on disk is unchanged")
         require(state.formFilledCount == 7,

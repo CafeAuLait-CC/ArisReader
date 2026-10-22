@@ -215,6 +215,9 @@ struct ContentEditInspector: View {
 
     private var recovery: some View {
         ReaderPanelSection(title: "Recovered Text Draft") {
+            if let notice = state.contentTextNotice {
+                Text(notice).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
+            }
             TextEditor(text: Binding(get: { state.contentTextRecovery ?? "" }, set: { state.contentTextRecovery = $0 }))
                 .frame(minHeight: 100).scrollContentBackground(.hidden).background(LyraReaderTheme.fieldBg)
             Picker("Font", selection: $font) { ForEach(fonts, id: \.self) { Text($0) } }
