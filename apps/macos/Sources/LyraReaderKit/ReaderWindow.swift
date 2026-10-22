@@ -396,7 +396,7 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.isReadOnlyDocument || state.pageEditSessionActive
+            if state.isReadOnlyDocument || state.pageEditHasPendingChanges
                 || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
                 || !state.pendingRedactions.isEmpty
@@ -407,7 +407,7 @@ public struct ReaderWindow: View {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if !state.pendingRedactions.isEmpty { redactionBanner }
-                    if state.pageEditSessionActive { pageEditBanner }
+                    if state.pageEditHasPendingChanges { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
                     if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner

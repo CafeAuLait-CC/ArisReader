@@ -80,6 +80,10 @@ struct ReaderChecks {
             try await contentEditingChecks(root:fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-content-identity") {
+            try await contentEditIdentityChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-rename") {
             try renameCompatibilityChecks(root: fastRoot)
             return
@@ -634,6 +638,7 @@ struct ReaderChecks {
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
         try await stampSignatureChecks(root: root)
         try await contentEditingChecks(root: root)
+        try await contentEditIdentityChecks(root: root)
         try await documentCacheChecks(root: root)
         try await annotatedCopyGuardChecks(root: root)
         try await extractDestinationGuardChecks(root: root)

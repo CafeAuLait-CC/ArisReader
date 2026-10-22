@@ -275,9 +275,15 @@ extension ReaderChecks {
         }
         require(before != covered, "the translated block changes the page pixels")
         let red = redPixelCount(coveredRep)
-        let expected = Int(block.width * block.height)
+        // The cached bitmap is in device pixels, so on a 2× display the block covers 4× its
+        // point area. Compare against the bitmap's own scale rather than assuming 1×: the
+        // drawing itself is correct at either scale, and this check must not fail on a Retina
+        // host.
+        let bitmapScaleX = CGFloat(coveredRep.pixelsWide) / host.bounds.width
+        let bitmapScaleY = CGFloat(coveredRep.pixelsHigh) / host.bounds.height
+        let expected = Int((block.width * bitmapScaleX) * (block.height * bitmapScaleY))
         require(red > expected * 8 / 10 && red < expected * 12 / 10,
-                "the cover paints the block and nothing else (\(red) red pixels vs \(expected) points²)")
+                "the cover paints the block and nothing else (\(red) red pixels vs \(expected) bitmap pixels)")
         // Show original removes the cover. The control chip deliberately remains (it is the
         // way back), so the pixel check hides the whole layer for the exact-restore comparison
         // and separately proves that the original-state layer paints no cover.
@@ -304,7 +310,17 @@ extension ReaderChecks {
 
     @MainActor
     private static func bitmapRep(_ view: NSView) -> NSBitmapImageRep? {
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        // Cache at 1× so rectangles given in points address the same pixels on every display.
+        // `bitmapImageRepForCachingDisplay` follows the host's backing scale, which made the
+        // pixel counts 4× too large on a Retina machine.
+        let width = max(1, Int(view.bounds.width.rounded()))
+        let height = max(1, Int(view.bounds.height.rounded()))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = view.bounds.size
         view.cacheDisplay(in: view.bounds, to: rep)
         return rep
     }
