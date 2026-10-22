@@ -536,9 +536,16 @@ public struct ReaderWindow: View {
         HStack(spacing: 10) {
             Image(systemName: "character.bubble")
                 .foregroundStyle(LyraReaderTheme.accent)
-            Text(state.translationNotice ?? "")
-                .font(.callout)
-                .frame(maxWidth: 640, alignment: .leading)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(state.translationNotice ?? "")
+                    .font(.callout)
+                    .frame(maxWidth: 640, alignment: .leading)
+                if let failure = state.translationFailure,
+                   let hint = AIOfflineHint.forFailure(failure) {
+                    AIOfflineHintView(hint: hint)
+                        .frame(maxWidth: 640, alignment: .leading)
+                }
+            }
             Spacer(minLength: 0)
             Button {
                 state.dismissTranslationNotice()

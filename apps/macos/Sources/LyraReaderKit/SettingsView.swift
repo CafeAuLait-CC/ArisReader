@@ -14,13 +14,16 @@ public struct SettingsView: View {
     @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
     @AppStorage(ReadingLayoutPreferences.layoutKey) private var layoutRaw = ReaderLayoutMode.continuous.rawValue
     @AppStorage(ReadingLayoutPreferences.gapKey) private var pageGapPt = Double(ReadingLayoutPreferences.defaultGapPt)
+    /// The AI panel's hint can open this window directly on the AI tab with the base-URL field
+    /// focused; the route is shared so the hint does not need a settings-window reference.
+    @ObservedObject private var route = AISettingsRoute.shared
 
     public init(registry: ReaderWindowRegistry) {
         self.registry = registry
     }
 
     public var body: some View {
-        TabView {
+        TabView(selection: $route.selectedTab) {
             Form {
                 Section("Rendering engine") {
                     Text(registry.settingsState.engine.version)
@@ -48,6 +51,7 @@ public struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .tag(AISettingsRoute.Tab.performance)
             .tabItem { Label("Performance", systemImage: "speedometer") }
 
             Form {
@@ -74,9 +78,11 @@ public struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
+            .tag(AISettingsRoute.Tab.reading)
             .tabItem { Label("Reading", systemImage: "book") }
 
             AISettingsView(store: AISettingsStore.shared)
+                .tag(AISettingsRoute.Tab.ai)
                 .tabItem { Label("AI", systemImage: "sparkles") }
         }
         .frame(width: 580, height: 520)

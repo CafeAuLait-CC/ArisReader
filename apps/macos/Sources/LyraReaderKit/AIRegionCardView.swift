@@ -428,6 +428,9 @@ struct AIRegionCardView: View {
                     }
                 }
             }
+            if assistant.phase == .failed, let hint = assistant.offlineHint {
+                AIOfflineHintView(hint: hint)
+            }
             if assistant.phase == .cancelled {
                 HStack(spacing: 5) {
                     Image(systemName: "stop.circle")

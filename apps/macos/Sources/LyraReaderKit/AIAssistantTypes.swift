@@ -216,6 +216,8 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
     public let pageCount: Int
     public var state: State
     public var error: String?
+    /// The fixed transport category for a failed turn. Nil unless `state == .failed`.
+    public var failure: AIRequestFailure?
     public var usage: AIUsage?
 
     public init(
@@ -227,6 +229,7 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
         pageCount: Int = 0,
         state: State = .streaming,
         error: String? = nil,
+        failure: AIRequestFailure? = nil,
         usage: AIUsage? = nil
     ) {
         self.id = id
@@ -237,6 +240,7 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
         self.pageCount = pageCount
         self.state = state
         self.error = error
+        self.failure = failure
         self.usage = usage
     }
 
@@ -586,7 +590,8 @@ public enum AIStreamEvent: Equatable, Sendable {
     case usage(AIUsage)
     case diagnostics(AIStreamDiagnostics)
     case done
-    case error(message: String, cancelled: Bool)
+    /// `failure` is the transport's fixed category; `.other` keeps the existing error display.
+    case error(message: String, cancelled: Bool, failure: AIRequestFailure = .other)
 }
 
 // MARK: - Service boundary
@@ -774,8 +779,12 @@ private final class RustAIChatHandle: AIChatHandle {
                 ))
             case .done:
                 return .done
-            case .error(let message, let cancelled):
-                return .error(message: message, cancelled: cancelled)
+            case .error(let message, let cancelled, let failure):
+                return .error(
+                    message: message,
+                    cancelled: cancelled,
+                    failure: AIRequestFailure(failure)
+                )
             }
         }
     }

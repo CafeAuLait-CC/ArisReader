@@ -3,6 +3,8 @@ import SwiftUI
 /// Settings > AI. The read/write rules are in `AISettingsStore`; this view is only the form.
 public struct AISettingsView: View {
     @ObservedObject private var store: AISettingsStore
+    @ObservedObject private var route = AISettingsRoute.shared
+    @FocusState private var baseURLFocused: Bool
     @State private var baseURL = ""
     @State private var model = ""
     @State private var temperature = AISettingsStore.defaultTemperature
@@ -30,6 +32,7 @@ public struct AISettingsView: View {
             Section {
                 TextField("Base URL", text: $baseURL)
                     .textFieldStyle(.roundedBorder)
+                    .focused($baseURLFocused)
                 TextField("Model", text: $model)
                     .textFieldStyle(.roundedBorder)
                 Text("Examples: https://api.openai.com/v1, https://api.deepseek.com/v1, or http://localhost:11434/v1 for Ollama. LyraReader appends /chat/completions; do not include it here.")
@@ -167,9 +170,25 @@ public struct AISettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear(perform: load)
+        .onAppear {
+            load()
+            focusBaseURLIfRequested()
+        }
+        .onChange(of: route.pendingBaseURLFocus) { _, pending in
+            if pending { focusBaseURLIfRequested() }
+        }
         .task(id: store.connectionMode) {
             if store.connectionMode == .chatGPT { await store.chatGPT.loadModels() }
+        }
+    }
+
+    /// Consume a request from the offline hint. The field takes focus after the tab has been
+    /// installed, so the reader can type a local URL immediately.
+    private func focusBaseURLIfRequested() {
+        guard route.pendingBaseURLFocus else { return }
+        route.consumeBaseURLFocus()
+        Task { @MainActor in
+            baseURLFocused = true
         }
     }
 

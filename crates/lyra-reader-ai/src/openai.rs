@@ -33,7 +33,7 @@ use ureq::unversioned::transport::{
 };
 
 use crate::chat::{ChatPart, ChatPlan};
-use crate::provider::AiError;
+use crate::provider::{AiError, AiFailure};
 
 /// Default time allowed to establish a connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -103,6 +103,9 @@ pub struct RequestSpec {
     pub method: &'static str,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Whether this endpoint is loopback. Connection failures mean different things for a local
+    /// server and a remote provider, and the transport is the only layer that sees the OS error.
+    pub is_local: bool,
 }
 
 impl fmt::Debug for RequestSpec {
@@ -163,6 +166,7 @@ pub fn build_request_spec(
             ("User-Agent".to_string(), "LyraReader/0.0".to_string()),
         ],
         body: part.wire_body.as_bytes().to_vec(),
+        is_local: plan.is_local,
     })
 }
 
@@ -207,6 +211,8 @@ pub fn redact(text: &str, key: &str) -> String {
 pub fn redact_error(error: AiError, key: &str) -> AiError {
     match error {
         AiError::Unreachable(message) => AiError::Unreachable(redact(&message, key)),
+        AiError::Offline(message) => AiError::Offline(redact(&message, key)),
+        AiError::LocalServer(message) => AiError::LocalServer(redact(&message, key)),
         AiError::InvalidSettings(message) => AiError::InvalidSettings(redact(&message, key)),
         AiError::EmptyContext(message) => AiError::EmptyContext(redact(&message, key)),
         AiError::HttpStatus(message) => AiError::HttpStatus(redact(&message, key)),
@@ -395,7 +401,7 @@ impl Transport for UreqTransport {
         // opaque status error.
         let response = request
             .send(&spec.body)
-            .map_err(|error| map_ureq_error(error, cancel))?;
+            .map_err(|error| map_ureq_error(error, cancel, spec.is_local))?;
         let status = response.status().as_u16();
         let reason = response
             .status()
@@ -519,7 +525,40 @@ impl ResponseStream for UreqResponseStream {
     }
 }
 
-fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken) -> AiError {
+/// The platform errors that mean "this Mac could not put the request on the network".
+///
+/// `ErrorKind` is used rather than any message text, so the mapping survives a locale change and
+/// a wording change in the HTTP stack. Rust maps the Unix/macOS codes (`ENETUNREACH`,
+/// `EHOSTUNREACH`, `ENETDOWN`) and the Windows equivalents to these kinds.
+fn is_network_unreachable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
+}
+
+/// Classify a connection-stage OS error. A loopback endpoint that refuses the connection means
+/// the local server is not running; the same error for a remote endpoint is not evidence that the
+/// Mac is offline, so it stays generic.
+fn classify_io_failure(error: &std::io::Error, is_local: bool) -> AiFailure {
+    let kind = error.kind();
+    if is_local {
+        return if is_network_unreachable(kind) || kind == std::io::ErrorKind::ConnectionRefused {
+            AiFailure::LocalServer
+        } else {
+            AiFailure::Other
+        };
+    }
+    if is_network_unreachable(kind) {
+        AiFailure::Offline
+    } else {
+        AiFailure::Other
+    }
+}
+
+fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken, is_local: bool) -> AiError {
     if cancel.is_cancelled() {
         return AiError::Cancelled;
     }
@@ -530,9 +569,21 @@ fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken) -> AiError {
         ureq::Error::Tls(message) => {
             AiError::Unreachable(format!("TLS handshake failed: {message}"))
         }
-        ureq::Error::Io(error) => AiError::Unreachable(format!("the connection failed: {error}")),
+        ureq::Error::Io(error) => match classify_io_failure(&error, is_local) {
+            AiFailure::Offline => AiError::Offline(format!("no network route: {error}")),
+            AiFailure::LocalServer => AiError::LocalServer(format!(
+                "the local server did not accept the connection: {error}"
+            )),
+            AiFailure::Other => AiError::Unreachable(format!("the connection failed: {error}")),
+        },
         ureq::Error::HostNotFound => {
-            AiError::Unreachable("could not resolve the provider host".to_string())
+            if is_local {
+                // A loopback host should not need the resolver; keep the generic transport error
+                // rather than claiming anything about the network or the local server.
+                AiError::Unreachable("could not resolve the endpoint host".to_string())
+            } else {
+                AiError::Offline("could not resolve the provider host".to_string())
+            }
         }
         ureq::Error::BadUri(message) => {
             AiError::InvalidSettings(format!("The endpoint URL is not valid: {message}"))
@@ -1491,6 +1542,19 @@ mod tests {
     }
 
     #[test]
+    fn redaction_also_applies_to_the_new_transport_categories() {
+        for error in [
+            AiError::Offline("no route for sk-secret-12345".to_string()),
+            AiError::LocalServer("refused for sk-secret-12345".to_string()),
+        ] {
+            let failure = error.failure();
+            let redacted = redact_error(error, "sk-secret-12345");
+            assert_eq!(redacted.failure(), failure);
+            assert!(!redacted.to_string().contains("sk-secret-12345"));
+        }
+    }
+
+    #[test]
     fn sse_decoder_handles_a_json_object_split_between_chunks() {
         let mut decoder = SseDecoder::new();
         assert!(decoder.push(b"data: {\"cho").unwrap().is_empty());
@@ -1709,6 +1773,93 @@ mod tests {
         let error =
             parse_stream_payload(r#"{"error":{"message":"model overloaded"}}"#).unwrap_err();
         assert!(error.to_string().contains("model overloaded"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn platform_network_errors_are_offline_only_for_a_remote_endpoint() {
+        // The raw platform codes, not message text. std maps these to the portable ErrorKinds
+        // the classifier matches; this test pins the mapping the app relies on.
+        #[cfg(target_os = "macos")]
+        let (unreachable_network, unreachable_host, network_down, refused) = (51, 65, 50, 61);
+        #[cfg(target_os = "linux")]
+        let (unreachable_network, unreachable_host, network_down, refused) = (101, 113, 100, 111);
+
+        for code in [unreachable_network, unreachable_host, network_down] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(classify_io_failure(&error, false), AiFailure::Offline);
+            assert_eq!(classify_io_failure(&error, true), AiFailure::LocalServer);
+        }
+
+        let refused_error = std::io::Error::from_raw_os_error(refused);
+        assert_eq!(
+            classify_io_failure(&refused_error, true),
+            AiFailure::LocalServer,
+            "a refused loopback connection means the local server is not running"
+        );
+        assert_eq!(
+            classify_io_failure(&refused_error, false),
+            AiFailure::Other,
+            "a refused remote connection is not evidence that this Mac is offline"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ureq_io_errors_keep_the_category_through_mapping() {
+        #[cfg(target_os = "macos")]
+        let (unreachable_network, refused) = (51, 61);
+        #[cfg(target_os = "linux")]
+        let (unreachable_network, refused) = (101, 111);
+
+        let cancel = CancellationToken::new();
+        let remote = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(unreachable_network)),
+            &cancel,
+            false,
+        );
+        assert_eq!(remote.failure(), AiFailure::Offline);
+
+        let local = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(refused)),
+            &cancel,
+            true,
+        );
+        assert_eq!(local.failure(), AiFailure::LocalServer);
+
+        let refused_remote = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(refused)),
+            &cancel,
+            false,
+        );
+        assert_eq!(refused_remote.failure(), AiFailure::Other);
+    }
+
+    #[test]
+    fn other_transport_errors_stay_generic() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(classify_io_failure(&reset, false), AiFailure::Other);
+        assert_eq!(classify_io_failure(&reset, true), AiFailure::Other);
+    }
+
+    #[test]
+    fn error_failure_categories_are_stable() {
+        assert_eq!(
+            AiError::Offline("no route".to_string()).failure(),
+            AiFailure::Offline
+        );
+        assert_eq!(
+            AiError::LocalServer("refused".to_string()).failure(),
+            AiFailure::LocalServer
+        );
+        assert_eq!(
+            AiError::Unreachable("TLS".to_string()).failure(),
+            AiFailure::Other
+        );
+        assert_eq!(
+            AiError::HttpStatus("HTTP 500".to_string()).failure(),
+            AiFailure::Other
+        );
     }
 
     #[test]

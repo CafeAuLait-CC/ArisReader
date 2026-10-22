@@ -1383,6 +1383,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One reader-facing sentence about the last translation action, including removals caused by
     /// a page edit. The window shows it as a dismissible banner.
     @Published public internal(set) var translationNotice: String?
+    /// The fixed transport category behind `translationNotice`, when the last failure was
+    /// recognized as offline or local-server. Nil for ordinary notices and validation errors.
+    @Published public internal(set) var translationFailure: AIRequestFailure?
     /// Page paper colours sampled from the visible rasters, so a cover matches the paper it sits
     /// on instead of assuming white.
     @Published public private(set) var translationPaperColors: [Int: TranslationPaperColor] = [:]
@@ -1569,9 +1572,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         translationNotice = notice
     }
 
+    func translationDidChangeFailure(_ failure: AIRequestFailure?) {
+        translationFailure = failure
+    }
+
     /// Dismiss the translation banner. It carries no state the reader can lose.
     public func dismissTranslationNotice() {
         translationNotice = nil
+        translationFailure = nil
         inPlaceTranslation.setNotice(nil)
     }
 

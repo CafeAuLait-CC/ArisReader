@@ -96,6 +96,8 @@ public enum AIAuditCode: String, Codable, CaseIterable, Sendable {
     case rateLimited = "rate_limited"
     case httpError = "http_error"
     case unreachable
+    case offline
+    case localServer = "local_server"
     case timeout
     case protocolError = "protocol_error"
     case unsupportedCapability = "unsupported_capability"
@@ -119,6 +121,8 @@ public enum AIAuditCode: String, Codable, CaseIterable, Sendable {
         case .rateLimited: return "rate limited"
         case .httpError: return "HTTP error"
         case .unreachable: return "unreachable"
+        case .offline: return "offline"
+        case .localServer: return "local server not running"
         case .timeout: return "timed out"
         case .protocolError: return "protocol error"
         case .unsupportedCapability: return "unsupported by the model"
@@ -169,9 +173,18 @@ public enum AIAuditCode: String, Codable, CaseIterable, Sendable {
         return .other
     }
 
-    /// Classify a stream error event. Provider messages are inspected only here, in memory;
-    /// no substring of them is ever written to disk.
-    static func classifyStreamFailure(message: String) -> AIAuditCode {
+    /// Classify a stream error event. The transport's fixed category is used first; provider
+    /// messages are inspected only here, in memory, when that category is `.other`. No substring
+    /// of a message is ever written to disk.
+    static func classifyStreamFailure(
+        message: String,
+        failure: AIRequestFailure = .other
+    ) -> AIAuditCode {
+        switch failure {
+        case .offline: return .offline
+        case .localServer: return .localServer
+        case .other: break
+        }
         let lower = message.lowercased()
         if lower.contains("unauthorized") || lower.contains("401") || lower.contains("api key") {
             return .unauthorized
@@ -620,21 +633,16 @@ final class AIAuditedChatHandle: AIChatHandle {
     }
 
     func poll() -> [AIStreamEvent] {
-        let events = base.poll()
-        for event in events {
-            switch event {
-            case .partStarted(let index, _, _):
-                attempt.markPartStarted(Int(index))
-            case .done:
-                record(.sent, code: nil)
-            case .error(let message, let cancelled):
-                if cancelled {
-                    record(.cancelled, code: nil)
-                } else {
-                    record(.failed, code: AIAuditCode.classifyStreamFailure(message: message))
-                }
-            default:
-                break
+        var events = base.poll()
+        observe(events)
+        // A finished base may still deliver its last events in a final poll (the handle contract
+        // says so). Asking once more before calling it a failure is what keeps this wrapper from
+        // recording `failed` for a request whose `.done` arrives on that poll.
+        if base.isFinished && !recorded {
+            let remaining = base.poll()
+            if !remaining.isEmpty {
+                events.append(contentsOf: remaining)
+                observe(remaining)
             }
         }
         // A transport that stops without a terminal event is a failure, not a silent success.
@@ -642,6 +650,31 @@ final class AIAuditedChatHandle: AIChatHandle {
             record(.failed, code: .providerError)
         }
         return events
+    }
+
+    private func observe(_ events: [AIStreamEvent]) {
+        for event in events {
+            switch event {
+            case .partStarted(let index, _, _):
+                attempt.markPartStarted(Int(index))
+            case .done:
+                record(.sent, code: nil)
+            case .error(let message, let cancelled, let failure):
+                if cancelled {
+                    record(.cancelled, code: nil)
+                } else {
+                    record(
+                        .failed,
+                        code: AIAuditCode.classifyStreamFailure(
+                            message: message,
+                            failure: failure
+                        )
+                    )
+                }
+            default:
+                break
+            }
+        }
     }
 
     func cancel() {

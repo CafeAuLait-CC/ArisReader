@@ -229,6 +229,10 @@ struct AIRegionHistoryView: View {
                             .font(.caption)
                             .foregroundStyle(LyraReaderTheme.warningFg)
                             .fixedSize(horizontal: false, vertical: true)
+                        if let failure = entry.failure,
+                           let hint = AIOfflineHint.forFailure(failure) {
+                            AIOfflineHintView(hint: hint)
+                        }
                     }
                     if !entry.citedPages.isEmpty {
                         Text("Citations: " + entry.citedPages.map { "[p.\($0)]" }.joined(separator: " · "))
