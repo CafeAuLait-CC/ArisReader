@@ -389,10 +389,18 @@ extension ReaderChecks {
         state.togglePerformancePanel()
         require(!state.performancePanel.isSamplingTaskRunning,
                 "the closed panel has no sampling task")
-        try await Task.sleep(for: .milliseconds(500))
-        let afterClose = harness.existingCounters()
-        try await Task.sleep(for: .milliseconds(800))
-        require(harness.existingCounters() == afterClose,
+        // Restoring a deep-zoom viewport can still finish newly visible tiles. Require a
+        // sustained idle interval, with a bounded deadline, rather than racing that work.
+        var afterClose = harness.existingCounters()
+        var idleSamples = 0
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(200))
+            let current = harness.existingCounters()
+            idleSamples = current == afterClose ? idleSamples + 1 : 0
+            afterClose = current
+            if idleSamples >= 4 { break }
+        }
+        require(idleSamples >= 4,
                 "with the panel closed no new timer changes the existing counters")
     }
 
