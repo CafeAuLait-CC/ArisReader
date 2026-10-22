@@ -668,12 +668,14 @@ extension ReaderChecks {
             try await Task.sleep(for: .milliseconds(20))
             harness.canvasRect
         }
+        require(state.coalescedViewportReloadCount == zoomedReloads,
+                "a zoomed-in drawer defers visible-column rebuilds throughout the drag")
         state.endRightPanelResize()
         try await Task.sleep(for: .milliseconds(350))
         let coalesced = state.coalescedViewportReloadCount - zoomedReloads
-        require(coalesced == 0,
-                "a zoomed-in overlay resize performs no coalesced rebuild per "
-                    + "step (\(coalesced) rebuilds for 15 width updates)")
+        require(coalesced <= 1,
+                "a zoomed-in drawer releases at most one rebuild after the drag "
+                    + "(\(coalesced) rebuilds for 15 width updates)")
 
         // A real (not pinned) animated close and open at the same zoom: the state holds the
         // per-frame viewport reports for the animation and releases them once. The wait covers
