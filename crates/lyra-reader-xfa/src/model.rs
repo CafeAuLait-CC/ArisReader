@@ -241,6 +241,7 @@ pub struct FieldInfo {
     pub multiline: bool,
     pub checked: bool,
     pub round_check: bool,
+    pub control_border: Border,
 }
 
 impl Default for FieldInfo {
@@ -256,6 +257,7 @@ impl Default for FieldInfo {
             multiline: false,
             checked: false,
             round_check: false,
+            control_border: Border::default(),
         }
     }
 }

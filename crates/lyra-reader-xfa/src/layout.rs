@@ -1070,6 +1070,17 @@ impl<'a> Renderer<'a> {
             | FieldType::Choice
             | FieldType::Picture
             | FieldType::Unknown => {
+                // The UI's border is independent of the field's outer border. An
+                // explicit textEdit/dateTimeEdit border must survive even when the
+                // surrounding field has hidden edges (details and signature boxes).
+                draw_border(
+                    page,
+                    &field.control_border,
+                    x + node.margins.left,
+                    y + node.margins.top,
+                    (width - node.margins.left - node.margins.right).max(0.0),
+                    (height - node.margins.top - node.margins.bottom).max(0.0),
+                );
                 if field.kind == FieldType::Choice && !field.read_only && width > 100.0 {
                     page.ops.push(Op::Triangle {
                         x: x + width - 9.0,
@@ -1863,5 +1874,28 @@ mod tests {
         );
         assert!(doc.pages[0].ops.iter().any(|op| matches!(op,
             Op::Text { y, text, .. } if text == "Next" && (*y - 30.0).abs() < 0.01)));
+    }
+    #[test]
+    fn explicit_ui_border_survives_a_hidden_outer_field_border() {
+        let doc = form(
+            r#"<field w="120pt" h="40pt"><border presence="hidden"/>
+          <margin leftInset="10pt" rightInset="5pt" topInset="2pt" bottomInset="3pt"/>
+          <caption placement="top" reserve="10pt"><value><text>Details</text></value></caption>
+          <ui><textEdit><border><edge thickness="1pt"/></border></textEdit></ui></field>"#,
+        );
+        let rules: Vec<_> = doc.pages[0]
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Line { x1, y1, x2, y2, .. } => Some((*x1, *y1, *x2, *y2)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules.len(), 4, "only the explicit control border is drawn");
+        assert!(
+            rules.contains(&(20.0, 22.0, 125.0, 22.0)),
+            "the control border excludes the caption and the field margins: {rules:?}"
+        );
+        assert!(rules.contains(&(125.0, 47.0, 20.0, 47.0)));
     }
 }

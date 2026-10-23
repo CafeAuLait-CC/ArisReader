@@ -601,6 +601,10 @@ fn parse_field(element: &Element) -> FieldInfo {
     if let Some(ui) = element.child("ui")
         && let Some(control) = ui.elements().next()
     {
+        field.control_border = control
+            .child("border")
+            .map(parse_border)
+            .unwrap_or_default();
         field.kind = match control.name.to_ascii_lowercase().as_str() {
             "textedit" => FieldType::Text,
             "checkbutton" => FieldType::CheckButton,
