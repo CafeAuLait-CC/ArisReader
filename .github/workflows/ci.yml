@@ -35,6 +35,9 @@
 #                                   native-checks-shard-<i>; the old second, duplicate invocation
 #                                   of the same suite is gone, and CI no longer produces
 #                                   build/reader-checks.log (a developer's bare check.sh still does).
+#   macos-shell-compat (ubuntu)     A no-work branch-protection shim: it reproduces the serial
+#                                   graph's required-check name and fails when any macOS job did
+#                                   not succeed. Remove it once the required-check list is updated.
 #
 # Nothing is weakened: every gate that ran before still runs and still fails the run. `check.sh`
 # keeps its developer meaning (everything, including LyraReaderChecks); CI divides it with the
@@ -533,3 +536,51 @@ jobs:
           name: native-checks-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/reader-checks-shard-${{ matrix.shard }}.log
           if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────── branch-protection compatibility shim
+  # The serial graph's required check was named `macos-shell (check.sh · LyraReaderChecks)`.
+  # Whether master still requires that exact check name is not readable with this workflow's
+  # token (`GET /branches/master/protection` returns 403), and a required check that never
+  # reports leaves every pull request on "Expected — waiting for status to be reported", which
+  # would block all merges. This job reproduces the old check name and reports success only when
+  # every real macOS job succeeded. It runs no checks of its own and is deliberately not a
+  # macOS runner: the status context is the job name, not the runner.
+  #
+  # Added 2026-10-23. Remove this job once a human has confirmed the required-check list and
+  # updated it to the new job names (macos-build, macos-rust, native-checks, swift-smoke).
+  macos-shell-compat:
+    name: macos-shell (check.sh · LyraReaderChecks)
+    needs: [macos-build, macos-rust, native-checks, swift-smoke]
+    # Report even when a dependency failed; the step below then fails this job, so a red gate
+    # can never be masked by a green compatibility check.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fail unless every macOS gate succeeded
+        shell: bash
+        env:
+          MACOS_BUILD: ${{ needs.macos-build.result }}
+          MACOS_RUST: ${{ needs.macos-rust.result }}
+          NATIVE_CHECKS: ${{ needs.native-checks.result }}
+          SWIFT_SMOKE: ${{ needs.swift-smoke.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for entry in \
+            "macos-build=$MACOS_BUILD" \
+            "macos-rust=$MACOS_RUST" \
+            "native-checks=$NATIVE_CHECKS" \
+            "swift-smoke=$SWIFT_SMOKE"; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            printf '%-15s %s\n' "$name" "$result"
+            if [ "$result" != "success" ]; then
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error title=macOS gate failed::at least one macOS job did not succeed; this compatibility check reports that failure under the old required-check name. Inspect the non-green job above."
+            exit 1
+          fi
+          echo "All macOS gates succeeded."
