@@ -5,8 +5,8 @@
 # rule this script enforces: a branch is deleted only for a pull request whose
 # merge response said merged=true AND whose merged tree passed verification.
 #
-# Usage: scripts/merge-pr.sh <pr-number> [<pr-number> ...]
-#        scripts/merge-pr.sh --skip-verify <pr-number> ...   (docs-only merges)
+# Usage: scripts/merge-pr.sh [--skip-verify] [--keep-branch] <pr-number> ...
+#        --keep-branch keeps the merged branch, for a pull request stacked on it.
 #
 # Exits non-zero on the first problem and deletes nothing in that case.
 set -euo pipefail
@@ -16,7 +16,14 @@ TOKEN_FILE="$(cd "$(dirname "$0")/../.." && pwd)/gh-pat"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKIP_VERIFY=0
 
-if [ "${1:-}" = "--skip-verify" ]; then SKIP_VERIFY=1; shift; fi
+KEEP_BRANCH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-verify) SKIP_VERIFY=1; shift ;;
+    --keep-branch) KEEP_BRANCH=1; shift ;;
+    *) break ;;
+  esac
+done
 if [ $# -eq 0 ]; then echo "usage: $0 [--skip-verify] <pr> [<pr> ...]" >&2; exit 2; fi
 if [ ! -r "$TOKEN_FILE" ]; then echo "fatal: cannot read token file $TOKEN_FILE" >&2; exit 1; fi
 TOKEN="$(tr -d '\n\r ' < "$TOKEN_FILE")"
@@ -131,6 +138,11 @@ if [ "$SKIP_VERIFY" -eq 0 ]; then
   esac
   echo "==> packaging"
   ./scripts/make-app-bundle.sh >/dev/null
+fi
+
+if [ "$KEEP_BRANCH" -eq 1 ]; then
+  echo "==> keeping branches (a pull request is stacked on one of them): ${MERGED_BRANCHES[*]}"
+  exit 0
 fi
 
 for BRANCH in "${MERGED_BRANCHES[@]}"; do
