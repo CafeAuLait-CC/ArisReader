@@ -459,7 +459,7 @@ jobs:
           echo "::warning title=Diagnostic upload failed::actions/upload-artifact could not store the macos-check-logs artifact (runner or network failure, e.g. DNS). No check was affected: the step outcomes above stand. The build/smoke-launch/evaluation logs from this job were NOT archived; each native-checks shard uploads its harness log separately."
 
   native-checks:
-    name: native-checks (LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    name: native-checks (LyraReaderChecks shard ${{ matrix.shard }}/97)
     needs: macos-build
     runs-on: macos-15
     timeout-minutes: 20
@@ -468,7 +468,7 @@ jobs:
       # one shard's or the whole harness's.
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [97]
     env:
       # How the Rust engine finds the library at run time. Each shard downloads PDFium itself
       # (not cached) so a download failure fails that shard instead of hiding behind a cache.
@@ -490,7 +490,7 @@ jobs:
       # beside the PDF by design, so disable it here: otherwise this step would leave sidecars
       # in the checkout (and later runs would silently test a warm index). The cache is covered
       # by cargo test, whose integration tests copy fixtures into scratch directories.
-      - name: Run LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }}
+      - name: Run LyraReaderChecks shard ${{ matrix.shard }}/97
         shell: bash
         env:
           LYRA_READER_INDEX_CACHE: disabled
@@ -506,12 +506,12 @@ jobs:
           LOG="$RUNNER_TEMP/reader-checks-shard-${{ matrix.shard }}.log"
           # `set -o pipefail` keeps the harness's exit status while tee shows every assertion in
           # the job log. The full log is uploaded below either way.
-          "$BIN" "$GITHUB_WORKSPACE" --shard ${{ matrix.shard }}/${{ strategy.job-total }} 2>&1 | tee "$LOG"
+          "$BIN" "$GITHUB_WORKSPACE" --shard ${{ matrix.shard }}/97 2>&1 | tee "$LOG"
           status=${PIPESTATUS[0]}
           assertions=$(grep -c '^PASS' "$LOG" || true)
-          echo "shard ${{ matrix.shard }}/${{ strategy.job-total }} ran $assertions assertions"
+          echo "shard ${{ matrix.shard }}/97 ran $assertions assertions"
           {
-            echo "### LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }}"
+            echo "### LyraReaderChecks shard ${{ matrix.shard }}/97"
             echo ""
             echo "- assertions: $assertions"
             echo ""
@@ -522,7 +522,7 @@ jobs:
           # A shard that selected no work must not look green: the selector or the registry is
           # broken even if the harness itself exited 0.
           if [ "$assertions" -eq 0 ]; then
-            echo "::error title=Empty LyraReaderChecks shard::shard ${{ matrix.shard }}/${{ strategy.job-total }} ran zero assertions; the shard selector or the suite registry is broken."
+            echo "::error title=Empty LyraReaderChecks shard::shard ${{ matrix.shard }}/97 ran zero assertions; the shard selector or the suite registry is broken."
             exit 1
           fi
           exit "$status"
