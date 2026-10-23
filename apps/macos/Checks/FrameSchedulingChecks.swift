@@ -3,6 +3,32 @@ import LyraReaderKit
 
 extension ReaderChecks {
     @MainActor static func frameSchedulingChecks() async throws {
+        let segments = [
+            PagePlacement(index: 0, topPt: 0, leftPt: 10, widthPt: 300, heightPt: 80),
+            PagePlacement(index: 0, topPt: 160, leftPt: 10, widthPt: 300, heightPt: 100,
+                          sourceTopPt: 80)]
+        let viewport = CGSize(width: 400, height: 700)
+        let cuts = PageChromeGeometry.tornEdges(frames: segments, viewport: viewport,
+            contentWidthPt: 400, zoom: 1, scrollYPt: 0)
+        require(cuts.count == 2 && cuts[0].points.count > 20,
+                "a split page has two finely irregular paper edges")
+        require(cuts[0].points.allSatisfy { $0.y >= 80 && $0.y <= 81.6 }
+                    && cuts[1].points.allSatisfy { $0.y <= 160 && $0.y >= 158.4 },
+                "tear decorations extend only into the gap, never over PDF pixels")
+        let moved = PageChromeGeometry.tornEdges(frames: segments, viewport: viewport,
+            contentWidthPt: 400, zoom: 1, scrollYPt: 10)
+        require(zip(cuts[0].points, moved[0].points).allSatisfy { abs($0.y - $1.y - 10) < 0.001 && $0.x == $1.x },
+                "scrolling translates the same tear pattern without regenerated noise")
+        require(PageChromeGeometry.tornEdges(frames: [segments[0]], viewport: viewport,
+            contentWidthPt: 400, zoom: 1, scrollYPt: 0).isEmpty,
+                "ordinary and restored paper edges have no tear decoration")
+        for zoom in [0.5, 1.8, 4] {
+            let scaled = PageChromeGeometry.tornEdges(frames: segments, viewport: viewport,
+                contentWidthPt: 400, zoom: zoom, scrollYPt: 0)
+            require(scaled.count == 2 && scaled.allSatisfy { cut in
+                cut.points.allSatisfy { abs($0.y - cut.baseline) <= 1.61 }
+            }, "tear teeth remain subtle at zoom \(zoom)")
+        }
         _ = NSApplication.shared
         let frame = CGRect(x: 0, y: 0, width: 320, height: 240)
         let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)

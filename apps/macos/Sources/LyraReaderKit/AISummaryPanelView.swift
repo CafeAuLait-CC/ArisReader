@@ -359,14 +359,6 @@ private struct AISummaryRowView: View {
                             .foregroundStyle(LyraReaderTheme.textTertiary)
                             .lineLimit(1)
                     }
-                    if !entry.summary.isEmpty {
-                        Text(entry.summary)
-                            .font(.system(size: compact ? 9 : 10))
-                            .foregroundStyle(entry.state == .stale ? LyraReaderTheme.textTertiary : LyraReaderTheme.textSecondary)
-                            .lineLimit(compact ? 2 : 5)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                     if let note = entry.note, entry.state != .stale {
                         Text(note)
                             .font(.system(size: 8))
@@ -379,6 +371,11 @@ private struct AISummaryRowView: View {
             }
             .buttonStyle(.plain)
             .help(entry.isLinkable ? "Jump to page \(entry.linkPage + 1)" : "")
+            if !entry.summary.isEmpty {
+                AIAnswerView(text: entry.summary, pageCount: model.pageCount,
+                    onJump: { state.gotoPage($0 - 1) })
+                    .opacity(entry.state == .stale ? 0.65 : 1)
+            }
             if entry.state.needsRetry {
                 HStack(spacing: 4) {
                     if case .failed(let message) = entry.state, !message.isEmpty {

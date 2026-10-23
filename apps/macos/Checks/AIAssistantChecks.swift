@@ -578,6 +578,7 @@ extension ReaderChecks {
         func promptSelection(for range: ClosedRange<Int>) async throws -> String {
             let record = AiPlanRequestRecord(
                 action: .translateSelection,
+                documentKnowledge: false,
                 currentPage: 0,
                 selection: AiSelectionRecord(
                     page: 0,
@@ -613,6 +614,7 @@ extension ReaderChecks {
         let summaryPlan = try await engine.prepareAIPlan(
             AiPlanRequestRecord(
                 action: .summarizePage,
+                documentKnowledge: false,
                 currentPage: 0,
                 selection: nil,
                 question: nil,
@@ -645,6 +647,7 @@ extension ReaderChecks {
             let documentPlan = try await engine.prepareAIPlan(
                 AiPlanRequestRecord(
                     action: .summarizeDocument,
+                documentKnowledge: false,
                     currentPage: 0,
                     selection: nil,
                     question: nil,

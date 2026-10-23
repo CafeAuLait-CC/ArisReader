@@ -46,6 +46,42 @@ public struct ReaderMarkdownDocument: Equatable, Sendable {
         self.blocks = blocks
     }
 
+    /// Plain text for compact contexts such as history rows. Formatting syntax is removed,
+    /// while block boundaries remain readable. Callers can bound the result without rendering
+    /// the full document into a constrained list cell.
+    public var plainText: String {
+        func inlineText(_ runs: [ReaderMarkdownInline]) -> String {
+            runs.map { run in
+                switch run {
+                case .text(let value), .code(let value), .citation(_, let value), .math(let value): value
+                case .bold(let nested), .italic(let nested), .strikethrough(let nested): inlineText(nested)
+                case .link(let label, _): inlineText(label)
+                case .mathFallback(let source, _): source
+                }
+            }.joined()
+        }
+        func blockText(_ block: ReaderMarkdownBlock) -> String? {
+            switch block {
+            case .heading(_, let runs), .paragraph(let runs), .bullet(_, let runs): inlineText(runs)
+            case .numbered(_, let number, let runs): "\(number). " + inlineText(runs)
+            case .quote(let blocks): blocks.compactMap(blockText).joined(separator: " ")
+            case .code(_, let source), .mathBlock(let source, _): source
+            case .table(let headers, _, let rows):
+                (headers.map(inlineText) + rows.flatMap { $0.map(inlineText) }).joined(separator: " · ")
+            case .divider: nil
+            }
+        }
+        return blocks.compactMap(blockText).filter { !$0.isEmpty }.joined(separator: " ")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    public func plainTextPreview(maxCharacters: Int) -> String {
+        let text = plainText
+        guard maxCharacters >= 0, text.count > maxCharacters else { return text }
+        guard maxCharacters > 0 else { return "…" }
+        return String(text.prefix(maxCharacters)) + "…"
+    }
+
     /// True when any block is mathematics. The renderer uses this to decide whether a text view
     /// needs CoreText attachments; answers without math can still use the same rich text view.
     public var containsMath: Bool {

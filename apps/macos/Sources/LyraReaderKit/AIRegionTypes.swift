@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreGraphics
 import Foundation
 
@@ -7,7 +8,7 @@ import Foundation
 /// The rectangle is page-local view space (`rasterize_region`'s space) in points. The PNG is the
 /// capture the model receives, `text` is what the text layer reported inside the same rectangle,
 /// and the pixel size is the capture's own, never re-derived from the rectangle after the fact.
-public struct AIRegionAttachment: Equatable, Sendable {
+public struct AIRegionAttachment: Codable, Equatable, Sendable {
     /// 0-based, as the engine's page indices are.
     public let page: Int
     public let rect: CGRect
@@ -212,7 +213,7 @@ public enum AIRegionText {
 
 /// The state of a finished region conversation. Cancelled and failed turns are kept in history
 /// (the question is knowledge too) but are omitted from the Markdown export.
-public enum AIRegionAnswerState: String, Equatable, Sendable {
+public enum AIRegionAnswerState: String, Codable, Equatable, Sendable {
     case finished
     case cancelled
     case failed
@@ -224,7 +225,7 @@ public enum AIRegionAnswerState: String, Equatable, Sendable {
 /// It is deliberately not a PDF annotation and not a sidecar: no file beside the PDF is created.
 /// The PNG lives in memory only; it is written to disk only when the reader exports the
 /// knowledge document and chooses a destination.
-public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
+public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public let documentKey: String
     public let attachment: AIRegionAttachment
@@ -235,6 +236,8 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
     /// The fixed transport category of a failed answer. Nil for a cancelled or successful turn.
     public let failure: AIRequestFailure?
     public let createdAt: Date
+    public let turns: [AIRegionTurn]
+    public let knowledgeNote: String
 
     public init(
         id: UUID = UUID(),
@@ -245,7 +248,9 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
         state: AIRegionAnswerState,
         error: String? = nil,
         failure: AIRequestFailure? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        turns: [AIRegionTurn] = [],
+        knowledgeNote: String = ""
     ) {
         self.id = id
         self.documentKey = documentKey
@@ -256,18 +261,25 @@ public struct AIRegionHistoryEntry: Identifiable, Equatable, Sendable {
         self.error = error
         self.failure = failure
         self.createdAt = createdAt
+        self.turns = turns
+        self.knowledgeNote = knowledgeNote
+    }
+
+    public var allTurns: [AIRegionTurn] {
+        turns.isEmpty ? [AIRegionTurn(question: question, answer: answer, state: state,
+                                     error: error, createdAt: createdAt)] : turns
     }
 
     public var hasAnswer: Bool {
-        !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !knowledgeNote.isEmpty || allTurns.contains { !$0.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
     /// `[p.N]` citations the answer made, in the order the answer first mentions them.
-    public var citedPages: [Int] { AIAnswerMarkdown.allCitedPages(in: answer) }
+    public var citedPages: [Int] { AIAnswerMarkdown.allCitedPages(in: allTurns.map(\.answer).joined(separator: "\n") + "\n" + knowledgeNote) }
 
     public var answerPreview: String {
-        let collapsed = answer.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        return collapsed.count <= 160 ? collapsed : String(collapsed.prefix(160)) + "…"
+        ReaderMarkdown.parse(knowledgeNote.isEmpty ? answer : knowledgeNote, pageCount: Int.max)
+            .plainTextPreview(maxCharacters: 160)
     }
 
     public var timeLabel: String {
@@ -291,97 +303,121 @@ enum AIRegionDates {
     }()
 }
 
-/// One open region conversation shown in the document gap.
-///
-/// The request state lives in its own `AIAssistantModel`, so the card's cancel/retry can never
-/// disturb the right panel's chat and two cards can stream at once. The card owns the editable
-/// question and reports its measured view height; `AppState` turns that into the gap height in
-/// content points.
+/// A complete turn, retained independently of the next request's streaming state.
+public struct AIRegionTurn: Codable, Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let question: String
+    public let answer: String
+    public let state: AIRegionAnswerState
+    public let error: String?
+    public let createdAt: Date
+
+    public init(id: UUID = UUID(), question: String, answer: String,
+                state: AIRegionAnswerState = .finished, error: String? = nil,
+                createdAt: Date = Date()) {
+        self.id = id; self.question = question; self.answer = answer
+        self.state = state; self.error = error; self.createdAt = createdAt
+    }
+}
+
+/// One bounded conversation anchored to a fixed tear in the paper.
 @MainActor
 public final class AIRegionCard: ObservableObject, Identifiable {
-    /// The height estimate a new card starts with, in view points. The placement rule uses it to
-    /// decide whether a tear can hold the card before the real height is measured; the measured
-    /// height then drives the gap exactly.
-    public static let initialHeightViewPt: CGFloat = 240
-
+    public static let initialHeightViewPt: CGFloat = 180
+    public static func maximumHeight(in viewport: CGFloat) -> CGFloat {
+        min(420, max(150, viewport * 0.55))
+    }
     public let id: UUID
     public let documentKey: String
     public let attachment: AIRegionAttachment
     public let assistant: AIAssistantModel
+    public let notesAssistant: AIAssistantModel
     public let createdAt: Date
-    /// The question field. Sending captures it in `assistant.regionAskedQuestion`; editing it
-    /// afterwards cannot change the question the answer belongs to.
-    @Published public var question: String = ""
-    /// Measured height of the whole card in view points. It starts at a small estimate and is
-    /// corrected after the first layout pass; the gap follows it exactly.
-    @Published public private(set) var heightViewPt: CGFloat = AIRegionCard.initialHeightViewPt
-    /// Page-local Y of the tear this card opened, or nil when it sits after the page's row.
-    ///
-    /// The tear belongs to the card: when the card closes, the split disappears with the gap.
-    /// It is fixed at creation (and can fall back to the page foot if the measured card turns out
-    /// to be taller than the space below the selection), never re-chosen on a scroll or a zoom.
+    @Published public var question = ""
+    @Published public var knowledgeNote = ""
+    @Published public private(set) var turns: [AIRegionTurn] = []
+    @Published public private(set) var heightViewPt: CGFloat = initialHeightViewPt
     public internal(set) var tearSplitPt: CGFloat?
-    /// Why the inside-page tear was refused, when it was. The card's status line reports it.
     public internal(set) var tearFallbackReason: String?
+    private var pendingNoteApplication = false
+    private var liveTurnID = UUID()
+    private var liveTurnDate = Date()
+    private var observations = Set<AnyCancellable>()
 
-    public init(
-        id: UUID = UUID(),
-        documentKey: String,
-        attachment: AIRegionAttachment,
-        assistant: AIAssistantModel,
-        createdAt: Date = Date(),
-        tearSplitPt: CGFloat? = nil,
-        tearFallbackReason: String? = nil
-    ) {
-        self.id = id
-        self.documentKey = documentKey
-        self.attachment = attachment
-        self.assistant = assistant
-        self.createdAt = createdAt
-        self.question = ""
-        self.tearSplitPt = tearSplitPt
+    public init(id: UUID = UUID(), documentKey: String, attachment: AIRegionAttachment,
+                assistant: AIAssistantModel, createdAt: Date = Date(),
+                tearSplitPt: CGFloat? = nil, tearFallbackReason: String? = nil) {
+        self.id = id; self.documentKey = documentKey; self.attachment = attachment
+        self.assistant = assistant; self.notesAssistant = assistant.makeRegionSibling()
+        self.createdAt = createdAt; self.tearSplitPt = tearSplitPt
         self.tearFallbackReason = tearFallbackReason
+        assistant.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &observations)
+        notesAssistant.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
+        }.store(in: &observations)
     }
-
-    /// The question the current answer belongs to.
     public var askedQuestion: String? { assistant.regionAskedQuestion }
-
     public var answer: String { assistant.answer }
     public var isStreaming: Bool { assistant.phase == .streaming }
     public var hasPreview: Bool { assistant.plan != nil }
-
+    public var isBusy: Bool { assistant.phase == .preparing || isStreaming }
+    public var notesBusy: Bool { notesAssistant.phase == .preparing || notesAssistant.phase == .streaming }
     public var answerState: AIRegionAnswerState {
-        let trimmed = assistant.answer.trimmingCharacters(in: .whitespacesAndNewlines)
         switch assistant.phase {
-        case .failed:
-            return trimmed.isEmpty ? .failed : .failed
-        case .cancelled:
-            return trimmed.isEmpty ? .cancelled : .cancelled
-        case .finished:
-            return trimmed.isEmpty ? .empty : .finished
-        default:
-            return trimmed.isEmpty ? .empty : .finished
+        case .failed: .failed
+        case .cancelled: .cancelled
+        default: answer.isEmpty ? .empty : .finished
         }
     }
-
-    /// What "Done", "Collapse" or a document switch keeps. Nil when the card never got a
-    /// question (closing an empty draft then discards it: there is nothing to remember).
-    public var historyEntry: AIRegionHistoryEntry? {
-        guard let question = askedQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !question.isEmpty else { return nil }
-        return AIRegionHistoryEntry(
-            id: id,
-            documentKey: documentKey,
-            attachment: attachment,
-            question: question,
-            answer: assistant.answer,
-            state: answerState,
-            error: assistant.errorMessage,
-            failure: answerState == .failed ? assistant.requestFailure : nil,
-            createdAt: createdAt
-        )
+    public var allTurns: [AIRegionTurn] {
+        guard let askedQuestion, !askedQuestion.isEmpty else { return turns }
+        return turns + [AIRegionTurn(id: liveTurnID, question: askedQuestion, answer: answer,
+                                    state: answerState, error: assistant.errorMessage,
+                                    createdAt: liveTurnDate)]
     }
-
+    public var conversationContext: [AIConversationTurn] {
+        allTurns.filter { $0.state == .finished && !$0.answer.isEmpty }
+            .map { AIConversationTurn(question: $0.question, answer: $0.answer) }
+    }
+    public func restore(_ entry: AIRegionHistoryEntry) {
+        turns = entry.allTurns
+        knowledgeNote = entry.knowledgeNote
+    }
+    public func send(context: AIReaderContext) async {
+        let next = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !next.isEmpty, !isBusy, !notesBusy else { return }
+        let history = conversationContext
+        turns = allTurns
+        liveTurnID = UUID(); liveTurnDate = Date()
+        await assistant.prepareRegion(question: next, attachment: attachment,
+                                      context: context, history: history)
+        if assistant.phase == .preview {
+            question = ""
+            assistant.send()
+        }
+    }
+    /// Distillation is an explicit request. Its output never replaces the conversation.
+    public func distill(context: AIReaderContext) async {
+        guard !isBusy, !notesBusy, !conversationContext.isEmpty else { return }
+        pendingNoteApplication = true
+        await notesAssistant.prepareRegion(
+            question: "Summarize the earlier conversation into concise reading notes in the reader's language. Keep key concepts, evidence, important notation, and unresolved questions. Cite the selected page as [p.N]. Do not invent facts. Return Markdown bullet points only.",
+            attachment: attachment, context: context, history: conversationContext)
+        if notesAssistant.phase == .preview { notesAssistant.send() }
+    }
+    public func keepGeneratedNote() {
+        guard pendingNoteApplication, notesAssistant.phase == .finished, !notesAssistant.answer.isEmpty else { return }
+        pendingNoteApplication = false
+        knowledgeNote = notesAssistant.answer
+    }
+    public var historyEntry: AIRegionHistoryEntry? {
+        guard let first = allTurns.first else { return nil }
+        return AIRegionHistoryEntry(id: id, documentKey: documentKey, attachment: attachment,
+            question: first.question, answer: allTurns.last?.answer ?? "", state: answerState,
+            error: assistant.errorMessage, failure: assistant.requestFailure, createdAt: createdAt,
+            turns: allTurns, knowledgeNote: knowledgeNote)
+    }
     public func updateHeight(_ height: CGFloat) {
         guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.5 else { return }
         heightViewPt = height

@@ -230,7 +230,7 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(180))
         host.layoutSubtreeIfNeeded()
         try await eventually("the hosted card reports its measured height") {
-            card.heightViewPt > 240
+            card.heightViewPt > 120 && card.heightViewPt <= AIRegionCard.maximumHeight(in: 700)
         }
         try await Task.sleep(for: .milliseconds(120))
         host.layoutSubtreeIfNeeded()
@@ -255,9 +255,9 @@ extension ReaderChecks {
                 "the region overlay lets a click outside the card reach the canvas, got \(String(describing: outsideHit))")
         require(insideHit != nil && insideHit !== container,
                 "the card itself receives a click, got \(String(describing: insideHit))")
-        require(abs(frame.width - 564) < 1.5,
-                "the card is page-width minus a margin (564 pt), got \(frame.width)")
-        require(abs(frame.minX - 168) < 1.5,
+        require(abs(frame.width - 576) < 1.5,
+                "the card is page-width minus a margin (576 pt), got \(frame.width)")
+        require(abs(frame.minX - 162) < 1.5,
                 "the card is centred on the page column, got x=\(frame.minX)")
         // The card's height is measured asynchronously; wait until the layout has applied the
         // same measured gap before comparing page offsets. (A single read can catch the page
@@ -780,7 +780,7 @@ extension ReaderChecks {
             exportedAt: Date(timeIntervalSince1970: 1_700_000_200),
             imageFolderName: "region-paper-images"
         )
-        require(document.markdown.contains("# Region questions — Region Paper"),
+        require(document.markdown.contains("# Reading notes — Region Paper"),
                 "the export has a document title")
         require(document.markdown.contains("## Contents"), "the export has a table of contents")
         require(document.markdown.contains("region-paper-images/region-01.png"),

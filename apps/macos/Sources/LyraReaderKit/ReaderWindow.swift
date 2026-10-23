@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
+    @ObservedObject private var documentKnowledge: AIDocumentKnowledge
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
     /// Documents arriving at *this* window: its own coordinator, so a drop on its canvas becomes a
     /// tab here and nowhere else. Files dropped on the canvas also drive its hover hint.
@@ -39,6 +40,7 @@ public struct ReaderWindow: View {
         aiAssistant: AIAssistantModel? = nil
     ) {
         self.state = state
+        _documentKnowledge = ObservedObject(wrappedValue: state.documentKnowledge)
         self.opener = opener
         self.previewPanels = previewPanels
         self.integratesTitlebar = integratesTitlebar
@@ -116,6 +118,9 @@ public struct ReaderWindow: View {
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
+        .sheet(isPresented: $documentKnowledge.isPresented) {
+            AIDocumentKnowledgeSheet(knowledge: documentKnowledge)
+        }
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
         .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
             if state.closeRequiresReview {
@@ -128,12 +133,14 @@ public struct ReaderWindow: View {
         } message: { Text(state.closeChangesMessage) }
         .onAppear {
             state.installTerminationHandling()
+            documentKnowledge.settings = aiAssistant.settings
             // The in-place action uses the same provider settings and target language as the
             // assistant panel; there is exactly one AI configuration in a window.
             state.inPlaceTranslationSettingsOverride = aiAssistant.settings
             state.inPlaceTranslationAuditOverride = aiAssistant.audit
             state.inPlaceTranslationTargetLanguage = aiAssistant.targetLanguage
         }
+        .onChange(of: state.document?.url) { _, _ in documentKnowledge.invalidate() }
         .onChange(of: aiAssistant.targetLanguage) { _, language in
             state.inPlaceTranslationTargetLanguage = language
         }
@@ -353,27 +360,21 @@ public struct ReaderWindow: View {
                     CanvasContextMenu.menu(state: state, at: point)
                 },
                 onTranslationToggle: { id in state.toggleTranslation(id: id) },
-                onTranslationCancel: { id in state.cancelTranslation(id: id) }
-            )
-            .background(ReferencePreviewHost(state: state, panels: previewPanels))
-
-            AIRegionOverlayHost(
-                state: state,
-                onOpenInPanel: { entry in
+                onTranslationCancel: { id in state.cancelTranslation(id: id) },
+                regionState: state,
+                onOpenRegionInPanel: { entry in
                     guard let context = state.aiReaderContext else { return }
-                    aiAssistant.importConversation(
-                        question: entry.question,
-                        answer: entry.answer,
-                        attachment: entry.attachment,
-                        context: context
-                    )
+                    aiAssistant.importConversation(question: entry.question, answer: entry.answer,
+                        attachment: entry.attachment, context: context)
                     state.rightPanelVisible = true
                 },
-                onShowHistory: {
+                onShowRegionHistory: {
                     state.rightPanelVisible = true
                     aiAssistant.selectedTab = .regions
                 }
             )
+            .background(ReferencePreviewHost(state: state, panels: previewPanels))
+
 
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)

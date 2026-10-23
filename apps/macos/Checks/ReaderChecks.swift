@@ -57,6 +57,7 @@ struct ReaderChecks {
         // pages and the page gap). Checks must not inherit them from whatever the person
         // running the suite chose in the app: pin continuous/12 for this process. Setters still
         // exercise the real layout path, they just do not write the preference.
+        AppState.usesDocumentKnowledge = false
         AppState.usesStoredReadingLayoutPreferences = false
         // Same rule for the sidebar's remembered tab and the right panel's width/visibility: a
         // check run must not move the person's app into the state the check exercises.
@@ -161,6 +162,14 @@ struct ReaderChecks {
         if CommandLine.arguments.contains("--check-inplace-translation") {
             try await inPlaceTranslationChecks(root: fastRoot)
             print("In-place translation checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--preview-region-review") {
+            try await regionReviewPreview(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-reading-notes") {
+            try await regionReadingNotesChecks(root: fastRoot)
             return
         }
         if CommandLine.arguments.contains("--check-region-questions") {
@@ -720,6 +729,7 @@ struct ReaderChecks {
         try renameCompatibilityChecks(root: root)
         try await aiAssistantChecks(root: root)
         try await inPlaceTranslationChecks(root: root)
+        try await regionReadingNotesChecks(root: root)
         try await regionQuestionChecks(root: root)
         try await insidePageTearChecks(root: root)
         try await aiAuditChecks(root: root)

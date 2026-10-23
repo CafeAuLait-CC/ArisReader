@@ -443,10 +443,9 @@ public struct AIAssistantPanel: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Part \(index + 1) · \(model.partLabels[index] ?? "")")
                                     .font(.caption2.weight(.semibold))
-                                Text(model.partAnswers[index] ?? "")
-                                    .font(.caption)
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
+                                AIAnswerView(text: model.partAnswers[index] ?? "",
+                                    pageCount: Int(model.plan?.pageCount ?? 0),
+                                    onJump: { state.gotoPage($0 - 1) })
                             }
                         }
                     }
@@ -511,11 +510,8 @@ public struct AIAssistantPanel: View {
     }
 
     private var reasoningText: some View {
-        Text(model.reasoning)
-            .font(.callout)
+        AIAnswerView(text: model.reasoning, pageCount: 0, onJump: { _ in })
             .foregroundStyle(LyraReaderTheme.textSecondary)
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder

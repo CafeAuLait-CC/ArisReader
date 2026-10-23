@@ -95,6 +95,7 @@ public final class AIAssistantModel: ObservableObject {
     private var conversations: [String: [AIChatTurn]] = [:]
     private var streamingChatTurnID: UUID?
     private var retryingChatTurnID: UUID?
+    private var regionPreparationID = UUID()
 
     public init(settings: AISettingsStore = .shared, audit: AIAuditTrail = .shared) {
         self.settings = settings
@@ -213,7 +214,7 @@ public final class AIAssistantModel: ObservableObject {
     }
 
     /// Prepare a request preview. This reads document text locally and does not read the key.
-    public func prepare(action: AIAssistantAction, context: AIReaderContext) async {
+    public func prepare(action: AIAssistantAction, context: AIReaderContext, documentKnowledge: Bool = false) async {
         if documentKey != context.documentKey {
             attach(service: service, context: context)
         }
@@ -274,6 +275,7 @@ public final class AIAssistantModel: ObservableObject {
             selection: context.selection,
             question: (question?.isEmpty == false) ? question : nil,
             language: (language?.isEmpty == false) ? language : nil,
+            documentKnowledge: documentKnowledge,
             settings: providerSettings
         )
 
@@ -409,10 +411,26 @@ public final class AIAssistantModel: ObservableObject {
     /// exact rectangle, its extracted text and (when the model accepts images) the PNG capture.
     /// The preview is the same `AiPlanRecord` every other action shows, so nothing can be sent
     /// that the card did not display.
+    func cancelRegionWork() {
+        regionPreparationID = UUID()
+        if phase == .preparing || phase == .streaming {
+            cancelWork()
+            phase = .cancelled
+            statusNote = "Stopped. The conversation is kept."
+        }
+    }
+
+    func makeRegionSibling() -> AIAssistantModel {
+        let sibling = AIAssistantModel(settings: settings, audit: audit)
+        sibling.service = service
+        return sibling
+    }
+
     public func prepareRegion(
         question rawQuestion: String,
         attachment: AIRegionAttachment,
-        context: AIReaderContext
+        context: AIReaderContext,
+        history: [AIConversationTurn] = []
     ) async {
         if documentKey != context.documentKey {
             attach(service: service, context: context)
@@ -424,6 +442,14 @@ public final class AIAssistantModel: ObservableObject {
             errorMessage = nil
             return
         }
+        cancelWork()
+        plan = nil
+        resetMergeState()
+        resetStreamOutput()
+        errorMessage = nil
+        regionAskedQuestion = question
+        let preparationID = UUID()
+        regionPreparationID = preparationID
         let auditStart = Date()
         guard let service else {
             recordRefusal(.regionQuestion, code: .notConfigured, startedAt: auditStart)
@@ -476,7 +502,7 @@ public final class AIAssistantModel: ObservableObject {
             selection: nil,
             question: question,
             language: nil,
-            history: [],
+            history: history,
             region: attachment,
             sendRegionImage: providerSettings.vision,
             settings: providerSettings
@@ -484,14 +510,14 @@ public final class AIAssistantModel: ObservableObject {
         do {
             let source = try await service.prepare(request)
             let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
-            guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
+            guard regionPreparationID == preparationID, documentKey == context.documentKey, regionAskedQuestion == question else { return }
             self.plan = plan
             phase = .preview
             let imageNote = plan.parts.first?.includesRegionImage == true
                 ? "The image part is included." : "Text only: the image part is not included."
             statusNote = "Nothing has been sent yet. \(imageNote) Review the exact request below, then press Ask."
         } catch {
-            guard documentKey == context.documentKey, regionAskedQuestion == question else { return }
+            guard regionPreparationID == preparationID, documentKey == context.documentKey, regionAskedQuestion == question else { return }
             let message = AIReadableError.message(error)
             recordRefusal(.regionQuestion,
                           code: AIAuditCode.classifyPreparationFailure(

@@ -76,7 +76,7 @@ public enum AIRegionMarkdownExport {
         let title = singleLine(documentTitle).replacingOccurrences(of: "#", with: "\\#")
         let fileName = singleLine(documentFileName)
         var markdown = ""
-        markdown += "# Region questions — \(title)\n\n"
+        markdown += "# Reading notes — \(title)\n\n"
         markdown += "- **Document:** `\(codeSpan(fileName))`\n"
         markdown += "- **Exported:** \(AIRegionDates.iso.string(from: exportedAt))\n"
         markdown += "- **Conversations:** \(answered.count)\n"
@@ -101,11 +101,19 @@ public enum AIRegionMarkdownExport {
             }
             markdown += "![\(altText(index: index, entry: entry))](\(linkPath(folder: imageFolderName, file: imageName)))\n\n"
             markdown += "**Page:** \(entry.attachment.page + 1) · **Region:** \(Int(entry.attachment.rect.width.rounded())) × \(Int(entry.attachment.rect.height.rounded())) pt · **Asked:** \(AIRegionDates.iso.string(from: entry.createdAt))\n\n"
-            markdown += "**Question**\n\n"
-            markdown += questionParagraph(entry.question)
-            markdown += "\n\n**Answer**\n\n"
-            markdown += entry.answer.trimmingCharacters(in: .whitespacesAndNewlines)
-            markdown += "\n\n"
+            if !entry.knowledgeNote.isEmpty {
+                markdown += "### Reading note\n\n" + entry.knowledgeNote.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
+            }
+            for (turnIndex, turn) in entry.allTurns.enumerated() {
+                markdown += "### Turn \(turnIndex + 1)\n\n**Question**\n\n"
+                markdown += questionParagraph(turn.question)
+                markdown += "\n\n**Answer**\n\n"
+                markdown += turn.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if turn.state != .finished {
+                    markdown += "\n\n*\(turn.state.rawValue); this turn may be partial.*"
+                }
+                markdown += "\n\n"
+            }
             let citations = entry.citedPages
             if citations.isEmpty {
                 markdown += "**Citations:** none\n\n"
