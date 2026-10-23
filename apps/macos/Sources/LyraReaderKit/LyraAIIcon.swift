@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The supplied quill and four-point star, kept as independent monochrome vector paths.
@@ -5,6 +6,25 @@ import SwiftUI
 struct LyraAIIcon: View {
     var isActive = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// NSToolbar-backed tab items extract an Image; arbitrary Shape content is omitted.
+    /// A drawing representation keeps the same vectors sharp at either backing scale.
+    @MainActor static let templateImage: NSImage = {
+        let image = NSImage(size: CGSize(width: 28, height: 28), flipped: true) { rect in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            context.saveGState()
+            defer { context.restoreGState() }
+            context.translateBy(x: rect.minX, y: rect.minY)
+            context.scaleBy(x: rect.width / 32, y: rect.height / 32)
+            context.setFillColor(NSColor.black.cgColor)
+            context.addPath(LyraAIPath.quill.cgPath)
+            context.addPath(LyraAIPath.sparkle.cgPath)
+            context.fillPath()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }()
 
     var body: some View {
         ZStack {
@@ -53,7 +73,7 @@ private struct LyraAIPath: Shape {
             .concatenating(CGAffineTransform(translationX: rect.minX, y: rect.minY)))
     }
 
-    private static let quill: Path = {
+    fileprivate static let quill: Path = {
         var p = Path()
         p.move(to: CGPoint(x: 25.921875, y: 3.0729167))
         p.addCurve(to: CGPoint(x: 25.526042, y: 3.1770833), control1: CGPoint(x: 25.790435, y: 3.0705827), control2: CGPoint(x: 25.654185, y: 3.1071582))
@@ -148,7 +168,7 @@ private struct LyraAIPath: Shape {
         return p
     }()
 
-    private static let sparkle: Path = {
+    fileprivate static let sparkle: Path = {
         var p = Path()
         p.move(to: CGPoint(x: 8, y: 3.05))
         p.addCurve(to: CGPoint(x: 8.24, y: 3.48), control1: CGPoint(x: 8.15, y: 3.05), control2: CGPoint(x: 8.2, y: 3.2))
