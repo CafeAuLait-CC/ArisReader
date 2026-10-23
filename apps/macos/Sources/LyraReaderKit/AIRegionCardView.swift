@@ -63,18 +63,16 @@ struct AIRegionCardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().overlay(LyraReaderTheme.separator)
+            Rectangle().fill(LyraReaderTheme.accentBorder.opacity(0.18)).frame(height: 1).padding(.horizontal, 18)
             transcript
-            Divider().overlay(LyraReaderTheme.separator)
+            Rectangle().fill(LyraReaderTheme.accentBorder.opacity(0.18)).frame(height: 1).padding(.horizontal, 18)
             composer.background(GeometryReader { p in
                 Color.clear.preference(key: AIRegionComposerHeightKey.self, value: p.size.height)
             })
             .onPreferenceChange(AIRegionComposerHeightKey.self) { composerHeight = $0 }
         }
         .foregroundStyle(LyraReaderTheme.textPrimary)
-        .background(LyraReaderTheme.panelBg, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(LyraReaderTheme.controlBorder.opacity(0.55)))
-        .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
+        .background(RegionNotePaper())
         .padding(.vertical, 8)
         .background(GeometryReader { proxy in
             Color.clear.preference(key: AIRegionCardHeightKey.self, value: proxy.size.height)
@@ -126,7 +124,7 @@ struct AIRegionCardView: View {
             }.buttonStyle(.plain).help("View selected region")
                 .popover(isPresented: $showingSelection) { selectionPreview }
             if showingNote {
-                Text("Reading note").font(.caption).foregroundStyle(LyraReaderTheme.noteFg)
+                Text("Reading note").font(.system(size: 12, design: .serif)).foregroundStyle(LyraReaderTheme.noteFg)
             } else if card.isBusy || card.notesBusy {
                 Text(card.notesBusy ? "Making notes…" : assistant.answer.isEmpty ? "Thinking…" : "Responding…")
                     .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
@@ -164,7 +162,7 @@ struct AIRegionCardView: View {
                     .frame(width: 26, height: 26).contentShape(Rectangle())
             }.buttonStyle(.plain).help("Collapse and keep conversation")
                 .accessibilityLabel("Collapse and keep conversation")
-        }.padding(.horizontal, 13).frame(height: 40)
+        }.padding(.horizontal, 18).frame(height: 40)
     }
     private var selectionPreview: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -196,7 +194,7 @@ struct AIRegionCardView: View {
                             Color.clear.preference(key: AIRegionBottomKey.self,
                                 value: p.frame(in: .named("regionTranscript")).maxY)
                         })
-                }.padding(13).frame(maxWidth: .infinity, alignment: .leading)
+                }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
                     .background(GeometryReader { p in
                         Color.clear.preference(key: AIRegionTranscriptHeightKey.self, value: p.size.height)
@@ -220,7 +218,10 @@ struct AIRegionCardView: View {
                 Spacer(minLength: 30)
                 Text(turn.question).font(.system(size: 13)).textSelection(.enabled)
                     .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(LyraReaderTheme.accentSoft, in: RoundedRectangle(cornerRadius: 8))
+                    .background(LyraReaderTheme.accentSoft.opacity(0.65), in: RoundedRectangle(cornerRadius: 4))
+                    .overlay(alignment: .leading) {
+                        Rectangle().fill(LyraReaderTheme.accentBorder.opacity(0.45)).frame(width: 2)
+                    }
             }
             if !turn.answer.isEmpty {
                 AIAnswerView(text: turn.answer, pageCount: state.document?.pageCount ?? 0,
@@ -269,10 +270,11 @@ struct AIRegionCardView: View {
                 .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...3)
                 .focused($questionFocused).onSubmit { send() }
                 .disabled(card.isBusy || card.notesBusy)
-                .padding(9).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(
-                    questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder,
-                    lineWidth: questionFocused ? 1.5 : 0.7))
+                .padding(9).background(LyraReaderTheme.raisedBg.opacity(0.45), in: RoundedRectangle(cornerRadius: 3))
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder)
+                        .frame(height: questionFocused ? 1.5 : 0.7)
+                }
                 .accessibilityLabel("Region question")
             if card.isBusy || card.notesBusy {
                 Button { assistant.cancelRegionWork(); notes.cancelRegionWork() } label: {
@@ -287,7 +289,7 @@ struct AIRegionCardView: View {
                     .keyboardShortcut(.return, modifiers: .command)
                     .help("Send · ⌘Return").accessibilityLabel("Send region question")
             }
-        }.padding(.horizontal, 12).padding(.vertical, 10)
+        }.padding(.leading, 18).padding(.trailing, 24).padding(.vertical, 10)
     }
     private func send() {
         guard let context = state.aiReaderContext else { return }
@@ -539,5 +541,64 @@ final class AIRegionCanvasHost: NSView {
         let local = convert(point, from: superview)
         guard hosts.values.contains(where: { !$0.isHidden && $0.frame.contains(local) }) else { return nil }
         return super.hitTest(point)
+    }
+}
+
+
+/// A quiet sheet of note paper inside the PDF split. Decoration stays behind the
+/// content so it cannot intercept selection, scrolling, or the fixed composer.
+private struct RegionNotePaper: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 5)
+            .fill(LyraReaderTheme.panelBg)
+            .overlay {
+                if !reduceTransparency {
+                    LinearGradient(colors: [LyraReaderTheme.accentSoft.opacity(0.75),
+                                            LyraReaderTheme.raisedBg.opacity(0.25),
+                                            LyraReaderTheme.accentSoft.opacity(0.45)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                    Canvas { context, size in
+                        // Deterministic short fibres, capped independently of response length.
+                        for index in 0..<180 {
+                            let x = CGFloat((index * 137 + 29) % 997) / 997 * size.width
+                            let y = CGFloat((index * 263 + 71) % 991) / 991 * size.height
+                            var fibre = Path()
+                            fibre.move(to: CGPoint(x: x, y: y))
+                            fibre.addLine(to: CGPoint(x: x + 2 + CGFloat(index % 4), y: y + 0.4))
+                            context.stroke(fibre, with: .color(LyraReaderTheme.accentBorder.opacity(0.055)), lineWidth: 0.5)
+                        }
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay {
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(LyraReaderTheme.accentBorder.opacity(contrast == .increased ? 0.8 : 0.28), lineWidth: 0.8)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                // A small turned corner, clear of the send button and transcript.
+                Path { path in
+                    path.move(to: CGPoint(x: 0, y: 14))
+                    path.addLine(to: CGPoint(x: 14, y: 0))
+                    path.addLine(to: CGPoint(x: 14, y: 11))
+                    path.addQuadCurve(to: CGPoint(x: 11, y: 14), control: CGPoint(x: 14, y: 14))
+                    path.closeSubpath()
+                }
+                .fill(LyraReaderTheme.accentSoft)
+                .overlay {
+                    Path { path in
+                        path.move(to: CGPoint(x: 0, y: 14))
+                        path.addQuadCurve(to: CGPoint(x: 14, y: 0), control: CGPoint(x: 10, y: 11))
+                    }.stroke(LyraReaderTheme.accentBorder.opacity(0.3), lineWidth: 0.7)
+                }
+                .frame(width: 14, height: 14).padding(1)
+            }
+            .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.09), radius: 5, x: 0, y: 3)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
