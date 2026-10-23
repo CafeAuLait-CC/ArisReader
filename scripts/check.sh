@@ -12,9 +12,10 @@
 # A bare `./scripts/check.sh` still does all of it. These opt-outs exist so CI can run each half
 # in its own parallel job without changing what a developer gets. The environment form is what CI
 # uses; every switch defaults to running the part:
-#   --no-swift           (no environment form) skip the Swift build and LyraReaderChecks
+#   --no-swift           skip the Swift build and LyraReaderChecks
 #   --no-rust            skip section 3 (another job runs the Rust gate)
 #   --no-native-checks   skip the in-script LyraReaderChecks run (CI runs it as `--shard i/n`)
+#   LYRA_READER_CHECK_SKIP_SWIFT=1
 #   LYRA_READER_CHECK_SKIP_RUST=1
 #   LYRA_READER_CHECK_SKIP_NATIVE_CHECKS=1
 set -uo pipefail
@@ -25,6 +26,7 @@ cd "$ROOT"
 SKIP_SWIFT=0
 SKIP_RUST=0
 SKIP_NATIVE_CHECKS=0
+case "${LYRA_READER_CHECK_SKIP_SWIFT:-0}" in 1|true|yes) SKIP_SWIFT=1 ;; esac
 case "${LYRA_READER_CHECK_SKIP_RUST:-0}" in 1|true|yes) SKIP_RUST=1 ;; esac
 case "${LYRA_READER_CHECK_SKIP_NATIVE_CHECKS:-0}" in 1|true|yes) SKIP_NATIVE_CHECKS=1 ;; esac
 for arg in "$@"; do
@@ -32,7 +34,7 @@ for arg in "$@"; do
     --no-swift) SKIP_SWIFT=1 ;;
     --no-rust) SKIP_RUST=1 ;;
     --no-native-checks) SKIP_NATIVE_CHECKS=1 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
   esac
 done
 
@@ -160,7 +162,7 @@ fi
 section "Native macOS shell"
 SWIFT_BUILT=0
 if [ "$SKIP_SWIFT" = "1" ]; then
-  warn "skipped (--no-swift)"
+  warn "skipped (LYRA_READER_CHECK_SKIP_SWIFT=1 / --no-swift: another job runs the Swift build)"
 elif [ "$SWIFT_OK" = "1" ]; then
   # In a restricted sandbox (including CI/agent environments) SwiftPM's nested sandbox-exec is rejected, so fall back to --disable-sandbox
   if (cd apps/macos && swift build >"$ROOT/build/swift-build.log" 2>&1); then
