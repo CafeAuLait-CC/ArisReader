@@ -2,542 +2,330 @@ import AppKit
 import LyraReaderBindings
 import SwiftUI
 
-/// The cards drawn in the gaps opened in the document flow.
-///
-/// This is an overlay only in the drawing sense: the gap itself is real (pages below the card's
-/// row are shifted down by `AppState`), so a card never covers page content. Its top follows the
-/// page point through scroll and zoom because both coordinates come from the same
-/// `CanvasGeometry` conversion the canvas uses for pages.
+/// Compatibility host for previews and isolated native checks. The reader uses the native
+/// canvas child below so the card and paper share the very same submitted scroll transform.
 public struct AIRegionCardsOverlay: View {
-    @ObservedObject private var state: AppState
-    private let onOpenInPanel: (AIRegionHistoryEntry) -> Void
-    private let onShowHistory: () -> Void
-
-    public init(
-        state: AppState,
-        onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
-        onShowHistory: @escaping () -> Void
-    ) {
-        self.state = state
-        self.onOpenInPanel = onOpenInPanel
-        self.onShowHistory = onShowHistory
+    @ObservedObject var state: AppState
+    let onOpenInPanel: (AIRegionHistoryEntry) -> Void
+    let onShowHistory: () -> Void
+    public init(state: AppState, onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
+                onShowHistory: @escaping () -> Void) {
+        self.state = state; self.onOpenInPanel = onOpenInPanel; self.onShowHistory = onShowHistory
     }
-
     public var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topLeading) {
                 ForEach(state.regionCards) { card in
                     if let frame = AIRegionCardPlacement.frame(for: card, state: state, in: geometry.size) {
-                        let visible = frame.y + card.heightViewPt > 0
-                            && frame.y < geometry.size.height
-                        AIRegionCardView(
-                            state: state,
-                            card: card,
-                            width: frame.width,
-                            onOpenInPanel: onOpenInPanel,
-                            onShowHistory: onShowHistory
-                        )
-                        .frame(width: frame.width)
-                        .offset(x: frame.x, y: frame.y)
-                        .opacity(visible ? 1 : 0)
-                        .allowsHitTesting(visible)
-                        .transition(.opacity)
+                        AIRegionCardView(state: state, card: card, width: frame.width,
+                            maximumHeight: AIRegionCard.maximumHeight(in: geometry.size.height),
+                            onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory)
+                            .frame(width: frame.width)
+                            .offset(x: frame.x, y: frame.y)
                     }
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        }
-        .clipped()
-        .animation(.easeOut(duration: 0.16), value: state.regionCards.count)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }.clipped()
     }
-
-
 }
 
-/// One Jupyter-style cell: the question and the answer beneath it, with a small header that
-/// names the page and region and offers the three lifecycle actions.
+/// A small reading conversation: paper context, a bounded transcript and a fixed composer.
 struct AIRegionCardView: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @ObservedObject var card: AIRegionCard
     @ObservedObject private var assistant: AIAssistantModel
+    @ObservedObject private var notes: AIAssistantModel
     let width: CGFloat
+    var maximumHeight: CGFloat = 420
     let onOpenInPanel: (AIRegionHistoryEntry) -> Void
     let onShowHistory: () -> Void
-
+    @State private var showingSelection = false
+    @State private var showingDetails = false
+    @State private var showingNote = false
+    @State private var editingNote = false
     @State private var confirmingDelete = false
+    @State private var transcriptHeight: CGFloat = 40
+    @State private var composerHeight: CGFloat = 54
+    @State private var followLatest = true
     @FocusState private var questionFocused: Bool
 
-    init(
-        state: AppState,
-        card: AIRegionCard,
-        width: CGFloat,
-        onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
-        onShowHistory: @escaping () -> Void
-    ) {
-        self.state = state
-        self.card = card
-        self.width = width
-        self.onOpenInPanel = onOpenInPanel
-        self.onShowHistory = onShowHistory
+    init(state: AppState, card: AIRegionCard, width: CGFloat, maximumHeight: CGFloat = 420,
+         onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
+         onShowHistory: @escaping () -> Void) {
+        self.state = state; self.card = card; self.width = width
+        self.maximumHeight = maximumHeight
+        self.onOpenInPanel = onOpenInPanel; self.onShowHistory = onShowHistory
         _assistant = ObservedObject(wrappedValue: card.assistant)
+        _notes = ObservedObject(wrappedValue: card.notesAssistant)
     }
-
+    private var transcriptLimit: CGFloat { max(30, maximumHeight - 58 - composerHeight) }
+    private var transcriptViewHeight: CGFloat { min(max(32, transcriptHeight), transcriptLimit) }
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(spacing: 0) {
             header
-            attachmentStrip
             Divider().overlay(LyraReaderTheme.separator)
-            questionCell
-            if let plan = assistant.plan, assistant.phase == .preview {
-                preview(plan)
-            }
-            answerCell
-            footer
+            transcript
+            Divider().overlay(LyraReaderTheme.separator)
+            composer.background(GeometryReader { p in
+                Color.clear.preference(key: AIRegionComposerHeightKey.self, value: p.size.height)
+            })
+            .onPreferenceChange(AIRegionComposerHeightKey.self) { composerHeight = $0 }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(LyraReaderTheme.panelBg,
-                    in: RoundedRectangle(cornerRadius: 9))
-        .overlay(
-            RoundedRectangle(cornerRadius: 9)
-                .strokeBorder(LyraReaderTheme.separator, lineWidth: 0.75)
-        )
-        .overlay(alignment: .topLeading) {
-            // A small tear-like accent at the top-left: the card is inserted where the page
-            // flow was cut, not floating over the page.
-            Rectangle()
-                .fill(LyraReaderTheme.accent.opacity(0.65))
-                .frame(width: 44, height: 2)
-                .offset(x: 12, y: -1)
+        .foregroundStyle(LyraReaderTheme.textPrimary)
+        .background(LyraReaderTheme.panelBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(LyraReaderTheme.controlBorder.opacity(0.55)))
+        .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
+        .padding(.vertical, 8)
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: AIRegionCardHeightKey.self, value: proxy.size.height)
+        })
+        .onPreferenceChange(AIRegionCardHeightKey.self) { height in
+            Task { @MainActor in state.updateRegionCardHeight(cardID: card.id, viewHeight: height) }
         }
-        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
-        .background(heightReporter)
         .background(AIRegionCardMarkerHost())
-        .confirmationDialog("Delete this region conversation?",
-                            isPresented: $confirmingDelete,
+        .onAppear { questionFocused = true }
+        .sheet(isPresented: $editingNote, onDismiss: { state.persistRegionHistory() }) {
+            VStack(spacing: 12) {
+                HStack {
+                    Text("Edit Reading Note").font(.headline)
+                    Spacer()
+                    Button("Done") { editingNote = false }.keyboardShortcut(.defaultAction)
+                }
+                Text("Edit the Markdown source. Your changes appear in the reading preview.")
+                    .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                TextEditor(text: $card.knowledgeNote)
+                    .font(.system(size: 13, design: .monospaced))
+                    .accessibilityLabel("Reading note Markdown source")
+            }.padding(18).frame(width: 600, height: 460)
+                .background(LyraReaderTheme.panelBg)
+        }
+        .onChange(of: notes.phase) { _, phase in
+            if phase == .finished {
+                card.keepGeneratedNote(); showingNote = true; state.persistRegionHistory()
+            }
+        }
+        .confirmationDialog("Delete this conversation?", isPresented: $confirmingDelete,
                             titleVisibility: .visible) {
             Button("Delete Conversation", role: .destructive) {
-                assistant.cancel()
-                state.closeRegionCard(id: card.id, keepHistory: false,
-                                      reason: "Region conversation deleted. The page layout returned to normal.")
+                state.closeRegionCard(id: card.id, keepHistory: false)
             }
             Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The question and answer are discarded. This cannot be undone; nothing is written to the PDF either way.")
-        }
-        .onAppear {
-            if card.question.isEmpty { questionFocused = true }
         }
     }
-
     private var header: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "rectangle.dashed")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(LyraReaderTheme.accent)
-            Text("Page \(card.attachment.page + 1) · \(card.attachment.sizeLabel)")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(LyraReaderTheme.textPrimary)
-                .lineLimit(1)
-            if card.attachment.textTruncated {
-                Text("text capped")
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.warningFg)
-            }
-            Spacer(minLength: 4)
-            headerButton("arrow.up.forward.app", help: "Copy this conversation into the AI panel chat") {
-                guard let entry = card.historyEntry else { return }
-                onOpenInPanel(entry)
-            }
-            .disabled(card.askedQuestion == nil || assistant.answer.isEmpty)
-            headerButton("chevron.down", help: "Close the gap and keep this conversation in Region questions") {
-                close(keepHistory: true, showHistory: true)
-            }
-            headerButton("trash", help: "Delete this conversation and close the gap") {
-                confirmingDelete = true
-            }
-        }
-    }
-
-    private func headerButton(
-        _ systemName: String,
-        help: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 10.5, weight: .semibold))
-                .frame(width: 22, height: 20)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(LyraReaderTheme.textSecondary)
-        .help(help)
-        .accessibilityLabel(help)
-    }
-
-    private var attachmentStrip: some View {
-        HStack(alignment: .top, spacing: 9) {
-            if let image = card.attachment.thumbnail {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.medium)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 92, height: 62)
-                    .background(LyraReaderTheme.canvasBg)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .overlay(RoundedRectangle(cornerRadius: 4)
-                        .strokeBorder(LyraReaderTheme.separator, lineWidth: 0.5))
-                    .accessibilityLabel("Selected region on page \(card.attachment.page + 1)")
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(card.attachment.pageLabel)
-                    .font(.caption2.weight(.semibold))
-                Text(card.attachment.sizeLabel)
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textSecondary)
-                Text(card.attachment.pixelLabel)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-                Text("\(card.attachment.characterCount.formatted()) characters · capture \(card.attachment.captureScale, specifier: "%.2f")×")
-                    .font(.caption2)
-                    .foregroundStyle(card.attachment.textTruncated
-                        ? LyraReaderTheme.warningFg : LyraReaderTheme.textSecondary)
-                    .lineLimit(2)
-                Text(imageStatement)
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var imageStatement: String {
-        if let plan = assistant.plan {
-            return plan.parts.first?.includesRegionImage == true
-                ? "Image included in the request as PNG."
-                : "Text-only request: the picture is shown here and kept for export, but not sent."
-        }
-        let vision = (try? assistant.settings.providerSettings().vision) ?? false
-        if !vision {
-            return "Text-only model: the picture is shown here and kept for export, but not sent."
-        }
-        return "Image included in the request as PNG."
-    }
-
-    private var questionCell: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Question")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(LyraReaderTheme.textSecondary)
-            HStack(alignment: .bottom, spacing: 6) {
-                TextField("Ask about this region…", text: $card.question, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .lineLimit(2...6)
-                    .padding(7)
-                    .background(LyraReaderTheme.raisedBg,
-                                in: RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(questionFocused ? LyraReaderTheme.accent
-                                                      : LyraReaderTheme.separator,
-                                      lineWidth: questionFocused ? 1 : 0.5))
-                    .focused($questionFocused)
-                    .onSubmit { ask() }
-                    .disabled(assistant.phase == .streaming)
-                questionActions
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var questionActions: some View {
-        if assistant.phase == .preparing {
-            ProgressView().controlSize(.small)
-                .frame(width: 54, height: 28)
-        } else if assistant.phase == .preview, assistant.plan != nil {
-            Button("Send") { assistant.send() }
-                .buttonStyle(RegionCardButtonStyle(prominent: true))
-                .help("Send the previewed request")
-        } else if assistant.phase == .streaming {
-            Button("Cancel") { assistant.cancel() }
-                .buttonStyle(RegionCardButtonStyle())
-                .help("Stop the request; the partial answer is kept")
-        } else {
-            Button(assistant.phase == .failed || assistant.phase == .cancelled ? "Retry" : "Ask") {
-                if assistant.phase == .failed, assistant.plan != nil, assistant.canRetry {
-                    assistant.retry()
-                } else {
-                    ask()
-                }
-            }
-            .buttonStyle(RegionCardButtonStyle(prominent: true))
-            .disabled(card.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .help("Build the exact request preview first; nothing is sent until Send")
-        }
-    }
-
-    private func ask() {
-        guard let context = state.aiReaderContext else { return }
-        let question = card.question
-        Task { @MainActor in
-            await assistant.prepareRegion(
-                question: question,
-                attachment: card.attachment,
-                context: context
-            )
-        }
-    }
-
-    private func preview(_ plan: AiPlanRecord) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text("Request preview")
-                    .font(.caption2.weight(.semibold))
-                Spacer()
-                Text("\(plan.estimatedTokens) est. tokens")
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textTertiary)
-            }
-            Text(plan.isLocal
-                 ? "This endpoint runs on this Mac; the region stays here."
-                 : "This is a remote endpoint: the region's text and picture leave this Mac when you press Send.")
-                .font(.caption2)
-                .foregroundStyle(plan.isLocal ? LyraReaderTheme.textSecondary
-                                              : LyraReaderTheme.warningFg)
-                .fixedSize(horizontal: false, vertical: true)
-            previewRow("Model", plan.model)
-            previewRow("Pages", plan.sourcePageLabel)
-            previewRow("Region", card.attachment.sizeLabel)
-            previewRow("Text", "\(card.attachment.characterCount.formatted()) characters")
-            previewRow("Picture", plan.parts.first?.includesRegionImage == true
-                ? "\(card.attachment.pixelLabel) PNG included"
-                : "Not sent (text-only model configuration)")
-            if card.attachment.textTruncated {
-                Text("The region text was capped at \(AIRegionLimits.maximumTextCharacters.formatted()) characters; the preview sends the capped text.")
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.warningFg)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let note = plan.note {
-                Text(note)
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.warningFg)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            DisclosureGroup("Prompts and exact JSON body") {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("User prompt")
-                        .font(.caption2.weight(.semibold))
-                    promptBox(plan.parts.first?.userPrompt ?? "")
-                    Text("Exact JSON body")
-                        .font(.caption2.weight(.semibold))
-                    promptBox(plan.parts.first?.wireBody ?? "")
-                }
-                .padding(.top, 3)
-            }
-            .font(.caption2)
-        }
-        .padding(8)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 6))
-    }
-
-    private func previewRow(_ name: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Text(name)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(LyraReaderTheme.textSecondary)
-                .frame(width: 48, alignment: .leading)
-            Text(value)
-                .font(.caption2)
-                .lineLimit(2)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-        }
-    }
-
-    private func promptBox(_ text: String) -> some View {
-        ScrollView(.vertical) {
-            Text(text)
-                .font(.system(size: 9, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-        }
-        .frame(maxHeight: 150)
-        .padding(5)
-        .background(LyraReaderTheme.panelBg, in: RoundedRectangle(cornerRadius: 4))
-    }
-
-    @ViewBuilder
-    private var answerCell: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 5) {
-                Text("Answer")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(LyraReaderTheme.textSecondary)
-                if assistant.phase == .streaming {
-                    ProgressView().controlSize(.mini)
-                    Text("\(assistant.answer.count) characters")
-                        .font(.caption2)
-                        .foregroundStyle(LyraReaderTheme.textTertiary)
-                }
-                Spacer(minLength: 4)
-                if !assistant.answer.isEmpty {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(assistant.answer, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 10.5))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Copy the Markdown source, including $…$ mathematics")
-                    .accessibilityLabel("Copy answer as Markdown")
-                }
-            }
-            if assistant.answer.isEmpty {
-                emptyAnswerView
-            } else {
-                AIAnswerView(
-                    text: assistant.answer,
-                    pageCount: state.document?.pageCount ?? 0,
-                    verifiedPages: [card.attachment.page + 1],
-                    onJump: { page in state.gotoPage(page - 1) }
-                )
-                if assistant.phase == .streaming {
-                    Text("Streaming in place. The gap grows with the answer; pages below stay pushed down.")
-                        .font(.caption2)
-                        .foregroundStyle(LyraReaderTheme.textTertiary)
-                }
-            }
-            if let error = assistant.errorMessage, assistant.phase == .failed {
-                HStack(alignment: .top, spacing: 5) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(LyraReaderTheme.errorFg)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(error)
-                            .font(.caption2)
-                            .foregroundStyle(LyraReaderTheme.errorFg)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if assistant.canRetry {
-                            Button("Retry the same request") { assistant.retry() }
-                                .buttonStyle(.plain)
-                                .font(.caption2.weight(.semibold))
-                        }
-                    }
-                }
-            }
-            if assistant.phase == .failed, let hint = assistant.offlineHint {
-                AIOfflineHintView(hint: hint)
-            }
-            if assistant.phase == .cancelled {
+        HStack(spacing: 7) {
+            LyraAIIcon(isActive: card.isBusy || card.notesBusy)
+                .frame(width: 21, height: 21).foregroundStyle(LyraReaderTheme.accent)
+                .accessibilityLabel(card.isBusy || card.notesBusy ? "Lyra is responding" : "Lyra")
+            Button { showingSelection.toggle() } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: "stop.circle")
-                        .foregroundStyle(LyraReaderTheme.warningFg)
-                    Text(assistant.answer.isEmpty
-                         ? "Cancelled before the first token. The question is kept."
-                         : "Cancelled. The partial answer above is kept.")
-                        .font(.caption2)
-                        .foregroundStyle(LyraReaderTheme.warningFg)
-                    if assistant.canRetry {
-                        Button("Retry") { assistant.retry() }
-                            .buttonStyle(.plain)
-                            .font(.caption2.weight(.semibold))
+                    Text("Page \(card.attachment.page + 1)").font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
+                }
+            }.buttonStyle(.plain).help("View selected region")
+                .popover(isPresented: $showingSelection) { selectionPreview }
+            if showingNote {
+                Text("Reading note").font(.caption).foregroundStyle(LyraReaderTheme.noteFg)
+            } else if card.isBusy || card.notesBusy {
+                Text(card.notesBusy ? "Making notes…" : assistant.answer.isEmpty ? "Thinking…" : "Responding…")
+                    .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+            }
+            Spacer(minLength: 4)
+            if showingNote && !card.notesBusy && !card.knowledgeNote.isEmpty {
+                Button { editingNote = true } label: {
+                    Image(systemName: "square.and.pencil").frame(width: 24, height: 24)
+                }.buttonStyle(.plain).help("Edit reading note")
+                    .accessibilityLabel("Edit reading note")
+            }
+            Menu {
+                Button(showingNote ? "Show Conversation" : "Show Reading Note") { showingNote.toggle() }
+                    .disabled(card.knowledgeNote.isEmpty && !card.notesBusy)
+                Button("Distill into Reading Note") {
+                    guard let context = state.aiReaderContext else { return }
+                    showingNote = true
+                    Task { await card.distill(context: context) }
+                }.disabled(card.conversationContext.isEmpty || card.isBusy || card.notesBusy)
+                Button("Export Reading Notes…") { state.presentRegionHistoryExportPanel() }
+                    .disabled(!state.hasExportableRegionHistory)
+                Divider()
+                Button("Request Details") { showingDetails.toggle() }
+                Button("All Reading Notes") { onShowHistory() }
+                if let entry = card.historyEntry {
+                    Button("Open in AI Panel") { onOpenInPanel(entry) }
+                }
+                Divider()
+                Button("Delete Conversation…", role: .destructive) { confirmingDelete = true }
+            } label: { Image(systemName: "ellipsis").frame(width: 24, height: 24) }
+                .menuStyle(.borderlessButton).fixedSize().help("Conversation actions")
+                .accessibilityLabel("Conversation actions")
+            Button { state.closeRegionCard(id: card.id, keepHistory: true) } label: {
+                Image(systemName: "chevron.up").font(.system(size: 11, weight: .medium))
+                    .frame(width: 26, height: 26).contentShape(Rectangle())
+            }.buttonStyle(.plain).help("Collapse and keep conversation")
+                .accessibilityLabel("Collapse and keep conversation")
+        }.padding(.horizontal, 13).frame(height: 40)
+    }
+    private var selectionPreview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let image = card.attachment.thumbnail {
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 360, maxHeight: 230)
+            }
+            Text("Page \(card.attachment.page + 1) · \(card.attachment.sizeLabel)")
+                .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+            Text(card.attachment.text).font(.caption).lineLimit(5).textSelection(.enabled)
+        }.padding(14).frame(width: 360).background(LyraReaderTheme.raisedBg)
+    }
+    private var transcript: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 14) {
+                    if showingDetails { requestDetails }
+                    if showingNote {
+                        noteContent
+                    } else if card.allTurns.isEmpty {
+                        Text("What would you like to understand about this region?")
+                            .font(.system(size: 12)).foregroundStyle(LyraReaderTheme.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ForEach(card.allTurns) { turn in turnView(turn) }
                     }
+                    Color.clear.frame(height: 1).id("latest")
+                        .background(GeometryReader { p in
+                            Color.clear.preference(key: AIRegionBottomKey.self,
+                                value: p.frame(in: .named("regionTranscript")).maxY)
+                        })
+                }.padding(13).frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(GeometryReader { p in
+                        Color.clear.preference(key: AIRegionTranscriptHeightKey.self, value: p.size.height)
+                    })
+            }
+            .coordinateSpace(name: "regionTranscript")
+            .frame(height: transcriptViewHeight)
+            .onPreferenceChange(AIRegionTranscriptHeightKey.self) { transcriptHeight = $0 }
+            .onPreferenceChange(AIRegionBottomKey.self) { followLatest = $0 < transcriptViewHeight + 48 }
+            .onChange(of: assistant.answer) { _, _ in
+                if followLatest { proxy.scrollTo("latest", anchor: .bottom) }
+            }
+            .onChange(of: assistant.regionAskedQuestion) { _, _ in
+                followLatest = true; proxy.scrollTo("latest", anchor: .bottom)
+            }
+        }
+    }
+    private func turnView(_ turn: AIRegionTurn) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Spacer(minLength: 30)
+                Text(turn.question).font(.system(size: 13)).textSelection(.enabled)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(LyraReaderTheme.accentSoft, in: RoundedRectangle(cornerRadius: 8))
+            }
+            if !turn.answer.isEmpty {
+                AIAnswerView(text: turn.answer, pageCount: state.document?.pageCount ?? 0,
+                             verifiedPages: [card.attachment.page + 1],
+                             onJump: { state.gotoPage($0 - 1) })
+            } else if card.isBusy && turn.id == card.allTurns.last?.id {
+                Text("Thinking…").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+            }
+            if let error = turn.error {
+                Text(error).font(.caption).foregroundStyle(LyraReaderTheme.errorFg).textSelection(.enabled)
+            }
+            if turn.state == .cancelled {
+                Text("Stopped · partial answer kept").font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    @ViewBuilder private var noteContent: some View {
+        if card.notesBusy {
+            AIAnswerView(text: notes.answer.isEmpty ? "Organizing key points…" : notes.answer,
+                         pageCount: state.document?.pageCount ?? 0,
+                         verifiedPages: [card.attachment.page + 1], onJump: { state.gotoPage($0 - 1) })
+        } else if !card.knowledgeNote.isEmpty {
+            AIAnswerView(text: card.knowledgeNote, pageCount: state.document?.pageCount ?? 0,
+                         verifiedPages: [card.attachment.page + 1], onJump: { state.gotoPage($0 - 1) })
+        } else {
+            Text(notes.errorMessage ?? "Choose Distill into Reading Note to collect the key points.")
+                .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+        }
+    }
+    private var requestDetails: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("\(card.attachment.pixelLabel) · \(card.attachment.characterCount) text characters")
+            if let plan = assistant.plan {
+                Text("\(plan.model) · \(plan.estimatedTokens) estimated tokens")
+                Text(plan.isLocal ? "Local endpoint" : "Remote endpoint · selected text and enabled image are sent")
+                ForEach(Array(plan.parts.enumerated()), id: \.offset) { _, part in
+                    Text(part.wireBody).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
                 }
             }
-        }
+        }.font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary)
     }
-
-    @ViewBuilder
-    private var emptyAnswerView: some View {
-        if assistant.phase == .streaming {
-            Text("Waiting for the first token…")
-                .font(.caption)
-                .foregroundStyle(LyraReaderTheme.textSecondary)
-        } else if assistant.phase == .cancelled {
-            EmptyView()
-        } else if assistant.phase == .failed {
-            EmptyView()
-        } else {
-            Text("No answer yet. Ask a question about the selected region.")
-                .font(.caption)
-                .foregroundStyle(LyraReaderTheme.textTertiary)
-        }
-    }
-
-    private var footer: some View {
-        HStack(spacing: 8) {
-            Text(card.askedQuestion == nil
-                 ? "Ask creates a preview; Send starts the request."
-                 : "This conversation lives in the document flow, not in the PDF.")
-                .font(.caption2)
-                .foregroundStyle(LyraReaderTheme.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            Button("Done") { close(keepHistory: true, showHistory: true) }
-                .buttonStyle(RegionCardButtonStyle())
-                .help("Close the gap, keep the conversation in Region questions")
-            Button("Open in AI panel") {
-                guard let entry = card.historyEntry else { return }
-                onOpenInPanel(entry)
+    private var composer: some View {
+        HStack(alignment: .bottom, spacing: 9) {
+            TextField(card.allTurns.isEmpty ? "Ask about this region…" : "Ask a follow-up…",
+                      text: $card.question, axis: .vertical)
+                .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...3)
+                .focused($questionFocused).onSubmit { send() }
+                .disabled(card.isBusy || card.notesBusy)
+                .padding(9).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(
+                    questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder,
+                    lineWidth: questionFocused ? 1.5 : 0.7))
+                .accessibilityLabel("Region question")
+            if card.isBusy || card.notesBusy {
+                Button { assistant.cancelRegionWork(); notes.cancelRegionWork() } label: {
+                    Image(systemName: "stop.fill").frame(width: 24, height: 28)
+                }.buttonStyle(RegionCardButtonStyle()).help("Stop response").accessibilityLabel("Stop response")
+            } else {
+                Button(action: send) {
+                    Image(systemName: "arrow.up").font(.system(size: 13, weight: .semibold))
+                        .frame(width: 24, height: 28)
+                }.buttonStyle(RegionCardButtonStyle(prominent: true))
+                    .disabled(card.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("Send · ⌘Return").accessibilityLabel("Send region question")
             }
-            .buttonStyle(RegionCardButtonStyle())
-            .disabled(card.askedQuestion == nil || assistant.answer.isEmpty)
-            .help("Copy the question and answer into the panel's chat")
-        }
+        }.padding(.horizontal, 12).padding(.vertical, 10)
     }
-
-    private func close(keepHistory: Bool, showHistory: Bool) {
-        assistant.cancel()
-        state.closeRegionCard(id: card.id, keepHistory: keepHistory)
-        if showHistory { onShowHistory() }
-    }
-
-    private var heightReporter: some View {
-        GeometryReader { proxy in
-            Color.clear.preference(key: AIRegionCardHeightKey.self, value: proxy.size.height)
-        }
-        .onPreferenceChange(AIRegionCardHeightKey.self) { height in
-            card.updateHeight(height)
-        }
+    private func send() {
+        guard let context = state.aiReaderContext else { return }
+        showingNote = false
+        Task { await card.send(context: context) }
     }
 }
 
 private struct AIRegionCardHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
-
-
-/// A compact button that fits the card's width without the panel style's full-width frame.
+private struct AIRegionComposerHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 54
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+private struct AIRegionTranscriptHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 40
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+private struct AIRegionBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
 private struct RegionCardButtonStyle: ButtonStyle {
     var prominent = false
     @Environment(\.isEnabled) private var enabled
-
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 11.5, weight: .medium))
-            .padding(.horizontal, 9)
-            .frame(minHeight: 26)
+        configuration.label.padding(.horizontal, 4)
             .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled
-                             : prominent ? LyraReaderTheme.onAccent : LyraReaderTheme.textPrimary)
+                : prominent ? LyraReaderTheme.onAccent : LyraReaderTheme.textPrimary)
             .background(!enabled ? LyraReaderTheme.panelBg
-                        : prominent
-                            ? (configuration.isPressed ? LyraReaderTheme.accentPressed
-                                                       : LyraReaderTheme.accent)
-                            : (configuration.isPressed ? LyraReaderTheme.pressedBg
-                                                       : LyraReaderTheme.fieldBg),
-                        in: RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5)
-                .strokeBorder(prominent ? Color.clear : LyraReaderTheme.controlBorder))
-            .opacity(enabled ? 1 : 0.5)
+                : prominent ? (configuration.isPressed ? LyraReaderTheme.accentPressed : LyraReaderTheme.accent)
+                : LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(
+                prominent && enabled ? Color.clear : LyraReaderTheme.controlBorder))
     }
 }
-
 
 /// A zero-size AppKit marker behind the card, so the hosted checks can measure the shipped card
 /// frame without inspecting SwiftUI's private view tree.
@@ -570,24 +358,29 @@ enum AIRegionCardPlacement {
     static func frame(
         for card: AIRegionCard,
         state: AppState,
-        in size: CGSize
+        in size: CGSize,
+        scroll: CGFloat? = nil,
+        zoom submittedZoom: CGFloat? = nil,
+        viewport clip: CGRect? = nil
     ) -> (x: CGFloat, y: CGFloat, width: CGFloat)? {
         guard let placement = state.canvasPageFrames.first(where: { $0.index == card.attachment.page }),
               let gapTop = state.regionGapTop(for: card.id),
               size.width > 120, size.height > 80
         else { return nil }
-        let zoom = max(state.zoomFactor, 0.01)
+        let zoom = max(submittedZoom ?? state.zoomFactor, 0.01)
         let offsetX = CanvasGeometry.contentOffsetX(
             viewportWidthPt: size.width,
             contentWidthPt: state.contentWidthPt,
             zoom: zoom
         )
+        let viewport = clip ?? CGRect(origin: .zero, size: size)
         let pageWidth = placement.widthPt * zoom
-        let maxWidth = min(size.width - 32, 780)
-        let width = min(max(320, pageWidth - 36), max(240, maxWidth))
+        let maxWidth = min(viewport.width - 24, 760)
+        let width = min(max(320, pageWidth - 24), max(240, maxWidth))
         let centreX = offsetX + (placement.leftPt + placement.widthPt / 2) * zoom
-        let x = min(max(16, centreX - width / 2), max(16, size.width - width - 16))
-        let y = CanvasGeometry.viewY(contentY: gapTop, scrollYPt: state.scrollYPt, zoom: zoom)
+        let x = min(max(viewport.minX + 12, centreX - width / 2),
+                    max(viewport.minX + 12, viewport.maxX - width - 12))
+        let y = CanvasGeometry.viewY(contentY: gapTop, scrollYPt: scroll ?? state.scrollYPt, zoom: zoom)
         return (x, y, width)
     }
 }
@@ -677,6 +470,74 @@ public final class AIRegionOverlayPassthroughView: NSView {
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
         guard interactiveRects.contains(where: { $0.contains(point) }) else { return nil }
+        return super.hitTest(point)
+    }
+}
+
+/// Native children move in the same transaction as the Metal paper and page borders.
+/// Root views survive scroll frames, preserving focus, selection and the transcript's scroll.
+@MainActor
+final class AIRegionCanvasHost: NSView {
+    override var isFlipped: Bool { true }
+    private weak var state: AppState?
+    private var onOpenInPanel: (AIRegionHistoryEntry) -> Void = { _ in }
+    private var onShowHistory: () -> Void = {}
+    private var hosts: [UUID: NSHostingView<AIRegionCardView>] = [:]
+    private var sizes: [UUID: CGSize] = [:]
+    private var placementSignature = ""
+    var cardFrames: [CGRect] { hosts.values.map(\.frame) }
+
+    func configure(state: AppState?, onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
+                   onShowHistory: @escaping () -> Void) -> Bool {
+        let signature = state?.regionCards.map {
+            "\($0.id):\($0.heightViewPt):\(state?.regionGapTop(for: $0.id) ?? 0)"
+        }.joined(separator: "|") ?? ""
+        let changed = self.state !== state || placementSignature != signature
+        placementSignature = signature
+        self.state = state; self.onOpenInPanel = onOpenInPanel; self.onShowHistory = onShowHistory
+        return changed
+    }
+    func sync(size: CGSize, viewport: CGRect, scroll: CGFloat, zoom: CGFloat) {
+        let viewportFrame = CGRect(origin: .zero, size: size)
+        if frame != viewportFrame { frame = viewportFrame }
+        guard let state else {
+            hosts.values.forEach { $0.removeFromSuperview() }; hosts.removeAll(); sizes.removeAll()
+            return
+        }
+        let ids = Set(state.regionCards.map(\.id))
+        for id in hosts.keys where !ids.contains(id) {
+            hosts.removeValue(forKey: id)?.removeFromSuperview(); sizes[id] = nil
+        }
+        for card in state.regionCards {
+            guard let place = AIRegionCardPlacement.frame(for: card, state: state, in: size,
+                                                          scroll: scroll, zoom: zoom, viewport: viewport) else { continue }
+            let maxHeight = AIRegionCard.maximumHeight(in: viewport.height)
+            let dimensions = CGSize(width: place.width, height: maxHeight)
+            let host: NSHostingView<AIRegionCardView>
+            if let existing = hosts[card.id] {
+                host = existing
+                if sizes[card.id] != dimensions {
+                    host.rootView = AIRegionCardView(state: state, card: card, width: place.width,
+                        maximumHeight: maxHeight, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory)
+                }
+            } else {
+                host = NSHostingView(rootView: AIRegionCardView(state: state, card: card, width: place.width,
+                    maximumHeight: maxHeight, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory))
+                host.sizingOptions = []
+                addSubview(host)
+                hosts[card.id] = host
+            }
+            sizes[card.id] = dimensions
+            let frame = CGRect(x: place.x, y: place.y, width: place.width, height: card.heightViewPt)
+            if host.frame != frame { host.frame = frame }
+            host.isHidden = host.frame.maxY <= 0 || host.frame.minY >= size.height
+        }
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // AppKit passes a point in the superview's coordinates. The Metal parent is
+        // bottom-up while this host is top-down; hit-test in the host's own coordinates.
+        let local = convert(point, from: superview)
+        guard hosts.values.contains(where: { !$0.isHidden && $0.frame.contains(local) }) else { return nil }
         return super.hitTest(point)
     }
 }

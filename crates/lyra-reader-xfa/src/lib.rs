@@ -62,7 +62,8 @@ pub struct XfaStatus {
     pub page_count: u32,
     pub field_count: u32,
     /// The things the renderer could not draw, in a person's words. Never empty for a partial
-    /// form; the shell shows this line in the status area and the banner.
+    /// form. This stays a diagnostic: the banner and the status line are short user-facing copy,
+    /// while the information panel and `lyra-reader-cli xfa` keep the detail.
     pub skipped: Vec<String>,
     /// Set only when the template could not be rendered; the caller then opens the original.
     pub error: Option<String>,

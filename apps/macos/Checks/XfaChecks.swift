@@ -13,6 +13,8 @@ import LyraReaderKit
 /// * text from the template and a value resolved from the dataset's LOV table (Canada);
 /// * the read-only policy in the engine and in `AppState` (annotation, form, page-edit,
 ///   content-edit, redaction, save and copy commands are all unavailable);
+/// * the shell's short banner and status line (no packet names, field counts or skipped list),
+///   while the structural record stays available through the engine;
 /// * an ordinary PDF is unchanged and is not treated as XFA;
 /// * an empty-user-password XFA opens without a prompt, while a genuinely password-protected
 ///   PDF still refuses.
@@ -95,12 +97,27 @@ extension ReaderChecks {
         })
         require(state.isXfaDocument && state.isReadOnlyDocument,
                 "the shell marks the XFA document read-only")
-        require(state.readOnlyBannerTitle.contains("XFA form"),
-                "the banner says this is an XFA form rendered from XML")
+        require(state.readOnlyBannerTitle == "XFA form · read-only",
+                "the banner uses the short title: \(state.readOnlyBannerTitle)")
+        let bannerBody = state.readOnlyBannerBody
+        require(bannerBody == "This document is an XFA form, opened read-only; the rendering "
+                + "may not match the original form. To edit it, open it in Adobe Acrobat.",
+                "the banner uses the short two-sentence body: \(bannerBody)")
+        require(bannerBody.filter { $0 == "." }.count == 2,
+                "the banner body is exactly two sentences: \(bannerBody)")
+        require(state.readOnlyBannerNote.isEmpty,
+                "the XFA banner has no extra note")
+        let bannerAndStatus = [
+            state.readOnlyBannerTitle, bannerBody, state.readOnlyBannerNote, state.statusMessage,
+        ].joined(separator: " ")
+        for unwanted in ["skipped", "field", "template", "datasets", "font", "substitut"] {
+            require(!bannerAndStatus.localizedCaseInsensitiveContains(unwanted),
+                    "the banner and status line do not mention \(unwanted): \(bannerAndStatus)")
+        }
         require(state.readOnlyReason?.contains("XFA") == true,
-                "the banner's reason is the XFA one")
-        require(state.statusMessage.contains("XFA"),
-                "the status line says the page count and skips: \(state.statusMessage)")
+                "the read-only reason behind the refusals is still the XFA one")
+        require(state.statusMessage == "XFA form · read-only · 5 page(s)",
+                "the status line is the short form: \(state.statusMessage)")
         require(!state.canEditAnnotations,
                 "annotation tools are not offered for an XFA form")
         require(!state.canPageEdit && !state.canPageOperations,

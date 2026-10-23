@@ -6,7 +6,7 @@ import SwiftUI
 /// This mirrors `AiFailureRecord` on the Rust side, which is computed from the platform error
 /// (never from message text) at the one HTTP transport. Every AI action uses that transport, so
 /// the panel, the region card, document chat and the layered summary all read the same category.
-public enum AIRequestFailure: Equatable, Sendable {
+public enum AIRequestFailure: Codable, Equatable, Sendable {
     case other
     case offline
     case localServer

@@ -1641,7 +1641,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Injection points for the native checks: production keeps both nil.
     public var regionAssistantFactory: (() -> AIAssistantModel)?
     public var regionChatServiceOverride: (() -> (any AIChatServicing)?)?
-    var regionHeightObservers: [UUID: AnyCancellable] = [:]
+    public static var usesDocumentKnowledge = true
+    public lazy var documentKnowledge = AIDocumentKnowledge()
+    var regionContentObservers: [UUID: AnyCancellable] = [:]
+    var regionHistoryLoadFailures = Set<String>()
     var regionEscapeMonitor: Any?
 
     /// A rectangle the reader marked for redaction, pending until the explicit apply command.
@@ -3538,10 +3541,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = nil
             currentPage = 1
             if loaded.xfa.isXfa {
-                let skipped = loaded.xfa.skipped.count
-                statusMessage = "XFA form · rendered read-only from XML · "
-                    + "\(loaded.pageCount) page(s) · \(loaded.xfa.fieldCount) field(s)"
-                    + (skipped == 0 ? "" : " · \(skipped) item(s) skipped")
+                // A reading cue, not a diagnostics report: the structural facts (packets, field
+                // and skipped counts) stay in the FFI record and in `lyra-reader-cli xfa`.
+                statusMessage = "XFA form · read-only · \(loaded.pageCount) page(s)"
             } else if loaded.pageCount > 0 {
                 statusMessage = String(
                     format: "Opened %d page(s) · first page %.0f×%.0f pt · %@",
@@ -3581,6 +3583,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // cached page-edit session has opened its working revision, so the cache directory is
             // still the original PDF's, never a revision path.
             translationCacheDocumentURL = url
+            loadRegionHistory(for: url)
             refreshTranslationPaperColors()
             inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
             return true
@@ -3593,6 +3596,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        documentKnowledge.invalidate()
         let wasChanging = isChangingDocumentState
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
@@ -7116,6 +7120,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// tab close and by `resetDocumentState`, so a scroll or a typed note cannot be lost just
     /// because the debounce had not expired yet.
     public func flushPendingWrites() {
+        persistRegionHistory()
         if editingAnnotationID != nil { commitTextEditing() }
         let pendingNote = hasPendingAnnotationWrite
         let pendingPosition = self.pendingPosition != nil
@@ -7859,10 +7864,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The banner's headline.
     public var readOnlyBannerTitle: String {
-        isXfaDocument ? "XFA form · rendered read-only from XML" : "Signed PDF · read-only in place"
+        isXfaDocument ? "XFA form · read-only" : "Signed PDF · read-only in place"
     }
 
-    /// The evidence, one line, for the banner's second line.
+    /// The banner's body, directly under the headline.
+    ///
+    /// An XFA form gets reader-facing copy only: it says what the document is, that it opens
+    /// read-only and that the rendering may differ, then where to edit it. Packet names, counts
+    /// and the list of skipped items belong to diagnostics, not to the banner.
+    public var readOnlyBannerBody: String {
+        if isXfaDocument {
+            return "This document is an XFA form, opened read-only; the rendering may not match "
+                + "the original form. To edit it, open it in Adobe Acrobat."
+        }
+        return readOnlyReason ?? "This PDF is digitally signed, so it is read-only."
+    }
+
+    /// Detailed evidence for the information panel and for diagnostics. It is deliberately not
+    /// shown in the XFA banner; `lyra-reader-cli xfa` and the FFI status record keep it too.
     public var readOnlyBannerEvidence: String {
         if isXfaDocument {
             let packets = documentXfa.packetNames.count
@@ -7873,11 +7892,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return documentSignature.evidence.map(\.detail).joined(separator: " · ")
     }
 
-    /// What a read-only document can still do. Shown in the banner next to the reason.
+    /// What a read-only document can still do. Shown in the banner next to the reason for a
+    /// signed PDF. The XFA banner is short copy only, so it has no second note.
     public var readOnlyBannerNote: String {
-        if isXfaDocument {
-            return "Reading, zoom, search, selection and summaries stay available. The source PDF is never modified."
-        }
+        if isXfaDocument { return "" }
         return "Saving a copy is allowed; the copy leaves the signature fields out."
     }
 
@@ -12642,6 +12660,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         undoStack = state.undoStack
         redoStack = state.redoStack
         translationCacheDocumentURL = state.translationDocumentURL
+        if let url = state.translationDocumentURL ?? state.document.url { loadRegionHistory(for: url) }
         inPlaceTranslation.restore(
             state.translationSnapshot,
             url: state.translationDocumentURL ?? state.document.url,

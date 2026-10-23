@@ -245,10 +245,13 @@ struct ReaderToolbar: View {
                         ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
                         : "Fill & Sign · fill this PDF's form fields")))
             separator
-            tool("Ask about a region", "rectangle.dashed",
-                 selected: state.regionSelectionArmed) {
-                state.toggleRegionSelection()
+            Button { state.toggleRegionSelection() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "rectangle.dashed")
+                    if !compact { Text("Ask Region").font(.system(size: 12, weight: .medium)) }
+                }
             }
+            .buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
             .disabled(!state.canArmRegionSelection)
             .help(state.regionSelectionUnavailableReason
                   ?? "Drag a rectangle over the page; the question opens in a gap below it")

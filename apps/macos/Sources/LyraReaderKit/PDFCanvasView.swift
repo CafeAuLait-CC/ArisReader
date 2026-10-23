@@ -228,6 +228,17 @@ public final class MetalCanvasView: NSView {
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
 
+    private let regionHost = AIRegionCanvasHost()
+    package var regionCardFrames: [CGRect] { regionHost.cardFrames }
+    public func configureRegionCards(state: AppState?,
+        onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void = { _ in },
+        onShowHistory: @escaping () -> Void = {}) {
+        if regionHost.superview == nil { addSubview(regionHost) }
+        if regionHost.configure(state: state, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory) {
+            markNeedsRender()
+        }
+    }
+
     private var pageChrome: PageChromeOverlayView?
     package var pageChromeRectangles: [CGRect] { pageChrome?.pageRectangles ?? [] }
     private var annotationOverlay: AnnotationOverlayView?
@@ -525,6 +536,17 @@ public final class MetalCanvasView: NSView {
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.reportDisplayCalibration() }
+        })
+        screenObservers.append(center.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let clip = note.object as? NSClipView else { return }
+            let identifier = ObjectIdentifier(clip)
+            MainActor.assumeIsolated {
+                guard let self, let parentClip = self.enclosingScrollView?.contentView,
+                      identifier == ObjectIdentifier(parentClip) else { return }
+                self.markNeedsRender()
+            }
         })
     }
 
@@ -1462,6 +1484,7 @@ public final class MetalCanvasView: NSView {
         let contentWidthPx = contentWidthPt * zoom * scale
         let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
         contentOffsetX = offsetX / scale
+        regionHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom)
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
@@ -1725,6 +1748,9 @@ public final class MetalCanvasView: NSView {
 
 /// SwiftUI wrapper around [`MetalCanvasView`].
 public struct PDFCanvasView: NSViewRepresentable {
+    private let regionState: AppState?
+    private let onOpenRegionInPanel: (AIRegionHistoryEntry) -> Void
+    private let onShowRegionHistory: () -> Void
     private let pages: [CanvasPage]
     private let scrollYPt: CGFloat
     private let zoom: CGFloat
@@ -1835,8 +1861,14 @@ public struct PDFCanvasView: NSViewRepresentable {
         fileDrop: DocumentOpenCoordinator? = nil,
         onContextMenu: ((CGPoint) -> NSMenu?)? = nil,
         onTranslationToggle: ((String) -> Void)? = nil,
-        onTranslationCancel: ((String) -> Void)? = nil
+        onTranslationCancel: ((String) -> Void)? = nil,
+        regionState: AppState? = nil,
+        onOpenRegionInPanel: @escaping (AIRegionHistoryEntry) -> Void = { _ in },
+        onShowRegionHistory: @escaping () -> Void = {}
     ) {
+        self.regionState = regionState
+        self.onOpenRegionInPanel = onOpenRegionInPanel
+        self.onShowRegionHistory = onShowRegionHistory
         self.pages = pages
         self.scrollYPt = scrollYPt
         self.zoom = zoom
@@ -1902,6 +1934,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 
     private func configure(_ view: MetalCanvasView) {
+        view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
+                                  onShowHistory: onShowRegionHistory)
         view.interactionSnapshot = interactionSnapshot
         view.onFrame = onFrame
         view.onFailure = onFailure
