@@ -106,7 +106,6 @@ struct PlannedPage {
     scale: f64,
     content_x: f64,
     content_y: f64,
-    content_width: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -197,7 +196,6 @@ impl<'a> Renderer<'a> {
                     scale,
                     content_x: content.x,
                     content_y: content.y,
-                    content_width: content.width,
                 });
             } else {
                 self.paginate(&mut items, capacity, area_index, content, &mut plans);
@@ -212,7 +210,6 @@ impl<'a> Renderer<'a> {
                 scale: 1.0,
                 content_x: self.main_area().content_area.x,
                 content_y: self.main_area().content_area.y,
-                content_width: self.main_area().content_area.width,
             });
         }
         plans
@@ -250,7 +247,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn measure_item(&self, item: &FlowItem) -> Measured {
-        self.measure(&item.node)
+        self.measure_in_width(&item.node, item.width)
     }
 
     fn paginate(
@@ -353,7 +350,6 @@ impl<'a> Renderer<'a> {
             scale,
             content_x: content.x,
             content_y: content.y,
-            content_width: content.width,
         }
     }
 
@@ -418,7 +414,7 @@ impl<'a> Renderer<'a> {
                 &item.node,
                 x,
                 cursor,
-                plan.content_width - item.x.max(0.0),
+                item.width,
                 plan.scale,
                 &mut path,
                 None,
@@ -528,9 +524,19 @@ impl<'a> Renderer<'a> {
         if !node.presence.paints() && node.kind != NodeKind::Subform {
             return;
         }
-        let width = node.geometry.width.unwrap_or(avail_width).max(0.0);
-        let measured = self.measure(node);
-        let mut height = node.geometry.height.unwrap_or(measured.height) * scale;
+        // The parent resolves the available box, including a table's column allocation.
+        // Reapplying a cell's preferred `w` here breaks the shared column boundaries.
+        let width = avail_width.max(0.0);
+        let measured = self.measure_in_width(node, width);
+        let mut height = measured.height * scale;
+        if node.presence.paints()
+            && !matches!(
+                node.field.as_ref().map(|field| field.kind),
+                Some(FieldType::Button | FieldType::Barcode | FieldType::Signature)
+            )
+        {
+            draw_border(page, &node.border, x, y, width, height);
+        }
         let mut field_x = x;
         let mut field_y = y;
         let mut field_width = width;
@@ -777,7 +783,7 @@ impl<'a> Renderer<'a> {
                             .copied()
                             .or(child.geometry.width)
                             .unwrap_or(width / row.children.len().max(1) as f64);
-                        let measured = self.measure(child);
+                        let measured = self.measure_in_width(child, child_width);
                         let mut child_path = path.clone();
                         child_path.push(format!("{}[{}]", row.name, 0));
                         child_path.push(format!("{}[{occurrence}]", child.name));
@@ -964,23 +970,6 @@ impl<'a> Renderer<'a> {
                     // not executed.
                     return;
                 }
-                if node.border.visible {
-                    page.ops.push(Op::Rect {
-                        x,
-                        y,
-                        width,
-                        height,
-                        fill: node.border.fill,
-                        stroke: Some(node.border.color),
-                        line_width: node.border.thickness.max(0.2),
-                    });
-                }
-                let mut margins = node.margins;
-                if node.name.eq_ignore_ascii_case("Text2") && node.font.size >= 11.0 {
-                    // The template's 13.97 mm left inset is for the field label column; the
-                    // printed masthead starts at the page margin.
-                    margins.left = 1.5 * crate::units::POINTS_PER_MM;
-                }
                 self.draw_text_block(
                     page,
                     &draw.text,
@@ -991,7 +980,7 @@ impl<'a> Renderer<'a> {
                     height,
                     &node.font,
                     &node.paragraph,
-                    margins,
+                    node.margins,
                 );
             }
         }
@@ -1009,7 +998,7 @@ impl<'a> Renderer<'a> {
         height: f64,
         path: &[String],
         parent_path: Option<&[String]>,
-        is_radio: bool,
+        _is_radio: bool,
     ) {
         let value = self.dataset.resolve(path, field, parent_path);
         match field.kind {
@@ -1017,7 +1006,7 @@ impl<'a> Renderer<'a> {
                 let checked = value.as_deref().map(is_checked).unwrap_or(field.checked);
                 let size = height.clamp(5.0, 9.0);
                 let centre_y = y + (height - size) / 2.0;
-                if is_radio {
+                if field.round_check {
                     page.ops.push(Op::Circle {
                         x: x + size / 2.0,
                         y: centre_y + size / 2.0,
@@ -1081,21 +1070,6 @@ impl<'a> Renderer<'a> {
             | FieldType::Choice
             | FieldType::Picture
             | FieldType::Unknown => {
-                let stroke = if node.border.visible {
-                    Some(node.border.color)
-                } else {
-                    Some(Color::grey(0.45))
-                };
-                let line_width = node.border.thickness.max(0.35);
-                page.ops.push(Op::Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    fill: node.border.fill.filter(|_| node.border.visible),
-                    stroke,
-                    line_width,
-                });
                 if field.kind == FieldType::Choice && !field.read_only && width > 100.0 {
                     page.ops.push(Op::Triangle {
                         x: x + width - 9.0,
@@ -1134,11 +1108,10 @@ impl<'a> Renderer<'a> {
         height: f64,
         align: HorizontalAlign,
     ) {
-        let paragraph = Paragraph {
-            horizontal: align,
-            vertical: VerticalAlign::Middle,
-            ..Paragraph::default()
-        };
+        let mut paragraph = caption.paragraph.clone();
+        if paragraph.horizontal == HorizontalAlign::Left {
+            paragraph.horizontal = align;
+        }
         self.draw_text_block(
             page,
             &caption.text,
@@ -1149,12 +1122,7 @@ impl<'a> Renderer<'a> {
             height,
             &caption.style,
             &paragraph,
-            Insets {
-                top: 0.5,
-                bottom: 0.5,
-                left: 0.5,
-                right: 0.5,
-            },
+            caption.margins,
         );
     }
 
@@ -1172,8 +1140,8 @@ impl<'a> Renderer<'a> {
         paragraph: &Paragraph,
         insets: Insets,
     ) {
-        let left = insets.left.max(0.0);
-        let right = insets.right.max(0.0);
+        let left = (insets.left + paragraph.margin_left).max(0.0);
+        let right = (insets.right + paragraph.margin_right).max(0.0);
         let top = insets.top.max(0.0);
         let bottom = insets.bottom.max(0.0);
         let available = (width - left - right).max(1.0);
@@ -1194,45 +1162,59 @@ impl<'a> Renderer<'a> {
             }
             size = trial;
         }
-        let mut lines: Vec<(String, bool, bool, HorizontalAlign)> = Vec::new();
-        if rich.is_empty() {
-            let normalised = normalise_space(text);
-            if normalised.trim().is_empty() {
-                return;
-            }
-            for line in wrap(&normalised, size, bold, available) {
-                lines.push((line, bold, italic, paragraph.horizontal));
-            }
-        } else {
-            for rich_paragraph in rich {
-                let text = rich_paragraph.text();
-                if text.trim().is_empty() {
-                    continue;
+        let make_lines = |fitted_size: f64| {
+            let mut lines: Vec<(String, f64, bool, bool, HorizontalAlign)> = Vec::new();
+            if rich.is_empty() {
+                let normalised = normalise_space(text);
+                if !normalised.trim().is_empty() {
+                    for line in wrap(&normalised, fitted_size, bold, available) {
+                        lines.push((line, fitted_size, bold, italic, paragraph.horizontal));
+                    }
                 }
-                let paragraph_bold = weighted_bold(rich_paragraph);
-                let paragraph_size = rich_paragraph
-                    .runs
-                    .iter()
-                    .find_map(|run| run.size)
-                    .unwrap_or(size);
-                let align = rich_paragraph.horizontal.unwrap_or(paragraph.horizontal);
-                for line in wrap(&text, paragraph_size, paragraph_bold, available) {
-                    lines.push((line, paragraph_bold, italic, align));
+            } else {
+                for rich_paragraph in rich {
+                    let text = rich_paragraph.text();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let paragraph_bold = weighted_bold(rich_paragraph);
+                    let paragraph_size = rich_paragraph
+                        .runs
+                        .iter()
+                        .find_map(|run| run.size)
+                        .unwrap_or(style.size)
+                        * fitted_size
+                        / style.size.max(1.0);
+                    let align = rich_paragraph.horizontal.unwrap_or(paragraph.horizontal);
+                    for line in wrap(&text, paragraph_size, paragraph_bold, available) {
+                        lines.push((line, paragraph_size, paragraph_bold, italic, align));
+                    }
                 }
             }
+            lines
+        };
+        let leading = |font_size: f64| paragraph.line_height.unwrap_or(font_size * 1.18);
+        let mut lines = make_lines(size);
+        let mut total: f64 = lines.iter().map(|line| leading(line.1)).sum();
+        let available_height = (height - top - bottom).max(0.0);
+        // A substituted font may need an extra line, and compressed pages also shrink
+        // caption reserves. Fit within that fixed box instead of painting over its rule.
+        // Never drop source lines; the 5 pt floor keeps a tiny box from hiding text.
+        while available_height > 0.0 && total > available_height + 0.01 && size > 5.0 {
+            size = (size - 0.25).max(5.0);
+            lines = make_lines(size);
+            total = lines.iter().map(|line| leading(line.1)).sum();
         }
         if lines.is_empty() {
             return;
         }
-        let line_height = size * 1.18;
-        let total = lines.len() as f64 * line_height;
         let mut cursor = match paragraph.vertical {
             VerticalAlign::Top => y + top,
-            VerticalAlign::Middle => y + top + (height - top - bottom - total) / 2.0,
-            VerticalAlign::Bottom => y + height - bottom - total,
+            VerticalAlign::Middle => y + top + ((height - top - bottom - total) / 2.0).max(0.0),
+            VerticalAlign::Bottom => y + top + (height - top - bottom - total).max(0.0),
         };
-        for (line, line_bold, line_italic, align) in lines {
-            let line_width = text_width(&line, size, line_bold);
+        for (line, line_size, line_bold, line_italic, align) in lines {
+            let line_width = text_width(&line, line_size, line_bold);
             let line_x = match align {
                 HorizontalAlign::Left => x + left,
                 HorizontalAlign::Center => x + left + (available - line_width) / 2.0,
@@ -1242,12 +1224,12 @@ impl<'a> Renderer<'a> {
                 x: line_x,
                 y: cursor,
                 text: line,
-                size,
+                size: line_size,
                 bold: line_bold,
                 italic: line_italic,
                 color: style.color,
             });
-            cursor += line_height;
+            cursor += leading(line_size);
         }
     }
 
@@ -1263,18 +1245,24 @@ impl<'a> Renderer<'a> {
                 (intrinsic > 0.0).then_some(intrinsic)
             })
             .unwrap_or(0.0);
-        let mut height = if let Some(height) = node.geometry.height {
-            height
-        } else {
-            self.content_height(node, width)
-        };
+        self.measure_in_width(node, width)
+    }
+
+    fn measure_in_width(&self, node: &LayoutNode, width: f64) -> Measured {
+        if !node.presence.occupies_space() {
+            return Measured::default();
+        }
+        // minH/maxH constrain growable boxes; an explicit h is fixed in XFA.
+        if let Some(height) = node.geometry.height {
+            return Measured { height };
+        }
+        let mut height = self.content_height(node, width);
         if let Some(minimum) = node.geometry.min_height {
             height = height.max(minimum);
         }
         if let Some(maximum) = node.geometry.max_height {
             height = height.min(maximum);
         }
-        let _ = width;
         Measured { height }
     }
 
@@ -1347,7 +1335,7 @@ impl<'a> Renderer<'a> {
                             .geometry
                             .width
                             .unwrap_or_else(|| self.intrinsic_width(child));
-                        if cursor + child_width > width && cursor > 0.0 {
+                        if cursor + child_width > width + 0.01 && cursor > 0.0 {
                             cursor = 0.0;
                             height += row_height;
                             row_height = 0.0;
@@ -1373,9 +1361,9 @@ impl<'a> Renderer<'a> {
                                 .get(index)
                                 .copied()
                                 .or(child.geometry.width)
-                                .unwrap_or(0.0);
-                            let _ = child_width;
-                            row_height = row_height.max(self.measure(child).height);
+                                .unwrap_or(width / row.children.len().max(1) as f64);
+                            row_height =
+                                row_height.max(self.measure_in_width(child, child_width).height);
                         }
                         total += row_height;
                     }
@@ -1530,6 +1518,39 @@ fn is_checked(value: &str) -> bool {
     )
 }
 
+/// Borders belong to the complete container/field box, including its caption.
+fn draw_border(page: &mut RenderedPage, border: &Border, x: f64, y: f64, width: f64, height: f64) {
+    if let Some(fill) = border.fill {
+        page.ops.push(Op::Rect {
+            x,
+            y,
+            width,
+            height,
+            fill: Some(fill),
+            stroke: None,
+            line_width: 0.0,
+        });
+    }
+    let sides = [
+        (x, y, x + width, y),
+        (x + width, y, x + width, y + height),
+        (x + width, y + height, x, y + height),
+        (x, y + height, x, y),
+    ];
+    for (stroke, (x1, y1, x2, y2)) in border.edges.iter().zip(sides) {
+        if let Some((thickness, color)) = stroke {
+            page.ops.push(Op::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width: *thickness,
+                color: *color,
+            });
+        }
+    }
+}
+
 fn weighted_bold(paragraph: &RichParagraph) -> bool {
     let mut bold = 0usize;
     let mut total = 0usize;
@@ -1565,7 +1586,12 @@ fn caption_width(caption: &Caption, size: f64) -> f64 {
 
 fn text_block_height(node: &LayoutNode, width: f64, _vertical: VerticalAlign) -> f64 {
     let size = node.font.size.max(1.0);
-    let available = (width - node.margins.left - node.margins.right).max(1.0);
+    let available = (width
+        - node.margins.left
+        - node.margins.right
+        - node.paragraph.margin_left
+        - node.paragraph.margin_right)
+        .max(1.0);
     let text = node
         .draw
         .as_ref()
@@ -1582,7 +1608,9 @@ fn text_block_height(node: &LayoutNode, width: f64, _vertical: VerticalAlign) ->
         })
         .unwrap_or_default();
     let lines = wrap(&text, size, node.font.bold, available).len();
-    lines as f64 * size * 1.18 + node.margins.top + node.margins.bottom
+    lines as f64 * node.paragraph.line_height.unwrap_or(size * 1.18)
+        + node.margins.top
+        + node.margins.bottom
 }
 
 /// Every text string a page body draws, used only to avoid painting the page-area title a
@@ -1670,5 +1698,170 @@ mod tests {
             "expected the body to split: {}",
             document.pages.len()
         );
+    }
+    fn form(body: &str) -> RenderedDocument {
+        render_template(&format!(
+            r#"<template><subform name="form1">
+          <pageSet><pageArea name="Page1"><contentArea x="10pt" y="10pt" w="400pt" h="700pt"/>
+          <medium stock="letter"/></pageArea></pageSet>
+          <subform name="Page1" w="400pt" layout="tb">{body}</subform>
+          </subform></template>"#
+        ))
+    }
+
+    #[test]
+    fn table_allocation_controls_both_cell_borders_and_wrapped_row_height() {
+        fn table(preferred: f64) -> RenderedDocument {
+            form(&format!(
+                r#"<subform layout="table" columnWidths="120pt 80pt" w="200pt">
+              <subform layout="row">
+                <draw w="{preferred}pt"><font size="10pt"/><border><edge/></border><value><text>A sentence that wraps in its allocated column.</text></value></draw>
+                <draw w="30pt"><font size="10pt"/><border><edge/></border><value><text>Other</text></value></draw>
+              </subform>
+              <subform layout="row"><draw h="20pt"><value><text>Next row</text></value></draw></subform>
+              </subform>"#
+            ))
+        }
+        let narrow = table(10.0);
+        let wide = table(300.0);
+        let next_y = |document: &RenderedDocument| {
+            document.pages[0]
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Text { text, y, .. } if text == "Next row" => Some(*y),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            (next_y(&narrow) - next_y(&wide)).abs() < 0.01,
+            "the column allocation, not a cell's preferred width, controls wrapping and row placement"
+        );
+        assert!(
+            next_y(&narrow) < 60.0,
+            "a narrow preferred width must not inflate the row"
+        );
+        assert!(narrow.pages[0].ops.iter().any(|op| matches!(op,
+            Op::Line { x1, x2, .. } if (*x1 - 10.0).abs() < 0.01 && (*x2 - 130.0).abs() < 0.01)));
+    }
+
+    #[test]
+    fn fractional_flow_width_does_not_add_a_phantom_row() {
+        let doc = form(
+            r#"<subform layout="lr-tb" w="0.3pt">
+          <draw w="0.1pt" h="10pt"/><draw w="0.2pt" h="10pt"/>
+          </subform><draw h="10pt"><value><text>After</text></value></draw>"#,
+        );
+        let y = doc.pages[0]
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Text { y, text, .. } if text == "After" => Some(*y),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            (y - 20.0).abs() < 0.01,
+            "0.1 + 0.2 must fit the same row when painted and measured: {y}"
+        );
+    }
+
+    #[test]
+    fn rich_title_inherits_font_and_honors_its_template_inset_and_width() {
+        let doc = form(
+            r#"<draw name="Text2" w="200pt" h="40pt">
+          <font size="12pt" weight="bold"/><margin leftInset="40pt"/>
+          <value><exData><body><p>Title</p></body></exData></value></draw>"#,
+        );
+        assert!(doc.pages[0].ops.iter().any(|op| matches!(op,
+            Op::Text { x, bold: true, size, text, .. }
+              if (*x - 50.0).abs() < 0.01 && (*size - 12.0).abs() < 0.01 && text == "Title")));
+    }
+
+    #[test]
+    fn caption_and_container_border_do_not_create_an_inner_control_box() {
+        let doc = form(
+            r#"<subform w="200pt" h="40pt"><border><edge/><edge presence="hidden"/><edge/><edge presence="hidden"/></border>
+          <field w="200pt" h="40pt"><ui><textEdit><border presence="hidden"/></textEdit></ui>
+          <margin leftInset="15pt"/><caption placement="top" reserve="12pt">
+          <para marginLeft="5pt"/><value><text>Caption</text></value></caption>
+          </field></subform>"#,
+        );
+        assert_eq!(
+            doc.pages[0]
+                .ops
+                .iter()
+                .filter(|op| matches!(op, Op::Line { .. }))
+                .count(),
+            2,
+            "only the template's top/bottom container rules are visible"
+        );
+        assert!(
+            !doc.pages[0].ops.iter().any(|op| matches!(
+                op,
+                Op::Rect {
+                    stroke: Some(_),
+                    ..
+                }
+            )),
+            "no unrequested inner input border"
+        );
+        assert!(doc.pages[0].ops.iter().any(|op| matches!(op,
+            Op::Text { x, text, .. } if text == "Caption" && (*x - 30.0).abs() < 0.01)));
+    }
+
+    #[test]
+    fn rich_paragraphs_keep_explicit_leading_and_exclusive_checks_keep_square_shape() {
+        let doc = form(
+            r#"<draw w="200pt" h="30pt"><font size="8pt"/><para lineHeight="9pt"/>
+          <value><exData><body><p>First</p><p>Second</p></body></exData></value></draw>
+          <exclGroup><field w="30pt" h="12pt"><ui><checkButton/></ui></field></exclGroup>"#,
+        );
+        let ys: Vec<_> = doc.pages[0]
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert!((ys[1] - ys[0] - 9.0).abs() < 0.01);
+        assert!(
+            !doc.pages[0]
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Circle { .. })),
+            "membership in an exclusive group does not change the XML checkbox shape"
+        );
+    }
+    #[test]
+    fn compressed_caption_reserve_fits_its_text_before_the_next_rule() {
+        let doc = form(
+            r#"<field w="120pt" h="20pt"><ui><textEdit/></ui>
+          <caption placement="bottom" reserve="6pt"><font size="8pt"/>
+          <value><text>YYYY</text></value></caption></field>"#,
+        );
+        let (y, size) = doc.pages[0]
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Text { y, size, text, .. } if text == "YYYY" => Some((*y, *size)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            size >= 5.0 && y + size * 1.18 <= 30.01,
+            "caption must stay inside the bottom of the field: y={y}, size={size}"
+        );
+    }
+    #[test]
+    fn fixed_height_ignores_growable_box_limits() {
+        let doc = form(
+            r#"<draw w="200pt" h="20pt" minH="100pt"><value><text>Fixed</text></value></draw>
+          <draw h="10pt"><value><text>Next</text></value></draw>"#,
+        );
+        assert!(doc.pages[0].ops.iter().any(|op| matches!(op,
+            Op::Text { y, text, .. } if text == "Next" && (*y - 30.0).abs() < 0.01)));
     }
 }

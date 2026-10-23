@@ -61,6 +61,7 @@ pub struct Paragraph {
     pub text_indent: f64,
     pub margin_left: f64,
     pub margin_right: f64,
+    pub line_height: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +92,8 @@ pub struct Border {
     pub thickness: f64,
     pub color: Color,
     pub fill: Option<Color>,
+    /// Top, right, bottom, left; an absent stroke is an explicitly hidden edge.
+    pub edges: [Option<(f64, Color)>; 4],
 }
 
 impl Default for Border {
@@ -100,6 +103,7 @@ impl Default for Border {
             thickness: 0.5,
             color: Color::BLACK,
             fill: None,
+            edges: [None; 4],
         }
     }
 }
@@ -119,6 +123,8 @@ pub struct Caption {
     pub placement: Option<CaptionPlacement>,
     pub reserve: f64,
     pub style: TextStyle,
+    pub paragraph: Paragraph,
+    pub margins: Insets,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -234,6 +240,7 @@ pub struct FieldInfo {
     pub read_only: bool,
     pub multiline: bool,
     pub checked: bool,
+    pub round_check: bool,
 }
 
 impl Default for FieldInfo {
@@ -248,6 +255,7 @@ impl Default for FieldInfo {
             read_only: false,
             multiline: false,
             checked: false,
+            round_check: false,
         }
     }
 }

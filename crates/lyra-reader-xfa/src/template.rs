@@ -413,18 +413,31 @@ fn build_node(element: &Element, inherited: &Defaults, warnings: &mut Vec<String
             "right" => Some(CaptionPlacement::Right),
             _ => None,
         };
-        let (text, rich) = caption.child("value").map(value_text).unwrap_or_default();
+        let mut caption_paragraph = paragraph.clone();
+        if let Some(para) = caption.child("para") {
+            apply_paragraph(&mut caption_paragraph, para);
+        }
+        let (text, rich) = caption
+            .child("value")
+            .map(|value| value_text_with_style(value, &caption_font))
+            .unwrap_or_default();
         Caption {
             text,
             rich,
             placement,
             reserve,
             style: caption_font,
+            paragraph: caption_paragraph,
+            margins: Insets {
+                left: margins.left,
+                right: margins.right,
+                ..Insets::default()
+            },
         }
     });
 
     let field = (kind == NodeKind::Field).then(|| parse_field(element));
-    let draw = (kind == NodeKind::Draw).then(|| parse_draw(element));
+    let draw = (kind == NodeKind::Draw).then(|| parse_draw(element, &font));
 
     let child_defaults = Defaults {
         font: font.clone(),
@@ -487,6 +500,9 @@ fn apply_font(font: &mut TextStyle, element: &Element) {
 }
 
 fn apply_paragraph(paragraph: &mut Paragraph, element: &Element) {
+    if let Some(height) = length(element.attribute("lineHeight")) {
+        paragraph.line_height = (height > 0.0).then_some(height);
+    }
     if let Some(value) = element.attribute("hAlign") {
         paragraph.horizontal = match value {
             "center" => HorizontalAlign::Center,
@@ -528,48 +544,52 @@ fn parse_margins(element: &Element, defaults: Insets) -> Insets {
 }
 
 fn parse_border(element: &Element) -> Border {
-    let presence = Presence::parse(element.attribute("presence"));
-    let mut visible = false;
-    let mut thickness = 0.5;
-    let mut color = Color::BLACK;
-    let mut fill = None;
-    for child in element.elements() {
-        match child.name.to_ascii_lowercase().as_str() {
-            "edge" => {
-                if Presence::parse(child.attribute("presence")) == Presence::Visible {
-                    visible = true;
-                }
-                if let Some(value) = length(child.attribute("thickness")) {
-                    thickness = value;
-                }
-                if let Some(value) = child
-                    .child("color")
+    let shown = Presence::parse(element.attribute("presence")) == Presence::Visible;
+    let mut strokes = Vec::new();
+    for edge in element.children_named("edge") {
+        let stroke = if shown && Presence::parse(edge.attribute("presence")) == Presence::Visible {
+            Some((
+                length(edge.attribute("thickness")).unwrap_or(0.5),
+                edge.child("color")
                     .and_then(|color| Color::parse(color.attribute("value").unwrap_or("")))
-                {
-                    color = value;
-                }
-            }
-            "corner" => {
-                if Presence::parse(child.attribute("presence")) == Presence::Visible {
-                    visible = true;
-                }
-            }
-            "fill" => {
-                fill = child
-                    .child("color")
-                    .and_then(|color| Color::parse(color.attribute("value").unwrap_or("")));
-            }
-            _ => {}
-        }
+                    .unwrap_or(Color::BLACK),
+            ))
+        } else {
+            None
+        };
+        strokes.push(stroke);
     }
-    if presence != Presence::Visible {
-        visible = false;
-    }
+    // XFA repeats the last edge to fill the remaining sides. Corners never make
+    // an explicitly hidden straight edge visible.
+    let edges = std::array::from_fn(|index| {
+        strokes.get(index).copied().unwrap_or_else(|| {
+            strokes
+                .last()
+                .copied()
+                .unwrap_or(shown.then_some((0.5, Color::BLACK)))
+        })
+    });
+    let (thickness, color) = edges
+        .iter()
+        .flatten()
+        .copied()
+        .next()
+        .unwrap_or((0.5, Color::BLACK));
+    let fill = if shown {
+        element
+            .child("fill")
+            .filter(|fill| Presence::parse(fill.attribute("presence")) == Presence::Visible)
+            .and_then(|fill| fill.child("color"))
+            .and_then(|color| Color::parse(color.attribute("value").unwrap_or("")))
+    } else {
+        None
+    };
     Border {
-        visible,
+        visible: edges.iter().any(Option::is_some),
         thickness,
         color,
         fill,
+        edges,
     }
 }
 
@@ -593,6 +613,11 @@ fn parse_field(element: &Element) -> FieldInfo {
             "picture" => FieldType::Picture,
             _ => FieldType::Unknown,
         };
+        if let Some(check) = ui.child("checkButton") {
+            field.round_check = check
+                .attribute("shape")
+                .is_some_and(|shape| shape.eq_ignore_ascii_case("round"));
+        }
         if let Some(text_edit) = ui.child("textEdit") {
             field.multiline = text_edit
                 .attribute("multiLine")
@@ -637,7 +662,7 @@ fn parse_field(element: &Element) -> FieldInfo {
     field
 }
 
-fn parse_draw(element: &Element) -> DrawInfo {
+fn parse_draw(element: &Element, style: &TextStyle) -> DrawInfo {
     let Some(value) = element.child("value") else {
         return DrawInfo::default();
     };
@@ -678,7 +703,7 @@ fn parse_draw(element: &Element) -> DrawInfo {
             rich: Vec::new(),
         };
     }
-    let (text, rich) = value_text(value);
+    let (text, rich) = value_text_with_style(value, style);
     DrawInfo {
         kind: DrawKind::Text,
         text,
@@ -688,8 +713,12 @@ fn parse_draw(element: &Element) -> DrawInfo {
 
 /// Returns the value's plain text and rich paragraphs (when the value is XHTML).
 fn value_text(value: &Element) -> (String, Vec<RichParagraph>) {
+    value_text_with_style(value, &TextStyle::default())
+}
+
+fn value_text_with_style(value: &Element, style: &TextStyle) -> (String, Vec<RichParagraph>) {
     if let Some(exdata) = value.child("exData") {
-        let rich = parse_rich(exdata);
+        let rich = parse_rich(exdata, style);
         let text = rich
             .iter()
             .map(RichParagraph::text)
@@ -705,12 +734,19 @@ fn value_text(value: &Element) -> (String, Vec<RichParagraph>) {
     (normalise_space(&text), Vec::new())
 }
 
-fn parse_rich(exdata: &Element) -> Vec<RichParagraph> {
+fn parse_rich(exdata: &Element, font: &TextStyle) -> Vec<RichParagraph> {
+    let inherited = RichStyle {
+        bold: font.bold,
+        italic: font.italic,
+        size: Some(font.size),
+        color: Some(font.color),
+        horizontal: None,
+    };
     let mut paragraphs = Vec::new();
     let body = exdata.child("body").unwrap_or(exdata);
     let paragraph_elements: Vec<&Element> = body.children_named("p").collect();
     if paragraph_elements.is_empty() {
-        let runs = rich_runs(body, &RichStyle::default());
+        let runs = rich_runs(body, &inherited);
         if !runs.is_empty() {
             paragraphs.push(RichParagraph {
                 runs,
@@ -720,7 +756,7 @@ fn parse_rich(exdata: &Element) -> Vec<RichParagraph> {
         return paragraphs;
     }
     for paragraph in paragraph_elements {
-        let style = rich_style(paragraph.attribute("style"), &RichStyle::default());
+        let style = rich_style(paragraph.attribute("style"), &inherited);
         let runs = rich_runs(paragraph, &style);
         if runs.is_empty() {
             continue;
