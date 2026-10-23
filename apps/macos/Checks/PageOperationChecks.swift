@@ -583,7 +583,11 @@ extension ReaderChecks {
         require(!encryptedSplitOK, "splitting an encrypted document is refused")
         require(!fileManager.fileExists(atPath: encryptedSplitOutput.path),
                 "a refused encrypted split writes nothing")
-        require(encryptedSplitState.lastError?.lowercased().contains("password-protected") == true,
-                "the encrypted-split refusal gives a readable reason")
+        let encryptedSplitReason = encryptedSplitState.lastError?.lowercased() ?? ""
+        require(encryptedSplitReason.contains("encrypted")
+                    && (encryptedSplitReason.contains("password-protected")
+                        || encryptedSplitReason.contains("not supported")
+                        || encryptedSplitReason.contains("refused")),
+                "the encrypted-split refusal gives a readable reason: \(encryptedSplitState.lastError ?? "nil")")
     }
 }

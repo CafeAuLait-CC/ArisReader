@@ -42,6 +42,65 @@ public struct DocumentSignature: Codable, Equatable, Sendable {
     }
 }
 
+/// The XFA facts for an open document.
+///
+/// An XFA form is rendered read-only from its XML into a synthetic in-memory PDF. `isXfa`
+/// therefore means: every write command is refused (annotations, form filling, content
+/// editing, page operations, save-a-copy of edits), while zoom, scroll, search, selection and
+/// summaries work on the synthetic pages. `skipped` is the honest list of what the renderer
+/// could not draw.
+public struct DocumentXfa: Codable, Equatable, Sendable {
+    public let isXfa: Bool
+    public let rendered: Bool
+    public let pageCount: Int
+    public let fieldCount: Int
+    public let packetNames: [String]
+    public let skipped: [String]
+    public let error: String?
+    public let readOnlyReason: String?
+    public let encrypted: Bool
+
+    public init(
+        isXfa: Bool,
+        rendered: Bool,
+        pageCount: Int,
+        fieldCount: Int,
+        packetNames: [String],
+        skipped: [String],
+        error: String?,
+        readOnlyReason: String?,
+        encrypted: Bool
+    ) {
+        self.isXfa = isXfa
+        self.rendered = rendered
+        self.pageCount = pageCount
+        self.fieldCount = fieldCount
+        self.packetNames = packetNames
+        self.skipped = skipped
+        self.error = error
+        self.readOnlyReason = readOnlyReason
+        self.encrypted = encrypted
+    }
+
+    public static let none = DocumentXfa(
+        isXfa: false, rendered: false, pageCount: 0, fieldCount: 0,
+        packetNames: [], skipped: [], error: nil, readOnlyReason: nil, encrypted: false)
+
+    init(_ record: XfaStatusRecord) {
+        isXfa = record.isXfa
+        rendered = record.rendered
+        pageCount = Int(record.pageCount)
+        fieldCount = Int(record.fieldCount)
+        packetNames = record.packetNames
+        skipped = record.skipped
+        error = record.error
+        readOnlyReason = record.readOnlyReason
+        encrypted = record.encrypted
+    }
+
+    public var skippedSummary: String { skipped.joined(separator: " · ") }
+}
+
 /// Snapshot of a document the shell has opened.
 ///
 /// Deliberately *not* called `DocumentSummary`: the UniFFI-generated control plane
@@ -58,6 +117,8 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
     public var backend: String
     /// Signature evidence, read once at open. `.unsigned` when the document has none.
     public var signature: DocumentSignature
+    /// XFA state, read once at open. `.none` for an ordinary PDF.
+    public var xfa: DocumentXfa
 
     public init(
         id: UUID = UUID(),
@@ -66,7 +127,8 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
         url: URL? = nil,
         firstPageSize: CGSize = .zero,
         backend: String = "unknown",
-        signature: DocumentSignature = .unsigned
+        signature: DocumentSignature = .unsigned,
+        xfa: DocumentXfa = .none
     ) {
         self.id = id
         self.title = title
@@ -75,6 +137,7 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
         self.firstPageSize = firstPageSize
         self.backend = backend
         self.signature = signature
+        self.xfa = xfa
     }
 }
 
@@ -2185,7 +2248,8 @@ public final class RustEngine: PDFEngine {
                 height: firstPage?.heightPt ?? 0
             ),
             backend: engine.backend(),
-            signature: DocumentSignature(opened.signatureStatus())
+            signature: DocumentSignature(opened.signatureStatus()),
+            xfa: DocumentXfa(opened.xfaStatus())
         )
 
         openDocuments[key] = opened

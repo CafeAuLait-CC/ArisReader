@@ -915,6 +915,7 @@ dependencies = [
  "lyra-reader-pdfium",
  "lyra-reader-render",
  "lyra-reader-text",
+ "lyra-reader-xfa",
  "serde",
  "serde_json",
 ]
@@ -941,6 +942,7 @@ dependencies = [
  "lyra-reader-pdfium",
  "lyra-reader-session",
  "lyra-reader-text",
+ "lyra-reader-xfa",
  "serde",
  "serde_json",
  "sha2",
@@ -1001,6 +1003,13 @@ version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
  "serde",
+]
+
+[[package]]
+name = "lyra-reader-xfa"
+version = "0.0.0"
+dependencies = [
+ "lopdf",
 ]
 
 [[package]]

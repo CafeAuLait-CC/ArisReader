@@ -125,6 +125,9 @@ pub struct DocumentSummary {
     /// `/Rotate` of the first page, in degrees (0/90/180/270).
     pub rotation_degrees: i32,
     pub is_encrypted: bool,
+    /// True when the file is an XFA form; the page count and size then describe the synthetic
+    /// read-only rendering, not the (usually blank) PDF page tree.
+    pub is_xfa: bool,
     /// Which backend produced this summary (for diagnostics in the UI).
     pub backend: String,
 }
@@ -333,7 +336,25 @@ impl LyraReaderEngine {
         path: String,
         password: Option<String>,
     ) -> Result<DocumentSummary, LyraReaderFfiError> {
-        let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
+        let source = std::path::Path::new(&path);
+        let prepared = match lyra_reader_xfa::prepare(source, password.as_deref()) {
+            Ok(prepared) => prepared,
+            Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+                return Err(lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::Encrypted,
+                    "the document is password protected",
+                )
+                .into());
+            }
+            Err(_) => None,
+        };
+        let backend = match prepared.as_ref() {
+            Some(prepared) => match &prepared.pdf {
+                Some(bytes) => PdfiumBackend::open_bytes(bytes.clone(), source)?,
+                None => PdfiumBackend::open(source, password.as_deref())?,
+            },
+            None => PdfiumBackend::open(source, password.as_deref())?,
+        };
 
         let page_count = backend.page_count();
         let (width, height, rotation) = if page_count > 0 {
@@ -350,7 +371,11 @@ impl LyraReaderEngine {
             first_page_width_pt: width,
             first_page_height_pt: height,
             rotation_degrees: rotation,
-            is_encrypted: backend.is_encrypted(),
+            is_encrypted: prepared
+                .as_ref()
+                .map(|prepared| prepared.file.encrypted)
+                .unwrap_or_else(|| backend.is_encrypted()),
+            is_xfa: prepared.is_some(),
             backend: backend_description().to_string(),
         })
     }
@@ -527,6 +552,35 @@ pub fn appearance_font_coverage(
     })
 }
 
+/// The XFA facts the shell needs to explain the document and to disable write commands.
+///
+/// An XFA form is rendered **read-only from its XML** into a synthetic in-memory PDF. There is
+/// no annotation write-back, no form filling, no content editing and no "save a copy" of edits:
+/// every command that would write is refused with [`Self::read_only_reason`], and the shell
+/// disables those controls with the same sentence. Reading aids (zoom, scroll, search,
+/// selection, summaries) are unaffected because they run on the synthetic PDF.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct XfaStatusRecord {
+    /// True when the file carries `/AcroForm /XFA`; false for every ordinary PDF.
+    pub is_xfa: bool,
+    /// True when the synthetic PDF was produced and is what the document handle renders.
+    pub rendered: bool,
+    /// Pages in the rendering (not the source PDF's page tree).
+    pub page_count: u32,
+    /// Fields found in the template.
+    pub field_count: u32,
+    /// Packet names in `/XFA` order.
+    pub packet_names: Vec<String>,
+    /// What the renderer could not draw, in a person's words. Empty only for a complete form.
+    pub skipped: Vec<String>,
+    /// Set when the template was detected but could not be rendered; the original PDF is open.
+    pub error: Option<String>,
+    /// The one explanation every XFA write refusal uses; `None` for an ordinary PDF.
+    pub read_only_reason: Option<String>,
+    /// The source file carries an encryption dictionary (even if it opened without a prompt).
+    pub encrypted: bool,
+}
+
 /// An open document.
 ///
 /// Long-lived by design: the shell opens once and then asks for pages as the reader
@@ -539,6 +593,9 @@ pub struct LyraReaderDocument {
     path: String,
     /// Kept so [`LyraReaderDocument::reopen`] can hand a worker its own copy.
     password: Option<String>,
+    /// XFA state, when this document is a form rendered from its XML. The synthetic bytes are
+    /// kept so a worker copy can open its own PDFium handle without touching the source file.
+    xfa: Option<XfaState>,
     /// Signature evidence, read once when the document was opened.
     ///
     /// The decision is a property of the file's bytes, and the file is not written while this
@@ -581,6 +638,13 @@ pub struct LyraReaderDocument {
     /// the document is open (the annotation writer replaces the file, and then the shell
     /// reopens it), so this cache has the document's lifetime.
     ai_text: Mutex<std::collections::HashMap<u32, (String, Vec<PageChar>)>>,
+}
+
+/// The XFA handle state: the shell-facing facts plus the in-memory synthetic PDF.
+#[derive(Clone)]
+struct XfaState {
+    status: XfaStatusRecord,
+    synthetic_pdf: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -748,6 +812,28 @@ impl LyraReaderDocument {
         }
     }
 
+    /// The XFA facts for this document. `is_xfa: false` for an ordinary PDF.
+    ///
+    /// The shell uses this record to show the "XFA form, rendered read-only from XML" banner,
+    /// list what was skipped, and disable annotation/form/editing commands. The engine refuses
+    /// those commands itself, so a stale button cannot write.
+    pub fn xfa_status(&self) -> XfaStatusRecord {
+        self.xfa
+            .as_ref()
+            .map(|state| state.status.clone())
+            .unwrap_or(XfaStatusRecord {
+                is_xfa: false,
+                rendered: false,
+                page_count: 0,
+                field_count: 0,
+                packet_names: Vec::new(),
+                skipped: Vec::new(),
+                error: None,
+                read_only_reason: None,
+                encrypted: false,
+            })
+    }
+
     /// Page size in points (`/Rotate` applied).
     pub fn page_size_pt(&self, page: u32) -> Result<PageSize, LyraReaderFfiError> {
         let info = self.backend.page_info(PageIndex(page))?;
@@ -835,12 +921,23 @@ impl LyraReaderDocument {
     /// copy per worker; [`LyraReaderDocument::rasterize_tile`] on each copy then runs in
     /// parallel with the others.
     pub fn reopen(&self) -> Result<Arc<LyraReaderDocument>, LyraReaderFfiError> {
-        let backend =
-            PdfiumBackend::open(std::path::Path::new(&self.path), self.password.as_deref())?;
+        let backend = match self
+            .xfa
+            .as_ref()
+            .and_then(|state| state.synthetic_pdf.as_ref())
+        {
+            Some(bytes) => {
+                PdfiumBackend::open_bytes((**bytes).clone(), std::path::Path::new(&self.path))?
+            }
+            None => {
+                PdfiumBackend::open(std::path::Path::new(&self.path), self.password.as_deref())?
+            }
+        };
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path: self.path.clone(),
             password: self.password.clone(),
+            xfa: self.xfa.clone(),
             signature: self.signature.clone(),
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
@@ -1495,6 +1592,13 @@ impl LyraReaderDocument {
     /// disappearing from the answer — "the file has no annotations" and "we could not read them"
     /// are different things, and the shell says so.
     pub fn annotations(&self) -> Result<Vec<AnnotationRecord>, LyraReaderFfiError> {
+        if self.xfa.is_some() {
+            // The synthetic PDF is a picture of the form, not an annotation carrier. Reading the
+            // source's annotations through a handle whose page count is the rendering's would
+            // ask the original one-page file for page 2. There is nothing to offer: annotation
+            // tools are disabled for an XFA document.
+            return Ok(Vec::new());
+        }
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
                 message: "the document was replaced on disk; reopen it before reading annotations"
@@ -1704,6 +1808,7 @@ impl LyraReaderDocument {
         destination: String,
     ) -> Result<(), LyraReaderFfiError> {
         use lyra_reader_pdfium::content_edit::ContentCommand;
+        self.ensure_not_xfa()?;
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::InvalidArgument {
                 message: "Reopen an unencrypted document before editing its contents.".into(),
@@ -1765,6 +1870,7 @@ impl LyraReaderDocument {
         destination: String,
         operation: PageOperationRecord,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
                 message: "the document was replaced on disk; reopen it before editing pages"
@@ -1797,6 +1903,7 @@ impl LyraReaderDocument {
         destination: String,
         pages: Vec<u32>,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
                 message:
@@ -1827,6 +1934,7 @@ impl LyraReaderDocument {
         others: Vec<String>,
         destination: String,
     ) -> Result<MergeReportRecord, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
                 message:
@@ -1853,6 +1961,7 @@ impl LyraReaderDocument {
         &self,
         parts: Vec<SplitPartRecord>,
     ) -> Result<SplitReportRecord, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         if self.backend.is_encrypted() {
             return Err(LyraReaderFfiError::Document {
                 message:
@@ -1876,6 +1985,7 @@ impl LyraReaderDocument {
         &self,
         destination: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         let report = lyra_reader_pdfium::publish_edited_copy(
             Path::new(&self.path),
             Path::new(&destination),
@@ -1894,6 +2004,7 @@ impl LyraReaderDocument {
         &self,
         original_path: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         // The revision is a working copy, so its own signature status (normally signed) is not
         // the authority for an in-place write: check the file that would actually change.
         let original = Path::new(&original_path);
@@ -1965,6 +2076,7 @@ impl LyraReaderDocument {
         destination: String,
         areas: Vec<RedactionAreaRecord>,
     ) -> Result<RedactionReportRecord, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         let areas = redaction_areas_for(&self.backend, &areas)?;
         let report = redact_pdf(
             Path::new(&self.path),
@@ -1987,6 +2099,7 @@ impl LyraReaderDocument {
     ) -> Result<RedactionReportRecord, LyraReaderFfiError> {
         // Signed documents are read-only: this command would write into the file (or an
         // edited derivative of it), so it stops here with the one shared explanation.
+        self.ensure_not_xfa()?;
         self.ensure_writable()?;
         let areas = redaction_areas_for(&self.backend, &areas)?;
         let report = redact_pdf(
@@ -2127,6 +2240,27 @@ impl LyraReaderDocument {
             });
         }
         let path = Path::new(&self.path);
+        if let Some(state) = &self.xfa {
+            // The synthetic PDF has no fillable fields: drawing a control in a picture does not
+            // create a widget. Report the refusal and the source's encryption state so the shell
+            // explains why the form tool is not offered, instead of showing an empty form.
+            let reason = state
+                .status
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| lyra_reader_xfa::READ_ONLY_REASON.to_string());
+            return Ok(FormInfoRecord {
+                fields: Vec::new(),
+                encrypted: state.status.encrypted,
+                pdf_version: lyra_reader_pdfium::read_document_facts_unencrypted_header(
+                    path,
+                    self.backend.page_count(),
+                )
+                .pdf_version,
+                page_count: self.backend.page_count(),
+                refusal: Some(reason),
+            });
+        }
         if !self.backend.has_acro_form() {
             // No AcroForm: skip the whole-file dictionary parse. The PDF version is still a
             // fact the information panel would ask for, and reading the header is cheap.
@@ -2273,6 +2407,42 @@ impl LyraReaderDocument {
             });
         }
         let path = Path::new(&self.path);
+        if let Some(state) = &self.xfa {
+            // The page count must describe what the handle renders (the synthetic form), while
+            // the `/Info` entries still come from the source the reader opened.
+            let mut record =
+                match lyra_reader_pdfium::read_document_info(path, self.password.as_deref()) {
+                    Ok(info) => DocumentInfoRecord {
+                        title: info.properties.title,
+                        author: info.properties.author,
+                        subject: info.properties.subject,
+                        keywords: info.properties.keywords,
+                        page_count: info.facts.page_count,
+                        pdf_version: info.facts.pdf_version,
+                        is_encrypted: info.facts.is_encrypted,
+                        has_info_dictionary: info.has_info_dictionary,
+                    },
+                    Err(_) => {
+                        let facts = lyra_reader_pdfium::read_document_facts_unencrypted_header(
+                            path,
+                            self.backend.page_count(),
+                        );
+                        DocumentInfoRecord {
+                            title: String::new(),
+                            author: String::new(),
+                            subject: String::new(),
+                            keywords: String::new(),
+                            page_count: facts.page_count,
+                            pdf_version: facts.pdf_version,
+                            is_encrypted: true,
+                            has_info_dictionary: false,
+                        }
+                    }
+                };
+            record.page_count = self.backend.page_count();
+            record.is_encrypted = state.status.encrypted;
+            return Ok(record);
+        }
         match lyra_reader_pdfium::read_document_info(path, self.password.as_deref()) {
             Ok(info) => Ok(DocumentInfoRecord {
                 title: info.properties.title,
@@ -3103,6 +3273,25 @@ impl LyraReaderDocument {
         }
     }
 
+    /// The gate for every command that writes an XFA derivative, including copies.
+    ///
+    /// A signed document may still be exported to a new file; an XFA form may not, because the
+    /// synthetic PDF is not the source and a copy of it would be a picture of the form rather
+    /// than a form. The refusal sentence is the one the banner shows.
+    fn ensure_not_xfa(&self) -> Result<(), LyraReaderFfiError> {
+        if let Some(state) = &self.xfa {
+            let message = state
+                .status
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| lyra_reader_xfa::READ_ONLY_REASON.to_string());
+            return Err(
+                lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message).into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Plain text and character boxes for one page, extracted once and kept for the
     /// document's lifetime. The boxes and the text come from the same `raw.chars` sequence, so
     /// the context builder's gutter rule and the canvas's selection indices agree.
@@ -3113,7 +3302,9 @@ impl LyraReaderDocument {
         mode: SaveMode,
     ) -> Result<FormSaveReport, LyraReaderFfiError> {
         // Writing values into the signed file is refused; a filled **copy** is a new file and
-        // is allowed (and stripped of the signature material it would otherwise carry).
+        // is allowed (and stripped of the signature material it would otherwise carry). An XFA
+        // form has no fillable fields in its synthetic PDF, so both modes are refused.
+        self.ensure_not_xfa()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -3160,7 +3351,8 @@ impl LyraReaderDocument {
         mode: SaveMode,
     ) -> Result<PropertiesSaveReport, LyraReaderFfiError> {
         // In-place property writing is refused; a properties **copy** is a new file and is
-        // allowed (and stripped of signature material).
+        // allowed (and stripped of signature material). An XFA form allows neither.
+        self.ensure_not_xfa()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -3251,7 +3443,8 @@ impl LyraReaderDocument {
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         // A copy writes a new file and is allowed for a signed document. Replacing the original
         // would invalidate the signature, so it is refused here; the copy is then stripped of
-        // the signature material it would otherwise carry.
+        // the signature material it would otherwise carry. An XFA form allows neither.
+        self.ensure_not_xfa()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -5231,11 +5424,62 @@ impl LyraReaderEngine {
         path: String,
         password: Option<String>,
     ) -> Result<Arc<LyraReaderDocument>, LyraReaderFfiError> {
-        let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
+        let source = std::path::Path::new(&path);
+        // Detect XFA before PDFium decides what the document is. A blank page is not evidence:
+        // the decision comes from `/AcroForm /XFA`. The empty user password is handled by the
+        // standard security handler, so a permission-encrypted form opens without a prompt.
+        let xfa = match lyra_reader_xfa::prepare(source, password.as_deref()) {
+            Ok(prepared) => prepared,
+            Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+                return Err(lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::Encrypted,
+                    "the document is password protected",
+                )
+                .with_detail(format!("path: {}", source.display()))
+                .into());
+            }
+            Err(error) => {
+                // A damaged XFA packet is not an ordinary PDF. Keep the normal open path (the
+                // blank page is still the honest fallback) but the status will name the error
+                // only when the structural read succeeded; a parse failure here means the
+                // catalog itself was unreadable, which PDFium will report.
+                eprintln!("lyra-reader-xfa: detection failed: {error}");
+                None
+            }
+        };
+        let (backend, xfa_state) = match xfa {
+            Some(prepared) => {
+                let backend = match &prepared.pdf {
+                    Some(bytes) => PdfiumBackend::open_bytes(bytes.clone(), source)?,
+                    None => PdfiumBackend::open(source, password.as_deref())?,
+                };
+                let status = XfaStatusRecord {
+                    is_xfa: true,
+                    rendered: prepared.status.rendered,
+                    page_count: if prepared.status.rendered {
+                        prepared.status.page_count
+                    } else {
+                        backend.page_count()
+                    },
+                    field_count: prepared.status.field_count,
+                    packet_names: prepared.status.packet_names.clone(),
+                    skipped: prepared.status.skipped.clone(),
+                    error: prepared.status.error.clone(),
+                    read_only_reason: Some(prepared.status.read_only_reason.clone()),
+                    encrypted: prepared.file.encrypted,
+                };
+                let state = XfaState {
+                    status,
+                    synthetic_pdf: prepared.pdf.map(std::sync::Arc::new),
+                };
+                (backend, Some(state))
+            }
+            None => (PdfiumBackend::open(source, password.as_deref())?, None),
+        };
         // One structural read, at open. The decision cannot change while this handle lives and
         // worker copies inherit it, so no other read path pays for it.
         let signature = lyra_reader_pdfium::detect_signature(
-            std::path::Path::new(&path),
+            source,
             password.as_deref(),
             backend.signature_count(),
         );
@@ -5243,6 +5487,7 @@ impl LyraReaderEngine {
             backend,
             path,
             password,
+            xfa: xfa_state,
             signature,
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
