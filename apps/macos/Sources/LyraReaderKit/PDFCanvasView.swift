@@ -229,6 +229,7 @@ public final class MetalCanvasView: NSView {
     public var onCancelTool: (() -> Bool)?
 
     private var pageChrome: PageChromeOverlayView?
+    package var pageChromeRectangles: [CGRect] { pageChrome?.pageRectangles ?? [] }
     private var annotationOverlay: AnnotationOverlayView?
     private var translationOverlay: TranslationOverlayView?
     private var drawingPage: Int?
@@ -447,6 +448,10 @@ public final class MetalCanvasView: NSView {
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.isOpaque = true
+        // wgpu's Metal backend waits until the command buffer is scheduled before presenting
+        // transaction-backed drawables. This keeps the paper and its AppKit edge/shadow layers
+        // in one Core Animation presentation during scrollbar tracking.
+        metalLayer.presentsWithTransaction = true
         return metalLayer
     }
 
@@ -1440,6 +1445,12 @@ public final class MetalCanvasView: NSView {
 
     private func renderFrame() {
         guard surfaceId != 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        // Borders and paper quads must use the same submitted scroll position. Publishing
+        // borders from a setter moved the gap a frame ahead of Metal during scrollbar tracking.
+        syncPageChrome()
 
         // Every visible page goes into one frame; the shell only hands us pages it has
         // already rasterized, so an empty list simply means "nothing to draw yet".
@@ -1625,7 +1636,6 @@ public final class MetalCanvasView: NSView {
     }
 
     private func syncAnnotationOverlay() {
-        syncPageChrome()
         guard let overlay = annotationOverlay else { return }
         let color = annotationColor.nsColor
         overlay.update(

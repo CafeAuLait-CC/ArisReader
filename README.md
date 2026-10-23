@@ -47,7 +47,8 @@ separate features with their own documented limits.
   every request before anything leaves the machine, keeps the key in the Keychain, and keeps a local record of what
   each send contained (pages, characters, whether a picture went) that never stores document text.
   Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
-  edge; switching between them preserves drafts and keeps the PDF canvas and window geometry stable.
+  edge; switching between them preserves drafts, reserves the panel's width in the document
+  viewport and keeps the document's vertical position stable. Wide pages can scroll horizontally.
 - **Translate in place**: select a paragraph and choose Translate from the context menu, the toolbar or
   ⇧⌘L; the translation is drawn over that block with a Show original / Translate chip and a fitted font size,
   never a side-by-side panel. Per-block results are cached in the document cache, so flipping, switching tabs,

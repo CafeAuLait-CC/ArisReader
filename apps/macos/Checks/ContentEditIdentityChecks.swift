@@ -123,8 +123,8 @@ extension ReaderChecks {
       failing.contentTextRecovery != nil && !failing.contentCommandInFlight
     }
     require(
-      failing.lastError?.contains("Content edit failed") == true,
-      "the edit error is what the reader sees: \(failing.lastError ?? "no error")")
+      failing.lastError == nil && failing.contentTextNotice?.contains("Content edit failed") == true,
+      "an oversized draft is explained inline without a modal alert")
     require(
       failing.contentEditPage?.revision == revision,
       "the failed edit keeps the previous revision")

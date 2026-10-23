@@ -67,6 +67,7 @@ public final class ReaderSession: ObservableObject, Identifiable {
 
     private var windowObservers: [NSObjectProtocol] = []
     private var titlebarLayout: ReaderTitlebarLayout?
+    private var closeDelegate: ReaderWindowCloseDelegate?
 
     /// `state` is injectable so the checks can drive a session against a known engine; the app
     /// leaves it out and gets a session with its own engine.
@@ -112,6 +113,9 @@ public final class ReaderSession: ObservableObject, Identifiable {
         if window !== self.window {
             removeWindowObservers()
             self.window = window
+            let delegate = ReaderWindowCloseDelegate(state: state, previous: window.delegate)
+            closeDelegate = delegate
+            window.delegate = delegate
             window.backgroundColor = LyraReaderTheme.titlebarColor
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
@@ -167,6 +171,35 @@ public final class ReaderSession: ObservableObject, Identifiable {
         for observer in windowObservers { NotificationCenter.default.removeObserver(observer) }
         windowObservers.removeAll()
         titlebarLayout = nil
+        if let window, window.delegate === closeDelegate { window.delegate = closeDelegate?.previous }
+        closeDelegate = nil
+    }
+}
+
+@MainActor
+private final class ReaderWindowCloseDelegate: NSObject, NSWindowDelegate {
+    weak var state: AppState?
+    // NSObject's selector forwarding hooks are nonisolated; AppKit installs and invokes this
+    // proxy on the window's main thread.
+    nonisolated(unsafe) weak var previous: (any NSWindowDelegate)?
+    init(state: AppState, previous: (any NSWindowDelegate)?) {
+        self.state = state
+        self.previous = previous
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard state?.prepareWindowClose(continueClosing: { [weak sender] in sender?.performClose(nil) }) != false else {
+            return false
+        }
+        return previous?.windowShouldClose?(sender) ?? true
+    }
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || previous?.responds(to: selector) == true
+    }
+    override func forwardingTarget(for selector: Selector!) -> Any? {
+        if let delegate = previous, delegate.responds(to: selector) {
+            return delegate
+        }
+        return super.forwardingTarget(for: selector)
     }
 }
 

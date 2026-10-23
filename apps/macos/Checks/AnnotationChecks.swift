@@ -337,8 +337,12 @@ extension ReaderChecks {
                                                       from: Data(contentsOf: records(of: typing)))
         require(flushedAtClose.first?.note == timed + "!!??",
                 "the note typed just before the tab closed reached the annotation cache")
+        require(typingState.contentCloseRequested, "closing the dirty note waits for the save decision")
+        typingState.discardContentAndClose()
         typingState.closeTab(1)
+        if typingState.contentCloseRequested { typingState.discardContentAndClose() }
         typingState.closeTab(0)
+        if typingState.contentCloseRequested { typingState.discardContentAndClose() }
         require(typingState.document == nil, "closing the last tab closes the document")
 
         // ── 5. A read-only directory still refuses to write and loses nothing ──

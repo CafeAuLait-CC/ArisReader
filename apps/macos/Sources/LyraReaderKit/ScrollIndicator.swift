@@ -99,7 +99,7 @@ struct ScrollIndicator: View {
     /// before it and the right-hand panel starts after it.
     private var laneWidth: CGFloat { ReaderChrome.scrollIndicatorLaneWidthPt }
     /// Distance from the lane's trailing edge to the thumb.
-    private let trailingInset: CGFloat = 2
+    private var trailingInset: CGFloat { (laneWidth - width) / 2 }
 
     /// The drag in flight, if any. Cleared when the document changes, so a cancelled gesture
     /// cannot leave the next press thinking it is a continuation.
@@ -140,12 +140,12 @@ struct ScrollIndicator: View {
                     )
                     .animation(.easeOut(duration: 0.25), value: active)
                     .allowsHitTesting(false)
+                    .opacity(state.showsScrollIndicator ? 1 : 0)
+                    .animation(.easeOut(duration: 0.25), value: state.showsScrollIndicator)
             }
             .frame(width: laneWidth, height: proxy.size.height, alignment: .topTrailing)
         }
         .frame(width: laneWidth)
-        .opacity(state.showsScrollIndicator ? 1 : 0)
-        .animation(.easeOut(duration: 0.25), value: state.showsScrollIndicator)
         // Interaction is the document's fact, not the fade's: a scrollable document is grabbable
         // even while the capsule is transparent, and a document that fits is not grabbable at all.
         .allowsHitTesting(state.scrollIndicatorIsInteractive)

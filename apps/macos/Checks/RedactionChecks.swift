@@ -151,10 +151,17 @@ extension ReaderChecks {
 
         // ── The pending-mark model the canvas and the confirmation use ───────────────────
         let state = AppState(engine: try RustEngine())
-        require(state.open(url: source), "the reader opens the fixture")
+        state.newTab(url: source)
+        require(state.document != nil, "the reader opens the fixture")
         require(!state.canApplyRedactions, "there is nothing to apply before a mark")
         state.addPendingRedaction(page: 0, rect: CGRect(x: 100, y: 100, width: 40, height: 20))
         require(state.pendingRedactions.count == 1, "the mark is pending")
+        state.closeTab(0)
+        require(state.contentCloseRequested && state.closeRequiresReview,
+                "closing protects pending redaction marks")
+        state.saveContentAndClose()
+        require(state.document != nil && state.pendingRedactions.count == 1 && !state.contentCloseRequested,
+                "reviewing redactions keeps marks without applying or discarding them")
         require(state.pendingRedactionPageCount == 1, "the pending page count is reported")
         require(state.pendingRedactionMarks.first?.page == 0,
                 "the canvas receives the pending rectangle")

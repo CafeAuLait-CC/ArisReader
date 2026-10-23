@@ -82,6 +82,132 @@ fn kerning_paragraph_replaces_real_content_and_survives_reopen() {
 }
 
 #[test]
+fn text_frame_grows_for_wrapping_and_retains_its_top_and_width() {
+    let source = fixture("grow", b"BT /F1 12 Tf 72 700 Td (Short text.) Tj ET BT /F1 12 Tf 72 650 Td (Untouched neighbour) Tj ET");
+    let page = inspect_content(&source, 0).unwrap();
+    let item = page.items.iter().find(|i| i.text == "Short text.").unwrap();
+    let text =
+        "A longer paragraph with inserted words, a replacement and a second line.\nMore text.";
+    let output = source.with_file_name("grown.pdf");
+    edit_content(
+        &source,
+        &output,
+        0,
+        &ContentCommand::ReplaceText {
+            revision: page.revision,
+            target: item.id.clone(),
+            text: text.into(),
+            bounds: item.bounds,
+            font: "Helvetica".into(),
+            size: item.size,
+            colour: item.colour,
+            alignment: 0,
+        },
+    )
+    .unwrap();
+    let after = inspect_content(&output, 0).unwrap();
+    let grown = after
+        .items
+        .iter()
+        .find(|i| i.text.starts_with("A longer"))
+        .unwrap();
+    assert!(grown.bounds.height > item.bounds.height * 2.0);
+    assert!((grown.bounds.width - item.bounds.width).abs() < 0.1);
+    assert!(
+        (grown.bounds.y + grown.bounds.height - item.bounds.y - item.bounds.height).abs() < 0.1
+    );
+    assert!(after.items.iter().any(|i| i.text == "Untouched neighbour"));
+    // The longer frame now overlaps its neighbour. It must remain one independently
+    // selectable/editable block across several revisions, without absorbing that neighbour.
+    let second = source.with_file_name("edited-again.pdf");
+    edit_content(
+        &output,
+        &second,
+        0,
+        &ContentCommand::ReplaceText {
+            revision: after.revision.clone(),
+            target: grown.id.clone(),
+            text: "Edited again.".into(),
+            bounds: grown.bounds,
+            font: "Original".into(),
+            size: grown.size,
+            colour: grown.colour,
+            alignment: 0,
+        },
+    )
+    .unwrap();
+    let reopened = inspect_content(&second, 0).unwrap();
+    assert!(
+        reopened
+            .items
+            .iter()
+            .any(|i| i.text.replace('\n', " ") == "Edited again.")
+    );
+    assert!(
+        reopened
+            .items
+            .iter()
+            .any(|i| i.text == "Untouched neighbour")
+    );
+}
+
+#[test]
+fn real_review_paragraphs_accept_insert_delete_replace_and_longer_text() {
+    let Ok(samples) = std::env::var("LYRA_READER_PDF_SAMPLES") else {
+        return;
+    };
+    for name in [
+        "review_ashley_0826.pdf",
+        "review_du_0923.pdf",
+        "manuscript_0925.pdf",
+    ] {
+        let source = Path::new(&samples).join(name);
+        if !source.exists() {
+            continue;
+        }
+        let page = inspect_content(&source, 0).unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|i| {
+                i.can_edit_text
+                    && i.bounds.width > 150.0
+                    && i.text.chars().filter(|c| c.is_alphabetic()).count() > 100
+            })
+            .expect("a real body paragraph");
+        let original = item.text.replace('\n', " ");
+        let variants = [
+            format!("{original} More text."),
+            original.chars().skip(4).collect(),
+            original.replacen(' ', " edited ", 1),
+            format!(
+                "{original}\nAdditional text for a longer paragraph that wraps onto another line."
+            ),
+        ];
+        for (index, text) in variants.iter().enumerate() {
+            let output = std::env::temp_dir().join(format!("lyra-feedback-{name}-{index}.pdf"));
+            let _ = std::fs::remove_file(&output);
+            edit_content(
+                &source,
+                &output,
+                0,
+                &ContentCommand::ReplaceText {
+                    revision: page.revision.clone(),
+                    target: item.id.clone(),
+                    text: text.clone(),
+                    bounds: item.bounds,
+                    font: "Original".into(),
+                    size: item.size,
+                    colour: item.colour,
+                    alignment: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} variant {index}: {e}"));
+        }
+    }
+}
+
+#[test]
 fn move_then_delete_and_stale_revision_are_transactional() {
     let source = fixture("move", b"BT /F1 12 Tf 72 700 Td (Move this) Tj ET");
     let page = inspect_content(&source, 0).unwrap();

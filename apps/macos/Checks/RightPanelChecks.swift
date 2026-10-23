@@ -52,6 +52,9 @@ private final class RightPanelHarness {
 
     var canvasRect: CGRect {
         host.layoutSubtreeIfNeeded()
+        if let clip = canvas.enclosingScrollView?.contentView {
+            return host.convert(clip.bounds, from: clip)
+        }
         return host.convert(canvas.bounds, from: canvas)
     }
 
@@ -369,9 +372,9 @@ extension ReaderChecks {
         let openFootprint = harness.panelTotalWidth
         require(abs(openFootprint - ReaderSidePanelMetrics.totalWidth(contentWidth: 320)) < 0.5,
                 "the open panel's footprint is 327 pt (measured \(openFootprint) pt)")
-        require(abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5,
-                "the canvas reports the width the panel left it "
-                    + "(\(state.canvasViewportWidthPt) vs \(harness.canvasRect.width) pt)")
+        try await eventually("the canvas reports the width the panel left it", {
+            abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+        })
 
         // The AI view is the panel's content, not a copy of it or a placeholder: the assistant's
         // own marker view is in the AppKit hierarchy, and its scrolling content is an NSScrollView
@@ -426,7 +429,7 @@ extension ReaderChecks {
                 "the scroll offset stays at \(scrollBefore) pt while the panel opens")
         require(pageTops.count == panelWidths.count
                     && pageTops.allSatisfy { abs($0 - pageTopBefore) < 0.01 },
-                "the page's on-screen top stays at \(pageTopBefore) pt while the panel opens")
+                "the page's on-screen top stays at \(pageTopBefore) pt while the panel opens (\(pageTops))")
 
         // The mirror image: pin the close from open to closed and keep measuring the same page.
         state.rightPanelVisible = false
@@ -515,17 +518,19 @@ extension ReaderChecks {
         let expectedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
+            - harness.panelTotalWidth
         require(abs(harness.canvasRect.width - expectedCanvas) < 0.5,
                 "both panels open: canvas width \(harness.canvasRect.width) pt = window "
                     + "\(harness.host.bounds.width) - sidebar \(ReaderChrome.sidebarTotalWidthPt) "
-                    + "- indicator \(ReaderChrome.scrollIndicatorLaneWidthPt) pt; overlay width \(harness.panelTotalWidth) pt")
+                    + "- indicator \(ReaderChrome.scrollIndicatorLaneWidthPt) - panel \(harness.panelTotalWidth) pt")
         require(abs(state.canvasViewportWidthPt - expectedCanvas) < 0.5,
                 "the canvas viewport equals the same number (\(state.canvasViewportWidthPt) pt)")
         require(harness.canvasRect.minX >= ReaderChrome.sidebarTotalWidthPt - 0.5,
                 "the canvas starts after the left sidebar (x=\(harness.canvasRect.minX) pt)")
         require(abs(harness.canvasRect.maxX + ReaderChrome.scrollIndicatorLaneWidthPt
+                    + harness.panelTotalWidth
                     - harness.host.bounds.width) < 0.5,
-                "the canvas extends beneath the overlay and keeps its scroll lane")
+                "the scroll lane separates the document viewport from the right panel")
         require(abs(harness.panelTotalWidth
                     - ReaderSidePanelMetrics.totalWidth(contentWidth: 320)) < 0.5,
                 "the two panels coexist without either changing the other's width")
@@ -540,6 +545,7 @@ extension ReaderChecks {
         var expectedResizedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
+            - harness.panelTotalWidth
         require(abs(harness.canvasRect.width - expectedResizedCanvas) < 0.5,
                 "the canvas follows the minimum width (\(harness.canvasRect.width) pt)")
         require(abs(state.canvasViewportWidthPt - expectedResizedCanvas) < 0.5,
@@ -554,6 +560,7 @@ extension ReaderChecks {
         expectedResizedCanvas = harness.host.bounds.width
             - ReaderChrome.sidebarTotalWidthPt
             - ReaderChrome.scrollIndicatorLaneWidthPt
+            - harness.panelTotalWidth
         require(abs(harness.canvasRect.width - expectedResizedCanvas) < 0.5,
                 "the canvas follows the maximum width (\(harness.canvasRect.width) pt)")
         require(expectedResizedCanvas > 100,
@@ -615,8 +622,8 @@ extension ReaderChecks {
         }
         state.transitionProgressOverride = ReaderTransitionProgress(panel: 1)
         try await Task.sleep(for: .milliseconds(80))
-        require(slideCanvasWidths.allSatisfy { abs($0 - (slideCanvasWidths.first ?? 0)) < 0.5 },
-                "opening the overlay leaves the Metal viewport width unchanged "
+        require((slideCanvasWidths.first ?? 0) - (slideCanvasWidths.last ?? 0) > 300,
+                "opening the panel smoothly reserves its width in the document viewport "
                     + "(\(slideCanvasWidths.first ?? 0) -> \(slideCanvasWidths.last ?? 0) pt)")
         require(state.viewportReloadCount == reloadsBefore,
                 "a width-only panel open performs no visible-band rebuild per frame "
@@ -661,12 +668,14 @@ extension ReaderChecks {
             try await Task.sleep(for: .milliseconds(20))
             harness.canvasRect
         }
+        require(state.coalescedViewportReloadCount == zoomedReloads,
+                "a zoomed-in drawer defers visible-column rebuilds throughout the drag")
         state.endRightPanelResize()
         try await Task.sleep(for: .milliseconds(350))
         let coalesced = state.coalescedViewportReloadCount - zoomedReloads
-        require(coalesced == 0,
-                "a zoomed-in overlay resize performs no coalesced rebuild per "
-                    + "step (\(coalesced) rebuilds for 15 width updates)")
+        require(coalesced <= 1,
+                "a zoomed-in drawer releases at most one rebuild after the drag "
+                    + "(\(coalesced) rebuilds for 15 width updates)")
 
         // A real (not pinned) animated close and open at the same zoom: the state holds the
         // per-frame viewport reports for the animation and releases them once. The wait covers
