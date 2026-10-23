@@ -21,8 +21,8 @@ pub use chat::{
     SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH,
     SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS, SelectionRange, SourceRect, SummaryCoverage,
     SummaryLayer, SummaryLayerPlan, SummaryLayerRequest, SummaryUnitPlan, SummaryUnitRequest,
-    build_document_chat_plan, build_region_question_plan, build_summary_layer, inspect_base_url,
-    inspect_summary_layer, validate_model,
+    build_document_chat_plan, build_document_knowledge_plan, build_region_question_plan,
+    build_summary_layer, inspect_base_url, inspect_summary_layer, validate_model,
 };
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
 pub use mock::MockProvider;

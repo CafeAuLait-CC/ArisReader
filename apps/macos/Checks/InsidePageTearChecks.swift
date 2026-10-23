@@ -214,14 +214,13 @@ extension ReaderChecks {
                 "the tear is never placed above the selected region")
 
         let nearFoot = plan(CGRect(x: 100, y: 1000, width: 220, height: 100), gap: 300)
-        require(nearFoot.anchor == .pageFoot,
-                "a selection with less than a card's height below it falls back to the page foot")
-        require(nearFoot.fallbackReason != nil,
-                "the page-foot fallback says why instead of silently cutting the page")
+        require(nearFoot.splitPt == 1100,
+                "a safe cut near the foot does not depend on the inserted conversation height")
+        require(nearFoot.fallbackReason == nil, "a safe cut needs no fallback")
 
         let tallerThanPage = plan(CGRect(x: 100, y: 100, width: 220, height: 90), gap: 1400)
-        require(tallerThanPage.anchor == .pageFoot,
-                "a card taller than the page falls back to the page foot")
+        require(tallerThanPage.splitPt == 190,
+                "even a large inserted gap keeps the same safe paper cut")
 
         let figure = Figure(kind: "Figure", label: "1", page: 0, captionText: "A figure",
                             xPt: 40, yPt: 250, widthPt: 520, heightPt: 350)
@@ -251,8 +250,8 @@ extension ReaderChecks {
             pageHeightPt: 1200,
             selection: CGRect(x: 100, y: 100, width: 220, height: 200),
             gapPt: 500, textPage: figureText, figures: [figure])
-        require(figureNoFit.anchor == .pageFoot,
-                "when the only whitespace below a figure leaves less than the card, the card falls back")
+        require(figureNoFit.splitPt == 711,
+                "a larger gap stays below the figure at the same whitespace")
 
         let uncaptionedArtwork = PageTearPlacement.plan(
             pageHeightPt: 1200,
@@ -710,24 +709,17 @@ extension ReaderChecks {
                 "the real tear is outside the figure region (250…600)")
         figureState.closeRegionCard(id: overFigure.id, keepHistory: false)
 
-        // A measured card that outgrows the space below the split falls back explicitly, and the
-        // page returns to one whole segment rather than losing its lower piece.
+        // Growing a response must not relocate its anchor or lose the lower paper segment.
         let (tallState, _) = makeTearState()
         let tall = try await openCard(tallState, rect: CGRect(x: 100, y: 100, width: 220, height: 90),
                                       measuredViewHeight: 300)
-        require(tall.tearSplitPt == 190, "the tall-card fixture starts with an inside tear")
         tallState.updateRegionCardHeight(cardID: tall.id, viewHeight: 1400)
         tallState.reloadVisiblePages()
-        require(tall.tearSplitPt == nil,
-                "a card taller than the paper below the split moves to the page foot")
-        require(tall.tearFallbackReason != nil,
-                "the measured-height fallback says why")
-        require(tallState.pageSegments(forPage: 0).count == 1,
-                "the page becomes one whole segment again, so no content is missing")
-        let tallGap = tallState.regionGapHeightPt(tall)
-        require(abs(tallGap - 1400) < 0.001, "the fallback gap is the measured card's height")
-        require(abs(tallState.regionGapTop(for: tall.id)! - 1200) < 0.001,
-                "the fallback gap starts at the page foot")
+        require(tall.tearSplitPt == 190, "growing a conversation preserves its paper cut")
+        require(tall.tearFallbackReason == nil, "growth does not create a fallback")
+        require(tallState.pageSegments(forPage: 0).count == 2, "both paper segments remain")
+        require(abs(tallState.regionGapHeightPt(tall) - 1400) < 0.001, "the inserted gap follows measured height")
+        require(abs(tallState.regionGapTop(for: tall.id)! - 190) < 0.001, "the gap stays at the original cut")
         tallState.closeRegionCard(id: tall.id, keepHistory: false)
     }
 

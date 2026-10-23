@@ -1641,7 +1641,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Injection points for the native checks: production keeps both nil.
     public var regionAssistantFactory: (() -> AIAssistantModel)?
     public var regionChatServiceOverride: (() -> (any AIChatServicing)?)?
-    var regionHeightObservers: [UUID: AnyCancellable] = [:]
+    public static var usesDocumentKnowledge = true
+    public lazy var documentKnowledge = AIDocumentKnowledge()
+    var regionContentObservers: [UUID: AnyCancellable] = [:]
+    var regionHistoryLoadFailures = Set<String>()
     var regionEscapeMonitor: Any?
 
     /// A rectangle the reader marked for redaction, pending until the explicit apply command.
@@ -3580,6 +3583,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // cached page-edit session has opened its working revision, so the cache directory is
             // still the original PDF's, never a revision path.
             translationCacheDocumentURL = url
+            loadRegionHistory(for: url)
             refreshTranslationPaperColors()
             inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
             return true
@@ -3592,6 +3596,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        documentKnowledge.invalidate()
         let wasChanging = isChangingDocumentState
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
@@ -7115,6 +7120,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// tab close and by `resetDocumentState`, so a scroll or a typed note cannot be lost just
     /// because the debounce had not expired yet.
     public func flushPendingWrites() {
+        persistRegionHistory()
         if editingAnnotationID != nil { commitTextEditing() }
         let pendingNote = hasPendingAnnotationWrite
         let pendingPosition = self.pendingPosition != nil
@@ -12654,6 +12660,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         undoStack = state.undoStack
         redoStack = state.redoStack
         translationCacheDocumentURL = state.translationDocumentURL
+        if let url = state.translationDocumentURL ?? state.document.url { loadRegionHistory(for: url) }
         inPlaceTranslation.restore(
             state.translationSnapshot,
             url: state.translationDocumentURL ?? state.document.url,

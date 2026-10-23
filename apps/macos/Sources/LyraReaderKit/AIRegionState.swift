@@ -4,45 +4,24 @@ import CoreGraphics
 import Foundation
 import UniformTypeIdentifiers
 
-/// Region questions: arming, capture, the real gap in the page flow, history and the explicit
-/// "open in the AI panel" bridge.
-///
-/// **The gap is a layout shift, not an overlay.** `AIRegionCards` is an in-memory list; the
-/// canvas and the engine still compute the document's normal page layout. Every page below a
-/// card's page row is drawn `gapHeight` points lower, and `contentHeightPt` grows by exactly the
-/// same amount. Removing the card removes the shift, so every page returns to its previous
-/// offset byte for byte. The card itself is a SwiftUI view placed in that empty band; it never
-/// covers a page, because the pages below have moved out of its way.
-///
-/// **Persistence.** Open cards and their history live in this `AppState` for the window's
-/// session (switching tabs closes the cards and keeps the history). Nothing is written beside
-/// the PDF: no annotation, no sidecar, no cache file. Surviving an app relaunch would need a
-/// store outside the document (for example Application Support keyed by file identity); this
-/// change deliberately does not invent one, and the UI says history is session-only.
-///
-/// **Where the gap can be.** The canvas draws a page as one raster, so a gap cannot cut through
-/// the middle of that bitmap without splitting it. The nearest legal whitespace *below* a
-/// selection is therefore the page's bottom margin / the inter-page divider: the card is inserted
-/// after the selected page's row and pushes every later row down. A selection in a large blank
-/// area still gets its card at that row boundary rather than a hole punched in the page itself.
-/// A page rotation, insertion or deletion changes what the captured rectangle means, so it closes
-/// the open card into history and says why. Editing page content under a card leaves the card
-/// anchored and keeps the original capture and text: it is a snapshot of what was asked about,
-/// not a live view of the edited page.
+/// Region conversations live in the document cache, never in the source PDF.
 extension AppState {
-    /// Conversations kept per document. Older entries are dropped first.
-    public static let regionHistoryLimit = 20
-
     // MARK: - Identity and availability
 
     public var regionDocumentKey: String? {
         guard let document else { return nil }
-        return document.url?.standardizedFileURL.path ?? document.id.uuidString
+        return (translationDocumentURL ?? document.url)?.standardizedFileURL.path ?? document.id.uuidString
     }
 
     public var currentRegionHistory: [AIRegionHistoryEntry] {
         guard let key = regionDocumentKey else { return [] }
-        return regionHistory[key] ?? []
+        var entries = regionHistory[key] ?? []
+        for card in regionCards where card.documentKey == key {
+            if let entry = card.historyEntry {
+                entries.removeAll { $0.id == entry.id }; entries.append(entry)
+            }
+        }
+        return entries
     }
 
     /// Why the toolbar's region button is unavailable, or nil when it can arm.
@@ -286,7 +265,8 @@ extension AppState {
     @discardableResult
     private func addRegionCard(
         attachment: AIRegionAttachment,
-        tearPlan: PageTearPlan = PageTearPlan(anchor: .pageFoot)
+        tearPlan: PageTearPlan = PageTearPlan(anchor: .pageFoot),
+        restoring entry: AIRegionHistoryEntry? = nil
     ) -> AIRegionCard? {
         guard let key = regionDocumentKey, let context = aiReaderContext else { return nil }
         // One card at a time: starting a new region question closes the previous gap and keeps
@@ -303,22 +283,20 @@ extension AppState {
             context: context
         )
         let card = AIRegionCard(
+            id: entry?.id ?? UUID(),
             documentKey: key,
             attachment: attachment,
             assistant: assistant,
             tearSplitPt: tearPlan.splitPt,
             tearFallbackReason: tearPlan.fallbackReason
         )
+        if let entry { card.restore(entry) }
         card.updateHeight(card.heightViewPt)
         regionCards.append(card)
-        regionHeightObservers[card.id] = card.$heightViewPt
-            .removeDuplicates()
-            .dropFirst()
-            .sink { [weak self, weak card] height in
-                guard let self, let card else { return }
-                Task { @MainActor in
-                    self.updateRegionCardHeight(cardID: card.id, viewHeight: height)
-                }
+        regionContentObservers[card.id] = card.objectWillChange
+            .throttle(for: .milliseconds(750), scheduler: RunLoop.main, latest: true)
+            .sink { [weak self] in
+                Task { @MainActor in self?.persistRegionHistory() }
             }
         refreshRegionLayout(preservingScroll: true)
         scrollToRegionCard(card)
@@ -340,9 +318,12 @@ extension AppState {
             regionRefusalMessage = "That region belongs to another document; open it first."
             return nil
         }
+        guard entry.attachment.page >= 0, entry.attachment.page < (document?.pageCount ?? 0) else {
+            regionRefusalMessage = "That saved region refers to a page that is no longer in this PDF. Its conversation is still available in Reading notes."
+            return nil
+        }
         let plan = tearPlan(for: entry.attachment, textPage: cachedTextPage(entry.attachment.page))
-        guard let card = addRegionCard(attachment: entry.attachment, tearPlan: plan) else { return nil }
-        card.question = entry.question
+        guard let card = addRegionCard(attachment: entry.attachment, tearPlan: plan, restoring: entry) else { return nil }
         return card
     }
 
@@ -357,17 +338,23 @@ extension AppState {
     ) {
         guard let index = regionCards.firstIndex(where: { $0.id == id }) else { return }
         let card = regionCards[index]
-        if card.assistant.phase == .streaming { card.assistant.cancel() }
+        card.assistant.cancelRegionWork()
+        card.notesAssistant.cancelRegionWork()
+        card.keepGeneratedNote()
         let gapTop = regionGapTop(for: card) ?? 0
         let gapHeight = regionGapHeightPt(card)
         if let entry = card.historyEntry, keepHistory {
             appendRegionHistory(entry)
         }
         if scrollYPt > gapTop {
-            scrollYPt = max(0, scrollYPt - gapHeight)
+            scrollYPt = max(gapTop, scrollYPt - gapHeight)
         }
         regionCards.remove(at: index)
-        regionHeightObservers[id] = nil
+        regionContentObservers[id] = nil
+        if !keepHistory, let key = regionDocumentKey {
+            regionHistory[key]?.removeAll { $0.id == id }
+        }
+        persistRegionHistory()
         refreshRegionLayout(preservingScroll: false)
         if keepHistory, card.historyEntry != nil {
             regionStatusMessage = reason ?? "Region conversation moved to Region questions. The page layout returned to normal."
@@ -386,8 +373,8 @@ extension AppState {
             return
         }
         let cards = regionCards
-        for card in cards where card.assistant.phase == .streaming {
-            card.assistant.cancel()
+        for card in cards {
+            card.assistant.cancelRegionWork(); card.notesAssistant.cancelRegionWork(); card.keepGeneratedNote()
         }
         if keepHistory {
             for card in cards {
@@ -396,11 +383,12 @@ extension AppState {
         }
         let removedShift = cards.reduce(CGFloat(0)) { total, card in
             guard let top = regionGapTop(for: card), scrollYPt > top else { return total }
-            return total + regionGapHeightPt(card)
+            return total + min(regionGapHeightPt(card), scrollYPt - top)
         }
         if removedShift > 0 { scrollYPt = max(0, scrollYPt - removedShift) }
         regionCards.removeAll()
-        regionHeightObservers.removeAll()
+        regionContentObservers.removeAll()
+        persistRegionHistory()
         refreshRegionLayout(preservingScroll: false)
         regionStatusMessage = reason ?? (keepHistory
             ? "Region conversations moved to Region questions."
@@ -427,28 +415,14 @@ extension AppState {
         let previousTop = regionGapTop(for: card) ?? 0
         card.updateHeight(viewHeight)
 
-        // The tear was chosen for the card's estimate. If the measured card does not fit below
-        // the split any more, fall back explicitly to the page foot rather than leave a page cut
-        // into a piece shorter than the card. This never silently drops page content: the whole
-        // page is still drawn, and the card moves into the page-flow gap it used before.
-        if let split = card.tearSplitPt {
-            let size = pageSizePt(forPage: card.attachment.page)
-            let gap = regionGapHeightPt(card)
-            if size.height > 1, size.height - split < gap - 0.01 {
-                card.tearSplitPt = nil
-                card.tearFallbackReason =
-                    "The measured card is taller than the page below the selection, so it moved below the page instead of cutting it."
-                regionStatusMessage = card.tearFallbackReason
-                statusMessage = regionStatusMessage ?? ""
-            }
-        }
-
+        // Growing a conversation opens more space at the same paper cut. The remaining
+        // paper need not be taller than the inserted gap; it must never jump to the page foot.
         let nextGap = regionGapTotalPt
         let nextTop = regionGapTop(for: card) ?? 0
         let delta = nextGap - previousGap
         let anchorMove = nextTop - previousTop
         guard abs(delta) > 0.01 || abs(anchorMove) > 0.01 else { return }
-        if scrollYPt > min(previousTop, nextTop) {
+        if scrollYPt >= previousTop + previousGap {
             scrollYPt = max(0, scrollYPt + delta + max(0, anchorMove))
         }
         refreshRegionLayout(preservingScroll: false)
@@ -461,16 +435,45 @@ extension AppState {
         var list = regionHistory[entry.documentKey] ?? []
         list.removeAll { $0.id == entry.id }
         list.append(entry)
-        if list.count > Self.regionHistoryLimit {
-            list.removeFirst(list.count - Self.regionHistoryLimit)
-        }
         regionHistory[entry.documentKey] = list
     }
 
+    /// Atomic local storage includes open conversations, so quitting does not lose an answer.
+    func persistRegionHistory() {
+        guard let key = regionDocumentKey, !regionHistoryLoadFailures.contains(key),
+              let url = translationDocumentURL ?? document?.url else { return }
+        do {
+            let data = try JSONEncoder().encode(currentRegionHistory)
+            try data.write(to: DocumentEditCache.directory(for: url)
+                .appendingPathComponent("region-conversations-v1.json"), options: .atomic)
+        } catch {
+            regionRefusalMessage = "Could not save reading notes locally: \(error.localizedDescription)"
+        }
+    }
+
+    func loadRegionHistory(for url: URL) {
+        let key = url.standardizedFileURL.path
+        guard regionHistory[key] == nil else { return }
+        let file = DocumentEditCache.directory(for: url).appendingPathComponent("region-conversations-v1.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        do {
+            let entries = try JSONDecoder().decode([AIRegionHistoryEntry].self, from: Data(contentsOf: file))
+            regionHistory[key] = entries.filter { $0.documentKey == key }
+        } catch {
+            regionHistoryLoadFailures.insert(key)
+            regionRefusalMessage = "Saved reading notes could not be opened. The original records were kept: \(error.localizedDescription)"
+        }
+    }
+
     public func deleteRegionHistoryEntry(id: UUID) {
+        if regionCards.contains(where: { $0.id == id }) {
+            closeRegionCard(id: id, keepHistory: false)
+            return
+        }
         guard let key = regionDocumentKey, var list = regionHistory[key] else { return }
         list.removeAll { $0.id == id }
         regionHistory[key] = list
+        persistRegionHistory()
         regionStatusMessage = "Region conversation deleted from history."
         statusMessage = regionStatusMessage ?? ""
     }
@@ -478,6 +481,7 @@ extension AppState {
     public func clearRegionHistory() {
         guard let key = regionDocumentKey else { return }
         regionHistory[key] = []
+        persistRegionHistory()
         regionStatusMessage = "Region history cleared for this document."
     }
 
@@ -496,9 +500,9 @@ extension AppState {
             return
         }
         let panel = NSSavePanel()
-        panel.title = "Export Region Questions"
+        panel.title = "Export Reading Notes"
         panel.message = "One Markdown document plus a folder of region pictures beside it."
-        panel.nameFieldStringValue = "\(document?.title ?? "Document") — Region Questions.md"
+        panel.nameFieldStringValue = "\(document?.title ?? "Document") — Reading Notes.md"
         if let markdown = UTType(filenameExtension: "md") {
             panel.allowedContentTypes = [markdown]
         }
@@ -677,7 +681,7 @@ extension AppState {
         var result = y
         for card in regionCards {
             guard let top = regionGapTop(for: card) else { continue }
-            if y >= top { result -= regionGapHeightPt(card) }
+            if y >= top { result -= min(regionGapHeightPt(card), y - top) }
         }
         return max(0, result)
     }
@@ -708,7 +712,7 @@ extension AppState {
         let height = regionGapHeightPt(card)
         let viewport = regionViewportHeightContentPt
         if top < scrollYPt || top + height > scrollYPt + viewport {
-            scrollYPt = regionClampScroll(max(0, top - 16))
+            scrollYPt = regionClampScroll(max(0, top - min(100 / max(zoomFactor, 0.01), viewport * 0.18)))
             reloadVisiblePages()
         }
     }

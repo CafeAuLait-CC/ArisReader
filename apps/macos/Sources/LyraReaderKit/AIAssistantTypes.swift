@@ -417,6 +417,8 @@ public struct AIMakePlanRequest: Sendable {
     public let region: AIRegionAttachment?
     /// Whether the region picture should be included. Mirrors `settings.vision` and is explicit
     /// in the record so a text-only preview says why the image is absent.
+    public let documentKnowledge: Bool
+    public let includeDocumentContext: Bool
     public let sendRegionImage: Bool
     public let settings: AIProviderSettings
 
@@ -429,6 +431,8 @@ public struct AIMakePlanRequest: Sendable {
         history: [AIConversationTurn] = [],
         region: AIRegionAttachment? = nil,
         sendRegionImage: Bool = false,
+        includeDocumentContext: Bool = false,
+        documentKnowledge: Bool = false,
         settings: AIProviderSettings
     ) {
         self.action = action
@@ -438,8 +442,18 @@ public struct AIMakePlanRequest: Sendable {
         self.language = language
         self.history = history
         self.region = region
+        self.documentKnowledge = documentKnowledge
+        self.includeDocumentContext = includeDocumentContext
         self.sendRegionImage = sendRegionImage
         self.settings = settings
+    }
+}
+
+extension AIMakePlanRequest {
+    func withDocumentContext() -> Self {
+        Self(action: action, currentPage: currentPage, selection: selection, question: question,
+             language: language, history: history, region: region, sendRegionImage: sendRegionImage,
+             includeDocumentContext: true, documentKnowledge: documentKnowledge, settings: settings)
     }
 }
 
@@ -666,11 +680,13 @@ public final class RustAIChatService: AIChatServicing {
                 imagePng: attachment.png,
                 imageWidthPx: UInt32(max(0, attachment.pixelWidth)),
                 imageHeightPx: UInt32(max(0, attachment.pixelHeight)),
-                sendImage: request.sendRegionImage && request.settings.vision
+                sendImage: request.sendRegionImage && request.settings.vision,
+                includeDocumentContext: request.includeDocumentContext
             )
         }
         let record = AiPlanRequestRecord(
             action: request.action.generated,
+            documentKnowledge: request.documentKnowledge,
             currentPage: UInt32(max(0, request.currentPage - 1)),
             selection: selection,
             question: request.question,
@@ -1281,7 +1297,12 @@ extension AppState {
     /// AI feature is honest about needing the Rust core instead of faking an answer.
     public var aiChatService: (any AIChatServicing)? {
         guard let engine = engine as? RustEngine else { return nil }
-        return RustAIChatService(engine: engine)
+        let base = RustAIChatService(engine: engine)
+        guard Self.usesDocumentKnowledge, let context = aiReaderContext,
+              let sourceURL = document?.url else { return base }
+        return DocumentKnowledgeService(base: base, knowledge: documentKnowledge,
+            context: context, sourceURL: sourceURL,
+            cacheDocumentURL: translationDocumentURL ?? sourceURL)
     }
 }
 

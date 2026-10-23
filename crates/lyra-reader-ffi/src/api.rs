@@ -28,8 +28,8 @@ use lyra_reader_ai::chat::{
     SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
     SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange, SourceRect as AiSourceRect,
     SummaryLayer, SummaryLayerRequest, SummaryUnitRequest, build_document_chat_plan,
-    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
-    inspect_base_url, inspect_summary_layer, validate_model,
+    build_document_knowledge_plan, build_merge_plan, build_plan, build_region_question_plan,
+    build_summary_layer, inspect_base_url, inspect_summary_layer, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
@@ -2675,8 +2675,8 @@ impl LyraReaderDocument {
             });
         }
 
-        // A region question sends exactly the reader's rectangle: no retrieval, no page text
-        // beyond what the shell extracted from that rectangle.
+        // A region image is exactly the selected rectangle. Once document knowledge has been
+        // established, bounded related source passages can connect it to the full document.
         if action == AiAction::RegionQuestion {
             let region = request.region.ok_or_else(|| LyraReaderFfiError::Ai {
                 message: "The region question has no region; nothing was sent.".to_string(),
@@ -2748,10 +2748,18 @@ impl LyraReaderDocument {
                     });
                 }
             };
+            let mut document_pages = Vec::new();
+            if region.include_document_context {
+                for page in 0..page_count {
+                    let (text, chars) = self.ai_page(page)?;
+                    document_pages.push(PageText { page, text, chars });
+                }
+            }
             let plan = build_region_question_plan(RegionQuestionRequest {
                 document_title,
                 page_count,
                 page: region.page,
+                document_pages,
                 rect: RegionRect {
                     x_pt: region.x_pt,
                     y_pt: region.y_pt,
@@ -2762,6 +2770,14 @@ impl LyraReaderDocument {
                 image,
                 send_image: region.send_image,
                 question: request.question.unwrap_or_default(),
+                history: request
+                    .history
+                    .into_iter()
+                    .map(|turn| ConversationTurn {
+                        question: turn.question,
+                        answer: turn.answer,
+                    })
+                    .collect(),
                 settings,
             })?;
             return Ok(ai_plan_record(plan));
@@ -2844,7 +2860,7 @@ impl LyraReaderDocument {
                 settings,
             })?
         } else {
-            build_plan(PlanRequest {
+            let input = PlanRequest {
                 action,
                 document_title,
                 page_count,
@@ -2854,7 +2870,12 @@ impl LyraReaderDocument {
                 language: request.language,
                 pages,
                 settings,
-            })?
+            };
+            if request.document_knowledge {
+                build_document_knowledge_plan(input)?
+            } else {
+                build_plan(input)?
+            }
         };
         Ok(ai_plan_record(plan))
     }
@@ -5572,6 +5593,7 @@ pub struct AiRegionRecord {
     pub image_height_px: Option<u32>,
     /// Whether the configured model accepts image input. False degrades to text only.
     pub send_image: bool,
+    pub include_document_context: bool,
 }
 
 /// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
@@ -5586,6 +5608,7 @@ pub struct AiConversationTurnRecord {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AiPlanRequestRecord {
     pub action: AiActionRecord,
+    pub document_knowledge: bool,
     pub current_page: u32,
     pub selection: Option<AiSelectionRecord>,
     pub question: Option<String>,

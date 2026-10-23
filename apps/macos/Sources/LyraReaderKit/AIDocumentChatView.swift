@@ -252,11 +252,8 @@ public struct AIDocumentChatView: View {
             }
             if !turn.reasoning.isEmpty {
                 DisclosureGroup("Provider reasoning (not the answer)") {
-                    Text(turn.reasoning)
-                        .font(.caption2)
+                    AIAnswerView(text: turn.reasoning, pageCount: 0, onJump: { _ in })
                         .foregroundStyle(LyraReaderTheme.textSecondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.caption2)
             }

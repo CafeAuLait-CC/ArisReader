@@ -58,29 +58,8 @@ public struct PageTearPlan: Equatable, Sendable {
     }
 }
 
-/// The placement rule for a region card's tear.
-///
-/// **The exact rule.** Let `H` be the page height, `b` the selection's bottom edge, `g` the
-/// card's gap, and `F` the page's figure/table regions (the artwork-plus-caption boxes from the
-/// document's caption index).
-///
-/// 1. If `H - b < g` — the part of the page below the selection is shorter than the card — no
-///    inside-page tear can satisfy the rule; the card falls back to the page foot.
-/// 2. A selection with no text at all is a picture, a rule or a table the text layer cannot
-///    describe. If the figure/table index names no region on this page either, the card falls
-///    back to the page foot rather than cut through artwork it cannot see.
-/// 3. Candidate Y positions, in increasing order, are `b`, then the bottom edge of every text
-///    line that ends below `b`, then `H`.
-/// 4. The first candidate that (a) is at or below `b` (never through the selected region),
-///    (b) is not strictly inside a figure/table box, and (c) still leaves at least `g` points of
-///    page below it is the tear. Condition (c) repeats the fit check for the candidate, so a
-///    line bottom close to the page foot cannot sneak in.
-/// 5. If no candidate qualifies, the card falls back to the page foot. The page is never cut
-///    through a figure/table, and no tear is ever shorter than the card.
-///
-/// Step 3 is what "the nearest sensible point below the selection" means in practice: `b` is
-/// used when it is already whitespace (a drag ending between lines), otherwise the tear moves
-/// to the bottom of the line the selection ends in, leaving that line whole above the card.
+/// The nearest safe whitespace below the selection. The inserted space does not have to fit
+/// inside the remaining paper: its two segments move apart without changing their pixels.
 public enum PageTearPlacement {
     public static func plan(
         pageHeightPt: CGFloat,
@@ -97,23 +76,9 @@ public enum PageTearPlacement {
         }
         let height = pageHeightPt
         let bottom = min(max(0, selection.maxY), height)
-        let gap = gapPt.isFinite ? max(0, gapPt) : 0
         guard bottom > 0.01, height - bottom > 0.01 else {
             return PageTearPlan(anchor: .pageFoot)
         }
-        if gap >= height {
-            return PageTearPlan(
-                anchor: .pageFoot,
-                fallbackReason: "The card is taller than the page, so it sits below the page instead of cutting it."
-            )
-        }
-        guard height - bottom >= gap else {
-            return PageTearPlan(
-                anchor: .pageFoot,
-                fallbackReason: "The part of the page below the selection is shorter than the card, so the card sits below the page instead of cutting it."
-            )
-        }
-
         let boxes = figures.filter { $0.page >= 0 && $0.widthPt > 1 && $0.heightPt > 1 }
             .map { CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt) }
         // A non-blank selection with no text is a picture, a rule or a table the text layer
@@ -134,13 +99,6 @@ public enum PageTearPlacement {
         for raw in candidates {
             let y = min(height, max(bottom, raw))
             guard y > 0.01, y < height - 0.01 else { continue }
-            guard height - y >= gap else {
-                // Candidates only move down, so nothing later can fit either.
-                return PageTearPlan(
-                    anchor: .pageFoot,
-                    fallbackReason: "The part of the page below the nearest whitespace is shorter than the card, so the card sits below the page instead of cutting it."
-                )
-            }
             if boxes.contains(where: { y > $0.minY + 0.01 && y < $0.maxY - 0.01 }) {
                 continue
             }
