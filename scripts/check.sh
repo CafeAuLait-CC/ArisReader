@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
 # LyraReader environment self-check + build check.
 #
-# Usage: ./scripts/check.sh [--no-swift]
+# Usage: ./scripts/check.sh [--no-swift] [--no-rust] [--no-native-checks]
 #
 # Does four things:
 #   1. Print toolchain facts (Rust / Swift / SDK / Xcode / PDFium)
 #   2. Diagnose known Swift toolchain mismatches (see docs/09-dev-setup.md §2)
-#   3. cargo check / test / clippy
+#   3. cargo check / test / clippy / fmt
 #   4. swift build + LyraReaderChecks (only when the Swift probe passes)
+#
+# A bare `./scripts/check.sh` still does all of it. These opt-outs exist so CI can run each half
+# in its own parallel job without changing what a developer gets. The environment form is what CI
+# uses; every switch defaults to running the part:
+#   --no-swift           skip the Swift build and LyraReaderChecks
+#   --no-rust            skip section 3 (another job runs the Rust gate)
+#   --no-native-checks   skip the in-script LyraReaderChecks run (CI runs it as `--shard i/n`)
+#   LYRA_READER_CHECK_SKIP_SWIFT=1
+#   LYRA_READER_CHECK_SKIP_RUST=1
+#   LYRA_READER_CHECK_SKIP_NATIVE_CHECKS=1
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 SKIP_SWIFT=0
+SKIP_RUST=0
+SKIP_NATIVE_CHECKS=0
+case "${LYRA_READER_CHECK_SKIP_SWIFT:-0}" in 1|true|yes) SKIP_SWIFT=1 ;; esac
+case "${LYRA_READER_CHECK_SKIP_RUST:-0}" in 1|true|yes) SKIP_RUST=1 ;; esac
+case "${LYRA_READER_CHECK_SKIP_NATIVE_CHECKS:-0}" in 1|true|yes) SKIP_NATIVE_CHECKS=1 ;; esac
 for arg in "$@"; do
   case "$arg" in
     --no-swift) SKIP_SWIFT=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --no-rust) SKIP_RUST=1 ;;
+    --no-native-checks) SKIP_NATIVE_CHECKS=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
   esac
 done
 
@@ -104,36 +121,40 @@ fi
 
 # ── 3. Rust ───────────────────────────────────────────────────────────────────
 section "Rust workspace"
-if cargo check --workspace --quiet 2>"$ROOT/build/cargo-check.log"; then
-  ok "cargo check --workspace"
+if [ "$SKIP_RUST" = "1" ]; then
+  warn "skipped (LYRA_READER_CHECK_SKIP_RUST=1 / --no-rust: the Rust gate runs in another job)"
 else
-  bad "cargo check --workspace (see build/cargo-check.log)"
-  tail -20 "$ROOT/build/cargo-check.log" | sed 's/^/      /'
-fi
-
-if cargo test --workspace --quiet >"$ROOT/build/cargo-test.log" 2>&1; then
-  TESTS="$(grep -oE '[0-9]+ passed' "$ROOT/build/cargo-test.log" | awk '{s += $1} END {print s + 0}')"
-  ok "cargo test --workspace (${TESTS:-?} tests passed)"
-else
-  bad "cargo test --workspace (see build/cargo-test.log)"
-  grep -E "^(error|failures)" "$ROOT/build/cargo-test.log" | head -10 | sed 's/^/      /'
-fi
-
-if cargo clippy --version >/dev/null 2>&1; then
-  if cargo clippy --workspace --all-targets --quiet -- -D warnings >"$ROOT/build/clippy.log" 2>&1; then
-    ok "cargo clippy -D warnings"
+  if cargo check --workspace --quiet 2>"$ROOT/build/cargo-check.log"; then
+    ok "cargo check --workspace"
   else
-    bad "cargo clippy reported warnings (see build/clippy.log)"
+    bad "cargo check --workspace (see build/cargo-check.log)"
+    tail -20 "$ROOT/build/cargo-check.log" | sed 's/^/      /'
   fi
-else
-  warn "clippy not installed: rustup component add clippy"
-fi
 
-if cargo fmt --version >/dev/null 2>&1; then
-  if cargo fmt --all --check >/dev/null 2>&1; then
-    ok "cargo fmt --check"
+  if cargo test --workspace --quiet >"$ROOT/build/cargo-test.log" 2>&1; then
+    TESTS="$(grep -oE '[0-9]+ passed' "$ROOT/build/cargo-test.log" | awk '{s += $1} END {print s + 0}')"
+    ok "cargo test --workspace (${TESTS:-?} tests passed)"
   else
-    bad "formatting differs: run cargo fmt"
+    bad "cargo test --workspace (see build/cargo-test.log)"
+    grep -E "^(error|failures)" "$ROOT/build/cargo-test.log" | head -10 | sed 's/^/      /'
+  fi
+
+  if cargo clippy --version >/dev/null 2>&1; then
+    if cargo clippy --workspace --all-targets --quiet -- -D warnings >"$ROOT/build/clippy.log" 2>&1; then
+      ok "cargo clippy -D warnings"
+    else
+      bad "cargo clippy reported warnings (see build/clippy.log)"
+    fi
+  else
+    warn "clippy not installed: rustup component add clippy"
+  fi
+
+  if cargo fmt --version >/dev/null 2>&1; then
+    if cargo fmt --all --check >/dev/null 2>&1; then
+      ok "cargo fmt --check"
+    else
+      bad "formatting differs: run cargo fmt"
+    fi
   fi
 fi
 
@@ -141,7 +162,7 @@ fi
 section "Native macOS shell"
 SWIFT_BUILT=0
 if [ "$SKIP_SWIFT" = "1" ]; then
-  warn "skipped (--no-swift)"
+  warn "skipped (LYRA_READER_CHECK_SKIP_SWIFT=1 / --no-swift: another job runs the Swift build)"
 elif [ "$SWIFT_OK" = "1" ]; then
   # In a restricted sandbox (including CI/agent environments) SwiftPM's nested sandbox-exec is rejected, so fall back to --disable-sandbox
   if (cd apps/macos && swift build >"$ROOT/build/swift-build.log" 2>&1); then
@@ -165,7 +186,9 @@ if [ "$SWIFT_BUILT" = "1" ]; then
   # index cache is disabled on top of that so the suite never reads or writes the user's cache
   # and cannot depend on what an earlier run left there. The cache itself is covered by the Rust
   # integration tests, which copy their fixtures into a scratch directory first.
-  if LYRA_READER_INDEX_CACHE=disabled \
+  if [ "$SKIP_NATIVE_CHECKS" = "1" ]; then
+    warn "LyraReaderChecks skipped (LYRA_READER_CHECK_SKIP_NATIVE_CHECKS=1 / --no-native-checks: CI runs it as --shard i/n)"
+  elif LYRA_READER_INDEX_CACHE=disabled \
     LYRA_READER_PDFIUM_PATH="${LYRA_READER_PDFIUM_PATH:-$ROOT/vendor/pdfium/lib/libpdfium.dylib}" \
     "$ROOT/apps/macos/.build/debug/LyraReaderChecks" "$ROOT" >"$ROOT/build/reader-checks.log" 2>&1; then
     ok "LyraReaderChecks (complete native regression suite)"

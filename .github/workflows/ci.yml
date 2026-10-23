@@ -1,14 +1,58 @@
 # Continuous integration for LyraReader (LyraReader).
 #
-# Two jobs:
-#   * rust-core   — the fast Rust signal (fmt, clippy, workspace tests with pinned PDFium) on ubuntu-latest.
-#                   The platform is part of the point, not an accident: this is the only job that
-#                   compiles the workspace for a non-Apple target, which is how it caught
-#                   `lyra-reader-gpu` using an Apple-only wgpu surface target and failing to build
-#                   on Linux at all. It does not replace the macOS job, and the macOS job does not
-#                   replace it.
-#   * macos-shell — the gate that actually protects this project: scripts/check.sh plus the
-#                   LyraReaderChecks harness (the native regression suite)
+# Job graph — macOS work runs in parallel instead of one serial ~16-minute job:
+#
+#   rust-core      (ubuntu-latest)  The fast cross-platform Rust signal: fmt, clippy and the
+#                                   workspace tests with pinned Linux PDFium. The platform is
+#                                   part of the point, not an accident: this is the only job that
+#                                   compiles the workspace for a non-Apple target, which is how it
+#                                   caught `lyra-reader-gpu` using an Apple-only wgpu surface
+#                                   target and failing to build on Linux at all. It does not
+#                                   replace the macOS jobs, and they do not replace it.
+#
+#   macos-rust     (macos-15)       The same Rust gates compiled for the Apple target: fmt,
+#                                   clippy, cargo check/test with macOS PDFium, plus the native
+#                                   measurement unit tests. Runs in parallel with the Swift build.
+#                                   Before this split it sat behind that build inside check.sh even
+#                                   though it does not need Swift.
+#
+#   macos-build    (macos-15)       Builds the Rust static library + UniFFI bindings, then the
+#                                   Swift package, and publishes both as run artifacts. Every
+#                                   Swift-side job starts from those products instead of paying
+#                                   the build again.
+#
+#   swift-smoke    (macos-15)       needs macos-build. Receives the packaged, signed LyraReader.app
+#                                   and launches it twice through LaunchServices. Keeps the
+#                                   corpus/reference-eval honesty steps where they were and
+#                                   archives the logs. It does not rebuild: a second build here
+#                                   would only duplicate the gate macos-build already ran, and a
+#                                   248 MB build directory took three minutes to download.
+#
+#   native-checks  (macos-15 × 2)   needs macos-build. Runs the LyraReaderChecks harness with
+#                                   `--shard i/2`; together the shards run every registered suite
+#                                   exactly once. The harness output lands in each shard's job log
+#                                   (the step tees it) and is archived as
+#                                   native-checks-shard-<i>; the old second, duplicate invocation
+#                                   of the same suite is gone, and CI no longer produces
+#                                   build/reader-checks.log (a developer's bare check.sh still does).
+#   macos-shell-compat (ubuntu)     A no-work branch-protection shim: it reproduces the serial
+#                                   graph's required-check name and fails when any macOS job did
+#                                   not succeed. Remove it once the required-check list is updated.
+#
+# Nothing is weakened: every gate that ran before still runs and still fails the run. `check.sh`
+# keeps its developer meaning (everything, including LyraReaderChecks); CI divides it with the
+# documented `LYRA_READER_CHECK_SKIP_SWIFT`, `LYRA_READER_CHECK_SKIP_RUST` and
+# `LYRA_READER_CHECK_SKIP_NATIVE_CHECKS` environment switches so each half runs in exactly one
+# job. (The same opt-outs have `--no-swift`, `--no-rust` and `--no-native-checks` flags for a
+# developer.) The one deliberate duplication is Rust target coverage: rust-core and macos-rust
+# compile the same code for different platforms.
+#
+# Cost: separate jobs bill separately. This graph deliberately spends more macOS runner minutes
+# to cut the wall clock: the cold build is paid once and published, and the native suite runs on
+# two runners. The serial graph was ~16.5 macOS minutes; the measured wall clock and runner-minute
+# totals for this graph are recorded in the pull request that introduced it. If wall clock ever
+# stops mattering more than cost, collapse macos-build and swift-smoke again and run native-checks
+# as one unsharded job.
 #
 # Pull requests are checked against the **merge result**, not against the head branch: that is
 # what `actions/checkout` does by default on `pull_request`, and it is the entire point of this
@@ -17,16 +61,18 @@
 # no explicit `ref:`, no `github.event.pull_request.head.sha`, no "merge commit" toggle.
 #
 # What this workflow cannot cover, said out loud instead of hidden (see the annotated steps):
-#   * PDFium is a downloaded dynamic library and is not committed. If the download fails, both
-#     gates fail: skipped PDF write coverage cannot satisfy a required check.
+#   * PDFium is a downloaded dynamic library and is not committed. Every job that needs it
+#     downloads it itself and fails when the download fails; it is deliberately not cached, so a
+#     download failure can never be hidden behind a cache. Skipped PDF write coverage cannot
+#     satisfy a required check.
 #   * `pdf-samples/` — the twelve-paper corpus, withheld for copyright — is not in the
 #     repository, so the corpus regressions (reference_corpus, table_corpus and the 226/227
-#     sampled citation spans) never run here, on either runner.
+#     sampled citation spans) never run here, on either platform.
 #   * `eval-papers/` — the twenty-paper evaluation corpus for the reference index (T4.10),
 #     fetched from the committed list of links in tests/eval/arxiv-links.txt — is not in the
-#     repository either, so `cargo test --workspace` says nothing about recall. The eval step
-#     decides by looking at the filesystem: if the corpus is there it measures, and a manual
-#     workflow_dispatch with `fetch_eval_papers` downloads it first; only when no corpus is
+#     repository either, so `cargo test --workspace` says nothing about recall. The eval step in
+#     swift-smoke decides by looking at the filesystem: if the corpus is there it measures, and a
+#     manual workflow_dispatch with `fetch_eval_papers` downloads it first; only when no corpus is
 #     present does the step print a ::notice:: saying the evaluation did NOT run.
 
 name: CI
@@ -100,7 +146,7 @@ jobs:
       # pass without rendering anything. A green Linux run is not evidence for the GPU path.
       - name: Record what a GPU-less Linux runner does not exercise
         run: |
-          echo "::notice title=GPU path not exercised on Linux::this runner has no Metal device and wgpu is built with the Metal backend only, so lyra-reader-gpu's offscreen probe and the matching lyra-reader-ffi test print \"skipping:\" instead of rendering. The GPU path runs in macos-shell (and in the LyraReaderChecks harness)."
+          echo "::notice title=GPU path not exercised on Linux::this runner has no Metal device and wgpu is built with the Metal backend only, so lyra-reader-gpu's offscreen probe and the matching lyra-reader-ffi test print \"skipping:\" instead of rendering. The GPU path runs in swift-smoke (the packaged app through LaunchServices) and in native-checks (the LyraReaderChecks harness)."
 
       # `cargo test --workspace` above is green even though the corpus regressions were never
       # run: their two test targets are `#[ignore]`d and need the private samples. Say it.
@@ -114,17 +160,18 @@ jobs:
         run: |
           echo "::notice title=Reference eval NOT run::The twenty-paper evaluation corpus is not in this repository (the PDFs are never committed; tests/eval/arxiv-links.txt is the list of links). reference_eval is #[ignore]d and needs eval-papers/, so recall and the precision audit were NOT measured here. Fetch it and measure on a machine that can hold it: ./scripts/fetch-eval-papers.sh && cargo test -p lyra-reader-cli --test reference_eval -- --ignored --nocapture"
 
-  macos-shell:
-    name: macos-shell (check.sh · LyraReaderChecks)
-    # macos-14 cannot build this package: its newest Xcode (16.2) ships Swift 6.1, while the
-    # sources use `isolated deinit` (apps/macos/Sources/LyraReaderKit/PDFCanvasView.swift),
-    # which needs Swift 6.2. macos-15 ships Xcode 26.x, and the step below selects it.
+  macos-rust:
+    name: macos-rust (fmt · clippy · tests · measurement)
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 45
     env:
-      # How the Rust engine finds the library at run time (crates/lyra-reader-pdfium/src/lib.rs).
+      # How the Rust engine finds the library at run time
+      # (crates/lyra-reader-pdfium/src/lib.rs), and the switch that makes a missing library
+      # fail the write regressions instead of silently skipping them.
       LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
       LYRA_READER_REQUIRE_PDFIUM: "1"
+      # The documented check.sh switch: this job runs only the Rust half.
+      LYRA_READER_CHECK_SKIP_SWIFT: "1"
     steps:
       - name: Check out the merge result
         uses: actions/checkout@v5
@@ -134,40 +181,83 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # apps/macos/Package.swift declares swift-tools-version 6.0, but the sources need a Swift
-      # 6.2 compiler: `isolated deinit` in PDFCanvasView.swift. Both runner defaults are older
-      # and both were real CI failures (macos-14's Xcode 15.4/Swift 5.10 cannot even load the
-      # manifest; macos-15's default Xcode 16.4/Swift 6.1 fails with "consecutive declarations on
-      # a line must be separated by ';'" at that deinit). Rather than pin a path, take the newest
-      # Xcode whose Swift is >= 6.2 and fail loudly here if the image ever ships none.
-      - name: Select an Xcode with Swift >= 6.2
-        run: |
-          set -euo pipefail
-          DEVELOPER=""
-          for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
-            version="$(DEVELOPER_DIR="$app/Contents/Developer" swift --version 2>/dev/null \
-              | sed -nE 's/.*Swift version ([0-9]+\.[0-9]+).*/\1/p' | head -1 || true)"
-            [ -n "$version" ] || continue
-            if [ "$(printf '%s\n6.2\n' "$version" | sort -V | head -1)" = "6.2" ]; then
-              DEVELOPER="$app/Contents/Developer"
-              break
-            fi
-          done
-          if [ -z "$DEVELOPER" ]; then
-            echo "::error::this image ships no Xcode with Swift >= 6.2, which the sources need (isolated deinit in PDFCanvasView.swift)"
-            exit 1
-          fi
-          export DEVELOPER_DIR="$DEVELOPER"
-          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
-          swift --version
-
+      # Same shared key as macos-build: both jobs compile the same crate graph on the same
+      # macOS image, and a cache entry saved by either is valid for the other.
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
 
       # PDFium is required for the native gate. A download failure must fail this job,
-      # otherwise branch protection accepts a merge result whose Swift was never checked.
+      # otherwise branch protection accepts a merge result whose write regressions never ran.
       - name: Fetch PDFium
-        id: pdfium
+        run: ./scripts/fetch-pdfium.sh
+
+      - name: Native measurement summary regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_native_scroll_measurement.py'
+
+      # The Rust half of check.sh: toolchain facts, Swift diagnostics, cargo check/test,
+      # clippy and fmt. LYRA_READER_CHECK_SKIP_SWIFT=1 skips only the Swift build and the
+      # in-script harness run; macos-build builds Swift and native-checks runs the harness, so
+      # both still run in this workflow. A developer's bare ./scripts/check.sh runs everything.
+      - name: Run the Rust half of ./scripts/check.sh
+        run: ./scripts/check.sh
+
+      # Same statement as in rust-core: the corpus is not in the repository, so the macOS
+      # cargo test above did not cover it either. Do not let a green summary imply otherwise.
+      - name: Record that the corpus regression did not run
+        run: |
+          echo "::notice title=Corpus regression NOT run::The twelve-paper corpus (pdf-samples/) is not in this repository (copyright), so the corpus regressions did NOT run in this job either: reference_corpus, table_corpus and the 226/227 sampled citation spans need LYRA_READER_PDF_SAMPLES and are #[ignore]d. Only a machine holding the corpus can run them. The real-manuscript content_edit tests also skip without LYRA_READER_PDF_SAMPLES; synthetic content-editing fixtures still run."
+
+  macos-build:
+    name: macos-build (Rust FFI · UniFFI · SwiftPM)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+      LYRA_READER_REQUIRE_PDFIUM: "1"
+      # The documented check.sh switches: this job runs only the Swift half, and the shard jobs
+      # run LyraReaderChecks separately.
+      LYRA_READER_CHECK_SKIP_RUST: "1"
+      LYRA_READER_CHECK_SKIP_NATIVE_CHECKS: "1"
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@v5
+
+      - name: Select an Xcode with Swift >= 6.2
+        id: xcode
+        uses: ./.github/actions/select-xcode
+
+      # The FFI cache is restored before cargo on purpose: on a hit the Cargo build below is
+      # skipped, so installing the toolchain and restoring a multi-gigabyte target directory
+      # first would be pure waste.
+      # The key covers every Rust input (workspace manifests, lockfile, toolchain, every crate
+      # file and the build script). The Rust compile/test gate itself is macos-rust, which runs
+      # on every push; this cache only supplies the linked artifact.
+      - name: Restore the Rust static library and UniFFI bindings
+        id: ffi_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/macos/.rust
+            apps/macos/Sources/LyraReaderBindings
+            apps/macos/Sources/LyraReaderFFI/include/uniffi_scaffolding.h
+          key: rust-ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'scripts/build-rust.sh') }}
+
+      - name: Install stable Rust
+        if: steps.ffi_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        if: steps.ffi_cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+
+      # PDFium is required ... (same as above)
+      - name: Fetch PDFium
         run: ./scripts/fetch-pdfium.sh
 
       # ---------------------------------------------------------------- the Rust artifacts
@@ -175,30 +265,106 @@ jobs:
       # products (git-ignored), so a fresh checkout has neither and `swift build` cannot link.
       # scripts/check.sh does NOT produce them; this step does, and duplicates nothing.
       - name: Build the Rust static library and the UniFFI Swift bindings
+        if: steps.ffi_cache.outputs.cache-hit != 'true'
         run: ./scripts/build-rust.sh --debug
 
-      # fmt, clippy, the workspace tests, the Swift compile probe and `swift build`.
-      # (Its own LyraReaderChecks run happens inside; the explicit step below is what puts the
-      # harness output in the job log, because check.sh redirects it to build/reader-checks.log.)
-      - name: Run ./scripts/check.sh
-        if: steps.pdfium.outcome == 'success'
+      - name: Cache the SwiftPM build products
+        id: swiftpm_cache
+        uses: actions/cache@v4
+        with:
+          path: apps/macos/.build
+          # The key covers the Swift sources, the generated bindings (which change when the FFI
+          # surface changes) and the Xcode/Swift version. It deliberately does NOT cover Rust
+          # implementation changes: those do not change compiled Swift, but they do change the
+          # archive SwiftPM links. The step below removes the linked products whenever the FFI
+          # cache missed, so SwiftPM relinks them against the new archive instead of trusting a
+          # stale binary. Full recompiles are left to a genuine Swift/Xcode change.
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.swift_version }}-${{ hashFiles('apps/macos/Sources/**', 'apps/macos/Checks/**', 'apps/macos/Resources/**', 'apps/macos/Support/**', 'apps/macos/Package.swift') }}
+
+      # A cache hit can hold binaries linked against the previous Rust archive. Deleting the
+      # final products (not the object files) makes SwiftPM relink; compiling is still skipped.
+      - name: Force a relink when the Rust archive changed
+        if: steps.ffi_cache.outputs.cache-hit != 'true'
+        run: |
+          rm -f apps/macos/.build/debug/LyraReaderChecks apps/macos/.build/debug/LyraReader
+
+      # The Swift half of check.sh: the compile probe and `swift build` (debug, the same build
+      # the smoke script packages). It still runs on a cache hit; the cache only makes it
+      # incremental.
+      - name: Run the Swift half of ./scripts/check.sh
         run: ./scripts/check.sh
 
-      # The gate this workflow exists for. Argument is the repository root: the harness resolves
-      # its fixtures as <root>/tests/fixtures/*.pdf (apps/macos/Checks/ReaderChecks.swift).
-      # `set -o pipefail` keeps the exit status while still showing every line in the log.
-      - name: LyraReaderChecks (native regression suite)
-        if: steps.pdfium.outcome == 'success'
-        shell: bash
-        # The harness opens fixtures by their committed paths. The document index cache writes
-        # beside the PDF by design, so disable it here: otherwise this step would leave sidecars
-        # in the checkout (and later runs would silently test a warm index). The cache is covered
-        # by `cargo test` above, whose integration tests copy fixtures into scratch directories.
-        env:
-          LYRA_READER_INDEX_CACHE: disabled
+      # Assemble and ad-hoc sign the bundle here, where the build already is. The smoke job only
+      # launches it, so the app travels as a 21 MB archive instead of the ~248 MB SwiftPM build
+      # directory (whose download alone cost three minutes in the first measured run).
+      - name: Package and sign the application bundle
+        run: ./scripts/make-app-bundle.sh --debug
+
+      - name: Archive the application bundle and the checks executable
         run: |
-          set -o pipefail
-          "$GITHUB_WORKSPACE/apps/macos/.build/debug/LyraReaderChecks" "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/reader-checks.log"
+          set -euo pipefail
+          tar -czf "$RUNNER_TEMP/LyraReader-app.tar.gz" -C "$GITHUB_WORKSPACE" build/LyraReader.app
+          # .build/debug is a symlink to the architecture-specific directory. -h stores the
+          # executable as a regular file, so a shard can extract it anywhere.
+          tar -czhf "$RUNNER_TEMP/reader-checks.tar.gz" -C apps/macos/.build/debug LyraReaderChecks
+
+      - name: Upload the application bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-app
+          path: ${{ runner.temp }}/LyraReader-app.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the LyraReaderChecks executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-checks
+          path: ${{ runner.temp }}/reader-checks.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  swift-smoke:
+    name: swift-smoke (LaunchServices · eval)
+    needs: macos-build
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+      LYRA_READER_REQUIRE_PDFIUM: "1"
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@v5
+
+      # The reference evaluation below is a `cargo test`; this job is its historical home, so
+      # the toolchain is installed here even though launching the app does not need it. On a run
+      # without the corpus the eval step only prints its ::notice::, as before.
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # PDFium is fetched here too because the reference evaluation needs it when it runs, and
+      # because a broken download should fail this job rather than be hidden by the bundle.
+      - name: Fetch PDFium
+        run: ./scripts/fetch-pdfium.sh
+
+      - name: Download the packaged application
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-app
+          path: ${{ runner.temp }}/reader-app
+
+      - name: Restore the packaged application
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/reader-app/LyraReader-app.tar.gz" -C "$GITHUB_WORKSPACE"
+          # The checkout's Swift sources were written after the artifact was built, so their
+          # mtimes would make smoke-launch-app.sh call the bundle stale. It is not: it was built
+          # from this same merge result in macos-build. Touch the executable so the staleness
+          # check compares content age, not archive age, and pass --no-build; the gate that the
+          # bundle compiles already ran in macos-build.
+          touch build/LyraReader.app/Contents/MacOS/LyraReader
 
       # The class of failure nothing above can see. LyraReaderChecks constructs the app delegate
       # itself, so it never asks SwiftUI to build one through the Objective-C runtime; on
@@ -211,12 +377,10 @@ jobs:
       # job). It is fatal like every other gate here: the one non-fatal outcome is an environment
       # that cannot launch a GUI application at all, which the script announces with a ::notice::
       # and exits 0 for, because an unrun check is announced rather than passed silently.
-      # The bundle is assembled from the debug build the steps above already produced; capture
-      # logs land in build/smoke-launch-*.log, which the artifact step below preserves.
+      # The bundle was assembled and signed by macos-build; this job launches it. Capture logs
+      # land in build/smoke-launch-*.log, which the artifact step below preserves.
       - name: Smoke-launch the packaged app through LaunchServices
-        if: steps.pdfium.outcome == 'success'
-        shell: bash
-        run: ./scripts/smoke-launch-app.sh
+        run: ./scripts/smoke-launch-app.sh --no-build
 
       # Same statement as in rust-core: the corpus is not in the repository, so nothing above
       # covered it. Do not let a future reader assume otherwise.
@@ -271,8 +435,9 @@ jobs:
       # A green gate reported as a failure is a false negative that trains people to ignore red,
       # so this upload is deliberately `continue-on-error`. The step below keeps the flake visible
       # instead of hiding it. Every step that runs tests or checks stays fatal: nothing above this
-      # line is non-fatal.
-      - name: Preserve native and evaluation diagnostics
+      # line is non-fatal. The native-checks jobs archive their own harness logs under the same
+      # rule.
+      - name: Preserve build and evaluation diagnostics
         id: diagnostics_upload
         if: always()
         continue-on-error: true
@@ -281,7 +446,6 @@ jobs:
           name: macos-check-logs
           path: |
             build/*.log
-            ${{ runner.temp }}/reader-checks.log
             ${{ runner.temp }}/reference-eval.log
           if-no-files-found: ignore
 
@@ -292,4 +456,131 @@ jobs:
       - name: Announce a failed diagnostic upload
         if: always() && steps.diagnostics_upload.outcome == 'failure'
         run: |
-          echo "::warning title=Diagnostic upload failed::actions/upload-artifact could not store the macos-check-logs artifact (runner or network failure, e.g. DNS). No check was affected: the step outcomes above stand. The check and evaluation logs for this run were NOT archived."
+          echo "::warning title=Diagnostic upload failed::actions/upload-artifact could not store the macos-check-logs artifact (runner or network failure, e.g. DNS). No check was affected: the step outcomes above stand. The build/smoke-launch/evaluation logs from this job were NOT archived; each native-checks shard uploads its harness log separately."
+
+  native-checks:
+    name: native-checks (LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: macos-build
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      # Every shard reports even when one fails: the job graph must show whether the failure is
+      # one shard's or the whole harness's.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      # How the Rust engine finds the library at run time. Each shard downloads PDFium itself
+      # (not cached) so a download failure fails that shard instead of hiding behind a cache.
+      LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@v5
+
+      - name: Fetch PDFium
+        run: ./scripts/fetch-pdfium.sh
+
+      - name: Download the LyraReaderChecks executable
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-checks
+          path: ${{ runner.temp }}/reader-checks
+
+      # The harness opens fixtures by their committed paths. The document index cache writes
+      # beside the PDF by design, so disable it here: otherwise this step would leave sidecars
+      # in the checkout (and later runs would silently test a warm index). The cache is covered
+      # by cargo test, whose integration tests copy fixtures into scratch directories.
+      - name: Run LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }}
+        shell: bash
+        env:
+          LYRA_READER_INDEX_CACHE: disabled
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/reader-checks-bin"
+          if ! tar -xzf "$RUNNER_TEMP/reader-checks/reader-checks.tar.gz" \
+              -C "$RUNNER_TEMP/reader-checks-bin"; then
+            echo "::error title=LyraReaderChecks missing::the reader-checks artifact did not extract; the harness did not run at all"
+            exit 1
+          fi
+          BIN="$RUNNER_TEMP/reader-checks-bin/LyraReaderChecks"
+          LOG="$RUNNER_TEMP/reader-checks-shard-${{ matrix.shard }}.log"
+          # `set -o pipefail` keeps the harness's exit status while tee shows every assertion in
+          # the job log. The full log is uploaded below either way.
+          "$BIN" "$GITHUB_WORKSPACE" --shard ${{ matrix.shard }}/${{ strategy.job-total }} 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          assertions=$(grep -c '^PASS' "$LOG" || true)
+          echo "shard ${{ matrix.shard }}/${{ strategy.job-total }} ran $assertions assertions"
+          {
+            echo "### LyraReaderChecks shard ${{ matrix.shard }}/${{ strategy.job-total }}"
+            echo ""
+            echo "- assertions: $assertions"
+            echo ""
+            echo '```'
+            grep '^SHARD' "$LOG" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A shard that selected no work must not look green: the selector or the registry is
+          # broken even if the harness itself exited 0.
+          if [ "$assertions" -eq 0 ]; then
+            echo "::error title=Empty LyraReaderChecks shard::shard ${{ matrix.shard }}/${{ strategy.job-total }} ran zero assertions; the shard selector or the suite registry is broken."
+            exit 1
+          fi
+          exit "$status"
+
+      # Diagnostics are not a gate; the same upload-flake reasoning as macos-check-logs applies.
+      - name: Preserve the shard log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-checks-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/reader-checks-shard-${{ matrix.shard }}.log
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────── branch-protection compatibility shim
+  # The serial graph's required check was named `macos-shell (check.sh · LyraReaderChecks)`.
+  # Whether master still requires that exact check name is not readable with this workflow's
+  # token (`GET /branches/master/protection` returns 403), and a required check that never
+  # reports leaves every pull request on "Expected — waiting for status to be reported", which
+  # would block all merges. This job reproduces the old check name and reports success only when
+  # every real macOS job succeeded. It runs no checks of its own and is deliberately not a
+  # macOS runner: the status context is the job name, not the runner.
+  #
+  # Added 2026-10-23. Remove this job once a human has confirmed the required-check list and
+  # updated it to the new job names (macos-build, macos-rust, native-checks, swift-smoke).
+  macos-shell-compat:
+    name: macos-shell (check.sh · LyraReaderChecks)
+    needs: [macos-build, macos-rust, native-checks, swift-smoke]
+    # Report even when a dependency failed; the step below then fails this job, so a red gate
+    # can never be masked by a green compatibility check.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fail unless every macOS gate succeeded
+        shell: bash
+        env:
+          MACOS_BUILD: ${{ needs.macos-build.result }}
+          MACOS_RUST: ${{ needs.macos-rust.result }}
+          NATIVE_CHECKS: ${{ needs.native-checks.result }}
+          SWIFT_SMOKE: ${{ needs.swift-smoke.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for entry in \
+            "macos-build=$MACOS_BUILD" \
+            "macos-rust=$MACOS_RUST" \
+            "native-checks=$NATIVE_CHECKS" \
+            "swift-smoke=$SWIFT_SMOKE"; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            printf '%-15s %s\n' "$name" "$result"
+            if [ "$result" != "success" ]; then
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error title=macOS gate failed::at least one macOS job did not succeed; this compatibility check reports that failure under the old required-check name. Inspect the non-green job above."
+            exit 1
+          fi
+          echo "All macOS gates succeeded."
