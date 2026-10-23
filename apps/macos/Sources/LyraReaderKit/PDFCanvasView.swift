@@ -367,6 +367,7 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
+    package var residentTextureIDs: [Int: UInt64] { textures.mapValues(\.id) }
     /// Whether to print what this view submits (`LYRA_READER_CANVAS_DUMP=1`).
     ///
     /// A quad's `placement.index` is the key its texture is cached under, so **two quads sharing

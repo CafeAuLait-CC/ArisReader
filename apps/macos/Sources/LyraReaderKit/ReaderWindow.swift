@@ -87,7 +87,6 @@ public struct ReaderWindow: View {
                         progressOverride: state.transitionProgressOverride?.editingPanel
                     ) {
                         ContentEditInspector(state: state)
-                            .padding(.top, ReaderChrome.secondaryToolbarHeightPt)
                     }
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
@@ -491,7 +490,7 @@ public struct ReaderWindow: View {
             }
         }
         // Same rule as the sidebar: the animation has to own the layout that changes. The row
-        // ends at the canvas's trailing edge, before the scroll lane and the right panel; the
+        // covers the scroll lane and ends flush against the right panel; the
         // trailing inset uses their settled widths (like the leading sidebar inset) so the row's
         // own controls do not reflow on every animation frame.
         .padding(.trailing, secondaryToolbarTrailingInset)
@@ -529,11 +528,12 @@ public struct ReaderWindow: View {
         return ReaderChrome.sidebarTotalWidthPt
     }
 
-    /// Everything between the canvas's trailing edge and the window's: the scroll lane, the
-    /// search results and the right panel. Page overview draws over the whole content area, so it
+    /// The search results and right panels. The row covers the scroll lane, preventing a strip
+    /// of track between the tools and the inspector. Page overview draws over the whole area, so it
     /// suppresses all three like it suppresses the leading inset.
     private var secondaryToolbarTrailingInset: CGFloat {
-        (state.contentEditEnabled ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0) + ReaderChrome.trailingChromeWidth(
+        guard !state.pageOverviewVisible, state.document != nil else { return 0 }
+        return (state.contentEditEnabled ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0) + ReaderChrome.trailingChromeWidth(
             documentOpen: state.document != nil,
             pageOverviewVisible: state.pageOverviewVisible,
             searchVisible: state.searchSidebarVisible,

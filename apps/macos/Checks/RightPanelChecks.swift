@@ -192,8 +192,8 @@ extension ReaderChecks {
             documentOpen: true, pageOverviewVisible: false,
             searchVisible: false, rightPanelVisible: true, rightPanelContentWidth: 320
         )
-        require(trailing == ReaderChrome.scrollIndicatorLaneWidthPt + 327,
-                "with only the right panel open, the secondary row stops after lane + panel "
+        require(trailing == 327,
+                "with only the right panel open, the secondary row covers the scroll lane "
                     + "(\(trailing) pt)")
         let withSearch = ReaderChrome.trailingChromeWidth(
             documentOpen: true, pageOverviewVisible: false,
@@ -753,8 +753,57 @@ extension ReaderChecks {
         require(!state.rightPanelVisible,
                 "the burst leaves the state closed (rightPanelVisible=\(state.rightPanelVisible))")
 
+        // Keep the Metal textures as well as the CPU bitmaps when a drawer covers them.
+        // Wait for raster/text arrivals to settle before sampling the actual submitted IDs.
+        var stableRasters = 0
+        var lastRasters = -1
+        for _ in 0..<100 {
+            let count = state.tileRasterCount
+            stableRasters = count == lastRasters ? stableRasters + 1 : 0
+            lastRasters = count
+            if stableRasters >= 10 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let screenBottom = state.scrollYPt + harness.canvasRect.height / state.zoomFactor
+        let visibleIDs = Set(state.canvasPages.filter {
+            $0.placement.index >= 0 && $0.placement.topPt < screenBottom
+                && $0.placement.topPt + $0.placement.heightPt > state.scrollYPt
+        }.map { $0.placement.index })
+        let texturesBefore = harness.canvas.residentTextureIDs.filter { visibleIDs.contains($0.key) }
+        require(!texturesBefore.isEmpty, "deep zoom has resident sharp textures before drawer cover")
+        state.transitionProgressOverride = ReaderTransitionProgress(panel: 1)
+        state.rightPanelVisible = true
+        try await Task.sleep(for: .milliseconds(500))
+        require(texturesBefore.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                "opening the drawer keeps every previously visible sharp GPU texture")
+        state.rightPanelVisible = false
+        state.transitionProgressOverride = ReaderTransitionProgress(panel: 0)
+        try await Task.sleep(for: .milliseconds(500))
+        require(texturesBefore.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                "closing the drawer reveals the same textures without re-upload")
+
+        state.transitionProgressOverride = ReaderTransitionProgress(row: 1, panel: 0, editingPanel: 1)
         state.toggleContentEditing()
         require(state.contentEditEnabled && !state.rightPanelVisible, "Edit closes the AI overlay")
+        func chromeRect(_ kind: ReaderChromeMarkerView.Kind) -> CGRect? {
+            func find(_ view: NSView) -> ReaderChromeMarkerView? {
+                if let found = view as? ReaderChromeMarkerView, found.kind == kind { return found }
+                return view.subviews.lazy.compactMap { find($0) }.first
+            }
+            harness.host.layoutSubtreeIfNeeded()
+            guard let marker = find(harness.host) else { return nil }
+            return harness.host.convert(marker.bounds, from: marker)
+        }
+        try await eventually("the edit inspector and secondary row have measurable frames", {
+            (chromeRect(.editingInspector)?.width ?? 0) > 290
+                && (chromeRect(.secondaryToolbar)?.height ?? 0) > 45
+        })
+        let row = chromeRect(.secondaryToolbar)!
+        let inspector = chromeRect(.editingInspector)!
+        require(abs(row.maxX - inspector.minX) < 0.5,
+                "the secondary toolbar covers the scroll track and meets the inspector without a gap")
+        require(abs(inspector.maxY - harness.canvasRect.maxY) < 0.5,
+                "the inspector begins at the content top without a toolbar-height blank strip")
         state.contentTextRecovery = "Preserve this draft"
         state.toggleRightPanel()
         require(state.contentEditEnabled && !state.rightPanelVisible,

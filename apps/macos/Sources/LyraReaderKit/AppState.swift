@@ -13181,6 +13181,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The pinned set is the *shown* band plus the ring the byte budget allows: a tile
             // outside the band may be re-rasterized, a visible one may not be dropped.
 
+            // A drawer hides already sharp columns; it does not invalidate them. Keep those
+            // bitmaps in both the pinned CPU set and the submitted quads, so Metal also keeps
+            // their textures. Closing the drawer can then reveal them without raster/upload
+            // work. Retention is limited to this LOD, the current vertical band and the strip
+            // the trailing drawers can cover; scrolling to another band or zooming releases it.
+            let drawerWidth = (rightPanelVisible || performancePanelVisible
+                ? ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelWidthPt) : 0)
+                + (contentEditEnabled ? ReaderChrome.editingPanelWidthPt : 0)
+            if drawerWidth > 0 || rightPanelLayoutIsMoving {
+                let coveredRight = viewport.maxX + drawerWidth / max(zoomFactor, 0.01)
+                    + CGFloat(Self.prefetchColumns + 1) * tilePt
+                for tile in previous {
+                    let id = tile.placement.index
+                    let tx = id & 1023
+                    let ty = (id >> 10) & 1023
+                    guard (id >> 20) & 15 == Int(lod), span.rows.contains(ty),
+                          tx > span.columns.upperBound,
+                          rightPanelLayoutIsMoving || tile.placement.leftPt < coveredRight
+                    else { continue }
+                    wanted.insert(TileKey(page: placement.index, lod: lod, x: tx, y: ty))
+                    sharpRows.append(tile)
+                    bandReport.record(.offscreenColumn, bytes: tile.image.bgra.count)
+                }
+            }
+
             for ty in span.rows {
                 var rowReady: [CanvasPage] = []
                 var rowComplete = true
