@@ -548,8 +548,14 @@ extension ReaderChecks {
             - harness.panelTotalWidth
         require(abs(harness.canvasRect.width - expectedResizedCanvas) < 0.5,
                 "the canvas follows the minimum width (\(harness.canvasRect.width) pt)")
-        require(abs(state.canvasViewportWidthPt - expectedResizedCanvas) < 0.5,
-                "the canvas viewport follows the minimum width too")
+        // SwiftUI's panel frame can settle one layout pass before the native canvas
+        // reports its viewport. Wait for that callback, as the initial open above does.
+        try await eventuallyExplaining("the canvas viewport follows the minimum width too", {
+            "viewport=\(state.canvasViewportWidthPt), expected=\(expectedResizedCanvas)"
+        }, {
+            _ = harness.canvasRect
+            return abs(state.canvasViewportWidthPt - expectedResizedCanvas) < 0.5
+        })
 
         state.setRightPanelWidth(10_000)
         require(state.rightPanelWidthPt == 520,
