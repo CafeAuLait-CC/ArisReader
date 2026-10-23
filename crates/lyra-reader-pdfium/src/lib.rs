@@ -126,7 +126,10 @@ pub use redaction::{
 #[cfg(feature = "pdfium")]
 pub use rewrite::{SignatureStripReport, strip_signature_from_copy};
 #[cfg(feature = "pdfium")]
-pub use signature::{SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature};
+pub use signature::{
+    SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature,
+    detect_signature_in_document,
+};
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
 #[cfg(feature = "pdfium")]

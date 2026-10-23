@@ -74,6 +74,10 @@ impl DocumentBackend for PdfiumBackend {
         false
     }
 
+    fn needs_password(&self) -> bool {
+        false
+    }
+
     fn is_tagged(&self) -> bool {
         false
     }

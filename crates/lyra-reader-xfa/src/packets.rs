@@ -70,16 +70,30 @@ pub enum Detection {
     PasswordRequired,
 }
 
+/// Loads a PDF once for structural probes. The caller can pass the returned document to both
+/// XFA detection and signature detection, so an open does not parse the same bytes twice.
+pub fn load_document(path: &Path, password: Option<&str>) -> Result<Document> {
+    load(path, password).map_err(classify_load_error)
+}
+
 /// Reads `path` and classifies it. `password` is only used by the normal document path; XFA
 /// support intentionally opens only the no-prompt case (the empty user password).
 pub fn detect(path: &Path, password: Option<&str>) -> Result<Detection> {
-    let document = match load(path, password) {
-        Ok(document) => document,
-        Err(error) => return classify_load_error(error),
-    };
+    match load(path, password) {
+        Ok(document) => detect_in_document(&document, password),
+        Err(error) => match classify_load_error(error) {
+            XfaError::PasswordRequired => Ok(Detection::PasswordRequired),
+            error => Err(error),
+        },
+    }
+}
+
+/// Classifies an already-loaded document. This is the shared-parse entry point: the caller
+/// owns the `lopdf::Document` and can use it for signature evidence too.
+pub fn detect_in_document(document: &Document, password: Option<&str>) -> Result<Detection> {
     let encrypted = document.was_encrypted() || document.is_encrypted();
 
-    let Some(xfa) = catalog_xfa(&document) else {
+    let Some(xfa) = catalog_xfa(document) else {
         return Ok(Detection::NotXfa { encrypted });
     };
 
@@ -90,9 +104,9 @@ pub fn detect(path: &Path, password: Option<&str>) -> Result<Detection> {
         .and_then(|value| value.as_bool().ok())
         .unwrap_or(false);
 
-    let resolved = resolve(&document, &xfa);
+    let resolved = resolve(document, &xfa);
     let mut warnings = Vec::new();
-    let packets = packets_from(&document, resolved, &mut warnings).map_err(XfaError::Malformed)?;
+    let packets = packets_from(document, resolved, &mut warnings).map_err(XfaError::Malformed)?;
     if packets.is_empty() {
         return Err(XfaError::Malformed(
             "/AcroForm has an /XFA entry but it contains no packets".to_string(),
@@ -116,15 +130,15 @@ fn load(path: &Path, password: Option<&str>) -> std::result::Result<Document, lo
     }
 }
 
-fn classify_load_error(error: lopdf::Error) -> Result<Detection> {
+fn classify_load_error(error: lopdf::Error) -> XfaError {
     use lopdf::Error as PdfError;
     match &error {
-        PdfError::Decryption(_) | PdfError::InvalidPassword => Ok(Detection::PasswordRequired),
+        PdfError::Decryption(_) | PdfError::InvalidPassword => XfaError::PasswordRequired,
         PdfError::IO(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            Err(XfaError::Io("the file does not exist".to_string()))
+            XfaError::Io("the file does not exist".to_string())
         }
-        PdfError::IO(io) => Err(XfaError::Io(io.to_string())),
-        other => Err(XfaError::Pdf(other.to_string())),
+        PdfError::IO(io) => XfaError::Io(io.to_string()),
+        other => XfaError::Pdf(other.to_string()),
     }
 }
 

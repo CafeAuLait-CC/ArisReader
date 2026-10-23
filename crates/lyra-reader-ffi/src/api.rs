@@ -1809,7 +1809,8 @@ impl LyraReaderDocument {
     ) -> Result<(), LyraReaderFfiError> {
         use lyra_reader_pdfium::content_edit::ContentCommand;
         self.ensure_not_xfa()?;
-        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.is_encrypted() {
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.needs_password()
+        {
             return Err(LyraReaderFfiError::InvalidArgument {
                 message: "Reopen an unencrypted document before editing its contents.".into(),
             });
@@ -1877,7 +1878,7 @@ impl LyraReaderDocument {
                     .to_string(),
             });
         }
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
@@ -1904,7 +1905,7 @@ impl LyraReaderDocument {
         pages: Vec<u32>,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
         self.ensure_not_xfa()?;
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
@@ -1935,7 +1936,7 @@ impl LyraReaderDocument {
         destination: String,
     ) -> Result<MergeReportRecord, LyraReaderFfiError> {
         self.ensure_not_xfa()?;
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; merging an encrypted document is refused and no output was written"
@@ -1962,7 +1963,7 @@ impl LyraReaderDocument {
         parts: Vec<SplitPartRecord>,
     ) -> Result<SplitReportRecord, LyraReaderFfiError> {
         self.ensure_not_xfa()?;
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; splitting an encrypted document is refused and no output was written"
@@ -2014,7 +2015,7 @@ impl LyraReaderDocument {
             return Err(LyraReaderFfiError::Document { message: reason });
         }
         self.ensure_writable()?;
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
@@ -3454,7 +3455,7 @@ impl LyraReaderDocument {
                     .to_string(),
             });
         }
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
                 message:
                     "this document is encrypted; saving annotations or bookmarks into it is not supported yet"
@@ -5425,11 +5426,26 @@ impl LyraReaderEngine {
         password: Option<String>,
     ) -> Result<Arc<LyraReaderDocument>, LyraReaderFfiError> {
         let source = std::path::Path::new(&path);
-        // Detect XFA before PDFium decides what the document is. A blank page is not evidence:
-        // the decision comes from `/AcroForm /XFA`. The empty user password is handled by the
-        // standard security handler, so a permission-encrypted form opens without a prompt.
-        let xfa = match lyra_reader_xfa::prepare(source, password.as_deref()) {
-            Ok(prepared) => prepared,
+        // One full structural read at open. The same document is used for the XFA probe and the
+        // signature policy; previously each probe loaded and parsed the whole file, which was
+        // pure waste on every ordinary PDF. A blank page is not evidence of XFA: the decision
+        // comes from `/AcroForm /XFA`. The empty user password is handled by the standard
+        // security handler, so a permission-encrypted form opens without a prompt.
+        let structural = lyra_reader_xfa::load_document(source, password.as_deref());
+        let xfa = match &structural {
+            Ok(document) => {
+                match lyra_reader_xfa::prepare_in_document(document, password.as_deref()) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        // A damaged XFA packet is not an ordinary PDF. Keep the normal open path
+                        // (the fallback page is still the honest fallback) and let PDFium report
+                        // what it can; the status names the error when the packet read got far
+                        // enough to build one.
+                        eprintln!("lyra-reader-xfa: detection failed: {error}");
+                        None
+                    }
+                }
+            }
             Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
                 return Err(lyra_reader_core::LyraReaderError::new(
                     ErrorCode::Encrypted,
@@ -5439,11 +5455,10 @@ impl LyraReaderEngine {
                 .into());
             }
             Err(error) => {
-                // A damaged XFA packet is not an ordinary PDF. Keep the normal open path (the
-                // blank page is still the honest fallback) but the status will name the error
-                // only when the structural read succeeded; a parse failure here means the
-                // catalog itself was unreadable, which PDFium will report.
-                eprintln!("lyra-reader-xfa: detection failed: {error}");
+                // A structural parse failure on an otherwise openable PDF: signature detection
+                // below keeps its old fallback (PDFium's signature count), and PDFium decides
+                // whether the document itself can open.
+                eprintln!("lyra-reader-xfa: structural read failed: {error}");
                 None
             }
         };
@@ -5476,13 +5491,21 @@ impl LyraReaderEngine {
             }
             None => (PdfiumBackend::open(source, password.as_deref())?, None),
         };
-        // One structural read, at open. The decision cannot change while this handle lives and
-        // worker copies inherit it, so no other read path pays for it.
-        let signature = lyra_reader_pdfium::detect_signature(
-            source,
-            password.as_deref(),
-            backend.signature_count(),
-        );
+        // The decision cannot change while this handle lives and worker copies inherit it.
+        // Reuse the document loaded above when it parsed; only a failed structural read falls
+        // back to the path-based signature probe, whose PDFium signature count is the last
+        // resort for a structure lopdf could not read.
+        let signature = match &structural {
+            Ok(document) => lyra_reader_pdfium::detect_signature_in_document(
+                document,
+                backend.signature_count(),
+            ),
+            Err(_) => lyra_reader_pdfium::detect_signature(
+                source,
+                password.as_deref(),
+                backend.signature_count(),
+            ),
+        };
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path,

@@ -215,6 +215,9 @@ pub struct PdfiumBackend {
     /// Whether the file carries an encryption dictionary, even when it opened without a
     /// prompt (a permission-encrypted form with an empty user password).
     encrypted: bool,
+    /// Whether the caller supplied a password. Write gates use this, not `encrypted`, so the
+    /// reporting change does not alter an ordinary PDF's edit behavior.
+    needs_password: bool,
     /// Additional per-document guard; all PDFium operations also take PDFIUM_LOCK.
     raster_lock: std::sync::Mutex<()>,
     /// Second document handle, used for annotation reads only (`FPDFAnnot_*`).
@@ -262,6 +265,7 @@ impl PdfiumBackend {
                     path: path.to_path_buf(),
                     password: password.map(str::to_string),
                     encrypted,
+                    needs_password: password.is_some(),
                     raster_lock: std::sync::Mutex::new(()),
                     annotation_reader: std::sync::OnceLock::new(),
                     annotation_rendering: std::sync::Mutex::new(HashMap::new()),
@@ -312,6 +316,7 @@ impl PdfiumBackend {
                 path: display_path.to_path_buf(),
                 password: None,
                 encrypted: false,
+                needs_password: false,
                 raster_lock: std::sync::Mutex::new(()),
                 annotation_reader: std::sync::OnceLock::new(),
                 annotation_rendering: std::sync::Mutex::new(HashMap::new()),
@@ -1122,6 +1127,10 @@ impl DocumentBackend for PdfiumBackend {
 
     fn is_encrypted(&self) -> bool {
         self.encrypted
+    }
+
+    fn needs_password(&self) -> bool {
+        self.needs_password
     }
 
     fn is_tagged(&self) -> bool {

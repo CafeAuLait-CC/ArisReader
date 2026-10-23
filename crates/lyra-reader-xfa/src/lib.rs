@@ -38,7 +38,7 @@ pub use dataset::DataSet;
 pub use error::{Result, XfaError};
 pub use layout::{RenderedDocument, RenderedPage};
 pub use model::PageSize;
-pub use packets::{Detection, Packet, XfaFile};
+pub use packets::{Detection, Packet, XfaFile, load_document};
 pub use template::Template;
 
 use std::path::Path;
@@ -87,7 +87,19 @@ pub struct PreparedXfa {
 /// password. A file that still needs a password returns [`XfaError::PasswordRequired`], which
 /// the shell translates into the same prompt an ordinary encrypted PDF gets.
 pub fn prepare(path: &Path, password: Option<&str>) -> Result<Option<PreparedXfa>> {
-    let detection = packets::detect(path, password)?;
+    let document = packets::load_document(path, password)?;
+    prepare_in_document(&document, password)
+}
+
+/// Builds the XFA document from a PDF that the caller has already loaded structurally.
+///
+/// This is the shared-parse entry point used by the FFI: the same `lopdf::Document` supplies
+/// the XFA packets and the signature evidence, so an open reads the bytes once.
+pub fn prepare_in_document(
+    document: &lopdf::Document,
+    password: Option<&str>,
+) -> Result<Option<PreparedXfa>> {
+    let detection = packets::detect_in_document(document, password)?;
     let file = match detection {
         Detection::NotXfa { .. } => return Ok(None),
         Detection::PasswordRequired => return Err(XfaError::PasswordRequired),
