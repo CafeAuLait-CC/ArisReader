@@ -814,9 +814,9 @@ impl LyraReaderDocument {
 
     /// The XFA facts for this document. `is_xfa: false` for an ordinary PDF.
     ///
-    /// The shell uses this record to show the "XFA form, rendered read-only from XML" banner,
-    /// list what was skipped, and disable annotation/form/editing commands. The engine refuses
-    /// those commands itself, so a stale button cannot write.
+    /// The shell uses this record for its short "XFA form · read-only" banner, for the detailed
+    /// XFA diagnostics outside the banner, and to disable annotation/form/editing commands. The
+    /// engine refuses those commands itself, so a stale button cannot write.
     pub fn xfa_status(&self) -> XfaStatusRecord {
         self.xfa
             .as_ref()
