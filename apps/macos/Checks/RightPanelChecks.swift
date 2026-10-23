@@ -192,8 +192,8 @@ extension ReaderChecks {
             documentOpen: true, pageOverviewVisible: false,
             searchVisible: false, rightPanelVisible: true, rightPanelContentWidth: 320
         )
-        require(trailing == ReaderChrome.scrollIndicatorLaneWidthPt + 327,
-                "with only the right panel open, the secondary row stops after lane + panel "
+        require(trailing == 327,
+                "with only the right panel open, the secondary row covers the scroll lane "
                     + "(\(trailing) pt)")
         let withSearch = ReaderChrome.trailingChromeWidth(
             documentOpen: true, pageOverviewVisible: false,
@@ -687,8 +687,8 @@ extension ReaderChecks {
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedCloseReloads = state.coalescedViewportReloadCount - beforeAnimatedClose
-        require(animatedCloseReloads == 0,
-                "closing the overlay keeps the PDF band unchanged "
+        require(animatedCloseReloads <= 1,
+                "closing the overlay coalesces the final PDF band update "
                     + "(\(animatedCloseReloads) rebuilds, not one per frame)")
         let beforeAnimatedOpen = state.coalescedViewportReloadCount
         state.rightPanelVisible = true
@@ -697,8 +697,8 @@ extension ReaderChecks {
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedOpenReloads = state.coalescedViewportReloadCount - beforeAnimatedOpen
-        require(animatedOpenReloads == 0,
-                "opening the overlay keeps the PDF band unchanged "
+        require(animatedOpenReloads <= 1,
+                "opening the overlay coalesces the final PDF band update "
                     + "(\(animatedOpenReloads) rebuilds, not one per frame)")
 
         // ── Reduce Motion ──────────────────────────────────────────────────────────────
@@ -753,8 +753,30 @@ extension ReaderChecks {
         require(!state.rightPanelVisible,
                 "the burst leaves the state closed (rightPanelVisible=\(state.rightPanelVisible))")
 
+        try await rightPanelTextureRetentionChecks(fixture: fixture)
+
+        state.transitionProgressOverride = ReaderTransitionProgress(row: 1, panel: 0, editingPanel: 1)
         state.toggleContentEditing()
         require(state.contentEditEnabled && !state.rightPanelVisible, "Edit closes the AI overlay")
+        func chromeRect(_ kind: ReaderChromeMarkerView.Kind) -> CGRect? {
+            func find(_ view: NSView) -> ReaderChromeMarkerView? {
+                if let found = view as? ReaderChromeMarkerView, found.kind == kind { return found }
+                return view.subviews.lazy.compactMap { find($0) }.first
+            }
+            harness.host.layoutSubtreeIfNeeded()
+            guard let marker = find(harness.host) else { return nil }
+            return harness.host.convert(marker.bounds, from: marker)
+        }
+        try await eventually("the edit inspector and secondary row have measurable frames", {
+            (chromeRect(.editingInspector)?.width ?? 0) > 290
+                && (chromeRect(.secondaryToolbar)?.height ?? 0) > 45
+        })
+        let row = chromeRect(.secondaryToolbar)!
+        let inspector = chromeRect(.editingInspector)!
+        require(abs(row.maxX - inspector.minX) < 0.5,
+                "the secondary toolbar covers the scroll track and meets the inspector without a gap")
+        require(abs(inspector.maxY - harness.canvasRect.maxY) < 0.5,
+                "the inspector begins at the content top without a toolbar-height blank strip")
         state.contentTextRecovery = "Preserve this draft"
         state.toggleRightPanel()
         require(state.contentEditEnabled && !state.rightPanelVisible,
@@ -766,6 +788,72 @@ extension ReaderChecks {
         require(!state.rightPanelVisible && state.contentEditEnabled, "opening Edit again closes AI")
 
         print("Right-panel checks passed")
+    }
+
+    /// A percentage is not a raster-path guarantee: at CI's low display density 300% can
+    /// still use a whole-page raster. Exercise tiles explicitly, at all supported densities,
+    /// and wait for actual uploads rather than a quiet raster counter on the wrong path.
+    @MainActor
+    private static func rightPanelTextureRetentionChecks(fixture: URL) async throws {
+        let suite = "lyra-drawer-textures-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for factor in [38.0 / 72, 1, 108.5 / 72] {
+            let state = AppState(engine: try RustEngine(), preferFullPageRasters: false)
+            require(state.open(url: fixture), "the tiled-drawer fixture opens at calibration \(factor)")
+            state.sidebarVisible = true
+            state.rightPanelVisible = false
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0)
+            let model = AIAssistantModel(settings: AISettingsStore(
+                defaults: defaults, keyStore: InMemoryAPIKeyStore(key: nil)))
+            let harness = RightPanelHarness(state: state, aiAssistant: model)
+            defer { harness.close() }
+            try await harness.mount()
+            try await eventually("the tiled-drawer viewport reports its actual width", {
+                harness.canvas.hasAttachedSurface
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            state.setDisplayCalibration(DisplayCalibration(factor: factor))
+            state.zoomPercent = 300
+            state.reloadVisiblePages()
+            func visibleIDs() -> Set<Int> {
+                let bottom = state.scrollYPt + harness.canvasRect.height / state.zoomFactor
+                return Set(state.canvasPages.filter {
+                    $0.placement.index >= 0 && $0.placement.topPt < bottom
+                        && $0.placement.topPt + $0.placement.heightPt > state.scrollYPt
+                        && ($0.placement.index >> 20) & 15 == Int(state.currentRasterLOD)
+                }.map { $0.placement.index })
+            }
+            try await eventuallyExplaining("the tiled path uploads visible sharp textures", {
+                "calibration=\(factor), screenPage=\(state.usesScreenPageRasters), "
+                    + "quads=\(visibleIDs().count), textures=\(harness.canvas.residentTextureIDs.count)"
+            }, {
+                let ids = visibleIDs()
+                return !state.usesScreenPageRasters && !ids.isEmpty
+                    && ids.allSatisfy { harness.canvas.residentTextureIDs[$0] != nil }
+            })
+            let ids = visibleIDs()
+            let before = harness.canvas.residentTextureIDs.filter { ids.contains($0.key) }
+            require(!before.isEmpty, "deep zoom has resident sharp textures before drawer cover")
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 1)
+            state.rightPanelVisible = true
+            try await eventually("the covering drawer is fully laid out", {
+                abs(harness.panelTotalWidth - 327) < 0.5
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            try await Task.sleep(for: .milliseconds(300))
+            require(before.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                    "opening the drawer retains sharp textures at calibration \(factor)")
+            state.rightPanelVisible = false
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0)
+            try await eventually("the revealing drawer is fully closed", {
+                harness.panelTotalWidth < 0.5
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            try await Task.sleep(for: .milliseconds(300))
+            require(before.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                    "closing the drawer reuses the same textures at calibration \(factor)")
+        }
     }
 
     // MARK: - Accessibility helpers

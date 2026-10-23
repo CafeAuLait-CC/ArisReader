@@ -106,8 +106,7 @@ public struct AIAssistantPanel: View {
 
     private var noDocument: some View {
         VStack(spacing: 10) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 30, weight: .light))
+            LyraAIIcon().frame(width: 36, height: 36)
                 .foregroundStyle(LyraReaderTheme.textTertiary)
             Text("No document")
                 .font(.callout)
@@ -196,8 +195,13 @@ public struct AIAssistantPanel: View {
                 let action: AIAssistantAction = model.selectedTab == .translation ? .translateSelection :
                     (model.summaryUsesSelection ? .summarizeSelection : .summarizeDocument)
                 Button { prepare(action) } label: {
-                    Label(model.selectedTab == .translation ? "Preview Translation" : "Preview Summary",
-                          systemImage: model.selectedTab == .translation ? "character.bubble" : "sparkles")
+                    Label {
+                        Text(model.selectedTab == .translation ? "Preview Translation" : "Preview Summary")
+                    } icon: {
+                        if model.selectedTab == .translation {
+                            Image(systemName: "character.bubble")
+                        } else { LyraAIIcon().frame(width: 16, height: 16) }
+                    }
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(ReaderPanelButtonStyle(prominent: true))
@@ -733,7 +737,9 @@ public struct AIAssistantRightPanelContent: View {
     public var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("AI Assistant", systemImage: "sparkles").font(.system(size: 13, weight: .semibold))
+                Label { Text("AI Assistant") } icon: {
+                    LyraAIActivityIcon(model: model).frame(width: 20, height: 20)
+                }.font(.system(size: 13, weight: .semibold))
                 Spacer()
                 SettingsLink { Image(systemName: "gearshape") }
                     .buttonStyle(LyraReaderToolStyle()).help("AI connection settings")

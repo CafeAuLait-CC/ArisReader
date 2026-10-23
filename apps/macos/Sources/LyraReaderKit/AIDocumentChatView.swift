@@ -162,7 +162,9 @@ public struct AIDocumentChatView: View {
             }
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Label("Lyra", systemImage: "sparkles")
+                    Label { Text("Lyra") } icon: {
+                        LyraAIIcon(isActive: turn.isStreaming).frame(width: 16, height: 16)
+                    }
                         .font(.caption.weight(.semibold)).foregroundStyle(LyraReaderTheme.accent)
                     Spacer()
                     if !turn.answer.isEmpty {

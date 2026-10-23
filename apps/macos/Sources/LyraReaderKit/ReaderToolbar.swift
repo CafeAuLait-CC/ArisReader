@@ -199,9 +199,14 @@ struct ReaderToolbar: View {
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
             Button { state.toggleContentEditing() } label: {
-                Label("Edit PDF",systemImage:"character.cursor.ibeam")
+                HStack(spacing: 6) {
+                    Image(systemName: "character.cursor.ibeam")
+                    if !compact { Text("Edit").font(.system(size: 12, weight: .medium)) }
+                }.padding(.horizontal, 6)
             }.buttonStyle(LyraReaderToolStyle(selected:state.contentEditEnabled))
                 .disabled(!state.canPageEdit)
+                .help("Show PDF editing tools").accessibilityLabel("Edit")
+                .accessibilityValue(state.contentEditEnabled ? "Expanded" : "Collapsed")
             LyraReaderMenu(title: "Organise pages", items: [
                 LyraReaderMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
                 LyraReaderMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },
@@ -259,9 +264,11 @@ struct ReaderToolbar: View {
                   : "\(state.translationSelectionTitle) (⇧⌘L)")
             .accessibilityLabel(state.translationSelectionTitle)
             .accessibilityValue(state.selection == nil ? "No selection" : "Selection on page \(state.selection!.page + 1)")
-            tool("AI assistant (⇧⌘A)", "sparkles", selected: state.rightPanelVisible) {
+            Button {
                 state.toggleRightPanel()
-            }
+            } label: { LyraAIIcon().frame(width: 20, height: 20) }
+            .buttonStyle(LyraReaderToolStyle(selected: state.rightPanelVisible))
+            .help("AI assistant (⇧⌘A)")
             .accessibilityLabel("AI assistant panel")
             .accessibilityValue(state.rightPanelVisible ? "Open" : "Closed")
             .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -384,6 +391,7 @@ struct ReaderSecondaryToolbar: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
         .frame(height: ReaderChrome.secondaryToolbarHeightPt)
+        .background(ReaderChromeMarkerHost(kind: .secondaryToolbar))
         .background(LyraReaderTheme.panelBg)
         .overlay(alignment: .bottom) { LyraReaderTheme.separator.frame(height: 1) }
         .buttonStyle(LyraReaderToolStyle())
@@ -433,9 +441,6 @@ struct ReaderSecondaryToolbar: View {
             }
             .buttonStyle(LyraReaderToolStyle(selected: ["erase", "blackout"].contains(state.contentEditTool)))
             Spacer(minLength: 0)
-            Button { state.toggleContentEditing() } label: {
-                Label("Done", systemImage: "checkmark")
-            }.accessibilityLabel("Close PDF editing")
         }
         .font(.system(size: 12))
     }

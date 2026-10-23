@@ -61,6 +61,7 @@ struct ContentEditInspector: View {
             footer.padding(16)
         }
         .frame(width: 292).frame(maxHeight: .infinity)
+        .background(ReaderChromeMarkerHost(kind: .editingInspector))
         .background(LyraReaderTheme.panelBg)
         .overlay(alignment: .leading) { LyraReaderTheme.separator.frame(width: 1) }
         .foregroundStyle(LyraReaderTheme.textPrimary)

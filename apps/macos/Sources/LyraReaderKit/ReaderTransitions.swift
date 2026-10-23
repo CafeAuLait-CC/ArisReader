@@ -1,6 +1,20 @@
 import AppKit
 import SwiftUI
 
+/// Native frame probes let regression checks measure the chrome SwiftUI actually lays out.
+package final class ReaderChromeMarkerView: NSView {
+    package enum Kind { case secondaryToolbar, editingInspector }
+    package let kind: Kind
+    init(kind: Kind) { self.kind = kind; super.init(frame: .zero) }
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+}
+
+struct ReaderChromeMarkerHost: NSViewRepresentable {
+    let kind: ReaderChromeMarkerView.Kind
+    func makeNSView(context: Context) -> ReaderChromeMarkerView { ReaderChromeMarkerView(kind: kind) }
+    func updateNSView(_ view: ReaderChromeMarkerView, context: Context) {}
+}
+
 /// Fixed chrome sizes shared by the transition views and the hosted-window checks.
 public enum ReaderChrome {
     /// Content width of the sidebar, before its edge separator.
@@ -11,6 +25,7 @@ public enum ReaderChrome {
     public static var sidebarTotalWidthPt: CGFloat { sidebarWidthPt + sidebarSeparatorWidthPt }
     /// The annotation / page-overview row: 32 pt controls plus 7 pt padding above and below.
     public static let secondaryToolbarHeightPt: CGFloat = 46
+    public static let editingPanelWidthPt: CGFloat = 292
     /// Width of the scroll indicator's lane at the canvas's trailing edge.
     ///
     /// The indicator is a sibling of the canvas rather than an overlay, so this strip is real
@@ -18,10 +33,10 @@ public enum ReaderChrome {
     /// and the right panel starts after it. The lane is only present while a document is open.
     public static let scrollIndicatorLaneWidthPt: CGFloat = 13
 
-    /// Everything the layout puts between the canvas and the window's trailing edge.
+    /// Trailing panels the secondary toolbar must avoid.
     ///
-    /// The secondary toolbar is drawn over the content row, so it has to stop at the same place:
-    /// the scroll lane, then search results, then the right panel. Page overview covers the whole
+    /// The secondary toolbar covers the scroll lane and stops flush against search results or
+    /// the right panel. Page overview covers the whole
     /// content area, so it has no trailing chrome to avoid. Kept as a pure function so the
     /// checks can assert the overlay's arithmetic without a screenshot.
     public static func trailingChromeWidth(
@@ -32,7 +47,7 @@ public enum ReaderChrome {
         rightPanelContentWidth: CGFloat
     ) -> CGFloat {
         guard documentOpen, !pageOverviewVisible else { return 0 }
-        var width = scrollIndicatorLaneWidthPt
+        var width: CGFloat = 0
         if searchVisible { width += sidebarTotalWidthPt }
         if rightPanelVisible {
             width += ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelContentWidth)

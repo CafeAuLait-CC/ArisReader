@@ -6,8 +6,11 @@ import Foundation
 /// `PreviewEngine`'s (`pageTopPt = 1200 × index`), so a page jump makes the previous pages'
 /// tiles stale — which is what the budget is allowed to evict.
 @MainActor private final class BudgetTileEngine: PreviewEngine {
+    var tileCalls: [TileKey: Int] = [:]
     override func rasterizeTile(page: Int, lod: UInt8, tileX: Int, tileY: Int, tileSize: Int) async throws -> TileImage {
-        TileImage(page: page, lod: lod, tileX: tileX, tileY: tileY, sizePx: tileSize,
+        let key = TileKey(page: page, lod: lod, x: tileX, y: tileY)
+        tileCalls[key, default: 0] += 1
+        return TileImage(page: page, lod: lod, tileX: tileX, tileY: tileY, sizePx: tileSize,
                   bgra: Data(repeating: 200, count: tileSize * tileSize * 4),
                   generation: UInt64(9000 + page * 100 + tileY * 10 + tileX))
     }
@@ -191,5 +194,59 @@ extension ReaderChecks {
                 + "(\(state.tileCacheUsedBytes) <= \(state.tileCacheBudgetBytes))")
         require(state.tileCachePeakBytes >= state.tileCacheUsedBytes,
                 "the peak byte counter is reported for the HUD")
+        try await drawerTileRetentionChecks(url: url)
+    }
+
+    /// A deliberately tiny budget forces eviction to expose lost pinning, rather than letting
+    /// an ample cache hide the drawer regression. Check quads as well as cache/call counts:
+    /// dropping a quad would release its GPU texture even if the CPU bitmap survived.
+    @MainActor static func drawerTileRetentionChecks(url: URL) async throws {
+        let engine = BudgetTileEngine()
+        let state = AppState(engine: engine, tileCacheBudgetBytes: 1, preferFullPageRasters: false)
+        state.setDisplayCalibration(.uncalibratedDefault)
+        state.setDeviceScale(1)
+        state.setViewportSize(CGSize(width: 1280, height: 500))
+        state.open(url: url)
+        state.gotoPage(0)
+        state.zoomPercent = 300
+        state.reloadVisiblePages()
+        let lod = state.currentRasterLOD
+        let covered = TileKey(page: 0, lod: lod, x: 3, y: 0)
+        let id = (covered.page << 24) | (Int(lod) << 20) | (covered.y << 10) | covered.x
+        try await eventually("the wide deep-zoom viewport has its trailing sharp column", {
+            state.canvasPages.contains { $0.placement.index == id } && state.isTileCached(covered)
+        })
+        let calls = engine.tileCalls[covered]
+        for editing in [false, true] {
+            state.rightPanelVisible = !editing
+            state.contentEditEnabled = editing
+            let drawerWidth = editing ? ReaderChrome.editingPanelWidthPt
+                : ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)
+            state.setViewportSize(CGSize(width: 1280 - drawerWidth, height: 500))
+            // Force a real band evaluation as a page raster/text arrival would do while open.
+            state.reloadVisiblePages()
+            require(state.canvasPages.first { $0.placement.index == id }!.placement.leftPt
+                        >= (1280 - drawerWidth) / state.zoomFactor,
+                    "the checked sharp column is actually behind the \(editing ? "Edit" : "AI") drawer")
+            require(state.canvasPages.contains { $0.placement.index == id },
+                    "\(editing ? "Edit" : "AI") keeps a covered sharp tile in the GPU quad set")
+            require(state.isTileCached(covered),
+                    "\(editing ? "Edit" : "AI") pins its covered tile under cache pressure")
+            state.noteRightPanelVisibilityChange(animated: true)
+            state.rightPanelVisible = false
+            state.contentEditEnabled = false
+            // The first closing frame still has a narrow viewport.
+            state.reloadVisiblePages()
+            require(state.canvasPages.contains { $0.placement.index == id },
+                    "the first closing frame retains the covered tile")
+            state.setViewportSize(CGSize(width: 1280, height: 500))
+            state.reloadVisiblePages()
+            require(engine.tileCalls[covered] == calls,
+                    "revealing the \(editing ? "Edit" : "AI") covered column requests no new raster")
+        }
+        state.gotoPage(9)
+        try await eventually("scrolled-away retained columns are released under budget pressure", {
+            !state.isTileCached(covered) && !state.canvasPages.contains { $0.placement.index == id }
+        })
     }
 }

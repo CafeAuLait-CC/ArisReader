@@ -83,7 +83,9 @@ public struct SettingsView: View {
 
             AISettingsView(store: AISettingsStore.shared)
                 .tag(AISettingsRoute.Tab.ai)
-                .tabItem { Label("AI", systemImage: "sparkles") }
+                .tabItem {
+                    Label { Text("AI") } icon: { Image(nsImage: LyraAIIcon.templateImage) }
+                }
         }
         .frame(width: 580, height: 520)
         .tint(LyraReaderTheme.accent)

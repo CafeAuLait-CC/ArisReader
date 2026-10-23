@@ -88,7 +88,7 @@ struct HorizontalDocumentViewport<Content: View>: NSViewRepresentable {
 }
 
 struct ReaderEditingPanelTransition<Content: View>: View {
-    static var width: CGFloat { 292 }
+    static var width: CGFloat { ReaderChrome.editingPanelWidthPt }
     let isVisible: Bool
     let progressOverride: Double?
     @ViewBuilder let content: () -> Content
