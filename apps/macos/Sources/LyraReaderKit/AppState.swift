@@ -321,6 +321,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// it closed, so the content keeps its geometry and an answer is not thrown away by a toggle.
     @Published public var rightPanelVisible: Bool = false {
         didSet {
+            if oldValue != rightPanelVisible, document != nil {
+                // Protect covered columns before SwiftUI reports the new viewport. Tile
+                // completions can rebuild the band between this write and onChange/layout.
+                beginRightPanelMovement()
+                armRightPanelSettle(after: ReaderMotion.panelDuration + 0.15)
+            }
             if rightPanelVisible, contentEditEnabled {
                 if deferContentTransition({ [weak self] in self?.rightPanelVisible = true }) {
                     rightPanelVisible = false
@@ -4131,7 +4137,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard document != nil else { return }
         beginRightPanelMovement()
         guard animated else {
-            finishRightPanelMovement()
+            // The view jumps immediately, but its viewport report still arrives later.
+            // Keep the raster band intact until that layout has reached the canvas too.
+            armRightPanelSettle(after: 0.15)
             return
         }
         // Hold for at least the animation's nominal length. Every frame that arrives re-arms

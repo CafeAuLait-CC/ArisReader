@@ -753,34 +753,7 @@ extension ReaderChecks {
         require(!state.rightPanelVisible,
                 "the burst leaves the state closed (rightPanelVisible=\(state.rightPanelVisible))")
 
-        // Keep the Metal textures as well as the CPU bitmaps when a drawer covers them.
-        // Wait for raster/text arrivals to settle before sampling the actual submitted IDs.
-        var stableRasters = 0
-        var lastRasters = -1
-        for _ in 0..<100 {
-            let count = state.tileRasterCount
-            stableRasters = count == lastRasters ? stableRasters + 1 : 0
-            lastRasters = count
-            if stableRasters >= 10 { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        let screenBottom = state.scrollYPt + harness.canvasRect.height / state.zoomFactor
-        let visibleIDs = Set(state.canvasPages.filter {
-            $0.placement.index >= 0 && $0.placement.topPt < screenBottom
-                && $0.placement.topPt + $0.placement.heightPt > state.scrollYPt
-        }.map { $0.placement.index })
-        let texturesBefore = harness.canvas.residentTextureIDs.filter { visibleIDs.contains($0.key) }
-        require(!texturesBefore.isEmpty, "deep zoom has resident sharp textures before drawer cover")
-        state.transitionProgressOverride = ReaderTransitionProgress(panel: 1)
-        state.rightPanelVisible = true
-        try await Task.sleep(for: .milliseconds(500))
-        require(texturesBefore.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
-                "opening the drawer keeps every previously visible sharp GPU texture")
-        state.rightPanelVisible = false
-        state.transitionProgressOverride = ReaderTransitionProgress(panel: 0)
-        try await Task.sleep(for: .milliseconds(500))
-        require(texturesBefore.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
-                "closing the drawer reveals the same textures without re-upload")
+        try await rightPanelTextureRetentionChecks(fixture: fixture)
 
         state.transitionProgressOverride = ReaderTransitionProgress(row: 1, panel: 0, editingPanel: 1)
         state.toggleContentEditing()
@@ -815,6 +788,72 @@ extension ReaderChecks {
         require(!state.rightPanelVisible && state.contentEditEnabled, "opening Edit again closes AI")
 
         print("Right-panel checks passed")
+    }
+
+    /// A percentage is not a raster-path guarantee: at CI's low display density 300% can
+    /// still use a whole-page raster. Exercise tiles explicitly, at all supported densities,
+    /// and wait for actual uploads rather than a quiet raster counter on the wrong path.
+    @MainActor
+    private static func rightPanelTextureRetentionChecks(fixture: URL) async throws {
+        let suite = "lyra-drawer-textures-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for factor in [38.0 / 72, 1, 108.5 / 72] {
+            let state = AppState(engine: try RustEngine(), preferFullPageRasters: false)
+            require(state.open(url: fixture), "the tiled-drawer fixture opens at calibration \(factor)")
+            state.sidebarVisible = true
+            state.rightPanelVisible = false
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0)
+            let model = AIAssistantModel(settings: AISettingsStore(
+                defaults: defaults, keyStore: InMemoryAPIKeyStore(key: nil)))
+            let harness = RightPanelHarness(state: state, aiAssistant: model)
+            defer { harness.close() }
+            try await harness.mount()
+            try await eventually("the tiled-drawer viewport reports its actual width", {
+                harness.canvas.hasAttachedSurface
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            state.setDisplayCalibration(DisplayCalibration(factor: factor))
+            state.zoomPercent = 300
+            state.reloadVisiblePages()
+            func visibleIDs() -> Set<Int> {
+                let bottom = state.scrollYPt + harness.canvasRect.height / state.zoomFactor
+                return Set(state.canvasPages.filter {
+                    $0.placement.index >= 0 && $0.placement.topPt < bottom
+                        && $0.placement.topPt + $0.placement.heightPt > state.scrollYPt
+                        && ($0.placement.index >> 20) & 15 == Int(state.currentRasterLOD)
+                }.map { $0.placement.index })
+            }
+            try await eventuallyExplaining("the tiled path uploads visible sharp textures", {
+                "calibration=\(factor), screenPage=\(state.usesScreenPageRasters), "
+                    + "quads=\(visibleIDs().count), textures=\(harness.canvas.residentTextureIDs.count)"
+            }, {
+                let ids = visibleIDs()
+                return !state.usesScreenPageRasters && !ids.isEmpty
+                    && ids.allSatisfy { harness.canvas.residentTextureIDs[$0] != nil }
+            })
+            let ids = visibleIDs()
+            let before = harness.canvas.residentTextureIDs.filter { ids.contains($0.key) }
+            require(!before.isEmpty, "deep zoom has resident sharp textures before drawer cover")
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 1)
+            state.rightPanelVisible = true
+            try await eventually("the covering drawer is fully laid out", {
+                abs(harness.panelTotalWidth - 327) < 0.5
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            try await Task.sleep(for: .milliseconds(300))
+            require(before.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                    "opening the drawer retains sharp textures at calibration \(factor)")
+            state.rightPanelVisible = false
+            state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0)
+            try await eventually("the revealing drawer is fully closed", {
+                harness.panelTotalWidth < 0.5
+                    && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
+            })
+            try await Task.sleep(for: .milliseconds(300))
+            require(before.allSatisfy { harness.canvas.residentTextureIDs[$0.key] == $0.value },
+                    "closing the drawer reuses the same textures at calibration \(factor)")
+        }
     }
 
     // MARK: - Accessibility helpers
