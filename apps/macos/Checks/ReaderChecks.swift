@@ -608,6 +608,7 @@ struct ReaderChecks {
                 state.setViewportSize(CGSize(width: 700, height: 500))
                 state.newTab(url: a)
                 require(state.document?.pageCount == 1 && state.tabs.count == 1, "normal open initializes document/tab")
+                require(false, "DELIBERATE FAILURE: the native-check gate must turn this run red")
                 try await eventually("normal open loads thumbnail", { state.thumbnails[0] != nil })
                 state.searchQuery = "LyraReader"
                 state.runSearch()
