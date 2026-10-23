@@ -80,6 +80,10 @@ struct ReaderChecks {
             try await extractDestinationGuardChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-xfa") {
+            try await xfaChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-content-editing") {
             try await contentEditingChecks(root:fastRoot)
             return
@@ -743,6 +747,10 @@ struct ReaderChecks {
         // last tab closes, so it needs a window wgpu will actually present.
         try await canvasClearChecks(a: a, b: b)
         try await frameSchedulingChecks()
+        // Last: this check opens the local XFA sample and leaves no window behind, but it is
+        // kept after the long-lived surface/window checks so its raster timers cannot influence
+        // their measurements.
+        try await xfaChecks(root: root)
         print("All reader regression checks passed")
     }
 }

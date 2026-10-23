@@ -77,8 +77,10 @@ public struct TabStrip: View {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundStyle(LyraReaderTheme.warningFg)
-                        .help(state.readOnlyReason ?? "Signed PDF · read-only")
-                        .accessibilityLabel("Signed PDF, read-only")
+                        .help(state.readOnlyReason ?? state.readOnlyBannerTitle)
+                        .accessibilityLabel(state.isXfaDocument
+                                            ? "XFA form, read-only"
+                                            : "Signed PDF, read-only")
                 }
                 Spacer(minLength: 0)
             }
@@ -229,12 +231,14 @@ struct ReaderToolbar: View {
             tool("Fill & Sign", "signature", selected: state.formToolActive) {
                 state.toggleFormTool()
             }
-            .disabled(state.document == nil)
-            .help(state.isReadOnlyDocument
-                  ? "Fill & Sign · fill this PDF's form fields · changes can be saved to a copy"
-                  : (state.formToolActive
-                     ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
-                     : "Fill & Sign · fill this PDF's form fields"))
+            .disabled(!state.canUseFormTool)
+            .help(state.isXfaDocument
+                  ? "Fill & Sign · not available: this XFA form is rendered read-only from its XML"
+                  : (state.isReadOnlyDocument
+                     ? "Fill & Sign · fill this PDF's form fields · changes can be saved to a copy"
+                     : (state.formToolActive
+                        ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
+                        : "Fill & Sign · fill this PDF's form fields")))
             separator
             tool("Ask about a region", "rectangle.dashed",
                  selected: state.regionSelectionArmed) {
@@ -387,7 +391,10 @@ struct ReaderSecondaryToolbar: View {
 
     /// Help for a tool that changes the document: a signed file says where the edit can go.
     private func writeHelp(_ normal: String) -> String {
-        state.isReadOnlyDocument ? normal + " · edits are saved to a copy" : normal
+        if state.isXfaDocument {
+            return normal + " · not available: this XFA form is rendered read-only from its XML"
+        }
+        return state.isReadOnlyDocument ? normal + " · edits are saved to a copy" : normal
     }
 
     private var overviewRow: some View {

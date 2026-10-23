@@ -624,7 +624,9 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
+            state.isXfaDocument
+                ? "XFA form, rendered read-only from XML. \(state.readOnlyReason ?? "")"
+                : "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
         )
     }
 
@@ -651,7 +653,7 @@ public struct ReaderWindow: View {
             Button("Replace Original…") { state.presentReplaceRedactionsConfirmation() }
                 .disabled(!state.canReplaceOriginalWithRedactions)
                 .help(state.isReadOnlyDocument
-                      ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                      ? (state.readOnlyReason ?? state.readOnlyBannerTitle)
                       : "Replace the original file with the redacted version")
             Button("Clear") { state.clearPendingRedactions() }
         }
@@ -687,7 +689,7 @@ public struct ReaderWindow: View {
             }
             .disabled(!state.canReplaceOriginalWithFilledForm)
             .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                  ? (state.readOnlyReason ?? state.readOnlyBannerTitle)
                   : "Write the form values into the original file")
             Button("Discard") { state.discardFormChanges() }
                 .disabled(!state.formHasPendingChanges)

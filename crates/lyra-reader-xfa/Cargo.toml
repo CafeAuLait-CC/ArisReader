@@ -1,0 +1,16 @@
+[package]
+name = "lyra-reader-xfa"
+description = "Read-only XFA form support: decrypt the XFA packets, extract the layout and data, and render a static PDF"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The standard security handler (RC4 / AESV2) and object-stream parsing. The crate
+# deliberately does not hand-roll a cipher: lopdf decrypts with the empty user password
+# exactly as a viewer would.
+lopdf = { version = "0.45", default-features = false }

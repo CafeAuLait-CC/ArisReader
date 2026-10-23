@@ -435,6 +435,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
 
     @Published public var contentEditEnabled = false {
         didSet {
+            if contentEditEnabled, isXfaDocument {
+                contentEditEnabled = false
+                lastError = readOnlyReason
+                statusMessage = "XFA form · content editing is not available"
+                return
+            }
             if contentEditEnabled {
                 rightPanelVisible = false
                 performancePanelVisible = false
@@ -3525,7 +3531,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             document = loaded
             lastError = nil
             currentPage = 1
-            if loaded.pageCount > 0 {
+            if loaded.xfa.isXfa {
+                let skipped = loaded.xfa.skipped.count
+                statusMessage = "XFA form · rendered read-only from XML · "
+                    + "\(loaded.pageCount) page(s) · \(loaded.xfa.fieldCount) field(s)"
+                    + (skipped == 0 ? "" : " · \(skipped) item(s) skipped")
+            } else if loaded.pageCount > 0 {
                 statusMessage = String(
                     format: "Opened %d page(s) · first page %.0f×%.0f pt · %@",
                     loaded.pageCount,
@@ -7314,7 +7325,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveFilledForm: Bool {
-        document != nil && formHasPendingChanges
+        document != nil && !isXfaDocument && formHasPendingChanges
             && !formSaveInProgress && !formInfo.encrypted
     }
 
@@ -7325,7 +7336,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the Fill & Sign placeholder has something to offer.
     public var canUseFormTool: Bool {
-        document != nil && !formInfo.encrypted
+        document != nil && !isXfaDocument && !formInfo.encrypted
             && formInfo.fields.contains(where: { $0.editable })
     }
 
@@ -7333,6 +7344,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// selection mode, so a click on a field is an edit and a click elsewhere still reads.
     public func toggleFormTool() {
         guard document != nil else { return }
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · fillable fields are not available"
+            return
+        }
         if formInfo.encrypted {
             lastError = formInfo.refusal
                 ?? "This PDF is encrypted, so the reader will not fill it."
@@ -7669,7 +7685,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveDocumentProperties: Bool {
-        document != nil && documentInfo != nil
+        document != nil && !isXfaDocument && documentInfo != nil
             && documentPropertiesAreDirty && !propertiesSaveInProgress
             && !(documentInfo?.isEncrypted ?? true)
     }
@@ -7812,33 +7828,55 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The signature evidence for the open document, read by the engine once at open.
     public var documentSignature: DocumentSignature { pageEditSession?.originalSignature ?? document?.signature ?? .unsigned }
 
-    /// True when the file carries a digital signature and every **in-place** write is refused.
+    /// The XFA facts for the open document, read by the engine once at open.
+    public var documentXfa: DocumentXfa { document?.xfa ?? .none }
+
+    /// True when the document is an XFA form rendered read-only from its XML.
+    public var isXfaDocument: Bool { documentXfa.isXfa }
+
+    /// True when the file carries a digital signature or is an XFA form. Every write command is
+    /// refused with ``readOnlyReason``; reading aids stay available.
     ///
-    /// Edits are still allowed: they go to the annotation cache and can be saved to a new file. The
-    /// decision lives in Rust; the shell mirrors it only to disable the in-place controls and
-    /// explain them. A direct engine call is still refused by the same gate, so a stale button
-    /// cannot rewrite a signed file.
-    public var isReadOnlyDocument: Bool { documentSignature.signed }
+    /// For a signed PDF the refusal is only for in-place writes (copies are still allowed). For
+    /// an XFA form even copies are refused: the synthetic PDF is a rendering of the form, not
+    /// the form itself, so a "copy of the edits" would not be the document the reader thinks it
+    /// is. The decision lives in Rust; the shell mirrors it to disable and explain the controls.
+    public var isReadOnlyDocument: Bool { documentSignature.signed || isXfaDocument }
 
-    /// The one sentence every in-place write refuses with.
-    public var readOnlyReason: String? { documentSignature.readOnlyReason }
+    /// The one sentence every write refusal uses. An XFA form's reason is more specific than
+    /// the signature reason, so it wins when both are present (the sample has both).
+    public var readOnlyReason: String? {
+        isXfaDocument ? (documentXfa.readOnlyReason ?? documentXfa.error) : documentSignature.readOnlyReason
+    }
 
-    /// The banner's headline. The reason below it names the evidence.
-    public var readOnlyBannerTitle: String { "Signed PDF · read-only in place" }
+    /// The banner's headline.
+    public var readOnlyBannerTitle: String {
+        isXfaDocument ? "XFA form · rendered read-only from XML" : "Signed PDF · read-only in place"
+    }
 
     /// The evidence, one line, for the banner's second line.
     public var readOnlyBannerEvidence: String {
-        documentSignature.evidence.map(\.detail).joined(separator: " · ")
+        if isXfaDocument {
+            let packets = documentXfa.packetNames.count
+            let base = "\(packets) XFA packet(s) · \(documentXfa.pageCount) page(s) · \(documentXfa.fieldCount) field(s)"
+            if documentXfa.skipped.isEmpty { return base }
+            return base + " · skipped: " + documentXfa.skipped.joined(separator: " · ")
+        }
+        return documentSignature.evidence.map(\.detail).joined(separator: " · ")
     }
 
-    /// What a signed document can still do. Shown in the banner next to the reason.
+    /// What a read-only document can still do. Shown in the banner next to the reason.
     public var readOnlyBannerNote: String {
-        "Saving a copy is allowed; the copy leaves the signature fields out."
+        if isXfaDocument {
+            return "Reading, zoom, search, selection and summaries stay available. The source PDF is never modified."
+        }
+        return "Saving a copy is allowed; the copy leaves the signature fields out."
     }
 
     /// True when annotation tools may create or remove marks. Cache edits are allowed for a
     /// signed document too: they can be written to a copy, and the signed original is untouched.
-    public var canEditAnnotations: Bool { document != nil }
+    /// An XFA form offers none: its synthetic pages are a rendering, not an annotation carrier.
+    public var canEditAnnotations: Bool { document != nil && !isXfaDocument }
 
     /// Refuses an in-place write and states the shared reason. Returns true when the file is
     /// writable.
@@ -7849,9 +7887,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func guardWritable() -> Bool {
         guard let reason = readOnlyReason else { return true }
         lastError = reason
-        statusMessage = "Signed PDF · read-only"
+        statusMessage = isXfaDocument ? "XFA form · read-only" : "Signed PDF · read-only"
         FileHandle.standardError.write(Data(
-            "lyra-reader-signature: write refused · \(reason)\n".utf8
+            (isXfaDocument ? "lyra-reader-xfa: write refused · \(reason)\n"
+                           : "lyra-reader-signature: write refused · \(reason)\n").utf8
         ))
         return false
     }
@@ -7859,7 +7898,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // MARK: - Saving annotations into the PDF
 
     public var canSaveDocument: Bool {
-        document != nil && !pageEditBusy && !annotationSaveInProgress &&
+        document != nil && !isXfaDocument && !pageEditBusy && !annotationSaveInProgress &&
             (canSaveAnnotationsToPDF || canSavePageEditsCopy || contentCommandInFlight)
     }
 
@@ -7904,11 +7943,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func saveDocument() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · rendered read-only from XML"
+            return
+        }
         if isReadOnlyDocument { presentSaveDocumentCopyPanel(); return }
         Task { @MainActor [weak self] in _ = await self?.saveDocumentToOriginal() }
     }
 
     public func presentSaveDocumentCopyPanel() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · saving a copy of edits is not available"
+            return
+        }
         if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel() }
         else { presentSaveAnnotatedCopyPanel() }
     }
@@ -9168,7 +9217,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canMarkRedactions: Bool {
-        document != nil && !redactionBusy && pageEditSession == nil
+        document != nil && !isXfaDocument && !redactionBusy && pageEditSession == nil
     }
 
     public var canApplyRedactions: Bool {
@@ -9578,11 +9627,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the page commands can run at all.
     public var canPageEdit: Bool {
-        document != nil && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
+        document != nil && !isXfaDocument && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
     }
 
-    /// Page operations that write a new file (extract, merge, split).
-    public var canPageOperations: Bool { document != nil }
+    /// Page operations that write a new file (extract, merge, split). An XFA form has no
+    /// meaningful page operation to offer: its pages are synthesized from the XML.
+    public var canPageOperations: Bool { document != nil && !isXfaDocument }
 
     /// Whether a page-editing session exists at all. A session is prepared before the first
     /// write, so this can be true with nothing staged yet; the interface must ask
@@ -14790,6 +14840,11 @@ extension AppState {
     }
 
     public func toggleContentEditing() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · rendered read-only from XML"
+            return
+        }
         if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
         contentEditEnabled.toggle()
         if contentEditEnabled {

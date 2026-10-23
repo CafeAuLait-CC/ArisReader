@@ -148,7 +148,24 @@ struct DocumentInformationContent: View {
                         ?? state.document.map { "\($0.pageCount)" } ?? "—")
                     fact("PDF version", value: state.documentInfo?.pdfVersion ?? "—")
                     fact("Encrypted", value: (state.documentInfo?.isEncrypted ?? false) ? "Yes" : "No")
+                    if state.isXfaDocument {
+                        fact("Source", value: "XFA form rendered from XML (read-only)")
+                    }
                     Spacer(minLength: 0)
+                }
+                if state.isXfaDocument {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(state.readOnlyBannerEvidence)
+                            .font(.caption2)
+                            .foregroundStyle(LyraReaderTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let error = state.documentXfa.error {
+                            Text(error)
+                                .font(.caption2)
+                                .foregroundStyle(LyraReaderTheme.warningFg)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                 }
                 if let failure = state.documentInfoError {
                     Text(failure)
@@ -180,7 +197,7 @@ struct DocumentInformationContent: View {
                         }
                         .disabled(!state.canReplaceOriginalWithDocumentProperties)
                         .help(state.isReadOnlyDocument
-                              ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                              ? (state.readOnlyReason ?? state.readOnlyBannerTitle)
                               : "Back up and replace the original file's information")
                         Spacer()
                         if state.documentPropertiesAreDirty {
@@ -191,7 +208,16 @@ struct DocumentInformationContent: View {
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    if state.isReadOnlyDocument {
+                    if state.isXfaDocument {
+                        Text(
+                            "XFA form: the pages are rendered read-only from the document's XML. "
+                            + "Properties, forms, annotations and editing are not written back, "
+                            + "and no copy of edits is offered. Reading aids stay available."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.warningFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else if state.isReadOnlyDocument {
                         Text(
                             "Signed PDF: edits here can be saved to a copy. A modified copy "
                             + "has its signature fields removed, so it does not look signed."

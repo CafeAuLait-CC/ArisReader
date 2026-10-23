@@ -40,7 +40,7 @@ uniffi::setup_scaffolding!();
 
 pub mod api;
 mod index_cache;
-pub use api::{DocumentSummary, LyraReaderEngine, LyraReaderFfiError};
+pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
 
 /// Location of a document's disposable derived index, for cache management and diagnostics.
 pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathBuf {

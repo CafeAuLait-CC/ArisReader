@@ -138,29 +138,42 @@ pub fn detect_signature(
     password: Option<&str>,
     pdfium_signatures: u32,
 ) -> SignatureStatus {
-    let mut status = SignatureStatus::default();
-    let parsed = match load_document(path, password) {
-        Ok(document) => {
-            read_evidence(&document, &mut status);
-            true
+    match load_document(path, password) {
+        Ok(document) => detect_signature_in_document(&document, pdfium_signatures),
+        Err(_) => {
+            let mut status = SignatureStatus::default();
+            // PDFium's count includes an *unsigned* signature field, so it is not evidence on
+            // its own (a form prepared for signing must stay writable). It is a fallback only
+            // when the dictionary read could not run: a structure we cannot read cannot prove
+            // the document unsigned, and a real signature is the one thing PDFium can still see.
+            if pdfium_signatures > 0 {
+                let noun = if pdfium_signatures == 1 {
+                    "one digital signature"
+                } else {
+                    "digital signatures"
+                };
+                status.push(
+                    SignatureEvidenceKind::Pdfium,
+                    format!("PDFium reports {pdfium_signatures} {noun}"),
+                );
+            }
+            status
         }
-        Err(_) => false,
-    };
-    // PDFium's count includes an *unsigned* signature field, so it is not evidence on its own
-    // (a form prepared for signing must stay writable). It is a fallback only when the
-    // dictionary read could not run: a structure we cannot read cannot prove the document
-    // unsigned, and a real signature is the one thing PDFium can still see.
-    if !parsed && !status.is_signed() && pdfium_signatures > 0 {
-        let noun = if pdfium_signatures == 1 {
-            "one digital signature"
-        } else {
-            "digital signatures"
-        };
-        status.push(
-            SignatureEvidenceKind::Pdfium,
-            format!("PDFium reports {pdfium_signatures} {noun}"),
-        );
     }
+}
+
+/// Reports signature evidence from a document the caller has already loaded.
+///
+/// The open path loads the PDF once for XFA detection and hands the same document here, so the
+/// signature policy and the XFA policy do not pay for two full structural reads of the file.
+/// PDFium's signature count is not consulted here: the structural read succeeded, and the
+/// dictionary evidence is the primary source (an unsigned signature field is not a signature).
+pub fn detect_signature_in_document(
+    document: &Document,
+    _pdfium_signatures: u32,
+) -> SignatureStatus {
+    let mut status = SignatureStatus::default();
+    read_evidence(document, &mut status);
     status
 }
 

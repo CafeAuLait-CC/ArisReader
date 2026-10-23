@@ -19,6 +19,7 @@ lyra-reader-metadata = { workspace = true }
 lyra-reader-core = { workspace = true }
 lyra-reader-pdfium = { workspace = true }
 lyra-reader-render = { workspace = true }
+lyra-reader-xfa = { workspace = true }
 # PNG encode/decode for the `render` and `compare` subcommands. Deliberately kept
 # out of the engine crates: the engine deals in raw pixel buffers only.
 image = { version = "0.25", default-features = false, features = ["png"] }

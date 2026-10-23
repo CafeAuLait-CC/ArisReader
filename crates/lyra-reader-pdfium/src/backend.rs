@@ -212,8 +212,12 @@ pub struct PdfiumBackend {
     path: PathBuf,
     /// Kept so [`PdfiumBackend::reopen`] can hand another thread its own copy.
     password: Option<String>,
-    /// Whether the document was opened with a password (see `is_encrypted`).
-    password_protected: bool,
+    /// Whether the file carries an encryption dictionary, even when it opened without a
+    /// prompt (a permission-encrypted form with an empty user password).
+    encrypted: bool,
+    /// Whether the caller supplied a password. Write gates use this, not `encrypted`, so the
+    /// reporting change does not alter an ordinary PDF's edit behavior.
+    needs_password: bool,
     /// Additional per-document guard; all PDFium operations also take PDFIUM_LOCK.
     raster_lock: std::sync::Mutex<()>,
     /// Second document handle, used for annotation reads only (`FPDFAnnot_*`).
@@ -249,17 +253,25 @@ impl PdfiumBackend {
         let document = pdfium.load_pdf_from_file(path, password);
 
         match document {
-            Ok(document) => Ok(Self {
-                page_count: document.pages().len().max(0) as u32,
-                document: Some(document),
-                path: path.to_path_buf(),
-                password: password.map(str::to_string),
-                password_protected: password.is_some(),
-                raster_lock: std::sync::Mutex::new(()),
-                annotation_reader: std::sync::OnceLock::new(),
-                annotation_rendering: std::sync::Mutex::new(HashMap::new()),
-                link_borders: OnceLock::new(),
-            }),
+            Ok(document) => {
+                let encrypted = document
+                    .permissions()
+                    .security_handler_revision()
+                    .map(|revision| revision != PdfSecurityHandlerRevision::Unprotected)
+                    .unwrap_or(false);
+                Ok(Self {
+                    page_count: document.pages().len().max(0) as u32,
+                    document: Some(document),
+                    path: path.to_path_buf(),
+                    password: password.map(str::to_string),
+                    encrypted,
+                    needs_password: password.is_some(),
+                    raster_lock: std::sync::Mutex::new(()),
+                    annotation_reader: std::sync::OnceLock::new(),
+                    annotation_rendering: std::sync::Mutex::new(HashMap::new()),
+                    link_borders: OnceLock::new(),
+                })
+            }
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(LyraReaderError::new(
                     ErrorCode::Encrypted,
@@ -283,6 +295,47 @@ impl PdfiumBackend {
                 "PDFium could not open the document",
             )
             .with_detail(format!("path: {} → {error}", path.display()))),
+        }
+    }
+
+    /// Opens a PDF held in memory, with `display_path` kept as the document's identity.
+    ///
+    /// This is how an XFA form's synthetic PDF reaches the existing renderer: the bytes live in
+    /// the handle (PDFium's wrapper owns them), and the path stays the source file so the rest
+    /// of the reader, the cache and the shell keep one identity for the document.
+    pub fn open_bytes(bytes: Vec<u8>, display_path: &Path) -> Result<Self> {
+        let pdfium = pdfium_instance()?;
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let document = pdfium.load_pdf_from_byte_vec(bytes, None);
+        match document {
+            Ok(document) => Ok(Self {
+                page_count: document.pages().len().max(0) as u32,
+                document: Some(document),
+                path: display_path.to_path_buf(),
+                password: None,
+                encrypted: false,
+                needs_password: false,
+                raster_lock: std::sync::Mutex::new(()),
+                annotation_reader: std::sync::OnceLock::new(),
+                annotation_rendering: std::sync::Mutex::new(HashMap::new()),
+                link_borders: OnceLock::new(),
+            }),
+            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
+                Err(LyraReaderError::new(
+                    ErrorCode::Encrypted,
+                    "the synthetic document is unexpectedly password protected",
+                ))
+            }
+            Err(error) => Err(LyraReaderError::new(
+                ErrorCode::CorruptDocument,
+                "PDFium could not open the synthetic XFA document",
+            )
+            .with_detail(format!(
+                "display path: {} → {error}",
+                display_path.display()
+            ))),
         }
     }
 
@@ -1073,7 +1126,11 @@ impl DocumentBackend for PdfiumBackend {
     }
 
     fn is_encrypted(&self) -> bool {
-        self.password_protected
+        self.encrypted
+    }
+
+    fn needs_password(&self) -> bool {
+        self.needs_password
     }
 
     fn is_tagged(&self) -> bool {

@@ -22,6 +22,7 @@ lyra-reader-session = { path = "crates/lyra-reader-session" }
 lyra-reader-ai      = { path = "crates/lyra-reader-ai" }
 lyra-reader-ffi     = { path = "crates/lyra-reader-ffi" }
 lyra-reader-metadata = { path = "crates/lyra-reader-metadata" }
+lyra-reader-xfa     = { path = "crates/lyra-reader-xfa" }
 
 # ── External dependencies (from M1; versions in docs/09-dev-setup.md) ─────────
 # wgpu          = "30"          # GPU abstraction (Metal / Vulkan / DX12)
