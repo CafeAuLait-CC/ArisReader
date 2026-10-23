@@ -583,12 +583,14 @@ public struct ReaderWindow: View {
         .accessibilityLabel(state.translationNotice ?? "Translation status")
     }
 
-    /// The read-only explanation for a digitally signed document.
+    /// The read-only explanation for a digitally signed document or an XFA form.
     ///
     /// This is a *permanent* banner, not a pending-state one: the restriction belongs to the
-    /// file, so it stays visible for as long as the document is open. It names the evidence the
-    /// engine found and says what still works (copying/exporting), because a banner that only
-    /// said "read-only" would leave the reader guessing whether reading is affected too.
+    /// file, so it stays visible for as long as the document is open. A signed PDF names the
+    /// evidence the engine found and says what still works (copying/exporting), because a banner
+    /// that only said "read-only" would leave the reader guessing whether reading is affected
+    /// too. An XFA form gets two sentences of reader-facing copy instead: packet names, field
+    /// counts and the skipped list are diagnostics, not banner text.
     private var readOnlyBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.doc")
@@ -596,11 +598,11 @@ public struct ReaderWindow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(state.readOnlyBannerTitle)
                     .font(.callout.weight(.semibold))
-                Text(state.readOnlyReason ?? "This PDF is digitally signed, so it is read-only.")
+                Text(state.readOnlyBannerBody)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: 640, alignment: .leading)
-                if !state.readOnlyBannerEvidence.isEmpty {
+                if !state.isXfaDocument && !state.readOnlyBannerEvidence.isEmpty {
                     Text(state.readOnlyBannerEvidence)
                         .font(.caption2)
                         .foregroundStyle(LyraReaderTheme.textTertiary)
@@ -608,10 +610,12 @@ public struct ReaderWindow: View {
                 }
             }
             Spacer(minLength: 0)
-            Text(state.readOnlyBannerNote)
-                .font(.caption2)
-                .foregroundStyle(LyraReaderTheme.textSecondary)
-                .frame(maxWidth: 220, alignment: .trailing)
+            if !state.readOnlyBannerNote.isEmpty {
+                Text(state.readOnlyBannerNote)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .frame(maxWidth: 220, alignment: .trailing)
+            }
         }
         .controlSize(.small)
         .padding(.horizontal, 14)
@@ -625,8 +629,8 @@ public struct ReaderWindow: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             state.isXfaDocument
-                ? "XFA form, rendered read-only from XML. \(state.readOnlyReason ?? "")"
-                : "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
+                ? "\(state.readOnlyBannerTitle). \(state.readOnlyBannerBody)"
+                : "Signed PDF, read-only. \(state.readOnlyBannerBody) Saving a copy still works."
         )
     }
 
