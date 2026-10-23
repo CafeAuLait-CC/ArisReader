@@ -113,9 +113,9 @@ design notes rather than here.
 ## Documentation index
 
 The design documents live in `docs/` in the working copy and are **not committed** (see the note under
-*Directory layout*), so the links below resolve locally. Two design documents do ship with the code:
-[PDF-CONTENT-EDITING.md](PDF-CONTENT-EDITING.md) (the content editor's model, limits and verification) and
-[RENAMING.md](RENAMING.md) (the rename's scope and upgrade compatibility).
+*Directory layout*), so the links below resolve locally. Everything explanatory lives there: the README
+carries the overview, and the only documents that ship with the code are this file, the licence and
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 | Document | Contents |
 | --- | --- |
@@ -131,6 +131,8 @@ The design documents live in `docs/` in the working copy and are **not committed
 | [10 Text and citations](docs/10-text-and-citations.md) | Text layer, citation detection, bibliography attribution, caption indexing |
 | [11 Content editing](docs/11-content-editing.md) | The content editor in Chinese: interaction, the three hard decisions, limits, verification |
 | [12](docs/12-readme-feature-notes.md) / [13](docs/13-readme-measurements.md) / [14](docs/14-readme-intro-archive.md) | Material moved out of this README: feature implementation notes, measurement recipes, the former overview |
+| [15](docs/15-document-saving.md) | The save model: working copies, the annotation cache, backups and what a failed save leaves behind |
+| [16](docs/16-renaming.md) | The ArisReader to LyraReader rename: scope, compatibility kept, and what migrates on first open |
 | [ADR](docs/adr/) | Architecture decision records |
 
 ## Milestones at a glance
