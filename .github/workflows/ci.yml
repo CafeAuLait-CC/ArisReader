@@ -21,10 +21,12 @@
 #                                   Swift-side job starts from those products instead of paying
 #                                   the build again.
 #
-#   swift-smoke    (macos-15)       needs macos-build. Rebuilds (incrementally) from the published
-#                                   products, packages LyraReader.app and launches it twice through
-#                                   LaunchServices. Keeps the corpus/reference-eval honesty steps
-#                                   where they were and archives the logs.
+#   swift-smoke    (macos-15)       needs macos-build. Receives the packaged, signed LyraReader.app
+#                                   and launches it twice through LaunchServices. Keeps the
+#                                   corpus/reference-eval honesty steps where they were and
+#                                   archives the logs. It does not rebuild: a second build here
+#                                   would only duplicate the gate macos-build already ran, and a
+#                                   248 MB build directory took three minutes to download.
 #
 #   native-checks  (macos-15 × 2)   needs macos-build. Runs the LyraReaderChecks harness with
 #                                   `--shard i/2`; together the shards run every registered suite
@@ -289,23 +291,25 @@ jobs:
       - name: Run the Swift half of ./scripts/check.sh
         run: ./scripts/check.sh
 
-      - name: Package the build products for the parallel jobs
+      # Assemble and ad-hoc sign the bundle here, where the build already is. The smoke job only
+      # launches it, so the app travels as a 21 MB archive instead of the ~248 MB SwiftPM build
+      # directory (whose download alone cost three minutes in the first measured run).
+      - name: Package and sign the application bundle
+        run: ./scripts/make-app-bundle.sh --debug
+
+      - name: Archive the application bundle and the checks executable
         run: |
           set -euo pipefail
-          tar -czf "$RUNNER_TEMP/macos-build.tar.gz" \
-            apps/macos/.build \
-            apps/macos/.rust \
-            apps/macos/Sources/LyraReaderBindings \
-            apps/macos/Sources/LyraReaderFFI/include/uniffi_scaffolding.h
+          tar -czf "$RUNNER_TEMP/LyraReader-app.tar.gz" -C "$GITHUB_WORKSPACE" build/LyraReader.app
           # .build/debug is a symlink to the architecture-specific directory. -h stores the
           # executable as a regular file, so a shard can extract it anywhere.
           tar -czhf "$RUNNER_TEMP/reader-checks.tar.gz" -C apps/macos/.build/debug LyraReaderChecks
 
-      - name: Upload the shared Swift/Rust build products
+      - name: Upload the application bundle
         uses: actions/upload-artifact@v4
         with:
-          name: macos-build
-          path: ${{ runner.temp }}/macos-build.tar.gz
+          name: reader-app
+          path: ${{ runner.temp }}/LyraReader-app.tar.gz
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
@@ -320,47 +324,44 @@ jobs:
           retention-days: 1
 
   swift-smoke:
-    name: swift-smoke (build · package · LaunchServices · eval)
+    name: swift-smoke (LaunchServices · eval)
     needs: macos-build
     runs-on: macos-15
     timeout-minutes: 45
     env:
       LYRA_READER_PDFIUM_PATH: ${{ github.workspace }}/vendor/pdfium/lib/libpdfium.dylib
       LYRA_READER_REQUIRE_PDFIUM: "1"
-      # Same contract as macos-build: Swift half only; native-checks owns the harness run.
-      LYRA_READER_CHECK_SKIP_RUST: "1"
-      LYRA_READER_CHECK_SKIP_NATIVE_CHECKS: "1"
     steps:
       - name: Check out the merge result
         uses: actions/checkout@v5
 
-      - name: Select an Xcode with Swift >= 6.2
-        id: xcode
-        uses: ./.github/actions/select-xcode
-
       # The reference evaluation below is a `cargo test`; this job is its historical home, so
-      # the toolchain is installed here even though the Swift build does not need it. On a run
+      # the toolchain is installed here even though launching the app does not need it. On a run
       # without the corpus the eval step only prints its ::notice::, as before.
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # PDFium is needed both to package the app and by the reference evaluation when it runs.
+      # PDFium is fetched here too because the reference evaluation needs it when it runs, and
+      # because a broken download should fail this job rather than be hidden by the bundle.
       - name: Fetch PDFium
         run: ./scripts/fetch-pdfium.sh
 
-      - name: Download the shared build products
+      - name: Download the packaged application
         uses: actions/download-artifact@v4
         with:
-          name: macos-build
-          path: ${{ runner.temp }}/macos-build
+          name: reader-app
+          path: ${{ runner.temp }}/reader-app
 
-      - name: Restore the shared build products
-        run: tar -xzf "$RUNNER_TEMP/macos-build/macos-build.tar.gz" -C "$GITHUB_WORKSPACE"
-
-      # Build again from the restored products (incremental). This proves the published
-      # products are usable in a fresh job and leaves the build the smoke script packages.
-      - name: Build the Swift package from the shared products
-        run: ./scripts/check.sh
+      - name: Restore the packaged application
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/reader-app/LyraReader-app.tar.gz" -C "$GITHUB_WORKSPACE"
+          # The checkout's Swift sources were written after the artifact was built, so their
+          # mtimes would make smoke-launch-app.sh call the bundle stale. It is not: it was built
+          # from this same merge result in macos-build. Touch the executable so the staleness
+          # check compares content age, not archive age, and pass --no-build; the gate that the
+          # bundle compiles already ran in macos-build.
+          touch build/LyraReader.app/Contents/MacOS/LyraReader
 
       # The class of failure nothing above can see. LyraReaderChecks constructs the app delegate
       # itself, so it never asks SwiftUI to build one through the Objective-C runtime; on
@@ -373,10 +374,10 @@ jobs:
       # job). It is fatal like every other gate here: the one non-fatal outcome is an environment
       # that cannot launch a GUI application at all, which the script announces with a ::notice::
       # and exits 0 for, because an unrun check is announced rather than passed silently.
-      # The bundle is assembled from the debug build the steps above produced; capture logs land
-      # in build/smoke-launch-*.log, which the artifact step below preserves.
+      # The bundle was assembled and signed by macos-build; this job launches it. Capture logs
+      # land in build/smoke-launch-*.log, which the artifact step below preserves.
       - name: Smoke-launch the packaged app through LaunchServices
-        run: ./scripts/smoke-launch-app.sh
+        run: ./scripts/smoke-launch-app.sh --no-build
 
       # Same statement as in rust-core: the corpus is not in the repository, so nothing above
       # covered it. Do not let a future reader assume otherwise.

@@ -7,9 +7,9 @@
 # separated by ';'" at that deinit. Rather than pin a path, take the newest Xcode whose Swift is
 # at least 6.2 and fail loudly here if the image ever ships none.
 #
-# This lives in a composite action because two jobs (macos-build and swift-smoke) need the same
-# compiler. Keeping it in one place means the incident above cannot be re-learned by the job that
-# did not carry the comment.
+# This lives in a composite action so the selection logic and the incident above stay in one
+# unit instead of a snippet that gets copied (and slowly drifts) between jobs. macos-build uses
+# it; any future Swift job should too.
 name: Select an Xcode with Swift >= 6.2
 description: Select the newest Xcode with a Swift 6.2+ compiler and export DEVELOPER_DIR
 
