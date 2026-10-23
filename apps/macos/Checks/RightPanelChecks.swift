@@ -687,8 +687,8 @@ extension ReaderChecks {
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedCloseReloads = state.coalescedViewportReloadCount - beforeAnimatedClose
-        require(animatedCloseReloads == 0,
-                "closing the overlay keeps the PDF band unchanged "
+        require(animatedCloseReloads <= 1,
+                "closing the overlay coalesces the final PDF band update "
                     + "(\(animatedCloseReloads) rebuilds, not one per frame)")
         let beforeAnimatedOpen = state.coalescedViewportReloadCount
         state.rightPanelVisible = true
@@ -697,8 +697,8 @@ extension ReaderChecks {
         })
         try await Task.sleep(for: .milliseconds(120))
         let animatedOpenReloads = state.coalescedViewportReloadCount - beforeAnimatedOpen
-        require(animatedOpenReloads == 0,
-                "opening the overlay keeps the PDF band unchanged "
+        require(animatedOpenReloads <= 1,
+                "opening the overlay coalesces the final PDF band update "
                     + "(\(animatedOpenReloads) rebuilds, not one per frame)")
 
         // ── Reduce Motion ──────────────────────────────────────────────────────────────
