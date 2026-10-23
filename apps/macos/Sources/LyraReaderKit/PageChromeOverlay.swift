@@ -42,9 +42,9 @@ package enum PageChromeGeometry {
                 guard baseline > -20, baseline < viewport.height + 20 else { continue }
                 let points = (0...count).map { i -> CGPoint in
                     let irregularity = CGFloat((i * 37 + lower.index * 13) % 11) / 10
-                    let amplitude: CGFloat = i == 0 || i == count ? 0 : depth * (0.25 + irregularity * 0.75)
+                    let toothDepth: CGFloat = i == 0 || i == count ? 0 : depth * (0.25 + irregularity * 0.75)
                     return CGPoint(x: left + width * CGFloat(i) / CGFloat(count),
-                                   y: baseline + direction * amplitude)
+                                   y: baseline + direction * toothDepth)
                 }
                 result.append(TornEdge(points: points, baseline: baseline))
             }
