@@ -146,8 +146,15 @@ public enum TabRowLayout {
         frameObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
-    /// AppKit may restore its native frames during the appearance transaction. Correct those
-    /// writes synchronously, before the compositor can display the intermediate 28 pt row.
+    /// AppKit may restore its native frames whenever it lays the titlebar out again (an
+    /// appearance transaction, a change to the window's document-edited state, a resize).
+    /// Correct those writes synchronously, before the compositor can display the intermediate
+    /// 28 pt row, and queue a pass as well: the synchronous correction runs inside AppKit's own
+    /// layout, so AppKit can overwrite it for any button it lays out after the notification.
+    /// AppKit lays the buttons out in close → miniaturize → zoom order, which is why the last
+    /// one (green) was the one left at the native 7 / 27 / 47 pt origins and 6 pt top inset when
+    /// the last tab was closed. The queued pass runs after AppKit's layout transaction and
+    /// reasserts all three.
     private func observeFrames(_ views: [NSView]) {
         guard observedViews.count != views.count || !zip(observedViews, views).allSatisfy({ $0 === $1 }) else { return }
         frameObservers.forEach(NotificationCenter.default.removeObserver)
@@ -158,7 +165,10 @@ public enum TabRowLayout {
             frameObservers.append(NotificationCenter.default.addObserver(
                 forName: NSView.frameDidChangeNotification, object: view, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.alignButtons() }
+                MainActor.assumeIsolated {
+                    self?.alignButtons()
+                    self?.scheduleAlignment()
+                }
             })
         }
     }
