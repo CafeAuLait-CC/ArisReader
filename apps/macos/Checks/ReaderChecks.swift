@@ -480,7 +480,8 @@ struct ReaderChecks {
         }
         if CommandLine.arguments.contains("--check-redaction") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
-            try await redactionChecks(root: root)
+            try await contentRedactionChecks(root: root)
+            try await redactionRetirementChecks(root: root)
             return
         }
         if CommandLine.arguments.contains("--check-printing") {
@@ -963,7 +964,8 @@ struct ReaderChecks {
                 try await pageOperationChecks(root: root)
             }),
             ("redaction", {
-                try await redactionChecks(root: root)
+                try await contentRedactionChecks(root: root)
+                try await redactionRetirementChecks(root: root)
             }),
             ("printing", {
                 try await printingChecks(root: root)

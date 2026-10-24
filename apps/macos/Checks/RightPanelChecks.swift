@@ -260,8 +260,6 @@ extension ReaderChecks {
             ("Copy BibTeX", "b", [.command, .shift]),
             ("Continuous", "1", [.command]),
             ("Facing", "3", [.command]),
-            ("Redact Tool", "r", [.command, .shift]),
-            ("Mark Redaction", "r", [.command, .option]),
         ]
         let newKey = String(ReaderShortcuts.toggleAIPanelKey.character)
         let newModifiers = ReaderShortcuts.toggleAIPanelModifiers

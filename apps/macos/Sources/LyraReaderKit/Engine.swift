@@ -1025,59 +1025,6 @@ public struct BookmarkWriteRequest: Sendable, Equatable {
 }
 
 /// What a successful PDF write did.
-
-/// One rectangle the reader marked for redaction, in page-local view space (points, top-left
-/// origin, 100% zoom). The engine converts it to PDF user space with the page's own crop box and
-/// rotation.
-public struct RedactionArea: Sendable, Equatable {
-    public let page: Int
-    public let rect: CGRect
-
-    public init(page: Int, rect: CGRect) {
-        self.page = page
-        self.rect = rect
-    }
-}
-
-/// What one page would lose if the redaction were applied.
-public struct RedactionPagePreview: Sendable, Equatable {
-    public let page: Int
-    public let characters: Int
-    /// A short excerpt of the covered text, for the confirmation dialog.
-    public let textPreview: String
-    /// Vector paths, images, shadings and form XObjects intersecting a mark.
-    public let graphics: Int
-}
-
-/// What applying the marked areas would lose, gathered before the confirmation.
-public struct RedactionPreview: Sendable, Equatable {
-    public let pages: [RedactionPagePreview]
-    public let removedCharacters: Int
-}
-
-/// What one page lost when the redaction was applied.
-public struct RedactionPageReport: Sendable, Equatable {
-    public let page: Int
-    public let removedCharacters: Int
-    public let removedGraphics: Int
-    /// True when the page was rasterised; its whole text layer is gone.
-    public let rasterized: Bool
-    public let fillMarks: Int
-}
-
-/// What a successful redaction write did. `verified` is the writer's own reopen-and-prove step.
-public struct RedactionReport: Sendable, Equatable {
-    public let destinationPath: String
-    /// Present only for a replacement; the backup is verified byte-identical.
-    public let backupPath: String?
-    public let pages: [RedactionPageReport]
-    public let removedCharacters: Int
-    public let outputBytes: UInt64
-    public let cleanedTemporaryFiles: Int
-    public let verified: Bool
-    public let originalUnchanged: Bool
-}
-
 public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
     /// The `/NM` values written, so the annotation cache can remove exactly those entries.
@@ -1820,14 +1767,6 @@ public protocol PDFEngine: AnyObject {
     func interruptedSaveNote(at url: URL) -> String?
     /// The name to offer for an annotated copy of `url`.
     func suggestedAnnotatedCopyURL(for url: URL) -> URL
-    /// Reports what applying `areas` would remove, without writing. Used by the confirmation.
-    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview
-    /// Removes the content under `areas` and writes a new PDF; the open document is untouched.
-    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport
-    /// Replaces the open document with a redacted version, after a verified backup.
-    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport
-    /// The name to offer for a redacted copy: `<name> (redacted).pdf`.
-    func suggestedRedactionCopyURL(for url: URL) -> URL
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
     /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
@@ -1910,37 +1849,6 @@ public extension PDFEngine {
 
     /// Engines with no synchronous renderer let the print view show a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? { nil }
-
-    /// Engines without a redaction writer refuse instead of pretending to remove content.
-    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
-        )
-    }
-
-    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
-        )
-    }
-
-    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
-        )
-    }
-
-    func suggestedRedactionCopyURL(for url: URL) -> URL {
-        url.deletingLastPathComponent()
-            .appendingPathComponent("\(url.deletingPathExtension().lastPathComponent) (redacted).pdf")
-    }
-
 
     /// Engines without a PDF writer refuse the operation instead of pretending to save.
     func saveAnnotatedCopy(
@@ -3278,138 +3186,7 @@ public final class RustEngine: PDFEngine {
         return URL(fileURLWithPath: document.suggestedCopyPath())
     }
 
-    // MARK: - Redaction
-
-    public func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionPreviewRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.previewRedactions(areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        return Self.redactionPreview(record)
-    }
-
-    public func redactToCopy(
-        to url: URL,
-        areas: [RedactionArea]
-    ) async throws -> RedactionReport {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.redactToCopy(
-                        destination: url.path, areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        invalidateCachedCopy(at: url)
-        return Self.redactionReport(record)
-    }
-
-    public func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.replaceWithRedactions(areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        // The active handle now describes the pre-replacement bytes and must not be handed out
-        // by a later open. The caller immediately reopens the file.
-        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
-        return Self.redactionReport(record)
-    }
-
-    public func suggestedRedactionCopyURL(for url: URL) -> URL {
-        guard let document else {
-            let stem = url.deletingPathExtension().lastPathComponent
-            return url.deletingLastPathComponent()
-                .appendingPathComponent("\(stem) (redacted).pdf")
-        }
-        return URL(fileURLWithPath: document.suggestedRedactionCopyPath())
-    }
-
-    private static func redactionRecords(_ areas: [RedactionArea]) -> [RedactionAreaRecord] {
-        areas.map { area in
-            RedactionAreaRecord(
-                page: UInt32(max(area.page, 0)),
-                xPt: Double(area.rect.minX),
-                yPt: Double(area.rect.minY),
-                widthPt: Double(area.rect.width),
-                heightPt: Double(area.rect.height)
-            )
-        }
-    }
-
-    private static func redactionPreview(_ record: RedactionPreviewRecord) -> RedactionPreview {
-        RedactionPreview(
-            pages: record.pages.map { page in
-                RedactionPagePreview(
-                    page: Int(page.page),
-                    characters: Int(page.characters),
-                    textPreview: page.textPreview,
-                    graphics: Int(page.graphics)
-                )
-            },
-            removedCharacters: Int(record.removedCharacters)
-        )
-    }
-
-    private static func redactionReport(_ record: RedactionReportRecord) -> RedactionReport {
-        RedactionReport(
-            destinationPath: record.destinationPath,
-            backupPath: record.backupPath,
-            pages: record.pages.map { page in
-                RedactionPageReport(
-                    page: Int(page.page),
-                    removedCharacters: Int(page.removedCharacters),
-                    removedGraphics: Int(page.removedGraphics),
-                    rasterized: page.rasterized,
-                    fillMarks: Int(page.fillMarks)
-                )
-            },
-            removedCharacters: Int(record.removedCharacters),
-            outputBytes: record.outputBytes,
-            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
-            verified: record.verified,
-            originalUnchanged: record.originalUnchanged
-        )
-    }
-
+    // MARK: - Shell requests
 
     /// One shell request, as the FFI record.
     private static func writeRecords(from requests: [AnnotationWriteRequest]) -> [WriteAnnotationRecord] {

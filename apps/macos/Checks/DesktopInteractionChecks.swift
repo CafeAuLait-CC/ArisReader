@@ -88,6 +88,9 @@ extension ReaderChecks {
             fatalError("FAIL: the canvas-menu check could not select the fixture's text")
         }
         let withSelection = CanvasContextMenu.items(state: state, at: point)
+        require(!withSelection.contains(where: {
+                    $0.title.localizedCaseInsensitiveContains("redact")
+                }), "the canvas menu offers no redaction command; redaction lives in Edit")
         for action in textActions {
             guard let item = withSelection.first(where: { $0.action == action }) else {
                 fatalError("FAIL: a canvas menu with a selection is missing \(action)")

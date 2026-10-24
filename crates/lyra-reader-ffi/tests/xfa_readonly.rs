@@ -223,14 +223,6 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
         ),
     );
     expect_read_only(
-        "redact_to_copy",
-        read_only(document.redact_to_copy(dest(), vec![]).map(|_| ())),
-    );
-    expect_read_only(
-        "replace_with_redactions",
-        read_only(document.replace_with_redactions(vec![]).map(|_| ())),
-    );
-    expect_read_only(
         "apply_content_edit",
         read_only(
             document

@@ -25,9 +25,8 @@ import QuartzCore
 final class AnnotationOverlayView: NSView {
     private let container = CALayer()
     private let marksLayer = CALayer()
-    private let redactionsLayer = CALayer()
     private let liveLayer = CALayer()
-    /// Every layer this view added below the three content layers, so a rebuild removes exactly
+    /// Every layer this view added below the content layers, so a rebuild removes exactly
     /// its own output and nothing else.
     private var markLayers: [CALayer] = []
 
@@ -35,7 +34,6 @@ final class AnnotationOverlayView: NSView {
     /// page-local range it shows (`sourceTopPt`/`sourceHeightPt`).
     private var framesList: [PagePlacement] = []
     private var marks: [CanvasAnnotationMark] = []
-    private var redactionMarks: [CanvasRedactionMark] = []
     private var zoom: CGFloat = 1
     private var scrollYPt: CGFloat = 0
     private var contentWidthPt: CGFloat = 0
@@ -57,7 +55,6 @@ final class AnnotationOverlayView: NSView {
         layer?.isGeometryFlipped = true
         layer?.addSublayer(container)
         container.addSublayer(marksLayer)
-        container.addSublayer(redactionsLayer)
         container.addSublayer(liveLayer)
         container.anchorPoint = CGPoint(x: 0, y: 0)
         container.position = .zero
@@ -104,23 +101,7 @@ final class AnnotationOverlayView: NSView {
             rebuildMarkLayers()
             renderLive()
         }
-        if framesChanged {
-            rebuildRedactionLayers()
-        }
         updateTransform()
-    }
-
-    /// Draws the redaction rectangles that are still pending.
-    ///
-    /// A pending mark is not an annotation: it is a warning that this area will be removed if
-    /// the reader confirms. The fill is dark and the outline is dashed so it can never be
-    /// mistaken for the finished black mark.
-    func updateRedactions(_ marks: [CanvasRedactionMark], frames: [PagePlacement]) {
-        let framesChanged = frames != framesList
-        self.framesList = frames
-        guard marks != redactionMarks || framesChanged else { return }
-        self.redactionMarks = marks
-        rebuildRedactionLayers()
     }
 
     // MARK: - Page-local ↔ content
@@ -194,30 +175,6 @@ final class AnnotationOverlayView: NSView {
             result.append(clip)
         }
         return result
-    }
-
-    // MARK: - Redactions
-
-    private func rebuildRedactionLayers() {
-        redactionsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        for mark in redactionMarks {
-            let rect = CGRect(x: mark.rect.minX, y: mark.rect.minY,
-                              width: mark.rect.width, height: mark.rect.height)
-            let path = CGPath(rect: rect, transform: nil)
-            let layers = clippedContentLayers(
-                for: path,
-                page: mark.page,
-                stroke: NSColor.systemRed.withAlphaComponent(0.9),
-                fill: NSColor(calibratedWhite: 0.08, alpha: 0.55),
-                lineWidth: 1.2 / max(zoom, 0.01)
-            )
-            for layer in layers {
-                if let shape = layer.sublayers?.first as? CAShapeLayer {
-                    shape.lineDashPattern = [4, 3]
-                }
-                redactionsLayer.addSublayer(layer)
-            }
-        }
     }
 
     // MARK: - Hit testing

@@ -263,7 +263,6 @@ public struct ReaderWindow: View {
                 annotationPageFrames: state.canvasPageSegments,
                 translationOverlays: state.translationOverlays,
                 translationPaperColors: state.translationPaperColors,
-                redactionMarks: state.pendingRedactionMarks,
                 annotationTool: state.annotationTool,
                 regionSelectionArmed: state.regionSelectionArmed,
                 onRegionSelection: { page, rect in
@@ -288,9 +287,6 @@ public struct ReaderWindow: View {
                             lineEnd: draft.lineEnd
                         )
                     }
-                },
-                onRedactionDraft: { page, rect in
-                    state.addPendingRedaction(page: page, rect: rect)
                 },
                 // The eraser's mode owns the pointer, but all of its geometry and undo live in
                 // AppState like every other edit. Hover drives the pre-erase halo only.
@@ -412,14 +408,12 @@ public struct ReaderWindow: View {
             if state.isReadOnlyDocument
                 || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
-                || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil
                 || state.eraserRefusalNotice != nil
                 || state.regionRefusalMessage != nil
                 || state.translationNotice != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
-                    if !state.pendingRedactions.isEmpty { redactionBanner }
                     if state.formHasPendingChanges { formBanner }
                     if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner
@@ -638,43 +632,6 @@ public struct ReaderWindow: View {
     /// The form session's version of the page-edit banner: the same raised panel, the same
     /// warning icon and the same sentence about the file on disk. It says exactly which fields
     /// changed and never calls the file saved.
-    private var redactionBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "rectangle.dashed")
-                .foregroundStyle(Color.red)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Redactions pending")
-                    .font(.callout.weight(.semibold))
-                Text(
-                    "\(state.pendingRedactions.count) area(s) on \(state.pendingRedactionPageCount) page(s)"
-                        + " · nothing has been removed yet; the file on disk is unchanged"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Divider().frame(height: 24)
-            Button("Apply to Copy…") { state.presentApplyRedactionsPanel() }
-                .disabled(!state.canApplyRedactions)
-            Button("Replace Original…") { state.presentReplaceRedactionsConfirmation() }
-                .disabled(!state.canReplaceOriginalWithRedactions)
-                .help(state.isReadOnlyDocument
-                      ? (state.readOnlyReason ?? state.readOnlyBannerTitle)
-                      : "Replace the original file with the redacted version")
-            Button("Clear") { state.clearPendingRedactions() }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.red.opacity(0.5), lineWidth: 1)
-        )
-        .shadow(radius: 3, y: 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Redactions pending. Nothing has been removed from the file yet.")
-    }
-
     private var formBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "signature")
