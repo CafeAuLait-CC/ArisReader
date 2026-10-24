@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use crate::openai::stream_options_unsupported;
 use crate::provider::AiError;
 
 /// Largest amount of page text placed in one request. Long documents are split into parts; a
@@ -611,6 +612,7 @@ pub fn build_merge_plan(request: MergePlanRequest) -> Result<ChatPlan, AiError> 
         &system,
         &user,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let note = Some(format!(
         "This consolidation is a separate request built from {} part summaries. Nothing is sent until you press Send.",
@@ -643,6 +645,106 @@ pub fn build_merge_plan(request: MergePlanRequest) -> Result<ChatPlan, AiError> 
         }],
         source_pages: pages,
         note,
+        sources: Vec::new(),
+        history_turns: 0,
+    })
+}
+
+/// A one-shot prompt with no document context: the manual endpoint probe's input.
+///
+/// It exists so the probe can drive the real request builder (the same [`ChatPart::wire_body`]
+/// the app previews and sends) without inventing a second JSON encoder in the CLI. It is not a
+/// document action: there are no pages, retrieval or history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptPlanRequest {
+    /// Exactly the text the user typed. It is sent as the user message.
+    pub prompt: String,
+    /// An optional PNG, already read and bounded by the caller, sent as an `image_url` data URL.
+    pub image: Option<ChatImage>,
+    /// Whether the body asks the provider to stream. The probe defaults to true.
+    pub stream: bool,
+    pub settings: ChatSettings,
+}
+
+/// The system message for a plain probe prompt. It asks for a direct answer without pretending
+/// this is a document action.
+pub const PROMPT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Answer the user's request directly and concisely.";
+
+/// Build one plain prompt as a [`ChatPlan`].
+///
+/// This is deliberately small: it validates the settings and the local input, then delegates the
+/// whole wire body to the same `make_wire_body` path every app action uses, including the image
+/// data-URL branch. The probe's request is therefore evidence about the real client, not about a
+/// hand-written HTTP call.
+pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError> {
+    let (endpoint, model, temperature, max_tokens, reasoning) =
+        validate_settings(&request.settings)?;
+    if request.prompt.trim().is_empty() {
+        return Err(empty_context("The prompt is empty; nothing was sent."));
+    }
+    if let Some(image) = &request.image {
+        if image.png.is_empty() {
+            return Err(empty_context(
+                "The attached image is empty; nothing was sent.",
+            ));
+        }
+        if image.png.len() > MAX_REGION_IMAGE_BYTES {
+            return Err(empty_context(format!(
+                "The attached image is larger than {} MiB; nothing was sent.",
+                MAX_REGION_IMAGE_BYTES / (1024 * 1024)
+            )));
+        }
+        if image.width_px == 0 || image.height_px == 0 {
+            return Err(empty_context(
+                "The attached image has no pixel dimensions; nothing was sent.",
+            ));
+        }
+    }
+
+    let system_prompt = PROMPT_SYSTEM_PROMPT.to_string();
+    let request_characters =
+        (system_prompt.chars().count() + request.prompt.chars().count()) as u64;
+    let wire_body = make_wire_body_with_stream(
+        &model,
+        temperature,
+        max_tokens,
+        reasoning.as_ref(),
+        &system_prompt,
+        &request.prompt,
+        request.image.as_ref(),
+        request.stream,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
+    );
+    Ok(ChatPlan {
+        // A plain prompt has no one-shot document action; the variant is a preview label and a
+        // mock-provider hint only, and `run_plan` never reads it.
+        action: Action::DocumentChat,
+        document_title: "Manual endpoint probe".to_string(),
+        page_count: 0,
+        base_url: endpoint.base_url,
+        endpoint: endpoint.endpoint,
+        host: endpoint.host,
+        is_local: endpoint.is_local,
+        model,
+        temperature,
+        max_tokens,
+        parts: vec![ChatPart {
+            index: 0,
+            total: 1,
+            label: "Probe prompt".to_string(),
+            pages: Vec::new(),
+            primary_page: 0,
+            page_characters: 0,
+            request_characters,
+            system_prompt,
+            user_prompt: request.prompt.clone(),
+            image: request.image.clone(),
+            wire_body,
+            note: None,
+        }],
+        source_pages: Vec::new(),
+        note: None,
         sources: Vec::new(),
         history_turns: 0,
     })
@@ -924,6 +1026,7 @@ pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, A
                 .push_str(&page.text);
         }
         let mut plan = build_plan(part_request)?;
+        let include_stream_options = !stream_options_unsupported(&plan.endpoint, &plan.model);
         for part in &mut plan.parts {
             part.index = index as u32;
             part.total = total;
@@ -944,6 +1047,7 @@ pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, A
                     &part.system_prompt,
                     &part.user_prompt,
                     None,
+                    include_stream_options,
                 );
             }
         }
@@ -1004,6 +1108,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
 
     let mut builder = PlanBuilder {
         request: &request,
+        endpoint: &endpoint.endpoint,
         model: &model,
         temperature,
         max_tokens,
@@ -1078,6 +1183,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
 
 struct PlanBuilder<'a> {
     request: &'a PlanRequest,
+    endpoint: &'a str,
     model: &'a str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
@@ -1443,6 +1549,7 @@ impl PlanBuilder<'_> {
             &system_prompt,
             &user_prompt,
             None,
+            !stream_options_unsupported(self.endpoint, self.model),
         );
         ChatPart {
             index,
@@ -1461,6 +1568,7 @@ impl PlanBuilder<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_wire_body(
     model: &str,
     temperature: Option<f32>,
@@ -1469,6 +1577,34 @@ fn make_wire_body(
     system_prompt: &str,
     user_prompt: &str,
     image: Option<&ChatImage>,
+    include_stream_options: bool,
+) -> String {
+    make_wire_body_with_stream(
+        model,
+        temperature,
+        max_tokens,
+        reasoning,
+        system_prompt,
+        user_prompt,
+        image,
+        true,
+        include_stream_options,
+    )
+}
+
+/// The shared body builder with an explicit `stream` flag. Every app action passes `true`
+/// through [`make_wire_body`]; the manual probe may ask for one complete JSON response instead.
+#[allow(clippy::too_many_arguments)]
+fn make_wire_body_with_stream(
+    model: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    reasoning: Option<&ReasoningRequest>,
+    system_prompt: &str,
+    user_prompt: &str,
+    image: Option<&ChatImage>,
+    stream: bool,
+    include_stream_options: bool,
 ) -> String {
     let mut object = serde_json::Map::new();
     object.insert("model".to_string(), serde_json::json!(model));
@@ -1494,7 +1630,18 @@ fn make_wire_body(
             { "role": "user", "content": user_content },
         ]),
     );
-    object.insert("stream".to_string(), serde_json::json!(true));
+    object.insert("stream".to_string(), serde_json::json!(stream));
+    if stream && include_stream_options {
+        // OpenAI-compatible streaming responses only carry a token-usage chunk when this
+        // standard option is requested. Without it the panel's usage summary is empty on
+        // providers that follow the OpenAI shape (including local MLX servers); DeepSeek and
+        // OpenAI both accept it. A non-streaming request must not send it, and a server that
+        // rejected it once gets a body without it from then on.
+        object.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
     if let Some(temperature) = temperature {
         object.insert("temperature".to_string(), serde_json::json!(temperature));
     }
@@ -2099,6 +2246,7 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         &system,
         &user,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let request_characters = (system.chars().count() + user.chars().count()) as u64;
     let page_characters = context.chars().count() as u64;
@@ -2476,6 +2624,7 @@ Keep the selected region central. Connect it to the related source passages when
         &system,
         &user,
         image_used.then_some(request.image.as_ref()).flatten(),
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let request_characters = (system.chars().count() + user.chars().count()) as u64;
     let page_characters = (text.chars().count() + related.chars().count()) as u64;
@@ -3038,6 +3187,7 @@ fn build_summary_unit_plan(
         &system_prompt,
         &user_prompt,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let note = coverage_note(request.layer, unit, coverage, request.page_count);
     let primary_page = coverage.pages.first().copied().unwrap_or(1);

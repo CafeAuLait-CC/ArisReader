@@ -19,6 +19,7 @@
 //! lyra-reader-cli tables <file.pdf>... [--pages N] [--all]
 //! lyra-reader-cli metadata <file.pdf> [--bibtex]
 //! lyra-reader-cli eval [--body-pages N] [--save-baseline FILE] [--compare FILE]
+//! lyra-reader-cli ai probe --base-url URL --model MODEL --prompt TEXT [options]
 //! ```
 
 use lyra_reader_core::Rect;
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod ai;
 mod bench;
 mod eval;
 mod xfa;
@@ -62,6 +64,13 @@ Usage:
                  [--save-baseline FILE]          and/or LYRA_READER_EVAL_PAPERS): citations detected
                  [--compare FILE]                vs resolved, captions that do not close, and table
                                                  grid regions; writes versioned JSON baselines
+  lyra-reader-cli ai probe --base-url URL        manual real-endpoint check: stream one plain
+                 --model MODEL --prompt TEXT     prompt (and optionally one PNG) through the same
+                 [--api-key KEY] [--image P.png] request builder, transport and SSE parser the
+                 [--max-tokens N] [--stream]     app uses. It sends your prompt and picture to the
+                 [--no-stream] [--yes-remote]    endpoint you name; never run it from tests or CI.
+                                                 It refuses a non-loopback host unless --yes-remote
+                                                 is passed. Run `ai probe --help` for details.
   lyra-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
   lyra-reader-cli xfa <file.pdf> --out <dir>  decrypt the XFA packets, write them to <dir>,
@@ -164,6 +173,7 @@ fn main() -> ExitCode {
         Some("tables") => cmd_tables(rest(&args)),
         Some("metadata") => cmd_metadata(rest(&args)),
         Some("eval") => eval::run(rest(&args)),
+        Some("ai") => ai::run(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -199,6 +209,9 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--json"
                 | "--all"
                 | "--include-tj-adjustments"
+                | "--stream"
+                | "--no-stream"
+                | "--yes-remote"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;

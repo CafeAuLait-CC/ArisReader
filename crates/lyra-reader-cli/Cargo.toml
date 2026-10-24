@@ -14,6 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+lyra-reader-ai = { workspace = true }
 lyra-reader-text = { path = "../lyra-reader-text" }
 lyra-reader-metadata = { workspace = true }
 lyra-reader-core = { workspace = true }
