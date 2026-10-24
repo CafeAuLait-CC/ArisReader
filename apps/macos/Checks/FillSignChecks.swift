@@ -6,17 +6,11 @@ import LyraReaderKit
 import PDFKit
 import SwiftUI
 
-/// The Fill & Sign row and inspector, end to end.
-///
-/// Fill & Sign is a sub-toolbar row now. The seven items come from the same
-/// `AppState.fillSignRowCommands` the row lays out; the Signature inspector keeps the one real
-/// `NSMenu` AppKit needs for the Continuity Camera handoff. These checks drive the row's tools,
-/// place marks onto a real page and inspect the real annotation cache. The one thing they cannot
-/// exercise is the device handoff itself — that needs a paired iPhone/iPad. They do check the
-/// menu identifier AppKit requires and the `readSelectionFromPasteboard:` path the system calls,
-/// with a pasteboard the check fills itself.
+/// Exercises Fill & Sign placement and the real Continuity image requestor in a window.
+/// Device discovery and the iPhone/iPad sketch board still require physical-device verification.
 extension ReaderChecks {
     @MainActor static func fillSignChecks(root: URL) async throws {
+        _ = NSApplication.shared
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
             .appendingPathComponent("lyra-reader-fillsign-\(UUID())")
@@ -112,35 +106,13 @@ extension ReaderChecks {
         require(!state.fillSignInspectorVisible,
                 "the inspector is absent before a Fill & Sign tool is armed")
 
-        // The only real NSMenu left is the Signature inspector's continuity pop-up.
         let controller = FillSignCommandController(state: state)
-        let signatureMenu = controller.makeSignatureMethodMenu()
-        require(signatureMenu.autoenablesItems == false,
-                "the Signature method menu owns its enabled state (no AppKit guessing)")
-        require(signatureMenu.items.map(\.title)
-                    == ["Type", "Draw", "Image…", "From iPhone or iPad"],
-                "the Signature inspector's methods are Type, Draw, Image…, From iPhone or iPad")
-        require(Array(signatureMenu.items.prefix(3).map(\.toolTip))
-                    .allSatisfy { $0?.contains("annotation until you save") == true },
-                "the three picture methods say they place an annotation until saved")
-        let continuity = signatureMenu.items[3]
-        require(continuity.identifier?.rawValue == "NSMenuItemImportFromDeviceIdentifier",
-                "the continuity item carries NSMenuItemImportFromDeviceIdentifier")
-        require(continuity.identifier == NSMenuItem.importFromDeviceIdentifier,
-                "the continuity identifier is the AppKit constant, not a look-alike")
-        guard let continuityAction = continuity.action else {
-            require(false, "the continuity item has an action")
-            return
-        }
-        require(NSStringFromSelector(continuityAction) == "readSelectionFromPasteboard:",
-                "the continuity item's action is the NSServicesMenuRequestor selector")
-        require((continuity.target as? FillSignCommandController) === controller,
-                "the continuity item targets the receiving controller")
-        require(continuity.toolTip?.contains("annotation until you save") == true,
-                "the continuity item says the sketch becomes an annotation until saved")
         require(state.fillSignSignatureMethods.map(\.title)
                     == ["Type", "Draw", "Image…", "From iPhone or iPad"],
-                "the state exposes the same four methods the inspector draws")
+                "the Signature inspector exposes all four methods")
+        require(state.fillSignSignatureMethods.allSatisfy {
+                    $0.help.contains("annotation until you save")
+                }, "every signature method explains that it places an annotation until saved")
 
         let stampStyles = AppState.StampStyle.allCases
         require(!stampStyles.isEmpty
@@ -391,19 +363,26 @@ extension ReaderChecks {
         require(!state.annotations.contains(where: { $0.id == drawnAnnotation.id }),
                 "undo removes a drawn signature")
 
-        // ── 8. Continuity: the identifier is present; the receive path works ───────────
-        // The device handoff itself cannot run here: there is no paired iPhone/iPad. The
-        // check fills a pasteboard the same way macOS does and calls the exact protocol
-        // method the system calls after the sketch arrives.
-        require(continuity.identifier == NSMenuItem.importFromDeviceIdentifier,
-                "the continuity row is wired with the identifier AppKit recognises")
+        // ── 8. Discover and deliver through the actual window's first responder ───────
+        let requestor = ContinuitySignatureRequestor(controller: controller)
+        let continuityWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 160),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        continuityWindow.isReleasedWhenClosed = false
+        continuityWindow.contentView = requestor
+        defer { continuityWindow.close() }
+        require(requestor.beginRequest(), "Continuity installs its requestor in a real window")
+        let receiver = continuityWindow.firstResponder?.validRequestor(
+            forSendType: nil, returnType: .tiff) as? NSServicesMenuRequestor
+        require((receiver as? ContinuitySignatureRequestor) === requestor,
+                "AppKit discovers the image receiver through the window's responder chain")
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-fillsign-\(UUID())"))
-        pasteboard.clearContents()
+        defer { pasteboard.releaseGlobally() }
         pasteboard.setData(picture, forType: .png)
-        require(controller.receiveContinuitySelection(pasteboard),
-                "the continuity requestor accepts a pasted sketch")
+        require(receiver?.readSelection?(from: pasteboard) == true,
+                "the discovered Services requestor accepts a returned sketch")
         require(state.pendingSignatureImageData == picture,
-                "the pasted sketch becomes the armed signature image")
+                "the returned sketch becomes the armed signature image")
         require(state.placeSignature(atContentPoint: contentPoint(state, CGPoint(x: 560, y: 480))),
                 "the received sketch places as a signature image")
         require(state.annotations.last?.kind == .signature,
@@ -435,6 +414,10 @@ extension ReaderChecks {
         require(encryptedState.fillSignRowCommands.allSatisfy {
                     $0.help.localizedCaseInsensitiveContains("encrypted")
                 }, "every disabled encrypted row item explains the encryption")
+
+        try await continuitySignatureChecks(
+            state: state, refusedState: xfaState, encryptedState: encryptedState,
+            fixture: plain, picture: picture)
 
         // Signed: placements are allowed (the cache is written to a copy), while the form
         // writes into the original stay disabled with the signature reason. The row items are
@@ -539,7 +522,7 @@ extension ReaderChecks {
                     == "Replaced",
                 "the first keystroke replaces the date instead of appending to it")
 
-        print("NOTE: the Continuity Camera handoff itself needs a paired iPhone/iPad; "
-                + "only its menu identifier and pasteboard receive path ran here.")
+        print("NOTE: Continuity device discovery and the sketch board need a paired iPhone/iPad; "
+                + "this automated check covers the responder chain and image delivery contract.")
     }
 }

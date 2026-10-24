@@ -643,24 +643,9 @@ extension ReaderChecks {
 
         // ── 10. Continuity is hosted in the inspector and still wired ────────────────────
         let controller = FillSignCommandController(state: state)
-        let methodMenu = controller.makeSignatureMethodMenu()
-        let continuity = methodMenu.items.first {
-            $0.identifier == NSMenuItem.importFromDeviceIdentifier
-        }
-        guard let continuity else {
-            require(false, "the Signature inspector hosts the Continuity item")
-            return
-        }
-        require(continuity.identifier?.rawValue == "NSMenuItemImportFromDeviceIdentifier",
-                "the inspector's continuity item keeps AppKit's identifier")
-        if let action = continuity.action {
-            require(NSStringFromSelector(action) == "readSelectionFromPasteboard:",
-                    "the inspector's continuity item uses the NSServicesMenuRequestor selector")
-        } else {
-            require(false, "the inspector's continuity item has an action")
-        }
-        require((continuity.target as? FillSignCommandController) === controller,
-                "the inspector's continuity item targets the receiving controller")
+        let requestor = ContinuitySignatureRequestor(controller: controller)
+        require(requestor.title == "From iPhone or iPad",
+                "the Signature inspector retains its device entry")
         let inspectorSource = try String(
             contentsOf: root.appendingPathComponent(
                 "apps/macos/Sources/LyraReaderKit/FillSignInspector.swift"),
@@ -680,7 +665,14 @@ extension ReaderChecks {
         NSGraphicsContext.restoreGraphicsState()
         pasteboard.setData(png.representation(using: .png, properties: [:])!, forType: .png)
         state.selectFillSignTool(.signature)
-        require(controller.receiveContinuitySelection(pasteboard),
+        let requestorWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        requestorWindow.isReleasedWhenClosed = false
+        requestorWindow.contentView = requestor
+        defer { requestorWindow.close(); pasteboard.releaseGlobally() }
+        require(requestor.beginRequest(), "the inspector's device button becomes the requestor")
+        require(requestor.readSelection(from: pasteboard),
                 "the continuity requestor accepts a sketch from the pasteboard")
         require(state.pendingSignatureImageData != nil,
                 "the received sketch becomes the armed signature image")

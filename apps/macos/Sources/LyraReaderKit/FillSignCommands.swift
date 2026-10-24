@@ -2,13 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Runs the Fill & Sign inspector's commands and builds the one small AppKit menu it needs.
-///
-/// Fill & Sign is a sub-toolbar row, not a menu. The only real `NSMenu` left is the Signature
-/// inspector's "From iPhone or iPad" pop-up: AppKit's Continuity Camera handoff requires an
-/// `NSMenuItem` carrying `NSMenuItemImportFromDeviceIdentifier` and the
-/// `NSServicesMenuRequestor` action, and a look-alike SwiftUI button cannot receive the sketch.
-/// The other three methods are ordinary buttons in the inspector and call ``dispatch(_:)``.
+/// Runs the Fill & Sign inspector's signature and image commands.
 @MainActor
 package final class FillSignCommandController: NSObject {
     package let state: AppState
@@ -16,58 +10,6 @@ package final class FillSignCommandController: NSObject {
     package init(state: AppState) {
         self.state = state
         super.init()
-    }
-
-    // MARK: - The continuity menu
-
-    /// The four Signature methods as a real menu, in #153's submenu order.
-    package func makeSignatureMethodMenu() -> NSMenu {
-        let menu = NSMenu(title: "Signature")
-        menu.autoenablesItems = false
-        for command in state.fillSignSignatureMethods {
-            menu.addItem(makeSignatureMethodItem(command))
-        }
-        return menu
-    }
-
-    /// The one item the inspector's pop-up shows. Exposed so the checks can assert the
-    /// identifier, selector and target AppKit requires without opening a menu.
-    package func makeContinuityMenuItem() -> NSMenuItem {
-        let command = state.fillSignSignatureMethods.first { $0.action == .continuity }
-            ?? SignatureMethodCommand(
-                action: .continuity, title: "From iPhone or iPad",
-                icon: "iphone.and.arrow.forward", enabled: false, help: "")
-        return makeSignatureMethodItem(command)
-    }
-
-    private func makeSignatureMethodItem(_ command: SignatureMethodCommand) -> NSMenuItem {
-        let item = NSMenuItem(title: command.title,
-                              action: #selector(performMenuAction(_:)),
-                              keyEquivalent: "")
-        item.target = self
-        item.representedObject = "signature-\(command.action.rawValue)"
-        item.isEnabled = command.enabled
-        item.toolTip = command.help
-        if let image = NSImage(systemSymbolName: command.icon, accessibilityDescription: nil) {
-            image.isTemplate = true
-            item.image = image
-        }
-        if command.action == .continuity {
-            // AppKit looks for this identifier and replaces the row with the paired devices'
-            // sketch entry. The action must be the NSServicesMenuRequestor method.
-            item.identifier = NSMenuItem.importFromDeviceIdentifier
-            item.action = #selector(receiveContinuitySelection(_:))
-        }
-        return item
-    }
-
-    /// Menu actions run after the menu has closed: the transient menu must not own a modal
-    /// dialog's event loop.
-    @objc private func performMenuAction(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.dispatch(id)
-        }
     }
 
     /// Runs a signature method (or a form command) with a stable id. Exposed to the checks so
@@ -80,11 +22,6 @@ package final class FillSignCommandController: NSObject {
             chooseDrawnSignature()
         case "signature-image":
             chooseSignatureImage()
-        case "signature-continuity":
-            // AppKit normally replaces this row with the paired device submenu. If the action
-            // is reached without a device, say why rather than doing nothing.
-            state.statusMessage = "No iPhone or iPad sketch was received"
-            NSSound.beep()
         case "save-filled-copy":
             state.performFillAndSignCommand("save-filled-copy")
         case "write-form-values":
@@ -141,24 +78,13 @@ package final class FillSignCommandController: NSObject {
         state.armSignatureTool(imageData: data)
     }
 
-    /// The Continuity Camera path: macOS hands the sketch over on a pasteboard after the reader
-    /// finishes it on the paired device.
-    ///
-    /// This is `NSServicesMenuRequestor.readSelectionFromPasteboard:`. The Objective-C selector
-    /// is pinned explicitly rather than depending on the Swift importer's name for it: recent
-    /// SDKs call the method `readSelection(from:)`, older ones
-    /// `readSelectionFromPasteboard(_:)`, and the selector AppKit sends is the same either way.
-    /// TIFF is the usual transport; the writer accepts PNG or JPEG, so convert when needed.
-    @objc(readSelectionFromPasteboard:)
+    /// Called by the Continuity requestor after it has verified the originating document.
+    /// Validate before arming: a cancelled or unreadable sketch must preserve the current tool.
     package func receiveContinuitySelection(_ pasteboard: NSPasteboard) -> Bool {
-        prepareSignatureTool()
-        guard state.canPlaceFillSignAnnotation else {
-            state.lastError = state.fillSignPlacementRefusal
-            return false
-        }
+        guard state.canPlaceFillSignAnnotation else { return false }
+        guard !(pasteboard.types ?? []).isEmpty else { return false }
         guard let data = Self.imageData(from: pasteboard) else {
             state.lastError = "The sketch from the device could not be read as an image."
-            state.statusMessage = "No signature sketch was received"
             return false
         }
         state.armSignatureTool(imageData: data)
@@ -167,31 +93,37 @@ package final class FillSignCommandController: NSObject {
     }
 
     static func imageData(from pasteboard: NSPasteboard) -> Data? {
+        // Services may return PNG, JPEG or TIFF. Decode every payload before passing it to
+        // the PDF writer, including file URLs; a nonempty pasteboard is not necessarily an image.
+        for type in [NSPasteboard.PasteboardType.png,
+                     NSPasteboard.PasteboardType(UTType.jpeg.identifier), .tiff] {
+            if let data = pasteboard.data(forType: type),
+               let result = validatedImageData(data, type: type) { return result }
+        }
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
             .urlReadingContentsConformToTypes: [UTType.png.identifier, UTType.jpeg.identifier],
         ]
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options)
-            as? [URL], let url = urls.first,
-           let data = try? Data(contentsOf: url), !data.isEmpty {
-            return data
+            as? [URL], let url = urls.first, url.isFileURL,
+           let data = try? Data(contentsOf: url) {
+            return validatedImageData(data, type: nil)
         }
-        if let data = pasteboard.data(forType: .png), !data.isEmpty { return data }
-        if let data = pasteboard.data(forType: .tiff), !data.isEmpty {
-            return pngData(from: data)
-        }
-        let jpegType = NSPasteboard.PasteboardType(UTType.jpeg.identifier)
-        if let data = pasteboard.data(forType: jpegType), !data.isEmpty { return data }
-        if let string = pasteboard.string(forType: .fileURL),
-           let url = URL(string: string),
-           let data = try? Data(contentsOf: url), !data.isEmpty {
-            return data
+        // Match the full set of image return types advertised by the requestor. AppKit may
+        // negotiate another image representation; normalize it to the writer's PNG format.
+        if pasteboard.canReadItem(withDataConformingToTypes: NSImage.imageTypes),
+           let image = NSImage(pasteboard: pasteboard), let tiff = image.tiffRepresentation {
+            return validatedImageData(tiff, type: .tiff)
         }
         return nil
     }
 
-    private static func pngData(from data: Data) -> Data? {
-        guard let rep = NSBitmapImageRep(data: data) else { return nil }
+    private static func validatedImageData(
+        _ data: Data, type: NSPasteboard.PasteboardType?
+    ) -> Data? {
+        guard let rep = NSBitmapImageRep(data: data), rep.pixelsWide > 0,
+              rep.pixelsHigh > 0 else { return nil }
+        if type == .png || type?.rawValue == UTType.jpeg.identifier { return data }
         return rep.representation(using: .png, properties: [:])
     }
 
@@ -218,53 +150,6 @@ package final class FillSignCommandController: NSObject {
         guard panel.runModal() == .OK, let url = panel.url,
               let data = try? Data(contentsOf: url), !data.isEmpty else { return }
         state.armPicturePlacement(imageData: data)
-    }
-}
-
-/// The Signature inspector's Continuity Camera button.
-///
-/// It is a pull-down `NSPopUpButton` whose menu holds the real
-/// `NSMenuItemImportFromDeviceIdentifier` item. AppKit only replaces the item with the paired
-/// devices' sketch entry when it is inside an actual menu being tracked, which is why this stays
-/// AppKit rather than becoming a SwiftUI button.
-package struct SignatureContinuityButton: NSViewRepresentable {
-    package let controller: FillSignCommandController
-    package let enabled: Bool
-
-    package init(controller: FillSignCommandController, enabled: Bool) {
-        self.controller = controller
-        self.enabled = enabled
-    }
-
-    package func makeNSView(context: Context) -> NSPopUpButton {
-        let button = StretchingPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 240, height: 26), pullsDown: true)
-        button.bezelStyle = .rounded
-        button.controlSize = .regular
-        button.font = NSFont.systemFont(ofSize: 12)
-        button.autoenablesItems = false
-        button.addItem(withTitle: "From iPhone or iPad")
-        button.menu?.autoenablesItems = false
-        button.menu?.addItem(controller.makeContinuityMenuItem())
-        button.isEnabled = enabled
-        button.toolTip =
-            "Sign on a paired iPhone or iPad and place the sketch as a signature image"
-        return button
-    }
-
-    package func updateNSView(_ button: NSPopUpButton, context: Context) {
-        button.isEnabled = enabled
-        let item = button.menu?.items.first {
-            $0.identifier == NSMenuItem.importFromDeviceIdentifier
-        }
-        item?.isEnabled = enabled
-    }
-
-    /// A pop-up whose width follows the inspector's column instead of its title.
-    package final class StretchingPopUpButton: NSPopUpButton {
-        package override var intrinsicContentSize: NSSize {
-            NSSize(width: NSView.noIntrinsicMetric, height: 26)
-        }
     }
 }
 
