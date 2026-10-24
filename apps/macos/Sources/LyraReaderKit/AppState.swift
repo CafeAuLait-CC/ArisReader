@@ -403,7 +403,44 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     }
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
-    @Published public var annotationToolsVisible: Bool = false
+    @Published public var annotationToolsVisible: Bool = false {
+        didSet {
+            if annotationToolsVisible { closeOtherSecondaryRows(except: .annotations) }
+        }
+    }
+    /// Whether the Fill & Sign row is expanded. It shares the one secondary-row slot with the
+    /// annotation, Edit and Export rows, so only one of them can be open.
+    @Published public var fillAndSignVisible: Bool = false {
+        didSet {
+            if fillAndSignVisible {
+                closeOtherSecondaryRows(except: .fillAndSign)
+            } else {
+                // The inspector exists only while a Fill & Sign tool is armed. Closing the row
+                // clears the arm, the placement it was waiting for, and the inspector with it.
+                clearFillSignTool()
+            }
+        }
+    }
+    /// Whether the Export row is expanded. Like the other rows it owns the one shared slot and
+    /// its own toolbar button's selected state.
+    @Published public var exportVisible: Bool = false {
+        didSet {
+            if exportVisible { closeOtherSecondaryRows(except: .export) }
+        }
+    }
+    /// The Fill & Sign row item currently armed, if any.
+    ///
+    /// This is deliberately separate from ``annotationTool``: a date, check mark or cross claims
+    /// one click without changing what a drag means, and Signature waits for a method to be
+    /// chosen in the inspector. The inspector is visible exactly when this is non-nil while the
+    /// Fill & Sign row is open.
+    @Published public private(set) var armedFillSignTool: FillSignTool?
+    /// The date style the Date tool places, chosen in the Fill & Sign inspector.
+    @Published public var fillSignDateFormat: FillSignDateFormat = .medium
+    /// The rotation the Date tool places, chosen in the Fill & Sign inspector.
+    @Published public var fillSignDateRotation: FillSignDateRotation = .none
+    /// The initial height of a placed picture, chosen in the Fill & Sign inspector.
+    @Published public var fillSignImageSize: FillSignImageSize = .medium
     /// 100% means actual physical size, scaled by the current screen's calibration.
     @Published public var zoomPercent: Int = 100 {
         willSet {if newValue != zoomPercent,contentTextEditing {commitContentText?()}}
@@ -457,12 +494,19 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
                 return
             }
             if contentEditEnabled {
+                closeOtherSecondaryRows(except: .contentEdit)
                 rightPanelVisible = false
                 performancePanelVisible = false
                 // Edit owns the pointer: a form field that was borrowing the keyboard hands it
                 // back before the content editor starts receiving clicks.
                 blurFormField()
                 cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
+            } else {
+                // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
+                // pointer state, so the inspector (which follows an armed tool) stays closed.
+                contentEditTool = "select"
+                contentEditSelection = nil
+                contentLinkDraft = nil
             }
         }
     }
@@ -4563,11 +4607,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
         let hadMarkSelection = selectedAnnotationID != nil || pendingMarkSelection != nil
+        // A Fill & Sign row item is armed even when it has no placement yet (Signature waits
+        // for a method, Image for a picture). Escape clears the row's armed item and its
+        // inspector before it falls through to the annotation tools.
+        if armedFillSignTool != nil {
+            clearFillSignTool()
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
         // Fill & Sign arms a click, not a drawing tool. Escape drops it first so the next click
         // is the pointer again instead of an unexpected check mark.
         if pendingFillSignPlacement != nil {
             pendingFillSignPlacement = nil
             annotationTool = .select
+            // The armed row item goes with the placement, so the inspector closes too.
+            finishFillSignPlacement()
             statusMessage = "Placement cancelled"
             if hadMarkSelection { clearAnnotationSelection() }
             return true
@@ -4587,6 +4641,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             pendingSignatureImageData = nil
             pendingSignatureIsPicture = false
             annotationTool = .select
+            finishFillSignPlacement()
             statusMessage = "Stamp tool off"
             if hadMarkSelection { clearAnnotationSelection() }
             return true
@@ -4922,7 +4977,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let style = pendingStampStyle,
               let hit = pagePoint(atContentPoint: point) else { return false }
         let placed = addStampAnnotation(page: hit.page, style: style, center: hit.point)
-        if placed { pendingStampStyle = nil; annotationTool = .select }
+        if placed {
+            pendingStampStyle = nil
+            annotationTool = .select
+            finishFillSignPlacement()
+        }
         return placed
     }
 
@@ -4938,6 +4997,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             pendingSignatureImageData = nil
             pendingSignatureIsPicture = false
             annotationTool = .select
+            finishFillSignPlacement()
         }
         return placed
     }
@@ -4981,12 +5041,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                            stampStyle: "signature")
     }
 
-    /// Adds an arbitrary picture as the same `/Stamp`-with-an-image the signature uses, but at
-    /// a larger default size and with the "image" style in the cache.
+    /// Adds an arbitrary picture as the same `/Stamp`-with-an-image the signature uses, at the
+    /// size class chosen in the Fill & Sign inspector (medium is the historical default) and
+    /// with the "image" style in the cache.
     @discardableResult
     public func addPictureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
         addImageAnnotation(page: page, imageData: imageData, center: center,
-                           height: Annotation.defaultPictureHeight,
+                           height: fillSignImageSize.height,
                            stampStyle: "image")
     }
 
@@ -5025,13 +5086,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Text is the one Fill & Sign command that arms a real tool. It also claims the next click
     /// so the box is placed with one click, while the tool's double-click behaviour is kept for
-    /// the toolbar button.
+    /// the toolbar button. The tool is also the Fill & Sign row's armed item, so its inspector
+    /// opens with it and closes when the placement commits or is cancelled.
     public func armFillSignText() {
         guard canPlaceFillSignAnnotation else {
             lastError = fillSignPlacementRefusal
             return
         }
-        annotationToolsVisible = true
+        prepareFillSignTool(.text)
         annotationTool = .textBox
         pendingFillSignPlacement = .text
         statusMessage = "Click the page to place a text box"
@@ -5043,9 +5105,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = fillSignPlacementRefusal
             return
         }
+        prepareFillSignTool(.date)
         annotationTool = .select
         pendingFillSignPlacement = .date
-        statusMessage = "Click the page to place today's date"
+        statusMessage = "Click the page to place \(fillSignDateFormat.title.lowercased()) date"
     }
 
     /// Arms a one-click vector check mark or cross.
@@ -5054,6 +5117,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = fillSignPlacementRefusal
             return
         }
+        prepareFillSignTool(mark == .checkmark ? .checkmark : .cross)
         annotationTool = .select
         pendingFillSignPlacement = mark == .checkmark ? .checkmark : .cross
         statusMessage = "Click the page to place a \(mark.title.lowercased())"
@@ -5074,42 +5138,61 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if placed {
                 pendingFillSignPlacement = nil
                 annotationTool = .select
+                finishFillSignPlacement()
             }
             return placed
         case .date:
             guard placeDateTextBox(atContentPoint: point) else { return false }
             pendingFillSignPlacement = nil
+            finishFillSignPlacement()
             return true
         case .checkmark:
             guard addFillSignMark(.checkmark, page: hit.page, center: hit.point) else {
                 return false
             }
             pendingFillSignPlacement = nil
+            finishFillSignPlacement()
             return true
         case .cross:
             guard addFillSignMark(.cross, page: hit.page, center: hit.point) else {
                 return false
             }
             pendingFillSignPlacement = nil
+            finishFillSignPlacement()
             return true
         case .drawnSignature(let signature):
             guard addDrawnSignature(signature, page: hit.page, center: hit.point) else {
                 return false
             }
             pendingFillSignPlacement = nil
+            finishFillSignPlacement()
             return true
         }
     }
 
-    /// Places today's date as a text box centred on the click, selected so typing replaces it.
+    /// Places today's date centred on the click, in the style and rotation chosen in the
+    /// inspector. A 0° date is the editable text box #153 placed; a rotated one is rendered to
+    /// a transparent picture and placed through the image `/Stamp` writer, which is the reader's
+    /// only annotation appearance that carries an arbitrary orientation into the saved PDF.
     @discardableResult
     public func placeDateTextBox(atContentPoint point: CGPoint, date: Date = Date()) -> Bool {
         guard canPlaceFillSignAnnotation,
               let hit = pagePoint(atContentPoint: point),
               let placement = visiblePagePlacements.first(where: { $0.index == hit.page })
         else { return false }
-        let text = FillSignDate.mediumString(for: date)
+        let text = fillSignDateFormat.string(for: date)
         guard !text.isEmpty else { return false }
+        if fillSignDateRotation.isRotated {
+            guard let data = FillSignDatePictureRenderer.pngData(
+                text: text, rotation: fillSignDateRotation) else { return false }
+            let height = FillSignDatePictureRenderer.placementHeight(
+                text: text, rotation: fillSignDateRotation)
+            guard addImageAnnotation(page: hit.page, imageData: data, center: hit.point,
+                                     height: height, stampStyle: "date") else { return false }
+            statusMessage = "Placed the date as a picture · "
+                + "its \(fillSignDateRotation.title) rotation is kept when saved"
+            return true
+        }
         let fitted = TextBoxLayout.fittedRect(
             text: text,
             fontSize: Annotation.defaultTextBoxFontSize,
@@ -5119,7 +5202,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let box = placementBox(page: hit.page, size: fitted.size, center: hit.point),
               addTextBox(page: hit.page, rect: box, text: text) else { return false }
         editingTextSelectAll = true
-        statusMessage = "Placed today's date · type to replace it"
+        statusMessage = "Placed the date · type to replace it"
         return true
     }
 
@@ -7686,14 +7769,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             && !regionSelectionArmed && editingAnnotationID == nil
     }
 
-    /// The Fill & Sign menu opens whenever a document is open, even when it has no form fields.
-    /// The menu is the button's job; having nothing to fill is said inside it, not by greying
+    /// The Fill & Sign row opens whenever a document is open, even when it has no form fields.
+    /// The row is the button's job; having nothing to fill is said inside it, not by greying
     /// the button out.
-    public var canOpenFillAndSignMenu: Bool { document != nil }
+    public var canOpenFillAndSign: Bool { document != nil }
 
-    /// The toolbar button's tooltip. It names what the menu places, and says where a signed
+    /// The Fill & Sign toolbar button's tooltip. It names the seven tools and where a signed
     /// document keeps the result.
-    public var fillAndSignMenuHelp: String {
+    public var fillAndSignHelp: String {
         if document == nil { return "Fill & Sign · open a PDF first" }
         if isXfaDocument {
             return "Fill & Sign · not available: this XFA form is rendered read-only from its XML"
@@ -7706,10 +7789,44 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return isReadOnlyDocument ? base + " · the signed original is unchanged; save a copy" : base
     }
 
-    /// One command in the Fill & Sign menu's form section.
+    /// The Fill & Sign inspector is visible exactly while this row is open and one of its tools
+    /// is armed. Clearing the tool (Escape, a placed mark, the active row item again) closes it.
+    public var fillSignInspectorVisible: Bool {
+        document != nil && fillAndSignVisible && armedFillSignTool != nil
+    }
+
+    /// The Edit inspector is visible while Edit is open *and* a content tool is armed (or a page
+    /// object is selected with the implicit pointer). Opening Edit alone does not open it.
+    public var contentEditInspectorVisible: Bool {
+        document != nil && contentEditEnabled
+            && (contentEditTool != "select" || contentEditSelection != nil)
+    }
+
+    /// Width the right-hand inspector column takes from the canvas. There is one inspector slot
+    /// and at most one row open, so the two inspectors can never both be visible.
+    public var secondaryInspectorWidth: CGFloat {
+        if fillSignInspectorVisible || contentEditInspectorVisible {
+            return ReaderChrome.editingPanelWidthPt
+        }
+        return 0
+    }
+
+    /// The rows that are open. At most one element; the checks use this rather than the four
+    /// booleans so "one sub-toolbar at a time" is one assertion.
+    public var openSecondaryRows: [SecondaryRow] {
+        var rows: [SecondaryRow] = []
+        if annotationToolsVisible { rows.append(.annotations) }
+        if contentEditEnabled { rows.append(.contentEdit) }
+        if fillAndSignVisible { rows.append(.fillAndSign) }
+        if exportVisible { rows.append(.export) }
+        return rows
+    }
+
+    /// One command in the Fill & Sign inspector's form section.
     ///
-    /// The placement commands are ``FillSignMenuCommand``s above; these are the two form writes
-    /// that have always lived at the bottom of the menu.
+    /// The placement tools are the row; these are the two form writes that lived at the bottom
+    /// of #153's menu. The inspector shows them again, and File carries them for whenever no
+    /// Fill & Sign tool is armed.
     public struct FormMenuCommand: Identifiable, Equatable, Sendable {
         public let id: String
         public let title: String
@@ -7751,80 +7868,49 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return base
     }
 
-    /// The seven placement commands, with their Signature and Stamp submenus, then the two
-    /// form-save commands under a separator.
-    public var fillSignMenuCommands: [FillSignMenuCommand] {
+    /// The seven row items, left to right, with their enabled state and help.
+    public var fillSignRowCommands: [FillSignRowCommand] {
         let enabled = canPlaceFillSignAnnotation
-        let signatureChildren: [FillSignMenuCommand] = [
-            FillSignMenuCommand(
-                id: "signature-type", title: "Type",
-                action: .signatureType, enabled: enabled,
+        let helps: [FillSignTool: String] = [
+            .text: "Place a text box and start typing in it",
+            .signature: "Add a signature: type one, draw one, choose a picture or sign on a device",
+            .date: "Place today's date as a text box, selected so you can type over it",
+            .checkmark: "Place a vector check mark drawn as two ink strokes",
+            .cross: "Place a vector cross drawn as two ink strokes",
+            .stamp: "Place a stamp; the inspector shows the stamp styles",
+            .image: "Place a PNG or JPEG on the page as a picture annotation, not a signature",
+        ]
+        return FillSignTool.rowOrder.map { tool in
+            FillSignRowCommand(
+                tool: tool,
+                title: tool.title,
+                icon: tool.icon,
+                enabled: enabled,
+                help: fillSignPlacementHelp(helps[tool] ?? tool.title))
+        }
+    }
+
+    /// The Signature inspector's four methods, in #153's submenu order.
+    public var fillSignSignatureMethods: [SignatureMethodCommand] {
+        let enabled = canPlaceFillSignAnnotation
+        return [
+            SignatureMethodCommand(
+                action: .type, title: "Type", icon: "keyboard", enabled: enabled,
                 help: fillSignPlacementHelp(
                     "Type your name and place it as an image signature in a handwriting font")),
-            FillSignMenuCommand(
-                id: "signature-draw", title: "Draw",
-                action: .signatureDraw, enabled: enabled,
+            SignatureMethodCommand(
+                action: .draw, title: "Draw", icon: "scribble", enabled: enabled,
                 help: fillSignPlacementHelp(
                     "Draw a signature on a small canvas and place it as an ink annotation")),
-            FillSignMenuCommand(
-                id: "signature-image", title: "Image…",
-                action: .signatureImage, enabled: enabled,
+            SignatureMethodCommand(
+                action: .image, title: "Image…", icon: "photo", enabled: enabled,
                 help: fillSignPlacementHelp(
                     "Place a PNG or JPEG picture of your signature")),
-            FillSignMenuCommand(
-                id: "signature-continuity", title: "From iPhone or iPad",
-                action: .signatureContinuity, enabled: enabled,
+            SignatureMethodCommand(
+                action: .continuity, title: "From iPhone or iPad",
+                icon: "iphone.and.arrow.forward", enabled: enabled,
                 help: fillSignPlacementHelp(
                     "Sign on your iPhone or iPad and place the sketch as a signature image")),
-        ]
-        let stampChildren: [FillSignMenuCommand] = StampStyle.allCases.map { style in
-            FillSignMenuCommand(
-                id: "stamp-\(style.rawValue)", title: style.title,
-                action: .stamp(style), enabled: enabled,
-                help: fillSignPlacementHelp("Place a \(style.title) stamp"),
-                selected: annotationTool == .stamp && pendingStampStyle == style)
-        }
-        let formRefusal = formWriteRefusal
-        return [
-            FillSignMenuCommand(
-                id: "text", title: "Text", action: .text, enabled: enabled,
-                help: fillSignPlacementHelp("Place a text box and start typing in it")),
-            FillSignMenuCommand(
-                id: "signature", title: "Signature", action: .submenu, enabled: enabled,
-                help: fillSignPlacementHelp("Place a picture of a signature"),
-                children: signatureChildren),
-            FillSignMenuCommand(
-                id: "date", title: "Date", action: .date, enabled: enabled,
-                help: fillSignPlacementHelp(
-                    "Place today's date as a text box, selected so you can type over it")),
-            FillSignMenuCommand(
-                id: "checkmark", title: "Checkmark", action: .checkmark, enabled: enabled,
-                help: fillSignPlacementHelp("Place a vector check mark drawn as two ink strokes")),
-            FillSignMenuCommand(
-                id: "cross", title: "Cross", action: .cross, enabled: enabled,
-                help: fillSignPlacementHelp("Place a vector cross drawn as two ink strokes")),
-            FillSignMenuCommand(
-                id: "stamp", title: "Stamp", action: .submenu, enabled: enabled,
-                help: fillSignPlacementHelp("Place a stamp from the styles below"),
-                children: stampChildren),
-            FillSignMenuCommand(
-                id: "image", title: "Image…", action: .image, enabled: enabled,
-                help: fillSignPlacementHelp(
-                    "Place a PNG or JPEG on the page as a picture annotation, not a signature")),
-            FillSignMenuCommand(
-                id: "fill-sign-forms", title: "", action: .separator, enabled: false, help: nil),
-            FillSignMenuCommand(
-                id: "save-filled-copy", title: "Save Filled Form Copy…",
-                action: .saveFilledCopy, enabled: canSaveFilledForm,
-                help: canSaveFilledForm
-                    ? "Write the values in the reader into a copy; the original is unchanged."
-                    : (formRefusal ?? "There are no form changes to save.")),
-            FillSignMenuCommand(
-                id: "write-form-values", title: "Write Form Values to Original…",
-                action: .writeFormValues, enabled: canReplaceOriginalWithFilledForm,
-                help: canReplaceOriginalWithFilledForm
-                    ? "Write the filled values into the original file, with a verified backup first."
-                    : (readOnlyReason ?? formRefusal ?? "There are no form changes to save.")),
         ]
     }
 
@@ -7843,8 +7929,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// The Fill & Sign menu's items. The button is a menu, not a mode switch.
-    public var fillAndSignMenuCommands: [FormMenuCommand] {
+    /// The two form writes, shown in the Fill & Sign inspector's form section and in File.
+    public var fillSignFormCommands: [FormMenuCommand] {
         let refusal = formWriteRefusal
         return [
             FormMenuCommand(
@@ -13604,7 +13690,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // the trailing drawers can cover; scrolling to another band or zooming releases it.
             let drawerWidth = (rightPanelVisible || performancePanelVisible
                 ? ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelWidthPt) : 0)
-                + (contentEditEnabled ? ReaderChrome.editingPanelWidthPt : 0)
+                + secondaryInspectorWidth
             if drawerWidth > 0 || rightPanelLayoutIsMoving {
                 let coveredRight = viewport.maxX + drawerWidth / max(zoomFactor, 0.01)
                     + CGFloat(Self.prefetchColumns + 1) * tilePt
@@ -15258,6 +15344,149 @@ extension AppState {
         annotationTool = .select
         annotationToolsVisible = false
         contentEditSelection = nil
+    }
+
+    /// Opens the Fill & Sign row, or closes it when it is already the open row.
+    ///
+    /// The four secondary rows share one slot, so this is the switch the toolbar button uses:
+    /// opening it closes Annotate, Edit and Export, and closing it clears the armed tool (and
+    /// with it the inspector).
+    public func toggleFillAndSign() {
+        guard canOpenFillAndSign else { return }
+        if fillAndSignVisible {
+            fillAndSignVisible = false
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleFillAndSign() }) {
+            return
+        }
+        pageOverviewVisible = false
+        fillAndSignVisible = true
+        statusMessage = "Fill & Sign · choose a tool; its options appear on the right"
+    }
+
+    /// Opens the Export row, or closes it when it is already the open row.
+    public func toggleExport() {
+        guard document != nil else { return }
+        if exportVisible {
+            exportVisible = false
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleExport() }) {
+            return
+        }
+        pageOverviewVisible = false
+        exportVisible = true
+    }
+
+    /// Choosing a Fill & Sign row item: arm it (opening the row and its inspector), or clear it
+    /// when the same item is clicked again.
+    public func selectFillSignTool(_ tool: FillSignTool) {
+        guard canOpenFillAndSign else { return }
+        if armedFillSignTool == tool {
+            clearFillSignTool()
+            return
+        }
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in
+            self?.selectFillSignTool(tool)
+        }) { return }
+        prepareFillSignTool(tool)
+        switch tool {
+        case .text:
+            annotationTool = .textBox
+            pendingFillSignPlacement = .text
+            statusMessage = "Click the page to place a text box"
+        case .signature:
+            statusMessage = "Choose a signature method in the inspector"
+        case .date:
+            annotationTool = .select
+            pendingFillSignPlacement = .date
+            statusMessage = "Click the page to place the date"
+        case .checkmark:
+            annotationTool = .select
+            pendingFillSignPlacement = .checkmark
+            statusMessage = "Click the page to place a check mark"
+        case .cross:
+            annotationTool = .select
+            pendingFillSignPlacement = .cross
+            statusMessage = "Click the page to place a cross"
+        case .stamp:
+            armStampTool(pendingStampStyle ?? .approved)
+        case .image:
+            annotationTool = .select
+            statusMessage = "Choose an image in the inspector"
+        }
+    }
+
+    /// The Stamp inspector's style grid.
+    public func selectFillSignStamp(_ style: StampStyle) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        prepareFillSignTool(.stamp)
+        armStampTool(style)
+    }
+
+    /// Clears the armed Fill & Sign tool and closes its inspector. Safe to call when none is
+    /// armed; a tool that belongs to the annotation row is left alone unless this row armed it.
+    public func clearFillSignTool() {
+        let hadTool = armedFillSignTool != nil || pendingFillSignPlacement != nil
+        armedFillSignTool = nil
+        pendingFillSignPlacement = nil
+        if annotationTool == .textBox || annotationTool == .stamp || annotationTool == .signature {
+            annotationTool = .select
+        }
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+        if hadTool { statusMessage = "Fill & Sign tool cleared" }
+    }
+
+    /// The row-level setup every Fill & Sign entry point shares: the row owns the slot, the
+    /// inspector takes the right-hand drawer, and the armed item is the inspector's gate.
+    private func prepareFillSignTool(_ tool: FillSignTool) {
+        if contentEditEnabled {
+            if deferContentTransition({ [weak self] in self?.prepareFillSignTool(tool) }) { return }
+            contentEditEnabled = false
+        }
+        pageOverviewVisible = false
+        if !fillAndSignVisible { fillAndSignVisible = true }
+        // Switching row items starts from a clean pointer: a stamp style, a signature picture
+        // or a one-click placement belongs to the tool that armed it, not to the next one.
+        pendingFillSignPlacement = nil
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+        annotationTool = .select
+        armedFillSignTool = tool
+        // The inspector and the assistant share the right-hand slot: the tool's options must
+        // not be drawn behind the assistant panel.
+        rightPanelVisible = false
+        performancePanelVisible = false
+    }
+
+    /// Records that a Fill & Sign placement committed, so the inspector closes with the arm.
+    private func finishFillSignPlacement() {
+        guard armedFillSignTool != nil else { return }
+        armedFillSignTool = nil
+        pendingFillSignPlacement = nil
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+    }
+
+    /// Closes every secondary row except one. Called by the four visibility setters, so a row
+    /// cannot be opened beside another one even when a caller assigns the boolean directly.
+    private func closeOtherSecondaryRows(except row: SecondaryRow) {
+        if row != .annotations, annotationToolsVisible { annotationToolsVisible = false }
+        if row != .contentEdit, contentEditEnabled { contentEditEnabled = false }
+        if row != .fillAndSign, fillAndSignVisible { fillAndSignVisible = false }
+        if row != .export, exportVisible { exportVisible = false }
     }
 
     public func reloadContentObjects() async {

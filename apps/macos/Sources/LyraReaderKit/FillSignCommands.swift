@@ -2,72 +2,15 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// One command in the Fill & Sign menu, as data.
+/// Runs the Fill & Sign inspector's commands and builds the one small AppKit menu it needs.
 ///
-/// The same list feeds the real `NSMenu` and the checks: the menu's order, the disabled reasons,
-/// and the help are facts about the reader's state rather than about a particular AppKit call.
-/// The Signature and Stamp entries carry children; the two form-save commands stay at the bottom
-/// under a separator, where they were before the menu became a placement menu.
-public struct FillSignMenuCommand: Identifiable, Equatable, Sendable {
-    public enum Action: Equatable, Sendable {
-        case text
-        case date
-        case checkmark
-        case cross
-        case image
-        case signatureType
-        case signatureDraw
-        case signatureImage
-        case signatureContinuity
-        case stamp(AppState.StampStyle)
-        case saveFilledCopy
-        case writeFormValues
-        case submenu
-        case separator
-    }
-
-    public let id: String
-    public let title: String
-    public let action: Action
-    public let enabled: Bool
-    public let help: String?
-    public let children: [FillSignMenuCommand]
-    /// Shows the menu's checkmark for the choice the current tool is already using.
-    public let selected: Bool
-
-    public init(
-        id: String,
-        title: String,
-        action: Action,
-        enabled: Bool,
-        help: String?,
-        children: [FillSignMenuCommand] = [],
-        selected: Bool = false
-    ) {
-        self.id = id
-        self.title = title
-        self.action = action
-        self.enabled = enabled
-        self.help = help
-        self.children = children
-        self.selected = selected
-    }
-
-    public var isSeparator: Bool { action == .separator }
-
-    /// The seven placement entries a Fill & Sign menu starts with, in order.
-    public static let placementTitles = ["Text", "Signature", "Date", "Checkmark", "Cross",
-                                         "Stamp", "Image…"]
-}
-
-/// Builds and runs the Fill & Sign `NSMenu`.
-///
-/// A real AppKit menu, not the SwiftUI toolbar panel, is what makes the requirements possible:
-/// genuine submenus for Signature and Stamp, and the Continuity Camera item, which AppKit only
-/// recognises when it is an `NSMenuItem` with `NSMenuItemImportFromDeviceIdentifier` and a
-/// `NSServicesMenuRequestor` target.
+/// Fill & Sign is a sub-toolbar row, not a menu. The only real `NSMenu` left is the Signature
+/// inspector's "From iPhone or iPad" pop-up: AppKit's Continuity Camera handoff requires an
+/// `NSMenuItem` carrying `NSMenuItemImportFromDeviceIdentifier` and the
+/// `NSServicesMenuRequestor` action, and a look-alike SwiftUI button cannot receive the sketch.
+/// The other three methods are ordinary buttons in the inspector and call ``dispatch(_:)``.
 @MainActor
-package final class FillSignMenuController: NSObject {
+package final class FillSignCommandController: NSObject {
     package let state: AppState
 
     package init(state: AppState) {
@@ -75,64 +18,47 @@ package final class FillSignMenuController: NSObject {
         super.init()
     }
 
-    /// The menu the toolbar shows, built from ``AppState/fillSignMenuCommands``.
-    package func makeMenu() -> NSMenu {
-        let menu = NSMenu(title: "Fill & Sign")
+    // MARK: - The continuity menu
+
+    /// The four Signature methods as a real menu, in #153's submenu order.
+    package func makeSignatureMethodMenu() -> NSMenu {
+        let menu = NSMenu(title: "Signature")
         menu.autoenablesItems = false
-        for command in state.fillSignMenuCommands {
-            menu.addItem(makeItem(command))
+        for command in state.fillSignSignatureMethods {
+            menu.addItem(makeSignatureMethodItem(command))
         }
         return menu
     }
 
-    private func makeItem(_ command: FillSignMenuCommand) -> NSMenuItem {
-        guard !command.isSeparator else { return .separator() }
-        let hasSubmenu = !command.children.isEmpty
+    /// The one item the inspector's pop-up shows. Exposed so the checks can assert the
+    /// identifier, selector and target AppKit requires without opening a menu.
+    package func makeContinuityMenuItem() -> NSMenuItem {
+        let command = state.fillSignSignatureMethods.first { $0.action == .continuity }
+            ?? SignatureMethodCommand(
+                action: .continuity, title: "From iPhone or iPad",
+                icon: "iphone.and.arrow.forward", enabled: false, help: "")
+        return makeSignatureMethodItem(command)
+    }
+
+    private func makeSignatureMethodItem(_ command: SignatureMethodCommand) -> NSMenuItem {
         let item = NSMenuItem(title: command.title,
-                              action: hasSubmenu ? nil : #selector(performMenuAction(_:)),
+                              action: #selector(performMenuAction(_:)),
                               keyEquivalent: "")
-        item.target = hasSubmenu ? nil : self
-        item.representedObject = command.id
+        item.target = self
+        item.representedObject = "signature-\(command.action.rawValue)"
         item.isEnabled = command.enabled
-        item.state = command.selected ? .on : .off
         item.toolTip = command.help
-        if let symbol = Self.symbolName(for: command.action) {
-            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-            image?.isTemplate = true
+        if let image = NSImage(systemSymbolName: command.icon, accessibilityDescription: nil) {
+            image.isTemplate = true
             item.image = image
         }
-        if hasSubmenu {
-            let submenu = NSMenu(title: command.title)
-            submenu.autoenablesItems = false
-            for child in command.children { submenu.addItem(makeItem(child)) }
-            item.submenu = submenu
-        }
-        if command.action == .signatureContinuity {
+        if command.action == .continuity {
             // AppKit looks for this identifier and replaces the row with the paired devices'
-            // "Add a sketch" entry. The action must be the NSServicesMenuRequestor method.
+            // sketch entry. The action must be the NSServicesMenuRequestor method.
             item.identifier = NSMenuItem.importFromDeviceIdentifier
             item.action = #selector(receiveContinuitySelection(_:))
         }
         return item
-    }
-
-    private static func symbolName(for action: FillSignMenuCommand.Action) -> String? {
-        switch action {
-        case .text: return "textbox"
-        case .date: return "calendar"
-        case .checkmark: return "checkmark"
-        case .cross: return "xmark"
-        case .image: return "photo"
-        case .signatureType: return "keyboard"
-        case .signatureDraw: return "scribble"
-        case .signatureImage: return "photo"
-        case .signatureContinuity: return "iphone.and.arrow.forward"
-        case .stamp: return "seal"
-        case .saveFilledCopy: return "square.and.arrow.down"
-        case .writeFormValues: return "doc.badge.arrow.up"
-        case .submenu: return "signature"
-        case .separator: return nil
-        }
     }
 
     /// Menu actions run after the menu has closed: the transient menu must not own a modal
@@ -144,20 +70,10 @@ package final class FillSignMenuController: NSObject {
         }
     }
 
-    /// Runs the command with a stable id. Exposed to the checks so the menu's wiring can be
-    /// exercised without opening a real menu.
+    /// Runs a signature method (or a form command) with a stable id. Exposed to the checks so
+    /// the inspector's wiring can be exercised without opening a real menu.
     package func dispatch(_ id: String) {
         switch id {
-        case "text":
-            state.armFillSignText()
-        case "date":
-            state.armFillSignDate()
-        case "checkmark":
-            state.armFillSignMark(.checkmark)
-        case "cross":
-            state.armFillSignMark(.cross)
-        case "image":
-            chooseImage()
         case "signature-type":
             chooseTypedSignature()
         case "signature-draw":
@@ -174,17 +90,22 @@ package final class FillSignMenuController: NSObject {
         case "write-form-values":
             state.performFillAndSignCommand("write-form-values")
         default:
-            if id.hasPrefix("stamp-"),
-               let style = AppState.StampStyle(rawValue: String(id.dropFirst("stamp-".count))) {
-                state.armStampTool(style)
-            }
+            break
         }
     }
 
-    // MARK: - Signature submenu
+    /// Arms the Signature row item without toggling it off when it is already armed.
+    private func prepareSignatureTool() {
+        if state.armedFillSignTool != .signature {
+            state.selectFillSignTool(.signature)
+        }
+    }
+
+    // MARK: - Signature methods
 
     /// Type a name and render it into a PNG in a built-in handwriting font.
-    private func chooseTypedSignature() {
+    package func chooseTypedSignature() {
+        prepareSignatureTool()
         let dialog = TypedSignatureDialog()
         guard let choice = dialog.run() else { return }
         guard state.armTypedSignature(name: choice.name, fontName: choice.fontName) else {
@@ -193,13 +114,15 @@ package final class FillSignMenuController: NSObject {
     }
 
     /// Draw a signature on a small pad and place the strokes as an ink annotation.
-    private func chooseDrawnSignature() {
+    package func chooseDrawnSignature() {
+        prepareSignatureTool()
         let dialog = DrawnSignatureDialog()
         guard let signature = dialog.run() else { return }
         state.armDrawnSignature(signature)
     }
 
-    private func chooseSignatureImage() {
+    package func chooseSignatureImage() {
+        prepareSignatureTool()
         guard state.canPlaceFillSignAnnotation else {
             state.lastError = state.fillSignPlacementRefusal
             return
@@ -228,6 +151,7 @@ package final class FillSignMenuController: NSObject {
     /// TIFF is the usual transport; the writer accepts PNG or JPEG, so convert when needed.
     @objc(readSelectionFromPasteboard:)
     package func receiveContinuitySelection(_ pasteboard: NSPasteboard) -> Bool {
+        prepareSignatureTool()
         guard state.canPlaceFillSignAnnotation else {
             state.lastError = state.fillSignPlacementRefusal
             return false
@@ -273,7 +197,12 @@ package final class FillSignMenuController: NSObject {
 
     // MARK: - Image placement
 
-    private func chooseImage() {
+    /// The Image inspector's "Choose Image…" button. The row item arms the tool first; this
+    /// then asks for the picture whose size the inspector controls.
+    package func chooseImage() {
+        if state.armedFillSignTool != .image {
+            state.selectFillSignTool(.image)
+        }
         guard state.canPlaceFillSignAnnotation else {
             state.lastError = state.fillSignPlacementRefusal
             return
@@ -292,70 +221,51 @@ package final class FillSignMenuController: NSObject {
     }
 }
 
-/// Presents the Fill & Sign menu below its toolbar button.
-@MainActor
-package final class FillSignMenuPresenter {
-    package static let shared = FillSignMenuPresenter()
-    private var controller: FillSignMenuController?
+/// The Signature inspector's Continuity Camera button.
+///
+/// It is a pull-down `NSPopUpButton` whose menu holds the real
+/// `NSMenuItemImportFromDeviceIdentifier` item. AppKit only replaces the item with the paired
+/// devices' sketch entry when it is inside an actual menu being tracked, which is why this stays
+/// AppKit rather than becoming a SwiftUI button.
+package struct SignatureContinuityButton: NSViewRepresentable {
+    package let controller: FillSignCommandController
+    package let enabled: Bool
 
-    package func present(for state: AppState, from view: NSView?) {
-        guard let view, view.window != nil else { return }
-        let controller = FillSignMenuController(state: state)
+    package init(controller: FillSignCommandController, enabled: Bool) {
         self.controller = controller
-        // The menu's actions must outlive the tracking loop: the controller stays here until the
-        // next presentation, and each action also captures it.
-        let menu = controller.makeMenu()
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: view)
-    }
-}
-
-/// The SwiftUI toolbar button plus the AppKit anchor the menu is positioned against.
-package struct FillSignMenuButton: View {
-    @ObservedObject package var state: AppState
-    @State private var anchor = FillSignMenuAnchorBox()
-
-    package init(state: AppState) {
-        self.state = state
+        self.enabled = enabled
     }
 
-    package var body: some View {
-        Button {
-            FillSignMenuPresenter.shared.present(for: state, from: anchor.view)
-        } label: {
-            Image(systemName: AnnotationToolbarLayout.fillAndSignIcon)
-        }
-        .buttonStyle(LyraReaderToolStyle())
-        .disabled(!state.canOpenFillAndSignMenu)
-        .help(state.fillAndSignMenuHelp)
-        .accessibilityLabel(AnnotationToolbarLayout.fillAndSignLabel)
-        .accessibilityValue(state.canOpenFillAndSignMenu ? "" : "No document")
-        .background(FillSignMenuAnchor(box: anchor))
+    package func makeNSView(context: Context) -> NSPopUpButton {
+        let button = StretchingPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 240, height: 26), pullsDown: true)
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.font = NSFont.systemFont(ofSize: 12)
+        button.autoenablesItems = false
+        button.addItem(withTitle: "From iPhone or iPad")
+        button.menu?.autoenablesItems = false
+        button.menu?.addItem(controller.makeContinuityMenuItem())
+        button.isEnabled = enabled
+        button.toolTip =
+            "Sign on a paired iPhone or iPad and place the sketch as a signature image"
+        return button
     }
 
-    /// The button itself is SwiftUI; this zero-drawing view only supplies its window frame.
-    private struct FillSignMenuAnchor: NSViewRepresentable {
-        let box: FillSignMenuAnchorBox
-
-        func makeNSView(context: Context) -> AnchorView {
-            let view = AnchorView()
-            box.view = view
-            return view
+    package func updateNSView(_ button: NSPopUpButton, context: Context) {
+        button.isEnabled = enabled
+        let item = button.menu?.items.first {
+            $0.identifier == NSMenuItem.importFromDeviceIdentifier
         }
+        item?.isEnabled = enabled
+    }
 
-        func updateNSView(_ view: AnchorView, context: Context) {
-            box.view = view
-        }
-
-        final class AnchorView: NSView {
-            override var isFlipped: Bool { false }
-            override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    /// A pop-up whose width follows the inspector's column instead of its title.
+    package final class StretchingPopUpButton: NSPopUpButton {
+        package override var intrinsicContentSize: NSSize {
+            NSSize(width: NSView.noIntrinsicMetric, height: 26)
         }
     }
-}
-
-package final class FillSignMenuAnchorBox {
-    package weak var view: NSView?
-    package init() {}
 }
 
 // MARK: - Typed signature dialog

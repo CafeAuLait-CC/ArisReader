@@ -135,6 +135,20 @@ struct ReaderCommands: Commands {
 
             Divider()
 
+            // The two form writes used to live at the bottom of the Fill & Sign menu. Fill &
+            // Sign is a row now (its inspector repeats them while a tool is armed), so File
+            // carries them for whenever no Fill & Sign tool is open.
+            Button("Save Filled Form Copy…") {
+                session?.state.presentSaveFilledFormPanel()
+            }
+            .disabled(session?.state.canSaveFilledForm != true)
+            Button("Write Form Values to Original…") {
+                session?.state.presentReplaceOriginalWithFilledFormConfirmation()
+            }
+            .disabled(session?.state.canReplaceOriginalWithFilledForm != true)
+
+            Divider()
+
             // Exports that leave the reader as data rather than writing into the PDF: the
             // annotation text (Markdown or CSV, chosen in the save panel) and the BibTeX entry
             // for the paper. Both are grouped here because neither touches the document.
@@ -311,6 +325,21 @@ struct ReaderCommands: Commands {
         CommandGroup(after: .pasteboard) {
             Button("Redact…") { session?.state.openRedactionWorkspace() }
                 .disabled(session?.state.canOpenRedactionWorkspace != true)
+
+            // The toolbar's Organise pages menu is gone. Its six commands already had a home in
+            // the Pages menu below; this submenu gives them the Edit-menu home next to the
+            // other editing commands, and the checks assert every command is still here.
+            Menu(PageOperationsMenu.title) {
+                ForEach(PageOperationsMenu.commands) { command in
+                    Button(command.title) {
+                        guard let state = focusedState else { return }
+                        command.perform(on: state)
+                    }
+                    .disabled(focusedState.map { !command.isEnabled($0) } ?? true)
+                    .help(focusedState.map { command.helpText($0) } ?? command.help)
+                }
+            }
+            .disabled(focusedState == nil)
         }
 
         // Page operations (T3.9). Everything here is staged in a working copy until one of the

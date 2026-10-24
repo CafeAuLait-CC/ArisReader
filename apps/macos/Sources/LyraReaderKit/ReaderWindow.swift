@@ -84,12 +84,26 @@ public struct ReaderWindow: View {
                     }
                     assistantDrawer
                     if state.performancePanelVisible { performanceDrawer }
+                    // The two inspectors share the right-hand slot, so they also share the
+                    // test seam that pins the panel's progress. The override applies only to
+                    // the inspector that is actually visible: an editing-panel pin must not
+                    // force the Fill & Sign inspector open (or the other way round).
                     ReaderEditingPanelTransition(
-                        isVisible: state.contentEditEnabled && state.document != nil,
-                        progressOverride: state.transitionProgressOverride?.editingPanel
+                        isVisible: state.contentEditInspectorVisible,
+                        progressOverride: state.contentEditInspectorVisible
+                            ? state.transitionProgressOverride?.editingPanel : nil
                     ) {
                         ContentEditInspector(state: state)
                     }
+                    .background(ReaderChromeMarkerHost(kind: .editingInspectorSlot))
+                    ReaderEditingPanelTransition(
+                        isVisible: state.fillSignInspectorVisible,
+                        progressOverride: state.fillSignInspectorVisible
+                            ? state.transitionProgressOverride?.editingPanel : nil
+                    ) {
+                        FillSignInspector(state: state)
+                    }
+                    .background(ReaderChromeMarkerHost(kind: .fillSignInspectorSlot))
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
                 // HStack's layout that must interpolate, so the canvas width moves with the
@@ -98,7 +112,8 @@ public struct ReaderWindow: View {
                 .animation(sidebarAnimation, value: state.searchSidebarVisible)
                 .animation(panelAnimation, value: state.rightPanelVisible)
                 .animation(panelAnimation, value: state.performancePanelVisible)
-                .animation(panelAnimation, value: state.contentEditEnabled)
+                .animation(panelAnimation, value: state.contentEditInspectorVisible)
+                .animation(panelAnimation, value: state.fillSignInspectorVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -150,7 +165,10 @@ public struct ReaderWindow: View {
         .onChange(of: state.rightPanelVisible) { _, _ in
             state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
         }
-        .onChange(of: state.contentEditEnabled) { _, _ in
+        .onChange(of: state.contentEditInspectorVisible) { _, _ in
+            state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
+        }
+        .onChange(of: state.fillSignInspectorVisible) { _, _ in
             state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
         }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
@@ -485,6 +503,10 @@ public struct ReaderWindow: View {
             ) {
                 ReaderSecondaryToolbar(state: state)
             }
+            // The slot's animated height, not its 46 pt content: the checks read this instead
+            // of hit-testing, because the Edit workspace's content editor covers the canvas
+            // below the row and would look like row chrome.
+            .background(ReaderChromeMarkerHost(kind: .secondaryRowSlot))
         }
         // Same rule as the sidebar: the animation has to own the layout that changes. The row
         // covers the scroll lane and ends flush against the right panel; the
@@ -518,6 +540,7 @@ public struct ReaderWindow: View {
     /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
     private var secondaryToolbarVisible: Bool {
         state.pageOverviewVisible || state.annotationToolsVisible || state.contentEditEnabled
+            || state.fillAndSignVisible || state.exportVisible
     }
 
     private var secondaryToolbarInset: CGFloat {
@@ -530,7 +553,7 @@ public struct ReaderWindow: View {
     /// suppresses all three like it suppresses the leading inset.
     private var secondaryToolbarTrailingInset: CGFloat {
         guard !state.pageOverviewVisible, state.document != nil else { return 0 }
-        return (state.contentEditEnabled ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0) + ReaderChrome.trailingChromeWidth(
+        return state.secondaryInspectorWidth + ReaderChrome.trailingChromeWidth(
             documentOpen: state.document != nil,
             pageOverviewVisible: state.pageOverviewVisible,
             searchVisible: state.searchSidebarVisible,
