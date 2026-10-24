@@ -130,12 +130,20 @@ if [ "$SKIP_VERIFY" -eq 0 ]; then
   echo "==> building"
   ./scripts/build-rust.sh >/dev/null
   echo "==> checking"
-  RESULT="$(./scripts/check.sh 2>&1 | grep -E 'passed ·' | tail -1 || true)"
+  CHECK_LOG="$(mktemp -t lyra-merge-check)"
+  RESULT="$(./scripts/check.sh 2>&1 | tee "$CHECK_LOG" | grep -E 'passed ·' | tail -1 || true)"
   if [ -z "$RESULT" ]; then
     echo "fatal: the check suite produced no summary line; verification failed. Branches kept." >&2
+    echo "---- last lines of the check output ----" >&2
+    tail -n 25 "$CHECK_LOG" >&2
+    echo "----------------------------------------" >&2
     exit 1
   fi
   echo "    $RESULT"
+  if ! echo "$RESULT" | grep -q "0 failed"; then
+    echo "fatal: verification failed ($RESULT). Branches kept; see $CHECK_LOG" >&2
+    exit 1
+  fi
   case "$RESULT" in *"0 failed"*) ;; *)
     echo "fatal: verification failed; branches kept so the merge can be inspected." >&2
     exit 1
