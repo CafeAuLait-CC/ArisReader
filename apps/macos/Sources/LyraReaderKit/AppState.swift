@@ -382,6 +382,11 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// The drop-down whose option list is open.
     @Published public private(set) var formOpenChoiceFieldID: String?
     @Published public private(set) var formSaveInProgress = false
+    /// Set while a flattened copy is being written; the menu item and panel are unavailable.
+    @Published public private(set) var flattenInProgress = false
+    /// The last flattened copy's report, kept so the status line (and the checks) can name what
+    /// was baked, what was kept, and which comments were not carried over.
+    @Published public private(set) var lastFlattenReport: FlattenReport?
     /// Facts and `/Info` values for the information panel, loaded when it opens.
     @Published public private(set) var documentInfo: DocumentInfo?
     @Published public private(set) var documentPropertiesDraft: DocumentProperties = .init()
@@ -7686,6 +7691,131 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(Data(
                 "lyra-reader-forms: replace failed: \(error)\n".utf8
             ))
+            return false
+        }
+    }
+
+
+    // MARK: - Flattened copy
+
+    /// Whether "Export as Flattened Copy…" can run for the open document.
+    ///
+    /// The command reads the PDF as saved on disk; it is not a save of the reader's cache. It is
+    /// offered for an ordinary or signed PDF, never for an XFA form or an encrypted file (both
+    /// have a specific reason in ``flattenRefusal``).
+    public var canFlattenDocument: Bool {
+        document != nil && !isXfaDocument && !formInfo.encrypted
+            && !flattenInProgress && !annotationSaveInProgress && !formSaveInProgress
+            && !propertiesSaveInProgress && !redactionBusy && !pageEditBusy
+    }
+
+    /// The one sentence the menu item's help and a refused direct call share.
+    public var flattenRefusal: String? {
+        if document == nil { return "Open a PDF before exporting a flattened copy" }
+        if isXfaDocument { return readOnlyReason }
+        if formInfo.encrypted {
+            return "This PDF is encrypted, so a flattened copy is not supported: the new page "
+                + "content would need the security envelope rewritten."
+        }
+        if flattenInProgress { return "A flattened copy is already being written" }
+        return nil
+    }
+
+    /// The save-panel explanation. It is deliberately explicit about the limits: flattening is
+    /// an appearance export, not a signature and not protection from a content editor.
+    public static let flattenPanelMessage =
+        "Paints the annotations and filled form values into a new PDF; the original is not "
+        + "modified. Links and sticky notes stay as annotations, and a field that cannot be baked "
+        + "faithfully is kept and reported. The copy uses the file as saved on disk. This is not "
+        + "tamper-proof: the painted content is still editable with a PDF editor, and only a "
+        + "digital signature can detect changes made after signing."
+
+    public func presentFlattenCopyPanel() {
+        guard let url = document?.url else { return }
+        if let refusal = flattenRefusal {
+            lastError = refusal
+            statusMessage = isXfaDocument ? "XFA form · read-only" : "Flattened copy unavailable"
+            return
+        }
+        let suggestion = engine.suggestedFlattenedCopyURL(for: url)
+        let panel = NSSavePanel()
+        panel.title = "Export as Flattened Copy"
+        panel.message = Self.flattenPanelMessage
+        panel.nameFieldStringValue = suggestion.lastPathComponent
+        panel.directoryURL = suggestion.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.flattenToCopy(to: destination)
+        }
+    }
+
+    /// Writes the flattened copy through the engine's verified temporary-file save.
+    @discardableResult
+    public func flattenToCopy(to destination: URL) async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a PDF before exporting a flattened copy"
+            return false
+        }
+        if let refusal = flattenRefusal {
+            lastError = refusal
+            statusMessage = isXfaDocument ? "XFA form · read-only" : "Could not flatten the PDF"
+            return false
+        }
+        if Self.resolvesToSameFile(destination, url) {
+            lastError = "The flattened copy would be the original. Choose another name; the "
+                + "source is never overwritten."
+            return false
+        }
+        flattenInProgress = true
+        defer { flattenInProgress = false }
+        do {
+            let report = try await engine.flattenToCopy(to: destination)
+            lastFlattenReport = report
+            var status = "Saved the flattened copy to \(destination.lastPathComponent)"
+                + " · \(report.flattenedAnnotations) annotation(s) and "
+                + "\(report.flattenedFields) field(s) baked"
+                + " · the original is unchanged"
+            if report.linksKept > 0 || report.stickyNotesKept > 0
+                || !report.keptAnnotations.isEmpty || !report.keptFields.isEmpty {
+                status += " · kept \(report.linksKept) link(s), "
+                    + "\(report.stickyNotesKept) sticky note(s)"
+                let otherKept = max(
+                    0,
+                    report.keptAnnotations.count - report.linksKept
+                        - report.stickyNotesKept
+                )
+                if otherKept > 0 {
+                    status += ", \(otherKept) hidden/thread annotation(s)"
+                }
+                if !report.keptFields.isEmpty {
+                    let names = report.keptFields.prefix(3).map(\.name).joined(separator: ", ")
+                    status += ", \(report.keptFields.count) field(s) kept"
+                    if !names.isEmpty { status += " (\(names))" }
+                }
+            }
+            if report.commentsNotCarried > 0 {
+                status += " · \(report.commentsNotCarried) comment(s) not carried over"
+            }
+            if report.signatureFieldsRemoved > 0 {
+                status += " · \(report.signatureFieldsRemoved) signature field(s) removed"
+            }
+            statusMessage = status
+            FileHandle.standardError.write(Data((
+                "lyra-reader-flatten: wrote \(destination.path) · "
+                + "\(report.flattenedAnnotations) annotation(s), "
+                + "\(report.flattenedFields) field(s), "
+                + "\(report.keptAnnotations.count) kept annotation(s), "
+                + "\(report.keptFields.count) kept field(s)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not export the flattened copy: \(error.localizedDescription)"
+            statusMessage = "Could not export the flattened copy"
+            FileHandle.standardError.write(
+                Data("lyra-reader-flatten: failed (\(url.lastPathComponent)): \(error)\n".utf8)
+            )
             return false
         }
     }

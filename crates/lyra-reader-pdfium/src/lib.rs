@@ -55,6 +55,8 @@ pub mod content_edit;
 #[cfg(feature = "pdfium")]
 mod document_properties;
 #[cfg(feature = "pdfium")]
+mod flatten;
+#[cfg(feature = "pdfium")]
 mod forms;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
@@ -100,6 +102,11 @@ pub use document_properties::{
     DocumentFacts, DocumentInfo, DocumentProperties, PropertiesSaveReport,
     read_document_facts_unencrypted_header, read_document_info, save_document_properties,
     suggested_properties_copy_path,
+};
+#[cfg(feature = "pdfium")]
+pub use flatten::{
+    FlattenKindCount, FlattenReport, KeptAnnotation, KeptField, flatten_to_copy,
+    suggested_flatten_copy_path,
 };
 #[cfg(feature = "pdfium")]
 pub use forms::{

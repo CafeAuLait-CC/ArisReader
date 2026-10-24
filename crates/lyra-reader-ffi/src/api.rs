@@ -248,6 +248,49 @@ pub struct FormSaveReport {
     pub source_bytes_preserved: bool,
 }
 
+/// One kind of annotation or field a flattened copy baked, and how many of it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FlattenKindCountRecord {
+    pub kind: String,
+    pub count: u32,
+}
+
+/// One annotation a flattened copy deliberately keeps, with the reason a person can read.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KeptAnnotationRecord {
+    pub page: u32,
+    pub kind: String,
+    pub reason: String,
+    pub has_comment: bool,
+}
+
+/// One form field a flattened copy deliberately keeps.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KeptFieldRecord {
+    pub name: String,
+    pub kind: String,
+    pub reason: String,
+}
+
+/// What a successful flattened copy did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FlattenReportRecord {
+    pub destination_path: String,
+    pub pages: u32,
+    pub flattened_annotations: u32,
+    pub flattened_annotation_kinds: Vec<FlattenKindCountRecord>,
+    pub flattened_fields: u32,
+    pub flattened_field_kinds: Vec<FlattenKindCountRecord>,
+    pub kept_annotations: Vec<KeptAnnotationRecord>,
+    pub kept_fields: Vec<KeptFieldRecord>,
+    pub sticky_notes_kept: u32,
+    pub links_kept: u32,
+    pub comments_not_carried: u32,
+    pub signature_fields_removed: u32,
+    pub output_bytes: u64,
+    pub cleaned_temporary_files: u32,
+}
+
 /// The facts and editable `/Info` entries of a document.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DocumentInfoRecord {
@@ -2307,6 +2350,89 @@ impl LyraReaderDocument {
     /// The name to offer when saving a filled copy: `<name> (filled).pdf`.
     pub fn suggested_filled_copy_path(&self) -> String {
         lyra_reader_pdfium::suggested_filled_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Writes a flattened copy of the open document to `destination`.
+    ///
+    /// The annotations' appearances and the filled form widgets are painted into the page
+    /// content, then those annotations and the `/AcroForm` entry are removed. The text layer and
+    /// the vectors stay text and vectors; nothing is rasterised. Sticky notes and links are kept
+    /// as annotations, and a field whose appearance cannot be baked faithfully is kept and
+    /// reported. A signed document may be copied: the copy is a derived copy and has its
+    /// signature material stripped. An XFA form is refused with its existing read-only reason.
+    ///
+    /// This is not tamper-proof: the painted bytes are still editable by a content editor, and
+    /// only a digital signature can detect later changes.
+    pub fn flatten_to_copy(
+        &self,
+        destination: String,
+    ) -> Result<FlattenReportRecord, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LyraReaderFfiError::Document {
+                message: "the document was replaced on disk; reopen it before flattening"
+                    .to_string(),
+            });
+        }
+        let report = lyra_reader_pdfium::flatten_to_copy(
+            Path::new(&self.path),
+            Path::new(&destination),
+            self.password.as_deref(),
+        )?;
+        Ok(FlattenReportRecord {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            pages: report.pages,
+            flattened_annotations: report.flattened_annotations,
+            flattened_annotation_kinds: report
+                .flattened_annotation_kinds
+                .into_iter()
+                .map(|count| FlattenKindCountRecord {
+                    kind: count.kind,
+                    count: count.count,
+                })
+                .collect(),
+            flattened_fields: report.flattened_fields,
+            flattened_field_kinds: report
+                .flattened_field_kinds
+                .into_iter()
+                .map(|count| FlattenKindCountRecord {
+                    kind: count.kind,
+                    count: count.count,
+                })
+                .collect(),
+            kept_annotations: report
+                .kept_annotations
+                .into_iter()
+                .map(|kept| KeptAnnotationRecord {
+                    page: kept.page,
+                    kind: kept.kind,
+                    reason: kept.reason,
+                    has_comment: kept.has_comment,
+                })
+                .collect(),
+            kept_fields: report
+                .kept_fields
+                .into_iter()
+                .map(|kept| KeptFieldRecord {
+                    name: kept.name,
+                    kind: kept.kind,
+                    reason: kept.reason,
+                })
+                .collect(),
+            sticky_notes_kept: report.sticky_notes_kept,
+            links_kept: report.links_kept,
+            comments_not_carried: report.comments_not_carried,
+            signature_fields_removed: report.signature_fields_removed,
+            output_bytes: report.output_bytes,
+            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// The name to offer when exporting a flattened copy: `<name> (flattened).pdf`.
+    pub fn suggested_flatten_copy_path(&self) -> String {
+        lyra_reader_pdfium::suggested_flatten_copy_path(Path::new(&self.path))
             .to_string_lossy()
             .into_owned()
     }

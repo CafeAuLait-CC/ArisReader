@@ -1279,6 +1279,50 @@ public struct FormSaveReport: Sendable, Equatable {
     public let sourceBytesPreserved: Bool
 }
 
+
+/// One kind of annotation or field a flattened copy baked, and how many of it.
+public struct FlattenKindCount: Sendable, Equatable {
+    public let kind: String
+    public let count: Int
+}
+
+/// One annotation a flattened copy deliberately keeps, with the reason.
+public struct FlattenKeptAnnotation: Sendable, Equatable {
+    /// Zero-based page index.
+    public let page: Int
+    public let kind: String
+    public let reason: String
+    public let hasComment: Bool
+}
+
+/// One form field a flattened copy deliberately keeps.
+public struct FlattenKeptField: Sendable, Equatable {
+    public let name: String
+    public let kind: String
+    public let reason: String
+}
+
+/// What a successful "Export as Flattened Copy" did.
+///
+/// The report is the honest half of the command: it names what was baked, what was deliberately
+/// kept, and what an annotation's comment lost when its painted appearance moved into the page.
+public struct FlattenReport: Sendable, Equatable {
+    public let destination: URL
+    public let pages: Int
+    public let flattenedAnnotations: Int
+    public let flattenedAnnotationKinds: [FlattenKindCount]
+    public let flattenedFields: Int
+    public let flattenedFieldKinds: [FlattenKindCount]
+    public let keptAnnotations: [FlattenKeptAnnotation]
+    public let keptFields: [FlattenKeptField]
+    public let stickyNotesKept: Int
+    public let linksKept: Int
+    public let commentsNotCarried: Int
+    public let signatureFieldsRemoved: Int
+    public let outputBytes: UInt64
+    public let cleanedTemporaryFiles: Int
+}
+
 /// The document facts and editable `/Info` entries the information panel shows.
 public struct DocumentInfo: Sendable, Equatable {
     public let title: String
@@ -1731,6 +1775,17 @@ public protocol PDFEngine: AnyObject {
     func replaceWithFilledForm(_ values: [FormFieldValue]) async throws -> FormSaveReport
     /// The name to offer for a filled copy: `<name> (filled).pdf`.
     func suggestedFilledCopyURL(for url: URL) -> URL
+    /// Writes a **new** flattened PDF at `url`: annotation appearances and filled form widgets
+    /// are painted into the page content, then the annotation tree and the `/AcroForm` entry are
+    /// removed. The open document and the source file are never modified (a signed document is
+    /// copied, with its signature material stripped). Sticky notes and links are kept and
+    /// reported; a field whose appearance cannot be baked faithfully is kept and reported.
+    ///
+    /// This makes a signature harder to delete by accident. It is **not** tamper-proof: the
+    /// painted content is still editable, and only a digital signature detects later changes.
+    func flattenToCopy(to url: URL) async throws -> FlattenReport
+    /// The name to offer for a flattened copy: `<name> (flattened).pdf`.
+    func suggestedFlattenedCopyURL(for url: URL) -> URL
     /// The read-only facts and the four editable `/Info` entries.
     func documentInfo() async throws -> DocumentInfo
     /// Writes the four `/Info` entries into a new PDF at `url`.
@@ -1932,6 +1987,18 @@ public extension PDFEngine {
 
     func suggestedFilledCopyURL(for url: URL) -> URL {
         Self.suggestedCopyURL(for: url, suffix: "filled")
+    }
+
+    func flattenToCopy(to url: URL) async throws -> FlattenReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot flatten a PDF"]
+        )
+    }
+
+    func suggestedFlattenedCopyURL(for url: URL) -> URL {
+        Self.suggestedCopyURL(for: url, suffix: "flattened")
     }
 
     func documentInfo() async throws -> DocumentInfo {
@@ -2796,6 +2863,36 @@ public final class RustEngine: PDFEngine {
         return URL(fileURLWithPath: document.suggestedFilledCopyPath())
     }
 
+    public func flattenToCopy(to url: URL) async throws -> FlattenReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let record: LyraReaderBindings.FlattenReportRecord =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.flattenToCopy(
+                            destination: url.path))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        invalidateCachedCopy(at: url)
+        return Self.flattenReport(from: record)
+    }
+
+    public func suggestedFlattenedCopyURL(for url: URL) -> URL {
+        guard let document else {
+            return Self.suggestedCopyURL(for: url, suffix: "flattened")
+        }
+        return URL(fileURLWithPath: document.suggestedFlattenCopyPath())
+    }
+
     public func documentInfo() async throws -> DocumentInfo {
         guard let document else { return .empty }
         let record: DocumentInfoRecord = try await withCheckedThrowingContinuation { continuation in
@@ -3552,6 +3649,37 @@ public final class RustEngine: PDFEngine {
             backupPath: record.backupPath.map { URL(fileURLWithPath: $0) },
             cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
             sourceBytesPreserved: record.sourceBytesPreserved
+        )
+    }
+
+    private static func flattenReport(
+        from record: LyraReaderBindings.FlattenReportRecord
+    ) -> FlattenReport {
+        FlattenReport(
+            destination: URL(fileURLWithPath: record.destinationPath),
+            pages: Int(record.pages),
+            flattenedAnnotations: Int(record.flattenedAnnotations),
+            flattenedAnnotationKinds: record.flattenedAnnotationKinds.map {
+                FlattenKindCount(kind: $0.kind, count: Int($0.count))
+            },
+            flattenedFields: Int(record.flattenedFields),
+            flattenedFieldKinds: record.flattenedFieldKinds.map {
+                FlattenKindCount(kind: $0.kind, count: Int($0.count))
+            },
+            keptAnnotations: record.keptAnnotations.map {
+                FlattenKeptAnnotation(
+                    page: Int($0.page), kind: $0.kind,
+                    reason: $0.reason, hasComment: $0.hasComment)
+            },
+            keptFields: record.keptFields.map {
+                FlattenKeptField(name: $0.name, kind: $0.kind, reason: $0.reason)
+            },
+            stickyNotesKept: Int(record.stickyNotesKept),
+            linksKept: Int(record.linksKept),
+            commentsNotCarried: Int(record.commentsNotCarried),
+            signatureFieldsRemoved: Int(record.signatureFieldsRemoved),
+            outputBytes: record.outputBytes,
+            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles)
         )
     }
 

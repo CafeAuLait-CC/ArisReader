@@ -117,6 +117,105 @@ fn drop_embedded_file_tree(document: &mut Document) {
     }
 }
 
+/// Proves a flattened copy preserved everything that is **not** supposed to change.
+///
+/// A flattened copy deliberately removes the annotation tree and the AcroForm, and it adds the
+/// annotations' painted appearance to the page content. That makes the form-field half of
+/// [`verify_document_equivalence`] inapplicable. What must still hold is the part a reader
+/// promises regardless: the same pages with the same geometry, the original text layer (now
+/// followed by whatever text the baked appearances add), the outline, `/Info`, XMP and every
+/// embedded file.
+pub(crate) fn verify_flatten_equivalence(
+    source: &Path,
+    rewritten: &Path,
+    password: Option<&str>,
+) -> Result<()> {
+    compare_page_text_subsequence(source, rewritten, password)?;
+    compare_page_geometry(source, rewritten, password)?;
+    compare_outline(source, rewritten, password)?;
+    compare_metadata_and_info(source, rewritten, password)?;
+    compare_embedded_files(source, rewritten, password)?;
+    Ok(())
+}
+
+/// The source page text must survive as a subsequence of the flattened page's text.
+///
+/// Flattening paints annotation appearances into the page, and a text box or stamp appearance
+/// makes its own text extractable for the first time. The result is therefore a superset of the
+/// source's text, not an identical string. A subsequence check (ignoring whitespace, which PDF
+/// extraction normalises) is the honest contract: no source character may be lost or reordered,
+/// while baked text is allowed to appear.
+fn compare_page_text_subsequence(
+    source: &Path,
+    rewritten: &Path,
+    password: Option<&str>,
+) -> Result<()> {
+    let source_backend = crate::PdfiumBackend::open(source, password)?;
+    let rewritten_backend = crate::PdfiumBackend::open(rewritten, password)?;
+    let source_pages = source_backend.page_count();
+    if source_pages != rewritten_backend.page_count() {
+        return Err(refusal(
+            "page count",
+            format!(
+                "source has {source_pages} page(s), rewritten file has {}",
+                rewritten_backend.page_count()
+            ),
+        ));
+    }
+    for page in 0..source_pages {
+        let before: Vec<char> = source_backend
+            .raw_text_page(PageIndex(page))?
+            .text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let after: Vec<char> = rewritten_backend
+            .raw_text_page(PageIndex(page))?
+            .text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let mut cursor = 0;
+        for (index, character) in before.iter().enumerate() {
+            match after[cursor..]
+                .iter()
+                .position(|candidate| candidate == character)
+            {
+                Some(offset) => cursor += offset + 1,
+                None => {
+                    return Err(refusal(
+                        "page text (the text layer)",
+                        format!(
+                            "page {} lost a character at source position {index}; the flattened \
+                             page has {} character(s), the source {}. The flattened copy must keep \
+                             every selectable character.",
+                            page + 1,
+                            after.len(),
+                            before.len()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare_page_geometry(source: &Path, rewritten: &Path, password: Option<&str>) -> Result<()> {
+    let source_backend = crate::PdfiumBackend::open(source, password)?;
+    let rewritten_backend = crate::PdfiumBackend::open(rewritten, password)?;
+    for page in 0..source_backend.page_count() {
+        let page_index = PageIndex(page);
+        if source_backend.page_info(page_index)? != rewritten_backend.page_info(page_index)? {
+            return Err(refusal(
+                "page geometry",
+                format!("page {} changed size, rotation or label", page + 1),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reopens both files and proves the rewrite preserved everything it promised to preserve.
 ///
 /// Returns a refusal that names the feature that could not be preserved; never a silent pass.
