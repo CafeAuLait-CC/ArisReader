@@ -910,6 +910,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "libc",
+ "lyra-reader-ai",
  "lyra-reader-core",
  "lyra-reader-metadata",
  "lyra-reader-pdfium",

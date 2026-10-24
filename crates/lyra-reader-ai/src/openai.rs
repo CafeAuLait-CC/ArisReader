@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_body_streams_without_vendor_extensions() {
+    fn the_wire_body_asks_for_standard_streaming_usage() {
         let plan = build_plan(PlanRequest {
             action: Action::SummarizePage,
             document_title: "DeepSeek".to_string(),
@@ -1752,7 +1752,13 @@ mod tests {
                 .contains("\"model\":\"deepseek-flash\"")
         );
         assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
-        assert!(!plan.parts[0].wire_body.contains("stream_options"));
+        assert!(
+            plan.parts[0]
+                .wire_body
+                .contains("\"stream_options\":{\"include_usage\":true}"),
+            "body: {}",
+            plan.parts[0].wire_body
+        );
     }
 
     #[test]
