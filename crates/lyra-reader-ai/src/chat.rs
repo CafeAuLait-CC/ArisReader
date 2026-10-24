@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use crate::openai::stream_options_unsupported;
 use crate::provider::AiError;
 
 /// Largest amount of page text placed in one request. Long documents are split into parts; a
@@ -611,6 +612,7 @@ pub fn build_merge_plan(request: MergePlanRequest) -> Result<ChatPlan, AiError> 
         &system,
         &user,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let note = Some(format!(
         "This consolidation is a separate request built from {} part summaries. Nothing is sent until you press Send.",
@@ -712,6 +714,7 @@ pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError
         &request.prompt,
         request.image.as_ref(),
         request.stream,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     Ok(ChatPlan {
         // A plain prompt has no one-shot document action; the variant is a preview label and a
@@ -1023,6 +1026,7 @@ pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, A
                 .push_str(&page.text);
         }
         let mut plan = build_plan(part_request)?;
+        let include_stream_options = !stream_options_unsupported(&plan.endpoint, &plan.model);
         for part in &mut plan.parts {
             part.index = index as u32;
             part.total = total;
@@ -1043,6 +1047,7 @@ pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, A
                     &part.system_prompt,
                     &part.user_prompt,
                     None,
+                    include_stream_options,
                 );
             }
         }
@@ -1103,6 +1108,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
 
     let mut builder = PlanBuilder {
         request: &request,
+        endpoint: &endpoint.endpoint,
         model: &model,
         temperature,
         max_tokens,
@@ -1177,6 +1183,7 @@ pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
 
 struct PlanBuilder<'a> {
     request: &'a PlanRequest,
+    endpoint: &'a str,
     model: &'a str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
@@ -1542,6 +1549,7 @@ impl PlanBuilder<'_> {
             &system_prompt,
             &user_prompt,
             None,
+            !stream_options_unsupported(self.endpoint, self.model),
         );
         ChatPart {
             index,
@@ -1560,6 +1568,7 @@ impl PlanBuilder<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_wire_body(
     model: &str,
     temperature: Option<f32>,
@@ -1568,6 +1577,7 @@ fn make_wire_body(
     system_prompt: &str,
     user_prompt: &str,
     image: Option<&ChatImage>,
+    include_stream_options: bool,
 ) -> String {
     make_wire_body_with_stream(
         model,
@@ -1578,6 +1588,7 @@ fn make_wire_body(
         user_prompt,
         image,
         true,
+        include_stream_options,
     )
 }
 
@@ -1593,6 +1604,7 @@ fn make_wire_body_with_stream(
     user_prompt: &str,
     image: Option<&ChatImage>,
     stream: bool,
+    include_stream_options: bool,
 ) -> String {
     let mut object = serde_json::Map::new();
     object.insert("model".to_string(), serde_json::json!(model));
@@ -1619,11 +1631,12 @@ fn make_wire_body_with_stream(
         ]),
     );
     object.insert("stream".to_string(), serde_json::json!(stream));
-    if stream {
+    if stream && include_stream_options {
         // OpenAI-compatible streaming responses only carry a token-usage chunk when this
         // standard option is requested. Without it the panel's usage summary is empty on
         // providers that follow the OpenAI shape (including local MLX servers); DeepSeek and
-        // OpenAI both accept it. A non-streaming request must not send it.
+        // OpenAI both accept it. A non-streaming request must not send it, and a server that
+        // rejected it once gets a body without it from then on.
         object.insert(
             "stream_options".to_string(),
             serde_json::json!({ "include_usage": true }),
@@ -2233,6 +2246,7 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         &system,
         &user,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let request_characters = (system.chars().count() + user.chars().count()) as u64;
     let page_characters = context.chars().count() as u64;
@@ -2610,6 +2624,7 @@ Keep the selected region central. Connect it to the related source passages when
         &system,
         &user,
         image_used.then_some(request.image.as_ref()).flatten(),
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let request_characters = (system.chars().count() + user.chars().count()) as u64;
     let page_characters = (text.chars().count() + related.chars().count()) as u64;
@@ -3172,6 +3187,7 @@ fn build_summary_unit_plan(
         &system_prompt,
         &user_prompt,
         None,
+        !stream_options_unsupported(&endpoint.endpoint, &model),
     );
     let note = coverage_note(request.layer, unit, coverage, request.page_count);
     let primary_page = coverage.pages.first().copied().unwrap_or(1);
