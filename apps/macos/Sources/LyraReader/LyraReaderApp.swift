@@ -250,7 +250,7 @@ struct ReaderCommands: Commands {
             // The assistant left the sidebar for its own right-hand panel. ⇧⌘A is the AI-panel
             // binding the Rust keymap already documents, and it was unused by the native menu
             // (⌥⌘I is Document Information and ⌥⌘S toggles the sidebar).
-            Button(ReaderShortcuts.toggleAIPanelLabel) { session?.state.toggleRightPanel() }
+            Button(ReaderShortcuts.toggleAIPanelLabel) { session?.state.toggleAITools() }
                 .keyboardShortcut(ReaderShortcuts.toggleAIPanelKey,
                                   modifiers: ReaderShortcuts.toggleAIPanelModifiers)
                 .disabled(session == nil)

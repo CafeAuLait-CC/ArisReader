@@ -719,8 +719,8 @@ public struct AIAssistantPanel: View {
     }
 }
 
-/// Summary, translation and conversation share the sidebar's contiguous tab treatment.
-/// The window owns the model, so switching workspaces preserves drafts and conversation.
+/// The Lyra tools choose this panel's workspace. The window owns the model, so switching
+/// tools preserves drafts and conversation without duplicating navigation in the panel.
 public struct AIAssistantRightPanelContent: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
@@ -733,7 +733,7 @@ public struct AIAssistantRightPanelContent: View {
     public var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label { Text("AI Assistant") } icon: {
+                Label { Text(model.selectedTab.title) } icon: {
                     LyraAIActivityIcon(model: model).frame(width: 20, height: 20)
                 }.font(.system(size: 13, weight: .semibold))
                 Spacer()
@@ -742,19 +742,6 @@ public struct AIAssistantRightPanelContent: View {
                 Button { state.toggleRightPanel() } label: { Image(systemName: "xmark") }
                     .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Close AI assistant")
             }.padding(.horizontal, 14).padding(.vertical, 8)
-            GeometryReader { geometry in
-                HStack(spacing: 1) {
-                    ForEach(AIAssistantTab.allCases) { tab in
-                        Button { model.selectedTab = tab } label: {
-                            Text(tab.title).fixedSize(horizontal: true, vertical: false)
-                                .font(.system(size: 12, weight: .medium))
-                                .frame(width: max(0, (geometry.size.width - 3) / 4))
-                        }
-                        .buttonStyle(LyraReaderSidebarTabStyle(selected: model.selectedTab == tab))
-                        .accessibilityAddTraits(model.selectedTab == tab ? .isSelected : [])
-                    }
-                }.background(LyraReaderTheme.separator)
-            }.frame(height: 32).padding(.horizontal, 12).padding(.bottom, 12)
             Divider().overlay(LyraReaderTheme.separator)
             if model.selectedTab == .chat {
                 AIDocumentChatView(state: state, model: model)

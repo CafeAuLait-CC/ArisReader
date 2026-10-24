@@ -85,7 +85,7 @@ public enum ReaderSidePanelPreferences {
 /// ⌥⌘S is Toggle Sidebar, and the app's ⌘-number / ⌘[⌘] / ⌘⇧R / ⌥⌘R bindings are taken. ⇧⌘A is
 /// unused by the native menu and is the documented AI-panel binding in `lyra-reader-session`.
 public enum ReaderShortcuts {
-    public static let toggleAIPanelLabel = "Toggle AI Assistant"
+    public static let toggleAIPanelLabel = "Toggle Lyra Tools"
     public static let toggleAIPanelKey: KeyEquivalent = "a"
     public static let toggleAIPanelModifiers: EventModifiers = [.command, .shift]
 }

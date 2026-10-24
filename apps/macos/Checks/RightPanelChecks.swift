@@ -234,8 +234,8 @@ extension ReaderChecks {
                 "the AI panel command is bound to A")
         require(ReaderShortcuts.toggleAIPanelModifiers == [.command, .shift],
                 "the AI panel command uses ⇧⌘A")
-        require(ReaderShortcuts.toggleAIPanelLabel == "Toggle AI Assistant",
-                "the menu command is named Toggle AI Assistant")
+        require(ReaderShortcuts.toggleAIPanelLabel == "Toggle Lyra Tools",
+                "the menu command is named Toggle Lyra Tools")
 
         // The chords already on ReaderCommands, the toolbar menus and the Rust keymap. A new
         // shortcut has to be absent from every one of them.

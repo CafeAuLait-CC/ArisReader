@@ -221,7 +221,7 @@ struct AIDocumentKnowledgeSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
-                LyraAIIcon(isActive: knowledge.phase == .reading).frame(width: 32, height: 32)
+                LyraAIIcon(isActive: knowledge.phase == .reading || knowledge.phase == .preparing).frame(width: 32, height: 32)
                     .foregroundStyle(LyraReaderTheme.accent)
                 Text(knowledge.phase == .reading ? "Getting to know your document…" : "Get to know this document")
                     .font(.system(size: 18, weight: .semibold))

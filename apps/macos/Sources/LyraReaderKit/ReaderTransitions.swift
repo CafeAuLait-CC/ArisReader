@@ -227,6 +227,7 @@ struct ReaderSecondaryToolbarTransition<Content: View>: View {
 
     var body: some View {
         content
+            .offset(y: -ReaderChrome.secondaryToolbarHeightPt * (1 - progress))
             .frame(height: ReaderChrome.secondaryToolbarHeightPt)
             .frame(maxWidth: .infinity)
             .frame(height: ReaderChrome.secondaryToolbarHeightPt * progress, alignment: .top)

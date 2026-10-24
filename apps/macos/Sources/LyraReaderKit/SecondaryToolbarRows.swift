@@ -14,7 +14,7 @@ struct FillSignToolRow: View {
         ViewThatFits(in: .horizontal) {
             row(labels: true)
             row(labels: false)
-        }
+        }.frame(maxWidth: .infinity, alignment: .center)
     }
 
     @ViewBuilder
@@ -24,7 +24,7 @@ struct FillSignToolRow: View {
                 let command = state.fillSignRowCommands.first { $0.tool == tool }
                 Button { state.selectFillSignTool(tool) } label: {
                     if labels {
-                        Label(tool.title, systemImage: tool.icon)
+                        Label(tool.title, systemImage: tool.icon).padding(.horizontal, 7)
                     } else {
                         Image(systemName: tool.icon)
                     }
@@ -35,9 +35,8 @@ struct FillSignToolRow: View {
                 .accessibilityLabel(tool.title)
                 .accessibilityValue(state.armedFillSignTool == tool ? "Armed" : "")
                 .modifier(AnnotationToolbarItemFrame(
-                    id: tool.title, width: labels ? 104 : AnnotationToolbarLayout.buttonWidth))
+                    id: tool.title, width: labels ? 116 : AnnotationToolbarLayout.buttonWidth))
             }
-            Spacer(minLength: 0)
             Button { state.clearFillSignTool() } label: {
                 Image(systemName: "xmark").font(.system(size: 11))
             }
@@ -66,7 +65,7 @@ struct ExportToolRow: View {
         ViewThatFits(in: .horizontal) {
             row(labels: true)
             row(labels: false)
-        }
+        }.frame(maxWidth: .infinity, alignment: .center)
     }
 
     @ViewBuilder
@@ -75,7 +74,7 @@ struct ExportToolRow: View {
             ForEach(ExportCommand.all) { command in
                 Button { command.perform(on: state) } label: {
                     if labels {
-                        Label(command.title, systemImage: command.icon)
+                        Label(command.title, systemImage: command.icon).padding(.horizontal, 7)
                     } else {
                         Image(systemName: command.icon)
                     }
@@ -86,7 +85,6 @@ struct ExportToolRow: View {
                 .accessibilityLabel(command.fullTitle)
                 .modifier(ExportItemFrame(id: command.id, labels: labels))
             }
-            Spacer(minLength: 0)
         }
         .font(.system(size: labels ? 11 : 12))
     }

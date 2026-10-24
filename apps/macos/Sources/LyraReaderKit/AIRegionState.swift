@@ -286,10 +286,12 @@ extension AppState {
             documentKey: key,
             attachment: attachment,
             assistant: assistant,
+            createdAt: entry?.createdAt ?? Date(),
             tearSplitPt: tearPlan.splitPt,
             tearFallbackReason: tearPlan.fallbackReason
         )
-        if let entry { card.restore(entry) }
+        card.regionNumber = entry?.regionNumber ?? ((currentRegionHistory.compactMap(\.regionNumber).max() ?? 0) + 1)
+        if let entry { card.restore(entry); card.focusesComposerOnOpen = false }
         card.updateHeight(card.heightViewPt)
         regionCards.append(card)
         regionContentObservers[card.id] = card.objectWillChange
@@ -317,13 +319,30 @@ extension AppState {
             regionRefusalMessage = "That region belongs to another document; open it first."
             return nil
         }
+        guard entry.locationInvalidated != true else {
+            regionRefusalMessage = "The page layout has changed. This conversation is preserved in Reading notes; select a new region to continue on the edited page."
+            return nil
+        }
         guard entry.attachment.page >= 0, entry.attachment.page < (document?.pageCount ?? 0) else {
             regionRefusalMessage = "That saved region refers to a page that is no longer in this PDF. Its conversation is still available in Reading notes."
             return nil
         }
+        if let existing = regionCards.first(where: { $0.id == entry.id }) {
+            scrollToRegionCard(existing); return existing
+        }
         let plan = tearPlan(for: entry.attachment, textPage: cachedTextPage(entry.attachment.page))
         guard let card = addRegionCard(attachment: entry.attachment, tearPlan: plan, restoring: entry) else { return nil }
         return card
+    }
+
+    /// Layout edits invalidate captured coordinates, not the saved conversation or draft.
+    func invalidateRegionLocationsAfterPageEdit() {
+        closeAllRegionCards(reason: "Page layout changed. Conversations are preserved in Reading notes.")
+        guard let key = regionDocumentKey else { return }
+        for index in (regionHistory[key] ?? []).indices {
+            regionHistory[key]?[index].locationInvalidated = true
+        }
+        persistRegionHistory()
     }
 
     // MARK: - Card lifecycle
@@ -430,7 +449,6 @@ extension AppState {
     // MARK: - History
 
     private func appendRegionHistory(_ entry: AIRegionHistoryEntry) {
-        guard !entry.question.isEmpty else { return }
         var list = regionHistory[entry.documentKey] ?? []
         list.removeAll { $0.id == entry.id }
         list.append(entry)
@@ -457,7 +475,14 @@ extension AppState {
         guard FileManager.default.fileExists(atPath: file.path) else { return }
         do {
             let entries = try JSONDecoder().decode([AIRegionHistoryEntry].self, from: Data(contentsOf: file))
-            regionHistory[key] = entries.filter { $0.documentKey == key }
+            var migrated = entries.filter { $0.documentKey == key }
+            var next = (migrated.compactMap(\.regionNumber).max() ?? 0) + 1
+            for index in migrated.indices.sorted(by: { migrated[$0].createdAt == migrated[$1].createdAt ? migrated[$0].id.uuidString < migrated[$1].id.uuidString : migrated[$0].createdAt < migrated[$1].createdAt }) {
+                if migrated[index].regionNumber == nil {
+                    migrated[index].regionNumber = next; next += 1
+                }
+            }
+            regionHistory[key] = migrated
         } catch {
             regionHistoryLoadFailures.insert(key)
             regionRefusalMessage = "Saved reading notes could not be opened. The original records were kept: \(error.localizedDescription)"

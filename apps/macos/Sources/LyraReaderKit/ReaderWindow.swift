@@ -501,7 +501,13 @@ public struct ReaderWindow: View {
                 isVisible: secondaryToolbarVisible,
                 progressOverride: state.transitionProgressOverride?.row
             ) {
-                ReaderSecondaryToolbar(state: state)
+                if state.aiToolsVisible && !state.pageOverviewVisible {
+                    ReaderAIToolbar(state: state, model: aiAssistant)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                } else {
+                    ReaderSecondaryToolbar(state: state)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
             // The slot's animated height, not its 46 pt content: the checks read this instead
             // of hit-testing, because the Edit workspace's content editor covers the canvas
@@ -514,6 +520,7 @@ public struct ReaderWindow: View {
         // own controls do not reflow on every animation frame.
         .padding(.trailing, secondaryToolbarTrailingInset)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
+        .animation(secondaryRowAnimation, value: state.aiToolsVisible)
     }
 
     /// A toggle made while the window edge is being dragged changes layout without animating:
@@ -540,7 +547,7 @@ public struct ReaderWindow: View {
     /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
     private var secondaryToolbarVisible: Bool {
         state.pageOverviewVisible || state.annotationToolsVisible || state.contentEditEnabled
-            || state.fillAndSignVisible || state.exportVisible
+            || state.fillAndSignVisible || state.exportVisible || state.aiToolsVisible
     }
 
     private var secondaryToolbarInset: CGFloat {

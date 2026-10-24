@@ -33,10 +33,10 @@ struct LyraAIIcon: View {
                 // Only this layer ticks. The feather never scales, fades or moves.
                 TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
                     let breath = (1 - cos(context.date.timeIntervalSinceReferenceDate * .pi / 1.4)) / 2
-                    LyraAIPath(part: .sparkle)
-                        .opacity(0.65 + 0.35 * breath)
-                        .scaleEffect(0.97 + 0.06 * breath,
-                                     anchor: UnitPoint(x: 8.0 / 32, y: 6.25 / 32))
+                    ZStack {
+                        LyraAIPath(part: .sparkle).opacity(0.35 + 0.65 * breath)
+                        LyraAISatelliteStars(time: context.date.timeIntervalSinceReferenceDate)
+                    }
                 }
             } else {
                 LyraAIPath(part: .sparkle)
@@ -44,6 +44,25 @@ struct LyraAIIcon: View {
         }
         .aspectRatio(1, contentMode: .fit)
         .accessibilityHidden(true)
+    }
+}
+
+/// Two small glints use the same four-point shape, out of phase with the original star.
+private struct LyraAISatelliteStars: View {
+    let time: TimeInterval
+    var body: some View {
+        GeometryReader { proxy in
+            ForEach(0..<2) { index in
+                let phase = time * .pi / 1.4 + Double(index + 1) * 2.1
+                let opacity = 0.25 + 0.7 * (1 - cos(phase)) / 2
+                LyraAIPath(part: .sparkle)
+                    .scaleEffect(index == 0 ? 0.8 : 0.6, anchor: .topLeading)
+                    .offset(x: proxy.size.width * (index == 0 ? 0.65 : 0.7), y: proxy.size.height * (index == 0 ? -0.01 : 0.35))
+                    .opacity(opacity)
+                    .accessibilityHidden(true)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+        }
     }
 }
 

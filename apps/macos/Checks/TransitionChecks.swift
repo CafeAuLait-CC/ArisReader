@@ -539,6 +539,25 @@ extension ReaderChecks {
         require(harness.hit(fromCanvasTop: 10) === harness.canvas,
                 "with the row collapsed again, the page's top receives clicks")
 
+        // Lyra uses the very same moving, clipped row and leaves page geometry unchanged.
+        state.transitionProgressOverride = ReaderTransitionProgress(row: 0)
+        state.toggleAITools()
+        var lyraBottoms: [CGFloat] = []
+        for progress in [0.25, 0.5, 0.75, 1.0, 0.5, 0.0] {
+            state.transitionProgressOverride = ReaderTransitionProgress(row: progress)
+            let expected = ReaderChrome.secondaryToolbarHeightPt * CGFloat(progress)
+            try await eventually("Lyra tools slide at progress \(progress)", {
+                abs(harness.rowBottomFromCanvasTop() - expected) <= 2
+            })
+            lyraBottoms.append(harness.rowBottomFromCanvasTop())
+        }
+        require(lyraBottoms.contains { $0 > 2 && $0 < 44 },
+                "Lyra tools have intermediate slide frames instead of popping in")
+        require(abs(harness.canvasRect.height - frameBefore.height) < 0.01,
+                "Lyra tool animation preserves the PDF canvas height")
+        state.toggleAITools()
+        state.transitionProgressOverride = nil
+
         // ── Page overview shares the one row slot ───────────────────────────────────────
         state.annotationToolsVisible = true
         try await Task.sleep(for: .milliseconds(250))

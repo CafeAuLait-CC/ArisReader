@@ -38,6 +38,23 @@ extension ReaderChecks {
         let state = AppState(engine: engine)
         require(state.open(url: source), "reading-notes fixture opens")
         state.setViewportSize(CGSize(width: 900, height: 700))
+        state.toggleAITools()
+        require(state.aiToolsVisible && !state.annotationToolsVisible, "Lyra opens its own contextual tools")
+        state.armRegionSelection()
+        state.toggleAnnotationTools()
+        require(!state.aiToolsVisible && state.annotationToolsVisible && !state.regionSelectionArmed,
+                "opening annotation tools releases the Interleaf pointer")
+        state.toggleAITools()
+        require(state.aiToolsVisible && !state.annotationToolsVisible && state.annotationTool == .select,
+                "returning to Lyra restores the selection pointer")
+        state.toggleAITools()
+        state.toggleExport()
+        state.toggleAITools()
+        require(state.openSecondaryRows == [.lyra], "Lyra replaces Export in the shared row slot")
+        state.toggleFillAndSign()
+        require(state.openSecondaryRows == [.fillAndSign] && !state.aiToolsVisible,
+                "Fill & Sign replaces Lyra without stacking toolbar rows")
+        state.fillAndSignVisible = false
         let service = ReadingNotesService(engine: engine)
         state.regionChatServiceOverride = { service }
         state.regionAssistantFactory = { AIAssistantModel(settings: settings) }
@@ -181,7 +198,53 @@ extension ReaderChecks {
         try await Task.sleep(for: .milliseconds(100))
         require(longCard.heightViewPt <= AIRegionCard.maximumHeight(in: canvas.visibleRect.height) + 0.5,
                 "a multiline composer remains inside the total card height limit")
-        state.closeRegionCard(id: longCard.id, keepHistory: false)
+        // Switching regions preserves draft-only selections and their stable numbers.
+        let number = longCard.regionNumber
+        let draft = longCard.question
+        state.closeRegionCard(id: longCard.id, keepHistory: true)
+        let savedDraft = state.currentRegionHistory.first { $0.id == longCard.id }!
+        require(savedDraft.regionNumber == number && savedDraft.draftQuestion == draft,
+                "collapse saves the region number and unsent follow-up")
+        let resumed = state.reopenRegionCard(from: savedDraft)!
+        require(resumed.regionNumber == number && resumed.question == draft,
+                "marker reopening restores the same number and draft")
+        require(state.reopenRegionCard(from: savedDraft) === resumed && state.regionCards.count == 1,
+                "reactivating the active marker does not duplicate or reset the conversation")
+        state.closeRegionCard(id: resumed.id, keepHistory: true)
+        await state.createRegionCard(page: 0, rect: CGRect(x: 60, y: 60, width: 300, height: 140))
+        let unsent = state.regionCards.first!
+        unsent.question = "A draft not yet sent"
+        let unsentID = unsent.id
+        require(unsent.regionNumber > number, "a new selection receives a new stable number")
+        state.closeRegionCard(id: unsentID, keepHistory: true)
+        let savedUnsent = state.currentRegionHistory.first { $0.id == unsentID }!
+        require(savedUnsent.allTurns.isEmpty && savedUnsent.draftQuestion == "A draft not yet sent",
+                "an unsent selection survives collapse without inventing a conversation turn")
+        let restoredState = AppState(engine: try RustEngine())
+        require(restoredState.open(url: source), "region marker persistence fixture reopens")
+        require(restoredState.currentRegionHistory.contains { $0.id == unsentID && $0.regionNumber == savedUnsent.regionNumber },
+                "selection numbers and unsent records survive document relaunch")
+        state.deleteRegionHistoryEntry(id: unsentID)
+        require(!state.currentRegionHistory.contains { $0.id == unsentID }, "deleting a conversation removes its marker record")
+        var oldJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(savedUnsent)) as! [String: Any]
+        oldJSON.removeValue(forKey: "regionNumber"); oldJSON.removeValue(forKey: "draftQuestion")
+        let legacy = try JSONDecoder().decode(AIRegionHistoryEntry.self, from: JSONSerialization.data(withJSONObject: oldJSON))
+        require(legacy.regionNumber == nil, "old region caches decode without the new optional fields")
+        let crossing = AIRegionAttachment(page: 0, rect: CGRect(x: 20, y: 90, width: 80, height: 40),
+            text: "test", png: Data(), pixelWidth: 160, pixelHeight: 80, captureScale: 2)
+        let segments = [PagePlacement(index: 0, topPt: 0, leftPt: 0, widthPt: 200, heightPt: 100),
+                        PagePlacement(index: 0, topPt: 160, leftPt: 0, widthPt: 200, heightPt: 100, sourceTopPt: 100)]
+        let outlines = AIRegionMarkerGeometry.rectangles(attachment: crossing, frames: segments,
+            width: 400, contentWidth: 200, scroll: 20, zoom: 2)
+        require(outlines == [CGRect(x: 40, y: 140, width: 160, height: 20), CGRect(x: 40, y: 280, width: 160, height: 60)],
+                "selection outlines follow both torn page segments at submitted scroll and zoom")
+        let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: 200, height: 100))
+        scroll.hasVerticalScroller = true; scroll.scrollerStyle = .legacy
+        LyraReaderSidebarScroller.install(on: scroll)
+        let themed = scroll.verticalScroller as! LyraReaderSidebarScroller
+        themed.transparentTrack = true
+        require(themed.scrollerStyle == .legacy && themed.transparentTrack,
+                "the paper scroller preserves Always Show Scroll Bars native mode")
         print("Reading notes and document knowledge checks passed")
     }
 }

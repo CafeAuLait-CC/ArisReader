@@ -41,11 +41,34 @@ import SwiftUI
     var isFinished: Bool { finished }
 }
 
+@MainActor private final class RegionReviewPreferences: NSObject {
+    static let shared = RegionReviewPreferences()
+    private var window: NSWindow?
+    @objc func showPreferences() {
+        if window == nil {
+            let host = NSHostingView(rootView: SettingsView(registry: ReaderWindowRegistry()))
+            let value = NSWindow(contentRect: CGRect(x: 220, y: 180, width: 650, height: 540),
+                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            value.title = "Review Preferences"; value.isReleasedWhenClosed = false
+            value.contentView = host; window = value
+        }
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 extension ReaderChecks {
     @MainActor private static func runReviewEventLoop() { NSApplication.shared.run() }
 
     @MainActor static func regionReviewPreview(root: URL) async throws {
         NSApplication.shared.setActivationPolicy(.regular)
+        // Only this isolated review app's defaults; never change the system preference.
+        UserDefaults.standard.set("Always", forKey: "AppleShowScrollBars")
+        let menu = NSMenu()
+        let appItem = NSMenuItem(); let submenu = NSMenu()
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(RegionReviewPreferences.showPreferences), keyEquivalent: ",")
+        settingsItem.target = RegionReviewPreferences.shared
+        submenu.addItem(settingsItem); appItem.submenu = submenu; menu.addItem(appItem)
+        NSApplication.shared.mainMenu = menu
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-region-review-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         let pdf = scratch.appendingPathComponent("Shared context — local review.pdf")
@@ -81,12 +104,15 @@ extension ReaderChecks {
         cg.closePDF()
         let defaults = UserDefaults(suiteName: "lyra-region-review-\(UUID())")!
         let settings = AISettingsStore(defaults: defaults, keyStore: InMemoryAPIKeyStore(key: "mock-local-review"))
-        _ = settings.save(baseURL: "http://127.0.0.1:11434/v1", model: "local-ui-review", temperature: 0.2, maxTokens: 3000, apiKey: nil)
+        let localModel = ProcessInfo.processInfo.environment["LYRA_READER_REVIEW_LOCAL"] == "1"
+        _ = settings.save(baseURL: localModel ? "http://127.0.0.1:8080/v1" : "http://127.0.0.1:11434/v1",
+            model: localModel ? "mlx-community/Qwen3.8-27B-8bit" : "local-ui-review",
+            temperature: 0.2, maxTokens: localModel ? 1024 : 3000, apiKey: nil)
         let engine = try RustEngine()
         let state = AppState(engine: engine)
         state.sidebarVisible = false; state.rightPanelVisible = false
         require(state.open(url: pdf), "generated review paper opens")
-        let base = RegionReviewService(engine: engine)
+        let base: any AIChatServicing = localModel ? RustAIChatService(engine: engine) : RegionReviewService(engine: engine)
         state.documentKnowledge.settings = settings
         let context = state.aiReaderContext!
         let service = DocumentKnowledgeService(base: base, knowledge: state.documentKnowledge,
@@ -96,13 +122,13 @@ extension ReaderChecks {
         let assistant = AIAssistantModel(settings: settings)
         let host = NSHostingView(rootView: ReaderWindow(state: state,
             opener: DocumentOpenCoordinator(state: state), aiAssistant: assistant))
-        let window = NSWindow(contentRect: CGRect(x: 150, y: 120, width: 1180, height: 860),
+        let window = NSWindow(contentRect: CGRect(x: 150, y: 120, width: ProcessInfo.processInfo.environment["LYRA_READER_REVIEW_NARROW"] == "1" ? 760 : 1180, height: 860),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         // Appearance override is confined to this opt-in local review window.
         if ProcessInfo.processInfo.environment["LYRA_READER_REVIEW_DARK"] == "1" {
             window.appearance = NSAppearance(named: .darkAqua)
         }
-        window.title = "Lyra Region Review — Local Mock"
+        window.title = localModel ? "Lyra Interleaf — Local Qwen" : "Lyra Region Review — Local Mock"
         window.contentView = host; window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         runReviewEventLoop()

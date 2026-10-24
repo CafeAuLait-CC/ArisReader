@@ -18,6 +18,8 @@ public enum LyraReaderTheme {
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
     public static let sidebarBg = Color(nsColor: sidebarColor)
+    /// Conversation-only window surface; the global Lyra palette stays unchanged.
+    public static let regionWindowBg = Color(nsColor: adaptive(0xF7F0DF, 0x302B23))
     public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
     /// The floating preview's card colour, also cleared behind its transparent figure crops.
     public static let raisedBgColor = adaptive(0xFFFDFA, 0x343029)

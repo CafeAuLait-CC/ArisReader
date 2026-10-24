@@ -238,6 +238,10 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     public let createdAt: Date
     public let turns: [AIRegionTurn]
     public let knowledgeNote: String
+    public var regionNumber: Int?
+    public var draftQuestion: String?
+    /// Captured content remains readable after edits, but its old location must not be reopened.
+    public var locationInvalidated: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -250,7 +254,8 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
         failure: AIRequestFailure? = nil,
         createdAt: Date = Date(),
         turns: [AIRegionTurn] = [],
-        knowledgeNote: String = ""
+        knowledgeNote: String = "",
+        regionNumber: Int? = nil, draftQuestion: String? = nil
     ) {
         self.id = id
         self.documentKey = documentKey
@@ -263,10 +268,11 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
         self.createdAt = createdAt
         self.turns = turns
         self.knowledgeNote = knowledgeNote
+        self.regionNumber = regionNumber; self.draftQuestion = draftQuestion
     }
 
     public var allTurns: [AIRegionTurn] {
-        turns.isEmpty ? [AIRegionTurn(question: question, answer: answer, state: state,
+        turns.isEmpty && question.isEmpty ? [] : turns.isEmpty ? [AIRegionTurn(question: question, answer: answer, state: state,
                                      error: error, createdAt: createdAt)] : turns
     }
 
@@ -333,12 +339,14 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     public let assistant: AIAssistantModel
     public let notesAssistant: AIAssistantModel
     public let createdAt: Date
+    public var regionNumber: Int = 1
     @Published public var question = ""
     @Published public var knowledgeNote = ""
     @Published public private(set) var turns: [AIRegionTurn] = []
     @Published public private(set) var heightViewPt: CGFloat = initialHeightViewPt
     public internal(set) var tearSplitPt: CGFloat?
     public internal(set) var tearFallbackReason: String?
+    var focusesComposerOnOpen = true
     private var pendingNoteApplication = false
     private var liveTurnID = UUID()
     private var liveTurnDate = Date()
@@ -383,6 +391,8 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     public func restore(_ entry: AIRegionHistoryEntry) {
         turns = entry.allTurns
         knowledgeNote = entry.knowledgeNote
+        question = entry.draftQuestion ?? ""
+        regionNumber = entry.regionNumber ?? regionNumber
     }
     public func send(context: AIReaderContext) async {
         let next = question.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -412,11 +422,12 @@ public final class AIRegionCard: ObservableObject, Identifiable {
         knowledgeNote = notesAssistant.answer
     }
     public var historyEntry: AIRegionHistoryEntry? {
-        guard let first = allTurns.first else { return nil }
+        let first = allTurns.first
         return AIRegionHistoryEntry(id: id, documentKey: documentKey, attachment: attachment,
-            question: first.question, answer: allTurns.last?.answer ?? "", state: answerState,
+            question: first?.question ?? "", answer: allTurns.last?.answer ?? "", state: answerState,
             error: assistant.errorMessage, failure: assistant.requestFailure, createdAt: createdAt,
-            turns: allTurns, knowledgeNote: knowledgeNote)
+            turns: allTurns, knowledgeNote: knowledgeNote,
+            regionNumber: regionNumber, draftQuestion: question)
     }
     public func updateHeight(_ height: CGFloat) {
         guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.5 else { return }

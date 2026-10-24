@@ -441,6 +441,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public var fillSignDateRotation: FillSignDateRotation = .none
     /// The initial height of a placed picture, chosen in the Fill & Sign inspector.
     @Published public var fillSignImageSize: FillSignImageSize = .medium
+    @Published public var aiToolsVisible: Bool = false {
+        didSet {
+            if aiToolsVisible { closeOtherSecondaryRows(except: .lyra) }
+            else { cancelRegionSelection() }
+        }
+    }
     /// 100% means actual physical size, scaled by the current screen's calibration.
     @Published public var zoomPercent: Int = 100 {
         willSet {if newValue != zoomPercent,contentTextEditing {commitContentText?()}}
@@ -7779,6 +7785,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if contentEditEnabled { rows.append(.contentEdit) }
         if fillAndSignVisible { rows.append(.fillAndSign) }
         if exportVisible { rows.append(.export) }
+        if aiToolsVisible { rows.append(.lyra) }
         return rows
     }
 
@@ -11229,10 +11236,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // A page rotation, insertion or deletion changes what the captured rectangle means.
             // Rather than leave a card pointing at a different page, close it into history and
             // say why. The captured image and text stay exactly as they were asked about.
-            closeAllRegionCards(
-                reason: "The page layout changed (\(label)). Region conversations were closed into Region questions.",
-                keepHistory: true
-            )
+            invalidateRegionLocationsAfterPageEdit()
             return true
         } catch {
             // The revision was not adopted. Put the translation overlays that were on screen
@@ -15281,10 +15285,22 @@ extension AppState {
         return true
     }
 
+    public func toggleAITools() {
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleAITools() }) { return }
+        contentEditEnabled = false
+        pageOverviewVisible = false
+        annotationToolsVisible = false
+        annotationTool = .select
+        aiToolsVisible.toggle()
+        if !aiToolsVisible { cancelRegionSelection() }
+    }
+
     public func toggleAnnotationTools() {
         if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleAnnotationTools() }) { return }
         contentEditEnabled = false
         pageOverviewVisible = false
+        aiToolsVisible = false
+        cancelRegionSelection()
         annotationToolsVisible.toggle()
     }
 
@@ -15295,6 +15311,8 @@ extension AppState {
             return
         }
         if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
+        aiToolsVisible = false
+        cancelRegionSelection()
         contentEditEnabled.toggle()
         if contentEditEnabled {
             pageOverviewVisible = false
@@ -15447,6 +15465,7 @@ extension AppState {
         if row != .contentEdit, contentEditEnabled { contentEditEnabled = false }
         if row != .fillAndSign, fillAndSignVisible { fillAndSignVisible = false }
         if row != .export, exportVisible { exportVisible = false }
+        if row != .lyra, aiToolsVisible { aiToolsVisible = false }
     }
 
     public func reloadContentObjects() async {
