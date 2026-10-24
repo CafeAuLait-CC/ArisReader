@@ -252,35 +252,17 @@ struct ReaderToolbar: View {
             .accessibilityValue(state.exportVisible ? "Expanded" : "Collapsed")
             .background(AnnotationToolbarFrameReader(id: "toolbar.export"))
             separator
-            Button { state.toggleRegionSelection() } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "rectangle.dashed")
-                    if !compact { Text("Ask Region").font(.system(size: 12, weight: .medium)) }
-                }
+            Button { state.toggleAITools() } label: {
+                HStack(spacing: 6) {
+                    LyraAIIcon().frame(width: 20, height: 20)
+                    if !compact { Text("Lyra").font(.system(size: 12, weight: .medium)) }
+                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
-            .disabled(!state.canArmRegionSelection)
-            .help(state.regionSelectionUnavailableReason
-                  ?? "Drag a rectangle over the page; the question opens in a gap below it")
-            .accessibilityLabel("Ask about a region")
-            .accessibilityValue(state.regionSelectionArmed ? "Armed" : "")
-            tool(state.translationSelectionTitle, "character.bubble",
-                 selected: state.translationSelectionAction == .showOriginal) {
-                state.performTranslationAction()
-            }
-            .disabled(!state.canTranslateSelection)
-            .help(state.selection == nil
-                  ? "Select text on the page to translate it in place"
-                  : "\(state.translationSelectionTitle) (⇧⌘L)")
-            .accessibilityLabel(state.translationSelectionTitle)
-            .accessibilityValue(state.selection == nil ? "No selection" : "Selection on page \(state.selection!.page + 1)")
-            Button {
-                state.toggleRightPanel()
-            } label: { LyraAIIcon().frame(width: 20, height: 20) }
-            .buttonStyle(LyraReaderToolStyle(selected: state.rightPanelVisible))
-            .help("AI assistant (⇧⌘A)")
-            .accessibilityLabel("AI assistant panel")
-            .accessibilityValue(state.rightPanelVisible ? "Open" : "Closed")
+            .buttonStyle(LyraReaderToolStyle(selected: state.aiToolsVisible))
+            .help("Show Lyra tools (⇧⌘A)")
+            .accessibilityLabel("Lyra tools")
+            .accessibilityValue(state.aiToolsVisible ? "Expanded" : "Collapsed")
             .keyboardShortcut("a", modifiers: [.command, .shift])
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
@@ -373,15 +355,15 @@ struct ReaderSecondaryToolbar: View {
     var body: some View {
         Group {
             if state.pageOverviewVisible {
-                overviewRow
+                ReaderCenteredTools { overviewRow }
             } else if state.contentEditEnabled {
-                contentEditRow
+                ReaderCenteredTools { contentEditRow }
             } else if state.fillAndSignVisible {
                 fillSignRow
             } else if state.exportVisible {
                 exportRow
             } else {
-                annotationRow
+                ReaderCenteredTools { annotationRow }
             }
         }
         .padding(.horizontal, 14)
@@ -404,23 +386,22 @@ struct ReaderSecondaryToolbar: View {
     private var overviewRow: some View {
         HStack(spacing: 10) {
             Button { state.insertBlankPage(before: false) } label: {
-                Label("Insert Page", systemImage: "doc.badge.plus")
+                Label("Insert Page", systemImage: "doc.badge.plus").padding(.horizontal, 7)
             }.disabled(!state.canPageEdit)
             Button { state.rotateSelectedPages(clockwise: true) } label: {
-                Label("Rotate", systemImage: "rotate.right")
+                Label("Rotate", systemImage: "rotate.right").padding(.horizontal, 7)
             }.disabled(!state.canPageEdit)
             Button { state.presentExtractPagesPanel() } label: {
-                Label("Extract", systemImage: "square.and.arrow.up")
+                Label("Extract", systemImage: "square.and.arrow.up").padding(.horizontal, 7)
             }.disabled(!state.canPageOperations)
              .help(writeHelp("Write the selected pages to a new PDF"))
             Button { state.confirmDeleteSelectedPages() } label: {
-                Label("Delete", systemImage: "trash")
+                Label("Delete", systemImage: "trash").padding(.horizontal, 7)
             }.disabled(!state.canPageEdit || state.selectedPageIndices.count >= (state.document?.pageCount ?? 0))
-            Spacer(minLength: 0)
             Text("\(state.selectedPageIndices.count) selected")
                 .foregroundStyle(LyraReaderTheme.textSecondary)
             Button { state.pageOverviewVisible = false } label: {
-                Label("Done", systemImage: "checkmark")
+                Label("Done", systemImage: "checkmark").padding(.horizontal, 7)
             }.accessibilityLabel("Close page overview")
         }.font(.system(size: 12))
     }
@@ -451,5 +432,55 @@ private struct ReaderWindowDragArea: NSViewRepresentable {
     private final class DragView: NSView {
         override var mouseDownCanMoveWindow: Bool { true }
         override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+    }
+}
+
+/// AI actions share the reader's contextual row; the sidebar displays only the chosen workspace.
+struct ReaderAIToolbar: View {
+    @ObservedObject var state: AppState
+    @ObservedObject var model: AIAssistantModel
+    var body: some View {
+        ReaderCenteredTools {
+            HStack(spacing: 8) {
+                Button { state.rightPanelVisible = false; state.toggleRegionSelection() } label: {
+                    Label { Text("Interleaf") } icon: { InterleafIcon().frame(width: 18, height: 18) }.padding(.horizontal, 7)
+                }.buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
+                    .disabled(!state.canArmRegionSelection).help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
+                workspace("Summary", icon: "text.alignleft", tab: .summary)
+                workspace("Translate", icon: "character.bubble", tab: .translation)
+                workspace("Chat", icon: "bubble.left.and.bubble.right", tab: .chat)
+                workspace("Reading notes", icon: "note.text", tab: .regions)
+            }
+        }.font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14).frame(height: ReaderChrome.secondaryToolbarHeightPt)
+            .background(ReaderChromeMarkerHost(kind: .secondaryToolbar))
+            .background(LyraReaderTheme.toolbarBg)
+            .overlay(alignment: .bottom) { Rectangle().fill(LyraReaderTheme.separator).frame(height: 1) }
+    }
+    private func workspace(_ title: String, icon: String, tab: AIAssistantTab) -> some View {
+        Button {
+            state.cancelRegionSelection()
+            model.selectedTab = tab
+            state.rightPanelVisible = true
+        } label: {
+            Label { Text(title) } icon: {
+                if tab == .translation { TranslationIcon().frame(width: 18, height: 18) }
+                else { Image(systemName: icon) }
+            }.padding(.horizontal, 7)
+        }
+            .buttonStyle(LyraReaderToolStyle(selected: state.rightPanelVisible && model.selectedTab == tab))
+            .disabled(state.document == nil).help(title)
+    }
+}
+
+/// Centred at normal widths, horizontally scrollable when every tool cannot fit.
+struct ReaderCenteredTools<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView(.horizontal, showsIndicators: false) {
+                content().frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
+            }
+        }
     }
 }

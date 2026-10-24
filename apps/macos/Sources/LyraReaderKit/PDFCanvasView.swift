@@ -1482,7 +1482,7 @@ public final class MetalCanvasView: NSView {
         let contentWidthPx = contentWidthPt * zoom * scale
         let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
         contentOffsetX = offsetX / scale
-        regionHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom)
+        regionHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom, pageFrames: annotationPageFrames)
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []

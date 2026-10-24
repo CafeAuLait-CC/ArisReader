@@ -192,8 +192,9 @@ extension ReaderChecks {
                 "removing the card restores the page below to its previous offset")
         require(abs(state.contentHeightPt - beforeHeight) < 0.001,
                 "removing the card restores the content height")
-        require(state.currentRegionHistory.isEmpty,
-                "a card with no asked question leaves no history entry when it closes")
+        require(state.currentRegionHistory.count == 1 && state.currentRegionHistory[0].id == card.id
+                    && state.currentRegionHistory[0].allTurns.isEmpty,
+                "an unasked selection remains available as a marker without an invented turn")
     }
 
     // MARK: - The card geometry, measured in a hosted window

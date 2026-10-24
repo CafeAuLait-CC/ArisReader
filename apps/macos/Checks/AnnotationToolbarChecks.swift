@@ -87,8 +87,8 @@ extension ReaderChecks {
                         && abs(pointer.width - (4 * 34 + 3 * 2)) < 0.01
                         && abs(placement.width - (3 * 34 + 2 * 2)) < 0.01,
                     "at \(label) each group is exactly its buttons plus the 2 pt inner spacing")
-            require(abs(markup.minX - AnnotationToolbarLayout.horizontalPadding) < 0.01,
-                    "at \(label) group 1 starts at the row's leading padding")
+            require(markup.minX >= AnnotationToolbarLayout.horizontalPadding,
+                    "at \(label) group 1 keeps the minimum edge padding")
             for id in AnnotationToolbarLayout.Group.markup.itemIDs {
                 require(markup.insetBy(dx: -0.5, dy: -0.5)
                             .contains(frame(id, frames, label)),
@@ -118,6 +118,8 @@ extension ReaderChecks {
                     "at \(label) the colour picker and close button are trailing chrome")
             require(close.maxX <= width - AnnotationToolbarLayout.horizontalPadding + 0.01,
                     "at \(label) the trailing chrome fits inside the row (\(close.maxX) of \(width) pt)")
+            require(abs((markup.minX + close.maxX) / 2 - width / 2) < 0.5,
+                    "at \(label) the complete tool group is centred")
             return frames
         }
 
@@ -125,8 +127,8 @@ extension ReaderChecks {
         let minimum = assertGroups(width: minimumRowWidth, label: "900 pt minimum window")
         for id in ["group.markup", "group.pointer", "group.placement"]
             + AnnotationToolbarLayout.annotationToolIDs {
-            require(abs(wide[id]!.minX - minimum[id]!.minX) < 0.01,
-                    "\(id) does not move when the window narrows from 1200 to 900 pt")
+            require(abs((wide[id]!.minX - minimum[id]!.minX) - (wideRowWidth - minimumRowWidth) / 2) < 0.5,
+                    "\(id) stays centred when the window narrows from 1200 to 900 pt")
         }
 
         // ── The Edit row has no Select button ───────────────────────────────────────

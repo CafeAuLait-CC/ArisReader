@@ -905,7 +905,12 @@ extension ReaderChecks {
                 "a page edit removes the tear instead of pointing it at changed geometry")
         require(state.pageSegments(forPage: 0).count == 1,
                 "after the page edit the page is whole again")
-        require(state.currentRegionHistory.isEmpty,
-                "an unanswered draft is not turned into history by the page edit")
+        let saved = state.currentRegionHistory.first { $0.id == card.id }
+        require(saved?.draftQuestion == "Does a rotation keep this card?",
+                "a page edit preserves the unsent draft")
+        require(saved?.locationInvalidated == true,
+                "a page edit invalidates the original region coordinates")
+        require(saved.map { state.reopenRegionCard(from: $0) == nil } == true,
+                "an invalidated selection cannot reopen at stale coordinates")
     }
 }

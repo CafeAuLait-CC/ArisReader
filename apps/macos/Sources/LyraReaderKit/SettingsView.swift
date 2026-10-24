@@ -14,6 +14,7 @@ public struct SettingsView: View {
     @AppStorage(AppState.cacheBudgetSettingKey) private var cacheBudgetMB = AppState.defaultTileCacheBudgetMB
     @AppStorage(ReadingLayoutPreferences.layoutKey) private var layoutRaw = ReaderLayoutMode.continuous.rawValue
     @AppStorage(ReadingLayoutPreferences.gapKey) private var pageGapPt = Double(ReadingLayoutPreferences.defaultGapPt)
+    @AppStorage(RegionConversationStyle.preferenceKey) private var regionStyle = RegionConversationStyle.parchment.rawValue
     /// The AI panel's hint can open this window directly on the AI tab with the base-URL field
     /// focused; the route is shared so the hint does not need a settings-window reference.
     @ObservedObject private var route = AISettingsRoute.shared
@@ -55,6 +56,13 @@ public struct SettingsView: View {
             .tabItem { Label("Performance", systemImage: "speedometer") }
 
             Form {
+                Picker("Region conversations", selection: $regionStyle) {
+                    ForEach(RegionConversationStyle.allCases) { style in
+                        Text(style.title).tag(style.rawValue)
+                    }
+                }
+                Text("Choose a clean window or a paper note. Conversations stay the same when you switch.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Page layout", selection: layoutBinding) {
                     ForEach(ReaderLayoutMode.allCases) { mode in
                         Text(mode.title).tag(mode)

@@ -129,7 +129,7 @@ public enum ReaderToolbarProbe {
     /// Frames for the annotation row, including `group.*` entries, at a given row width.
     public static func annotationRowFrames(state: AppState, width: CGFloat) -> [String: CGRect] {
         measure(
-            AnnotationToolRow(state: state)
+            ReaderCenteredTools { AnnotationToolRow(state: state) }
                 .padding(.horizontal, AnnotationToolbarLayout.horizontalPadding),
             width: width
         )
@@ -138,7 +138,7 @@ public enum ReaderToolbarProbe {
     /// Frames for the Edit (content editing) row at a given row width.
     public static func contentEditRowFrames(state: AppState, width: CGFloat) -> [String: CGRect] {
         measure(
-            ContentEditToolRow(state: state)
+            ReaderCenteredTools { ContentEditToolRow(state: state) }
                 .padding(.horizontal, AnnotationToolbarLayout.horizontalPadding),
             width: width
         )
@@ -186,7 +186,6 @@ struct ContentEditToolRow: View {
                 "Redact", "rectangle.slash", "blackout",
                 help: "Drag a rectangle to remove the content under it and cover the area in black. "
                     + "Erase is in the inspector.")
-            Spacer(minLength: 0)
         }
         .font(.system(size: 12))
     }
@@ -197,7 +196,7 @@ struct ContentEditToolRow: View {
             ? ["erase", "blackout"].contains(state.contentEditTool)
             : state.contentEditTool == tool
         return Button { state.selectContentTool(tool) } label: {
-            Label(title, systemImage: icon)
+            Label(title, systemImage: icon).padding(.horizontal, 7)
         }
         .buttonStyle(LyraReaderToolStyle(selected: selected))
         .help(selected ? help + " Click it again to return to the pointer." : help)
@@ -255,7 +254,7 @@ struct AnnotationToolRow: View {
                 stampMenu
                 signatureMenu
             }
-            Spacer(minLength: 0)
+            Color.clear.frame(width: 8, height: 1).allowsHitTesting(false)
             colorMenu
             closeButton
         }

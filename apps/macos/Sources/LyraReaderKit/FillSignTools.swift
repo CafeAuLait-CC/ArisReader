@@ -11,6 +11,7 @@ public enum SecondaryRow: String, CaseIterable, Sendable {
     case contentEdit
     case fillAndSign
     case export
+    case lyra
 
     /// The row's human name, also used by the checks' failure messages.
     public var title: String {
@@ -19,6 +20,7 @@ public enum SecondaryRow: String, CaseIterable, Sendable {
         case .contentEdit: return "Edit"
         case .fillAndSign: return "Fill & Sign"
         case .export: return "Export"
+        case .lyra: return "Lyra"
         }
     }
 }

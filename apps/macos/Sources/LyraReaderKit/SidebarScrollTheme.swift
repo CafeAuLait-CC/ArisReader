@@ -44,6 +44,7 @@ struct SidebarScrollTheme: NSViewRepresentable {
 
 /// Native scrolling, tracking and accessibility, with the palette's track and thumb colors.
 package final class LyraReaderSidebarScroller: NSScroller {
+    package var transparentTrack = false { didSet { needsDisplay = true } }
     private var hovered = false
     private var hoverTracking: NSTrackingArea?
     override package class var isCompatibleWithOverlayScrollers: Bool { true }
@@ -70,7 +71,7 @@ package final class LyraReaderSidebarScroller: NSScroller {
 
     override package func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
         // Overlay tracks reveal the panel underneath; legacy tracks occupy their own gutter.
-        if scrollerStyle == .legacy {
+        if scrollerStyle == .legacy && !transparentTrack {
             LyraReaderTheme.sidebarColor.setFill()
             bounds.fill()
         }

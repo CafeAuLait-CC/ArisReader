@@ -32,10 +32,10 @@ struct AIRegionHistoryView: View {
                 VStack(spacing: 10) {
                     LyraAIIcon().frame(width: 32, height: 32).foregroundStyle(LyraReaderTheme.accent)
                     Text("Keep the ideas you discover").font(.callout.weight(.medium))
-                    Text("Choose Ask Region in the toolbar and draw over the page. Conversations and reading notes are saved locally.")
+                    Text("Choose Interleaf in the Lyra toolbar and draw over the page. Conversations and reading notes are saved locally.")
                         .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                         .multilineTextAlignment(.center)
-                    Button("Ask about a region") { state.bringRegionSelectionForward() }
+                    Button("Interleaf · Select & Ask") { state.bringRegionSelectionForward() }
                         .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                         .disabled(!state.canArmRegionSelection)
                 }.padding(22).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,12 +69,12 @@ struct AIRegionHistoryView: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("Page \(entry.attachment.page + 1)").font(.caption2.weight(.semibold))
+                    Text("Page \(entry.attachment.page + 1) · Region \(entry.regionNumber ?? 1)").font(.caption2.weight(.semibold))
                         .foregroundStyle(LyraReaderTheme.accent)
                     Spacer()
                     Text("\(entry.allTurns.count) turns").font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
-                Text(entry.question).font(.system(size: 12, weight: .medium)).lineLimit(2)
+                Text(entry.question.isEmpty ? (entry.draftQuestion?.isEmpty == false ? entry.draftQuestion! : "New region") : entry.question).font(.system(size: 12, weight: .medium)).lineLimit(2)
                 if !entry.knowledgeNote.isEmpty {
                     Label("Reading note", systemImage: "note.text").font(.caption2)
                         .foregroundStyle(LyraReaderTheme.noteFg)
@@ -97,7 +97,11 @@ struct AIRegionHistoryView: View {
             }.font(.caption).padding(12)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if entry.attachment.page >= 0, entry.attachment.page < (state.document?.pageCount ?? 0) {
+                    if entry.locationInvalidated == true {
+                        Text("Page layout changed · original selection preserved below")
+                            .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                        if !((entry.draftQuestion ?? "").isEmpty) { Text(entry.draftQuestion ?? "") }
+                    } else if entry.attachment.page >= 0, entry.attachment.page < (state.document?.pageCount ?? 0) {
                         Button {
                             state.gotoPage(entry.attachment.page)
                         } label: { Label("Page \(entry.attachment.page + 1)", systemImage: "doc.text") }
@@ -113,6 +117,15 @@ struct AIRegionHistoryView: View {
                             answer(entry.knowledgeNote, entry: entry)
                         }.padding(10).background(LyraReaderTheme.noteBg, in: RoundedRectangle(cornerRadius: 7))
                     }
+                    if entry.locationInvalidated == true {
+                        DisclosureGroup("Original selection") {
+                            if let image = entry.attachment.thumbnail {
+                                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
+                                    .frame(maxHeight: 180)
+                            }
+                            Text(entry.attachment.text).font(.caption).textSelection(.enabled)
+                        }
+                    }
                     ForEach(entry.allTurns) { turn in
                         Text(turn.question).font(.system(size: 13, weight: .medium)).textSelection(.enabled)
                         if !turn.answer.isEmpty { answer(turn.answer, entry: entry) }
@@ -123,6 +136,7 @@ struct AIRegionHistoryView: View {
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
             }
+            if entry.locationInvalidated != true {
             Button("Continue conversation") {
                 if state.reopenRegionCard(from: entry) != nil {
                     state.rightPanelVisible = false; selectedID = nil
@@ -130,6 +144,7 @@ struct AIRegionHistoryView: View {
             }.buttonStyle(ReaderPanelButtonStyle(prominent: true))
                 .disabled(entry.attachment.page < 0 || entry.attachment.page >= (state.document?.pageCount ?? 0))
                 .padding(12)
+            }
         }
     }
     private func answer(_ text: String, entry: AIRegionHistoryEntry) -> some View {

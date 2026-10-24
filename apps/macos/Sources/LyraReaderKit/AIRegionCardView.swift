@@ -39,6 +39,8 @@ struct AIRegionCardView: View {
     var maximumHeight: CGFloat = 420
     let onOpenInPanel: (AIRegionHistoryEntry) -> Void
     let onShowHistory: () -> Void
+    @AppStorage(RegionConversationStyle.preferenceKey) private var styleRaw = RegionConversationStyle.parchment.rawValue
+    private var parchment: Bool { styleRaw != RegionConversationStyle.window.rawValue }
     @State private var showingSelection = false
     @State private var showingDetails = false
     @State private var showingNote = false
@@ -72,7 +74,12 @@ struct AIRegionCardView: View {
             .onPreferenceChange(AIRegionComposerHeightKey.self) { composerHeight = $0 }
         }
         .foregroundStyle(LyraReaderTheme.textPrimary)
-        .background(RegionNotePaper())
+        .background {
+            if parchment { RegionNotePaper() }
+            else { RoundedRectangle(cornerRadius: 10).fill(LyraReaderTheme.regionWindowBg)
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(LyraReaderTheme.border))
+                .shadow(color: .black.opacity(0.06), radius: 4, y: 2) }
+        }
         .padding(.vertical, 8)
         .background(GeometryReader { proxy in
             Color.clear.preference(key: AIRegionCardHeightKey.self, value: proxy.size.height)
@@ -81,7 +88,12 @@ struct AIRegionCardView: View {
             Task { @MainActor in state.updateRegionCardHeight(cardID: card.id, viewHeight: height) }
         }
         .background(AIRegionCardMarkerHost())
-        .onAppear { questionFocused = true }
+        .background(RegionConversationKeyboard(collapse: {
+            state.closeRegionCard(id: card.id, keepHistory: true)
+        }, delete: {
+            requestDelete()
+        }, regionID: card.id, enabled: state.selectedAnnotationID == nil && !state.contentEditEnabled && !confirmingDelete && !editingNote && !showingSelection && !showingDetails))
+        .onAppear { questionFocused = card.focusesComposerOnOpen }
         .sheet(isPresented: $editingNote, onDismiss: { state.persistRegionHistory() }) {
             VStack(spacing: 12) {
                 HStack {
@@ -118,7 +130,7 @@ struct AIRegionCardView: View {
                 .accessibilityLabel(card.isBusy || card.notesBusy ? "Lyra is responding" : "Lyra")
             Button { showingSelection.toggle() } label: {
                 HStack(spacing: 5) {
-                    Text("Page \(card.attachment.page + 1)").font(.system(size: 12, weight: .semibold))
+                    Text("Page \(card.attachment.page + 1) · Region \(card.regionNumber)").font(.system(size: 12, weight: .semibold))
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
                 }
             }.buttonStyle(.plain).help("View selected region")
@@ -136,33 +148,43 @@ struct AIRegionCardView: View {
                 }.buttonStyle(.plain).help("Edit reading note")
                     .accessibilityLabel("Edit reading note")
             }
-            Menu {
-                Button(showingNote ? "Show Conversation" : "Show Reading Note") { showingNote.toggle() }
-                    .disabled(card.knowledgeNote.isEmpty && !card.notesBusy)
-                Button("Distill into Reading Note") {
-                    guard let context = state.aiReaderContext else { return }
-                    showingNote = true
-                    Task { await card.distill(context: context) }
-                }.disabled(card.conversationContext.isEmpty || card.isBusy || card.notesBusy)
-                Button("Export Reading Notes…") { state.presentRegionHistoryExportPanel() }
-                    .disabled(!state.hasExportableRegionHistory)
-                Divider()
-                Button("Request Details") { showingDetails.toggle() }
-                Button("All Reading Notes") { onShowHistory() }
-                if let entry = card.historyEntry {
-                    Button("Open in AI Panel") { onOpenInPanel(entry) }
-                }
-                Divider()
-                Button("Delete Conversation…", role: .destructive) { confirmingDelete = true }
-            } label: { Image(systemName: "ellipsis").frame(width: 24, height: 24) }
-                .menuStyle(.borderlessButton).fixedSize().help("Conversation actions")
-                .accessibilityLabel("Conversation actions")
+            LyraReaderMenu(title: "Conversation actions", items: conversationActions) {
+                Image(systemName: "ellipsis").frame(width: 24, height: 24)
+            }
             Button { state.closeRegionCard(id: card.id, keepHistory: true) } label: {
                 Image(systemName: "chevron.up").font(.system(size: 11, weight: .medium))
                     .frame(width: 26, height: 26).contentShape(Rectangle())
             }.buttonStyle(.plain).help("Collapse and keep conversation")
                 .accessibilityLabel("Collapse and keep conversation")
         }.padding(.horizontal, 18).frame(height: 40)
+    }
+    private var conversationActions: [LyraReaderMenuItem] {
+        [
+            LyraReaderMenuItem(showingNote ? "Show Conversation" : "Show Reading Note", icon: "note.text",
+                enabled: !card.knowledgeNote.isEmpty || card.notesBusy) { showingNote.toggle() },
+            LyraReaderMenuItem("Distill into Reading Note", icon: "sparkles",
+                enabled: !card.conversationContext.isEmpty && !card.isBusy && !card.notesBusy) {
+                guard let context = state.aiReaderContext else { return }
+                showingNote = true; Task { await card.distill(context: context) }
+            },
+            LyraReaderMenuItem("Export Reading Notes…", icon: "square.and.arrow.up",
+                enabled: state.hasExportableRegionHistory) { state.presentRegionHistoryExportPanel() },
+            .separator("details"),
+            LyraReaderMenuItem("Request Details", icon: "info.circle") { showingDetails.toggle() },
+            LyraReaderMenuItem("All Reading Notes", icon: "note.text") { onShowHistory() },
+            LyraReaderMenuItem("Open in AI Panel", icon: "sidebar.right") {
+                if let entry = card.historyEntry { onOpenInPanel(entry) }
+            },
+            .separator("delete"),
+            LyraReaderMenuItem("Delete Conversation…", icon: "trash", color: LyraReaderTheme.errorFg) {
+                requestDelete()
+            }
+        ]
+    }
+    private func requestDelete() {
+        if card.allTurns.isEmpty && card.knowledgeNote.isEmpty {
+            state.closeRegionCard(id: card.id, keepHistory: false)
+        } else { confirmingDelete = true }
     }
     private var selectionPreview: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -194,7 +216,7 @@ struct AIRegionCardView: View {
                             Color.clear.preference(key: AIRegionBottomKey.self,
                                 value: p.frame(in: .named("regionTranscript")).maxY)
                         })
-                }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
+                }.background(RegionTranscriptScrollTheme()).padding(18).frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
                     .background(GeometryReader { p in
                         Color.clear.preference(key: AIRegionTranscriptHeightKey.self, value: p.size.height)
@@ -270,10 +292,11 @@ struct AIRegionCardView: View {
                 .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...3)
                 .focused($questionFocused).onSubmit { send() }
                 .disabled(card.isBusy || card.notesBusy)
-                .padding(9).background(LyraReaderTheme.raisedBg.opacity(0.45), in: RoundedRectangle(cornerRadius: 3))
+                .padding(9).background(LyraReaderTheme.raisedBg.opacity(parchment ? 0.45 : 1), in: RoundedRectangle(cornerRadius: parchment ? 3 : 7))
+                .overlay { if !parchment { RoundedRectangle(cornerRadius: 7).strokeBorder(questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder) } }
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder)
-                        .frame(height: questionFocused ? 1.5 : 0.7)
+                        .frame(height: parchment ? (questionFocused ? 1.5 : 0.7) : 0)
                 }
                 .accessibilityLabel("Region question")
             if card.isBusy || card.notesBusy {
@@ -487,25 +510,31 @@ final class AIRegionCanvasHost: NSView {
     private var hosts: [UUID: NSHostingView<AIRegionCardView>] = [:]
     private var sizes: [UUID: CGSize] = [:]
     private var placementSignature = ""
+    private var markers: [UUID: AIRegionMarkerButton] = [:]
+    private let activeOutline = CAShapeLayer()
     var cardFrames: [CGRect] { hosts.values.map(\.frame) }
 
     func configure(state: AppState?, onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void,
                    onShowHistory: @escaping () -> Void) -> Bool {
-        let signature = state?.regionCards.map {
+        let cardSignature = state?.regionCards.map {
             "\($0.id):\($0.heightViewPt):\(state?.regionGapTop(for: $0.id) ?? 0)"
         }.joined(separator: "|") ?? ""
+        let historySignature = state?.currentRegionHistory.map { "\($0.id):\($0.regionNumber ?? 0)" }.joined(separator: "|") ?? ""
+        let signature = cardSignature + historySignature
         let changed = self.state !== state || placementSignature != signature
         placementSignature = signature
         self.state = state; self.onOpenInPanel = onOpenInPanel; self.onShowHistory = onShowHistory
         return changed
     }
-    func sync(size: CGSize, viewport: CGRect, scroll: CGFloat, zoom: CGFloat) {
+    func sync(size: CGSize, viewport: CGRect, scroll: CGFloat, zoom: CGFloat, pageFrames: [PagePlacement]) {
         let viewportFrame = CGRect(origin: .zero, size: size)
         if frame != viewportFrame { frame = viewportFrame }
         guard let state else {
             hosts.values.forEach { $0.removeFromSuperview() }; hosts.removeAll(); sizes.removeAll()
+            markers.values.forEach { $0.removeFromSuperview() }; markers.removeAll(); activeOutline.path = nil
             return
         }
+        syncMarkers(state: state, size: size, viewport: viewport, scroll: scroll, zoom: zoom, pageFrames: pageFrames)
         let ids = Set(state.regionCards.map(\.id))
         for id in hosts.keys where !ids.contains(id) {
             hosts.removeValue(forKey: id)?.removeFromSuperview(); sizes[id] = nil
@@ -535,11 +564,55 @@ final class AIRegionCanvasHost: NSView {
             host.isHidden = host.frame.maxY <= 0 || host.frame.minY >= size.height
         }
     }
+    private func syncMarkers(state: AppState, size: CGSize, viewport: CGRect,
+                             scroll: CGFloat, zoom: CGFloat, pageFrames: [PagePlacement]) {
+        wantsLayer = true
+        if activeOutline.superlayer == nil { layer?.insertSublayer(activeOutline, at: 0) }
+        let entries = state.currentRegionHistory.filter { $0.locationInvalidated != true }
+        let ids = Set(entries.map(\.id))
+        for id in Array(markers.keys) where !ids.contains(id) {
+            markers.removeValue(forKey: id)?.removeFromSuperview()
+        }
+        let path = CGMutablePath()
+        var occupied: [CGRect] = []
+        for entry in entries.sorted(by: { ($0.regionNumber ?? 0) < ($1.regionNumber ?? 0) }) {
+            let active = state.regionCards.contains { $0.id == entry.id }
+            let rects = AIRegionMarkerGeometry.rectangles(attachment: entry.attachment,
+                frames: pageFrames, width: size.width, contentWidth: state.contentWidthPt,
+                scroll: scroll, zoom: zoom)
+            if active { rects.forEach { path.addRoundedRect(in: $0, cornerWidth: 2, cornerHeight: 2) } }
+            let button = markers[entry.id] ?? AIRegionMarkerButton(frame: .zero)
+            if button.superview == nil { addSubview(button); markers[entry.id] = button }
+            guard let anchor = rects.first, anchor.intersects(viewport) else { button.isHidden = true; continue }
+            let number = entry.regionNumber ?? 1
+            button.regionID = entry.id
+            button.title = active ? "Region \(number)" : "\(number)"
+            button.contentTintColor = LyraReaderTheme.accentColor
+            button.toolTip = active ? "Selected region \(number)" : "Continue conversation in region \(number)"
+            button.setAccessibilityLabel(button.toolTip)
+            button.activate = { [weak state] in _ = state?.reopenRegionCard(from: entry) }
+            let width: CGFloat = active ? 82 : 28
+            var frame = CGRect(x: min(max(viewport.minX, anchor.minX), viewport.maxX - width),
+                               y: max(viewport.minY, anchor.minY - 25), width: width, height: 24)
+            // Keep nearby markers separately reachable instead of placing them on one another.
+            while occupied.contains(where: { $0.intersects(frame) }), frame.maxX + width + 4 <= viewport.maxX {
+                frame.origin.x += width + 4
+            }
+            occupied.append(frame); button.frame = frame; button.isHidden = false
+        }
+        activeOutline.path = path
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            activeOutline.strokeColor = LyraReaderTheme.accentColor.withAlphaComponent(0.85).cgColor
+            activeOutline.fillColor = LyraReaderTheme.accentColor.withAlphaComponent(0.06).cgColor
+        }
+        activeOutline.lineWidth = 1.2
+    }
     override func hitTest(_ point: NSPoint) -> NSView? {
         // AppKit passes a point in the superview's coordinates. The Metal parent is
         // bottom-up while this host is top-down; hit-test in the host's own coordinates.
         let local = convert(point, from: superview)
-        guard hosts.values.contains(where: { !$0.isHidden && $0.frame.contains(local) }) else { return nil }
+        guard hosts.values.contains(where: { !$0.isHidden && $0.frame.contains(local) })
+            || markers.values.contains(where: { !$0.isHidden && $0.frame.contains(local) }) else { return nil }
         return super.hitTest(point)
     }
 }
