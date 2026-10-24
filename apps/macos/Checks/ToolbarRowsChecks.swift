@@ -438,6 +438,12 @@ extension ReaderChecks {
         if state.exportVisible { state.exportVisible = false }
         if state.contentEditEnabled { state.contentEditEnabled = false }
         state.annotationToolsVisible = false
+        // The live-resize rule is about the *window*, not about the machine's Reduce Motion
+        // preference. Pin the preference off for this block (CI runners sometimes have it on)
+        // and restore whatever the process had afterwards.
+        let savedReduceMotion = ReaderMotion.reduceMotionOverride
+        defer { ReaderMotion.reduceMotionOverride = savedReduceMotion }
+        ReaderMotion.reduceMotionOverride = false
         NotificationCenter.default.post(
             name: NSWindow.willStartLiveResizeNotification, object: harness.window)
         try await Task.sleep(for: .milliseconds(80))
