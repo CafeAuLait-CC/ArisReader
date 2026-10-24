@@ -32,6 +32,22 @@ extension ReaderChecks {
         defer { appearance.mode = savedMode }
         appearance.mode = .original
 
+        // The reader's annotation cache is process-wide and keyed by the document path. Other
+        // suites in this run may have opened the checked-in fixtures, so their caches can make
+        // a fresh tab look dirty (and put a Save / Discard sheet in front of `closeTab`). The
+        // traffic-light geometry must be measured on documents whose cache state this check
+        // owns, so copy the two fixtures into a scratch directory first.
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lyra-reader-titlebar-discard-\(UUID())")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let multipage = scratch.appendingPathComponent("multipage.pdf")
+        let textPage = scratch.appendingPathComponent("text-page.pdf")
+        try FileManager.default.copyItem(
+            at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: multipage)
+        try FileManager.default.copyItem(
+            at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: textPage)
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -99,7 +115,7 @@ extension ReaderChecks {
         }
 
         try await waitForLayout("initial 44 pt row")
-        require(state.newTab(url: root.appendingPathComponent("tests/fixtures/multipage.pdf")),
+        require(state.newTab(url: multipage),
                 "the check opens a document (lastError: \(state.lastError ?? "nil"))")
         try await eventually("the document is open", { state.document != nil })
         try await waitForLayout("document open")
@@ -129,7 +145,7 @@ extension ReaderChecks {
 
         // Gaining a document again must restore the same group, so a stale frame from the close
         // cannot hide until the next event.
-        require(state.newTab(url: root.appendingPathComponent("tests/fixtures/multipage.pdf")),
+        require(state.newTab(url: multipage),
                 "the window gains a document again (lastError: \(state.lastError ?? "nil"))")
         try await eventually("the second document is open", { state.document != nil })
         try await waitForLayout("document open again")
@@ -138,7 +154,7 @@ extension ReaderChecks {
         // the first document is still live, then close the last, clean tab. AppKit re-lays the
         // titlebar on each content change, so these are the paths that do not go through the
         // Save / Discard decision but share its layout.
-        require(state.newTab(url: root.appendingPathComponent("tests/fixtures/text-page.pdf")),
+        require(state.newTab(url: textPage),
                 "a second tab opens (lastError: \(state.lastError ?? "nil"))")
         try await eventually("the second tab is live", {
             state.tabs.count == 2 && state.document?.pageCount == 1
@@ -146,13 +162,18 @@ extension ReaderChecks {
         try await waitForLayout("second tab open")
         state.closeTab(1)
         require(state.tabs.count == 1 && state.document != nil,
-                "closing the clean second tab keeps the first document")
+                "closing the clean second tab keeps the first document "
+                    + "(tabs \(state.tabs.count), active \(String(describing: state.activeTabIndex)), "
+                    + "dirty \(state.hasUnsavedDocumentChanges), "
+                    + "annotations \(state.annotations.count), "
+                    + "cacheDirty \(state.annotationCacheIsDirty), "
+                    + "closeRequested \(state.contentCloseRequested))")
         try await waitForLayout("second tab closed")
         state.closeTab(0)
         require(state.tabs.isEmpty && state.document == nil,
                 "closing the clean last tab needs no save decision")
         try await waitForLayout("clean last tab closed")
-        require(state.newTab(url: root.appendingPathComponent("tests/fixtures/multipage.pdf")),
+        require(state.newTab(url: multipage),
                 "the window gains a third document (lastError: \(state.lastError ?? "nil"))")
         try await eventually("the third document is open", { state.document != nil })
         try await waitForLayout("third document open")

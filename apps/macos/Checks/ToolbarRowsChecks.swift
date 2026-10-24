@@ -12,7 +12,17 @@ import SwiftUI
 extension ReaderChecks {
     @MainActor static func toolbarRowsChecks(root: URL) async throws {
         _ = NSApplication.shared
-        let fixture = root.appendingPathComponent("tests/fixtures/text-page.pdf")
+        // Use a scratch copy, not the checked-in fixture: this suite places and undoes
+        // annotations, and the reader's process-wide annotation cache is keyed by path. Writing
+        // to the repository fixture would leave a dirty cache for every later suite that opens
+        // it (the titlebar discard check's "clean second tab" is the one that caught this).
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lyra-reader-toolbar-rows-\(UUID())")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let fixture = scratch.appendingPathComponent("toolbar-rows.pdf")
+        try FileManager.default.copyItem(
+            at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: fixture)
 
         // ── 1. The rows and their one-at-a-time state machine ────────────────────────────
         let state = AppState(engine: try RustEngine())
