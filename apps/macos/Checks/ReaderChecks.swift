@@ -100,6 +100,10 @@ struct ReaderChecks {
         AppState.usesStoredSidePanelPreferences = false
 
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-preview-citation-card") {
+            try await previewCitationCardChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-drawer-tiles") {
             try await drawerTileRetentionChecks(url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
             return
@@ -898,6 +902,9 @@ struct ReaderChecks {
             }),
             ("preview-actions", {
                 try await previewActionChecks(root: root)
+            }),
+            ("preview-citation-card", {
+                try await previewCitationCardChecks(root: root)
             }),
             ("pointer-zoom", {
                 try await pointerZoomChecks(url: b)

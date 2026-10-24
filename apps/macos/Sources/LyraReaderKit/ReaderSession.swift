@@ -76,12 +76,6 @@ public final class ReaderSession: ObservableObject, Identifiable {
         self.opener = DocumentOpenCoordinator(state: self.state, registry: registry)
         self.previewPanels = ReferencePreviewPanelController()
         self.registry = registry
-        // The panel's "open in a new window" action is this window's own coordinator: it knows
-        // the document, the preview target and the registry that makes the second window. The
-        // closure is weak in the coordinator so the panel never keeps a closed window alive.
-        previewPanels.openInNewWindow = { [weak opener = self.opener] in
-            opener?.openPreviewTargetInNewWindow() ?? false
-        }
     }
 
     /// Installs the app's "make another reader window" command into the registry.
