@@ -87,10 +87,11 @@ package final class FillSignMenuController: NSObject {
 
     private func makeItem(_ command: FillSignMenuCommand) -> NSMenuItem {
         guard !command.isSeparator else { return .separator() }
+        let hasSubmenu = !command.children.isEmpty
         let item = NSMenuItem(title: command.title,
-                              action: #selector(performMenuAction(_:)),
+                              action: hasSubmenu ? nil : #selector(performMenuAction(_:)),
                               keyEquivalent: "")
-        item.target = self
+        item.target = hasSubmenu ? nil : self
         item.representedObject = command.id
         item.isEnabled = command.enabled
         item.state = command.selected ? .on : .off
@@ -100,7 +101,7 @@ package final class FillSignMenuController: NSObject {
             image?.isTemplate = true
             item.image = image
         }
-        if !command.children.isEmpty {
+        if hasSubmenu {
             let submenu = NSMenu(title: command.title)
             submenu.autoenablesItems = false
             for child in command.children { submenu.addItem(makeItem(child)) }
