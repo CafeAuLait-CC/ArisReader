@@ -533,8 +533,17 @@ struct ReaderChecks {
             tabRowLayoutChecks()
             titlebarResizeChecks()
             try await titlebarThemeChecks(root: root)
+            try await titlebarLastTabChecks(root: root)
             try await tabRetentionChecks(root: root)
             print("Tab-row checks passed")
+            return
+        }
+        // The last-document Discard regression on its own
+        // (`LyraReaderChecks --check-titlebar-discard .`).
+        if CommandLine.arguments.contains("--check-titlebar-discard") {
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
+            try await titlebarLastTabChecks(root: root)
+            print("Titlebar last-tab checks passed")
             return
         }
         // Lets the document-opening checks be run on their own while they are being worked on.
@@ -1001,6 +1010,9 @@ struct ReaderChecks {
             }),
             ("titlebar-theme", {
                 try await titlebarThemeChecks(root: root)
+            }),
+            ("titlebar-last-tab", {
+                try await titlebarLastTabChecks(root: root)
             }),
             ("tab-retention", {
                 try await tabRetentionChecks(root: root)
