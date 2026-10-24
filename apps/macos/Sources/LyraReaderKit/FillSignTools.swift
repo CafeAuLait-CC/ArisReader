@@ -200,8 +200,8 @@ public struct FillSignRowCommand: Identifiable, Equatable, Sendable {
 
 /// The Fill & Sign inspector's Signature methods, in the order #153's submenu used.
 ///
-/// `continuity` is the item AppKit recognises by identifier; the inspector hosts it inside a
-/// small pop-up button (see ``ContinuitySignatureButton``) rather than drawing a look-alike.
+/// The Continuity button opens a system contextual menu through an image-capable responder
+/// (see ``SignatureContinuityButton``); AppKit supplies the paired devices and Add Sketch action.
 public struct SignatureMethodCommand: Identifiable, Equatable, Sendable {
     public enum Action: String, Equatable, Sendable {
         case type
