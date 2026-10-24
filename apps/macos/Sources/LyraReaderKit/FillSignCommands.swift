@@ -157,26 +157,27 @@ package final class FillSignCommandController: NSObject {
 
 /// A small dialog: a name field, a handwriting-font popup, and a preview of what will be placed.
 @MainActor
-private final class TypedSignatureDialog: NSObject, NSTextFieldDelegate {
+package final class TypedSignatureDialog: NSObject, NSTextFieldDelegate {
     private let nameField = NSTextField()
     private let fontPopup = NSPopUpButton()
     private let preview = NSImageView()
-    private let accessory: NSView
+    package let accessory: NSView
     private let fontNames: [String]
 
-    override init() {
+    package override init() {
         fontNames = TypedSignatureRenderer.availableFontNames
-        accessory = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 176))
+        accessory = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 196))
         super.init()
         buildAccessory()
     }
 
     private func buildAccessory() {
         let nameLabel = NSTextField(labelWithString: "Name")
-        nameLabel.frame = NSRect(x: 0, y: 150, width: 44, height: 18)
+        nameLabel.frame = NSRect(x: 0, y: 176, width: 192, height: 18)
         accessory.addSubview(nameLabel)
 
-        nameField.frame = NSRect(x: 48, y: 146, width: 220, height: 24)
+        nameField.frame = NSRect(x: 0, y: 146, width: 192, height: 24)
+        nameField.setAccessibilityLabel("Signature name")
         nameField.placeholderString = "Your name"
         nameField.delegate = self
         nameField.target = self
@@ -184,10 +185,11 @@ private final class TypedSignatureDialog: NSObject, NSTextFieldDelegate {
         accessory.addSubview(nameField)
 
         let fontLabel = NSTextField(labelWithString: "Font")
-        fontLabel.frame = NSRect(x: 276, y: 150, width: 30, height: 18)
+        fontLabel.frame = NSRect(x: 208, y: 176, width: 212, height: 18)
         accessory.addSubview(fontLabel)
 
-        fontPopup.frame = NSRect(x: 310, y: 144, width: 110, height: 26)
+        fontPopup.frame = NSRect(x: 208, y: 144, width: 212, height: 26)
+        fontPopup.setAccessibilityLabel("Signature font")
         fontPopup.addItems(withTitles: fontNames.isEmpty ? ["System"] : fontNames)
         fontPopup.target = self
         fontPopup.action = #selector(refreshPreview)
@@ -219,7 +221,7 @@ private final class TypedSignatureDialog: NSObject, NSTextFieldDelegate {
         return title
     }
 
-    func controlTextDidChange(_ notification: Notification) {
+    package func controlTextDidChange(_ notification: Notification) {
         refreshPreview()
     }
 
@@ -285,21 +287,26 @@ private final class DrawnSignatureDialog {
 /// The pad's coordinate space is flipped so the normalised y axis points down, matching the
 /// annotation cache and making the conversion a division rather than a subtraction.
 @MainActor
-private final class SignaturePadView: NSView {
+package final class SignaturePadView: NSView {
     private var strokes: [[CGPoint]] = []
     private var current: [CGPoint] = []
 
-    override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
+    package override var isFlipped: Bool { true }
+    package override var isOpaque: Bool { true }
+    package override var acceptsFirstResponder: Bool { true }
+    // NSAlert allows background dragging. Ink gestures must stay with this canvas.
+    package override var mouseDownCanMoveWindow: Bool { false }
+    package override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    override func mouseDown(with event: NSEvent) {
+    package override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         current = [point]
         strokes.append(current)
         needsDisplay = true
     }
 
-    override func mouseDragged(with event: NSEvent) {
+    package override func mouseDragged(with event: NSEvent) {
         guard !strokes.isEmpty else { return }
         let point = convert(event.locationInWindow, from: nil)
         if let last = current.last, hypot(point.x - last.x, point.y - last.y) < 1 { return }
@@ -308,7 +315,8 @@ private final class SignaturePadView: NSView {
         needsDisplay = true
     }
 
-    override func mouseUp(with event: NSEvent) {
+    package override func mouseUp(with event: NSEvent) {
+        guard !current.isEmpty, !strokes.isEmpty else { return }
         let point = convert(event.locationInWindow, from: nil)
         if current.count < 2 {
             // A click is a dot, not a signature stroke. Drop it so "Place" cannot succeed on a
@@ -323,7 +331,7 @@ private final class SignaturePadView: NSView {
         needsDisplay = true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    package override func draw(_ dirtyRect: NSRect) {
         NSColor.white.setFill()
         bounds.fill()
         NSColor.separatorColor.setStroke()
@@ -357,7 +365,7 @@ private final class SignaturePadView: NSView {
 
     /// Normalise the ink into a 0…1 box with its own aspect ratio. A purely horizontal stroke is
     /// given a minimum height so placement does not divide by zero.
-    var drawnSignature: DrawnSignature? {
+    package var drawnSignature: DrawnSignature? {
         let usable = strokes.filter { $0.count >= 2 }
         let points = usable.flatMap { $0 }
         guard !points.isEmpty else { return nil }

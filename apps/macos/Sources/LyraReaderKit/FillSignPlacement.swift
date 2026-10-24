@@ -118,23 +118,27 @@ public enum DrawnSignaturePreview {
         _ signature: DrawnSignature,
         size: CGSize = CGSize(width: 240, height: 90)
     ) -> NSImage? {
-        guard !signature.isEmpty, size.width > 1, size.height > 1 else { return nil }
-        let image = NSImage(size: size)
+        guard !signature.isEmpty, size.width > 1, size.height > 1,
+              signature.aspect.isFinite, signature.aspect > 0 else { return nil }
+        let fittedSize = signature.aspect > size.width / size.height
+            ? CGSize(width: size.width, height: size.width / signature.aspect)
+            : CGSize(width: size.height * signature.aspect, height: size.height)
+        let image = NSImage(size: fittedSize)
         image.lockFocus()
         defer { image.unlockFocus() }
         NSColor.clear.setFill()
-        NSRect(origin: .zero, size: size).fill()
+        NSRect(origin: .zero, size: fittedSize).fill()
         NSColor.black.setStroke()
         for stroke in signature.strokes where stroke.count >= 2 {
             let path = NSBezierPath()
             path.lineWidth = 2
             path.lineCapStyle = .round
             path.lineJoinStyle = .round
-            path.move(to: CGPoint(x: stroke[0].x * size.width,
-                                  y: (1 - stroke[0].y) * size.height))
+            path.move(to: CGPoint(x: stroke[0].x * fittedSize.width,
+                                  y: (1 - stroke[0].y) * fittedSize.height))
             for point in stroke.dropFirst() {
-                path.line(to: CGPoint(x: point.x * size.width,
-                                      y: (1 - point.y) * size.height))
+                path.line(to: CGPoint(x: point.x * fittedSize.width,
+                                      y: (1 - point.y) * fittedSize.height))
             }
             path.stroke()
         }

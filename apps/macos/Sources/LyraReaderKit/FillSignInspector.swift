@@ -17,9 +17,7 @@ import SwiftUI
 /// whenever no Fill & Sign tool is armed.
 struct FillSignInspector: View {
     @ObservedObject var state: AppState
-    /// The continuity pop-up's menu item keeps this controller as its target. `@State` keeps
-    /// the same object across the body updates that a preview or a date-format change causes;
-    /// a fresh controller per update would leave the AppKit menu item pointing at a dead one.
+    /// Keep the same controller while AppKit's asynchronous device service is in flight.
     @State private var controller: FillSignCommandController
 
     init(state: AppState) {
@@ -117,6 +115,20 @@ struct FillSignInspector: View {
     private var signatureOptions: some View {
         ReaderPanelSection(title: "Signature") {
             signaturePreview
+            if state.canRotatePendingSignature {
+                HStack(spacing: 8) {
+                    Button { state.rotatePendingSignature(clockwise: false) } label: {
+                        Label("90°", systemImage: "rotate.left")
+                    }
+                    .accessibilityLabel("Rotate signature counterclockwise 90 degrees")
+                    .help("Rotate signature left by 90°")
+                    Button { state.rotatePendingSignature(clockwise: true) } label: {
+                        Label("90°", systemImage: "rotate.right")
+                    }
+                    .accessibilityLabel("Rotate signature clockwise 90 degrees")
+                    .help("Rotate signature right by 90°")
+                }
+            }
             Text("Type a name, draw with the pointer, choose a picture, or sign on a paired "
                  + "iPhone or iPad. All four place a picture of a signature, not a digital "
                  + "signature.")
