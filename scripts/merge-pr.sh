@@ -130,7 +130,11 @@ if [ "$SKIP_VERIFY" -eq 0 ]; then
   echo "==> building"
   ./scripts/build-rust.sh >/dev/null
   echo "==> checking"
-  RESULT="$(./scripts/check.sh 2>&1 | grep -E 'passed ·' | tail -1)"
+  RESULT="$(./scripts/check.sh 2>&1 | grep -E 'passed ·' | tail -1 || true)"
+  if [ -z "$RESULT" ]; then
+    echo "fatal: the check suite produced no summary line; verification failed. Branches kept." >&2
+    exit 1
+  fi
   echo "    $RESULT"
   case "$RESULT" in *"0 failed"*) ;; *)
     echo "fatal: verification failed; branches kept so the merge can be inspected." >&2

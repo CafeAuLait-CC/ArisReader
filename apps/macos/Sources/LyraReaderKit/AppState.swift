@@ -7706,7 +7706,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canFlattenDocument: Bool {
         document != nil && !isXfaDocument && !formInfo.encrypted
             && !flattenInProgress && !annotationSaveInProgress && !formSaveInProgress
-            && !propertiesSaveInProgress && !redactionBusy && !pageEditBusy
+            && !propertiesSaveInProgress && !pageEditBusy
     }
 
     /// The one sentence the menu item's help and a refused direct call share.
