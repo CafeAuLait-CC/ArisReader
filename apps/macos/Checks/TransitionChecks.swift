@@ -577,9 +577,17 @@ extension ReaderChecks {
         require(harness.hit(fromCanvasTop: 40) !== harness.canvas,
                 "leaving page overview returns the annotation row in the same slot without a gap")
         state.annotationToolsVisible = false
-        try await Task.sleep(for: .milliseconds(250))
-        require(harness.hit(fromCanvasTop: 10) === harness.canvas,
-                "closing the shared row restores the canvas's hit area at the top")
+        // Display-link transactions can start late when the shard has many hosted GPU views.
+        // Observe the actual released hit area rather than assuming wall-clock sleep means
+        // AppKit has presented the animation's last frame. A persistent overlay still fails.
+        try await eventuallyExplaining(
+            "closing the shared row restores the canvas's hit area at the top",
+            {
+                "Open rows: \(state.openSecondaryRows); overview: \(state.pageOverviewVisible); "
+                    + "hit: \(harness.hit(fromCanvasTop: 10).map { String(describing: type(of: $0)) } ?? "nil")"
+            },
+            { harness.hit(fromCanvasTop: 10) === harness.canvas }
+        )
 
         // ── Reduce Motion is immediate ──────────────────────────────────────────────────
         ReaderMotion.reduceMotionOverride = true

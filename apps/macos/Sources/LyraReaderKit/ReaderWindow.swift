@@ -519,6 +519,9 @@ public struct ReaderWindow: View {
         // trailing inset uses their settled widths (like the leading sidebar inset) so the row's
         // own controls do not reflow on every animation frame.
         .padding(.trailing, secondaryToolbarTrailingInset)
+        // Include the slot marker and leading spacer in the hit gate: neither the row's
+        // native scroll host nor its closing animation may leave a transparent hit surface.
+        .allowsHitTesting(secondaryToolbarVisible || state.transitionProgressOverride?.row != nil)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
         .animation(secondaryRowAnimation, value: state.aiToolsVisible)
     }
