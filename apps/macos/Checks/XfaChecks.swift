@@ -135,7 +135,12 @@ extension ReaderChecks {
         require(!state.canSaveDocument, "Save/Save As are disabled (no copy of edits)")
         require(!state.canSaveFilledForm && !state.canSaveDocumentProperties,
                 "form and properties copies are disabled")
-        require(!state.canMarkRedactions, "the redaction tool is not offered")
+        require(!state.canOpenRedactionWorkspace, "the Edit redaction entry is not offered")
+        state.openRedactionWorkspace()
+        require(!state.contentEditEnabled,
+                "asking for redaction does not open the Edit workspace on an XFA form")
+        require(state.lastError?.contains("XFA") == true,
+                "the refused redaction entry explains the XFA read-only rule")
         try await eventually("the form info finishes loading", {
             state.formLoadCompleted && !state.formLoading
         })

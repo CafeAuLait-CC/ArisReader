@@ -303,30 +303,14 @@ struct ReaderCommands: Commands {
             .disabled(session?.state.lastAnnotationBackupURL == nil)
         }
 
-        // Redaction (T3.12). Marks are pending until one of the two explicit apply commands;
-        // the confirmation says what will be lost, and neither command runs in the background.
-        CommandMenu("Redaction") {
-            Button("Redact Tool") { session?.state.toggleRedactionTool() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(session?.state.canMarkRedactions != true)
-            Button("Mark Selection for Redaction") {
-                _ = session?.state.markSelectionForRedaction()
-            }
-            .keyboardShortcut("r", modifiers: [.command, .option])
-            .disabled(session == nil)
-            Button("Remove Last Mark") { session?.state.removeLastPendingRedaction() }
-                .disabled(session?.state.pendingRedactions.isEmpty != false)
-
-            Divider()
-
-            Button("Apply to Copy…") { session?.state.presentApplyRedactionsPanel() }
-                .disabled(session?.state.canApplyRedactions != true)
-            Button("Replace Original…") {
-                session?.state.presentReplaceRedactionsConfirmation()
-            }
-            .disabled(session?.state.canApplyRedactions != true)
-            Button("Clear Pending Redactions") { session?.state.clearPendingRedactions() }
-                .disabled(session?.state.pendingRedactions.isEmpty != false)
+        // Redaction (T3.12) lives only in the Edit workspace. This entry opens that workspace
+        // with the Blackout tool armed; the area is then staged like any other content edit and
+        // is published only by Edit's own Save Copy / Replace Original transactions. No chord is
+        // assigned: the retired ⇧⌘R belonged to the Rust keymap's ExplainSelection, and a
+        // destructive command should not take a reader's existing shortcut by surprise.
+        CommandGroup(after: .pasteboard) {
+            Button("Redact…") { session?.state.openRedactionWorkspace() }
+                .disabled(session?.state.canOpenRedactionWorkspace != true)
         }
 
         // Page operations (T3.9). Everything here is staged in a working copy until one of the

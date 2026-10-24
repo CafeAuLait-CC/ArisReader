@@ -7,8 +7,8 @@ import Foundation
 ///
 /// A document that carries a digital signature is read-only **in place**: every command that
 /// would rewrite the file is refused, while commands whose destination is a new file (extract,
-/// merge, split, save edited copy, filled-form/properties copy, redaction to a copy, annotation
-/// copy export) are allowed. Those copies are stripped of signature fields, because their bytes
+/// merge, split, save edited copy, filled-form/properties copy, content-edit redaction to a copy,
+/// annotation copy export) are allowed. Those copies are stripped of signature fields, because their bytes
 /// are no longer covered by the signature. An unsigned document is written exactly as before,
 /// except that a save which removes annotations prunes the file so the removed content cannot be
 /// recovered from the bytes.
@@ -114,10 +114,6 @@ extension ReaderChecks {
             _ = try await gateEngine.replaceWithDocumentProperties(
                 DocumentProperties(title: "x", author: "", subject: "", keywords: ""))
         }
-        await expectRefusal("replaceWithRedactions") {
-            _ = try await gateEngine.replaceWithRedactions(
-                [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
-        }
         await expectRefusal("replaceOriginalWithPageEdits") {
             _ = try await gateEngine.replaceOriginalWithPageEdits(original: signedURL)
         }
@@ -170,13 +166,6 @@ extension ReaderChecks {
         let editedReport = try await gateEngine.saveEditedCopy(to: editedCopy)
         require(editedReport.pageCount == 1, "saveEditedCopy writes the revision")
         try requireUnsignedCopy(editedCopy, "saveEditedCopy")
-
-        // Redaction to a copy.
-        let redactedCopy = scratch.appendingPathComponent("copy-redacted.pdf")
-        _ = try await gateEngine.redactToCopy(
-            to: redactedCopy,
-            areas: [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
-        try requireUnsignedCopy(redactedCopy, "redactToCopy")
 
         // Annotation copy: the new mark is written, the signature fields are not.
         let annotatedCopy = scratch.appendingPathComponent("copy-annotated.pdf")
@@ -281,14 +270,13 @@ extension ReaderChecks {
                 "annotation tools stay usable: edits go to a copy")
         require(state.canPageEdit && state.canPageOperations,
                 "page editing is staged and page copies are available")
-        require(state.canMarkRedactions, "redaction can be staged")
+        require(state.canOpenRedactionWorkspace,
+                "redaction is offered through the Edit workspace")
         require(state.canSaveAnnotationsToPDF, "copy export is available")
         require(!state.canReplaceOriginalWithAnnotations,
                 "in-place annotation writing is disabled")
         require(!state.canReplaceOriginalWithPageEdits,
                 "applying a page revision to the signed original is disabled")
-        require(!state.canReplaceOriginalWithRedactions,
-                "replacing the signed original with a redaction is disabled")
         require(!state.canReplaceOriginalWithFilledForm,
                 "writing form values into the signed original is disabled")
         require(!state.canReplaceOriginalWithDocumentProperties,
@@ -307,14 +295,6 @@ extension ReaderChecks {
         state.toggleEraserTool()
         require(state.annotationTool == .eraser, "the eraser can be armed")
         state.selectTool()
-
-        // A redaction can be marked and applied to a copy; replacing is disabled.
-        state.addPendingRedaction(page: 0, rect: CGRect(x: 20, y: 20, width: 60, height: 30))
-        require(!state.pendingRedactions.isEmpty && state.canApplyRedactions,
-                "a redaction can be marked for a copy")
-        require(!state.canReplaceOriginalWithRedactions,
-                "the marked redaction cannot be applied in place")
-        state.clearPendingRedactions()
 
         // Form drafts and property drafts are allowed; only their in-place save is disabled.
         try await eventually("the signed fixture's form loads", {

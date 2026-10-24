@@ -215,9 +215,12 @@ extension ReaderChecks {
         require(state.formFieldsAcceptPointer,
                 "leaving Edit restores the implicit pointer state for form fields")
 
-        // ── The annotation redaction code still exists, but has no toolbar control ──
-        require(state.canMarkRedactions,
-                "the annotation-layer redaction path is still present for its menus and checks")
+        // ── There is no annotation-row redaction mode at all ────────────────────────
+        require(!AnnotationTool.allCases.contains(where: { $0.rawValue == "redact" }),
+                "the canvas has no redaction tool: redaction is an Edit-workspace content command")
+        state.openRedactionWorkspace()
+        require(state.contentEditEnabled && state.contentEditTool == "blackout",
+                "the menu's Redact… entry opens Edit with Blackout armed")
         print("Annotation toolbar checks passed")
     }
 }

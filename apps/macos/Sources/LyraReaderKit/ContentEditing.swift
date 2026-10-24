@@ -26,6 +26,12 @@ public struct PDFContentPage: Codable, Equatable, Sendable {
 
 public struct PDFContentCommand: Encodable, Sendable {
   public var action: String, revision: String
+  /// A command names its action and the revision it was built against; the remaining fields are
+  /// filled per tool. Public so the native checks can exercise a stale or malformed command.
+  public init(action: String, revision: String) {
+    self.action = action
+    self.revision = revision
+  }
   public var target: String? = nil
   public var bounds: PDFContentBox? = nil
   public var rotation: Double? = nil

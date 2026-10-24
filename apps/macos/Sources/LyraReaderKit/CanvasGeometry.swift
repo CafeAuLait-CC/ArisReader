@@ -32,7 +32,7 @@ public enum CanvasGeometry {
     ///
     /// This is the inverse of ``viewRect(pageTopPt:pageLeftPt:region:scrollYPt:zoom:contentOffsetX:)``
     /// for a single point, and the conversion the canvas applies at its event boundary before
-    /// any annotation, selection or redaction geometry sees it. Both directions live here so the
+    /// any annotation or selection geometry sees it. Both directions live here so the
     /// pointer path cannot drift from the drawing path.
     ///
     /// `zoom` is the calibrated factor (`zoomFactor`), so a view point maps to the same page
