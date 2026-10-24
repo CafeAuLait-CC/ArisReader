@@ -314,9 +314,9 @@ public struct ReaderWindow: View {
                 },
                 onPlaceStamp: { point in state.placeStamp(atContentPoint: point) },
                 onPlaceSignature: { point in state.placeSignature(atContentPoint: point) },
-                // Escape leaves the sticky markup mode or the eraser. It is consumed only when a
-                // mode was active; the canvas keeps its existing Escape handling for a live draft.
-                onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },
+                // Escape leaves whichever annotation tool is armed; the canvas cancels a live
+                // draft first. Escape inside a form field is the field editor's own key path.
+                onCancelTool: { state.cancelActiveAnnotationTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 performanceProbe: state.performanceProbe,

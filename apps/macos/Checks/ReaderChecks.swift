@@ -185,6 +185,10 @@ struct ReaderChecks {
             try await formChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-annotation-toolbar") {
+            try await annotationToolbarChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-appearance") {
             await appearanceChecks()
             return
@@ -708,6 +712,9 @@ struct ReaderChecks {
             ("sticky-markup", {
                 try await stickyMarkupChecks(
                     fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+            }),
+            ("annotation-toolbar", {
+                try await annotationToolbarChecks(root: root)
             }),
             ("live-markup", {
                 try await liveMarkupChecks(

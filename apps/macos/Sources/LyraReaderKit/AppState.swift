@@ -373,14 +373,13 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public private(set) var formLoading = false
     @Published public private(set) var formError: String?
     @Published public private(set) var formLoadCompleted = false
-    /// The form tool is a mode like the ink and markup tools: while it is on, a click on a field
-    /// edits it and a click elsewhere still reads the page. Leaving it restores normal reading.
-    @Published public var formToolActive = false {
-        didSet { if formToolActive { cancelRegionSelection(reason: "Region selection cancelled: Fill & Sign took the pointer.") } }
-    }
-    /// The field that owns the keyboard while the form tool is active.
+    /// The field that owns the keyboard while no annotation or content tool owns the pointer.
+    ///
+    /// There is no form tool: a click on a widget focuses it whenever the pointer is in its
+    /// implicit selection state, and arming any annotation/content tool takes the pointer away
+    /// again (and drops this focus).
     @Published public private(set) var formFocusedFieldID: String?
-    /// The drop-down whose option list is open, when the form tool is active.
+    /// The drop-down whose option list is open.
     @Published public private(set) var formOpenChoiceFieldID: String?
     @Published public private(set) var formSaveInProgress = false
     /// Facts and `/Info` values for the information panel, loaded when it opens.
@@ -390,7 +389,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public private(set) var documentInfoError: String?
     @Published public private(set) var propertiesSaveInProgress = false
     @Published public var pageOverviewVisible: Bool = false {
-        didSet { if pageOverviewVisible { cancelRegionSelection(reason: "Region selection cancelled: page overview opened.") } }
+        didSet {
+            if pageOverviewVisible {
+                blurFormField()
+                cancelRegionSelection(reason: "Region selection cancelled: page overview opened.")
+            }
+        }
     }
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
@@ -450,6 +454,9 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
             if contentEditEnabled {
                 rightPanelVisible = false
                 performancePanelVisible = false
+                // Edit owns the pointer: a form field that was borrowing the keyboard hands it
+                // back before the content editor starts receiving clicks.
+                blurFormField()
                 cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
             }
         }
@@ -2434,13 +2441,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public var pendingSignatureImageData: Data?
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The eraser removes ink on a drag. The
-    /// modes cannot both be active.
+    /// modes cannot both be active. ``AnnotationTool/select`` is the implicit pointer state: it
+    /// means no tool is armed, which is why the toolbar has no Select button.
     @Published public var annotationTool: AnnotationTool = .select {
         didSet {
-            // The form tool and the drawing tools are modes of the same canvas; choosing a
-            // drawing tool leaves the form tool (and never the other way around).
-            if annotationTool != .select && formToolActive {
-                formToolActive = false
+            // Arming any tool takes the pointer from a form field (and never the other way
+            // around): once a tool is active, a click on the page belongs to that tool for as
+            // long as it is armed.
+            if annotationTool != .select {
                 formFocusedFieldID = nil
                 formOpenChoiceFieldID = nil
             }
@@ -2458,8 +2466,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // disarms it so a later click cannot place the wrong picture.
                 if annotationTool != .stamp { pendingStampStyle = nil }
                 if annotationTool != .signature { pendingSignatureImageData = nil }
-                // Selection is the Select tool's business: arming a pen, shape, markup or the
-                // eraser drops the halo instead of leaving a mark that Delete would still act on.
+                // Selecting a mark belongs to the implicit pointer state: arming a pen, shape,
+                // markup or the eraser drops the halo instead of leaving a mark that Delete
+                // would still act on.
                 cancelPendingMarkSelection()
                 if selectedAnnotationID != nil { selectedAnnotationID = nil }
                 // A selection on screen is drawn as the mark the tool will commit, or as the
@@ -2820,7 +2829,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var formInfo: FormInfo
         var formDraft: [String: FormFieldValue]
         var formHasPendingChanges: Bool
-        var formToolActive: Bool
         var formLoadCompleted: Bool
         var formError: String?
         var documentInfo: DocumentInfo?
@@ -3657,7 +3665,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         formLoading = false
         formError = nil
         formLoadCompleted = false
-        formToolActive = false
         formFocusedFieldID = nil
         formOpenChoiceFieldID = nil
         formSaveInProgress = false
@@ -4497,9 +4504,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return added
     }
 
-    /// The Select button leaves whatever mode is active, including a sticky markup tool.
+    /// Returns the canvas to the implicit pointer state. Kept as the programmatic entry point
+    /// used by the checks; there is deliberately no toolbar Select button.
     public func selectTool() {
         annotationTool = .select
+    }
+
+    /// One toolbar click on a tool: arms it, or turns it off when it is already active.
+    ///
+    /// Turning a tool off always means ``AnnotationTool/select``, never "no state": the pointer
+    /// is the implicit state whenever no tool is armed, so the toolbar needs no Select button.
+    /// Stamp and signature are exceptions on purpose: they carry a chosen picture/style and are
+    /// armed by their menus (``armStampTool(_:)``/``armSignatureTool(imageData:)``), not toggled.
+    public func toggleAnnotationTool(_ tool: AnnotationTool) {
+        switch tool {
+        case .select:
+            selectTool()
+        case .highlight, .underline, .strikeout:
+            guard let kind = tool.textMarkupKind else { return }
+            toggleTextMarkupTool(kind)
+        case .eraser:
+            toggleEraserTool()
+        case .redact:
+            toggleRedactionTool()
+        case .stamp, .signature:
+            return
+        case .pen, .line, .arrow, .rectangle, .ellipse, .note, .textBox:
+            guard canEditAnnotations else { return }
+            annotationTool = annotationTool == tool ? .select : tool
+        }
     }
 
     /// Whether the toolbar's eraser button has something to act on.
@@ -4514,13 +4547,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationTool = annotationTool == .eraser ? .select : .eraser
     }
 
-    /// Escape and the Select button leave every mode that has no finished draft to keep.
+    /// Escape, or clicking the active tool again, leaves any armed annotation tool.
     ///
     /// Returns whether anything was left or cleared, so the canvas consumes Escape only when it
-    /// did something. A selected mark is dropped even in plain Select mode: Escape is the
-    /// platform-wide way to end a selection, and Delete must not still have a target afterwards.
-    /// Text markup and the eraser are left; the pen and shape tools keep their existing
-    /// behaviour (only the live draft is cancelled).
+    /// did something. A selected mark is dropped even in the implicit pointer state: Escape is
+    /// the platform-wide way to end a selection, and Delete must not still have a target
+    /// afterwards. Every case lands on ``AnnotationTool/select``.
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
         let hadMarkSelection = selectedAnnotationID != nil || pendingMarkSelection != nil
@@ -4548,16 +4580,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if hadMarkSelection { clearAnnotationSelection() }
             return true
         }
+        // Pen, shape, note and text-box modes: Escape cancels the live draft (the canvas does
+        // that before calling here) and drops the tool itself.
+        if annotationTool != .select {
+            annotationTool = .select
+            statusMessage = "Tool off · selection mode"
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
         guard hadMarkSelection else { return false }
         clearAnnotationSelection()
         return true
     }
 
-    /// Escape and the Select button leave the sticky markup mode.
+    /// Escape, or clicking the active markup tool again, leaves the sticky markup mode.
     ///
     /// Returns whether a mode was actually left, so the canvas can consume the Escape key only
-    /// when it did something. Pen and shape tools keep their existing Escape behaviour (the
-    /// live draft is cancelled; the tool stays selected).
+    /// when it did something.
     @discardableResult
     public func cancelTextMarkupTool() -> Bool {
         guard annotationTool.isTextMarkup else { return false }
@@ -7347,80 +7386,119 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         canSaveFilledForm && !isReadOnlyDocument
     }
 
-    /// Whether the Fill & Sign placeholder has something to offer.
-    public var canUseFormTool: Bool {
-        document != nil && !isXfaDocument && !formInfo.encrypted
-            && formInfo.fields.contains(where: { $0.editable })
+    /// True while a click on a form field belongs to the field rather than to the canvas.
+    ///
+    /// The pointer is implicitly in selection mode whenever no annotation or content tool is
+    /// armed, and that is the whole gate. There is no form tool to arm: a plain document and a
+    /// signed document both accept field clicks (a signed file's values stay drafts and can be
+    /// saved to a copy), while the pen, a shape, a markup tool, the eraser, a stamp/signature
+    /// placement, redaction marking, Edit PDF, an armed region marquee or an open placed-text
+    /// editor all own the pointer and leave fields alone.
+    public var formFieldsAcceptPointer: Bool {
+        document != nil && !isXfaDocument && !formInfo.encrypted && annotationTool == .select
+            && !contentEditEnabled && !pageOverviewVisible && !contentTextEditing
+            && !regionSelectionArmed && editingAnnotationID == nil
     }
 
-    /// The toolbar button. Activating the form tool leaves the annotation tool in its normal
-    /// selection mode, so a click on a field is an edit and a click elsewhere still reads.
-    public func toggleFormTool() {
-        guard document != nil else { return }
+    /// The Fill & Sign menu opens whenever a document is open, even when it has no form fields.
+    /// The menu is the button's job; having nothing to fill is said inside it, not by greying
+    /// the button out.
+    public var canOpenFillAndSignMenu: Bool { document != nil }
+
+    /// The toolbar button's tooltip. It names the difference from the Signature tool on purpose:
+    /// a reader who wants to sign picks Signature, not this menu.
+    public var fillAndSignMenuHelp: String {
         if isXfaDocument {
-            lastError = readOnlyReason
-            statusMessage = "XFA form · fillable fields are not available"
-            return
+            return "Fill form fields · not available: this XFA form is rendered read-only from its XML"
         }
         if formInfo.encrypted {
-            lastError = formInfo.refusal
-                ?? "This PDF is encrypted, so the reader will not fill it."
-            return
+            return "Fill form fields · this PDF is encrypted, so its fields cannot be filled"
         }
-        guard canUseFormTool else {
-            statusMessage = formInfo.fields.isEmpty
-                ? "This document has no form fields"
-                : "This document has no fillable form fields"
-            return
-        }
-        if formToolActive {
-            leaveFormTool()
-            return
-        }
-        formToolActive = true
-        annotationTool = .select
-        formFocusedFieldID = nil
-        formOpenChoiceFieldID = nil
-        statusMessage = formHasPendingChanges
-            ? (formPendingSummary ?? "Form tool: click a field to fill it")
-            : "Form tool: click a field to fill it · Tab next field · Esc leaves"
-        FileHandle.standardError.write(Data(
-            "lyra-reader-forms: tool on · \(formInfo.fields.count) field(s) · "
-            .appending("encrypted: \(formInfo.encrypted)\n").utf8
-        ))
+        let base = "Fill form fields · click a field to type in it, no tool needed"
+            + " · for a signature image use the Signature tool"
+        return isReadOnlyDocument ? base + " · values can be saved to a copy" : base
     }
 
-    /// Escape on the canvas: leave the form tool when it is active. Returns whether a mode was
-    /// consumed, so the canvas can fall through to its other Escape handling when it was not.
-    @discardableResult
-    public func cancelFormTool() -> Bool {
-        guard formToolActive || formFocusedFieldID != nil else { return false }
-        leaveFormTool()
-        return true
+    /// One command in the Fill & Sign menu.
+    ///
+    /// The menu's placement contents are a separate change. For now it exposes the two commands
+    /// the form feature already had; modelling them here (rather than only inside the toolbar)
+    /// keeps the "menu is available but its commands explain why they are disabled" rule
+    /// checkable without presenting a real menu.
+    public struct FormMenuCommand: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let title: String
+        public let enabled: Bool
+        public let help: String?
     }
 
-    /// Leaves the form tool and returns the canvas to normal reading. Pending values stay in the
-    /// reader and the banner keeps saying so; only an explicit save writes them.
-    public func leaveFormTool() {
-        let wasActive = formToolActive || formFocusedFieldID != nil
-        formToolActive = false
-        formFocusedFieldID = nil
-        formOpenChoiceFieldID = nil
-        if wasActive {
-            statusMessage = formHasPendingChanges
-                ? (formPendingSummary ?? "Reading mode")
-                : "Reading mode · form values are unchanged"
+    /// Why a form write is unavailable, in the reader's words. Nil means "ready".
+    private var formWriteRefusal: String? {
+        if document == nil { return "Open a PDF first." }
+        if isXfaDocument { return readOnlyReason }
+        if formInfo.encrypted {
+            return formInfo.refusal ?? "This PDF is encrypted, so the reader will not fill it."
+        }
+        if formLoading || !formLoadCompleted { return "Form fields are still loading." }
+        if !formInfo.fields.contains(where: { $0.editable }) {
+            return "This document has no fillable form fields."
+        }
+        if !formHasPendingChanges { return "There are no form changes to save." }
+        return nil
+    }
+
+    /// The Fill & Sign menu's items. The button is a menu, not a mode switch.
+    public var fillAndSignMenuCommands: [FormMenuCommand] {
+        let refusal = formWriteRefusal
+        return [
+            FormMenuCommand(
+                id: "save-filled-copy",
+                title: "Save Filled Form Copy…",
+                enabled: canSaveFilledForm,
+                help: canSaveFilledForm
+                    ? "Write the values in the reader into a copy; the original is unchanged."
+                    : (refusal ?? "There are no form changes to save.")
+            ),
+            FormMenuCommand(
+                id: "write-form-values",
+                title: "Write Form Values to Original…",
+                enabled: canReplaceOriginalWithFilledForm,
+                help: canReplaceOriginalWithFilledForm
+                    ? "Write the filled values into the original file, with a verified backup first."
+                    : (readOnlyReason ?? refusal ?? "There are no form changes to save.")
+            ),
+        ]
+    }
+
+    /// Runs a Fill & Sign command by its stable id. Unknown ids do nothing.
+    public func performFillAndSignCommand(_ id: String) {
+        switch id {
+        case "save-filled-copy":
+            presentSaveFilledFormPanel()
+        case "write-form-values":
+            presentReplaceOriginalWithFilledFormConfirmation()
+        default:
+            break
         }
     }
 
-    /// Puts the keyboard in a field. Only the form tool can focus an editable field.
+    /// Puts the keyboard in a field when the implicit pointer state owns it.
     public func focusFormField(_ id: String) {
-        guard formToolActive, let field = formField(id: id), field.editable else { return }
+        guard formFieldsAcceptPointer, let field = formField(id: id), field.editable else {
+            return
+        }
         formFocusedFieldID = id
         formOpenChoiceFieldID = field.kind == .comboBox ? id : nil
     }
 
-    /// Ends field editing without leaving the tool. Escape in a field calls this.
+    /// The overlay's tap handler. It is ``focusFormField(_:)`` under the same gate; the name
+    /// states the path so a check can drive a field click without putting a window on screen.
+    public func clickFormField(_ id: String) {
+        focusFormField(id)
+    }
+
+    /// Ends field editing and hands the keyboard back to the canvas. Escape in a field, or
+    /// arming a tool, calls this; pending values stay in the reader.
     public func blurFormField() {
         formFocusedFieldID = nil
         formOpenChoiceFieldID = nil
@@ -7429,6 +7507,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Tab order: the engine's reading order — page ascending, then the widget's top edge
     /// top-to-bottom, then its left edge. Wraps around at both ends.
     public func focusNextFormField(backwards: Bool = false) {
+        guard formFieldsAcceptPointer else { return }
         let editable = formInfo.fields.filter { $0.editable }
         guard !editable.isEmpty else { return }
         let current = formFocusedFieldID.flatMap { id in
@@ -7621,7 +7700,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let backup = report.backupPath?.lastPathComponent ?? "none"
             formDraft = [:]
             formInfo = .empty
-            formToolActive = false
             formFocusedFieldID = nil
             formOpenChoiceFieldID = nil
             formLoadCompleted = false
@@ -7960,7 +8038,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         cancelContentClose()
         contentEditEnabled = false
         if formHasPendingChanges {
-            if !formToolActive { toggleFormTool() }
             statusMessage = "Save the filled form before closing"
         } else {
             if annotationTool != .redact { toggleRedactionTool() }
@@ -11347,7 +11424,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             || openDocumentNote(at: point)
         // Nothing above claimed the click, and it landed on markup the file itself carries.
         // Adopt it into the editable model and select it; a kind with no editable model states
-        // its one reason instead. Only the Select tool owns mark selection; the armed markup
+        // its one reason instead. Only the implicit pointer state owns mark selection; the armed markup
         // tools keep their old click behaviour.
         if annotationTool == .select, !resolved,
            let document = fileOwnedMarkupHit(atContentPoint: point) {
@@ -12499,7 +12576,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             formInfo: formInfo,
             formDraft: formDraft,
             formHasPendingChanges: formHasPendingChanges,
-            formToolActive: formToolActive,
             formLoadCompleted: formLoadCompleted,
             formError: formError,
             documentInfo: documentInfo,
@@ -12616,7 +12692,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         metadataLoadCompleted = state.metadataLoadCompleted
         formInfo = state.formInfo
         formDraft = state.formDraft
-        formToolActive = state.formToolActive
         formLoadCompleted = state.formLoadCompleted
         formError = state.formError
         formLoading = false
@@ -14879,9 +14954,22 @@ extension AppState {
     public func selectContentTool(_ tool: String) {
         guard ["select", "text", "image", "link", "erase", "blackout"].contains(tool) else { return }
         if deferContentTransition({ [weak self] in self?.selectContentTool(tool) }) { return }
-        contentEditTool = tool
+        // One click arms a content tool; a second click on the same one returns the pointer to
+        // its implicit selection state, which is why the Edit row needs no Select button.
+        contentEditTool = (tool != "select" && contentEditTool == tool) ? "select" : tool
         contentEditSelection = nil
         contentLinkDraft = nil
+    }
+
+    /// Escape in the Edit workspace leaves the active content tool before it leaves Edit.
+    /// Returns whether a tool was cleared, so the caller can keep the workspace open.
+    @discardableResult
+    public func cancelContentTool() -> Bool {
+        guard contentEditTool != "select" else { return false }
+        contentEditTool = "select"
+        contentEditSelection = nil
+        contentLinkDraft = nil
+        return true
     }
 
     public func toggleAnnotationTools() {

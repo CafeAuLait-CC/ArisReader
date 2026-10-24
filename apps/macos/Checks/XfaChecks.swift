@@ -122,7 +122,16 @@ extension ReaderChecks {
                 "annotation tools are not offered for an XFA form")
         require(!state.canPageEdit && !state.canPageOperations,
                 "page editing and page operations are not offered")
-        require(!state.canUseFormTool, "the Fill & Sign tool is not offered")
+        require(state.canOpenFillAndSignMenu,
+                "the Fill & Sign menu is still available so it can explain the XFA refusal")
+        require(state.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+                "every Fill & Sign write command is disabled for an XFA form")
+        require(state.fillAndSignMenuCommands.allSatisfy {
+                    $0.help?.localizedCaseInsensitiveContains("XFA") == true
+                },
+                "the disabled Fill & Sign commands explain the XFA reason")
+        require(!state.formFieldsAcceptPointer,
+                "an XFA form's synthetic pages never take the pointer as fields")
         require(!state.canSaveDocument, "Save/Save As are disabled (no copy of edits)")
         require(!state.canSaveFilledForm && !state.canSaveDocumentProperties,
                 "form and properties copies are disabled")
@@ -132,6 +141,9 @@ extension ReaderChecks {
         })
         require(state.formInfo.fields.isEmpty,
                 "the shell's form model has no fields to fill")
+        state.clickFormField("xfa-field")
+        require(state.formFocusedFieldID == nil,
+                "a click on an XFA form does not focus a field, because there are none to edit")
         require(state.formInfo.refusal?.contains("XFA") == true,
                 "the form model carries the read-only explanation")
         state.loadDocumentInfo(force: true)

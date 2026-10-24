@@ -477,6 +477,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     }
     if event.keyCode == 53 {
       commitText()
+      // Escape first returns an armed content tool to the implicit pointer state; only a
+      // second Escape (with no tool armed) leaves the Edit workspace.
+      if state?.cancelContentTool() == true { return }
       state?.contentEditEnabled = false
       return
     }

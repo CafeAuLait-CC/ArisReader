@@ -156,7 +156,6 @@ extension ReaderChecks {
         try await eventually("multiline form fields load", { state.formLoadCompleted && !state.formLoading })
         let notes = state.formFields.first { $0.multiline }!
         state.gotoPage(notes.page + 1)
-        state.toggleFormTool()
         state.focusFormField(notes.id)
         try await eventually("a multiline form uses the native multiline editor", {
             host.layoutSubtreeIfNeeded()
@@ -169,6 +168,21 @@ extension ReaderChecks {
         try await eventually("Return inserts a newline instead of leaving a multiline form field", {
             state.formCurrentText(notes) == "First line\nSecond line" && state.formFocusedFieldID == notes.id
         })
+        guard let formEscape = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: formEditor.window?.windowNumber ?? 0, context: nil,
+            characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false, keyCode: 53
+        ) else {
+            require(false, "an Escape key event can be built for the form field")
+            return
+        }
+        formEditor.keyDown(with: formEscape)
+        try await eventually("Escape leaves the focused form field", {
+            state.formFocusedFieldID == nil
+        })
+        require(state.annotationTool == .select,
+                "leaving a form field keeps the implicit pointer state")
         print("Annotation editing checks passed")
     }
 }
