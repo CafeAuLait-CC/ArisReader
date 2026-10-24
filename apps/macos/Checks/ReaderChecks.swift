@@ -724,6 +724,9 @@ struct ReaderChecks {
             ("annotation-toolbar", {
                 try await annotationToolbarChecks(root: root)
             }),
+            ("fill-and-sign", {
+                try await fillSignChecks(root: root)
+            }),
             ("live-markup", {
                 try await liveMarkupChecks(
                     textPage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),

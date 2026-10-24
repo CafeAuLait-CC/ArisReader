@@ -310,6 +310,8 @@ public struct ReaderWindow: View {
                 },
                 onPlaceStamp: { point in state.placeStamp(atContentPoint: point) },
                 onPlaceSignature: { point in state.placeSignature(atContentPoint: point) },
+                fillSignPlacementPending: state.hasPendingFillSignPlacement,
+                onPlaceFillSign: { point in state.placePendingFillSign(atContentPoint: point) },
                 // Escape leaves whichever annotation tool is armed; the canvas cancels a live
                 // draft first. Escape inside a form field is the field editor's own key path.
                 onCancelTool: { state.cancelActiveAnnotationTool() },

@@ -239,29 +239,11 @@ struct ReaderToolbar: View {
                     state.presentReplaceOriginalWithFilledFormConfirmation()
                 },
             ]) { menuLabel("square.and.arrow.up") }
-            // Fill & Sign is a menu, not a mode. Form fields fill by clicking whenever no
-            // annotation/content tool owns the pointer, so there is no "form tool" to arm and
-            // nothing to grey out when a document has no fields: the menu opens and explains.
-            // Its placement contents are a separate change; this stub exposes the form commands
-            // that exist today.
-            LyraReaderMenu(title: AnnotationToolbarLayout.fillAndSignLabel, items: state.fillAndSignMenuCommands.map { command in
-                LyraReaderMenuItem(
-                    command.title,
-                    icon: command.id == "save-filled-copy" ? "square.and.arrow.down" : "doc.badge.arrow.up",
-                    enabled: command.enabled,
-                    help: command.help
-                ) {
-                    state.performFillAndSignCommand(command.id)
-                }
-            }) {
-                // A form/field glyph, not the `signature` symbol: the Signature tool below is
-                // what places a signature picture.
-                Image(systemName: AnnotationToolbarLayout.fillAndSignIcon)
-            }
-            .disabled(!state.canOpenFillAndSignMenu)
-            .help(state.fillAndSignMenuHelp)
-            .accessibilityLabel(AnnotationToolbarLayout.fillAndSignLabel)
-            .accessibilityValue(state.canOpenFillAndSignMenu ? "" : "No document")
+            // Fill & Sign is a menu, not a mode. The placement commands claim one click and
+            // return to the pointer; form fields still fill by clicking whenever no tool owns
+            // the pointer. The menu is a real NSMenu so Signature and Stamp have real submenus
+            // and the Continuity Camera row can be an AppKit services item.
+            FillSignMenuButton(state: state)
             separator
             Button { state.toggleRegionSelection() } label: {
                 HStack(spacing: 5) {
@@ -365,24 +347,6 @@ struct ReaderToolbar: View {
     private func pending(_ title: String, _ icon: String) -> some View {
         Button {} label: { Image(systemName: icon) }
             .disabled(true).help("\(title) · Coming soon").accessibilityLabel("\(title), coming soon")
-    }
-
-    /// Asks for the PNG (or JPEG) a reader signs with, then arms the signature tool.
-    ///
-    /// PNG with transparency is the normal case: the picture's alpha is carried into the PDF as
-    /// an image `/SMask`, so the page shows through around the strokes exactly as it does here.
-    @MainActor
-    fileprivate static func chooseSignatureImage(for state: AppState) {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a Signature Image"
-        panel.message = "Choose a PNG with a transparent background (or a JPEG). "
-            + "To draw a signature instead, use the pen."
-        panel.allowedContentTypes = [.png, .jpeg]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url,
-              let data = try? Data(contentsOf: url) else { return }
-        state.armSignatureTool(imageData: data)
     }
 }
 

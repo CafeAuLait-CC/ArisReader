@@ -759,7 +759,7 @@ public struct SidebarView: View {
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     if annotation.kind == .signature {
-                        Text("Signature image")
+                        Text(annotation.stampStyle == "image" ? "Picture" : "Signature image")
                             .font(.caption)
                     } else if annotation.kind.isPlacedText {
                         Text(annotation.note.isEmpty ? (annotation.kind == .textBox ? "Text Box" : "Sticky Note") : annotation.note)
@@ -816,7 +816,7 @@ public struct SidebarView: View {
         }
         if annotation.kind.isStampArtwork {
             let detail = annotation.kind == .signature
-                ? "picture"
+                ? (annotation.stampStyle == "image" ? "picture" : "signature picture")
                 : "\(annotation.stampStyle ?? "custom") · \(annotation.note.count) character\(annotation.note.count == 1 ? "" : "s")"
             return "\(source)Page \(annotation.page + 1) · \(kind) · \(detail)"
         }

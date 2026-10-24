@@ -24,12 +24,12 @@ public enum AnnotationToolbarLayout {
     public static let coordinateSpace = "lyra.annotation-toolbar"
 
     /// The Fill & Sign button's glyph. A form/field glyph, deliberately not `signature`: the
-    /// Signature tool in the placement group is the one that places a signature picture.
+    /// Signature tool in the placement group is the annotation row's signature picture.
     public static let fillAndSignIcon = "list.bullet.rectangle"
 
-    /// The Fill & Sign button's accessible name. It says "form fields" so it cannot be mistaken
-    /// for the Signature tool.
-    public static let fillAndSignLabel = "Fill form fields (Fill & Sign)"
+    /// The Fill & Sign button's accessible name. It is its own menu, so it does not carry the
+    /// form-fields qualifier it had as a stub.
+    public static let fillAndSignLabel = "Fill & Sign"
 
     public enum Group: String, CaseIterable, Sendable {
         case markup
@@ -406,8 +406,9 @@ struct AnnotationToolRow: View {
     private static func chooseSignatureImage(for state: AppState) {
         let panel = NSOpenPanel()
         panel.title = "Choose a Signature Image"
-        panel.message = "Choose a PNG with a transparent background (or a JPEG). "
-            + "To draw a signature instead, use the pen."
+        panel.message = "This places a picture of a signature, not a digital signature. "
+            + "Only a digital signature can detect later changes. Choose a PNG with a "
+            + "transparent background (or a JPEG); it stays an annotation until you save."
         panel.allowedContentTypes = [.png, .jpeg]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false

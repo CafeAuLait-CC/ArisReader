@@ -48,7 +48,8 @@ package struct PlacedTextEditorOverlay: View {
                         InlineTextBoxEditor(text: $text,
                             fontSize: annotation.fontSize * state.zoomFactor,
                             color: ReadingAppearanceStore.shared.mode.displayColor(annotation.color.nsColor),
-                            onCommit: { state.commitTextEditing() }, onCancel: { state.cancelTextEditing() })
+                            onCommit: { state.commitTextEditing() }, onCancel: { state.cancelTextEditing() },
+                            selectAllOnAppear: state.editingTextSelectAll)
                             .padding(AnnotationTextFont.padding(size: annotation.fontSize) * state.zoomFactor)
                             .help("Click the page or press ⌘Return to finish; Esc cancels")
                             .overlay(alignment: .topLeading) {

@@ -324,7 +324,8 @@ final class AnnotationOverlayView: NSView {
                     marksLayer.addSublayer(layer)
                     markLayers.append(layer)
                 }
-                if mark.kind == .textBox || mark.kind.isStampArtwork {
+                if mark.kind == .textBox || mark.kind.isStampArtwork
+                    || (mark.kind == .ink && mark.shapeRect != nil) {
                     appendResizeHandles(for: mark)
                 }
             }

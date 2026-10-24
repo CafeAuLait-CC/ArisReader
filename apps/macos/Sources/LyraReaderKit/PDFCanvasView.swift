@@ -213,6 +213,11 @@ public final class MetalCanvasView: NSView {
     public var onPlaceStamp: ((CGPoint) -> Bool)?
     /// A click with the image-signature tool armed, in content points.
     public var onPlaceSignature: ((CGPoint) -> Bool)?
+    /// A Fill & Sign placement is armed: the next click commits it (text, date, check, cross or
+    /// a drawn signature). Set from `AppState.pendingFillSignPlacement` on every update.
+    public var fillSignPlacementPending = false
+    /// A Fill & Sign click placement, in content points.
+    public var onPlaceFillSign: ((CGPoint) -> Bool)?
     /// Escape while the canvas is the first responder: leave a mode (sticky markup or the
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
@@ -239,6 +244,8 @@ public final class MetalCanvasView: NSView {
     private var notePlacementPending = false
     private var stampPlacementPending = false
     private var signaturePlacementPending = false
+    /// The press belonged to an armed Fill & Sign placement; the click commits on mouse-up.
+    private var fillSignPlacementPressPending = false
     /// The text-box tool owns a press from down to up, but only a double-click creates a box.
     /// The flag keeps a drag with the tool armed from falling through to text selection.
     private var textBoxPlacementPending = false
@@ -838,6 +845,14 @@ public final class MetalCanvasView: NSView {
             return
         }
 
+        // A Fill & Sign placement claims the click before every other pointer path. It is not a
+        // tool: a drag with it armed is still inert, and only a press that stays inside the
+        // click slop commits the mark.
+        if fillSignPlacementPending {
+            fillSignPlacementPressPending = true
+            return
+        }
+
         // A double-click on a placed text annotation opens its editor. It is decided before the
         // ordinary press paths so the second press of the pair cannot start a move.
         if annotationTool == .select, event.clickCount == 2,
@@ -935,6 +950,14 @@ public final class MetalCanvasView: NSView {
             }
             return
         }
+        if fillSignPlacementPressPending {
+            let location = convert(event.locationInWindow, from: nil)
+            if hypot(location.x - (pressLocation?.x ?? location.x),
+                     location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt {
+                pointerMoved = true
+            }
+            return
+        }
         if textBoxPlacementPending {
             // Dragging with the text-box tool armed is deliberately not a gesture: it neither
             // creates a rectangle nor starts a text selection.
@@ -991,6 +1014,15 @@ public final class MetalCanvasView: NSView {
         }
         if annotationDoubleClickConsumed {
             annotationDoubleClickConsumed = false
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
+        if fillSignPlacementPressPending {
+            fillSignPlacementPressPending = false
+            if !pointerMoved {
+                _ = onPlaceFillSign?(contentPoint(for: event))
+            }
             pressLocation = nil
             pointerMoved = false
             return
@@ -1227,6 +1259,7 @@ public final class MetalCanvasView: NSView {
             textBoxPlacementPending = false
             stampPlacementPending = false
             signaturePlacementPending = false
+            fillSignPlacementPressPending = false
             if eraserGestureActive {
                 eraserGestureActive = false
                 eraserLastContentPoint = nil
@@ -1742,6 +1775,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onPlaceTextBox: ((CGPoint) -> Bool)?
     private let onPlaceStamp: ((CGPoint) -> Bool)?
     private let onPlaceSignature: ((CGPoint) -> Bool)?
+    private let fillSignPlacementPending: Bool
+    private let onPlaceFillSign: ((CGPoint) -> Bool)?
     private let onCancelTool: (() -> Bool)?
     private let onFrame: (LyraReaderFrameStats) -> Void
     private let onFailure: (String) -> Void
@@ -1799,6 +1834,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         onPlaceTextBox: ((CGPoint) -> Bool)? = nil,
         onPlaceStamp: ((CGPoint) -> Bool)? = nil,
         onPlaceSignature: ((CGPoint) -> Bool)? = nil,
+        fillSignPlacementPending: Bool = false,
+        onPlaceFillSign: ((CGPoint) -> Bool)? = nil,
         onCancelTool: (() -> Bool)? = nil,
         onFrame: @escaping (LyraReaderFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
@@ -1856,6 +1893,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onPlaceTextBox = onPlaceTextBox
         self.onPlaceStamp = onPlaceStamp
         self.onPlaceSignature = onPlaceSignature
+        self.fillSignPlacementPending = fillSignPlacementPending
+        self.onPlaceFillSign = onPlaceFillSign
         self.onCancelTool = onCancelTool
         self.onFrame = onFrame
         self.onFailure = onFailure
@@ -1941,6 +1980,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onPlaceTextBox = onPlaceTextBox
         view.onPlaceStamp = onPlaceStamp
         view.onPlaceSignature = onPlaceSignature
+        view.fillSignPlacementPending = fillSignPlacementPending
+        view.onPlaceFillSign = onPlaceFillSign
         view.onCancelTool = onCancelTool
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
