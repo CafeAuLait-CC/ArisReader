@@ -31,9 +31,14 @@ separate features with their own documented limits.
   page gap, calibrated zoom (Actual Size / Fit Width / Fit Page), independent windows.
 - **Navigate**: outline with section numbers and levels, thumbnails that show the file's own annotations,
   document-wide search, per-window Back/Forward across preview jumps.
-- **Annotate**: text markup, ink, shapes, sticky notes, text boxes, stamps and image signatures — with undo,
+- **Annotate**: four sliding tool rows — Annotate (markup / pen / placement), Edit (content tools), Fill & Sign
+  (text, signature, date, checkmark, cross, stamp, image) and Export — with a right-hand inspector that appears only
+  while a tool or a selected object needs it; text markup, ink, shapes, sticky notes, text boxes, stamps and image
+  signatures, all with undo,
   recovery in the application cache and verified saving into the original PDF. Signed originals use Save As.
-- **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, all staged with undo and verified
+- **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, redaction consolidated in the Edit
+  workspace (Blackout / Erase), flattened copies that bake annotations and form values into the page, all staged with
+  undo and verified
   on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing
   (a page torn open by a region card still prints as the original page).
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
