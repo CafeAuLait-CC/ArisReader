@@ -122,11 +122,11 @@ extension ReaderChecks {
                 "annotation tools are not offered for an XFA form")
         require(!state.canPageEdit && !state.canPageOperations,
                 "page editing and page operations are not offered")
-        require(state.canOpenFillAndSignMenu,
-                "the Fill & Sign menu is still available so it can explain the XFA refusal")
-        require(state.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+        require(state.canOpenFillAndSign,
+                "the Fill & Sign row is still available so it can explain the XFA refusal")
+        require(state.fillSignFormCommands.allSatisfy { !$0.enabled },
                 "every Fill & Sign write command is disabled for an XFA form")
-        require(state.fillAndSignMenuCommands.allSatisfy {
+        require(state.fillSignFormCommands.allSatisfy {
                     $0.help?.localizedCaseInsensitiveContains("XFA") == true
                 },
                 "the disabled Fill & Sign commands explain the XFA reason")

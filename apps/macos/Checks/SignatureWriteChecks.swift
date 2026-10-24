@@ -300,10 +300,10 @@ extension ReaderChecks {
         try await eventually("the signed fixture's form loads", {
             !state.formLoading && (state.formError != nil || !state.formInfo.fields.isEmpty)
         })
-        require(state.canOpenFillAndSignMenu,
-                "the Fill & Sign menu is available on a signed document")
-        require(state.fillAndSignMenuCommands.contains { $0.id == "save-filled-copy" },
-                "the menu offers the filled-copy command")
+        require(state.canOpenFillAndSign,
+                "the Fill & Sign row is available on a signed document")
+        require(state.fillSignFormCommands.contains { $0.id == "save-filled-copy" },
+                "the Fill & Sign form commands offer the filled-copy command")
         if let editable = state.formInfo.fields.first(where: { $0.editable && $0.kind == .text }) {
             require(state.formFieldsAcceptPointer,
                     "a signed form's fields accept the pointer: values stay drafts for a copy")

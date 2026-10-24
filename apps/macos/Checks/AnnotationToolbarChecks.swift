@@ -44,12 +44,12 @@ extension ReaderChecks {
         require(AnnotationToolbarLayout.fillAndSignLabel
                     .caseInsensitiveCompare("Signature") != .orderedSame,
                 "the Fill & Sign accessible name is not 'Signature'")
-        require(state.fillAndSignMenuHelp.contains("signature")
-                    && state.fillAndSignMenuHelp.contains("annotation until you save"),
+        require(state.fillAndSignHelp.contains("signature")
+                    && state.fillAndSignHelp.contains("annotation until you save"),
                 "the Fill & Sign tooltip names its placement menu and that the result is an annotation")
         require(AnnotationToolbarLayout.fillAndSignLabel == "Fill & Sign",
                 "the Fill & Sign accessible name is the menu's own name")
-        require(state.canOpenFillAndSignMenu,
+        require(state.canOpenFillAndSign,
                 "Fill & Sign is available on a document")
 
         // ── Frames at the 1200 pt window and at the 900 pt minimum ──────────────────

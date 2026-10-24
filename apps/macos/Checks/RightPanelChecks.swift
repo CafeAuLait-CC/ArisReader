@@ -762,6 +762,9 @@ extension ReaderChecks {
         state.transitionProgressOverride = ReaderTransitionProgress(row: 1, panel: 0, editingPanel: 1)
         state.toggleContentEditing()
         require(state.contentEditEnabled && !state.rightPanelVisible, "Edit closes the AI overlay")
+        // Edit's inspector follows an armed tool now; without one the row is open but the
+        // inspector is deliberately absent.
+        state.selectContentTool("text")
         func chromeRect(_ kind: ReaderChromeMarkerView.Kind) -> CGRect? {
             func find(_ view: NSView) -> ReaderChromeMarkerView? {
                 if let found = view as? ReaderChromeMarkerView, found.kind == kind { return found }
