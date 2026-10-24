@@ -17,6 +17,9 @@ struct InlineTextBoxEditor: NSViewRepresentable {
     var onTab: ((Bool) -> Void)? = nil
     var accessibilityName = "Text box content"
     var useAppearanceFont = true
+    /// Start with the whole text selected. A new Date box uses this so the first keystroke
+    /// replaces the date; an ordinary empty box is unaffected.
+    var selectAllOnAppear = false
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> EditorContainer {
@@ -35,12 +38,21 @@ struct InlineTextBoxEditor: NSViewRepresentable {
         view.delegate = context.coordinator
         view.string = text
         view.setAccessibilityLabel(accessibilityName)
+        context.coordinator.pendingSelectAll = selectAllOnAppear
         updateNSView(container, context: context)
-        DispatchQueue.main.async { [weak container] in
+        let wantsSelectAll = selectAllOnAppear
+        DispatchQueue.main.async { [weak container, weak coordinator = context.coordinator] in
             guard let container, let window = container.window else { return }
             window.makeFirstResponder(container.editor)
-            container.editor.setSelectedRange(
-                NSRange(location: (container.editor.string as NSString).length, length: 0))
+            let length = (container.editor.string as NSString).length
+            if wantsSelectAll {
+                if length > 0 {
+                    container.editor.setSelectedRange(NSRange(location: 0, length: length))
+                    coordinator?.pendingSelectAll = false
+                }
+            } else {
+                container.editor.setSelectedRange(NSRange(location: length, length: 0))
+            }
         }
         return container
     }
@@ -58,12 +70,19 @@ struct InlineTextBoxEditor: NSViewRepresentable {
         view.onCancel = onCancel
         view.onTab = onTab
         if view.string != text { view.string = text }
+        // The Date box's text arrives after the view is made. Once it is here, select it once so
+        // typing replaces it; later keystrokes must not re-select what the reader is writing.
+        if context.coordinator.pendingSelectAll, !text.isEmpty {
+            view.setSelectedRange(NSRange(location: 0, length: (text as NSString).length))
+            context.coordinator.pendingSelectAll = false
+        }
         // SwiftUI can hand the container a new size without asking the text view to lay out
         // again; doing it here keeps the insertion point at the top-left on the very first pass.
         container.needsLayout = true
     }
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: InlineTextBoxEditor
+        var pendingSelectAll = false
         init(_ parent: InlineTextBoxEditor) { self.parent = parent }
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }

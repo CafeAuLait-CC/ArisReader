@@ -1005,6 +1005,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// picture's aspect ratio, so a tall signature is not stretched on the way in.
     public static let defaultSignatureHeight: CGFloat = 64
 
+    /// The height a newly placed ordinary picture occupies, in page points. Larger than a
+    /// signature: a picture is content the reader is placing, not a mark that stays out of the way.
+    public static let defaultPictureHeight: CGFloat = 140
+
     /// The smallest text box the reader may create or resize to, in points.
     ///
     /// The width is wide enough for a few narrow glyphs but small enough for the box a
@@ -2423,6 +2427,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public var pendingStampStyle: StampStyle?
     /// The picture the armed signature tool will place, or `nil` when it is not armed.
     @Published public var pendingSignatureImageData: Data?
+    /// True when the armed picture is an ordinary image rather than a signature. The annotation
+    /// kind and writer are the same; this only decides the initial size and the words shown.
+    @Published public private(set) var pendingSignatureIsPicture = false
+    /// A Fill & Sign placement waiting for the next click on the page.
+    ///
+    /// This is orthogonal to ``annotationTool``: a check mark or a date does not change what a
+    /// drag means, it only claims the next click. Text is the one case that also arms the
+    /// existing text-box tool because its editing surface is the tool's.
+    @Published public private(set) var pendingFillSignPlacement: FillSignPlacement?
+    /// True when the open placed-text editor should start with its whole text selected.
+    ///
+    /// Only a Date placement creates a box with words already in it; selecting them means the
+    /// reader's first keystroke replaces the date rather than appending to it.
+    @Published public private(set) var editingTextSelectAll = false
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The eraser removes ink on a drag. The
     /// modes cannot both be active. ``AnnotationTool/select`` is the implicit pointer state: it
@@ -2449,7 +2467,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // A placed stamp or signature picture belongs to its own tool; leaving that tool
                 // disarms it so a later click cannot place the wrong picture.
                 if annotationTool != .stamp { pendingStampStyle = nil }
-                if annotationTool != .signature { pendingSignatureImageData = nil }
+                if annotationTool != .signature {
+                    pendingSignatureImageData = nil
+                    pendingSignatureIsPicture = false
+                }
+                // A Fill & Sign placement belongs to the gesture that armed it. Any tool change
+                // (including turning a tool off) drops it, so a later click can never place a
+                // check mark or date the reader has forgotten about.
+                pendingFillSignPlacement = nil
                 // Selecting a mark belongs to the implicit pointer state: arming a pen, shape,
                 // markup or the eraser drops the halo instead of leaving a mark that Delete
                 // would still act on.
@@ -3697,6 +3722,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
+        pendingFillSignPlacement = nil
+        pendingSignatureIsPicture = false
         annotationTool = .select
         transitionProgressOverride = nil
         annotations = []
@@ -4535,6 +4563,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
         let hadMarkSelection = selectedAnnotationID != nil || pendingMarkSelection != nil
+        // Fill & Sign arms a click, not a drawing tool. Escape drops it first so the next click
+        // is the pointer again instead of an unexpected check mark.
+        if pendingFillSignPlacement != nil {
+            pendingFillSignPlacement = nil
+            annotationTool = .select
+            statusMessage = "Placement cancelled"
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
         if cancelTextMarkupTool() {
             if hadMarkSelection { clearAnnotationSelection() }
             return true
@@ -4548,6 +4585,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if annotationTool == .stamp || annotationTool == .signature {
             pendingStampStyle = nil
             pendingSignatureImageData = nil
+            pendingSignatureIsPicture = false
             annotationTool = .select
             statusMessage = "Stamp tool off"
             if hadMarkSelection { clearAnnotationSelection() }
@@ -4799,6 +4837,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Arms the stamp tool with one style. The next click on a page places it.
     public func armStampTool(_ style: StampStyle) {
+        pendingFillSignPlacement = nil
+        pendingSignatureIsPicture = false
         pendingStampStyle = style
         pendingSignatureImageData = nil
         annotationTool = .stamp
@@ -4814,10 +4854,66 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "That image file is empty."
             return
         }
+        pendingFillSignPlacement = nil
         pendingSignatureImageData = imageData
+        pendingSignatureIsPicture = false
         pendingStampStyle = nil
         annotationTool = .signature
         statusMessage = "Click on the page to place the signature image"
+    }
+
+    /// Arms the signature tool with an ordinary picture instead of a signature.
+    ///
+    /// The annotation kind and writer are the same (`/Stamp` with an image appearance); the
+    /// difference is the larger default size and the words the reader sees. Nothing here calls
+    /// it a signature.
+    public func armPicturePlacement(imageData: Data) {
+        guard !imageData.isEmpty else {
+            lastError = "That image file is empty."
+            return
+        }
+        guard CGImageSourceCreateWithData(imageData as CFData, nil) != nil else {
+            lastError = "That file is not an image the reader can place."
+            return
+        }
+        pendingFillSignPlacement = nil
+        pendingSignatureImageData = imageData
+        pendingSignatureIsPicture = true
+        pendingStampStyle = nil
+        annotationTool = .signature
+        statusMessage = "Click on the page to place the picture"
+    }
+
+    /// Renders a typed name in a built-in handwriting font and arms it as a signature image.
+    /// Returns false (with `lastError`) when the name is empty or no handwriting font is usable.
+    @discardableResult
+    public func armTypedSignature(name: String, fontName: String? = nil) -> Bool {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return false
+        }
+        guard let data = TypedSignatureRenderer.pngData(name: name, fontName: fontName) else {
+            lastError = "That name could not be drawn in a handwriting font."
+            return false
+        }
+        armSignatureTool(imageData: data)
+        statusMessage = "Click on the page to place the typed signature"
+        return true
+    }
+
+    /// Arms a hand-drawn signature as an ink annotation placement.
+    public func armDrawnSignature(_ signature: DrawnSignature) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        guard !signature.isEmpty else {
+            lastError = "Draw a signature first."
+            return
+        }
+        annotationTool = .select
+        pendingFillSignPlacement = .drawnSignature(signature)
+        statusMessage = "Click on the page to place the drawn signature"
     }
 
     /// Places the armed stamp centred on a content point. Returns whether it was added.
@@ -4830,13 +4926,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return placed
     }
 
-    /// Places the armed signature image centred on a content point.
+    /// Places the armed signature image (or picture) centred on a content point.
     @discardableResult
     public func placeSignature(atContentPoint point: CGPoint) -> Bool {
         guard let data = pendingSignatureImageData,
               let hit = pagePoint(atContentPoint: point) else { return false }
-        let placed = addSignatureAnnotation(page: hit.page, imageData: data, center: hit.point)
-        if placed { pendingSignatureImageData = nil; annotationTool = .select }
+        let placed = pendingSignatureIsPicture
+            ? addPictureAnnotation(page: hit.page, imageData: data, center: hit.point)
+            : addSignatureAnnotation(page: hit.page, imageData: data, center: hit.point)
+        if placed {
+            pendingSignatureImageData = nil
+            pendingSignatureIsPicture = false
+            annotationTool = .select
+        }
         return placed
     }
 
@@ -4874,6 +4976,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// decides the initial width, so a tall signature is not stretched on the way in.
     @discardableResult
     public func addSignatureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
+        addImageAnnotation(page: page, imageData: imageData, center: center,
+                           height: Annotation.defaultSignatureHeight,
+                           stampStyle: "signature")
+    }
+
+    /// Adds an arbitrary picture as the same `/Stamp`-with-an-image the signature uses, but at
+    /// a larger default size and with the "image" style in the cache.
+    @discardableResult
+    public func addPictureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
+        addImageAnnotation(page: page, imageData: imageData, center: center,
+                           height: Annotation.defaultPictureHeight,
+                           stampStyle: "image")
+    }
+
+    private func addImageAnnotation(page: Int, imageData: Data, center: CGPoint,
+                                    height: CGFloat, stampStyle: String) -> Bool {
         guard let document, page >= 0, page < document.pageCount,
               let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
@@ -4881,7 +4999,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = annotationWritesBlockedReason
             return false
         }
-        guard let size = Self.signatureBoxSize(imageData) else {
+        guard let size = Self.imageBoxSize(imageData, height: height) else {
             lastError = "That file is not an image the reader can place."
             return false
         }
@@ -4897,10 +5015,167 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             createdAt: Date(),
             shapeRect: box,
             strokeWidth: 0,
-            stampStyle: "signature",
+            stampStyle: stampStyle,
             imageData: imageData
         )
         return appendPlacedArtwork(annotation)
+    }
+
+    // MARK: - Fill & Sign placement
+
+    /// Text is the one Fill & Sign command that arms a real tool. It also claims the next click
+    /// so the box is placed with one click, while the tool's double-click behaviour is kept for
+    /// the toolbar button.
+    public func armFillSignText() {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        annotationToolsVisible = true
+        annotationTool = .textBox
+        pendingFillSignPlacement = .text
+        statusMessage = "Click the page to place a text box"
+    }
+
+    /// Arms a one-click date text box.
+    public func armFillSignDate() {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        annotationTool = .select
+        pendingFillSignPlacement = .date
+        statusMessage = "Click the page to place today's date"
+    }
+
+    /// Arms a one-click vector check mark or cross.
+    public func armFillSignMark(_ mark: FillSignMark) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        annotationTool = .select
+        pendingFillSignPlacement = mark == .checkmark ? .checkmark : .cross
+        statusMessage = "Click the page to place a \(mark.title.lowercased())"
+    }
+
+    /// Commits the armed Fill & Sign placement at a content point. Returns whether anything was
+    /// placed; a click in the gap between pages leaves the placement armed.
+    @discardableResult
+    public func placePendingFillSign(atContentPoint point: CGPoint) -> Bool {
+        guard let pending = pendingFillSignPlacement,
+              let hit = pagePoint(atContentPoint: point) else { return false }
+        switch pending {
+        case .text:
+            // `placeOrOpenTextBox` opens the editor, which returns the canvas to the pointer.
+            // Clear the pending placement here too: opening a box that is already being edited
+            // can return without changing the tool, and a stale placement must not survive.
+            let placed = placeOrOpenTextBox(atContentPoint: point)
+            if placed {
+                pendingFillSignPlacement = nil
+                annotationTool = .select
+            }
+            return placed
+        case .date:
+            guard placeDateTextBox(atContentPoint: point) else { return false }
+            pendingFillSignPlacement = nil
+            return true
+        case .checkmark:
+            guard addFillSignMark(.checkmark, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            return true
+        case .cross:
+            guard addFillSignMark(.cross, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            return true
+        case .drawnSignature(let signature):
+            guard addDrawnSignature(signature, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            return true
+        }
+    }
+
+    /// Places today's date as a text box centred on the click, selected so typing replaces it.
+    @discardableResult
+    public func placeDateTextBox(atContentPoint point: CGPoint, date: Date = Date()) -> Bool {
+        guard canPlaceFillSignAnnotation,
+              let hit = pagePoint(atContentPoint: point),
+              let placement = visiblePagePlacements.first(where: { $0.index == hit.page })
+        else { return false }
+        let text = FillSignDate.mediumString(for: date)
+        guard !text.isEmpty else { return false }
+        let fitted = TextBoxLayout.fittedRect(
+            text: text,
+            fontSize: Annotation.defaultTextBoxFontSize,
+            origin: .zero,
+            maximumWidth: max(1, placement.widthPt),
+            maximumHeight: max(1, placement.heightPt))
+        guard let box = placementBox(page: hit.page, size: fitted.size, center: hit.point),
+              addTextBox(page: hit.page, rect: box, text: text) else { return false }
+        editingTextSelectAll = true
+        statusMessage = "Placed today's date · type to replace it"
+        return true
+    }
+
+    /// Adds one vector mark as a single ink annotation with two strokes. One undo step removes
+    /// the whole mark.
+    @discardableResult
+    public func addFillSignMark(_ mark: FillSignMark, page: Int, center: CGPoint) -> Bool {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return false
+        }
+        let strokes = mark.strokes(centeredAt: center)
+        let points = strokes.flatMap { $0 }
+        var minX = points[0].x, maxX = points[0].x
+        var minY = points[0].y, maxY = points[0].y
+        for point in points.dropFirst() {
+            minX = Swift.min(minX, point.x); maxX = Swift.max(maxX, point.x)
+            minY = Swift.min(minY, point.y); maxY = Swift.max(maxY, point.y)
+        }
+        // The box is what the selection's eight resize handles are drawn around. Normal pen ink
+        // has no box (a freehand stroke is moved, not squashed); a placed symbol is a shape a
+        // reader may want to enlarge, so it carries one.
+        let box = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        let placed = addGeometryAnnotation(
+            kind: .ink,
+            page: page,
+            inkPaths: strokes,
+            shapeRect: box,
+            color: annotationStrokeColor,
+            strokeWidth: mark.strokeWidth)
+        if placed { statusMessage = "Placed a \(mark.title.lowercased())" }
+        return placed
+    }
+
+    /// Adds hand-drawn signature strokes as one ink annotation, scaled to the signature default.
+    @discardableResult
+    public func addDrawnSignature(_ signature: DrawnSignature, page: Int, center: CGPoint) -> Bool {
+        guard canPlaceFillSignAnnotation, !signature.isEmpty else { return false }
+        let height = Annotation.defaultSignatureHeight
+        let aspect = min(max(signature.aspect, 0.3), 6)
+        let size = CGSize(width: height * aspect, height: height)
+        guard let box = placementBox(page: page, size: size, center: center) else { return false }
+        let paths = signature.strokes.compactMap { stroke -> [CGPoint]? in
+            guard stroke.count >= 2 else { return nil }
+            return stroke.map { point in
+                CGPoint(x: box.minX + point.x * box.width,
+                        y: box.minY + point.y * box.height)
+            }
+        }
+        guard !paths.isEmpty else { return false }
+        let placed = addGeometryAnnotation(
+            kind: .ink, page: page, inkPaths: paths, shapeRect: box,
+            color: annotationStrokeColor,
+            strokeWidth: AppState.defaultAnnotationStrokeWidth)
+        if placed { statusMessage = "Placed a drawn signature" }
+        return placed
     }
 
     /// The one commit path for a placed stamp or signature: one cache write, then one undo step.
@@ -4916,7 +5191,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectedAnnotationID = annotation.id
         refreshSelectionOverlay()
         reloadVisiblePages()
-        statusMessage = "Placed a \(annotation.kind == .stamp ? "stamp" : "signature image")"
+        if annotation.kind == .stamp {
+            statusMessage = "Placed a stamp"
+        } else if annotation.stampStyle == "image" {
+            statusMessage = "Placed a picture"
+        } else {
+            statusMessage = "Placed a signature image"
+        }
         return true
     }
 
@@ -4938,18 +5219,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return CGRect(x: x, y: y, width: width, height: height)
     }
 
-    /// The initial page-space size of an image signature, from the picture's pixel aspect ratio.
-    private static func signatureBoxSize(_ data: Data) -> CGSize? {
+    /// The initial page-space size of an image signature or picture, from the picture's pixel
+    /// aspect ratio. `height` is the signature's or the picture's default height in points.
+    private static func imageBoxSize(_ data: Data, height boxHeight: CGFloat) -> CGSize? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any],
               let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
-              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
-              width > 0, height > 0 else { return nil }
-        let aspect = width / height
+              let pixelHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width > 0, pixelHeight > 0 else { return nil }
+        let aspect = width / pixelHeight
         let clamped = min(max(aspect, 0.2), 8.0)
-        return CGSize(width: Annotation.defaultSignatureHeight * clamped,
-                      height: Annotation.defaultSignatureHeight)
+        return CGSize(width: boxHeight * clamped, height: boxHeight)
     }
 
     /// Decodes an image signature into the straight RGBA the PDF writer stores.
@@ -5098,7 +5379,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard rect.insetBy(dx: -tolerance, dy: -tolerance).contains(local) else { continue }
                 return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                      handle: nil)
-            case .textBox, .stamp, .signature:
+            case .textBox, .stamp, .signature, .ink:
                 let selected = annotation.id == selectedAnnotationID
                 if selected,
                    let handle = textBoxHandle(at: local, in: rect, tolerance: tolerance) {
@@ -5113,7 +5394,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                          handle: nil)
                 }
-            case .ink, .square, .circle, .line, .arrow, .highlight, .underline, .strikeout:
+            case .square, .circle, .line, .arrow, .highlight, .underline, .strikeout:
                 continue
             }
         }
@@ -5256,13 +5537,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return addTextBox(page: page, rect: CGRect(origin: origin, size: size))
     }
 
-    /// Creates an empty text box in `rect` (page space) and opens its editor.
+    /// Creates a text box in `rect` (page space) and opens its editor. `text` is usually empty;
+    /// the Date placement passes today's date so the box starts filled.
     ///
     /// The double-click path (`placeTextBox`) computes the one-line-high creation rect; this
     /// rectangle-based entry point remains for callers that already have a box, such as an
     /// older annotation cache or a restored session. Its contents then grow from that box.
     @discardableResult
-    public func addTextBox(page: Int, rect: CGRect) -> Bool {
+    public func addTextBox(page: Int, rect: CGRect, text: String = "") -> Bool {
         guard let document, page >= 0, page < document.pageCount,
               let placement = visiblePagePlacements.first(where: { $0.index == page }),
               let url = document.url else { return false }
@@ -5273,6 +5555,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         box.size.height = max(box.height, Annotation.minimumTextBoxSize.height)
         box.origin.x = min(max(0, box.origin.x), max(0, placement.widthPt - box.width))
         box.origin.y = min(max(0, box.origin.y), max(0, placement.heightPt - box.height))
+        if !text.isEmpty {
+            box = TextBoxLayout.fittedRect(
+                text: text,
+                fontSize: Annotation.defaultTextBoxFontSize,
+                origin: box.origin,
+                maximumWidth: max(1, placement.widthPt - box.minX),
+                maximumHeight: max(1, placement.heightPt - box.minY))
+        }
 
         let annotation = Annotation(
             id: UUID(),
@@ -5281,7 +5571,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             start: 0,
             end: 0,
             color: AppState.defaultTextBoxColor,
-            note: "",
+            note: text,
             createdAt: Date(),
             shapeRect: box,
             strokeWidth: 0,
@@ -5329,6 +5619,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = nil
         selectionAnchor = nil
         closeDocumentNote()
+        editingTextSelectAll = false
         editingAnnotationID = id
         editingWasCreated = created
         editingOriginalText = annotation.note
@@ -5389,6 +5680,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
         reloadVisiblePages()
         return written
     }
@@ -5412,6 +5704,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
 
         var updated = annotations
         if wasCreated {
@@ -5526,8 +5819,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !wasClick, finalRect != original.shapeRect,
               let index = annotations.firstIndex(where: { $0.id == original.id })
         else { return }
-        var resized = annotations[index]
-        resized.shapeRect = finalRect
+        let resized = Self.applyingBox(finalRect, to: annotations[index])
         guard resized.hasValidGeometry else {
             annotations[index] = original
             return
@@ -6469,8 +6761,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let minimum = Self.minimumPlacementSize(for: before.kind)
         guard rect.width >= minimum.width, rect.height >= minimum.height,
               rect.minX.isFinite, rect.minY.isFinite else { return false }
-        var after = before
-        after.shapeRect = rect
+        let after = Self.applyingBox(rect, to: before)
         guard after.hasValidGeometry else { return false }
         var updated = annotations
         updated[index] = after
@@ -6482,6 +6773,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
         statusMessage = "Resized the \(after.kind.rawValue)"
         return true
+    }
+
+    /// Moves a placed mark's box to `rect`, scaling ink strokes through the old box.
+    ///
+    /// A check, cross or drawn signature is ink that carries a box for its resize handles; a
+    /// plain pen stroke has no box and is moved, never squashed. Keeping this in one helper
+    /// means the drag path and the programmatic path measure the same geometry.
+    private static func applyingBox(_ rect: CGRect, to annotation: Annotation) -> Annotation {
+        var after = annotation
+        if after.kind == .ink, let old = after.shapeRect,
+           old.width > 0.01, old.height > 0.01 {
+            after.inkPaths = after.inkPaths.map { stroke in
+                stroke.map { point in
+                    CGPoint(x: rect.minX + (point.x - old.minX) / old.width * rect.width,
+                            y: rect.minY + (point.y - old.minY) / old.height * rect.height)
+                }
+            }
+        }
+        after.shapeRect = rect
+        return after
     }
 
     /// The canvas bitmap the reader draws for one stamp the PDF carries.
@@ -6664,6 +6975,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             editingWasCreated = false
             editingOriginalText = ""
             editingUndoDepth = 0
+            editingTextSelectAll = false
         }
         if selectedAnnotationID == id { selectedAnnotationID = nil }
         let removed = annotations[index]
@@ -7369,6 +7681,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// pointer and leave fields alone.
     public var formFieldsAcceptPointer: Bool {
         document != nil && !isXfaDocument && !formInfo.encrypted && annotationTool == .select
+            && pendingFillSignPlacement == nil
             && !contentEditEnabled && !pageOverviewVisible && !contentTextEditing
             && !regionSelectionArmed && editingAnnotationID == nil
     }
@@ -7378,31 +7691,141 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the button out.
     public var canOpenFillAndSignMenu: Bool { document != nil }
 
-    /// The toolbar button's tooltip. It names the difference from the Signature tool on purpose:
-    /// a reader who wants to sign picks Signature, not this menu.
+    /// The toolbar button's tooltip. It names what the menu places, and says where a signed
+    /// document keeps the result.
     public var fillAndSignMenuHelp: String {
+        if document == nil { return "Fill & Sign · open a PDF first" }
         if isXfaDocument {
-            return "Fill form fields · not available: this XFA form is rendered read-only from its XML"
+            return "Fill & Sign · not available: this XFA form is rendered read-only from its XML"
         }
         if formInfo.encrypted {
-            return "Fill form fields · this PDF is encrypted, so its fields cannot be filled"
+            return "Fill & Sign · not available: this PDF is encrypted, so the reader will not add annotations"
         }
-        let base = "Fill form fields · click a field to type in it, no tool needed"
-            + " · for a signature image use the Signature tool"
-        return isReadOnlyDocument ? base + " · values can be saved to a copy" : base
+        let base = "Fill & Sign: place text, a signature, date, check mark, cross, stamp or image"
+            + " on the page · each is an annotation until you save"
+        return isReadOnlyDocument ? base + " · the signed original is unchanged; save a copy" : base
     }
 
-    /// One command in the Fill & Sign menu.
+    /// One command in the Fill & Sign menu's form section.
     ///
-    /// The menu's placement contents are a separate change. For now it exposes the two commands
-    /// the form feature already had; modelling them here (rather than only inside the toolbar)
-    /// keeps the "menu is available but its commands explain why they are disabled" rule
-    /// checkable without presenting a real menu.
+    /// The placement commands are ``FillSignMenuCommand``s above; these are the two form writes
+    /// that have always lived at the bottom of the menu.
     public struct FormMenuCommand: Identifiable, Equatable, Sendable {
         public let id: String
         public let title: String
         public let enabled: Bool
         public let help: String?
+    }
+
+    /// Why a Fill & Sign placement is unavailable, in the reader's words. Nil means "ready".
+    ///
+    /// A signed document is deliberately not a refusal: annotations live in the reader's cache
+    /// and are written to a copy, exactly like the annotation toolbar's marks.
+    public var fillSignPlacementRefusal: String? {
+        if document == nil { return "Open a PDF first." }
+        if isXfaDocument {
+            return readOnlyReason ?? "This XFA form is rendered read-only from its XML."
+        }
+        if formInfo.encrypted {
+            return formInfo.refusal
+                ?? "This PDF is encrypted, so the reader will not add annotations."
+        }
+        return nil
+    }
+
+    /// Whether the placement half of Fill & Sign can arm.
+    public var canPlaceFillSignAnnotation: Bool { fillSignPlacementRefusal == nil }
+
+    /// True when a Fill & Sign placement is waiting for a click, so the checks and the canvas
+    /// can ask without unwrapping the enum.
+    public var hasPendingFillSignPlacement: Bool { pendingFillSignPlacement != nil }
+
+    private func fillSignPlacementHelp(_ what: String) -> String {
+        let base = "\(what) · placed as an annotation until you save"
+        if let refusal = fillSignPlacementRefusal {
+            return base + " · not available: \(refusal)"
+        }
+        if isReadOnlyDocument {
+            return base + " · the signed original is unchanged; save a copy to keep it"
+        }
+        return base
+    }
+
+    /// The seven placement commands, with their Signature and Stamp submenus, then the two
+    /// form-save commands under a separator.
+    public var fillSignMenuCommands: [FillSignMenuCommand] {
+        let enabled = canPlaceFillSignAnnotation
+        let signatureChildren: [FillSignMenuCommand] = [
+            FillSignMenuCommand(
+                id: "signature-type", title: "Type",
+                action: .signatureType, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Type your name and place it as an image signature in a handwriting font")),
+            FillSignMenuCommand(
+                id: "signature-draw", title: "Draw",
+                action: .signatureDraw, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Draw a signature on a small canvas and place it as an ink annotation")),
+            FillSignMenuCommand(
+                id: "signature-image", title: "Image…",
+                action: .signatureImage, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Place a PNG or JPEG picture of your signature")),
+            FillSignMenuCommand(
+                id: "signature-continuity", title: "From iPhone or iPad",
+                action: .signatureContinuity, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Sign on your iPhone or iPad and place the sketch as a signature image")),
+        ]
+        let stampChildren: [FillSignMenuCommand] = StampStyle.allCases.map { style in
+            FillSignMenuCommand(
+                id: "stamp-\(style.rawValue)", title: style.title,
+                action: .stamp(style), enabled: enabled,
+                help: fillSignPlacementHelp("Place a \(style.title) stamp"),
+                selected: annotationTool == .stamp && pendingStampStyle == style)
+        }
+        let formRefusal = formWriteRefusal
+        return [
+            FillSignMenuCommand(
+                id: "text", title: "Text", action: .text, enabled: enabled,
+                help: fillSignPlacementHelp("Place a text box and start typing in it")),
+            FillSignMenuCommand(
+                id: "signature", title: "Signature", action: .submenu, enabled: enabled,
+                help: fillSignPlacementHelp("Place a picture of a signature"),
+                children: signatureChildren),
+            FillSignMenuCommand(
+                id: "date", title: "Date", action: .date, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Place today's date as a text box, selected so you can type over it")),
+            FillSignMenuCommand(
+                id: "checkmark", title: "Checkmark", action: .checkmark, enabled: enabled,
+                help: fillSignPlacementHelp("Place a vector check mark drawn as two ink strokes")),
+            FillSignMenuCommand(
+                id: "cross", title: "Cross", action: .cross, enabled: enabled,
+                help: fillSignPlacementHelp("Place a vector cross drawn as two ink strokes")),
+            FillSignMenuCommand(
+                id: "stamp", title: "Stamp", action: .submenu, enabled: enabled,
+                help: fillSignPlacementHelp("Place a stamp from the styles below"),
+                children: stampChildren),
+            FillSignMenuCommand(
+                id: "image", title: "Image…", action: .image, enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Place a PNG or JPEG on the page as a picture annotation, not a signature")),
+            FillSignMenuCommand(
+                id: "fill-sign-forms", title: "", action: .separator, enabled: false, help: nil),
+            FillSignMenuCommand(
+                id: "save-filled-copy", title: "Save Filled Form Copy…",
+                action: .saveFilledCopy, enabled: canSaveFilledForm,
+                help: canSaveFilledForm
+                    ? "Write the values in the reader into a copy; the original is unchanged."
+                    : (formRefusal ?? "There are no form changes to save.")),
+            FillSignMenuCommand(
+                id: "write-form-values", title: "Write Form Values to Original…",
+                action: .writeFormValues, enabled: canReplaceOriginalWithFilledForm,
+                help: canReplaceOriginalWithFilledForm
+                    ? "Write the filled values into the original file, with a verified backup first."
+                    : (readOnlyReason ?? formRefusal ?? "There are no form changes to save.")),
+        ]
     }
 
     /// Why a form write is unavailable, in the reader's words. Nil means "ready".
@@ -14423,10 +14846,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
             ), let index = annotations.firstIndex(where: { $0.id == original.id })
             else { return }
-            annotations[index].shapeRect = rect
-            // The text box's text is a canvas quad, so it has to be re-laid out at the new size
-            // while the drag is in flight. This is a canvas refresh, not a cache write: the
-            // file is written once, on mouse-up.
+            // Set the box (and scale ink strokes through it) while the drag is in flight. This
+            // is a canvas refresh, not a cache write: the file is written once, on mouse-up.
+            annotations[index] = Self.applyingBox(rect, to: annotations[index])
             refreshSelectionOverlay()
             return
         }

@@ -86,7 +86,7 @@ extension ReaderChecks {
         require(state.canOpenFillAndSignMenu,
                 "the Fill & Sign menu is available on a form document")
         require(state.fillAndSignMenuCommands.count == 2,
-                "the Fill & Sign menu stub keeps the two current form commands")
+                "the Fill & Sign menu keeps the two form-save commands at the bottom")
         require(state.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
                 "both form commands are disabled before there are changes")
         let stateFields = state.formInfo.fields
