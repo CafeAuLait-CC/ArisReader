@@ -233,17 +233,29 @@ struct ReaderToolbar: View {
                     state.presentReplaceOriginalWithFilledFormConfirmation()
                 },
             ]) { menuLabel("square.and.arrow.up") }
-            tool("Fill & Sign", "signature", selected: state.formToolActive) {
-                state.toggleFormTool()
+            // Fill & Sign is a menu, not a mode. Form fields fill by clicking whenever no
+            // annotation/content tool owns the pointer, so there is no "form tool" to arm and
+            // nothing to grey out when a document has no fields: the menu opens and explains.
+            // Its placement contents are a separate change; this stub exposes the form commands
+            // that exist today.
+            LyraReaderMenu(title: AnnotationToolbarLayout.fillAndSignLabel, items: state.fillAndSignMenuCommands.map { command in
+                LyraReaderMenuItem(
+                    command.title,
+                    icon: command.id == "save-filled-copy" ? "square.and.arrow.down" : "doc.badge.arrow.up",
+                    enabled: command.enabled,
+                    help: command.help
+                ) {
+                    state.performFillAndSignCommand(command.id)
+                }
+            }) {
+                // A form/field glyph, not the `signature` symbol: the Signature tool below is
+                // what places a signature picture.
+                Image(systemName: AnnotationToolbarLayout.fillAndSignIcon)
             }
-            .disabled(!state.canUseFormTool)
-            .help(state.isXfaDocument
-                  ? "Fill & Sign · not available: this XFA form is rendered read-only from its XML"
-                  : (state.isReadOnlyDocument
-                     ? "Fill & Sign · fill this PDF's form fields · changes can be saved to a copy"
-                     : (state.formToolActive
-                        ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
-                        : "Fill & Sign · fill this PDF's form fields")))
+            .disabled(!state.canOpenFillAndSignMenu)
+            .help(state.fillAndSignMenuHelp)
+            .accessibilityLabel(AnnotationToolbarLayout.fillAndSignLabel)
+            .accessibilityValue(state.canOpenFillAndSignMenu ? "" : "No document")
             separator
             Button { state.toggleRegionSelection() } label: {
                 HStack(spacing: 5) {
@@ -433,207 +445,11 @@ struct ReaderSecondaryToolbar: View {
     }
 
     private var contentEditRow: some View {
-        HStack(spacing: 8) {
-            contentTool("Select", "cursorarrow", "select")
-            separator
-            contentTool("Text", "textformat", "text")
-            contentTool("Image", "photo", "image")
-            contentTool("Link", "link", "link")
-            Button { state.selectContentTool("blackout") } label: {
-                Label("Redact", systemImage: "rectangle.slash")
-            }
-            .buttonStyle(LyraReaderToolStyle(selected: ["erase", "blackout"].contains(state.contentEditTool)))
-            Spacer(minLength: 0)
-        }
-        .font(.system(size: 12))
-    }
-
-    private func contentTool(_ title: String, _ icon: String, _ tool: String) -> some View {
-        Button { state.selectContentTool(tool) } label: {
-            Label(title, systemImage: icon)
-        }.buttonStyle(LyraReaderToolStyle(selected: state.contentEditTool == tool))
+        ContentEditToolRow(state: state)
     }
 
     private var annotationRow: some View {
-        HStack(spacing: 5) {
-            // Sticky markup tools: click once to arm, then every finished text selection is
-            // marked in the palette colour. Clicking the active one again (or Select/Escape)
-            // leaves the mode. The selection that exists when the tool is activated is marked
-            // immediately, so the old select-then-click flow still takes one click.
-            tool("Highlight", "highlighter",
-                 selected: state.annotationTool == .highlight,
-                 help: writeHelp("Highlight tool: new selections are highlighted until you turn it off")) {
-                state.toggleTextMarkupTool(.highlight)
-            }.disabled(!state.canEditAnnotations)
-            tool("Underline", "underline",
-                 selected: state.annotationTool == .underline,
-                 help: writeHelp("Underline tool: new selections are underlined until you turn it off")) {
-                state.toggleTextMarkupTool(.underline)
-            }.disabled(!state.canEditAnnotations)
-            tool("Strikethrough", "strikethrough",
-                 selected: state.annotationTool == .strikeout,
-                 help: writeHelp("Strikethrough tool: new selections are struck through until you turn it off")) {
-                state.toggleTextMarkupTool(.strikeout)
-            }.disabled(!state.canEditAnnotations)
-            separator
-            tool("Select a mark", "arrow.up.left",
-                 selected: state.annotationTool == .select) {
-                state.selectTool()
-            }.disabled(state.document == nil)
-            tool("Draw with the pen", "pencil.tip",
-                 selected: state.annotationTool == .pen,
-                 help: writeHelp("Draw with the pen")) {
-                state.annotationTool = state.annotationTool == .pen ? .select : .pen
-            }.disabled(!state.canEditAnnotations)
-            LyraReaderMenu(title: "Shapes", items: [
-                LyraReaderMenuItem("Line", icon: "line.diagonal",
-                             selected: state.annotationTool == .line) {
-                    state.annotationTool = state.annotationTool == .line ? .select : .line
-                },
-                LyraReaderMenuItem("Arrow", icon: "arrow.up.right",
-                             selected: state.annotationTool == .arrow) {
-                    state.annotationTool = state.annotationTool == .arrow ? .select : .arrow
-                },
-                LyraReaderMenuItem("Rectangle", icon: "rectangle",
-                             selected: state.annotationTool == .rectangle) {
-                    state.annotationTool = state.annotationTool == .rectangle ? .select : .rectangle
-                },
-                LyraReaderMenuItem("Ellipse", icon: "circle",
-                             selected: state.annotationTool == .ellipse) {
-                    state.annotationTool = state.annotationTool == .ellipse ? .select : .ellipse
-                },
-            ]) {
-                Image(systemName: "square.on.circle")
-            }.disabled(!state.canEditAnnotations)
-             .help(writeHelp("Shapes: line, arrow, rectangle or ellipse"))
-            tool("Eraser", "eraser",
-                 selected: state.annotationTool == .eraser,
-                 help: writeHelp("Eraser: drag over ink to cut it where you pass (Esc leaves the eraser)")) {
-                state.toggleEraserTool()
-            }.disabled(!state.canUseEraserTool)
-            tool("Place a sticky note", "text.bubble",
-                 selected: state.annotationTool == .note,
-                 help: writeHelp("Place a sticky note")) {
-                state.annotationTool = state.annotationTool == .note ? .select : .note
-            }.disabled(!state.canEditAnnotations)
-            tool("Place a text box (double-click)", "textbox",
-                 selected: state.annotationTool == .textBox,
-                 help: writeHelp("Place a text box (double-click)")) {
-                state.annotationTool = state.annotationTool == .textBox ? .select : .textBox
-            }.disabled(!state.canEditAnnotations)
-            separator
-            tool("Redact", "rectangle.dashed",
-                 selected: state.annotationTool == .redact,
-                 help: writeHelp("Redact: drag over content to mark it (or mark the selected text); nothing is removed until you apply")) {
-                state.toggleRedactionTool()
-            }.disabled(!state.canMarkRedactions)
-
-            stampMenu
-            signatureMenu
-            separator
-            LyraReaderMenu(title: "Annotation color", items: AppState.annotationPalette.enumerated().map { _, item in
-                LyraReaderMenuItem(item.name, icon: "circle.fill", selected: state.annotationColor == item.color,
-                             color: Color(red: Double(item.color.red) / 255,
-                                          green: Double(item.color.green) / 255,
-                                          blue: Double(item.color.blue) / 255)) {
-                    state.annotationColor = item.color
-                }
-            }) {
-                Image(systemName: "circle.fill")
-                    .foregroundStyle(Color(red: Double(annotationColor.red) / 255,
-                                           green: Double(annotationColor.green) / 255,
-                                           blue: Double(annotationColor.blue) / 255))
-                    .font(.system(size: 17)).frame(width: 32, height: 32)
-            }
-            Spacer(minLength: 0)
-            Button { state.annotationToolsVisible = false } label: {
-                Image(systemName: "xmark").font(.system(size: 11))
-            }.help("Hide annotation tools").accessibilityLabel("Hide annotation tools")
-        }
-    }
-
-    private var annotationColor: AnnotationColor { state.annotationColor }
-
-    /// Stamps: one small set of meaningful marks, not a text field pretending to be a stamp.
-    @ViewBuilder
-    private var stampMenu: some View {
-        LyraReaderMenu(title: "Stamps", items: stampMenuItems) {
-            Image(systemName: "seal")
-        }
-        .disabled(!state.canEditAnnotations)
-        .help(writeHelp("Stamps: Approved, Reviewed, Draft, Confidential or a dated mark; click the page to place it"))
-    }
-
-    private var stampMenuItems: [LyraReaderMenuItem] {
-        AppState.StampStyle.allCases.map { style in
-            LyraReaderMenuItem(
-                style.title, icon: "seal",
-                selected: state.annotationTool == .stamp && state.pendingStampStyle == style,
-                color: Color(red: Double(style.color.red) / 255,
-                             green: Double(style.color.green) / 255,
-                             blue: Double(style.color.blue) / 255),
-                action: { state.armStampTool(style) }
-            )
-        }
-    }
-
-    /// A signature image, plus the honest alternative: a hand-drawn signature *is* the pen.
-    @ViewBuilder
-    private var signatureMenu: some View {
-        LyraReaderMenu(title: "Signature", items: signatureMenuItems) {
-            Image(systemName: "signature")
-        }
-        .disabled(!state.canEditAnnotations)
-        .help(writeHelp("Signature: place a picture of a signature, or draw one with the pen"))
-    }
-
-    private var signatureMenuItems: [LyraReaderMenuItem] {
-        [
-            LyraReaderMenuItem("Place Image Signature…", icon: "photo",
-                               enabled: state.canEditAnnotations,
-                               selected: state.annotationTool == .signature,
-                               action: { Self.chooseSignatureImage(for: state) }),
-            .separator("signature-pen"),
-            LyraReaderMenuItem("Draw with the Pen", icon: "pencil.tip",
-                               enabled: state.canEditAnnotations,
-                               help: "A hand-drawn signature is a pen stroke, not a picture",
-                               selected: state.annotationTool == .pen,
-                               action: {
-                                   state.annotationTool =
-                                       state.annotationTool == .pen ? .select : .pen
-                               }),
-        ]
-    }
-
-    private var separator: some View {
-        LyraReaderTheme.separator.frame(width: 1, height: 22).padding(.horizontal, 4)
-    }
-
-    private func tool(_ title: String, _ icon: String, selected: Bool = false,
-                      help: String? = nil,
-                      action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: icon) }
-            .buttonStyle(LyraReaderToolStyle(selected: selected))
-            .help(help ?? title).accessibilityLabel(title)
-            .accessibilityValue(selected ? "Selected" : "")
-    }
-
-    /// Asks for the PNG (or JPEG) a reader signs with, then arms the signature tool.
-    ///
-    /// PNG with transparency is the normal case: the picture's alpha is carried into the PDF as
-    /// an image `/SMask`, so the page shows through around the strokes exactly as it does here.
-    @MainActor
-    private static func chooseSignatureImage(for state: AppState) {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a Signature Image"
-        panel.message = "Choose a PNG with a transparent background (or a JPEG). "
-            + "To draw a signature instead, use the pen."
-        panel.allowedContentTypes = [.png, .jpeg]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url,
-              let data = try? Data(contentsOf: url) else { return }
-        state.armSignatureTool(imageData: data)
+        AnnotationToolRow(state: state)
     }
 }
 

@@ -72,20 +72,23 @@ extension ReaderChecks {
                 "a signature is a distinct, non-editable field kind")
         require(fullName.value == nil, "an empty text field has no value")
 
-        // ── The form tool and unsaved values ─────────────────────────────────────────
+        // ── Fields fill by click, with no tool armed ─────────────────────────────────
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 900, height: 650))
         state.newTab(url: fixture)
         try await eventually("form fields load for the AppState", {
             state.formLoadCompleted && !state.formLoading
         })
-        require(!state.formToolActive, "the reader opens in normal reading mode")
-        require(state.annotationTool == .select, "the default canvas tool is selection")
-        require(state.formInfo.fields.count == 8, "the shell sees every field")
-        state.toggleFormTool()
-        require(state.formToolActive, "the Fill & Sign tool activates")
         require(state.annotationTool == .select,
-                "form mode keeps the canvas in selection mode for reading clicks")
+                "the reader opens in the implicit pointer state")
+        require(state.formFieldsAcceptPointer,
+                "fields accept the pointer when no annotation or content tool is armed")
+        require(state.canOpenFillAndSignMenu,
+                "the Fill & Sign menu is available on a form document")
+        require(state.fillAndSignMenuCommands.count == 2,
+                "the Fill & Sign menu stub keeps the two current form commands")
+        require(state.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+                "both form commands are disabled before there are changes")
         let stateFields = state.formInfo.fields
         let stateFullName = stateFields[0]
         let stateEmail = stateFields[1]
@@ -95,8 +98,9 @@ extension ReaderChecks {
         let stateInterests = stateFields[5]
         let stateNotes = stateFields[7]
 
-        state.focusFormField(stateFullName.id)
-        require(state.formFocusedFieldID == stateFullName.id, "clicking a text field focuses it")
+        state.clickFormField(stateFullName.id)
+        require(state.formFocusedFieldID == stateFullName.id,
+                "clicking a text field focuses it with no tool armed")
         state.updateFormText(stateFullName.id, text: "Ada Lovelace")
         require(state.formCurrentText(stateFullName) == "Ada Lovelace",
                 "typing updates the reader's value, not the file")
@@ -106,8 +110,63 @@ extension ReaderChecks {
         state.focusNextFormField(backwards: true)
         require(state.formFocusedFieldID == stateFullName.id, "Shift-Tab moves back")
         state.blurFormField()
-        require(state.formFocusedFieldID == nil, "Escape leaves the field without leaving the tool")
-        require(state.formToolActive, "leaving the field keeps the form tool active")
+        require(state.formFocusedFieldID == nil, "Escape leaves the field")
+        require(state.annotationTool == .select && state.formFieldsAcceptPointer,
+                "leaving a field returns to the implicit pointer state")
+
+        // ── A field click and a text selection do not fight ──────────────────────────
+        // The overlay sits above the Metal canvas, so a press inside a widget belongs to the
+        // widget; a drag that starts on the page reaches the canvas and selects. A field click
+        // must not clear a selection made outside it.
+        try await eventually("the form fixture's page frame is ready", {
+            !state.canvasPageFrames.isEmpty
+        })
+        let textProbe = try RustEngine()
+        _ = try textProbe.openDocument(at: fixture)
+        let formText = try await textProbe.textPage(0)
+        if let frame = state.canvasPageFrames.first(where: { $0.index == 0 }),
+           formText.chars.count > 5,
+           let rect = formText.selectionRects(in: 0...5).first {
+            func pagePoint(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: frame.leftPt + x, y: frame.topPt + y)
+            }
+            let start = pagePoint(rect.minX + 1, rect.midY)
+            let end = pagePoint(rect.maxX - 1, rect.midY)
+            state.beginSelection(at: start)
+            state.extendSelection(to: end)
+            state.endPointerInteraction(at: end, wasClick: false)
+            require(state.selection != nil,
+                    "a drag over text selects it while form fields are clickable")
+            let selected = state.selection
+            state.clickFormField(stateEmail.id)
+            require(state.formFocusedFieldID == stateEmail.id,
+                    "a click inside a field edits it")
+            require(state.selection == selected,
+                    "the field click leaves the text selection untouched")
+            let outside = pagePoint(4, 4)
+            state.beginSelection(at: outside)
+            require(state.formFocusedFieldID == nil,
+                    "a click on the page outside a field hands the pointer back to reading")
+            state.clearSelection()
+        } else {
+            require(false, "the form fixture has text to select and a page frame")
+        }
+
+        // With a tool armed the tool owns the pointer: a field click is a page click, and the
+        // field neither focuses nor changes. Turning the tool off restores the pointer.
+        state.toggleAnnotationTool(.pen)
+        require(state.annotationTool == .pen && !state.formFieldsAcceptPointer,
+                "arming the pen takes the pointer away from the form layer")
+        state.focusFormField(stateFullName.id)
+        require(state.formFocusedFieldID == nil,
+                "with an annotation tool armed a field click does not focus the field")
+        state.toggleAnnotationTool(.pen)
+        require(state.annotationTool == .select && state.formFieldsAcceptPointer,
+                "clicking the active tool again returns to the pointer, where fields work")
+        state.focusFormField(stateFullName.id)
+        require(state.formFocusedFieldID == stateFullName.id,
+                "the field focuses again once the tool is off")
+        state.blurFormField()
 
         state.toggleFormCheckbox(stateAgree.id)
         state.selectFormRadioOption(stateColor.id, index: 2)
@@ -116,6 +175,8 @@ extension ReaderChecks {
         state.updateFormText(stateNotes.id, text: "Written on page two.")
         require(state.formHasPendingChanges, "the edits are pending in the reader")
         require(state.formChangedFields.count == 6, "six fields differ from the file")
+        require(state.fillAndSignMenuCommands.allSatisfy(\.enabled),
+                "once values are pending, both Fill & Sign commands are enabled")
         state.closeTab(0)
         require(state.contentCloseRequested && state.closeRequiresReview,
                 "closing a filled form protects its pending values")
@@ -127,18 +188,35 @@ extension ReaderChecks {
         require(state.formFilledCount == 7,
                 "seven fields are filled on screen (five edited plus the two prefilled ones)")
 
-        // Leaving the tool must restore reading, while the pending values stay.
+        // Pending values survive a tool switch, and switching tools never moves the viewport.
         let zoomBefore = state.zoomFactor
-        state.toggleFormTool()
-        require(!state.formToolActive && state.formFocusedFieldID == nil,
-                "leaving the form tool restores reading and drops keyboard focus")
-        require(state.annotationTool == .select, "reading interaction is still in selection mode")
-        require(state.zoomFactor == zoomBefore, "leaving the form tool did not move the viewport")
-        require(state.formHasPendingChanges, "leaving the tool does not discard unsaved values")
-        state.toggleFormTool()
-        require(state.formToolActive, "the form tool can be re-entered with its values intact")
-        require(state.cancelFormTool(), "Escape on the canvas leaves the form tool")
-        require(!state.formToolActive, "the canvas is back in reading mode after Escape")
+        state.toggleAnnotationTool(.pen)
+        require(state.annotationTool == .pen && state.formFocusedFieldID == nil,
+                "arming a tool drops a field's keyboard focus")
+        require(state.formHasPendingChanges, "switching tools does not discard unsaved values")
+        state.toggleAnnotationTool(.pen)
+        require(state.annotationTool == .select && state.formFieldsAcceptPointer,
+                "turning the tool off restores the pointer without losing values")
+        require(state.zoomFactor == zoomBefore, "the tool switch did not move the viewport")
+
+        // ── A document with no form fields still offers the Fill & Sign menu ─────────
+        let plain = AppState(engine: try RustEngine())
+        plain.setViewportSize(CGSize(width: 900, height: 650))
+        plain.newTab(url: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await eventually("the no-form document's form info loads", {
+            plain.formLoadCompleted && !plain.formLoading
+        })
+        require(plain.formInfo.fields.isEmpty, "the plain document has no form fields")
+        require(plain.canOpenFillAndSignMenu,
+                "Fill & Sign stays enabled when the document has no form fields")
+        require(!plain.fillAndSignMenuCommands.isEmpty,
+                "the menu still has items, so it can open instead of being greyed out")
+        require(plain.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+                "its commands are disabled: there is nothing to fill")
+        require(plain.fillAndSignMenuCommands.allSatisfy {
+                    $0.help?.contains("no fillable form fields") == true
+                },
+                "the disabled commands say why, inside the open menu")
 
         // ── Save a copy and read it back with this engine ────────────────────────────
         let filled = scratch.appendingPathComponent("filled.pdf")
@@ -177,7 +255,6 @@ extension ReaderChecks {
         try await eventually("the replace fixture's form loads", {
             replaceState.formLoadCompleted && !replaceState.formLoading
         })
-        replaceState.toggleFormTool()
         let replaceFullName = replaceState.formInfo.fields[0]
         replaceState.updateFormText(replaceFullName.id, text: "Replaced on disk")
         let replaced = await replaceState.replaceOriginalWithFilledForm()
@@ -505,11 +582,19 @@ extension ReaderChecks {
         try await eventually("form info loads for the encrypted file", {
             encryptedState.formLoadCompleted && !encryptedState.formLoading
         })
-        encryptedState.toggleFormTool()
-        require(!encryptedState.formToolActive,
-                "the form tool refuses an encrypted document")
-        require(encryptedState.lastError?.lowercased().contains("encrypted") == true,
-                "the reader says why the encrypted document cannot be filled")
+        require(encryptedState.canOpenFillAndSignMenu,
+                "the Fill & Sign menu is available to explain the encrypted refusal")
+        require(encryptedState.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+                "every form command is disabled for an encrypted document")
+        require(encryptedState.fillAndSignMenuCommands.allSatisfy {
+                    $0.help?.lowercased().contains("encrypted") == true
+                },
+                "the disabled commands explain the encryption")
+        require(!encryptedState.formFieldsAcceptPointer,
+                "an encrypted document's fields are inert, not click-to-edit")
+        encryptedState.focusFormField(encryptedInfo.fields.first?.id ?? "f1")
+        require(encryptedState.formFocusedFieldID == nil,
+                "clicking an encrypted document's field does not focus it")
         let encryptedDestination = scratch.appendingPathComponent("encrypted-filled.pdf")
         do {
             _ = try await encryptedProbe.saveFilledForm(

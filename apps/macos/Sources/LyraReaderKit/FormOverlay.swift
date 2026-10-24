@@ -1,8 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// The form layer: AcroForm widgets drawn over the page, and edited in place when the form tool
-/// is on.
+/// The form layer: AcroForm widgets drawn over the page, and edited in place by clicking one.
 ///
 /// Geometry comes from the engine in **page-local view space** (the widget's `/Rect` through the
 /// page's crop box, `/Rotate` and `/UserUnit`), so a field stays on its widget at every zoom and
@@ -10,9 +9,17 @@ import SwiftUI
 /// use; it draws its own chrome rather than burning pixels into the Metal raster, so the focus
 /// ring and button marks stay crisp at any scale.
 ///
-/// While the form tool is off the whole layer is transparent to the mouse and the keyboard: the
-/// canvas keeps text selection, links and scrolling exactly as it had them. The form tool is a
-/// mode like the ink and markup tools; leaving it restores reading without a second step.
+/// There is no form tool. While no annotation or content tool is armed the pointer is implicitly
+/// in selection mode, so a field click is an edit; arming a tool turns the whole layer transparent
+/// to the mouse and the keyboard and the canvas keeps text selection, links and scrolling exactly
+/// as it had them. The gate is ``AppState/formFieldsAcceptPointer``, one value shared by the
+/// layer, the click handler and the checks.
+///
+/// A field's hit area sits above the Metal canvas, so a click inside it belongs to the field even
+/// when selectable text runs underneath; a drag that starts on the page (outside every field)
+/// still selects text. That ordering is deliberate: a widget is an editable object drawn over the
+/// page, and the reader who clicks its rectangle is pointing at the object, not at the glyphs
+/// behind it.
 struct FormOverlay: View {
     @ObservedObject var state: AppState
 
@@ -31,16 +38,13 @@ struct FormOverlay: View {
                 }
             }
         }
-        .allowsHitTesting(state.formToolActive)
+        .allowsHitTesting(state.formFieldsAcceptPointer)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Form fields")
         .onChange(of: state.formFocusedFieldID) { old, new in
             // Escape leaves the field: hand the keyboard back to the page so arrow keys and
             // space scroll immediately instead of waiting for another click.
             if old != nil, new == nil { restoreCanvasFocus() }
-        }
-        .onChange(of: state.formToolActive) { _, active in
-            if !active { restoreCanvasFocus() }
         }
     }
 
@@ -114,7 +118,7 @@ struct FormOverlay: View {
     }
 
     private func isFocused(_ field: FormField) -> Bool {
-        state.formToolActive && state.formFocusedFieldID == field.id
+        state.formFocusedFieldID == field.id
     }
 
     private func filledDot() -> some View {
@@ -178,7 +182,7 @@ struct FormOverlay: View {
         .frame(width: rect.width, height: rect.height)
         .position(x: rect.midX, y: rect.midY)
         .contentShape(Rectangle())
-        .onTapGesture { state.focusFormField(field.id) }
+        .onTapGesture { state.clickFormField(field.id) }
         .help("\(field.kind.title): \(field.displayName)")
         .accessibilityElement(children: focused ? .contain : .ignore)
         .accessibilityLabel("\(field.kind.title) \(field.displayName)")

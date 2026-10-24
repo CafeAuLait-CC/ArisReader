@@ -3,12 +3,15 @@ import CoreGraphics
 
 /// The tool the canvas is in.
 ///
-/// One value selects exactly one tool. The text-markup cases (`highlight`, `underline`,
-/// `strikeout`) change both what a drag *looks like* and what it commits: the swept text is
-/// drawn as the target mark while the pointer is down, and that same selection becomes the
-/// annotation on release. Keeping them in this enum is what makes "pen, then highlight" leave
-/// one tool active rather than two modes that could both apply.
+/// One value selects exactly one tool. `select` is the implicit pointer state: no tool is armed,
+/// the toolbar has no Select button, and turning any tool off (clicking it again or pressing
+/// Escape) lands here. The text-markup cases (`highlight`, `underline`, `strikeout`) change both
+/// what a drag *looks like* and what it commits: the swept text is drawn as the target mark while
+/// the pointer is down, and that same selection becomes the annotation on release. Keeping them in
+/// this enum is what makes "pen, then highlight" leave one tool active rather than two modes that
+/// could both apply.
 public enum AnnotationTool: String, CaseIterable, Sendable {
+    /// The implicit pointer: no annotation tool is armed.
     case select
     case pen
     /// A mode rather than a drawing tool: dragging removes the ink under its pointer path
@@ -106,7 +109,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .select: return "Select"
+        case .select: return "Pointer"
         case .pen: return "Pen"
         case .eraser: return "Eraser"
         case .line: return "Line"

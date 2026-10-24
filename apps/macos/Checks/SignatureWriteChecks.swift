@@ -320,13 +320,30 @@ extension ReaderChecks {
         try await eventually("the signed fixture's form loads", {
             !state.formLoading && (state.formError != nil || !state.formInfo.fields.isEmpty)
         })
-        require(state.canUseFormTool, "form filling can be staged")
+        require(state.canOpenFillAndSignMenu,
+                "the Fill & Sign menu is available on a signed document")
+        require(state.fillAndSignMenuCommands.contains { $0.id == "save-filled-copy" },
+                "the menu offers the filled-copy command")
         if let editable = state.formInfo.fields.first(where: { $0.editable && $0.kind == .text }) {
+            require(state.formFieldsAcceptPointer,
+                    "a signed form's fields accept the pointer: values stay drafts for a copy")
+            state.clickFormField(editable.id)
+            require(state.formFocusedFieldID == editable.id,
+                    "a signed form's field focuses by click, with no tool armed")
             state.updateFormText(editable.id, text: "Draft on a signed PDF")
             require(state.canSaveFilledForm,
                     "a form draft can be saved to a copy")
             require(!state.canReplaceOriginalWithFilledForm,
                     "a form draft cannot be written into the signed original")
+            state.toggleAnnotationTool(.pen)
+            require(state.formFocusedFieldID == nil && !state.formFieldsAcceptPointer,
+                    "an armed annotation tool takes the pointer from the fields and drops focus")
+            state.focusFormField(editable.id)
+            require(state.formFocusedFieldID == nil,
+                    "with a tool armed a field click does not focus the field")
+            state.toggleAnnotationTool(.pen)
+            require(state.annotationTool == .select && state.formFieldsAcceptPointer,
+                    "turning the tool off restores the implicit pointer state for the fields")
         } else {
             require(false, "the signed fixture exposes an editable text field")
         }

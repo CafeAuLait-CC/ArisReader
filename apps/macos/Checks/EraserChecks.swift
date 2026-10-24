@@ -115,7 +115,7 @@ extension ReaderChecks {
         require(state.annotationTool == .eraser,
                 "arming the eraser replaces another tool: the canvas has one mode")
         state.selectTool()
-        require(state.annotationTool == .select, "choosing Select leaves the eraser")
+        require(state.annotationTool == .select, "returning to the implicit pointer state leaves the eraser")
 
         state.toggleEraserTool()
         require(state.cancelActiveAnnotationTool(), "Escape leaves the eraser")

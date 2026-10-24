@@ -201,7 +201,7 @@ extension ReaderChecks {
             require(false, "a drag with Select armed produces a text selection")
             return
         }
-        require(state.annotationTool == .select, "reading opens in Select mode")
+        require(state.annotationTool == .select, "reading opens in the implicit pointer state")
         require(state.annotations.isEmpty, "a plain selection creates no annotation")
         let plainExpected = expectedSelection(plainSelection.range)
         require(!plainExpected.isEmpty && overlayQuads() == plainExpected,
@@ -408,7 +408,7 @@ extension ReaderChecks {
         dragToPreview(leaveRange)
         require(!overlayQuads().isEmpty, "the tool-leaving gesture starts with a live preview")
         state.selectTool()
-        require(state.annotationTool == .select, "Select leaves the markup tool")
+        require(state.annotationTool == .select, "the implicit pointer state leaves the markup tool")
         guard let leaveSelection = state.selection else {
             require(false, "leaving the tool keeps the selection in progress")
             return

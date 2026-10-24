@@ -29,9 +29,8 @@ extension AppState {
         guard document != nil else { return "Open a PDF first." }
         if pageOverviewVisible { return "Close page overview first." }
         if contentEditEnabled { return "Region questions are unavailable while Edit PDF is on. Leave page editing first." }
-        if formToolActive { return "Region questions are unavailable while Fill & Sign is on." }
         if annotationTool != .select {
-            return "Region questions need the Select tool. Leave the annotation or drawing tool first."
+            return "Region questions need the pointer. Leave the annotation or drawing tool first."
         }
         if pageEditBusy || contentCommandInFlight {
             return "A document change is in progress. Try again when it finishes."
@@ -52,7 +51,7 @@ extension AppState {
     }
 
     public var canAskAboutRegion: Bool {
-        document != nil && !contentEditEnabled && !formToolActive && !pageOverviewVisible
+        document != nil && !contentEditEnabled && !pageOverviewVisible
     }
 
     // MARK: - Arming

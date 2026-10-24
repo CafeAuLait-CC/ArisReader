@@ -181,7 +181,7 @@ extension ReaderChecks {
                 "the existing selection becomes the chosen kind")
         require(state.selection == nil, "the activation-created mark consumes the selection")
 
-        // ── 6. Escape leaves the mode; Select leaves it too ───────────────────────────
+        // ── 6. Escape leaves the mode; the implicit pointer state leaves it too ───────
         state.toggleTextMarkupTool(.underline)
         require(state.annotationTool == .underline, "another tool can be armed after a mark")
         let canvas = MetalCanvasView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
@@ -199,7 +199,7 @@ extension ReaderChecks {
 
         state.toggleTextMarkupTool(.highlight)
         state.selectTool()
-        require(state.annotationTool == .select, "choosing Select leaves the sticky markup mode")
+        require(state.annotationTool == .select, "returning to the implicit pointer state leaves the sticky markup mode")
 
         // ── 7. A press on empty space clears instead of starting a selection ──────────
         state.toggleTextMarkupTool(.highlight)

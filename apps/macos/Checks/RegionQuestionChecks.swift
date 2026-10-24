@@ -339,15 +339,12 @@ extension ReaderChecks {
 
         state.annotationTool = .pen
         require(!state.canArmRegionSelection, "a drawing tool makes the region tool unavailable")
-        require(state.regionSelectionUnavailableReason?.contains("Select") == true,
-                "the reason names the mode that must be left")
+        require(state.regionSelectionUnavailableReason?.contains("pointer") == true,
+                "the reason names the pointer state that must be restored")
         state.annotationTool = .select
         state.contentEditEnabled = true
         require(!state.canArmRegionSelection, "Edit PDF makes the region tool unavailable")
         state.contentEditEnabled = false
-        state.formToolActive = true
-        require(!state.canArmRegionSelection, "Fill & Sign makes the region tool unavailable")
-        state.formToolActive = false
 
         // The real canvas gesture, driven through the same methods the mouse events use.
         let canvas = MetalCanvasView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))

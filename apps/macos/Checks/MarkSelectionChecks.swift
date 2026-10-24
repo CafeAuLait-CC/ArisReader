@@ -393,7 +393,7 @@ extension ReaderChecks {
         syncCanvas()
         canvas.keyDown(with: escapeEvent())
         require(state.selectedAnnotationID == nil, "Escape deselects the mark")
-        require(state.annotationTool == .select, "Escape leaves the reader in Select mode")
+        require(state.annotationTool == .select, "Escape leaves the reader in the implicit pointer state")
 
         click(at: clickPoint(for: created[0]))
         require(state.selectedAnnotationID == highlightID, "the highlight is selected for a tool switch")
