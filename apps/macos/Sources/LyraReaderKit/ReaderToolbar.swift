@@ -223,6 +223,12 @@ struct ReaderToolbar: View {
             LyraReaderMenu(title: "Export and save", items: [
                 LyraReaderMenuItem("Save", icon: "square.and.arrow.down", shortcut: "⌘S", enabled: state.canSaveDocument) { state.saveDocument() },
                 LyraReaderMenuItem("Save As…", icon: "doc.on.doc", shortcut: "⇧⌘S", enabled: state.canSaveDocument) { state.presentSaveDocumentCopyPanel() },
+                LyraReaderMenuItem("Export as Flattened Copy…", icon: "rectangle.stack",
+                                   enabled: state.canFlattenDocument,
+                                   help: state.flattenRefusal
+                                       ?? "Write a new PDF with annotations and filled form values painted into the page. Not tamper-proof.") {
+                    state.presentFlattenCopyPanel()
+                },
                 .separator("forms"),
                 LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm,
                                    help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {

@@ -450,6 +450,13 @@ struct ReaderChecks {
             print("Annotation export checks passed")
             return
         }
+        // "Export as Flattened Copy" on its own (`LyraReaderChecks --check-flatten .`).
+        if CommandLine.arguments.contains("--check-flatten") {
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
+            try await flattenChecks(root: root)
+            print("Flattened-copy checks passed")
+            return
+        }
         // The cold-click regression on its own (`LyraReaderChecks --check-cold-click .`).
         if CommandLine.arguments.contains("--check-cold-click") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
@@ -825,6 +832,9 @@ struct ReaderChecks {
             }),
             ("annotation-export", {
                 try await annotationExportChecks(root: root)
+            }),
+            ("flatten-copy", {
+                try await flattenChecks(root: root)
             }),
             ("thumbnail-annotations", {
                 try await thumbnailAnnotationChecks(
