@@ -418,6 +418,7 @@ extension ReaderChecks {
         try await continuitySignatureChecks(
             state: state, refusedState: xfaState, encryptedState: encryptedState,
             fixture: plain, picture: picture)
+        try signatureInteractionChecks(state: state)
 
         // Signed: placements are allowed (the cache is written to a copy), while the form
         // writes into the original stay disabled with the signature reason. The row items are

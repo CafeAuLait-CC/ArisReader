@@ -24,7 +24,8 @@ package struct SignatureContinuityButton: NSViewRepresentable {
 }
 
 @MainActor
-package final class ContinuitySignatureRequestor: NSButton, @preconcurrency NSServicesMenuRequestor {
+package final class ContinuitySignatureRequestor: NSButton,
+    @preconcurrency NSServicesMenuRequestor {
     private var controller: FillSignCommandController
     private struct Destination: Equatable {
         let documentID: UUID
@@ -46,6 +47,8 @@ package final class ContinuitySignatureRequestor: NSButton, @preconcurrency NSSe
         super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 26))
         title = "From iPhone or iPad"
         bezelStyle = .rounded
+        isBordered = false
+        focusRingType = .none
         controlSize = .regular
         font = .systemFont(ofSize: 12)
         target = self
@@ -84,6 +87,29 @@ package final class ContinuitySignatureRequestor: NSButton, @preconcurrency NSSe
 
     package func invalidateRequest() { requestedDestination = nil }
 
+    package override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
+        NSColor(isHighlighted ? LyraReaderTheme.pressedBg : LyraReaderTheme.fieldBg).setFill()
+        shape.fill()
+        let focused = window?.firstResponder === self
+        NSColor(focused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder).setStroke()
+        shape.lineWidth = focused ? 2 : 1
+        shape.stroke()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: LyraReaderTheme.textPrimaryColor.withAlphaComponent(isEnabled ? 1 : 0.45),
+        ]
+        let size = (title as NSString).size(withAttributes: attributes)
+        (title as NSString).draw(at: CGPoint(
+            x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+            withAttributes: attributes)
+    }
+
+    package override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     private var canReceiveSketch: Bool {
         isEnabled && requestedDestination != nil
             && requestedDestination == currentDestination
@@ -112,7 +138,14 @@ package final class ContinuitySignatureRequestor: NSButton, @preconcurrency NSSe
     package override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
         if resigned { invalidateRequest() }
+        needsDisplay = true
         return resigned
+    }
+
+    package override func becomeFirstResponder() -> Bool {
+        let focused = super.becomeFirstResponder()
+        needsDisplay = true
+        return focused
     }
 
     package override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -139,8 +172,6 @@ package final class ContinuitySignatureRequestor: NSButton, @preconcurrency NSSe
     private func presentDeviceMenu(with event: NSEvent) {
         guard beginRequest() else { return }
         let menu = NSMenu(title: "From iPhone or iPad")
-        let hint = NSMenuItem(title: "Choose Add Sketch to sign", action: nil, keyEquivalent: "")
-        menu.addItem(hint)
         // Do not add a marker with our own target/action. AppKit inserts and manages the
         // actual device services here, including Add Sketch when a device is available.
         NSMenu.popUpContextMenu(menu, with: event, for: self)
