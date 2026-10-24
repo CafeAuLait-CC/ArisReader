@@ -83,11 +83,11 @@ extension ReaderChecks {
                 "the reader opens in the implicit pointer state")
         require(state.formFieldsAcceptPointer,
                 "fields accept the pointer when no annotation or content tool is armed")
-        require(state.canOpenFillAndSignMenu,
-                "the Fill & Sign menu is available on a form document")
-        require(state.fillAndSignMenuCommands.count == 2,
-                "the Fill & Sign menu keeps the two form-save commands at the bottom")
-        require(state.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+        require(state.canOpenFillAndSign,
+                "the Fill & Sign row is available on a form document")
+        require(state.fillSignFormCommands.count == 2,
+                "the Fill & Sign form commands keep both writes")
+        require(state.fillSignFormCommands.allSatisfy { !$0.enabled },
                 "both form commands are disabled before there are changes")
         let stateFields = state.formInfo.fields
         let stateFullName = stateFields[0]
@@ -175,7 +175,7 @@ extension ReaderChecks {
         state.updateFormText(stateNotes.id, text: "Written on page two.")
         require(state.formHasPendingChanges, "the edits are pending in the reader")
         require(state.formChangedFields.count == 6, "six fields differ from the file")
-        require(state.fillAndSignMenuCommands.allSatisfy(\.enabled),
+        require(state.fillSignFormCommands.allSatisfy(\.enabled),
                 "once values are pending, both Fill & Sign commands are enabled")
         state.closeTab(0)
         require(state.contentCloseRequested && state.closeRequiresReview,
@@ -199,7 +199,7 @@ extension ReaderChecks {
                 "turning the tool off restores the pointer without losing values")
         require(state.zoomFactor == zoomBefore, "the tool switch did not move the viewport")
 
-        // ── A document with no form fields still offers the Fill & Sign menu ─────────
+        // ── A document with no form fields still offers the Fill & Sign row ─────────
         let plain = AppState(engine: try RustEngine())
         plain.setViewportSize(CGSize(width: 900, height: 650))
         plain.newTab(url: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
@@ -207,16 +207,16 @@ extension ReaderChecks {
             plain.formLoadCompleted && !plain.formLoading
         })
         require(plain.formInfo.fields.isEmpty, "the plain document has no form fields")
-        require(plain.canOpenFillAndSignMenu,
+        require(plain.canOpenFillAndSign,
                 "Fill & Sign stays enabled when the document has no form fields")
-        require(!plain.fillAndSignMenuCommands.isEmpty,
-                "the menu still has items, so it can open instead of being greyed out")
-        require(plain.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+        require(!plain.fillSignFormCommands.isEmpty,
+                "the form commands still exist, so the row can open instead of being greyed out")
+        require(plain.fillSignFormCommands.allSatisfy { !$0.enabled },
                 "its commands are disabled: there is nothing to fill")
-        require(plain.fillAndSignMenuCommands.allSatisfy {
+        require(plain.fillSignFormCommands.allSatisfy {
                     $0.help?.contains("no fillable form fields") == true
                 },
-                "the disabled commands say why, inside the open menu")
+                "the disabled commands say why, inside the inspector")
 
         // ── Save a copy and read it back with this engine ────────────────────────────
         let filled = scratch.appendingPathComponent("filled.pdf")
@@ -582,11 +582,11 @@ extension ReaderChecks {
         try await eventually("form info loads for the encrypted file", {
             encryptedState.formLoadCompleted && !encryptedState.formLoading
         })
-        require(encryptedState.canOpenFillAndSignMenu,
-                "the Fill & Sign menu is available to explain the encrypted refusal")
-        require(encryptedState.fillAndSignMenuCommands.allSatisfy { !$0.enabled },
+        require(encryptedState.canOpenFillAndSign,
+                "the Fill & Sign row is available to explain the encrypted refusal")
+        require(encryptedState.fillSignFormCommands.allSatisfy { !$0.enabled },
                 "every form command is disabled for an encrypted document")
-        require(encryptedState.fillAndSignMenuCommands.allSatisfy {
+        require(encryptedState.fillSignFormCommands.allSatisfy {
                     $0.help?.lowercased().contains("encrypted") == true
                 },
                 "the disabled commands explain the encryption")

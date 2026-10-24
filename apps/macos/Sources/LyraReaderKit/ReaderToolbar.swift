@@ -191,59 +191,66 @@ struct ReaderToolbar: View {
             Button { state.toggleAnnotationTools() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
-                    if !compact { Text("Annotate").font(.system(size: 12, weight: .medium)) }
+                    if !compact {
+                        Text("Annotate").font(.system(size: 12, weight: .medium))
+                            .background(AnnotationToolbarFrameReader(id: "toolbar.annotate.label"))
+                    }
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
                 }.padding(.horizontal, 6)
             }
             .buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
+            .background(AnnotationToolbarFrameReader(id: "toolbar.annotate"))
             Button { state.toggleContentEditing() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "character.cursor.ibeam")
-                    if !compact { Text("Edit").font(.system(size: 12, weight: .medium)) }
+                    if !compact {
+                        Text("Edit").font(.system(size: 12, weight: .medium))
+                            .background(AnnotationToolbarFrameReader(id: "toolbar.edit.label"))
+                    }
                 }.padding(.horizontal, 6)
-            }.buttonStyle(LyraReaderToolStyle(selected:state.contentEditEnabled))
+            }.buttonStyle(LyraReaderToolStyle(selected: state.contentEditEnabled))
                 .disabled(!state.canPageEdit)
                 .help("Show PDF editing tools").accessibilityLabel("Edit")
                 .accessibilityValue(state.contentEditEnabled ? "Expanded" : "Collapsed")
-            LyraReaderMenu(title: "Organise pages", items: [
-                LyraReaderMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
-                LyraReaderMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },
-                .separator("page-operations"),
-                LyraReaderMenuItem("Insert Blank Page After", icon: "doc.badge.plus", enabled: state.canPageEdit) { state.insertBlankPage(before: false) },
-                LyraReaderMenuItem("Extract Selected Pages…", icon: "doc.on.doc", enabled: state.canPageOperations,
-                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentExtractPagesPanel() },
-                .separator("merge-split"),
-                LyraReaderMenuItem("Append Pages from PDFs…", icon: "doc.badge.plus", enabled: state.canPageOperations,
-                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentMergeDocumentsPanel() },
-                LyraReaderMenuItem("Split Pages…", icon: "scissors", enabled: state.canPageOperations,
-                                   help: state.canPageOperations ? nil : state.readOnlyReason) { state.presentSplitPagesPanel() },
-            ]) { menuLabel("doc.on.doc") }
-            LyraReaderMenu(title: "Export and save", items: [
-                LyraReaderMenuItem("Save", icon: "square.and.arrow.down", shortcut: "⌘S", enabled: state.canSaveDocument) { state.saveDocument() },
-                LyraReaderMenuItem("Save As…", icon: "doc.on.doc", shortcut: "⇧⌘S", enabled: state.canSaveDocument) { state.presentSaveDocumentCopyPanel() },
-                LyraReaderMenuItem("Export as Flattened Copy…", icon: "rectangle.stack",
-                                   enabled: state.canFlattenDocument,
-                                   help: state.flattenRefusal
-                                       ?? "Write a new PDF with annotations and filled form values painted into the page. Not tamper-proof.") {
-                    state.presentFlattenCopyPanel()
-                },
-                .separator("forms"),
-                LyraReaderMenuItem("Save Filled Form Copy…", icon: "signature", enabled: state.canSaveFilledForm,
-                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
-                    state.presentSaveFilledFormPanel()
-                },
-                LyraReaderMenuItem("Write Form Values to Original…", icon: "doc.badge.arrow.up", enabled: state.canReplaceOriginalWithFilledForm,
-                                   help: state.isReadOnlyDocument ? state.readOnlyReason : nil) {
-                    state.presentReplaceOriginalWithFilledFormConfirmation()
-                },
-            ]) { menuLabel("square.and.arrow.up") }
-            // Fill & Sign is a menu, not a mode. The placement commands claim one click and
-            // return to the pointer; form fields still fill by clicking whenever no tool owns
-            // the pointer. The menu is a real NSMenu so Signature and Stamp have real submenus
-            // and the Continuity Camera row can be an AppKit services item.
-            FillSignMenuButton(state: state)
+                .background(AnnotationToolbarFrameReader(id: "toolbar.edit"))
+            // Fill & Sign is one of the four secondary rows, not a menu. Its button stays
+            // selected while the row is open; the row's seven tools are the placement commands
+            // #153 carried in a menu. Its inspector holds the per-tool options.
+            Button { state.toggleFillAndSign() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: AnnotationToolbarLayout.fillAndSignIcon)
+                    if !compact {
+                        Text("Fill & Sign").font(.system(size: 12, weight: .medium))
+                            .background(AnnotationToolbarFrameReader(id: "toolbar.fillSign.label"))
+                    }
+                }.padding(.horizontal, 6)
+            }
+            .buttonStyle(LyraReaderToolStyle(selected: state.fillAndSignVisible))
+            .disabled(!state.canOpenFillAndSign)
+            .help(state.fillAndSignHelp)
+            .accessibilityLabel(AnnotationToolbarLayout.fillAndSignLabel)
+            .accessibilityValue(state.fillAndSignVisible ? "Expanded" : "Collapsed")
+            .background(AnnotationToolbarFrameReader(id: "toolbar.fillSign"))
+            // Export is a row too. The glyph is a document with a download arrow, never the
+            // system Share symbol (`square.and.arrow.up`) the old menu used.
+            Button { state.toggleExport() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: AnnotationToolbarLayout.exportIcon)
+                    if !compact {
+                        Text("Export").font(.system(size: 12, weight: .medium))
+                            .background(AnnotationToolbarFrameReader(id: "toolbar.export.label"))
+                    }
+                }.padding(.horizontal, 6)
+            }
+            .buttonStyle(LyraReaderToolStyle(selected: state.exportVisible))
+            .disabled(state.document == nil)
+            .help("Export and save: Save, Save As, annotated and flattened copies, form copies, "
+                  + "annotation export and Print")
+            .accessibilityLabel("Export")
+            .accessibilityValue(state.exportVisible ? "Expanded" : "Collapsed")
+            .background(AnnotationToolbarFrameReader(id: "toolbar.export"))
             separator
             Button { state.toggleRegionSelection() } label: {
                 HStack(spacing: 5) {
@@ -369,6 +376,10 @@ struct ReaderSecondaryToolbar: View {
                 overviewRow
             } else if state.contentEditEnabled {
                 contentEditRow
+            } else if state.fillAndSignVisible {
+                fillSignRow
+            } else if state.exportVisible {
+                exportRow
             } else {
                 annotationRow
             }
@@ -416,6 +427,14 @@ struct ReaderSecondaryToolbar: View {
 
     private var contentEditRow: some View {
         ContentEditToolRow(state: state)
+    }
+
+    private var fillSignRow: some View {
+        FillSignToolRow(state: state)
+    }
+
+    private var exportRow: some View {
+        ExportToolRow(state: state)
     }
 
     private var annotationRow: some View {

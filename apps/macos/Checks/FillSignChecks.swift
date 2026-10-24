@@ -6,14 +6,15 @@ import LyraReaderKit
 import PDFKit
 import SwiftUI
 
-/// The Fill & Sign placement menu, end to end.
+/// The Fill & Sign row and inspector, end to end.
 ///
-/// The menu is a real `NSMenu` (Signature and Stamp are real submenus), built from the same
-/// `AppState.fillSignMenuCommands` the toolbar builds. These checks drive the menu's commands
-/// through the controller the toolbar uses, then place onto a real page and inspect the real
-/// annotation cache. The one thing they cannot exercise is the Continuity Camera handoff — that
-/// needs a paired iPhone/iPad. They do check the menu identifier AppKit requires and the
-/// `readSelection(from:)` path the system calls, with a pasteboard the check fills itself.
+/// Fill & Sign is a sub-toolbar row now. The seven items come from the same
+/// `AppState.fillSignRowCommands` the row lays out; the Signature inspector keeps the one real
+/// `NSMenu` AppKit needs for the Continuity Camera handoff. These checks drive the row's tools,
+/// place marks onto a real page and inspect the real annotation cache. The one thing they cannot
+/// exercise is the device handoff itself — that needs a paired iPhone/iPad. They do check the
+/// menu identifier AppKit requires and the `readSelectionFromPasteboard:` path the system calls,
+/// with a pasteboard the check fills itself.
 extension ReaderChecks {
     @MainActor static func fillSignChecks(root: URL) async throws {
         let fileManager = FileManager.default
@@ -87,92 +88,77 @@ extension ReaderChecks {
 
         let state = try await makeState(plain)
 
-        // ── 1. The menu: seven placement entries, in order, with real submenus ──────────
+        // ── 1. The row: seven placement tools, in order, each with its inspector ────────
         require(state.canPlaceFillSignAnnotation,
                 "a plain PDF offers the Fill & Sign placements")
-        require(state.canOpenFillAndSignMenu,
+        require(state.canOpenFillAndSign,
                 "the Fill & Sign button opens on a plain PDF")
-        let model = state.fillSignMenuCommands
-        let topLevel = model.filter { !$0.isSeparator }
-        require(Array(topLevel.prefix(7).map(\.title)) == FillSignMenuCommand.placementTitles,
-                "the menu starts with Text, Signature, Date, Checkmark, Cross, Stamp, Image… in order")
-        require(FillSignMenuCommand.placementTitles
-                    == ["Text", "Signature", "Date", "Checkmark", "Cross", "Stamp", "Image…"],
-                "the seven placement titles are the requested ones")
-        require(topLevel.map(\.id).prefix(7) == ["text", "signature", "date", "checkmark",
-                                                 "cross", "stamp", "image"],
-                "the seven placement ids are stable")
-        require(model.filter(\.isSeparator).count == 1,
-                "the form-save commands sit after one separator")
-        require(Array(model.suffix(2).map(\.id)) == ["save-filled-copy", "write-form-values"],
-                "the two form-save commands remain at the bottom")
-        let signature = model.first { $0.id == "signature" }
-        require(signature?.children.map(\.title)
-                    == ["Type", "Draw", "Image…", "From iPhone or iPad"],
-                "Signature is a submenu with Type, Draw, Image…, From iPhone or iPad")
-        let stamp = model.first { $0.id == "stamp" }
-        require(stamp?.children.map(\.title) == AppState.StampStyle.allCases.map(\.title),
-                "Stamp is the existing stamp-style submenu")
-        for command in model where !command.isSeparator && !command.children.isEmpty {
-            for child in command.children {
-                require(child.help?.contains("annotation until you save") == true,
-                        "\(command.title) → \(child.title) says it places an annotation until saved")
-            }
-        }
-        for command in Array(topLevel.prefix(7)) {
-            require(command.help?.contains("annotation until you save") == true,
-                    "\(command.title) says it places an annotation until saved")
-            require(command.enabled, "\(command.title) is enabled on a plain PDF")
-        }
+        let row = state.fillSignRowCommands
+        require(row.map(\.title) == ["Text", "Signature", "Date", "Checkmark", "Cross",
+                                     "Stamp", "Image"],
+                "the row has Text, Signature, Date, Checkmark, Cross, Stamp, Image in order")
+        require(row.map(\.id) == ["text", "signature", "date", "checkmark", "cross", "stamp",
+                                  "image"],
+                "the seven row ids are stable")
+        require(FillSignTool.rowOrder == [.text, .signature, .date, .checkmark, .cross, .stamp,
+                                          .image],
+                "the declared row order is the requested one")
+        require(row.allSatisfy(\.enabled), "every Fill & Sign row item is enabled on a plain PDF")
+        require(row.allSatisfy { $0.help.contains("annotation until you save") },
+                "every row item says its mark is an annotation until saved")
+        require(row.allSatisfy { NSImage(systemSymbolName: $0.icon,
+                                         accessibilityDescription: nil) != nil },
+                "every row item's symbol exists on this macOS")
+        require(!state.fillSignInspectorVisible,
+                "the inspector is absent before a Fill & Sign tool is armed")
 
-        let controller = FillSignMenuController(state: state)
-        let menu = controller.makeMenu()
-        require(menu.autoenablesItems == false,
-                "the Fill & Sign menu owns its enabled state (no AppKit guessing)")
-        require(Array(menu.items.prefix(7).map(\.title)) == FillSignMenuCommand.placementTitles,
-                "the built NSMenu has the seven placement rows in order")
-        require(menu.items.count == 10,
-                "the built NSMenu has the seven placements, a separator and two form commands")
-        require(menu.items[7].isSeparatorItem, "the form commands are under a separator")
-        require(menu.items[8].title == "Save Filled Form Copy…"
-                    && menu.items[9].title == "Write Form Values to Original…",
-                "the built menu keeps both form-save commands")
-        guard let signatureMenu = menu.items[1].submenu else {
-            require(false, "Signature is a real NSMenu submenu")
-            return
-        }
+        // The only real NSMenu left is the Signature inspector's continuity pop-up.
+        let controller = FillSignCommandController(state: state)
+        let signatureMenu = controller.makeSignatureMethodMenu()
+        require(signatureMenu.autoenablesItems == false,
+                "the Signature method menu owns its enabled state (no AppKit guessing)")
         require(signatureMenu.items.map(\.title)
                     == ["Type", "Draw", "Image…", "From iPhone or iPad"],
-                "the real Signature submenu has the four rows in order")
+                "the Signature inspector's methods are Type, Draw, Image…, From iPhone or iPad")
+        require(Array(signatureMenu.items.prefix(3).map(\.toolTip))
+                    .allSatisfy { $0?.contains("annotation until you save") == true },
+                "the three picture methods say they place an annotation until saved")
         let continuity = signatureMenu.items[3]
         require(continuity.identifier?.rawValue == "NSMenuItemImportFromDeviceIdentifier",
-                "the continuity row carries NSMenuItemImportFromDeviceIdentifier")
+                "the continuity item carries NSMenuItemImportFromDeviceIdentifier")
         require(continuity.identifier == NSMenuItem.importFromDeviceIdentifier,
                 "the continuity identifier is the AppKit constant, not a look-alike")
         guard let continuityAction = continuity.action else {
-            require(false, "the continuity row has an action")
+            require(false, "the continuity item has an action")
             return
         }
         require(NSStringFromSelector(continuityAction) == "readSelectionFromPasteboard:",
-                "the continuity row's action is the NSServicesMenuRequestor selector")
-        require((continuity.target as? FillSignMenuController) === controller,
-                "the continuity row targets the receiving controller")
+                "the continuity item's action is the NSServicesMenuRequestor selector")
+        require((continuity.target as? FillSignCommandController) === controller,
+                "the continuity item targets the receiving controller")
         require(continuity.toolTip?.contains("annotation until you save") == true,
-                "the continuity row says the sketch becomes an annotation until saved")
-        for item in menu.items where !item.isSeparatorItem {
-            require(item.toolTip?.contains("annotation until you save") == true
-                        || item.identifier == NSMenuItem.importFromDeviceIdentifier
-                        || item.title.hasPrefix("Save Filled Form")
-                        || item.title.hasPrefix("Write Form Values"),
-                    "\(item.title) has a help sentence")
-        }
+                "the continuity item says the sketch becomes an annotation until saved")
+        require(state.fillSignSignatureMethods.map(\.title)
+                    == ["Type", "Draw", "Image…", "From iPhone or iPad"],
+                "the state exposes the same four methods the inspector draws")
 
-        // ── 2. Text arms the text-box tool and takes the pointer from form fields ───────
-        controller.dispatch("text")
+        let stampStyles = AppState.StampStyle.allCases
+        require(!stampStyles.isEmpty
+                    && AppState.StampStyle.allCases.map(\.title) == stampStyles.map(\.title),
+                "the Stamp inspector grid has the existing stamp styles")
+        require(state.fillSignFormCommands.map(\.id) == ["save-filled-copy", "write-form-values"],
+                "the two form writes remain available to the inspector and File")
+
+        // ── 2. Text arms the text-box tool, opens the row and closes the inspector on place ──
+        state.selectFillSignTool(.text)
+        require(state.fillAndSignVisible,
+                "Text opens the Fill & Sign row")
+        require(state.armedFillSignTool == .text,
+                "Text is the row's armed item")
+        require(state.fillSignInspectorVisible,
+                "arming Text opens the right-hand inspector")
         require(state.annotationTool == .textBox,
                 "Text arms the existing text-box tool")
-        require(state.annotationToolsVisible,
-                "Text makes the annotation row visible so the armed tool is not invisible")
         require(state.pendingFillSignPlacement == .text,
                 "Text claims the next click for a one-click placement")
         require(!state.formFieldsAcceptPointer,
@@ -181,13 +167,19 @@ extension ReaderChecks {
                 "Escape cancels an armed Fill & Sign placement")
         require(state.pendingFillSignPlacement == nil && state.annotationTool == .select,
                 "Escape returns the canvas to the pointer")
+        require(!state.fillSignInspectorVisible,
+                "Escape clears the armed tool and closes the inspector")
 
         // ── 3. Date: today's date, medium style, selected for replacement ───────────────
         let datePoint = CGPoint(x: 250, y: 280)
-        controller.dispatch("date")
+        state.selectFillSignTool(.date)
+        require(state.fillSignInspectorVisible,
+                "Date's inspector appears while the date tool is armed")
         require(state.pendingFillSignPlacement == .date, "Date arms a one-click date placement")
         require(state.placePendingFillSign(atContentPoint: contentPoint(state, datePoint)),
                 "Date places a text box at the click point")
+        require(!state.fillSignInspectorVisible,
+                "placing the date closes the inspector with the armed tool")
         guard let dateBox = state.annotations.first(where: { $0.kind == .textBox }) else {
             require(false, "the Date placement created a text box")
             return
@@ -217,12 +209,14 @@ extension ReaderChecks {
         _ = state.commitTextEditing()
 
         // ── 4. Checkmark and Cross: two vector ink strokes each, at the click point ─────
-        func assertMark(_ mark: FillSignMark, command: String,
+        func assertMark(_ mark: FillSignMark, tool: FillSignTool,
                         click: CGPoint) {
             state.annotationColor = AppState.annotationPalette[0].color
             let countBefore = state.annotations.count
             let point = contentPoint(state, click)
-            controller.dispatch(command)
+            state.selectFillSignTool(tool)
+            require(state.fillSignInspectorVisible,
+                    "\(mark.title)'s inspector appears while it is armed")
             require(state.pendingFillSignPlacement
                         == (mark == .checkmark ? .checkmark : .cross),
                     "\(mark.title) arms a one-click placement")
@@ -285,8 +279,8 @@ extension ReaderChecks {
                     "redo restores \(mark.title)")
             state.undo()
         }
-        assertMark(.checkmark, command: "checkmark", click: CGPoint(x: 300, y: 360))
-        assertMark(.cross, command: "cross", click: CGPoint(x: 420, y: 360))
+        assertMark(.checkmark, tool: .checkmark, click: CGPoint(x: 300, y: 360))
+        assertMark(.cross, tool: .cross, click: CGPoint(x: 420, y: 360))
 
         // ── 5. Image… places an arbitrary picture, not a signature ─────────────────────
         state.annotationColor = AppState.annotationPalette[0].color
@@ -417,54 +411,45 @@ extension ReaderChecks {
         state.undo()
 
         // ── 9. Read-only documents: present and disabled with the existing reasons ─────
-        // XFA: even copies are refused, so every placement row is disabled and explains it.
+        // XFA: even copies are refused, so every row item is disabled and explains it.
         let xfaState = try await makeState(xfa)
         require(xfaState.isXfaDocument, "the XFA fixture reads as an XFA form")
-        let xfaPlacement = xfaState.fillSignMenuCommands.prefix(7)
-        require(xfaPlacement.count == 7, "the seven placement rows are still present on XFA")
+        let xfaPlacement = xfaState.fillSignRowCommands
+        require(xfaPlacement.count == 7, "the seven row items are still present on XFA")
         require(xfaPlacement.allSatisfy { !$0.enabled },
-                "every placement row is disabled on an XFA form")
+                "every row item is disabled on an XFA form")
         require(xfaPlacement.allSatisfy {
-                    $0.help?.localizedCaseInsensitiveContains("XFA") == true
-                }, "every disabled XFA placement row explains the XFA reason")
-        require(xfaState.fillSignMenuCommands.prefix(7).flatMap(\.children).allSatisfy {
-                    !$0.enabled && $0.help?.localizedCaseInsensitiveContains("XFA") == true
-                }, "the XFA submenu rows are disabled and explain the reason too")
-        let xfaMenu = FillSignMenuController(state: xfaState).makeMenu()
-        require(xfaMenu.items.prefix(7).allSatisfy { !$0.isEnabled },
-                "the built XFA menu shows the placement rows disabled")
-        require(xfaMenu.items.prefix(7).allSatisfy {
-                    $0.toolTip?.localizedCaseInsensitiveContains("XFA") == true
-                }, "the built XFA menu keeps the reason on each row")
+                    $0.help.localizedCaseInsensitiveContains("XFA")
+                }, "every disabled XFA row item explains the XFA reason")
+        require(xfaState.fillSignSignatureMethods.allSatisfy {
+                    !$0.enabled && $0.help.localizedCaseInsensitiveContains("XFA")
+                }, "the XFA Signature methods are disabled and explain the reason too")
 
-        // Encrypted: form fields cannot be written, and the menu says so rather than hiding.
+        // Encrypted: form fields cannot be written, and the row says so rather than hiding.
         let encryptedState = try await makeState(encrypted)
         try await eventually("the encrypted fixture's form facts load", {
             encryptedState.formLoadCompleted && !encryptedState.formLoading
         })
-        require(encryptedState.fillSignMenuCommands.prefix(7).allSatisfy { !$0.enabled },
-                "every placement row is disabled on an encrypted PDF")
-        require(encryptedState.fillSignMenuCommands.prefix(7).allSatisfy {
-                    $0.help?.localizedCaseInsensitiveContains("encrypted") == true
-                }, "every disabled encrypted row explains the encryption")
-        require(FillSignMenuController(state: encryptedState).makeMenu()
-                    .items.prefix(7).allSatisfy { !$0.isEnabled },
-                "the built encrypted menu shows the placement rows disabled")
+        require(encryptedState.fillSignRowCommands.allSatisfy { !$0.enabled },
+                "every row item is disabled on an encrypted PDF")
+        require(encryptedState.fillSignRowCommands.allSatisfy {
+                    $0.help.localizedCaseInsensitiveContains("encrypted")
+                }, "every disabled encrypted row item explains the encryption")
 
         // Signed: placements are allowed (the cache is written to a copy), while the form
-        // writes into the original stay disabled with the signature reason. The rows are
+        // writes into the original stay disabled with the signature reason. The row items are
         // present, not hidden, and their help says where the annotation can go.
         let signedState = try await makeState(signed)
         require(signedState.isReadOnlyDocument, "the signed fixture reads as read-only in place")
-        require(signedState.fillSignMenuCommands.prefix(7).allSatisfy(\.enabled),
+        require(signedState.fillSignRowCommands.allSatisfy(\.enabled),
                 "placements stay available on a signed PDF because they go to a copy")
-        require(signedState.fillSignMenuCommands.prefix(7).allSatisfy {
-                    $0.help?.contains("save a copy to keep it") == true
+        require(signedState.fillSignRowCommands.allSatisfy {
+                    $0.help.contains("save a copy to keep it")
                 }, "the signed-document placement help says the result needs a saved copy")
-        require(signedState.fillSignMenuCommands.first(where: { $0.id == "write-form-values" })?
+        require(signedState.fillSignFormCommands.first(where: { $0.id == "write-form-values" })?
                     .enabled == false,
                 "writing form values into the signed original is disabled")
-        require(signedState.fillSignMenuCommands.first(where: { $0.id == "write-form-values" })?
+        require(signedState.fillSignFormCommands.first(where: { $0.id == "write-form-values" })?
                     .help?.localizedCaseInsensitiveContains("sign") == true,
                 "the disabled signed write explains the signature")
         require(!signedState.canReplaceOriginalWithFilledForm,

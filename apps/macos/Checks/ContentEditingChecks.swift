@@ -284,8 +284,9 @@ extension ReaderChecks {
     }, {
       host.layoutSubtreeIfNeeded()
       guard let clip = view.enclosingScrollView?.contentView else { return false }
-      let expected = host.bounds.width - ReaderChrome.scrollIndicatorLaneWidthPt
-        - ReaderEditingPanelTransition<ContentEditInspector>.width
+      let inspectorWidth = state.contentEditInspectorVisible
+        ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0
+      let expected = host.bounds.width - ReaderChrome.scrollIndicatorLaneWidthPt - inspectorWidth
       // The viewport is reported asynchronously. At low DPI the paragraph is centered, so
       // calculating a click before that report produces a stale X coordinate on CI.
       return abs(clip.bounds.width - expected) < 0.5

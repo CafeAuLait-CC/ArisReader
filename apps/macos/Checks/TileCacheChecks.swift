@@ -220,6 +220,9 @@ extension ReaderChecks {
         for editing in [false, true] {
             state.rightPanelVisible = !editing
             state.contentEditEnabled = editing
+            // The Edit inspector follows an armed content tool; without one the drawer is not
+            // part of the layout and the covered-column arithmetic below would be wrong.
+            if editing { state.selectContentTool("text") }
             let drawerWidth = editing ? ReaderChrome.editingPanelWidthPt
                 : ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)
             state.setViewportSize(CGSize(width: 1280 - drawerWidth, height: 500))

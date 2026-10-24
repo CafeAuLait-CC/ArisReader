@@ -193,6 +193,14 @@ struct ReaderChecks {
             try await annotationToolbarChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-toolbar-rows") {
+            try await toolbarRowsChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-fill-and-sign") {
+            try await fillSignChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-appearance") {
             await appearanceChecks()
             return
@@ -736,6 +744,9 @@ struct ReaderChecks {
             }),
             ("annotation-toolbar", {
                 try await annotationToolbarChecks(root: root)
+            }),
+            ("toolbar-rows", {
+                try await toolbarRowsChecks(root: root)
             }),
             ("fill-and-sign", {
                 try await fillSignChecks(root: root)

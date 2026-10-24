@@ -3,7 +3,14 @@ import SwiftUI
 
 /// Native frame probes let regression checks measure the chrome SwiftUI actually lays out.
 package final class ReaderChromeMarkerView: NSView {
-    package enum Kind { case secondaryToolbar, editingInspector }
+    package enum Kind {
+        case secondaryToolbar
+        case secondaryRowSlot
+        case editingInspector
+        case editingInspectorSlot
+        case fillSignInspector
+        case fillSignInspectorSlot
+    }
     package let kind: Kind
     init(kind: Kind) { self.kind = kind; super.init(frame: .zero) }
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }

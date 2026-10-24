@@ -27,9 +27,13 @@ public enum AnnotationToolbarLayout {
     /// Signature tool in the placement group is the annotation row's signature picture.
     public static let fillAndSignIcon = "list.bullet.rectangle"
 
-    /// The Fill & Sign button's accessible name. It is its own menu, so it does not carry the
-    /// form-fields qualifier it had as a stub.
+    /// The Fill & Sign button's accessible name.
     public static let fillAndSignLabel = "Fill & Sign"
+
+    /// The Export button's glyph. A document with a downward arrow, never the system Share
+    /// symbol (`square.and.arrow.up`) the old Export menu used.
+    public static let exportIcon = "arrow.down.doc"
+    public static let exportLabel = "Export"
 
     public enum Group: String, CaseIterable, Sendable {
         case markup
@@ -140,15 +144,17 @@ public enum ReaderToolbarProbe {
         )
     }
 
-    private static func measure<V: View>(_ view: V, width: CGFloat) -> [String: CGRect] {
+    static func measure<V: View>(
+        _ view: V,
+        width: CGFloat,
+        height: CGFloat = ReaderChrome.secondaryToolbarHeightPt
+    ) -> [String: CGRect] {
         let probe = AnnotationToolbarFrameProbe()
         let root = view
             .environment(\.annotationToolbarFrameProbe, probe)
             .coordinateSpace(name: AnnotationToolbarLayout.coordinateSpace)
         let host = NSHostingView(rootView: root)
-        host.frame = NSRect(x: 0, y: 0,
-                            width: width,
-                            height: ReaderChrome.secondaryToolbarHeightPt)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
         host.layoutSubtreeIfNeeded()
         // The geometry readers report on their first layout pass; give SwiftUI one short run-loop
         // turn so a hosted row has the same frames it has in a window.
