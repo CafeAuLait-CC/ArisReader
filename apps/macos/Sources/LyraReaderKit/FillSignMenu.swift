@@ -67,7 +67,7 @@ public struct FillSignMenuCommand: Identifiable, Equatable, Sendable {
 /// recognises when it is an `NSMenuItem` with `NSMenuItemImportFromDeviceIdentifier` and a
 /// `NSServicesMenuRequestor` target.
 @MainActor
-package final class FillSignMenuController: NSObject, @preconcurrency NSServicesMenuRequestor {
+package final class FillSignMenuController: NSObject {
     package let state: AppState
 
     package init(state: AppState) {
@@ -110,7 +110,7 @@ package final class FillSignMenuController: NSObject, @preconcurrency NSServices
             // AppKit looks for this identifier and replaces the row with the paired devices'
             // "Add a sketch" entry. The action must be the NSServicesMenuRequestor method.
             item.identifier = NSMenuItem.importFromDeviceIdentifier
-            item.action = #selector(readSelection(from:))
+            item.action = #selector(receiveContinuitySelection(_:))
         }
         return item
     }
@@ -218,9 +218,15 @@ package final class FillSignMenuController: NSObject, @preconcurrency NSServices
     }
 
     /// The Continuity Camera path: macOS hands the sketch over on a pasteboard after the reader
-    /// finishes it on the paired device. TIFF is the usual transport; the writer accepts PNG or
-    /// JPEG, so convert when needed.
-    @objc package func readSelection(from pasteboard: NSPasteboard) -> Bool {
+    /// finishes it on the paired device.
+    ///
+    /// This is `NSServicesMenuRequestor.readSelectionFromPasteboard:`. The Objective-C selector
+    /// is pinned explicitly rather than depending on the Swift importer's name for it: recent
+    /// SDKs call the method `readSelection(from:)`, older ones
+    /// `readSelectionFromPasteboard(_:)`, and the selector AppKit sends is the same either way.
+    /// TIFF is the usual transport; the writer accepts PNG or JPEG, so convert when needed.
+    @objc(readSelectionFromPasteboard:)
+    package func receiveContinuitySelection(_ pasteboard: NSPasteboard) -> Bool {
         guard state.canPlaceFillSignAnnotation else {
             state.lastError = state.fillSignPlacementRefusal
             return false

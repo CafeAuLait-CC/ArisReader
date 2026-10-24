@@ -406,7 +406,7 @@ extension ReaderChecks {
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-fillsign-\(UUID())"))
         pasteboard.clearContents()
         pasteboard.setData(picture, forType: .png)
-        require(controller.readSelection(from: pasteboard),
+        require(controller.receiveContinuitySelection(pasteboard),
                 "the continuity requestor accepts a pasted sketch")
         require(state.pendingSignatureImageData == picture,
                 "the pasted sketch becomes the armed signature image")
