@@ -305,8 +305,8 @@ public final class DocumentOpenCoordinator: ObservableObject {
     /// before the window is requested so a drag of the wrong file produces a sentence, not an
     /// empty window.
     ///
-    /// `page` and `revealing` are the preview action's target: the new window opens the same
-    /// document and then moves to the page and the page-local rectangle the preview points at.
+    /// `page` and `revealing` are the thumbnail action's target: the new window opens the same
+    /// document and then moves to the page and the page-local rectangle the thumbnail points at.
     @discardableResult
     public func openInNewWindow(_ urls: [URL], page: Int? = nil, revealing region: CGRect? = nil) -> Bool {
         let files = urls.compactMap(Self.normalizedFileURL)
@@ -336,32 +336,6 @@ public final class DocumentOpenCoordinator: ObservableObject {
             : "Opening \(openable.count) documents in a new window"
         traceNewWindowRequest(openable, page: page)
         return true
-    }
-
-    /// The preview panel's "open in a new window" action.
-    ///
-    /// The target is the preview's own page and rectangle: a figure or table region, a cited
-    /// entry's fragment, or a plain page top. It is the same document, opened in a second
-    /// independent reader window through ``ReaderWindowRegistry``; this window's document, scroll
-    /// offset and tabs are never touched. A second window rather than an in-window split, because
-    /// the reader window has one canvas and no split layout to put a second one in.
-    @discardableResult
-    public func openPreviewTargetInNewWindow() -> Bool {
-        guard let preview = state.referencePreview else {
-            report("There is no preview to open in a new window.")
-            return false
-        }
-        guard let url = state.document?.url else {
-            report("There is no document to open in a new window.")
-            return false
-        }
-        return openInNewWindow([url], page: preview.page, revealing: preview.region)
-    }
-
-    /// Whether the preview action can run: a preview and a document must exist, and the app must
-    /// be able to make a reader window.
-    public var canOpenPreviewInNewWindow: Bool {
-        state.referencePreview != nil && state.document?.url != nil && canOpenInNewWindow
     }
 
     /// Whether a drop on the sidebar can actually create a window. The sidebar omits “Open in New

@@ -27,8 +27,12 @@ public enum LyraReaderTheme {
     public static let canvasBg = Color(nsColor: adaptive(0xE7E2D9, 0x171716))
     public static let emptyBg = Color(nsColor: adaptive(0xEEEAE3, 0x1B1A18))
     public static let statusbarBg = Color(nsColor: adaptive(0xF4F1EC, 0x24221F))
-    public static let textPrimary = Color(nsColor: adaptive(0x302B25, 0xF1ECE3))
-    public static let textSecondary = Color(nsColor: adaptive(0x655C50, 0xC8BFAF))
+    /// Dynamic NSColor forms of the text tokens, for callers that must resolve them under a
+    /// concrete appearance (the preview typography checks do exactly that).
+    public static let textPrimaryColor = adaptive(0x302B25, 0xF1ECE3)
+    public static let textPrimary = Color(nsColor: textPrimaryColor)
+    public static let textSecondaryColor = adaptive(0x655C50, 0xC8BFAF)
+    public static let textSecondary = Color(nsColor: textSecondaryColor)
     public static let textTertiary = Color(nsColor: adaptive(0x675C50, 0xB4A995))
     public static let textPlaceholder = Color(nsColor: adaptive(0x786E62, 0xB0A38F))
     public static let textDisabled = Color(nsColor: adaptive(0xA79E90, 0x736D62))

@@ -1747,14 +1747,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
-    /// A pinned preview stays exactly as it is while the reader keeps working.
-    ///
-    /// Pinning is a property of the preview, not of a second panel: while it is set, a new
-    /// interaction in the document that would normally replace the preview is refused instead of
-    /// replacing it (`openReferencePreview`). Unpinning only clears the flag; the next preview
-    /// request updates the panel again. Closing the preview or leaving the document clears it, so
-    /// a pin can never outlive the content it protects.
-    @Published public private(set) var referencePreviewPinned = false
     /// Page content for the preview panel (its own render surface).
     @Published public private(set) var referencePreviewPages: [CanvasPage] = []
     @Published public private(set) var referencePreviewZoom: CGFloat = 1
@@ -1801,15 +1793,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                              sectionReference: preview.sectionReference)
     }
 
-    public func showFullPreviewPage() {
-        guard let preview = referencePreview else { return }
-        // The page image is exactly what "Full page" is for, so the kind changes with the view.
-        // A section preview's text body is traded for the page it points at, which is the one
-        // place its crop is still the point.
-        openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
-                             kind: .page, anchor: preview.anchor, entries: preview.entries)
-    }
-
     /// Opens a floating preview of `page`.
     ///
     /// `entries` is the citation's whole group of resolved works; `page`, `title` and `region`
@@ -1821,11 +1804,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// *is* the body, so the panel opens immediately and no page, tile or prefetch work is
     /// started for it.
     ///
-    /// Returns `false` when the request was refused. The only refusal that is not an invalid
-    /// target is a **pinned** preview: a new interaction in the document must not replace what
-    /// the reader pinned, so the panel keeps its original content until it is unpinned. A request
-    /// for the preview already on screen (a viewport re-fit, for instance) is not a replacement
-    /// and still runs.
+    /// Returns `false` for an invalid target. A request for the preview already on screen (a
+    /// viewport re-fit, for instance) still runs.
     @discardableResult
     public func openReferencePreview(
         page: Int,
@@ -1854,10 +1834,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             sectionTitle: sectionTitle,
             sectionReference: sectionReference
         )
-        if referencePreviewPinned, let current = referencePreview, current != requested {
-            statusMessage = "Preview pinned — unpin it to preview a new reference"
-            return false
-        }
         if requested != referencePreview { previewLookupEpoch &+= 1 }
         previewEpoch &+= 1
         let request = previewEpoch
@@ -1918,7 +1894,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
             self.referencePreviewLoading = false
             guard let image = rasterized else {
-                self.referencePreviewError = "This preview could not be rendered. Try opening the full page."
+                self.referencePreviewError = "This preview could not be rendered."
                 return
             }
 
@@ -1945,7 +1921,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func closeReferencePreview() {
         previewLookupEpoch &+= 1
         previewEpoch &+= 1
-        referencePreviewPinned = false
         referencePreviewLoading = false
         referencePreviewError = nil
         referencePreviewScrollYPt = 0
@@ -1954,21 +1929,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     // MARK: - Preview actions (T4.8)
-
-    /// Whether the current preview can be pinned. Every preview kind can: pinning protects the
-    /// panel, not one body.
-    public var canPinReferencePreview: Bool { referencePreview != nil }
-
-    /// Pins or unpins the current preview. A pinned preview is frozen: new interactions in the
-    /// document are refused instead of replacing it. Unpinning re-arms the ordinary update path;
-    /// the next preview request lands in the same panel.
-    public func toggleReferencePreviewPin() {
-        guard referencePreview != nil else { return }
-        referencePreviewPinned.toggle()
-        statusMessage = referencePreviewPinned
-            ? "Preview pinned — new interactions will not replace it"
-            : "Preview unpinned — the next preview replaces it"
-    }
 
     /// Whether a citation preview can copy a BibTeX entry.
     ///

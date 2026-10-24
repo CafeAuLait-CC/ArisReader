@@ -106,11 +106,71 @@ public enum PreviewPanelGeometry {
     }
 }
 
+// MARK: - Typography
+
+/// A text weight the citation card uses, ordered so a check can say "semibold or heavier".
+///
+/// `Font.Weight` has no comparison order, so the card names the weights it needs on a numeric
+/// scale and converts at the two places that draw or measure: SwiftUI and AppKit.
+public enum ReferencePreviewTextWeight: Int, Comparable, Sendable {
+    case regular = 400
+    case medium = 500
+    case semibold = 600
+    case bold = 700
+
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+
+    var swiftUIWeight: Font.Weight {
+        switch self {
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        }
+    }
+
+    var appKitWeight: NSFont.Weight {
+        switch self {
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        }
+    }
+}
+
+/// The citation card's type scale and semantic text colours.
+///
+/// The paper title is two points larger than the full-citation paragraph and semibold, so it is
+/// the card body's most prominent line. The paragraph keeps its size and uses the palette's
+/// `text-secondary` token — the token the palette assigns to explanatory text — rather than an
+/// invented grey. Both roles resolve under the theme in light and dark appearances.
+public enum ReferencePreviewTypography {
+    public static let titleFontSize: CGFloat = 14
+    public static let titleWeight: ReferencePreviewTextWeight = .semibold
+    public static let bodyFontSize: CGFloat = 12
+
+    /// `text-secondary`: #655C50 on light paper, #C8BFAF on dark paper.
+    @MainActor
+    public static var bodyColor: NSColor { LyraReaderTheme.textSecondaryColor }
+    /// A non-link title uses the card's ordinary primary text.
+    @MainActor
+    public static var plainTitleColor: NSColor { LyraReaderTheme.textPrimaryColor }
+    /// A title that selects one entry is a link; the palette's accent is the link colour.
+    @MainActor
+    public static var linkedTitleColor: NSColor { LyraReaderTheme.accentColor }
+}
+
 // MARK: - Entry text
 
 /// Citation title extraction and text measurement shared by the preview model and view.
 public enum ReferencePreviewLayout {
-    public static let textFontSize: CGFloat = 12
+    public static let textFontSize: CGFloat = ReferencePreviewTypography.bodyFontSize
+    /// The paper-title row: one step above the body, semibold.
+    public static let headingFontSize: CGFloat = ReferencePreviewTypography.titleFontSize
+    public static let headingWeight: ReferencePreviewTextWeight = ReferencePreviewTypography.titleWeight
     public static let entrySpacingPt: CGFloat = 12
     /// Card padding plus the scroll indicator's lane.
     public static let textInsetPt: CGFloat = 30
@@ -145,11 +205,19 @@ public enum ReferencePreviewLayout {
     }
 
     /// Height of `text` wrapped to `widthPt`, in points.
-    public static func textHeight(_ text: String, widthPt: CGFloat) -> CGFloat {
+    ///
+    /// The caller passes the size and weight the view actually draws: a 14 pt semibold title
+    /// wraps into a taller line than the 12 pt body, and the content height has to agree.
+    public static func textHeight(
+        _ text: String,
+        widthPt: CGFloat,
+        fontSize: CGFloat = textFontSize,
+        weight: ReferencePreviewTextWeight = .regular
+    ) -> CGFloat {
         guard widthPt > 1, !text.isEmpty else { return 0 }
         let attributed = NSAttributedString(
             string: text,
-            attributes: [.font: NSFont.systemFont(ofSize: textFontSize)]
+            attributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: weight.appKitWeight)]
         )
         let bounds = attributed.boundingRect(
             with: CGSize(width: widthPt, height: .greatestFiniteMagnitude),
@@ -270,7 +338,11 @@ public final class ReferencePreviewModel: ObservableObject {
     public func fullContentHeight(panelWidthPt: CGFloat) -> CGFloat {
         let width = ReferencePreviewLayout.textColumnWidth(panelWidthPt: panelWidthPt)
         return 80 + entries.reduce(CGFloat(0)) { total, entry in
-            total + ReferencePreviewLayout.textHeight(entry.heading, widthPt: width)
+            total + ReferencePreviewLayout.textHeight(
+                entry.heading, widthPt: width,
+                fontSize: ReferencePreviewLayout.headingFontSize,
+                weight: ReferencePreviewLayout.headingWeight
+            )
                 + ReferencePreviewLayout.textHeight(entry.text, widthPt: width) + 16
         }
     }
@@ -474,13 +546,6 @@ public final class ReferencePreviewPanelController {
     public private(set) var panel: ReferencePreviewPanel?
     public let model = ReferencePreviewModel()
 
-    /// The window's "open this preview in a new reader window" action.
-    ///
-    /// Installed by ``ReaderSession`` from that window's ``DocumentOpenCoordinator``; `nil` for
-    /// the process-wide controller a check uses, which has no window to open. The panel shows the
-    /// control disabled rather than offering an action that cannot run.
-    public var openInNewWindow: (() -> Bool)?
-
     /// Where the reader last put the panel, and whether they are the reason it is there.
     public private(set) var rememberedFrame: CGRect?
     public private(set) var userAdjustedFrame = false
@@ -599,7 +664,7 @@ public final class ReferencePreviewPanelController {
         }
         panel.onGoBack = { [weak state] in state?.goBack() }
         let hosting = NSHostingView(rootView: ReferencePreviewPanelContent(
-            state: state, model: model, openInNewWindow: openInNewWindow
+            state: state, model: model
         ))
         hosting.autoresizingMask = [.width, .height]
         let container = NSView(frame: CGRect(origin: .zero, size: PreviewPanelGeometry.defaultSize))
@@ -717,6 +782,45 @@ public final class ReferencePreviewPanelController {
     }
 }
 
+// MARK: - Header controls
+
+/// Every interactive control the floating preview's header can show, in card order.
+///
+/// The header was reduced to the controls a reader still needs: navigation (Back, the page link,
+/// Go to page), the citation copy affordance (BibTeX) and Close. "Full page", the pin and "Open
+/// in New Window" were removed from the card; there is deliberately no case for any of them, so
+/// the header cannot reserve a slot for one.
+public enum ReferencePreviewHeaderControl: String, CaseIterable, Equatable, Sendable {
+    case back
+    case pageLink
+    case bibtex
+    case goToPage
+    case close
+}
+
+/// The card's header rows as data.
+///
+/// Modelling the rows here (rather than hand-writing a fixed set of buttons) is what lets the
+/// native checks assert the card's controls exactly, including that two adjacent controls are
+/// followed by no placeholder for a removed one. The trailing row is packed: its only spacing is
+/// the `HStack`'s, and the buttons are rendered from the array in declaration order.
+public enum ReferencePreviewHeaderLayout {
+    public static let titleRowLeading: [ReferencePreviewHeaderControl] = [.back]
+    public static let titleRowTrailing: [ReferencePreviewHeaderControl] = [.close]
+    public static let detailRowLeading: [ReferencePreviewHeaderControl] = [.pageLink]
+
+    /// The right-hand controls of the detail row. A citation can copy its BibTeX; every kind can
+    /// jump to the target page.
+    public static func detailRowTrailing(
+        for kind: AppState.ReferencePreviewKind
+    ) -> [ReferencePreviewHeaderControl] {
+        switch kind {
+        case .reference: return [.bibtex, .goToPage]
+        case .section, .figure, .page: return [.goToPage]
+        }
+    }
+}
+
 // MARK: - Content
 
 /// The preview card: the same material, corner radius and shadow the in-window overlay had. What
@@ -726,8 +830,6 @@ struct ReferencePreviewPanelContent: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: ReferencePreviewModel
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
-    /// The window's new-window action; `nil` when this controller belongs to no window.
-    var openInNewWindow: (() -> Bool)?
 
     var body: some View {
         if let preview = state.referencePreview {
@@ -751,89 +853,91 @@ struct ReferencePreviewPanelContent: View {
     private func header(_ preview: AppState.ReferencePreview) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                // The one control that undoes a jump the preview started. It stays visible
-                // (disabled) so the affordance does not appear only after it is needed, and
-                // "Go to page" keeps the panel open precisely so this button remains reachable.
-                Button {
-                    state.goBack()
-                } label: {
-                    Label("Back", systemImage: "chevron.left")
-                        .labelStyle(.titleAndIcon)
+                ForEach(ReferencePreviewHeaderLayout.titleRowLeading, id: \.self) { control in
+                    headerControl(control, preview: preview)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!state.canGoBack)
-                .help(state.canGoBack
-                      ? "Return to where you were before this jump"
-                      : "No preview jump to go back from")
-
                 Text(preview.title).font(.headline).lineLimit(1)
                 Spacer(minLength: 0)
-                // Pin keeps this preview while the reader works; a pinned panel refuses any
-                // interaction that would replace it (see `AppState.toggleReferencePreviewPin`).
-                Button { state.toggleReferencePreviewPin() } label: {
-                    Image(systemName: state.referencePreviewPinned ? "pin.fill" : "pin")
+                ForEach(ReferencePreviewHeaderLayout.titleRowTrailing, id: \.self) { control in
+                    headerControl(control, preview: preview)
                 }
-                .buttonStyle(.plain)
-                .disabled(!state.canPinReferencePreview)
-                .help(state.referencePreviewPinned
-                      ? "Unpin: new interactions may replace this preview again"
-                      : "Pin: keep this preview while you read")
-                .accessibilityLabel(state.referencePreviewPinned ? "Unpin preview" : "Pin preview")
-
-                // A second reader window, not an in-window split: the window has one canvas.
-                // The target page and rectangle travel with the request through the registry.
-                Button { _ = openInNewWindow?() } label: {
-                    Image(systemName: "rectangle.split.2x1")
-                }
-                .buttonStyle(.plain)
-                .disabled(openInNewWindow == nil)
-                .help("Open this reference at the same page and position in a new reader window")
-                .accessibilityLabel("Open in New Window")
-
-                Button { state.closeReferencePreview() } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.plain)
-                .help("Close preview")
             }
             HStack(spacing: 4) {
                 Text("From \(preview.source) ·")
                     .font(.caption).foregroundStyle(.secondary)
-                // The page number is a jump target in every preview, including the text-only
-                // section one; the explicit "Go to page" button below stays for discoverability.
-                Button("page \(preview.page + 1)") {
-                    state.jumpFromPreview(to: preview.page)
+                ForEach(ReferencePreviewHeaderLayout.detailRowLeading, id: \.self) { control in
+                    headerControl(control, preview: preview)
                 }
-                .buttonStyle(.link)
-                .font(.caption)
                 Spacer()
-                // Copying the generated entry is a citation action: only a `.reference` preview
-                // has bibliography entries, and the entry is the open document's recognised
-                // metadata. It is absent (not just disabled) for every other preview kind.
-                if preview.kind == .reference {
-                    Button {
-                        state.copyPreviewBibtex()
-                    } label: {
-                        Label("BibTeX", systemImage: "doc.on.doc")
-                    }
-                    .font(.caption)
-                    .disabled(!state.canCopyPreviewBibtex)
-                    .help(state.canCopyPreviewBibtex
-                          ? "Copy this document's generated BibTeX (the same entry Document Information copies)"
-                          : "No BibTeX is available for this document")
-                    .accessibilityLabel("Copy BibTeX")
-                }
-                Button("Full page") { state.showFullPreviewPage() }
-                    .disabled(state.referencePreviewPinned)
-                    .help(state.referencePreviewPinned
-                          ? "Unpin the preview to switch it to the full page"
-                          : "Show the preview's whole page")
-                Button("Go to page") {
-                    state.jumpFromPreview(to: preview.page)
+                ForEach(ReferencePreviewHeaderLayout.detailRowTrailing(for: preview.kind),
+                        id: \.self) { control in
+                    headerControl(control, preview: preview)
                 }
             }
             .font(.caption)
+        }
+    }
+
+    /// One header control. Every button the card renders comes from
+    /// ``ReferencePreviewHeaderLayout``; there are no hand-written pin, new-window or Full page
+    /// buttons left to take an invisible slot in a row.
+    @ViewBuilder
+    private func headerControl(
+        _ control: ReferencePreviewHeaderControl,
+        preview: AppState.ReferencePreview
+    ) -> some View {
+        switch control {
+        case .back:
+            // The one control that undoes a jump the preview started. It stays visible
+            // (disabled) so the affordance does not appear only after it is needed, and
+            // "Go to page" keeps the panel open precisely so this button remains reachable.
+            Button {
+                state.goBack()
+            } label: {
+                Label("Back", systemImage: "chevron.left")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!state.canGoBack)
+            .help(state.canGoBack
+                  ? "Return to where you were before this jump"
+                  : "No preview jump to go back from")
+        case .pageLink:
+            // The page number is a jump target in every preview, including the text-only
+            // section one; the explicit "Go to page" button below stays for discoverability.
+            Button("page \(preview.page + 1)") {
+                state.jumpFromPreview(to: preview.page)
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+        case .bibtex:
+            // Copying the generated entry is a citation action: only a `.reference` preview has
+            // bibliography entries. The control is absent for every other kind and disabled
+            // (not moved) when the document has no metadata.
+            Button {
+                state.copyPreviewBibtex()
+            } label: {
+                Label("BibTeX", systemImage: "doc.on.doc")
+            }
+            .font(.caption)
+            .disabled(!state.canCopyPreviewBibtex)
+            .help(state.canCopyPreviewBibtex
+                  ? "Copy this document's generated BibTeX (the same entry Document Information copies)"
+                  : "No BibTeX is available for this document")
+            .accessibilityLabel("Copy BibTeX")
+        case .goToPage:
+            Button("Go to page") {
+                state.jumpFromPreview(to: preview.page)
+            }
+        case .close:
+            Button {
+                state.closeReferencePreview()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Close preview")
         }
     }
 
@@ -845,14 +949,23 @@ struct ReferencePreviewPanelContent: View {
                     HStack(alignment: .top, spacing: 6) {
                         VStack(alignment: .leading, spacing: 4) {
                             if entry.page != nil {
+                                // The title is a link when it selects one entry; the link style
+                                // supplies the palette's accent, and the size/weight make it the
+                                // body's most prominent line.
                                 Button(entry.heading) { state.selectPreviewEntry(entry.citationEntry) }
                                     .buttonStyle(.link)
-                                    .disabled(state.referencePreviewPinned)
+                                    .font(.system(size: ReferencePreviewTypography.titleFontSize,
+                                                  weight: ReferencePreviewTypography.titleWeight.swiftUIWeight))
+                                    .foregroundStyle(Color(nsColor: ReferencePreviewTypography.linkedTitleColor))
                             } else {
-                                Text(entry.heading).bold()
+                                Text(entry.heading)
+                                    .font(.system(size: ReferencePreviewTypography.titleFontSize,
+                                                  weight: ReferencePreviewTypography.titleWeight.swiftUIWeight))
+                                    .foregroundStyle(Color(nsColor: ReferencePreviewTypography.plainTitleColor))
                             }
                             Text(entry.text)
-                                .font(.system(size: ReferencePreviewLayout.textFontSize))
+                                .font(.system(size: ReferencePreviewTypography.bodyFontSize))
+                                .foregroundStyle(Color(nsColor: ReferencePreviewTypography.bodyColor))
                                 .textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
